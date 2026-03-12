@@ -1,0 +1,239 @@
+project:
+  name: Twinr
+  tagline: Minimal digital, maximal haptic physical AI agent
+  language: English
+  audience:
+    primary:
+      - senior citizens
+    secondary:
+      - caregivers
+      - family members
+      - operators
+  principles:
+    - minimal digital complexity
+    - maximum haptic clarity
+    - senior-friendly interaction
+    - low cognitive load
+    - local configurability
+
+interaction:
+  green_button:
+    purpose: Start voice capture
+    behavior:
+      - start_listening
+      - capture_until_short_speech_pause
+      - handoff_audio_to_stt
+  yellow_button:
+    purpose: Print last answer
+    behavior:
+      - fetch_last_assistant_answer
+      - summarize_with_meta_llm_for_print
+      - send_to_thermal_printer
+
+conversation_pipeline:
+  steps:
+    - hardware_button_event
+    - microphone_capture
+    - speech_pause_detection
+    - stt_provider_transcription
+    - foundation_model_reasoning
+    - agentic_workflow_execution
+    - response_generation
+    - tts_provider_playback
+
+status_display:
+  type: eyes_display
+  states:
+    waiting:
+      description: Idle and ready
+    listening:
+      description: Capturing user speech
+    processing:
+      description: Thinking or running workflows
+    answering:
+      description: Speaking response
+    printing:
+      description: Printing condensed answer
+    error:
+      description: Fault or recoverable issue
+
+hardware:
+  buttons:
+    integration_mode: gpio
+    gpio_chip: gpiochip0
+    setup_script: hardware/buttons/setup_buttons.sh
+    notes:
+      - buttons are not exposed as Linux input devices on the current Raspberry Pi setup
+      - GPIO lines should be discovered with hardware/buttons/probe_buttons.py
+    green:
+      role: listen_trigger
+    yellow:
+      role: print_trigger
+  microphone:
+    role: voice_input
+    setup_script: hardware/mic/setup_audio.sh
+    default_device: default
+    stop_condition: short_speech_pause
+  speaker:
+    role: audio_output
+    setup_script: hardware/mic/setup_audio.sh
+    default_device: default
+  thermal_printer:
+    role: short_answer_printout
+    model: DFRobot DFR0503-EN
+    usb_compat: Gprinter GP-58
+    cups_queue: Thermal_GP58
+    setup_script: hardware/printer/setup_printer.sh
+  display:
+    role: status_feedback_with_eyes
+
+providers:
+  stt:
+    role: speech_to_text
+    candidates:
+      - OpenAI
+      - DeepInfra
+      - OpenRouter
+      - other pluggable providers
+    default_openai_model: whisper-1
+  llm:
+    role: reasoning_and_agent_control
+    candidates:
+      - OpenAI
+      - DeepInfra
+      - OpenRouter
+    default_openai_model: gpt-5.2
+    default_openai_reasoning_effort: medium
+    web_search_capable: true
+  tts:
+    role: spoken_response_generation
+    candidates:
+      - OpenAI
+      - DeepInfra
+      - OpenRouter
+    default_openai_model: gpt-4o-mini-tts
+    default_openai_voice: marin
+    default_style: clear_natural_standard_german
+  realtime_voice:
+    role: low_latency_direct_audio_conversation
+    provider: OpenAI
+    default_openai_model: gpt-4o-realtime-preview
+    default_openai_voice: sage
+    input_audio_format: pcm16_24khz_mono
+    output_audio_format: pcm16_24khz_mono
+    web_search_capable: false
+    follow_up_listening: true
+    audible_listen_beep: true
+  meta_llm:
+    role: compress_last_answer_for_print
+    output_requirements:
+      - concise
+      - easy_to_read
+      - print_friendly
+      - senior_readable
+
+agent:
+  base_agent:
+    responsibilities:
+      - run_button_driven_audio_loop
+      - coordinate_stt_llm_tts
+      - maintain_short_term_context
+      - manage_state_machine
+      - expose_last_answer_for_print
+  workflows:
+    responsibilities:
+      - tool_enabled_tasks
+      - multi_step_execution
+      - provider_calls
+      - external_actions_when_enabled
+
+memory:
+  on_device:
+    default: true
+    purpose:
+      - retain_recent_conversations
+      - compact_history_when_needed
+  print_memory:
+    purpose:
+      - store_last_response
+      - support_meta_llm_reformatting
+      - enable_reprint_or_print_history_extensions
+  long_term:
+    optional: true
+    backend: ChonkyDB
+    capabilities:
+      - vector_index
+      - graph_index
+      - fulltext_index
+      - hash_lookup
+      - temporal_index
+    purpose:
+      - durable_user_preferences
+      - persistent_facts
+      - long_horizon_recall
+
+web_interface:
+  port: 1337
+  goals:
+    - simple_local_configuration
+    - operator_friendly_controls
+    - low_technical_barrier
+  configurable_items:
+    - personality
+    - user_preferences
+    - provider_selection
+    - device_settings
+    - memory_settings
+    - print_settings
+    - display_settings
+
+non_functional_requirements:
+  usability:
+    - obvious_physical_controls
+    - low_cognitive_load
+    - short_feedback_loops
+  resilience:
+    - clear_error_state
+    - recoverable_failures
+    - provider_abstraction
+  privacy:
+    - on_device_memory_available_by_default
+    - long_term_memory_optional
+  deployment:
+    - runs_on_raspberry_pi
+    - supports_local_web_configuration
+
+repository_layout:
+  docs: Documentation and structured specs
+  hardware/display: Display-specific integrations
+  hardware/printer: Thermal printer integrations
+  hardware/buttons: Button handling and GPIO probing
+  hardware/mic: Microphone integrations
+  hardware/misc: Other hardware helpers
+  print: Print formatting and output flow
+  provider/openai: OpenAI provider adapters
+  provider/deepinfra: DeepInfra provider adapters
+  provider/openrouter: OpenRouter provider adapters
+  display/eyes: Eye state rendering logic
+  agent/base_agent: Core agent orchestration
+  agent/workflows: Task workflows
+  memory/on_device: Rolling local conversation memory
+  memory/print_memory: Last-answer and print-focused memory
+  memory/long_term: Optional ChonkyDB-backed persistent memory
+  test: Tests and validation
+
+mvp:
+  includes:
+    - gpio_button_discovery
+    - green_button_listen_flow
+    - pause_based_stop_listening
+    - stt_to_llm_to_tts_roundtrip
+    - realtime_audio_roundtrip
+    - yellow_button_print_last_answer
+    - eye_status_display
+    - on_device_short_term_memory
+    - local_web_ui_on_1337
+  excludes:
+    - complex_multi_user_management
+    - cloud_only_configuration
+    - mandatory_long_term_memory

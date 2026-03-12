@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "twinr"
+version = "0.1.0"
+description = "Minimal digital, maximal haptic physical AI agent"
+readme = "docs/README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=2.26.0,<3",
+    "websockets>=13,<16",
+]
+
+[project.scripts]
+twinr = "twinr.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

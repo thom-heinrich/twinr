@@ -1,0 +1,325 @@
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+import sys
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from twinr.config import TwinrConfig
+from twinr.providers.openai_backend import OpenAIBackend, _default_client_factory
+
+
+class FakeBinaryResponse:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def iter_bytes(self, _chunk_size: int | None = None):
+        midpoint = max(1, len(self._payload) // 2)
+        yield self._payload[:midpoint]
+        yield self._payload[midpoint:]
+
+
+class FakeResponsesAPI:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.stream_calls: list[dict] = []
+        self.output_text = "Backend answer"
+        self.output = [SimpleNamespace(type="web_search_call")]
+        self.queued_output_texts: list[str] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        output_text = self.queued_output_texts.pop(0) if self.queued_output_texts else self.output_text
+        return SimpleNamespace(
+            id="resp_123",
+            _request_id="req_123",
+            output_text=output_text,
+            output=self.output,
+        )
+
+    def stream(self, **kwargs):
+        self.stream_calls.append(kwargs)
+
+        class _StreamManager:
+            def __enter__(self_nonlocal):
+                return self_nonlocal
+
+            def __exit__(self_nonlocal, exc_type, exc, tb):
+                return None
+
+            def __iter__(self_nonlocal):
+                yield SimpleNamespace(type="response.output_text.delta", delta="Hello")
+                yield SimpleNamespace(type="response.output_text.delta", delta=" there")
+
+            def get_final_response(self_nonlocal):
+                return SimpleNamespace(
+                    id="resp_stream",
+                    _request_id="req_stream",
+                    output_text="Hello there",
+                    output=[],
+                )
+
+        return _StreamManager()
+
+
+class FakeTranscriptionsAPI:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return "Transcribed speech"
+
+
+class FakeModelAccessError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.status_code = 403
+        self.body = {"error": {"code": "model_not_found"}}
+
+
+class FakeSpeechAPI:
+    def __init__(self, fail_first: bool = False) -> None:
+        self.calls: list[dict] = []
+        self.fail_first = fail_first
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.fail_first and len(self.calls) == 1:
+            raise FakeModelAccessError("project does not have access to model")
+        return FakeBinaryResponse(b"AUDIO")
+
+    @property
+    def with_streaming_response(self):
+        parent = self
+
+        class _StreamingWrapper:
+            def create(self, **kwargs):
+                parent.calls.append(kwargs)
+                if parent.fail_first and len(parent.calls) == 1:
+                    raise FakeModelAccessError("project does not have access to model")
+
+                class _Manager:
+                    def __enter__(self_nonlocal):
+                        return FakeBinaryResponse(b"AUDIO")
+
+                    def __exit__(self_nonlocal, exc_type, exc, tb):
+                        return None
+
+                return _Manager()
+
+        return _StreamingWrapper()
+
+
+class OpenAIBackendTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.responses = FakeResponsesAPI()
+        self.transcriptions = FakeTranscriptionsAPI()
+        self.speech = FakeSpeechAPI()
+        self.client = SimpleNamespace(
+            responses=self.responses,
+            audio=SimpleNamespace(
+                transcriptions=self.transcriptions,
+                speech=self.speech,
+            ),
+        )
+        self.config = TwinrConfig(
+            openai_api_key="test-key",
+            default_model="gpt-5.2",
+            openai_reasoning_effort="medium",
+            openai_enable_web_search=False,
+            openai_stt_model="whisper-1",
+            openai_tts_model="gpt-4o-mini-tts",
+            openai_tts_voice="marin",
+            openai_tts_format="wav",
+            openai_tts_instructions="Speak in natural German.",
+            openai_web_search_context_size="medium",
+            openai_web_search_country="DE",
+            openai_web_search_city="Berlin",
+            openai_web_search_timezone="Europe/Berlin",
+        )
+        self.backend = OpenAIBackend(config=self.config, client=self.client)
+
+    def test_respond_builds_reasoning_and_web_search_request(self) -> None:
+        response = self.backend.respond_with_metadata(
+            "What is new today?",
+            conversation=[("system", "Be concise"), ("assistant", "Earlier answer")],
+            allow_web_search=True,
+        )
+
+        self.assertEqual(response.text, "Backend answer")
+        self.assertTrue(response.used_web_search)
+        self.assertEqual(response.response_id, "resp_123")
+        self.assertEqual(response.request_id, "req_123")
+
+        request = self.responses.calls[0]
+        self.assertEqual(request["model"], "gpt-5.2")
+        self.assertEqual(request["reasoning"], {"effort": "medium"})
+        self.assertFalse(request["store"])
+        self.assertEqual(request["tools"][0]["type"], "web_search")
+        self.assertEqual(request["tools"][0]["search_context_size"], "medium")
+        self.assertEqual(request["tools"][0]["user_location"]["country"], "DE")
+        self.assertEqual(request["input"][0]["role"], "system")
+        self.assertEqual(request["input"][0]["content"][0]["type"], "input_text")
+        self.assertEqual(request["input"][1]["role"], "assistant")
+        self.assertEqual(request["input"][1]["content"][0]["type"], "output_text")
+        self.assertEqual(request["input"][2]["role"], "user")
+        self.assertEqual(request["input"][2]["content"][0]["type"], "input_text")
+
+    def test_respond_merges_base_and_request_instructions(self) -> None:
+        backend = OpenAIBackend(
+            config=self.config,
+            client=self.client,
+            base_instructions="Base context",
+        )
+
+        backend.respond_with_metadata("Hello", instructions="Task context")
+
+        request = self.responses.calls[0]
+        self.assertEqual(request["instructions"], "Base context\n\nTask context")
+
+    def test_transcribe_passes_audio_tuple(self) -> None:
+        transcript = self.backend.transcribe(b"RIFF", filename="sample.wav", content_type="audio/wav")
+
+        self.assertEqual(transcript, "Transcribed speech")
+        request = self.transcriptions.calls[0]
+        self.assertEqual(request["model"], "whisper-1")
+        self.assertEqual(request["file"], ("sample.wav", b"RIFF", "audio/wav"))
+        self.assertEqual(request["response_format"], "text")
+
+    def test_synthesize_returns_audio_bytes(self) -> None:
+        audio_bytes = self.backend.synthesize("Hello from Twinr")
+
+        self.assertEqual(audio_bytes, b"AUDIO")
+        request = self.speech.calls[0]
+        self.assertEqual(request["model"], "gpt-4o-mini-tts")
+        self.assertEqual(request["voice"], "marin")
+        self.assertEqual(request["response_format"], "wav")
+        self.assertEqual(request["instructions"], "Speak in natural German.")
+
+    def test_synthesize_falls_back_to_tts_1_when_project_lacks_model_access(self) -> None:
+        fallback_config = replace(self.config, openai_tts_model="gpt-4o-mini-tts")
+        backend = OpenAIBackend(
+            config=fallback_config,
+            client=SimpleNamespace(
+                responses=self.responses,
+                audio=SimpleNamespace(
+                    transcriptions=self.transcriptions,
+                    speech=FakeSpeechAPI(fail_first=True),
+                ),
+            ),
+        )
+
+        audio_bytes = backend.synthesize("Hello from Twinr")
+
+        self.assertEqual(audio_bytes, b"AUDIO")
+        self.assertEqual(backend._client.audio.speech.calls[0]["model"], "gpt-4o-mini-tts")
+        self.assertEqual(backend._client.audio.speech.calls[1]["model"], "tts-1")
+        self.assertEqual(backend._client.audio.speech.calls[1]["voice"], "sage")
+
+    def test_synthesize_stream_yields_audio_chunks(self) -> None:
+        chunks = list(self.backend.synthesize_stream("Hello from Twinr"))
+
+        self.assertEqual(chunks, [b"AU", b"DIO"])
+        self.assertEqual(self.speech.calls[0]["model"], "gpt-4o-mini-tts")
+        self.assertEqual(self.speech.calls[0]["instructions"], "Speak in natural German.")
+
+    def test_respond_streaming_emits_text_deltas_and_returns_metadata(self) -> None:
+        deltas: list[str] = []
+
+        response = self.backend.respond_streaming(
+            "Say hello",
+            allow_web_search=False,
+            on_text_delta=deltas.append,
+        )
+
+        self.assertEqual(deltas, ["Hello", " there"])
+        self.assertEqual(response.text, "Hello there")
+        self.assertEqual(response.response_id, "resp_stream")
+        self.assertEqual(response.request_id, "req_stream")
+        self.assertFalse(response.used_web_search)
+        self.assertEqual(self.responses.stream_calls[0]["model"], "gpt-5.2")
+
+    def test_compose_print_job_uses_context_and_request_source(self) -> None:
+        self.responses.output_text = "TERMINE\nMontag 14 Uhr\nAdresse Praxis"
+        response = self.backend.compose_print_job_with_metadata(
+            conversation=(("user", "Wann ist der Termin?"), ("assistant", "Montag 14 Uhr.")),
+            focus_hint="appointment details",
+            direct_text="Montag 14 Uhr bei Dr. Meyer",
+            request_source="tool",
+        )
+
+        request = self.responses.calls[0]
+        self.assertEqual(response.text, "TERMINE\nMontag 14 Uhr\nAdresse Praxis")
+        self.assertEqual(request["reasoning"], {"effort": "medium"})
+        self.assertEqual(request["max_output_tokens"], 180)
+        self.assertNotIn("tools", request)
+        self.assertIn("Request source: tool", request["input"][-1]["content"][0]["text"])
+        self.assertIn("Focus hint: appointment details", request["input"][-1]["content"][0]["text"])
+        self.assertIn("Latest user message: Wann ist der Termin?", request["input"][-1]["content"][0]["text"])
+        self.assertIn("Latest assistant message: Montag 14 Uhr.", request["input"][-1]["content"][0]["text"])
+
+    def test_compose_print_job_enforces_output_limits(self) -> None:
+        limited_backend = OpenAIBackend(
+            config=replace(self.config, print_max_lines=2, print_max_chars=18),
+            client=self.client,
+        )
+        self.responses.output_text = "Zeile eins\nZeile zwei\nZeile drei"
+
+        response = limited_backend.compose_print_job_with_metadata(
+            direct_text="Too much text",
+            request_source="button",
+        )
+
+        self.assertEqual(response.text, "Zeile eins\nZeile…")
+
+    def test_compose_print_job_falls_back_when_summary_is_too_short(self) -> None:
+        verbose_source = (
+            "Der Termin ist am Montag um 14 Uhr bei Dr. Meyer in Hamburg. "
+            "Bitte bring deine Versicherungskarte und den Medikationsplan mit."
+        )
+        self.responses.queued_output_texts = ["Montag 14 Uhr", "Montag 14 Uhr\nDr. Meyer, Hamburg"]
+
+        response = self.backend.compose_print_job_with_metadata(
+            direct_text=verbose_source,
+            request_source="button",
+        )
+
+        self.assertEqual(response.text, "Montag 14 Uhr\nDr. Meyer, Hamburg")
+        self.assertEqual(len(self.responses.calls), 2)
+
+    def test_default_client_factory_skips_project_header_for_project_scoped_key(self) -> None:
+        captured_kwargs: dict[str, str] = {}
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+        original_module = sys.modules.get("openai")
+        sys.modules["openai"] = SimpleNamespace(OpenAI=FakeOpenAI)
+        try:
+            _default_client_factory(
+                TwinrConfig(
+                    openai_api_key="sk-proj-example",
+                    openai_project_id="proj_123",
+                )
+            )
+        finally:
+            if original_module is None:
+                sys.modules.pop("openai", None)
+            else:
+                sys.modules["openai"] = original_module
+
+        self.assertEqual(captured_kwargs, {"api_key": "sk-proj-example"})
+
+    def test_format_for_print_uses_low_reasoning_without_web_search(self) -> None:
+        self.backend.format_for_print("This is a longer answer that should be compressed.")
+
+        request = self.responses.calls[0]
+        self.assertEqual(request["reasoning"], {"effort": "low"})
+        self.assertNotIn("tools", request)
+        self.assertEqual(request["max_output_tokens"], 140)
