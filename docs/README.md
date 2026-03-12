@@ -107,13 +107,14 @@ The web interface should stay simple enough for caregivers, family members, or o
 ## Repository layout
 
 - `docs/` — documentation and structured specifications
-- `hardware/` — hardware-specific integrations for display, printer, buttons, mic, and miscellaneous devices
-- `print/` — print formatting and thermal printer logic
-- `provider/` — provider adapters for OpenAI, DeepInfra, and OpenRouter
-- `display/` — visual display logic such as status eyes
-- `agent/` — base agent logic and workflows
-- `memory/` — on-device, print-oriented, and long-term memory layers
-- `src/twinr/` — Python package mirroring the repo domains under `agent/`, `provider/`, `memory/`, `hardware/`, `display/`, and `print/`
+- `docs/providers/` — provider-specific notes and setup guides
+- `hardware/` — Raspberry Pi setup scripts for buttons, audio, and printer hardware
+- `personality/` — prompt-context files for system, user, and assistant style
+- `src/twinr/agent/` — runtime orchestration, state machine, and hardware workflows
+- `src/twinr/provider/` — provider implementations such as OpenAI
+- `src/twinr/memory/` — on-device conversation memory
+- `src/twinr/hardware/` — audio, button, and printer adapters
+- `src/twinr/providers/` — compatibility wrappers for legacy import paths
 - `test/` — tests and validation assets
 
 ## Intended user experience
