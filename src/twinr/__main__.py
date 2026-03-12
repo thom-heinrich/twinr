@@ -3,11 +3,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from twinr.config import TwinrConfig
-from twinr.providers.openai_backend import OpenAIBackend
-from twinr.realtime_runner import TwinrRealtimeHardwareLoop
-from twinr.runner import TwinrHardwareLoop
-from twinr.runtime import TwinrRuntime
+from twinr.agent.base_agent import TwinrConfig, TwinrRuntime
+from twinr.agent.workflows import TwinrHardwareLoop, TwinrRealtimeHardwareLoop
+from twinr.provider.openai import OpenAIBackend
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 
 try:
     import gpiod
