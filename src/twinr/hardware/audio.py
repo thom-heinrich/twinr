@@ -12,7 +12,7 @@ import subprocess
 import time
 import wave
 
-from twinr.config import TwinrConfig
+from twinr.agent.base_agent.config import TwinrConfig
 
 _SAMPLE_WIDTH_BYTES = 2
 

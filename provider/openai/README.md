@@ -38,7 +38,7 @@ TWINR_OPENAI_WEB_SEARCH_CONTEXT_SIZE=medium
 
 ## Python entry points
 
-- `src/twinr/providers/openai_backend.py`
+- `src/twinr/provider/openai/backend.py`
 - `src/twinr/__main__.py`
 
 ## Smoke examples

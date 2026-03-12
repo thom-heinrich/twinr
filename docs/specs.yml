@@ -218,6 +218,12 @@ repository_layout:
   agent/base_agent: Core agent orchestration
   agent/workflows: Task workflows
   memory/on_device: Rolling local conversation memory
+  src/twinr/agent: Python package for agent orchestration
+  src/twinr/provider: Python package for provider adapters
+  src/twinr/memory: Python package for memory implementations
+  src/twinr/hardware: Python package for hardware adapters
+  src/twinr/display: Python package for display logic
+  src/twinr/print: Python package for print flow
   memory/print_memory: Last-answer and print-focused memory
   memory/long_term: Optional ChonkyDB-backed persistent memory
   test: Tests and validation

@@ -113,7 +113,7 @@ The web interface should stay simple enough for caregivers, family members, or o
 - `display/` — visual display logic such as status eyes
 - `agent/` — base agent logic and workflows
 - `memory/` — on-device, print-oriented, and long-term memory layers
-- `src/twinr/` — Python runtime, config, state machine, memory, and hardware adapters
+- `src/twinr/` — Python package mirroring the repo domains under `agent/`, `provider/`, `memory/`, `hardware/`, `display/`, and `print/`
 - `test/` — tests and validation assets
 
 ## Intended user experience
