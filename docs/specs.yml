@@ -205,27 +205,18 @@ non_functional_requirements:
 
 repository_layout:
   docs: Documentation and structured specs
-  hardware/display: Display-specific integrations
-  hardware/printer: Thermal printer integrations
+  docs/providers: Provider-specific notes and setup guides
   hardware/buttons: Button handling and GPIO probing
   hardware/mic: Microphone integrations
-  hardware/misc: Other hardware helpers
-  print: Print formatting and output flow
-  provider/openai: OpenAI provider adapters
-  provider/deepinfra: DeepInfra provider adapters
-  provider/openrouter: OpenRouter provider adapters
-  display/eyes: Eye state rendering logic
-  agent/base_agent: Core agent orchestration
-  agent/workflows: Task workflows
-  memory/on_device: Rolling local conversation memory
+  hardware/printer: Thermal printer integrations
+  personality: System, user, and personality context files
   src/twinr/agent: Python package for agent orchestration
   src/twinr/provider: Python package for provider adapters
+  src/twinr/provider/openai: OpenAI provider implementation
+  src/twinr/providers: Legacy import wrappers
   src/twinr/memory: Python package for memory implementations
+  src/twinr/memory/on_device: Rolling local conversation memory
   src/twinr/hardware: Python package for hardware adapters
-  src/twinr/display: Python package for display logic
-  src/twinr/print: Python package for print flow
-  memory/print_memory: Last-answer and print-focused memory
-  memory/long_term: Optional ChonkyDB-backed persistent memory
   test: Tests and validation
 
 mvp:
