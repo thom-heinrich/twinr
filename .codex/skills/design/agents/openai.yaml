@@ -1,4 +1,0 @@
-interface:
-  display_name: "Design"
-  short_description: "Design Twinr interaction surfaces for accessibility and calm clarity"
-  default_prompt: "Use $design to improve Twinr accessibility, wording, web UI clarity, print output, or display-state behavior without making the product more complex."
