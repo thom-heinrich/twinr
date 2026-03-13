@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Live memory snapshot</h2>
+      <p class="section-description">This is the current memory content from the active Twinr runtime process.</p>
+    </div>
+  </div>
+  <div class="stats-grid">
+    <div class="stat-tile">
+      <span class="stat-label">Status</span>
+      <span class="stat-value">{{ snapshot.status }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Turns</span>
+      <span class="stat-value">{{ snapshot.memory_count }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Last transcript</span>
+      <span class="stat-value stat-value-small">{{ snapshot.last_transcript or "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Updated</span>
+      <span class="stat-value stat-value-small">{{ snapshot.updated_at or "—" }}</span>
+    </div>
+  </div>
+
+  {% if snapshot.memory_turns %}
+  <div class="memory-list">
+    {% for turn in snapshot.memory_turns %}
+    <article class="memory-turn">
+      <div class="memory-turn-meta">
+        <span class="role-badge role-{{ turn.role }}">{{ turn.role }}</span>
+        <span class="memory-time">{{ turn.created_at }}</span>
+      </div>
+      <div class="memory-content">{{ turn.content }}</div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No turns are stored yet. Start a conversation and refresh this page.</div>
+  {% endif %}
+</section>
+
+<form method="post" action="{{ form_action }}" class="stack">
+  {% for section in sections %}
+  <section class="panel">
+    <div class="section-header">
+      <div>
+        <h2>{{ section.title }}</h2>
+        <p class="section-description">{{ section.description }}</p>
+      </div>
+    </div>
+    <div class="form-grid">
+      {% for field in section.fields %}
+      <label class="field">
+        <span class="field-label">{{ field.label }}</span>
+        <span class="field-control">
+          {% if field.input_type == "select" %}
+          <select name="{{ field.key }}">
+            {% for option_value, option_label in field.options %}
+            <option value="{{ option_value }}" {% if field.value == option_value %}selected{% endif %}>{{ option_label }}</option>
+            {% endfor %}
+          </select>
+          {% else %}
+          <input type="text" name="{{ field.key }}" value="{{ field.value }}" placeholder="{{ field.placeholder }}">
+          {% endif %}
+        </span>
+        {% if field.help_text %}
+        <span class="field-help">{{ field.help_text }}</span>
+        {% endif %}
+      </label>
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+  <div class="actions">
+    <button type="submit">Save changes</button>
+  </div>
+</form>
+{% endblock %}

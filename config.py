@@ -143,7 +143,6 @@ class TwinrConfig:
     display_busy_gpio: int = 24
     display_width: int = 400
     display_height: int = 300
-    display_rotation_degrees: int = 270
     display_poll_interval_s: float = 0.5
     printer_queue: str = "Thermal_GP58"
     printer_device_uri: str | None = None
@@ -263,7 +262,6 @@ class TwinrConfig:
             display_busy_gpio=int(get_value("TWINR_DISPLAY_BUSY_GPIO", "24") or "24"),
             display_width=int(get_value("TWINR_DISPLAY_WIDTH", "400") or "400"),
             display_height=int(get_value("TWINR_DISPLAY_HEIGHT", "300") or "300"),
-            display_rotation_degrees=int(get_value("TWINR_DISPLAY_ROTATION_DEGREES", "270") or "270"),
             display_poll_interval_s=_parse_float(get_value("TWINR_DISPLAY_POLL_INTERVAL_S"), 0.5),
             printer_queue=get_value("TWINR_PRINTER_QUEUE", "Thermal_GP58") or "Thermal_GP58",
             printer_device_uri=get_value("TWINR_PRINTER_DEVICE_URI"),

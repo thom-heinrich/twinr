@@ -23,6 +23,7 @@ class FakeRealtimeSession:
                 transcript="Hallo Twinr",
                 response_text="Guten Tag",
                 response_id="resp_rt_123",
+                end_conversation=False,
             )
         ]
 
@@ -54,6 +55,7 @@ class FakeRealtimeSession:
             transcript="Hallo Twinr",
             response_text="Guten Tag",
             response_id="resp_rt_123",
+            end_conversation=False,
         )
 
 
@@ -247,11 +249,13 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 transcript="Erste Frage",
                 response_text="Erste Antwort",
                 response_id="resp_one",
+                end_conversation=False,
             ),
             OpenAIRealtimeTurn(
                 transcript="Zweite Frage",
                 response_text="Zweite Antwort",
                 response_id="resp_two",
+                end_conversation=False,
             ),
         ]
 
@@ -265,6 +269,31 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 ("assistant", "Erste Antwort"),
             ),
         )
+
+    def test_end_conversation_tool_stops_follow_up_loop(self) -> None:
+        config = TwinrConfig(
+            conversation_follow_up_enabled=True,
+            conversation_follow_up_timeout_s=3.5,
+        )
+        loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop(
+            config=config,
+            recorder=FakeRecorder(recordings=[b"PCMINPUT"]),
+        )
+        realtime_session.turns = [
+            OpenAIRealtimeTurn(
+                transcript="Danke, das war's",
+                response_text="Gern. Bis spaeter.",
+                response_id="resp_end",
+                end_conversation=True,
+            )
+        ]
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(recorder.pause_values, [1200])
+        self.assertEqual(len(player.tones), 1)
+        self.assertIn("conversation_ended=true", lines)
+        self.assertEqual(loop.runtime.status.value, "waiting")
 
     def test_print_tool_call_prints_without_formatter(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop()

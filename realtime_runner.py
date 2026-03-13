@@ -53,10 +53,7 @@ class TwinrRealtimeHardwareLoop:
         self.printer = printer or RawReceiptPrinter.from_config(config)
         self.realtime_session = realtime_session or OpenAIRealtimeSession(
             config=config,
-            tool_handlers={
-                "print_receipt": self._handle_print_tool_call,
-                "end_conversation": self._handle_end_conversation_tool_call,
-            },
+            tool_handlers={"print_receipt": self._handle_print_tool_call},
         )
         self.emit = emit or _default_emit
         self.sleep = sleep
@@ -201,15 +198,13 @@ class TwinrRealtimeHardwareLoop:
             self.emit(f"openai_response_id={turn.response_id}")
         self.runtime.finish_speaking()
         self._emit_status(force=True)
-        if turn.end_conversation:
-            self.emit("conversation_ended=true")
         self.emit(f"timing_capture_ms={capture_ms}")
         self.emit(f"timing_realtime_ms={realtime_ms}")
         self.emit("timing_playback_ms=streamed")
         if first_audio_at[0] is not None:
             self.emit(f"timing_first_audio_ms={int((first_audio_at[0] - turn_started) * 1000)}")
         self.emit(f"timing_total_ms={int((time.monotonic() - turn_started) * 1000)}")
-        return not turn.end_conversation
+        return True
 
     def _handle_print_turn(self) -> None:
         if self._is_print_cooldown_active():
@@ -260,15 +255,6 @@ class TwinrRealtimeHardwareLoop:
             "status": "printed",
             "text": composed.text,
             "job": print_job,
-        }
-
-    def _handle_end_conversation_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
-        reason = str(arguments.get("reason", "")).strip()
-        if reason:
-            self.emit(f"end_conversation_reason={reason}")
-        return {
-            "status": "ending",
-            "reason": reason or "user_requested_stop",
         }
 
     def _handle_error(self, exc: Exception) -> None:

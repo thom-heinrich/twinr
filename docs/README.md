@@ -79,6 +79,17 @@ Example configuration areas:
 
 The web interface should stay simple enough for caregivers, family members, or operators to maintain without developer tooling.
 
+The current implementation uses a server-rendered local dashboard with these sections:
+
+- Dashboard
+- Personality
+- Memory
+- Connect
+- Settings
+- User
+
+The `Memory` page reads a live runtime snapshot from the active Twinr process, so operators can inspect the current on-device conversation memory without attaching to the running loop.
+
 ## High-level architecture
 
 ### Inputs
@@ -108,9 +119,10 @@ The web interface should stay simple enough for caregivers, family members, or o
 
 - `docs/` — documentation and structured specifications
 - `docs/providers/` — provider-specific notes and setup guides
-- `hardware/` — Raspberry Pi setup scripts for buttons, audio, and printer hardware
+- `hardware/` — Raspberry Pi setup scripts for buttons, audio, printer, and display hardware
 - `personality/` — prompt-context files for system, user, and assistant style
 - `src/twinr/agent/` — runtime orchestration, state machine, and hardware workflows
+- `src/twinr/display/` — Waveshare display wrapper and image rendering helpers
 - `src/twinr/provider/` — provider implementations such as OpenAI
 - `src/twinr/memory/` — on-device conversation memory
 - `src/twinr/hardware/` — audio, button, and printer adapters
@@ -143,7 +155,7 @@ Persist the current mapping with:
 
 ```bash
 cd /twinr
-hardware/buttons/setup_buttons.sh --green 23 --yellow 24
+hardware/buttons/setup_buttons.sh --green 23 --yellow 22
 ```
 
 Probe the configured buttons with:
@@ -178,6 +190,45 @@ sudo hardware/printer/setup_printer.sh --default --test
 ```
 
 The setup script defaults to the `Thermal_GP58` queue and accepts an explicit `--device-uri` when auto-detection is not sufficient.
+
+### Display
+
+Twinr currently uses the `Waveshare 4.2inch e-Paper Module` with the `V2` Python driver and the standard Raspberry Pi SPI wiring.
+
+Install the vendor driver files, persist the GPIO mapping, and run a smoke test with:
+
+```bash
+cd /twinr
+sudo hardware/display/setup_display.sh
+```
+
+The current working mapping is:
+
+- `DIN/MOSI -> GPIO10`
+- `CLK -> GPIO11`
+- `CS -> GPIO8`
+- `DC -> GPIO25`
+- `RST -> GPIO17`
+- `BUSY -> GPIO24`
+
+Run a manual test card at any time with:
+
+```bash
+cd /twinr
+python3 hardware/display/display_test.py --env-file /twinr/.env
+```
+
+## Web dashboard
+
+Run the local settings UI with:
+
+```bash
+cd /twinr
+source .venv/bin/activate
+twinr --env-file /twinr/.env --run-web
+```
+
+By default, the UI binds to `0.0.0.0:1337`, so it is reachable from the local network.
 
 ## OpenAI backend
 
@@ -264,7 +315,7 @@ source .venv/bin/activate
 pip install -e .
 PYTHONPATH=src python3 -m unittest discover -s test -v
 PYTHONPATH=src python3 -m twinr --demo-transcript "Hello Twinr"
-hardware/buttons/setup_buttons.sh --green 23 --yellow 24
+hardware/buttons/setup_buttons.sh --green 23 --yellow 22
 sudo hardware/mic/setup_audio.sh --device-match Jabra
 python3 hardware/buttons/probe_buttons.py --env-file /twinr/.env --configured --duration 15
 ```

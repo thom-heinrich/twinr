@@ -146,7 +146,8 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             "Speak in clear, warm, natural standard German. "
             "Keep responses concise, practical, and easy for a senior user to understand. "
             "Do not use an English accent. "
-            "If the user explicitly asks for a printout, use the print_receipt tool with a short focus hint and optional exact text.\n\n"
+            "If the user explicitly asks for a printout, use the print_receipt tool with a short focus hint and optional exact text. "
+            "If the user clearly wants to stop or pause the conversation for now, call the end_conversation tool and then say a short goodbye.\n\n"
             "Speak concise German.",
         )
 
@@ -155,15 +156,22 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         session = OpenAIRealtimeSession(
             self.config,
             client=FakeRealtimeClient(FakeConnectionManager(connection)),
-            tool_handlers={"print_receipt": lambda _arguments: {"status": "printed"}},
+            tool_handlers={
+                "print_receipt": lambda _arguments: {"status": "printed"},
+                "end_conversation": lambda _arguments: {"status": "ending"},
+            },
         )
 
         with session:
             pass
 
         self.assertEqual(connection.session.calls[0]["tool_choice"], "auto")
-        self.assertEqual(connection.session.calls[0]["tools"][0]["name"], "print_receipt")
+        self.assertEqual(
+            [tool["name"] for tool in connection.session.calls[0]["tools"]],
+            ["print_receipt", "end_conversation"],
+        )
         self.assertIn("focus_hint", connection.session.calls[0]["tools"][0]["parameters"]["properties"])
+        self.assertIn("reason", connection.session.calls[0]["tools"][1]["parameters"]["properties"])
 
     def test_run_audio_turn_streams_audio_and_collects_text(self) -> None:
         audio_chunks: list[bytes] = []
@@ -244,6 +252,52 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertEqual(connection.conversation.item.calls[0]["type"], "function_call_output")
         self.assertEqual(connection.conversation.item.calls[0]["call_id"], "call_print_1")
         self.assertEqual(connection.response.calls, [{}, {}])
+
+    def test_run_audio_turn_marks_end_conversation_when_tool_called(self) -> None:
+        end_calls: list[dict] = []
+        session, connection, _manager = self.make_session(
+            SimpleNamespace(
+                type="response.done",
+                response=SimpleNamespace(
+                    id="resp_end_1",
+                    output=[
+                        SimpleNamespace(
+                            type="function_call",
+                            name="end_conversation",
+                            call_id="call_end_1",
+                            arguments='{"reason":"user said stop"}',
+                        )
+                    ],
+                ),
+            ),
+            SimpleNamespace(type="response.output_audio_transcript.delta", delta="Bis bald."),
+            SimpleNamespace(
+                type="response.done",
+                response=SimpleNamespace(
+                    id="resp_end_2",
+                    output=[
+                        SimpleNamespace(
+                            type="message",
+                            content=[SimpleNamespace(transcript="Bis bald.", text=None)],
+                        )
+                    ],
+                ),
+            ),
+        )
+        session = OpenAIRealtimeSession(
+            self.config,
+            client=FakeRealtimeClient(FakeConnectionManager(connection)),
+            tool_handlers={
+                "end_conversation": lambda arguments: end_calls.append(arguments) or {"status": "ending"}
+            },
+        )
+
+        with session:
+            turn = session.run_audio_turn(b"\x01\x02" * 100)
+
+        self.assertEqual(end_calls, [{"reason": "user said stop"}])
+        self.assertTrue(turn.end_conversation)
+        self.assertEqual(turn.response_text, "Bis bald.")
 
     def test_run_text_turn_creates_user_message(self) -> None:
         session, connection, _manager = self.make_session(

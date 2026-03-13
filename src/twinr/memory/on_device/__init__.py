@@ -29,6 +29,9 @@ class OnDeviceMemory:
     def turns(self) -> tuple[ConversationTurn, ...]:
         return tuple(self._turns)
 
+    def restore(self, turns: tuple[ConversationTurn, ...]) -> None:
+        self._turns = list(turns)
+
     def remember(self, role: str, content: str) -> ConversationTurn:
         turn = ConversationTurn(role=role, content=content.strip())
         self._turns.append(turn)

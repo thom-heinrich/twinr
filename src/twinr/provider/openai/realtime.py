@@ -14,7 +14,8 @@ _DEFAULT_REALTIME_INSTRUCTIONS = (
     "Speak in clear, warm, natural standard German. "
     "Keep responses concise, practical, and easy for a senior user to understand. "
     "Do not use an English accent. "
-    "If the user explicitly asks for a printout, use the print_receipt tool with a short focus hint and optional exact text."
+    "If the user explicitly asks for a printout, use the print_receipt tool with a short focus hint and optional exact text. "
+    "If the user clearly wants to stop or pause the conversation for now, call the end_conversation tool and then say a short goodbye."
 )
 
 
@@ -23,6 +24,7 @@ class OpenAIRealtimeTurn:
     transcript: str
     response_text: str
     response_id: str | None = None
+    end_conversation: bool = False
 
 
 def _default_async_client_factory(config: TwinrConfig) -> Any:
@@ -222,6 +224,7 @@ class OpenAIRealtimeSession:
         input_transcript_fragments: list[str] = []
         response_text_fragments: list[str] = []
         response_id: str | None = None
+        end_conversation = False
 
         while True:
             event = await self._connection.recv()
@@ -276,7 +279,9 @@ class OpenAIRealtimeSession:
                 response_id = getattr(response, "id", None)
                 function_calls = self._extract_function_calls(response)
                 if function_calls:
-                    await self._handle_function_calls(function_calls)
+                    handled_tools = await self._handle_function_calls(function_calls)
+                    if "end_conversation" in handled_tools:
+                        end_conversation = True
                     await self._connection.response.create(response={})
                     continue
                 if not "".join(response_text_fragments).strip():
@@ -293,6 +298,7 @@ class OpenAIRealtimeSession:
             transcript=transcript,
             response_text=response_text,
             response_id=response_id,
+            end_conversation=end_conversation,
         )
 
     async def _seed_conversation(self, conversation: tuple[tuple[str, str], ...] | None) -> None:
@@ -362,6 +368,28 @@ class OpenAIRealtimeSession:
                     },
                 }
             )
+        if "end_conversation" in self._tool_handlers:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "end_conversation",
+                    "description": (
+                        "End the current follow-up listening loop when the user clearly indicates they are done for now, "
+                        "for example by saying thanks, stop, pause, bye, or tschuss."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {
+                                "type": "string",
+                                "description": "Optional short note describing why the conversation should end.",
+                            }
+                        },
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                }
+            )
         return tools
 
     def _format_error(self, event: Any) -> str:
@@ -403,12 +431,14 @@ class OpenAIRealtimeSession:
             function_calls.append((name, call_id, arguments))
         return tuple(function_calls)
 
-    async def _handle_function_calls(self, function_calls: tuple[tuple[str, str, str], ...]) -> None:
+    async def _handle_function_calls(self, function_calls: tuple[tuple[str, str, str], ...]) -> tuple[str, ...]:
+        handled_names: list[str] = []
         for name, call_id, arguments_json in function_calls:
             handler = self._tool_handlers.get(name)
             if handler is None:
                 output = {"status": "error", "message": f"Unsupported tool: {name}"}
             else:
+                handled_names.append(name)
                 arguments = self._parse_tool_arguments(arguments_json)
                 try:
                     result = handler(arguments)
@@ -422,6 +452,7 @@ class OpenAIRealtimeSession:
                     "output": self._serialize_tool_output(output),
                 }
             )
+        return tuple(handled_names)
 
     def _parse_tool_arguments(self, arguments_json: str) -> dict[str, Any]:
         try:

@@ -6,6 +6,12 @@ import unicodedata
 
 from twinr.agent.base_agent.config import TwinrConfig
 
+_ESC_INIT = b"\x1b@"
+_ESC_STYLE_NORMAL = b"\x1b!\x00"
+_ESC_FONT_A = b"\x1bM\x00"
+_ESC_LINE_SPACING_DEFAULT = b"\x1b2"
+_GS_TEXT_NORMAL = b"\x1d!\x00"
+
 _UNICODE_REPLACEMENTS = {
     "Ä": "Ae",
     "Ö": "Oe",
@@ -60,7 +66,7 @@ class RawReceiptPrinter:
     def print_text(self, text: str) -> str:
         payload = self._build_text_payload(text)
         result = subprocess.run(
-            self._lp_command(),
+            ["lp", "-d", self.queue, "-o", "raw"],
             input=payload,
             capture_output=True,
             check=False,
@@ -72,7 +78,7 @@ class RawReceiptPrinter:
 
     def print_bytes(self, payload: bytes) -> str:
         result = subprocess.run(
-            self._lp_command(),
+            ["lp", "-d", self.queue, "-o", "raw"],
             input=payload,
             capture_output=True,
             check=False,
@@ -83,16 +89,23 @@ class RawReceiptPrinter:
         return result.stdout.decode("utf-8", errors="ignore").strip()
 
     def _build_text_payload(self, text: str) -> bytes:
-        return self._compose_receipt_text(text).encode("ascii", errors="strict")
+        return b"".join(
+            [
+                _ESC_INIT,
+                _ESC_STYLE_NORMAL,
+                _ESC_FONT_A,
+                _ESC_LINE_SPACING_DEFAULT,
+                _GS_TEXT_NORMAL,
+                self._compose_receipt_text(text).encode("ascii", errors="strict"),
+            ]
+        )
 
     def _compose_receipt_text(self, text: str) -> str:
         header = self._to_ascii_text(self.header_text).strip() or "TWINR.com"
         body = self._normalize_text(text)
         if body:
-            lines = ["", header, "", *body.split("\n"), *([""] * self.feed_lines)]
-        else:
-            lines = ["", header, *([""] * (self.feed_lines + 1))]
-        return "\r\n".join(lines)
+            return f"\n{header}\n\n{body}" + ("\n" * self.feed_lines)
+        return f"\n{header}" + ("\n" * (self.feed_lines + 1))
 
     def _normalize_text(self, text: str) -> str:
         normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
@@ -155,16 +168,3 @@ class RawReceiptPrinter:
         ascii_text = normalized.encode("ascii", errors="ignore").decode("ascii")
         cleaned = "".join(char if char == "\n" or 32 <= ord(char) <= 126 else " " for char in ascii_text)
         return cleaned.strip()
-
-    def _lp_command(self) -> list[str]:
-        return [
-            "lp",
-            "-d",
-            self.queue,
-            "-o",
-            "raw",
-            "-o",
-            "document-format=application/vnd.cups-raw",
-            "-o",
-            "job-sheets=none,none",
-        ]

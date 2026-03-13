@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block content %}
+<form method="post" action="{{ form_action }}" class="stack">
+  {% for section in sections %}
+  <section class="panel">
+    <div class="section-header">
+      <div>
+        <h2>{{ section.title }}</h2>
+        <p class="section-description">{{ section.description }}</p>
+      </div>
+    </div>
+    <div class="form-grid">
+      {% for field in section.fields %}
+      <label class="field">
+        <span class="field-label">{{ field.label }}</span>
+        <span class="field-control">
+          {% if field.input_type == "select" %}
+          <select name="{{ field.key }}">
+            {% for option_value, option_label in field.options %}
+            <option value="{{ option_value }}" {% if field.value == option_value %}selected{% endif %}>{{ option_label }}</option>
+            {% endfor %}
+          </select>
+          {% elif field.input_type == "password" %}
+          <input type="password" name="{{ field.key }}" value="" placeholder="{{ field.placeholder }}">
+          {% else %}
+          <input type="text" name="{{ field.key }}" value="{{ field.value }}" placeholder="{{ field.placeholder }}">
+          {% endif %}
+        </span>
+        {% if field.help_text %}
+        <span class="field-help">{{ field.help_text }}</span>
+        {% endif %}
+      </label>
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+  <div class="actions">
+    <button type="submit">Save changes</button>
+  </div>
+</form>
+{% endblock %}
