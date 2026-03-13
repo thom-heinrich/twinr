@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="card-grid">
+  {% for card in cards %}
+  <a class="card" href="{{ card.href }}">
+    <div class="card-title">{{ card.title }}</div>
+    <div class="card-value">{{ card.value }}</div>
+    <div class="card-detail">{{ card.detail }}</div>
+  </a>
+{% endfor %}
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Live runtime</h2>
+      <p class="section-description">Read from the active Twinr process snapshot.</p>
+    </div>
+  </div>
+  <div class="stats-grid">
+    <div class="stat-tile">
+      <span class="stat-label">Status</span>
+      <span class="stat-value">{{ snapshot.status }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Memory turns</span>
+      <span class="stat-value">{{ snapshot.memory_count }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Last transcript</span>
+      <span class="stat-value stat-value-small">{{ snapshot.last_transcript or "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Last update</span>
+      <span class="stat-value stat-value-small">{{ snapshot.updated_at or "—" }}</span>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Provider status</h2>
+    </div>
+  </div>
+  <div class="key-value-grid">
+    {% for label, value in provider_status %}
+    <div class="key-value">
+      <span class="key">{{ label }}</span>
+      <span class="value">{{ value }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel two-column">
+  <div>
+    <h2>Current config</h2>
+    <ul class="plain-list">
+      <li><strong>Host</strong> {{ config.web_host }}</li>
+      <li><strong>Port</strong> {{ config.web_port }}</li>
+      <li><strong>LLM</strong> {{ config.default_model }}</li>
+      <li><strong>Realtime</strong> {{ config.openai_realtime_model }}</li>
+      <li><strong>Printer</strong> {{ config.printer_queue }}</li>
+    </ul>
+  </div>
+  <div>
+    <h2>Configuration files</h2>
+    <ul class="plain-list">
+      <li><strong>.env</strong> {{ env_path }}</li>
+      <li><strong>SYSTEM</strong> personality/SYSTEM.md</li>
+      <li><strong>PERSONALITY</strong> personality/PERSONALITY.md</li>
+      <li><strong>USER</strong> personality/USER.md</li>
+    </ul>
+  </div>
+</section>
+{% endblock %}

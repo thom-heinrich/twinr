@@ -111,7 +111,9 @@ printf 'Configuring queue %s\n' "$QUEUE_NAME"
 printf 'Using device URI %s\n' "$DEVICE_URI"
 
 sudo "$LPADMIN_BIN" -x "$QUEUE_NAME" >/dev/null 2>&1 || true
-sudo "$LPADMIN_BIN" -p "$QUEUE_NAME" -E -v "$DEVICE_URI" -m raw
+sudo "$LPADMIN_BIN" -p "$QUEUE_NAME" -E -v "$DEVICE_URI" -m raw \
+  -o job-sheets-default=none,none \
+  -o printer-is-shared=false
 sudo "$CUPSENABLE_BIN" "$QUEUE_NAME"
 sudo "$CUPSACCEPT_BIN" "$QUEUE_NAME"
 

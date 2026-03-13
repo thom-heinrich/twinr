@@ -53,15 +53,32 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_AUDIO_SPEECH_THRESHOLD=950",
                         "TWINR_AUDIO_START_TIMEOUT_S=6.5",
                         "TWINR_AUDIO_MAX_RECORD_SECONDS=18.0",
+                        "TWINR_WEB_HOST=0.0.0.0",
+                        "TWINR_RUNTIME_STATE_PATH=/tmp/twinr-state-test.json",
+                        "TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP=true",
                         "TWINR_GREEN_BUTTON_GPIO=17",
                         "TWINR_YELLOW_BUTTON_GPIO=27",
                         "TWINR_BUTTON_ACTIVE_LOW=true",
                         "TWINR_BUTTON_BIAS=pull-up",
                         "TWINR_BUTTON_DEBOUNCE_MS=120",
                         "TWINR_BUTTON_PROBE_LINES=17,27,22",
+                        "TWINR_DISPLAY_DRIVER=waveshare_4in2_v2",
+                        "TWINR_DISPLAY_VENDOR_DIR=hardware/display/vendor",
+                        "TWINR_DISPLAY_SPI_BUS=0",
+                        "TWINR_DISPLAY_SPI_DEVICE=0",
+                        "TWINR_DISPLAY_CS_GPIO=8",
+                        "TWINR_DISPLAY_DC_GPIO=25",
+                        "TWINR_DISPLAY_RESET_GPIO=17",
+                        "TWINR_DISPLAY_BUSY_GPIO=24",
+                        "TWINR_DISPLAY_WIDTH=400",
+                        "TWINR_DISPLAY_HEIGHT=300",
+                        "TWINR_DISPLAY_ROTATION_DEGREES=270",
                         "TWINR_PRINTER_QUEUE=Twinr_Test_Printer",
                         "TWINR_PRINTER_DEVICE_URI=usb://Gprinter/GP-58?serial=WTTING%20",
+                        "TWINR_PRINTER_HEADER_TEXT=TWINR.com",
                         "TWINR_PRINTER_FEED_LINES=5",
+                        "TWINR_PRINTER_LINE_WIDTH=28",
+                        "TWINR_PRINT_BUTTON_COOLDOWN_S=2.5",
                     ]
                 ),
                 encoding="utf-8",
@@ -107,15 +124,32 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.audio_speech_threshold, 950)
         self.assertEqual(config.audio_start_timeout_s, 6.5)
         self.assertEqual(config.audio_max_record_seconds, 18.0)
+        self.assertEqual(config.web_host, "0.0.0.0")
+        self.assertEqual(config.runtime_state_path, "/tmp/twinr-state-test.json")
+        self.assertTrue(config.restore_runtime_state_on_startup)
         self.assertEqual(config.green_button_gpio, 17)
         self.assertEqual(config.yellow_button_gpio, 27)
         self.assertTrue(config.button_active_low)
         self.assertEqual(config.button_bias, "pull-up")
         self.assertEqual(config.button_debounce_ms, 120)
         self.assertEqual(config.button_probe_lines, (17, 27, 22))
+        self.assertEqual(config.display_driver, "waveshare_4in2_v2")
+        self.assertEqual(config.display_vendor_dir, "hardware/display/vendor")
+        self.assertEqual(config.display_spi_bus, 0)
+        self.assertEqual(config.display_spi_device, 0)
+        self.assertEqual(config.display_cs_gpio, 8)
+        self.assertEqual(config.display_dc_gpio, 25)
+        self.assertEqual(config.display_reset_gpio, 17)
+        self.assertEqual(config.display_busy_gpio, 24)
+        self.assertEqual(config.display_width, 400)
+        self.assertEqual(config.display_height, 300)
+        self.assertEqual(config.display_rotation_degrees, 270)
         self.assertEqual(config.printer_queue, "Twinr_Test_Printer")
         self.assertEqual(
             config.printer_device_uri,
             "usb://Gprinter/GP-58?serial=WTTING%20",
         )
+        self.assertEqual(config.printer_header_text, "TWINR.com")
         self.assertEqual(config.printer_feed_lines, 5)
+        self.assertEqual(config.printer_line_width, 28)
+        self.assertEqual(config.print_button_cooldown_s, 2.5)

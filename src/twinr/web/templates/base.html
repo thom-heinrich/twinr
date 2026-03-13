@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Twinr · {{ page_title }}</title>
+    <link rel="stylesheet" href="{{ request.url_for('static', path='twinr.css') }}">
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">T</span>
+          <div>
+            <div class="brand-name">Twinr</div>
+            <div class="brand-subtitle">Control Surface</div>
+          </div>
+        </div>
+        <nav class="nav">
+          {% for key, label, href in nav_items %}
+          <a class="nav-link {% if active_page == key %}active{% endif %}" href="{{ href }}">{{ label }}</a>
+          {% endfor %}
+        </nav>
+      </aside>
+      <main class="content">
+        <header class="page-header">
+          <div class="page-header-main">
+            <h1>{{ page_title }}</h1>
+            {% if intro %}
+            <p class="intro">{{ intro }}</p>
+            {% endif %}
+            <div class="path-hint">{{ env_path }}</div>
+          </div>
+          <div class="page-header-meta">
+            <div class="page-notes">
+              <span class="pill">LAN local</span>
+              <span class="pill">No build step</span>
+            </div>
+          </div>
+        </header>
+
+        {% if saved %}
+        <section class="flash success">Saved.</section>
+        {% endif %}
+
+        <section class="flash subtle">{{ restart_notice }}</section>
+
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </body>
+</html>

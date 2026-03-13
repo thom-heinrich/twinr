@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -29,9 +30,11 @@ class TwinrRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.memory.last_assistant_message(), "Hello back")
 
     def test_print_requires_previous_answer(self) -> None:
-        runtime = TwinrRuntime(config=TwinrConfig())
-        with self.assertRaises(RuntimeError):
-            runtime.press_yellow_button()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "runtime-state.json"
+            runtime = TwinrRuntime(config=TwinrConfig(runtime_state_path=str(snapshot_path)))
+            with self.assertRaises(RuntimeError):
+                runtime.press_yellow_button()
 
     def test_memory_compacts_when_limit_is_exceeded(self) -> None:
         memory = OnDeviceMemory(max_turns=4, keep_recent=2)
@@ -56,6 +59,44 @@ class TwinrRuntimeTests(unittest.TestCase):
 
         runtime.resume_answering_after_print()
         self.assertEqual(runtime.status, TwinrStatus.ANSWERING)
+
+    def test_runtime_persists_snapshot_for_web_ui(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "runtime-state.json"
+            runtime = TwinrRuntime(config=TwinrConfig(runtime_state_path=str(snapshot_path)))
+
+            runtime.press_green_button()
+            runtime.submit_transcript("Was steht heute an?")
+            runtime.complete_agent_turn("Heute steht der Arzttermin um 14 Uhr an.")
+            runtime.finish_speaking()
+
+            self.assertTrue(snapshot_path.exists())
+            snapshot_text = snapshot_path.read_text(encoding="utf-8")
+            self.assertIn('"status": "waiting"', snapshot_text)
+            self.assertIn("Was steht heute an?", snapshot_text)
+            self.assertIn("Arzttermin um 14 Uhr", snapshot_text)
+
+    def test_runtime_restores_last_response_from_snapshot_on_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "runtime-state.json"
+
+            runtime = TwinrRuntime(config=TwinrConfig(runtime_state_path=str(snapshot_path)))
+            runtime.press_green_button()
+            runtime.submit_transcript("Bitte merke dir den Zahnarzttermin.")
+            runtime.complete_agent_turn("Zahnarzttermin ist am Montag um 14 Uhr.")
+            runtime.finish_speaking()
+
+            restarted = TwinrRuntime(
+                config=TwinrConfig(
+                    runtime_state_path=str(snapshot_path),
+                    restore_runtime_state_on_startup=True,
+                )
+            )
+
+            self.assertEqual(
+                restarted.press_yellow_button(),
+                "Zahnarzttermin ist am Montag um 14 Uhr.",
+            )
 
 
 if __name__ == "__main__":

@@ -86,6 +86,18 @@ hardware:
     setup_script: hardware/printer/setup_printer.sh
   display:
     role: status_feedback_with_eyes
+    model: Waveshare 4.2inch e-Paper Module Rev 2.2
+    driver: waveshare_4in2_v2
+    setup_script: hardware/display/setup_display.sh
+    test_script: hardware/display/display_test.py
+    interface: spi
+    pins:
+      mosi: 10
+      clk: 11
+      cs: 8
+      dc: 25
+      reset: 17
+      busy: 24
 
 providers:
   stt:
@@ -174,11 +186,14 @@ memory:
 
 web_interface:
   port: 1337
+  host: 0.0.0.0
+  implementation: server_rendered_fastapi
   goals:
     - simple_local_configuration
     - operator_friendly_controls
     - low_technical_barrier
   configurable_items:
+    - dashboard_overview
     - personality
     - user_preferences
     - provider_selection
@@ -186,6 +201,14 @@ web_interface:
     - memory_settings
     - print_settings
     - display_settings
+  pages:
+    - dashboard
+    - personality
+    - memory
+    - connect
+    - settings
+    - user
+  live_runtime_snapshot: true
 
 non_functional_requirements:
   usability:
@@ -207,10 +230,12 @@ repository_layout:
   docs: Documentation and structured specs
   docs/providers: Provider-specific notes and setup guides
   hardware/buttons: Button handling and GPIO probing
+  hardware/display: Display setup and smoke tests
   hardware/mic: Microphone integrations
   hardware/printer: Thermal printer integrations
   personality: System, user, and personality context files
   src/twinr/agent: Python package for agent orchestration
+  src/twinr/display: Python package for Waveshare display adapters
   src/twinr/provider: Python package for provider adapters
   src/twinr/provider/openai: OpenAI provider implementation
   src/twinr/providers: Legacy import wrappers
