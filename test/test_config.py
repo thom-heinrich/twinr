@@ -76,14 +76,40 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_PROACTIVE_AUDIO_DEVICE=plughw:CARD=CameraB409241,DEV=0",
                         "TWINR_PROACTIVE_AUDIO_SAMPLE_MS=900",
                         "TWINR_PROACTIVE_AUDIO_DISTRESS_ENABLED=true",
+                        "TWINR_PROACTIVE_PERSON_RETURNED_ABSENCE_S=1400",
+                        "TWINR_PROACTIVE_PERSON_RETURNED_RECENT_MOTION_S=45",
+                        "TWINR_PROACTIVE_ATTENTION_WINDOW_S=7.5",
+                        "TWINR_PROACTIVE_SLUMPED_QUIET_S=24",
+                        "TWINR_PROACTIVE_POSSIBLE_FALL_STILLNESS_S=12",
+                        "TWINR_PROACTIVE_FLOOR_STILLNESS_S=28",
+                        "TWINR_PROACTIVE_SHOWING_INTENT_HOLD_S=2.2",
+                        "TWINR_PROACTIVE_POSITIVE_CONTACT_HOLD_S=2.4",
+                        "TWINR_PROACTIVE_DISTRESS_HOLD_S=4.5",
+                        "TWINR_PROACTIVE_FALL_TRANSITION_WINDOW_S=9.5",
+                        "TWINR_PROACTIVE_PERSON_RETURNED_SCORE_THRESHOLD=0.92",
+                        "TWINR_PROACTIVE_ATTENTION_WINDOW_SCORE_THRESHOLD=0.8",
+                        "TWINR_PROACTIVE_SLUMPED_QUIET_SCORE_THRESHOLD=0.88",
+                        "TWINR_PROACTIVE_POSSIBLE_FALL_SCORE_THRESHOLD=0.77",
+                        "TWINR_PROACTIVE_FLOOR_STILLNESS_SCORE_THRESHOLD=0.94",
+                        "TWINR_PROACTIVE_SHOWING_INTENT_SCORE_THRESHOLD=0.81",
+                        "TWINR_PROACTIVE_POSITIVE_CONTACT_SCORE_THRESHOLD=0.79",
+                        "TWINR_PROACTIVE_DISTRESS_POSSIBLE_SCORE_THRESHOLD=0.83",
                         "TWINR_WEB_HOST=0.0.0.0",
                         "TWINR_RUNTIME_STATE_PATH=/tmp/twinr-state-test.json",
                         "TWINR_MEMORY_MARKDOWN_PATH=/tmp/twinr-memory-test.md",
                         "TWINR_REMINDER_STORE_PATH=/tmp/twinr-reminders-test.json",
+                        "TWINR_AUTOMATION_STORE_PATH=/tmp/twinr-automations-test.json",
+                        "TWINR_VOICE_PROFILE_STORE_PATH=/tmp/twinr-voice-profile.json",
                         "TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP=true",
                         "TWINR_REMINDER_POLL_INTERVAL_S=2.5",
                         "TWINR_REMINDER_RETRY_DELAY_S=45.0",
                         "TWINR_REMINDER_MAX_ENTRIES=72",
+                        "TWINR_AUTOMATION_POLL_INTERVAL_S=7.5",
+                        "TWINR_AUTOMATION_MAX_ENTRIES=144",
+                        "TWINR_VOICE_PROFILE_MIN_SAMPLE_MS=1500",
+                        "TWINR_VOICE_PROFILE_LIKELY_THRESHOLD=0.78",
+                        "TWINR_VOICE_PROFILE_UNCERTAIN_THRESHOLD=0.60",
+                        "TWINR_VOICE_PROFILE_MAX_SAMPLES=8",
                         "TWINR_GREEN_BUTTON_GPIO=17",
                         "TWINR_YELLOW_BUTTON_GPIO=27",
                         "TWINR_PIR_MOTION_GPIO=26",
@@ -180,14 +206,40 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_audio_input_device, "plughw:CARD=CameraB409241,DEV=0")
         self.assertEqual(config.proactive_audio_sample_ms, 900)
         self.assertTrue(config.proactive_audio_distress_enabled)
+        self.assertEqual(config.proactive_person_returned_absence_s, 1400.0)
+        self.assertEqual(config.proactive_person_returned_recent_motion_s, 45.0)
+        self.assertEqual(config.proactive_attention_window_s, 7.5)
+        self.assertEqual(config.proactive_slumped_quiet_s, 24.0)
+        self.assertEqual(config.proactive_possible_fall_stillness_s, 12.0)
+        self.assertEqual(config.proactive_floor_stillness_s, 28.0)
+        self.assertEqual(config.proactive_showing_intent_hold_s, 2.2)
+        self.assertEqual(config.proactive_positive_contact_hold_s, 2.4)
+        self.assertEqual(config.proactive_distress_hold_s, 4.5)
+        self.assertEqual(config.proactive_fall_transition_window_s, 9.5)
+        self.assertEqual(config.proactive_person_returned_score_threshold, 0.92)
+        self.assertEqual(config.proactive_attention_window_score_threshold, 0.8)
+        self.assertEqual(config.proactive_slumped_quiet_score_threshold, 0.88)
+        self.assertEqual(config.proactive_possible_fall_score_threshold, 0.77)
+        self.assertEqual(config.proactive_floor_stillness_score_threshold, 0.94)
+        self.assertEqual(config.proactive_showing_intent_score_threshold, 0.81)
+        self.assertEqual(config.proactive_positive_contact_score_threshold, 0.79)
+        self.assertEqual(config.proactive_distress_possible_score_threshold, 0.83)
         self.assertEqual(config.web_host, "0.0.0.0")
         self.assertEqual(config.runtime_state_path, "/tmp/twinr-state-test.json")
         self.assertEqual(config.memory_markdown_path, "/tmp/twinr-memory-test.md")
         self.assertEqual(config.reminder_store_path, "/tmp/twinr-reminders-test.json")
+        self.assertEqual(config.automation_store_path, "/tmp/twinr-automations-test.json")
+        self.assertEqual(config.voice_profile_store_path, "/tmp/twinr-voice-profile.json")
         self.assertTrue(config.restore_runtime_state_on_startup)
         self.assertEqual(config.reminder_poll_interval_s, 2.5)
         self.assertEqual(config.reminder_retry_delay_s, 45.0)
         self.assertEqual(config.reminder_max_entries, 72)
+        self.assertEqual(config.automation_poll_interval_s, 7.5)
+        self.assertEqual(config.automation_max_entries, 144)
+        self.assertEqual(config.voice_profile_min_sample_ms, 1500)
+        self.assertEqual(config.voice_profile_likely_threshold, 0.78)
+        self.assertEqual(config.voice_profile_uncertain_threshold, 0.60)
+        self.assertEqual(config.voice_profile_max_samples, 8)
         self.assertEqual(config.green_button_gpio, 17)
         self.assertEqual(config.yellow_button_gpio, 27)
         self.assertEqual(config.pir_motion_gpio, 26)

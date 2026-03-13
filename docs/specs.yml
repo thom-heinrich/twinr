@@ -179,11 +179,16 @@ memory:
       runtime_snapshot_path: state/runtime-state.json
       durable_memory_markdown_path: state/MEMORY.md
       reminder_store_path: state/reminders.json
+      automation_store_path: state/automations.json
+      automation_poll_interval_s: 5.0
       durable_memory_write_rule: explicit_user_request_only
       reminder_write_rule: explicit_user_request_only_via_tool
       managed_profile_updates:
         - personality/USER.md
         - personality/PERSONALITY.md
+    operator_surfaces:
+      - memory_page_lists_pending_and_delivered_reminders
+      - memory_page_can_add_complete_and_delete_reminders
   print_memory:
     purpose:
       - store_last_response
@@ -215,6 +220,7 @@ web_interface:
     - dashboard_overview
     - personality
     - user_preferences
+    - automations
     - provider_selection
     - device_settings
     - memory_settings
@@ -224,6 +230,7 @@ web_interface:
     - dashboard
     - personality
     - memory
+    - automations
     - connect
     - settings
     - user
@@ -231,6 +238,15 @@ web_interface:
     - live_runtime_snapshot
     - durable_memory_markdown_inspection
     - durable_memory_manual_add
+    - reminder_inspection
+    - reminder_manual_add
+    - reminder_complete_delete_controls
+  automations_page_features:
+    - family_grouped_overview
+    - scheduled_automation_create_edit_delete
+    - sensor_automation_create_edit_delete
+    - enable_disable_controls
+    - integration_registered_family_blocks
   personality_page_features:
     - edit_system_base_text
     - edit_personality_base_text
@@ -273,8 +289,39 @@ repository_layout:
   src/twinr/providers/openai: OpenAI provider implementation
   src/twinr/memory: Python package for on-device memory, durable memory, and reminders
   src/twinr/memory/on_device: Rolling local conversation memory
+  src/twinr/automations: Python package for local automation triggers, actions, evaluation, and CRUD storage
   src/twinr/hardware: Python package for hardware adapters
+  src/twinr/web: Server-rendered local control dashboard
+  src/twinr/web/automations.py: Automation web view models, family registry, and form parsing
+  src/twinr/integrations/web_automation_families.py: Integration-side automation family registry for the local dashboard
   test: Tests and validation
+
+automation_tools:
+  realtime_voice_tools:
+    - list_automations
+    - create_time_automation
+    - create_sensor_automation
+    - update_time_automation
+    - update_sensor_automation
+    - delete_automation
+  current_scope:
+    - time_based_automation_management
+    - sensor_triggered_automation_management
+    - daily_weekly_once_schedules
+    - pir_motion_detected
+    - pir_no_motion_with_hold
+    - vad_speech_detected
+    - vad_quiet_with_hold
+    - camera_person_visible
+    - camera_hand_or_object_near_camera
+    - spoken_static_actions
+    - printed_static_actions
+    - llm_prompt_actions
+    - optional_web_search_during_due_execution
+  operator_examples:
+    - every_day_at_noon_tell_me_the_news_about_topic_x
+    - every_morning_give_me_the_weather
+    - every_day_at_08_00_print_the_headlines
 
 mvp:
   includes:

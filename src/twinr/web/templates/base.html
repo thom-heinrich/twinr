@@ -43,6 +43,10 @@
         <section class="flash success">Saved.</section>
         {% endif %}
 
+        {% if error_message %}
+        <section class="flash error">{{ error_message }}</section>
+        {% endif %}
+
         {% if restart_notice %}
         <section class="flash subtle">{{ restart_notice }}</section>
         {% endif %}

@@ -8,6 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.hardware import VoiceAssessment
 from twinr.memory.reminders import now_in_timezone
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority
 from twinr.providers.openai import OpenAIImageInput, OpenAITextResponse
@@ -176,6 +177,7 @@ class HardwareLoopTests(unittest.TestCase):
         config: TwinrConfig | None = None,
         camera=None,
         button_monitor=None,
+        voice_profile_monitor=None,
         proactive_monitor=None,
     ) -> tuple[TwinrHardwareLoop, list[str], FakeRecorder, FakePlayer, FakePrinter]:
         lines: list[str] = []
@@ -192,6 +194,7 @@ class HardwareLoopTests(unittest.TestCase):
             player=player,
             printer=printer,
             camera=camera or FakeCamera(),
+            voice_profile_monitor=voice_profile_monitor,
             proactive_monitor=proactive_monitor,
             emit=lines.append,
             sleep=lambda _seconds: None,
@@ -325,6 +328,37 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(images), 2)
         self.assertEqual(images[1].label, "Image 2: stored reference image of the main user. Use it only for person or identity comparison.")
         self.assertTrue(any(line.startswith("vision_reference_image=") for line in lines))
+
+    def test_green_button_updates_runtime_voice_assessment(self) -> None:
+        class FakeVoiceProfileMonitor:
+            def assess_wav_bytes(self, audio_bytes: bytes) -> VoiceAssessment:
+                self.audio_bytes = audio_bytes
+                return VoiceAssessment(
+                    status="likely_user",
+                    label="Likely user",
+                    detail="Close to the enrolled template.",
+                    confidence=0.81,
+                    checked_at="2026-03-13T12:00:00+00:00",
+                )
+
+        monitor = FakeVoiceProfileMonitor()
+        backend = FakeBackend()
+        loop, lines, _recorder, _player, _printer = self.make_loop(
+            backend=backend,
+            voice_profile_monitor=monitor,
+        )
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(monitor.audio_bytes, b"WAVDATA")
+        self.assertEqual(loop.runtime.user_voice_status, "likely_user")
+        self.assertEqual(loop.runtime.user_voice_confidence, 0.81)
+        self.assertEqual(loop.runtime.user_voice_checked_at, "2026-03-13T12:00:00+00:00")
+        self.assertIsNotNone(backend.respond_calls[0][1])
+        self.assertEqual(backend.respond_calls[0][1][0][0], "system")
+        self.assertIn("Speaker signal: likely match", backend.respond_calls[0][1][0][1])
+        self.assertIn("voice_profile_status=likely_user", lines)
+        self.assertIn("voice_profile_confidence=0.81", lines)
 
     def test_social_trigger_speaks_proactive_prompt(self) -> None:
         backend = FakeBackend()

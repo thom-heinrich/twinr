@@ -49,7 +49,7 @@ def build_support_bundle(
     events = event_store.tail(limit=event_limit)
     errors = [entry for entry in events if str(entry.get("level", "")).lower() == "error"][-20:]
     snapshot_path = Path(config.runtime_state_path)
-    snapshot_payload = _read_json(snapshot_path) if snapshot_path.exists() else None
+    snapshot_payload = _redact_runtime_snapshot_payload(_read_json(snapshot_path)) if snapshot_path.exists() else None
     usage_store = TwinrUsageStore.from_config(config)
     usage_summary = usage_store.summary().to_dict()
     recent_usage = [record.to_dict() for record in usage_store.tail(limit=50)]
@@ -168,6 +168,16 @@ def _read_json(path: Path) -> dict[str, object] | list[object] | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _redact_runtime_snapshot_payload(payload: dict[str, object] | list[object] | None) -> dict[str, object] | list[object] | None:
+    if not isinstance(payload, dict):
+        return payload
+    redacted = dict(payload)
+    redacted.pop("user_voice_status", None)
+    redacted.pop("user_voice_confidence", None)
+    redacted.pop("user_voice_checked_at", None)
+    return redacted
 
 
 def _latest_self_test_artifacts(root: Path, *, limit: int = 4) -> tuple[Path, ...]:

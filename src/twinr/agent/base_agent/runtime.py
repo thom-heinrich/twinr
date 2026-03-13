@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from twinr.automations import AutomationCondition, AutomationDefinition, AutomationStore
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.runtime_state import RuntimeSnapshotStore
 from twinr.agent.base_agent.state_machine import (
@@ -22,10 +23,14 @@ class TwinrRuntime:
     state_machine: TwinrStateMachine = field(default_factory=TwinrStateMachine)
     memory: OnDeviceMemory = field(init=False)
     reminder_store: ReminderStore = field(init=False)
+    automation_store: AutomationStore = field(init=False)
     snapshot_store: RuntimeSnapshotStore = field(init=False)
     ops_events: TwinrOpsEventStore = field(init=False)
     last_transcript: str | None = None
     last_response: str | None = None
+    user_voice_status: str | None = None
+    user_voice_confidence: float | None = None
+    user_voice_checked_at: str | None = None
 
     def __post_init__(self) -> None:
         self.memory = OnDeviceMemory(
@@ -37,6 +42,11 @@ class TwinrRuntime:
             timezone_name=self.config.local_timezone_name,
             retry_delay_s=self.config.reminder_retry_delay_s,
             max_entries=self.config.reminder_max_entries,
+        )
+        self.automation_store = AutomationStore(
+            self.config.automation_store_path,
+            timezone_name=self.config.local_timezone_name,
+            max_entries=self.config.automation_max_entries,
         )
         self.snapshot_store = RuntimeSnapshotStore(self.config.runtime_state_path)
         self.ops_events = TwinrOpsEventStore.from_config(self.config)
@@ -51,15 +61,38 @@ class TwinrRuntime:
     def conversation_context(self) -> tuple[tuple[str, str], ...]:
         return tuple((turn.role, turn.content) for turn in self.memory.turns)
 
-    def press_green_button(self) -> TwinrStatus:
+    def provider_conversation_context(self) -> tuple[tuple[str, str], ...]:
+        guidance = self._voice_guidance_message()
+        if not guidance:
+            return self.conversation_context()
+        return (("system", guidance), *self.conversation_context())
+
+    def begin_listening(
+        self,
+        *,
+        request_source: str,
+        button: str | None = None,
+        proactive_trigger: str | None = None,
+    ) -> TwinrStatus:
         status = self.state_machine.transition(TwinrEvent.GREEN_BUTTON_PRESSED)
         self._persist_snapshot()
+        data = {
+            "status": status.value,
+            "request_source": request_source,
+        }
+        if button:
+            data["button"] = button
+        if proactive_trigger:
+            data["proactive_trigger"] = proactive_trigger
         self.ops_events.append(
             event="turn_started",
-            message="Green button started a conversation turn.",
-            data={"button": "green", "status": status.value},
+            message="Conversation listening window started.",
+            data=data,
         )
         return status
+
+    def press_green_button(self) -> TwinrStatus:
+        return self.begin_listening(request_source="button", button="green")
 
     def submit_transcript(self, transcript: str) -> TwinrStatus:
         self.last_transcript = transcript.strip()
@@ -89,6 +122,13 @@ class TwinrRuntime:
             prompt,
             event="reminder_prompt_started",
             message="Twinr started speaking a due reminder.",
+        )
+
+    def begin_automation_prompt(self, prompt: str) -> str:
+        return self._begin_background_prompt(
+            prompt,
+            event="automation_prompt_started",
+            message="Twinr started speaking a due automation prompt.",
         )
 
     def _begin_background_prompt(self, prompt: str, *, event: str, message: str) -> str:
@@ -131,6 +171,48 @@ class TwinrRuntime:
             },
         )
         return response
+
+    def update_user_voice_assessment(
+        self,
+        *,
+        status: str | None,
+        confidence: float | None,
+        checked_at: str | None,
+    ) -> None:
+        self.user_voice_status = (status or "").strip() or None
+        self.user_voice_confidence = confidence
+        self.user_voice_checked_at = (checked_at or "").strip() or None
+        self._persist_snapshot()
+
+    def _voice_guidance_message(self) -> str | None:
+        status = (self.user_voice_status or "").strip().lower()
+        if not status:
+            return None
+        if status == "likely_user":
+            signal = "likely match to the enrolled main-user voice profile"
+        elif status == "uncertain":
+            signal = "partial match to the enrolled main-user voice profile"
+        elif status == "unknown_voice":
+            signal = "does not match the enrolled main-user voice profile closely enough"
+        else:
+            signal = status.replace("_", " ")
+
+        parts = [
+            "Live speaker signal for this turn. Treat it as a local heuristic, not proof of identity.",
+            f"Speaker signal: {signal}.",
+        ]
+        if self.user_voice_confidence is not None:
+            parts.append(f"Confidence: {self.user_voice_confidence * 100:.0f}%.")
+        if status in {"uncertain", "unknown_voice"}:
+            parts.append(
+                "For persistent or security-sensitive changes, first ask for explicit confirmation. "
+                "Only call tools with confirmed=true after the user clearly confirms in the current conversation."
+            )
+        else:
+            parts.append(
+                "You may use this signal for calmer personalization, but never as the only authorization for a sensitive action."
+            )
+        return " ".join(parts)
 
     def remember_search_result(
         self,
@@ -222,6 +304,184 @@ class TwinrRuntime:
         )
         return entry
 
+    def list_automation_records(self, *, now: datetime | None = None) -> tuple[dict[str, object], ...]:
+        return self.automation_store.list_tool_records(now=now)
+
+    def create_time_automation(
+        self,
+        *,
+        name: str,
+        actions,
+        description: str | None = None,
+        enabled: bool = True,
+        schedule: str = "once",
+        due_at: str | None = None,
+        time_of_day: str | None = None,
+        weekdays: tuple[int, ...] | list[int] = (),
+        timezone_name: str | None = None,
+        source: str = "tool",
+        tags: tuple[str, ...] | list[str] = (),
+    ) -> AutomationDefinition:
+        entry = self.automation_store.create_time_automation(
+            name=name,
+            description=description,
+            enabled=enabled,
+            schedule=schedule,
+            due_at=due_at,
+            time_of_day=time_of_day,
+            weekdays=weekdays,
+            timezone_name=timezone_name or self.config.local_timezone_name,
+            actions=actions,
+            source=source,
+            tags=tags,
+        )
+        self.remember_note(
+            kind="automation",
+            content=f"Time automation created: {entry.name}",
+            source=source,
+            metadata={"automation_id": entry.automation_id, "trigger_kind": entry.trigger.kind},
+        )
+        self.ops_events.append(
+            event="automation_created",
+            message="A time-based automation was created.",
+            data={
+                "automation_id": entry.automation_id,
+                "name": entry.name,
+                "schedule": getattr(entry.trigger, "schedule", entry.trigger.kind),
+            },
+        )
+        return entry
+
+    def create_if_then_automation(
+        self,
+        *,
+        name: str,
+        actions,
+        description: str | None = None,
+        enabled: bool = True,
+        event_name: str | None = None,
+        all_conditions: tuple[AutomationCondition, ...] | list[AutomationCondition] = (),
+        any_conditions: tuple[AutomationCondition, ...] | list[AutomationCondition] = (),
+        cooldown_seconds: float = 0.0,
+        source: str = "tool",
+        tags: tuple[str, ...] | list[str] = (),
+    ) -> AutomationDefinition:
+        entry = self.automation_store.create_if_then_automation(
+            name=name,
+            description=description,
+            enabled=enabled,
+            event_name=event_name,
+            all_conditions=all_conditions,
+            any_conditions=any_conditions,
+            cooldown_seconds=cooldown_seconds,
+            actions=actions,
+            source=source,
+            tags=tags,
+        )
+        self.remember_note(
+            kind="automation",
+            content=f"Sensor automation created: {entry.name}",
+            source=source,
+            metadata={"automation_id": entry.automation_id, "trigger_kind": entry.trigger.kind},
+        )
+        self.ops_events.append(
+            event="automation_created",
+            message="An if-then automation was created.",
+            data={
+                "automation_id": entry.automation_id,
+                "name": entry.name,
+                "event_name": getattr(entry.trigger, "event_name", None),
+            },
+        )
+        return entry
+
+    def update_automation(
+        self,
+        automation_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        enabled: bool | None = None,
+        trigger=None,
+        actions=None,
+        source: str | None = None,
+        tags: tuple[str, ...] | list[str] | None = None,
+    ) -> AutomationDefinition:
+        entry = self.automation_store.update(
+            automation_id,
+            name=name,
+            description=description,
+            enabled=enabled,
+            trigger=trigger,
+            actions=actions,
+            source=source,
+            tags=tags,
+        )
+        self.remember_note(
+            kind="automation",
+            content=f"Automation updated: {entry.name}",
+            source=source or "automation_update",
+            metadata={"automation_id": entry.automation_id, "trigger_kind": entry.trigger.kind},
+        )
+        self.ops_events.append(
+            event="automation_updated",
+            message="An automation was updated.",
+            data={"automation_id": entry.automation_id, "name": entry.name},
+        )
+        return entry
+
+    def delete_automation(self, automation_id: str, *, source: str = "tool") -> AutomationDefinition:
+        entry = self.automation_store.delete(automation_id)
+        self.remember_note(
+            kind="automation",
+            content=f"Automation deleted: {entry.name}",
+            source=source,
+            metadata={"automation_id": entry.automation_id},
+        )
+        self.ops_events.append(
+            event="automation_deleted",
+            message="An automation was deleted.",
+            data={"automation_id": entry.automation_id, "name": entry.name},
+        )
+        return entry
+
+    def due_time_automations(self, *, now: datetime | None = None) -> tuple[AutomationDefinition, ...]:
+        return self.automation_store.due_time_automations(now=now)
+
+    def matching_if_then_automations(
+        self,
+        *,
+        facts: dict[str, object],
+        event_name: str | None = None,
+        now: datetime | None = None,
+    ) -> tuple[AutomationDefinition, ...]:
+        return self.automation_store.matching_if_then_automations(
+            facts=facts,
+            event_name=event_name,
+            now=now,
+        )
+
+    def mark_automation_triggered(
+        self,
+        automation_id: str,
+        *,
+        triggered_at: datetime | None = None,
+        source: str = "automation_execution",
+    ) -> AutomationDefinition:
+        entry = self.automation_store.mark_triggered(automation_id, triggered_at=triggered_at)
+        self.remember_note(
+            kind="automation",
+            content=f"Automation ran: {entry.name}",
+            source=source,
+            metadata={"automation_id": entry.automation_id},
+        )
+        self.ops_events.append(
+            event="automation_triggered",
+            message="A scheduled automation was executed.",
+            data={"automation_id": entry.automation_id, "name": entry.name},
+        )
+        return entry
+
     def reserve_due_reminders(self, *, limit: int = 1) -> tuple[ReminderEntry, ...]:
         return self.reminder_store.reserve_due(limit=limit)
 
@@ -305,6 +565,27 @@ class TwinrRuntime:
         except InvalidTransitionError:
             return None
 
+    def begin_automation_print(self) -> TwinrStatus:
+        try:
+            status = self.state_machine.transition(TwinrEvent.PRINT_REQUESTED)
+        except InvalidTransitionError:
+            if self.state_machine.status != TwinrStatus.WAITING:
+                raise
+            status = self.state_machine.transition(TwinrEvent.YELLOW_BUTTON_PRESSED)
+        self._persist_snapshot()
+        self.ops_events.append(
+            event="print_started",
+            message="Scheduled automation requested a print.",
+            data={"request_source": "automation", "status": status.value},
+        )
+        return status
+
+    def maybe_begin_automation_print(self) -> TwinrStatus | None:
+        try:
+            return self.begin_automation_print()
+        except InvalidTransitionError:
+            return None
+
     def finish_printing(self) -> TwinrStatus:
         status = self.state_machine.transition(TwinrEvent.PRINT_FINISHED)
         self._persist_snapshot()
@@ -347,12 +628,18 @@ class TwinrRuntime:
             last_transcript=self.last_transcript,
             last_response=self.last_response,
             error_message=error_message,
+            user_voice_status=self.user_voice_status,
+            user_voice_confidence=self.user_voice_confidence,
+            user_voice_checked_at=self.user_voice_checked_at,
         )
 
     def _restore_snapshot_context(self) -> None:
         snapshot = self.snapshot_store.load()
         self.last_transcript = snapshot.last_transcript
         self.last_response = snapshot.last_response or None
+        self.user_voice_status = snapshot.user_voice_status or None
+        self.user_voice_confidence = snapshot.user_voice_confidence
+        self.user_voice_checked_at = snapshot.user_voice_checked_at or None
         if snapshot.memory_raw_tail or snapshot.memory_ledger or snapshot.memory_search_results:
             self.memory.restore_structured(
                 raw_tail=tuple(

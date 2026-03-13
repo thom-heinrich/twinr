@@ -55,6 +55,9 @@ class RuntimeSnapshot:
     last_response: str | None = None
     updated_at: str | None = None
     error_message: str | None = None
+    user_voice_status: str | None = None
+    user_voice_confidence: float | None = None
+    user_voice_checked_at: str | None = None
     memory_turns: tuple[RuntimeSnapshotTurn, ...] = ()
     memory_raw_tail: tuple[RuntimeSnapshotTurn, ...] = ()
     memory_ledger: tuple[RuntimeSnapshotLedgerItem, ...] = ()
@@ -84,6 +87,13 @@ class RuntimeSnapshotStore:
             last_response=data.get("last_response"),
             updated_at=data.get("updated_at"),
             error_message=data.get("error_message"),
+            user_voice_status=data.get("user_voice_status"),
+            user_voice_confidence=(
+                float(data["user_voice_confidence"])
+                if data.get("user_voice_confidence") is not None
+                else None
+            ),
+            user_voice_checked_at=data.get("user_voice_checked_at"),
             memory_turns=tuple(
                 RuntimeSnapshotTurn(
                     role=str(item.get("role", "")),
@@ -162,6 +172,9 @@ class RuntimeSnapshotStore:
         last_transcript: str | None,
         last_response: str | None,
         error_message: str | None = None,
+        user_voice_status: str | None = None,
+        user_voice_confidence: float | None = None,
+        user_voice_checked_at: str | None = None,
     ) -> RuntimeSnapshot:
         snapshot = RuntimeSnapshot(
             status=status,
@@ -169,6 +182,9 @@ class RuntimeSnapshotStore:
             last_response=last_response,
             updated_at=_utcnow().isoformat(),
             error_message=error_message,
+            user_voice_status=user_voice_status,
+            user_voice_confidence=user_voice_confidence,
+            user_voice_checked_at=user_voice_checked_at,
             memory_turns=tuple(
                 RuntimeSnapshotTurn(
                     role=turn.role,
@@ -220,6 +236,9 @@ class RuntimeSnapshotStore:
             "last_response": snapshot.last_response,
             "updated_at": snapshot.updated_at,
             "error_message": snapshot.error_message,
+            "user_voice_status": snapshot.user_voice_status,
+            "user_voice_confidence": snapshot.user_voice_confidence,
+            "user_voice_checked_at": snapshot.user_voice_checked_at,
             "memory_turns": [
                 {
                     "role": turn.role,

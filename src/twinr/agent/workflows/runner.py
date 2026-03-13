@@ -13,6 +13,7 @@ from twinr.hardware.audio import SilenceDetectedRecorder, WaveAudioPlayer
 from twinr.hardware.camera import V4L2StillCamera
 from twinr.hardware.buttons import ButtonAction, configured_button_monitor
 from twinr.hardware.printer import RawReceiptPrinter
+from twinr.hardware.voice_profile import VoiceProfileMonitor
 from twinr.ops import TwinrUsageStore
 from twinr.proactive import SocialTriggerDecision, build_default_proactive_monitor
 from twinr.providers.openai.backend import OpenAIBackend, OpenAIImageInput
@@ -106,6 +107,7 @@ class TwinrHardwareLoop:
         printer: RawReceiptPrinter | None = None,
         camera: V4L2StillCamera | None = None,
         usage_store: TwinrUsageStore | None = None,
+        voice_profile_monitor: VoiceProfileMonitor | None = None,
         proactive_monitor=None,
         emit: Callable[[str], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -120,6 +122,7 @@ class TwinrHardwareLoop:
         self.printer = printer or RawReceiptPrinter.from_config(config)
         self.camera = camera or V4L2StillCamera.from_config(config)
         self.usage_store = usage_store or TwinrUsageStore.from_config(config)
+        self.voice_profile_monitor = voice_profile_monitor or VoiceProfileMonitor.from_config(config)
         self._camera_lock = Lock()
         self._audio_lock = Lock()
         self.emit = emit or _default_emit
@@ -220,6 +223,7 @@ class TwinrHardwareLoop:
         with self._audio_lock:
             audio_bytes = self.recorder.record_until_pause(pause_ms=self.config.speech_pause_ms)
         capture_ms = int((time.monotonic() - capture_started) * 1000)
+        self._update_voice_assessment_from_wav(audio_bytes)
 
         stt_started = time.monotonic()
         try:
@@ -300,7 +304,7 @@ class TwinrHardwareLoop:
         try:
             response = self.backend.respond_streaming(
                 transcript,
-                conversation=self.runtime.conversation_context(),
+                conversation=self.runtime.provider_conversation_context(),
                 allow_web_search=allow_web_search,
                 on_text_delta=queue_ready_segments,
             )
@@ -375,7 +379,7 @@ class TwinrHardwareLoop:
         response = self.backend.respond_to_images_with_metadata(
             self._build_vision_prompt(transcript, include_reference=len(images) > 1),
             images=images,
-            conversation=self.runtime.conversation_context(),
+            conversation=self.runtime.provider_conversation_context(),
             allow_web_search=allow_web_search,
         )
         llm_ms = int((time.monotonic() - llm_started) * 1000)
@@ -429,7 +433,7 @@ class TwinrHardwareLoop:
         self._emit_status(force=True)
 
         composed = self.backend.compose_print_job_with_metadata(
-            conversation=self.runtime.conversation_context(),
+            conversation=self.runtime.provider_conversation_context(),
             focus_hint=self.runtime.last_transcript,
             direct_text=response_to_print,
             request_source="button",
@@ -475,6 +479,23 @@ class TwinrHardwareLoop:
         if force or status != self._last_status:
             self.emit(f"status={status}")
             self._last_status = status
+
+    def _update_voice_assessment_from_wav(self, audio_bytes: bytes) -> None:
+        try:
+            assessment = self.voice_profile_monitor.assess_wav_bytes(audio_bytes)
+        except Exception as exc:
+            self.emit(f"voice_profile_error={exc}")
+            return
+        if not assessment.should_persist:
+            return
+        self.runtime.update_user_voice_assessment(
+            status=assessment.status,
+            confidence=assessment.confidence,
+            checked_at=assessment.checked_at,
+        )
+        self.emit(f"voice_profile_status={assessment.status}")
+        if assessment.confidence is not None:
+            self.emit(f"voice_profile_confidence={assessment.confidence:.2f}")
 
     def _record_event(self, event: str, message: str, *, level: str = "info", **data: object) -> None:
         self.runtime.ops_events.append(event=event, message=message, level=level, data=data)

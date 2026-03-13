@@ -1,5 +1,7 @@
+from array import array
 from pathlib import Path
 from types import SimpleNamespace
+import math
 import sys
 import tempfile
 import time
@@ -7,13 +9,31 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from twinr.automations import AutomationAction
 from twinr.config import TwinrConfig
+from twinr.hardware import VoiceAssessment
 from twinr.memory.reminders import now_in_timezone
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority
 from twinr.providers.openai import OpenAITextResponse
 from twinr.providers.openai.realtime import OpenAIRealtimeTurn
 from twinr.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.runtime import TwinrRuntime
+
+
+def _voice_sample_pcm_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0.35, duration_s: float = 1.8) -> bytes:
+    sample_rate = 24000
+    total_frames = int(sample_rate * duration_s)
+    frames = array("h")
+    for index in range(total_frames):
+        t = index / sample_rate
+        envelope = min(1.0, index / (sample_rate * 0.2), (total_frames - index) / (sample_rate * 0.2))
+        sample = amplitude * envelope * (
+            (0.70 * math.sin(2.0 * math.pi * frequency_hz * t))
+            + (0.20 * math.sin(2.0 * math.pi * frequency_hz * 2.0 * t))
+            + (0.10 * math.sin(2.0 * math.pi * (frequency_hz + 35.0) * t))
+        )
+        frames.append(max(-32767, min(32767, int(sample * 32767))))
+    return frames.tobytes()
 
 
 class FakeRealtimeSession:
@@ -71,6 +91,9 @@ class FakePrintBackend:
         self.search_sleep_s = 0.0
         self.synthesize_calls: list[str] = []
         self.reminder_calls: list[object] = []
+        self.generic_reminder_calls: list[tuple[str, str | None, bool | None]] = []
+        self.automation_calls: list[tuple[str, bool, str]] = []
+        self.proactive_calls: list[tuple[str, str, str, int, tuple[tuple[str, str], ...] | None, tuple[str, ...]]] = []
 
     def compose_print_job_with_metadata(
         self,
@@ -127,6 +150,66 @@ class FakePrintBackend:
             response_id="resp_reminder_1",
             request_id="req_reminder_1",
             used_web_search=False,
+        )
+
+    def phrase_proactive_prompt_with_metadata(
+        self,
+        *,
+        trigger_id: str,
+        reason: str,
+        default_prompt: str,
+        priority: int,
+        conversation=None,
+        recent_prompts=(),
+    ) -> OpenAITextResponse:
+        self.proactive_calls.append(
+            (trigger_id, reason, default_prompt, priority, conversation, tuple(recent_prompts))
+        )
+        return OpenAITextResponse(
+            text=f"Proaktiv: {trigger_id}",
+            response_id="resp_social_1",
+            request_id="req_social_1",
+            model="gpt-5.2",
+            token_usage=None,
+            used_web_search=False,
+        )
+
+    def fulfill_automation_prompt_with_metadata(
+        self,
+        prompt: str,
+        *,
+        allow_web_search: bool,
+        delivery: str = "spoken",
+    ) -> OpenAITextResponse:
+        self.automation_calls.append((prompt, allow_web_search, delivery))
+        text = "Die Wettervorhersage ist trocken und mild."
+        if delivery == "printed":
+            text = "Schlagzeilen: Markt ruhig. Wetter mild."
+        return OpenAITextResponse(
+            text=text,
+            response_id="resp_auto_1",
+            request_id="req_auto_1",
+            used_web_search=allow_web_search,
+            model="gpt-5.2",
+            token_usage=None,
+        )
+
+    def respond_with_metadata(
+        self,
+        prompt: str,
+        *,
+        conversation=None,
+        instructions: str | None = None,
+        allow_web_search: bool | None = None,
+    ) -> OpenAITextResponse:
+        self.generic_reminder_calls.append((prompt, instructions, allow_web_search))
+        return OpenAITextResponse(
+            text="Erinnerung: Medikament nehmen",
+            response_id="resp_generic_1",
+            request_id="req_generic_1",
+            used_web_search=False,
+            model="gpt-5.2",
+            token_usage=None,
         )
 
 
@@ -247,12 +330,14 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         recorder: FakeRecorder | None = None,
         camera: FakeCamera | None = None,
         button_monitor=None,
+        print_backend: FakePrintBackend | None = None,
+        voice_profile_monitor=None,
         proactive_monitor=None,
     ) -> tuple[TwinrRealtimeHardwareLoop, list[str], FakeRealtimeSession, FakePrintBackend, FakeRecorder, FakePlayer, FakePrinter]:
         config = config or TwinrConfig()
         lines: list[str] = []
         realtime_session = FakeRealtimeSession()
-        print_backend = FakePrintBackend()
+        print_backend = print_backend or FakePrintBackend()
         recorder = recorder or FakeRecorder()
         player = FakePlayer()
         printer = FakePrinter()
@@ -266,6 +351,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             player=player,
             printer=printer,
             camera=camera or FakeCamera(),
+            voice_profile_monitor=voice_profile_monitor,
             proactive_monitor=proactive_monitor,
             emit=lines.append,
             sleep=lambda _seconds: None,
@@ -409,6 +495,39 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("conversation_ended=true", lines)
         self.assertEqual(loop.runtime.status.value, "waiting")
 
+    def test_green_button_updates_runtime_voice_assessment(self) -> None:
+        class FakeVoiceProfileMonitor:
+            def assess_pcm16(self, audio_pcm: bytes, *, sample_rate: int, channels: int) -> VoiceAssessment:
+                self.audio_pcm = audio_pcm
+                self.sample_rate = sample_rate
+                self.channels = channels
+                return VoiceAssessment(
+                    status="uncertain",
+                    label="Uncertain",
+                    detail="Partial match.",
+                    confidence=0.63,
+                    checked_at="2026-03-13T12:15:00+00:00",
+                )
+
+        monitor = FakeVoiceProfileMonitor()
+        loop, lines, realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            voice_profile_monitor=monitor,
+        )
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(monitor.audio_pcm, b"PCMINPUT")
+        self.assertEqual(monitor.sample_rate, loop.config.openai_realtime_input_sample_rate)
+        self.assertEqual(monitor.channels, loop.config.audio_channels)
+        self.assertEqual(loop.runtime.user_voice_status, "uncertain")
+        self.assertEqual(loop.runtime.user_voice_confidence, 0.63)
+        self.assertEqual(loop.runtime.user_voice_checked_at, "2026-03-13T12:15:00+00:00")
+        self.assertIsNotNone(realtime_session.conversations[0])
+        self.assertEqual(realtime_session.conversations[0][0][0], "system")
+        self.assertIn("Speaker signal: partial match", realtime_session.conversations[0][0][1])
+        self.assertIn("voice_profile_status=uncertain", lines)
+        self.assertIn("voice_profile_confidence=0.63", lines)
+
     def test_print_tool_call_prints_without_formatter(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop()
         loop.runtime.press_green_button()
@@ -479,6 +598,262 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime.memory.ledger[-1].kind, "reminder")
         self.assertIn("reminder_tool_call=true", lines)
 
+    def test_list_create_update_and_delete_time_automation_tool_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+
+            created = loop._handle_create_time_automation_tool_call(
+                {
+                    "name": "Daily weather",
+                    "schedule": "daily",
+                    "time_of_day": "08:00",
+                    "delivery": "spoken",
+                    "content_mode": "llm_prompt",
+                    "content": "Give the morning weather report.",
+                    "allow_web_search": True,
+                }
+            )
+            listed = loop._handle_list_automations_tool_call({})
+            updated = loop._handle_update_time_automation_tool_call(
+                {
+                    "automation_ref": created["automation"]["automation_id"],
+                    "time_of_day": "09:15",
+                    "delivery": "printed",
+                    "content": "Print the morning weather report.",
+                }
+            )
+            deleted = loop._handle_delete_automation_tool_call(
+                {"automation_ref": created["automation"]["automation_id"]}
+            )
+
+        self.assertEqual(created["status"], "created")
+        self.assertEqual(created["automation"]["schedule"], "daily")
+        self.assertEqual(created["automation"]["delivery"], "spoken")
+        self.assertEqual(listed["count"], 1)
+        self.assertEqual(updated["status"], "updated")
+        self.assertEqual(updated["automation"]["time_of_day"], "09:15")
+        self.assertEqual(updated["automation"]["delivery"], "printed")
+        self.assertEqual(deleted["status"], "deleted")
+        self.assertIn("automation_tool_call=true", lines)
+
+    def test_list_create_update_and_delete_sensor_automation_tool_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+
+            created = loop._handle_create_sensor_automation_tool_call(
+                {
+                    "name": "Visitor hello",
+                    "trigger_kind": "camera_person_visible",
+                    "delivery": "spoken",
+                    "content_mode": "llm_prompt",
+                    "content": "Say hello to the visitor.",
+                    "allow_web_search": False,
+                    "cooldown_seconds": 90,
+                }
+            )
+            listed = loop._handle_list_automations_tool_call({})
+            updated = loop._handle_update_sensor_automation_tool_call(
+                {
+                    "automation_ref": created["automation"]["automation_id"],
+                    "trigger_kind": "vad_quiet",
+                    "hold_seconds": 45,
+                    "delivery": "printed",
+                    "content": "Print a quiet-room note.",
+                }
+            )
+            deleted = loop._handle_delete_automation_tool_call(
+                {"automation_ref": created["automation"]["automation_id"]}
+            )
+
+        self.assertEqual(created["status"], "created")
+        self.assertEqual(created["automation"]["trigger_kind"], "if_then")
+        self.assertEqual(created["automation"]["sensor_trigger_kind"], "camera_person_visible")
+        self.assertEqual(listed["count"], 1)
+        self.assertEqual(updated["status"], "updated")
+        self.assertEqual(updated["automation"]["sensor_trigger_kind"], "vad_quiet")
+        self.assertEqual(updated["automation"]["sensor_hold_seconds"], 45.0)
+        self.assertEqual(updated["automation"]["delivery"], "printed")
+        self.assertEqual(deleted["status"], "deleted")
+        self.assertIn("automation_tool_call=true", lines)
+
+    def test_idle_loop_executes_due_spoken_automation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                automation_poll_interval_s=0.0,
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            entry = loop.runtime.create_time_automation(
+                name="Daily weather",
+                schedule="daily",
+                time_of_day=now_in_timezone(config.local_timezone_name).strftime("%H:%M"),
+                actions=(
+                    AutomationAction(
+                        kind="llm_prompt",
+                        text="Give the morning weather report.",
+                        payload={"delivery": "spoken", "allow_web_search": True},
+                        enabled=True,
+                    ),
+                ),
+                source="test",
+            )
+
+            executed = loop._maybe_run_due_automation()
+            stored = loop.runtime.automation_store.get(entry.automation_id)
+
+        self.assertTrue(executed)
+        self.assertEqual(print_backend.automation_calls, [("Give the morning weather report.", True, "spoken")])
+        self.assertEqual(print_backend.synthesize_calls, ["Die Wettervorhersage ist trocken und mild."])
+        self.assertEqual(player.played, [b"PCM"])
+        assert stored is not None
+        self.assertIsNotNone(stored.last_triggered_at)
+        self.assertIn("automation_executed=true", lines)
+
+    def test_idle_loop_executes_due_printed_automation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                automation_poll_interval_s=0.0,
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop(config=config)
+            entry = loop.runtime.create_time_automation(
+                name="Daily headlines",
+                schedule="daily",
+                time_of_day=now_in_timezone(config.local_timezone_name).strftime("%H:%M"),
+                actions=(
+                    AutomationAction(
+                        kind="llm_prompt",
+                        text="Print the main headlines of the day.",
+                        payload={"delivery": "printed", "allow_web_search": True},
+                        enabled=True,
+                    ),
+                ),
+                source="test",
+            )
+
+            executed = loop._maybe_run_due_automation()
+            stored = loop.runtime.automation_store.get(entry.automation_id)
+
+        self.assertTrue(executed)
+        self.assertEqual(print_backend.automation_calls, [("Print the main headlines of the day.", True, "printed")])
+        self.assertEqual(printer.printed, ["GUTEN TAG"])
+        assert stored is not None
+        self.assertIsNotNone(stored.last_triggered_at)
+        self.assertIn("automation_print_job=request id is Test-2 (1 file(s))", lines)
+
+    def test_idle_loop_executes_sensor_automation_from_camera_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            loop._handle_create_sensor_automation_tool_call(
+                {
+                    "name": "Visitor hello",
+                    "trigger_kind": "camera_person_visible",
+                    "delivery": "spoken",
+                    "content_mode": "llm_prompt",
+                    "content": "Say hello to the visitor.",
+                    "allow_web_search": False,
+                }
+            )
+
+            loop.handle_sensor_observation(
+                {
+                    "sensor": {"inspected": True, "observed_at": 5.0},
+                    "pir": {"motion_detected": True, "low_motion": False, "no_motion_for_s": 0.0},
+                    "camera": {
+                        "person_visible": True,
+                        "person_visible_for_s": 0.0,
+                        "looking_toward_device": True,
+                        "body_pose": "upright",
+                        "smiling": False,
+                        "hand_or_object_near_camera": False,
+                        "hand_or_object_near_camera_for_s": 0.0,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                        "speech_detected_for_s": 0.0,
+                        "quiet": True,
+                        "quiet_for_s": 12.0,
+                        "distress_detected": False,
+                    },
+                },
+                ("camera.person_visible",),
+            )
+            executed = loop._maybe_run_sensor_automation()
+
+        self.assertTrue(executed)
+        self.assertEqual(print_backend.automation_calls, [("Say hello to the visitor.", False, "spoken")])
+        self.assertEqual(player.played, [b"PCM"])
+        self.assertIn("automation_trigger_source=sensor", lines)
+        self.assertIn("automation_event_name=camera.person_visible", lines)
+
+    def test_idle_loop_executes_sensor_automation_from_duration_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, printer = self.make_loop(config=config)
+            loop._handle_create_sensor_automation_tool_call(
+                {
+                    "name": "Quiet room print",
+                    "trigger_kind": "vad_quiet",
+                    "hold_seconds": 30,
+                    "delivery": "printed",
+                    "content_mode": "static_text",
+                    "content": "Bitte leise bleiben.",
+                    "cooldown_seconds": 120,
+                }
+            )
+
+            loop.handle_sensor_observation(
+                {
+                    "sensor": {"inspected": False, "observed_at": 60.0},
+                    "pir": {"motion_detected": False, "low_motion": True, "no_motion_for_s": 45.0},
+                    "camera": {
+                        "person_visible": False,
+                        "person_visible_for_s": 0.0,
+                        "looking_toward_device": False,
+                        "body_pose": "unknown",
+                        "smiling": False,
+                        "hand_or_object_near_camera": False,
+                        "hand_or_object_near_camera_for_s": 0.0,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                        "speech_detected_for_s": 0.0,
+                        "quiet": True,
+                        "quiet_for_s": 45.0,
+                        "distress_detected": False,
+                    },
+                },
+                (),
+            )
+            executed = loop._maybe_run_sensor_automation()
+
+        self.assertTrue(executed)
+        self.assertEqual(printer.printed, ["Bitte leise bleiben."])
+        self.assertIn("automation_trigger_source=sensor", lines)
+
     def test_idle_loop_delivers_due_reminder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -502,6 +877,41 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(print_backend.reminder_calls), 1)
         self.assertEqual(print_backend.synthesize_calls, ["Erinnerung: Medikament nehmen"])
         self.assertEqual(player.played, [b"PCM"])
+        self.assertIn("reminder_delivered=true", lines)
+        self.assertTrue(stored_entries[0].delivered)
+
+    def test_idle_loop_delivers_due_reminder_with_generic_backend_fallback(self) -> None:
+        class LegacyReminderBackend(FakePrintBackend):
+            phrase_due_reminder_with_metadata = None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                reminder_store_path=str(Path(temp_dir) / "state" / "reminders.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                reminder_poll_interval_s=0.0,
+            )
+            print_backend = LegacyReminderBackend()
+            loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop(
+                config=config,
+                print_backend=print_backend,
+            )
+            loop.runtime.schedule_reminder(
+                due_at=now_in_timezone(config.local_timezone_name).isoformat(),
+                summary="Medikament nehmen",
+                kind="medication",
+                source="test",
+            )
+
+            delivered = loop._maybe_deliver_due_reminder()
+            stored_entries = loop.runtime.reminder_store.load_entries()
+
+        self.assertTrue(delivered)
+        self.assertEqual(len(print_backend.reminder_calls), 0)
+        self.assertEqual(len(print_backend.generic_reminder_calls), 1)
+        self.assertIn("Speak the reminder now.", print_backend.generic_reminder_calls[0][0])
+        self.assertEqual(player.played, [b"PCM"])
+        self.assertIn("reminder_backend_fallback=generic", lines)
         self.assertIn("reminder_delivered=true", lines)
         self.assertTrue(stored_entries[0].delivered)
 
@@ -534,6 +944,42 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime.memory.ledger[-1].kind, "preference")
         self.assertIn("user_profile_tool_call=true", lines)
 
+    def test_update_user_profile_requires_confirmation_for_unknown_voice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            personality_dir = Path(temp_dir) / "personality"
+            personality_dir.mkdir(parents=True, exist_ok=True)
+            (personality_dir / "USER.md").write_text("User: Thom.\n", encoding="utf-8")
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+            loop.runtime.update_user_voice_assessment(
+                status="unknown_voice",
+                confidence=0.22,
+                checked_at="2026-03-13T12:30:00+00:00",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "confirmed=true"):
+                loop._handle_update_user_profile_tool_call(
+                    {
+                        "category": "preferred_name",
+                        "instruction": "Call the user Thom in future turns.",
+                    }
+                )
+
+            result = loop._handle_update_user_profile_tool_call(
+                {
+                    "category": "preferred_name",
+                    "instruction": "Call the user Thom in future turns.",
+                    "confirmed": True,
+                }
+            )
+
+        self.assertEqual(result["status"], "updated")
+
     def test_update_personality_tool_call_updates_personality_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             personality_dir = Path(temp_dir) / "personality"
@@ -562,6 +1008,29 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("response_style: Keep answers very short and calm.", personality_text)
         self.assertEqual(loop.runtime.memory.ledger[-1].kind, "preference")
         self.assertIn("personality_tool_call=true", lines)
+
+    def test_voice_profile_tools_can_enroll_status_and_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                voice_profile_store_path=str(Path(temp_dir) / "state" / "voice_profile.json"),
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+            loop._current_turn_audio_pcm = _voice_sample_pcm_bytes()
+
+            enroll = loop._handle_enroll_voice_profile_tool_call({})
+            status = loop._handle_get_voice_profile_status_tool_call({})
+            reset = loop._handle_reset_voice_profile_tool_call({})
+
+        self.assertEqual(enroll["status"], "enrolled")
+        self.assertGreaterEqual(enroll["sample_count"], 1)
+        self.assertEqual(status["status"], "ok")
+        self.assertTrue(status["enrolled"])
+        self.assertEqual(status["current_signal"], "likely_user")
+        self.assertEqual(reset["status"], "reset")
+        self.assertFalse(reset["enrolled"])
+        self.assertIn("voice_profile_tool_call=true", lines)
 
     def test_inspect_camera_tool_uses_backend_and_reference_image(self) -> None:
         camera = FakeCamera()
@@ -640,13 +1109,78 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         self.assertTrue(spoke)
         self.assertEqual(loop.runtime.status.value, "waiting")
-        self.assertEqual(print_backend.synthesize_calls, ["Hey Thom, schön dich zu sehen. Wie geht's dir?"])
-        self.assertEqual(player.played, [b"PCM"])
+        self.assertEqual(len(print_backend.proactive_calls), 1)
+        self.assertEqual(loop.runtime.last_transcript, "Hallo Twinr")
+        self.assertEqual(loop.runtime.last_response, "Guten Tag")
+        proactive_call = print_backend.proactive_calls[0]
+        self.assertEqual(
+            proactive_call[:5],
+            (
+                "person_returned",
+                "Person returned after a long absence.",
+                "Hey Thom, schön dich zu sehen. Wie geht's dir?",
+                int(SocialTriggerPriority.PERSON_RETURNED),
+                (),
+            ),
+        )
+        self.assertIsInstance(proactive_call[5], tuple)
+        self.assertEqual(print_backend.synthesize_calls, ["Proaktiv: person_returned"])
+        self.assertEqual(len(player.tones), 1)
+        self.assertEqual(player.played, [b"PCM", b"PCM"])
         self.assertIn("social_trigger=person_returned", lines)
+        self.assertIn("proactive_listen=true", lines)
+        self.assertIn("status=listening", lines)
+        self.assertIn("social_response_id=resp_social_1", lines)
         self.assertTrue(any(line.startswith("timing_social_tts_ms=") for line in lines))
-        social_events = [entry for entry in loop.runtime.ops_events.tail(limit=20) if entry["event"] == "social_trigger_prompted"]
-        self.assertEqual(len(social_events), 1)
-        self.assertEqual(social_events[0]["data"]["prompt"], "Hey Thom, schön dich zu sehen. Wie geht's dir?")
+        social_events = [
+            entry
+            for entry in loop.runtime.ops_events.tail(limit=40)
+            if entry["event"] == "social_trigger_prompted"
+            and entry.get("data", {}).get("trigger") == "person_returned"
+        ]
+        self.assertTrue(social_events)
+        self.assertEqual(social_events[-1]["data"]["prompt"], "Proaktiv: person_returned")
+        self.assertEqual(
+            social_events[-1]["data"]["default_prompt"],
+            "Hey Thom, schön dich zu sehen. Wie geht's dir?",
+        )
+
+    def test_social_trigger_opens_hands_free_listening_window_and_times_out(self) -> None:
+        recorder = FakeRecorder(
+            recordings=[
+                RuntimeError("No speech detected before timeout"),
+            ]
+        )
+        loop, lines, realtime_session, print_backend, recorder, player, _printer = self.make_loop(
+            config=TwinrConfig(
+                conversation_follow_up_timeout_s=3.5,
+                audio_follow_up_speech_start_chunks=5,
+                audio_follow_up_ignore_ms=420,
+            ),
+            recorder=recorder,
+        )
+
+        spoke = loop.handle_social_trigger(
+            SocialTriggerDecision(
+                trigger_id="attention_window",
+                prompt="Kann ich dir bei etwas helfen?",
+                reason="Person was visible and quiet.",
+                observed_at=42.0,
+                priority=SocialTriggerPriority.ATTENTION_WINDOW,
+            )
+        )
+
+        self.assertTrue(spoke)
+        self.assertEqual(realtime_session.calls, [])
+        self.assertEqual(recorder.pause_values, [1200])
+        self.assertEqual(recorder.start_timeouts, [3.5])
+        self.assertEqual(recorder.speech_start_chunks, [5])
+        self.assertEqual(recorder.ignore_initial_ms, [420])
+        self.assertEqual(len(print_backend.proactive_calls), 1)
+        self.assertEqual(len(player.tones), 1)
+        self.assertEqual(player.played, [b"PCM"])
+        self.assertIn("proactive_listen_timeout=true", lines)
+        self.assertEqual(loop.runtime.status.value, "waiting")
 
     def test_social_trigger_is_skipped_when_runtime_is_busy(self) -> None:
         loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()
@@ -668,6 +1202,27 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         social_events = [entry for entry in loop.runtime.ops_events.tail(limit=20) if entry["event"] == "social_trigger_skipped"]
         self.assertEqual(len(social_events), 1)
         self.assertEqual(social_events[0]["data"]["prompt"], "Schön, dich zu sehen. Was möchtest du machen?")
+
+    def test_social_trigger_is_skipped_while_follow_up_session_is_active(self) -> None:
+        loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()
+        loop._conversation_session_active = True
+
+        spoke = loop.handle_social_trigger(
+            SocialTriggerDecision(
+                trigger_id="showing_intent",
+                prompt="Möchtest du mir etwas zeigen?",
+                reason="Object near the camera.",
+                observed_at=42.0,
+                priority=SocialTriggerPriority.SHOWING_INTENT,
+            )
+        )
+
+        self.assertFalse(spoke)
+        self.assertEqual(player.played, [])
+        self.assertIn("social_trigger_skipped=conversation_active", lines)
+        social_events = [entry for entry in loop.runtime.ops_events.tail(limit=20) if entry["event"] == "social_trigger_skipped"]
+        self.assertGreaterEqual(len(social_events), 1)
+        self.assertEqual(social_events[-1]["data"]["skip_reason"], "conversation_active")
 
     def test_run_opens_and_closes_proactive_monitor(self) -> None:
         button_monitor = FakeIdleButtonMonitor()

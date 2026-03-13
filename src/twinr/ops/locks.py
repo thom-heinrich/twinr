@@ -66,3 +66,25 @@ def loop_instance_lock(config: TwinrConfig, loop_name: str, *, label: str | None
         path=loop_lock_path(config, loop_name),
         label=label or loop_name.replace("-", " "),
     )
+
+
+def loop_lock_owner(config: TwinrConfig, loop_name: str) -> int | None:
+    path = loop_lock_path(config, loop_name)
+    if not path.exists():
+        return None
+
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.seek(0)
+            owner = handle.read().strip()
+            return int(owner) if owner.isdigit() else None
+        return None
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()

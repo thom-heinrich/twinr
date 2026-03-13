@@ -35,6 +35,10 @@
       <span class="stat-label">Last update</span>
       <span class="stat-value stat-value-small">{{ snapshot.updated_at or "—" }}</span>
     </div>
+    <div class="stat-tile">
+      <span class="stat-label">Voice check</span>
+      <span class="stat-value stat-value-small">{{ voice_snapshot_label }}</span>
+    </div>
   </div>
 </section>
 
@@ -128,6 +132,10 @@
     <article class="detail-card">
       <span class="detail-label">Last response</span>
       <div class="detail-body detail-body-copy">{{ snapshot.last_response or "—" }}</div>
+    </article>
+    <article class="detail-card">
+      <span class="detail-label">Voice check</span>
+      <div class="detail-body">{{ voice_snapshot_label }}</div>
     </article>
     <article class="detail-card detail-card-wide">
       <span class="detail-label">Last error</span>

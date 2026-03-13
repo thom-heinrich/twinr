@@ -240,6 +240,16 @@ class ReminderStore:
             return failed
         raise KeyError(f"Unknown reminder_id: {reminder_id}")
 
+    def delete(self, reminder_id: str) -> ReminderEntry:
+        entries = list(self.load_entries())
+        for index, entry in enumerate(entries):
+            if entry.reminder_id != reminder_id:
+                continue
+            removed = entries.pop(index)
+            self._write_entries(tuple(entries))
+            return removed
+        raise KeyError(f"Unknown reminder_id: {reminder_id}")
+
     def render_context(self, *, limit: int = 8) -> str | None:
         pending = [entry for entry in self.load_entries() if not entry.delivered]
         if not pending:
