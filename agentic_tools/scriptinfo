@@ -1,0 +1,3918 @@
+#!/usr/bin/env python3
+"""
+scriptinfo: cross-store "what happened to this script?" timeline.
+
+Goal
+----
+Given a repo-relative script path, aggregate the most recent (default: 50; can
+increase) relevant entries across Tessairact stores, sorted newest → oldest.
+
+Primary sources (current default)
+--------------------------------
+- tasks: tasks + task events (artifacts/stores/tasks/board.json)
+- chat: chat messages (artifacts/stores/chat/chatlog.json)
+- scripthistory: script events (artifacts/stores/scripthistory/scripthistory.json)
+- findings: finding summaries (artifacts/stores/findings/index.yml)
+- fixreport: fixreports (artifacts/stores/fixreport/reports/BF*.yml)
+- report: reports (artifacts/stores/report/index.yml + reports/RPT*.yml)
+- code_change_review: CCR artifacts (artifacts/stores/code_change_review/reviews/CCR*.yml)
+- hypothesis: hypothesis summaries (artifacts/stores/hypothesis/hypotheses.yml; fast line-scan)
+
+Link-graph walk
+---------------
+Default behavior includes a 1-hop walk over "ID-like" link tokens. This allows
+capturing related artifacts that do *not* explicitly mention the script path
+but reference e.g. task:<id>, finding:FND..., fixreport:BF...
+
+Note: By default, hypothesis entries are only included when they directly link to
+the script. Use `--extensive` to include broader hypotheses reachable via ID-walk
+and to emit full `links` arrays in `entries`.
+
+Stdout contract
+---------------
+- Default (TTY): human-first Markdown summary (wiki + LLM meta summary).
+- Default (non-TTY): JSON timeline/overview (for tool-loops/tests).
+- `--summary`: force the Markdown summary (even on non-TTY).
+- `--no-llm`: disable LLM summary and return the full JSON timeline/overview (more detail; deterministic; no network).
+- Help text via --help is allowed (argparse)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    NoReturn,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
+
+import yaml
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from common.links.tessairact_meta import (
+    dedupe_link_tokens,
+    extract_link_tokens_from_texts,
+    extract_links_from_doc,
+)
+
+from _store_layout import resolve_store_file, stores_root
+from agentic_tools.process_hints import enrich_payload_with_hints
+from agentic_tools.process_hints import hints_schema_fragment
+
+
+_LINK_TOKEN_RE = re.compile(r"^[a-z][a-z0-9_]{0,32}:[A-Za-z0-9._:/@+\\-]{1,256}$")
+_ERROR_CODE_TOKEN_RE = re.compile(r"[^A-Za-z0-9]+")
+
+# 1-hop walk only uses "ID-like" tokens to avoid topic/table explosions.
+_WALK_KIND_PATTERNS: Mapping[str, re.Pattern[str]] = {
+    "task": re.compile(r"^[0-9a-f]{8,64}$"),
+    "finding": re.compile(r"^FND[0-9A-Za-z_]{6,40}$"),
+    "fixreport": re.compile(r"^BF[0-9]{6}$"),
+    "report": re.compile(r"^RPT[0-9]{8}T[0-9]{6}Z_[0-9a-f]{8}$"),
+    "hypothesis": re.compile(r"^H[0-9]{5}$"),
+    "chat_msg": re.compile(r"^M[0-9]{5}$"),
+    "codex_session": re.compile(r"^session/[A-Za-z0-9-]{8,}$"),
+    "scripthistory_event": re.compile(r"^E[0-9]{5}$"),
+    # Science / evaluation artefacts (LINKS_CONTRACT.md)
+    "quantaudit": re.compile(r"^[A-Za-z0-9._-]{1,80}:[A-Za-z0-9._-]{1,80}$"),
+    "audit_file": re.compile(r"^[A-Za-z0-9._/\\-]{1,240}\\.ya?ml$"),
+    "audit_id": re.compile(
+        r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^_]{4,32}__[A-Za-z0-9._-]{3,160}__[0-9a-f]{7,64}$"
+    ),
+}
+
+_CLOSED_TASK_STATUSES = {"done", "archived", "completed"}
+_CLOSED_TASK_COLUMNS = {"done"}
+
+_CLOSED_FINDING_STATUSES = {"resolved", "wont_fix", "duplicate"}
+
+# Hypothesis statuses are defined by the `hypothesis` CLI; we treat deprecated/superseded as inactive noise by default.
+_HYPOTHESIS_VISIBLE_STATUSES = {"open", "in_review", "supported", "refuted"}
+
+_NOISE_TASK_EVENT_KINDS = {"agent_touch"}
+
+_SEVERITY_ORDER = {"p0": 0, "p1": 1, "p2": 2, "p3": 3}
+
+
+def _emit_json(payload: Mapping[str, Any], *, pretty: bool) -> None:
+    payload_out = enrich_payload_with_hints(payload, tool="scriptinfo")
+    # NOTE: We intentionally keep insertion order (no sort_keys) for readability in
+    # `--json-pretty` mode (wiki + overview should appear near the top). Payload
+    # assembly is deterministic, so this remains stable across runs.
+    sys.stdout.write(json.dumps(dict(payload_out), indent=2 if pretty else None) + "\n")
+
+
+def _emit_markdown(text: str) -> None:
+    out = str(text or "")
+    if not out.endswith("\n"):
+        out += "\n"
+    sys.stdout.write(out)
+
+
+def _extract_wiki_summary_lines(wiki_lines: Sequence[str]) -> List[str]:
+    """
+    Extract the content of the wiki "Summary" section.
+
+    Returns Markdown lines (without the "## Summary" heading line).
+    """
+    heading_re = re.compile(r"^(?P<h>#{1,6})\s+(?P<t>.+?)\s*$")
+    summary_heads = {"summary", "zusammenfassung", "kurzfassung"}
+
+    start: Optional[int] = None
+    for i, line in enumerate(list(wiki_lines)):
+        m = heading_re.match(str(line))
+        if not m:
+            continue
+        level = len(m.group("h"))
+        if level != 2:
+            continue
+        title = m.group("t").strip().lower()
+        if title in summary_heads:
+            start = i + 1
+            break
+
+    if start is None:
+        return []
+
+    out: List[str] = []
+    for line in list(wiki_lines)[start:]:
+        m = heading_re.match(str(line))
+        if m and len(m.group("h")) <= 2:
+            break
+        out.append(str(line))
+
+    # Trim outer blank lines.
+    while out and not out[0].strip():
+        out.pop(0)
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+
+def _extract_wiki_h2_section_lines(
+    wiki_lines: Sequence[str], *, headings: Set[str]
+) -> List[str]:
+    """
+    Extract the content of a H2 section by heading title.
+
+    `headings` is matched case-insensitively (after stripping).
+    Returns Markdown lines without the H2 heading line.
+    """
+    heading_re = re.compile(r"^(?P<h>#{1,6})\s+(?P<t>.+?)\s*$")
+    want = {str(h).strip().lower() for h in headings if str(h).strip()}
+    if not want:
+        return []
+
+    start: Optional[int] = None
+    for i, line in enumerate(list(wiki_lines)):
+        m = heading_re.match(str(line))
+        if not m:
+            continue
+        level = len(m.group("h"))
+        if level != 2:
+            continue
+        title = m.group("t").strip().lower()
+        if title in want:
+            start = i + 1
+            break
+
+    if start is None:
+        return []
+
+    out: List[str] = []
+    for line in list(wiki_lines)[start:]:
+        m = heading_re.match(str(line))
+        if m and len(m.group("h")) <= 2:
+            break
+        out.append(str(line))
+
+    # Trim outer blank lines.
+    while out and not out[0].strip():
+        out.pop(0)
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+
+def _render_summary_markdown(payload: Mapping[str, Any]) -> str:
+    """
+    Render the `--summary` output as Markdown-only (no JSON noise).
+
+    Contents (Markdown-only; no JSON noise):
+    - Wiki article (leading; excludes Open Questions + Safety* unless --extensive)
+    - LLM meta summary sections (single call across all artifacts)
+    - Final hint on how to get full context (JSON)
+    """
+    script_path = (
+        str(
+            (
+                (payload.get("script") or {})
+                if isinstance(payload.get("script"), dict)
+                else {}
+            ).get("path")
+            or ""
+        )
+    ).strip()
+
+    wiki = payload.get("wiki") if isinstance(payload.get("wiki"), dict) else {}
+    out_lines: List[str] = []
+
+    wiki_lines = wiki.get("lines") if isinstance(wiki, dict) else None
+    if isinstance(wiki_lines, list) and [str(x).strip() for x in wiki_lines if str(x).strip()]:
+        # Emit the wiki content as-is (in summary mode this is the "leading" wiki summary).
+        out_lines.extend([str(x) for x in wiki_lines])
+        if out_lines and out_lines[-1].strip():
+            out_lines.append("")
+    else:
+        title = str(wiki.get("title") or script_path).strip() or script_path or "scriptinfo"
+        out_lines.append(f"# {title}".rstrip())
+        out_lines.append("")
+        if wiki.get("ok") is False:
+            reason = str(wiki.get("reason") or "unavailable").strip()
+            path = str(wiki.get("path") or "").strip()
+            msg = f"_No wiki article available ({reason})._"
+            if path:
+                msg = f"{msg} (`{path}`)"
+            out_lines.append(msg)
+        else:
+            out_lines.append("_No wiki content available._")
+        out_lines.append("")
+
+    llm_summary = (
+        payload.get("llm_summary") if isinstance(payload.get("llm_summary"), dict) else None
+    )
+    out_lines.append("---")
+    out_lines.append("")
+
+    def _emit_section(title: str, paras: Optional[Sequence[str]]) -> None:
+        out_lines.append(f"## {title}".rstrip())
+        out_lines.append("")
+        items = [str(p).replace("\r", "").strip() for p in (paras or []) if str(p).strip()]
+        if not items:
+            out_lines.append("_No summary text available._")
+            out_lines.append("")
+            return
+        for p in items:
+            out_lines.append(p)
+            out_lines.append("")
+
+    if llm_summary:
+        b = str(llm_summary.get("backend") or "").strip()
+        m = str(llm_summary.get("model") or "").strip()
+        if b:
+            if m:
+                out_lines.append(f"_LLM backend:_ `{b}` (`{m}`)".rstrip())
+            else:
+                out_lines.append(f"_LLM backend:_ `{b}`".rstrip())
+            out_lines.append("")
+        attempts = llm_summary.get("attempts")
+        if isinstance(attempts, list) and len(attempts) > 1:
+            fails = []
+            for a in attempts:
+                if not isinstance(a, dict):
+                    continue
+                if a.get("ok") is True:
+                    continue
+                bb = str(a.get("backend") or "").strip()
+                ee = str(a.get("error") or "").strip()
+                if bb and ee:
+                    fails.append(f"{bb}: {ee[:180]}")
+            if fails:
+                out_lines.append("_Failover:_ " + "; ".join(fails[:3]))
+                out_lines.append("")
+
+    if not llm_summary:
+        _emit_section(
+            "Evolution",
+            [
+                "No LLM summary available. Run with `--summary` and ensure an LLM backend is configured (DeepInfra/OpenAI/OpenRouter)."
+            ],
+        )
+        _emit_section("Known Challenges", [])
+        _emit_section("Open Work", [])
+        _emit_section("Science", [])
+    elif llm_summary.get("ok") is not True:
+        err = str(llm_summary.get("error") or "unknown_error").strip()
+        _emit_section("Evolution", [f"LLM summary failed: {err}"])
+        _emit_section("Known Challenges", [])
+        _emit_section("Open Work", [])
+        _emit_section("Science", [])
+    else:
+        sections = llm_summary.get("sections")
+        if not isinstance(sections, dict):
+            sections = {}
+
+        _emit_section("Evolution", sections.get("evolution"))
+        _emit_section("Known Challenges", sections.get("known_challenges"))
+        _emit_section("Open Work", sections.get("open_work"))
+        _emit_section("Science", sections.get("science"))
+
+    if script_path:
+        out_lines.append("---")
+        out_lines.append(
+            f"Wenn du **MEHR WISSEN WILLST**, nutz `scriptinfo --no-llm {script_path}` (full JSON timeline/overview)."
+        )
+    return "\n".join(out_lines).rstrip() + "\n"
+
+def _fail_json(
+    code: str,
+    detail: str,
+    *,
+    status: int = 1,
+    pretty: bool,
+    error_code: str = "",
+    retryable: Optional[bool] = None,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> NoReturn:
+    normalized_error = str(code or "")
+    normalized_error_code = (
+        str(error_code or "").strip()
+        or _ERROR_CODE_TOKEN_RE.sub("_", normalized_error).strip("_").upper()
+        or "UNKNOWN_ERROR"
+    )
+    if retryable is None:
+        token = normalized_error_code.upper()
+        retryable = (
+            token in {"LOCK_TIMEOUT", "TIMEOUT", "IO_ERROR"}
+            or "TIMEOUT" in token
+            or "LOCK" in token
+        )
+    out: Dict[str, Any] = {
+        "ok": False,
+        "error": normalized_error,
+        "error_code": normalized_error_code,
+        "detail": str(detail),
+        "retryable": bool(retryable),
+    }
+    if extra:
+        out.update(dict(extra))
+    _emit_json(out, pretty=pretty)
+    raise SystemExit(int(status))
+
+
+def _parse_ts_epoch(ts: str) -> Optional[float]:
+    s = str(ts or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _norm_rel_path(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    p = Path(s)
+    if p.is_absolute():
+        try:
+            rel = p.resolve().relative_to(REPO_ROOT)
+        except Exception:
+            return ""
+        return str(rel.as_posix())
+
+    rel = str(p.as_posix())
+    while rel.startswith("./"):
+        rel = rel[2:]
+    rel = rel.strip("/")
+    return rel
+
+
+def _is_safe_repo_rel_path(path: str) -> bool:
+    """
+    Enforce a safe repo-relative path without traversal.
+
+    We intentionally fail-closed on '..' segments to prevent path traversal when
+    resolving filesystem paths (e.g. exists checks, indexer lookups).
+    """
+    s = str(path or "").strip()
+    if not s:
+        return False
+    parts = Path(s).parts
+    return not any(p == ".." for p in parts)
+
+
+def _best_effort_repo_rel_from_store_path(p: Path) -> str:
+    """
+    Best-effort mapping from a physical store path to a repo-relative logical path.
+
+    Stores can live outside REPO_ROOT (e.g. on an offload mount) while still
+    containing the substring "artifacts/stores/...". For link tokens we prefer
+    stable repo-relative logical paths when possible.
+    """
+    try:
+        return str(p.resolve().relative_to(REPO_ROOT).as_posix())
+    except Exception:
+        pass
+    s = p.as_posix()
+    needle = "artifacts/stores/"
+    idx = s.rfind(f"/{needle}")
+    if idx >= 0:
+        return s[idx + 1 :].lstrip("/")
+    idx2 = s.rfind(needle)
+    if idx2 >= 0:
+        return s[idx2:].lstrip("/")
+    return ""
+
+
+def _normalize_links(tokens: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    for tok in tokens:
+        s = str(tok or "").strip()
+        if not s or ":" not in s:
+            continue
+        kind_raw, ident_raw = s.split(":", 1)
+        kind = kind_raw.strip().lower()
+        ident = ident_raw.strip()
+        if not kind or not ident:
+            continue
+        if kind == "script":
+            ident = _norm_rel_path(ident)
+            if not ident or not _is_safe_repo_rel_path(ident):
+                continue
+        token_norm = f"{kind}:{ident}"
+        if not _LINK_TOKEN_RE.fullmatch(token_norm):
+            continue
+        out.append(token_norm)
+    return dedupe_link_tokens(out)
+
+
+def _extract_links_from_text_fields(fields: Iterable[Any]) -> List[str]:
+    texts: List[str] = []
+    for v in fields:
+        if v is None:
+            continue
+        if isinstance(v, str):
+            texts.append(v)
+        elif isinstance(v, (int, float, bool)):
+            continue
+        else:
+            # Best-effort: stringify small dict/list payloads.
+            try:
+                s = json.dumps(v, sort_keys=True)
+            except Exception:
+                s = str(v)
+            if s and len(s) <= 4000:
+                texts.append(s)
+    return extract_link_tokens_from_texts(texts)
+
+
+def _read_text_limited(path: Path, *, max_bytes: int) -> str:
+    if max_bytes > 0:
+        try:
+            sz = int(path.stat().st_size)
+        except Exception:
+            sz = -1
+        if sz >= 0 and sz > max_bytes:
+            raise ValueError(f"file_too_large: {path} ({sz} bytes > {max_bytes})")
+    return path.read_text(encoding="utf-8")
+
+
+def _yaml_safe_load_path(path: Path, *, max_bytes: int) -> Any:
+    class _LimitedSafeLoader(yaml.SafeLoader):
+        def __init__(self, stream) -> None:
+            super().__init__(stream)
+            self._alias_count = 0
+            self._depth = 0
+
+        def compose_node(self, parent, index):  # type: ignore[override]
+            max_aliases = int(os.environ.get("CAIA_SCRIPTINFO_MAX_YAML_ALIASES", "200"))
+            max_depth = int(os.environ.get("CAIA_SCRIPTINFO_MAX_YAML_DEPTH", "2000"))
+            if max_depth > 0:
+                self._depth += 1
+                if self._depth > max_depth:
+                    raise yaml.YAMLError(
+                        f"yaml_max_depth_exceeded: {self._depth} > {max_depth}"
+                    )
+            try:
+                if max_aliases > 0 and self.check_event(yaml.events.AliasEvent):
+                    self._alias_count += 1
+                    if self._alias_count > max_aliases:
+                        raise yaml.YAMLError(
+                            f"yaml_alias_limit_exceeded: {self._alias_count} > {max_aliases}"
+                        )
+                return super().compose_node(parent, index)
+            finally:
+                if max_depth > 0:
+                    self._depth -= 1
+
+    text = _read_text_limited(path, max_bytes=max_bytes)
+    max_aliases = int(os.environ.get("CAIA_SCRIPTINFO_MAX_YAML_ALIASES", "200"))
+    max_depth = int(os.environ.get("CAIA_SCRIPTINFO_MAX_YAML_DEPTH", "2000"))
+    if max_aliases <= 0 and max_depth <= 0:
+        return yaml.safe_load(text)
+    return yaml.load(text, Loader=_LimitedSafeLoader)
+
+
+@dataclass(frozen=True)
+class Entry:
+    ts_utc: str
+    ts_epoch: float
+    source: str
+    entry_id: str
+    title: str
+    summary: str
+    status: str
+    links: Tuple[str, ...]
+    path: str
+    active: bool
+    noise: bool
+    extra: Tuple[Tuple[str, Any], ...]
+
+    def to_dict(
+        self,
+        *,
+        extensive: bool,
+    ) -> Dict[str, Any]:
+        if not extensive:
+            # Baseline mode: prioritize human-readable text + time (minimal keys).
+            return {
+                "ts_utc": self.ts_utc,
+                "source": self.source,
+                "id": self.entry_id,
+                "title": self.title,
+                "summary": self.summary,
+            }
+
+        full_links = list(self.links)
+        links_out = full_links
+
+        out: Dict[str, Any] = {
+            "ts_utc": self.ts_utc,
+            "source": self.source,
+            "id": self.entry_id,
+            "title": self.title,
+            "summary": self.summary,
+            "status": self.status,
+            "path": self.path,
+            "active": bool(self.active),
+            "noise": bool(self.noise),
+            "links": links_out,
+            "links_total": int(len(full_links)),
+            "links_omitted": 0,
+        }
+        if self.extra:
+            out["extra"] = {k: v for k, v in self.extra}
+        return out
+
+    def has_link(self, token: str) -> bool:
+        return token in self.links
+
+    def has_any_link(self, tokens: Set[str]) -> bool:
+        if not tokens:
+            return False
+        for t in self.links:
+            if t in tokens:
+                return True
+        return False
+
+
+def _schema() -> Dict[str, Any]:
+    # Lightweight schema (not full JSONSchema draft), sufficient for tool-loop use.
+    return {
+        "name": "scriptinfo",
+        "description": "Aggregate cross-store timeline entries for a repo script path.",
+        "related_tools": {
+            "tasks": "Execution backlog linked to scripts via script:<path> tokens.",
+            "findings": "Observed bugs/smells and their lifecycle before fix closure.",
+            "fixreport": "Root-cause fix memory and prevention checklists.",
+            "scripthistory": "Append-only script evolution and knowledge notes.",
+            "hypothesis": "Falsifiable reasoning and evidence linked to scripts.",
+            "rules": "Canonical governance rules and normalized explain view.",
+        },
+        "recommended_workflow": [
+            "scriptinfo <path> --summary",
+            "scriptinfo <path> --no-llm --extensive",
+            "tasks overview",
+            "rules search \"<intent>\"",
+        ],
+        "args": {
+            "path": {
+                "type": "string",
+                "description": "Repo-relative script path (preferred).",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 50,
+                "default": 50,
+                "description": "Max entries to return (>=50).",
+            },
+            "walk": {
+                "type": "boolean",
+                "default": True,
+                "description": "Include 1-hop link-graph walk.",
+            },
+            "extensive": {
+                "type": "boolean",
+                "default": False,
+                "description": "Include full link lists and broader related items (e.g. hypotheses via ID-walk).",
+            },
+            "include_closed": {
+                "type": "boolean",
+                "default": False,
+                "description": "Include inactive/closed items (done tasks, addressed/resolved findings, checked reviews).",
+            },
+            "include_noise": {
+                "type": "boolean",
+                "default": False,
+                "description": "Include noisy automation/system events (e.g. task_moved/task_updated, agent_touch).",
+            },
+            "include_chat": {
+                "type": "boolean",
+                "default": True,
+                "description": "Include chat messages that link to the script or visible action items.",
+            },
+            "include_findings": {
+                "type": "boolean",
+                "default": True,
+                "description": "Include findings index entries (findings/index.yml) linked to the script.",
+            },
+            "include_indexer": {
+                "type": "boolean",
+                "default": True,
+                "description": "Include lightweight repo indexer metadata if available.",
+            },
+            "summary": {
+                "type": "boolean",
+                "default": False,
+                "description": "Call DeepInfra to produce a structured, script-specific meta summary (Evolution / Known Challenges / Open Work / Science) over linked artifacts. In summary mode, JSON output is compact (no raw timeline unless --extensive).",
+            },
+        },
+        "returns": {
+            "ok": {"type": "boolean"},
+            "script": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {"type": "string"},
+                    "exists": {"type": "boolean"},
+                },
+            },
+            "wiki": {
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "boolean"},
+                    "skipped": {"type": "boolean"},
+                    "path": {"type": "string"},
+                    "title": {"type": "string"},
+                    "lines": {"type": "array", "items": {"type": "string"}},
+                    "omitted_sections": {"type": "array", "items": {"type": "string"}},
+                    "reason": {"type": "string"},
+                },
+            },
+            "llm_summary": {"type": "object"},
+            "limit": {"type": "integer"},
+            "walk": {"type": "boolean"},
+            "filters": {
+                "type": "object",
+                "properties": {
+                    "extensive": {"type": "boolean"},
+                    "include_closed": {"type": "boolean"},
+                    "include_noise": {"type": "boolean"},
+                    "include_chat": {"type": "boolean"},
+                    "include_findings": {"type": "boolean"},
+                    "include_indexer": {"type": "boolean"},
+                },
+            },
+            "overview": {"type": "object"},
+            "indexer": {"type": "object"},
+            "entries": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ts_utc": {"type": "string"},
+                        "source": {"type": "string"},
+                        "id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "status": {"type": "string"},
+                        "path": {"type": "string"},
+                        "active": {"type": "boolean"},
+                        "noise": {"type": "boolean"},
+                        "links": {"type": "array", "items": {"type": "string"}},
+                        "links_total": {"type": "integer"},
+                        "links_omitted": {"type": "integer"},
+                        "extra": {"type": "object"},
+                    },
+                },
+            },
+            "stats": {"type": "object"},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+        },
+        "hint_envelope": hints_schema_fragment(),
+    }
+
+
+def _tasks_board_path() -> Path:
+    return Path(
+        resolve_store_file(
+            env_keys=("TASKS_FILE", "KANBAN_FILE"),
+            legacy_rel=".kanban_board.json",
+            canonical_rel="tasks/board.json",
+            repo_root=REPO_ROOT,
+        )
+    )
+
+
+def _chat_path() -> Path:
+    return Path(
+        resolve_store_file(
+            env_keys=("CHAT_FILE",),
+            legacy_rel=".chatlog.json",
+            canonical_rel="chat/chatlog.json",
+            repo_root=REPO_ROOT,
+        )
+    )
+
+
+def _scripthistory_path() -> Path:
+    return Path(
+        resolve_store_file(
+            env_keys=("SCRIPTHISTORY_FILE",),
+            legacy_rel=".scripthistory.json",
+            canonical_rel="scripthistory/scripthistory.json",
+            repo_root=REPO_ROOT,
+        )
+    )
+
+
+def _scan_tasks(board_path: Path) -> Tuple[List[Entry], Dict[str, Any]]:
+    stats: Dict[str, Any] = {
+        "source": "tasks",
+        "path": str(board_path),
+        "tasks": 0,
+        "tasks_active": 0,
+        "tasks_closed": 0,
+        "events": 0,
+        "events_noise": 0,
+        "events_no_text": 0,
+        "emitted": 0,
+    }
+    if not board_path.exists():
+        return [], {**stats, "missing": True}
+    try:
+        doc = json.loads(board_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [], {**stats, "error": f"json_parse_error: {exc}"}
+
+    out: List[Entry] = []
+
+    task_active: Dict[str, bool] = {}
+
+    tasks = doc.get("tasks")
+    if isinstance(tasks, dict):
+        for tid, t in tasks.items():
+            if not isinstance(t, dict):
+                continue
+            task_id = str(t.get("id") or tid).strip()
+            ts_utc = str(t.get("updated_at") or t.get("created_at") or "").strip()
+            ts_epoch = _parse_ts_epoch(ts_utc) or 0.0
+            title = str(t.get("title") or "").strip()
+            desc = str(t.get("description") or "").strip()
+            status_raw = str(t.get("status") or "").strip()
+            column_raw = str(t.get("column") or "").strip()
+            status = status_raw
+            column = column_raw
+            if column:
+                status = f"{status} ({column})" if status else column
+            active = (column_raw.strip().lower() not in _CLOSED_TASK_COLUMNS) and (
+                status_raw.strip().lower() not in _CLOSED_TASK_STATUSES
+            )
+            task_active[task_id] = bool(active)
+            raw_links = t.get("links") if isinstance(t.get("links"), list) else []
+            links = _normalize_links(
+                list(raw_links)
+                + [f"task:{task_id}"]
+                + _extract_links_from_text_fields([title, desc])
+            )
+            out.append(
+                Entry(
+                    ts_utc=ts_utc or "",
+                    ts_epoch=ts_epoch,
+                    source="task",
+                    entry_id=task_id,
+                    title=title,
+                    summary=desc[:4000],
+                    status=status,
+                    links=tuple(links),
+                    path="",
+                    active=bool(active),
+                    noise=False,
+                    extra=tuple(
+                        sorted(
+                            {
+                                "priority": t.get("priority"),
+                                "assignee": t.get("assignee"),
+                                "column": column_raw,
+                                "status_raw": status_raw,
+                            }.items()
+                        )
+                    ),
+                )
+            )
+            stats["tasks"] += 1
+            if active:
+                stats["tasks_active"] += 1
+            else:
+                stats["tasks_closed"] += 1
+
+    events = doc.get("events")
+    if isinstance(events, list):
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            ev_id = str(ev.get("id") or "").strip()
+            task_id = str(ev.get("task_id") or "").strip()
+            kind = str(ev.get("kind") or "").strip()
+            ts_utc = str(ev.get("ts") or "").strip()
+            ts_epoch = _parse_ts_epoch(ts_utc) or 0.0
+            payload = ev.get("payload")
+            actor = str(ev.get("actor") or "").strip()
+            payload_links = _extract_links_from_text_fields([payload])
+            links = _normalize_links([f"task:{task_id}"] + payload_links)
+            title = kind or "task_event"
+            summary = ""
+            if (
+                isinstance(payload, dict)
+                and "text" in payload
+                and isinstance(payload["text"], str)
+            ):
+                summary = payload["text"]
+            is_system = kind.startswith("task_") or kind in _NOISE_TASK_EVENT_KINDS
+            has_text = bool(str(summary or "").strip())
+            noise = bool(is_system or not has_text)
+            if noise and is_system:
+                stats["events_noise"] += 1
+            elif noise and not has_text:
+                stats["events_no_text"] += 1
+            active = bool(task_active.get(task_id, False))
+
+            out.append(
+                Entry(
+                    ts_utc=ts_utc,
+                    ts_epoch=ts_epoch,
+                    source="task_event",
+                    entry_id=ev_id or f"{task_id}:{kind}",
+                    title=title,
+                    summary=str(summary or "")[:4000],
+                    status="",
+                    links=tuple(links),
+                    path="",
+                    active=active,
+                    noise=noise,
+                    extra=tuple(
+                        sorted(
+                            {
+                                "task_id": task_id,
+                                "actor": actor,
+                                "kind": kind,
+                                "system": bool(is_system),
+                            }.items()
+                        )
+                    ),
+                )
+            )
+            stats["events"] += 1
+
+    stats["emitted"] = len(out)
+    return out, stats
+
+
+def _scan_chat(chat_path: Path) -> Tuple[List[Entry], Dict[str, Any]]:
+    stats: Dict[str, Any] = {
+        "source": "chat",
+        "path": str(chat_path),
+        "messages": 0,
+        "emitted": 0,
+    }
+    if not chat_path.exists():
+        return [], {**stats, "missing": True}
+    try:
+        doc = json.loads(chat_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [], {**stats, "error": f"json_parse_error: {exc}"}
+
+    messages = doc.get("messages")
+    out: List[Entry] = []
+    if isinstance(messages, dict):
+        for mid, m in messages.items():
+            if not isinstance(m, dict):
+                continue
+            msg_id = str(m.get("id") or mid).strip()
+            ts_utc = str(m.get("created_at") or "").strip()
+            ts_epoch = _parse_ts_epoch(ts_utc) or 0.0
+            channel = str(m.get("channel") or "").strip()
+            author = str(m.get("author") or "").strip()
+            text = str(m.get("text") or "").strip()
+            raw_links = m.get("links") if isinstance(m.get("links"), list) else []
+            links = _normalize_links(
+                list(raw_links)
+                + [f"chat_msg:{msg_id}"]
+                + _extract_links_from_text_fields([text])
+            )
+            out.append(
+                Entry(
+                    ts_utc=ts_utc,
+                    ts_epoch=ts_epoch,
+                    source="chat_msg",
+                    entry_id=msg_id,
+                    title=f"{author} @ {channel}".strip(),
+                    summary=text[:4000],
+                    status="",
+                    links=tuple(links),
+                    path="",
+                    active=True,
+                    noise=False,
+                    extra=tuple(sorted({"channel": channel, "author": author}.items())),
+                )
+            )
+            stats["messages"] += 1
+    stats["emitted"] = len(out)
+    return out, stats
+
+
+def _scan_scripthistory(
+    sh_path: Path,
+    *,
+    script_path: str,
+    event_ids: Optional[Set[str]] = None,
+) -> Tuple[List[Entry], Dict[str, Any]]:
+    """
+    Read scripthistory in a targeted way.
+
+    The store can be large; for scriptinfo we primarily want:
+      - all events for the requested script path, and
+      - optionally, specific event IDs referenced via 1-hop links.
+    """
+
+    stats: Dict[str, Any] = {
+        "source": "scripthistory",
+        "path": str(sh_path),
+        "scripts_scanned": 0,
+        "events_scanned": 0,
+        "events_emitted": 0,
+        "emitted": 0,
+    }
+    if not sh_path.exists():
+        return [], {**stats, "missing": True}
+    try:
+        doc = json.loads(sh_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [], {**stats, "error": f"json_parse_error: {exc}"}
+    scripts = doc.get("scripts")
+    if not isinstance(scripts, dict):
+        return [], stats
+
+    wanted_script = _norm_rel_path(script_path)
+    want_ids = {str(x).strip() for x in (event_ids or set()) if str(x).strip()}
+
+    out: List[Entry] = []
+
+    def _emit_event(script_p: str, ev: Mapping[str, Any]) -> None:
+        ev_id = str(ev.get("id") or "").strip()
+        ts_utc = str(ev.get("created_at") or "").strip()
+        ts_epoch = _parse_ts_epoch(ts_utc) or 0.0
+        ev_type = str(ev.get("type") or "").strip()
+        agent = str(ev.get("agent") or "").strip()
+        comment = str(ev.get("comment") or "").strip()
+        links = _normalize_links(
+            [f"script:{script_p}", f"scripthistory_event:{ev_id}"]
+            + _extract_links_from_text_fields([comment])
+        )
+        out.append(
+            Entry(
+                ts_utc=ts_utc,
+                ts_epoch=ts_epoch,
+                source="scripthistory_event",
+                entry_id=ev_id,
+                title=ev_type,
+                summary=comment[:4000],
+                status="",
+                links=tuple(links),
+                path=script_p,
+                active=True,
+                noise=False,
+                extra=tuple(sorted({"agent": agent}.items())),
+            )
+        )
+        stats["events_emitted"] += 1
+
+    # Prefer direct key lookup (fast path), then fallback to scanning for a matching `path`.
+    script_doc: Optional[Dict[str, Any]] = None
+    for key in {wanted_script, f"./{wanted_script}"}:
+        sd = scripts.get(key)
+        if isinstance(sd, dict):
+            script_doc = sd
+            break
+    if script_doc is None:
+        for spath, sdoc in scripts.items():
+            if not isinstance(sdoc, dict):
+                continue
+            if _norm_rel_path(str(sdoc.get("path") or spath)) == wanted_script:
+                script_doc = sdoc
+                break
+
+    if script_doc is not None:
+        stats["scripts_scanned"] += 1
+        script_p = _norm_rel_path(str(script_doc.get("path") or wanted_script))
+        events = script_doc.get("events")
+        if isinstance(events, list):
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                stats["events_scanned"] += 1
+                _emit_event(script_p, ev)
+
+    # Additionally, fetch any explicitly referenced event IDs (1-hop walk), even if not on the target script.
+    if want_ids:
+        for spath, sdoc in scripts.items():
+            if not isinstance(sdoc, dict):
+                continue
+            script_p = _norm_rel_path(str(sdoc.get("path") or spath))
+            if script_p == wanted_script and script_doc is not None:
+                continue
+            events = sdoc.get("events")
+            if not isinstance(events, list):
+                continue
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                ev_id = str(ev.get("id") or "").strip()
+                if ev_id not in want_ids:
+                    continue
+                stats["scripts_scanned"] += 1
+                stats["events_scanned"] += 1
+                _emit_event(script_p, ev)
+
+    stats["emitted"] = len(out)
+    return out, stats
+
+
+def _scan_findings_index(st_root: Path) -> Tuple[List[Entry], Dict[str, Any]]:
+    index_path = (st_root / "findings" / "index.yml").resolve()
+    stats: Dict[str, Any] = {
+        "source": "findings",
+        "path": str(index_path),
+        "items": 0,
+        "emitted": 0,
+    }
+    if not index_path.exists():
+        return [], {**stats, "missing": True}
+    try:
+        doc = _yaml_safe_load_path(index_path, max_bytes=5 * 1024 * 1024) or {}
+    except Exception as exc:
+        return [], {**stats, "error": f"yaml_parse_error: {exc}"}
+    items = doc.get("findings") if isinstance(doc, dict) else None
+    out: List[Entry] = []
+    if isinstance(items, list):
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            fid = str(it.get("finding_id") or "").strip()
+            ts_utc = str(it.get("ts_utc") or "").strip()
+            ts_epoch = _parse_ts_epoch(ts_utc) or 0.0
+            title = str(it.get("title") or "").strip()
+            summary = str(it.get("summary") or "").strip()
+            status_raw = str(it.get("status") or "").strip()
+            status = status_raw
+            sev = str(it.get("severity") or "").strip()
+            if sev:
+                status = f"{status} ({sev})" if status else sev
+            addressed = bool(it.get("addressed") is True)
+            active = (not addressed) and (
+                status_raw.strip().lower() not in _CLOSED_FINDING_STATUSES
+            )
+            target_path = _norm_rel_path(str(it.get("target_path") or "").strip())
+            raw_links = it.get("links") if isinstance(it.get("links"), list) else []
+            links = _normalize_links(
+                list(raw_links)
+                + ([f"finding:{fid}"] if fid else [])
+                + _extract_links_from_text_fields([title, summary])
+                + ([f"script:{target_path}"] if target_path else [])
+            )
+            out.append(
+                Entry(
+                    ts_utc=ts_utc,
+                    ts_epoch=ts_epoch,
+                    source="finding",
+                    entry_id=fid,
+                    title=title,
+                    summary=summary[:4000],
+                    status=status,
+                    links=tuple(links),
+                    path=target_path,
+                    active=bool(active),
+                    noise=False,
+                    extra=tuple(
+                        sorted(
+                            {
+                                "mode": it.get("mode"),
+                                "scope": it.get("scope"),
+                                "severity": sev,
+                                "status_raw": status_raw,
+                                "addressed": addressed,
+                            }.items()
+                        )
+                    ),
+                )
+            )
+            stats["items"] += 1
+    stats["emitted"] = len(out)
+    return out, stats
+
+
+def _iter_ccr_files(reviews_dir: Path) -> List[Path]:
+    out: List[Path] = []
+    if reviews_dir.exists() and reviews_dir.is_dir():
+        out.extend(
+            sorted(
+                [
+                    p
+                    for p in reviews_dir.iterdir()
+                    if p.is_file() and p.name.startswith("CCR")
+                ]
+            )
+        )
+        arch = reviews_dir / "__archive__"
+        if arch.exists() and arch.is_dir():
+            out.extend(
+                sorted(
+                    [
+                        p
+                        for p in arch.iterdir()
+                        if p.is_file() and p.name.startswith("CCR")
+                    ]
+                )
+            )
+    return out
+
+
+def _scan_code_change_reviews(
+    st_root: Path,
+    *,
+    search_tokens: Set[str],
+) -> Tuple[List[Entry], Dict[str, Any]]:
+    reviews_dir = (st_root / "code_change_review" / "reviews").resolve()
+    stats: Dict[str, Any] = {
+        "source": "code_change_review",
+        "path": str(reviews_dir),
+        "files": 0,
+        "text_scanned": 0,
+        "yaml_loaded": 0,
+        "emitted": 0,
+    }
+    files = _iter_ccr_files(reviews_dir)
+    if not files:
+        return [], {**stats, "missing": True}
+    toks = [str(t).strip() for t in sorted(search_tokens) if str(t).strip()]
+    out: List[Entry] = []
+    for p in files:
+        stats["files"] += 1
+        try:
+            text = _read_text_limited(p, max_bytes=2 * 1024 * 1024)
+            stats["text_scanned"] += 1
+        except Exception:
+            continue
+        if toks and not any(t in text for t in toks):
+            continue
+        try:
+            doc = _yaml_safe_load_path(p, max_bytes=2 * 1024 * 1024) or {}
+            stats["yaml_loaded"] += 1
+        except Exception:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        rid = str(doc.get("review_id") or p.stem).strip()
+        ts_utc = str(doc.get("created_at") or "").strip()
+        ts_epoch = _parse_ts_epoch(ts_utc) or 0.0
+        target_path = _norm_rel_path(str(doc.get("path") or "").strip())
+        title = target_path or "code_change_review"
+        ok = doc.get("ok")
+        checked = bool(doc.get("checked") is True)
+        active = not checked
+        status = "ok" if ok is True else ("not_ok" if ok is False else "")
+        links_doc, _warns = extract_links_from_doc(doc)
+        self_anchor = _best_effort_repo_rel_from_store_path(p)
+        links_extra: List[str] = []
+        if target_path:
+            links_extra.append(f"script:{target_path}")
+        if self_anchor:
+            links_extra.append(f"script:{_norm_rel_path(self_anchor)}")
+        links = _normalize_links(list(links_doc) + links_extra)
+        out.append(
+            Entry(
+                ts_utc=ts_utc,
+                ts_epoch=ts_epoch,
+                source="code_change_review",
+                entry_id=rid,
+                title=title,
+                summary=str(
+                    doc.get("result", {}).get("summary")
+                    if isinstance(doc.get("result"), dict)
+                    else ""
+                )[:4000],
+                status=status,
+                links=tuple(links),
+                path=target_path,
+                active=bool(active),
+                noise=False,
+                extra=tuple(
+                    sorted(
+                        {
+                            "author": doc.get("author"),
+                            "channel": doc.get("channel"),
+                            "ok": ok,
+                            "checked": checked,
+                            "checked_at": doc.get("checked_at"),
+                            "checked_by": doc.get("checked_by"),
+                        }.items()
+                    )
+                ),
+            )
+        )
+    stats["emitted"] = len(out)
+    return out, stats
+
+
+def _scan_fixreports(
+    st_root: Path, *, search_tokens: Set[str]
+) -> Tuple[List[Entry], Dict[str, Any]]:
+    reports_dir = (st_root / "fixreport" / "reports").resolve()
+    stats: Dict[str, Any] = {
+        "source": "fixreport",
+        "path": str(reports_dir),
+        "files": 0,
+        "yaml_loaded": 0,
+        "emitted": 0,
+    }
+    if not reports_dir.exists() or not reports_dir.is_dir():
+        return [], {**stats, "missing": True}
+
+    toks = [t for t in sorted(search_tokens) if t and ":" in t]
+    out: List[Entry] = []
+    for p in sorted(reports_dir.glob("BF*.yml")):
+        if not p.is_file():
+            continue
+        stats["files"] += 1
+        try:
+            text = _read_text_limited(p, max_bytes=2 * 1024 * 1024)
+        except Exception:
+            continue
+        if toks and not any(t in text for t in toks):
+            continue
+        try:
+            doc = _yaml_safe_load_path(p, max_bytes=2 * 1024 * 1024) or {}
+        except Exception:
+            continue
+        stats["yaml_loaded"] += 1
+        if not isinstance(doc, dict):
+            continue
+        fr = doc.get("fixreport")
+        if not isinstance(fr, dict):
+            continue
+        bf_id = str(fr.get("bf_id") or p.stem).strip()
+        ts_utc = str(
+            fr.get("ts_utc")
+            or doc.get("tessairact_meta", {}).get("created_at_utc")
+            or ""
+        ).strip()
+        ts_epoch = _parse_ts_epoch(ts_utc) or 0.0
+        title = str(
+            doc.get("narrative", {}).get("title")
+            if isinstance(doc.get("narrative"), dict)
+            else fr.get("title") or ""
+        ).strip()
+        summary = str(
+            doc.get("narrative", {}).get("summary")
+            if isinstance(doc.get("narrative"), dict)
+            else fr.get("summary") or ""
+        ).strip()
+        status = str(fr.get("severity") or "").strip()
+        links_doc, _warns = extract_links_from_doc(doc)
+        target_path = _norm_rel_path(str(fr.get("target_path") or "").strip())
+        links_extra: List[str] = [f"fixreport:{bf_id}"]
+        if target_path:
+            links_extra.append(f"script:{target_path}")
+        links = _normalize_links(list(links_doc) + links_extra)
+        out.append(
+            Entry(
+                ts_utc=ts_utc,
+                ts_epoch=ts_epoch,
+                source="fixreport",
+                entry_id=bf_id,
+                title=title,
+                summary=summary[:4000],
+                status=status,
+                links=tuple(links),
+                path=target_path,
+                active=True,
+                noise=False,
+                extra=tuple(
+                    sorted(
+                        {
+                            "root_cause": fr.get("root_cause"),
+                            "symptom": fr.get("symptom"),
+                        }.items()
+                    )
+                ),
+            )
+        )
+    stats["emitted"] = len(out)
+    return out, stats
+
+
+def _scan_reports(
+    st_root: Path, *, search_tokens: Set[str]
+) -> Tuple[List[Entry], Dict[str, Any]]:
+    state_dir = (st_root / "report").resolve()
+    index_path = (state_dir / "index.yml").resolve()
+    reports_dir = (state_dir / "reports").resolve()
+    stats: Dict[str, Any] = {
+        "source": "report",
+        "path": str(index_path),
+        "reports": 0,
+        "yaml_loaded": 0,
+        "report_docs_loaded": 0,
+        "emitted": 0,
+    }
+    if not index_path.exists() or not index_path.is_file():
+        return [], {**stats, "missing": True}
+
+    toks = [t for t in sorted(search_tokens) if t and ":" in t]
+    try:
+        doc = _yaml_safe_load_path(index_path, max_bytes=8 * 1024 * 1024) or {}
+    except Exception:
+        return [], {**stats, "error": "index_parse_failed"}
+    stats["yaml_loaded"] = 1
+    if not isinstance(doc, dict):
+        return [], stats
+
+    raw = doc.get("reports")
+    if not isinstance(raw, list):
+        return [], stats
+
+    max_docs = int(os.environ.get("CAIA_SCRIPTINFO_MAX_REPORT_DOCS", "200"))
+    if max_docs < 0:
+        max_docs = 0
+
+    out: List[Entry] = []
+    for it in raw[:50_000]:
+        if not isinstance(it, dict):
+            continue
+        rid = str(it.get("report_id") or "").strip()
+        if not rid:
+            continue
+        stats["reports"] += 1
+        links_idx = it.get("links")
+        links0 = [str(x).strip() for x in links_idx if str(x).strip()] if isinstance(links_idx, list) else []
+        if toks and not any(t in links0 for t in toks):
+            continue
+
+        created_at = str(it.get("created_at_utc") or it.get("updated_at_utc") or "").strip()
+        ts_utc = created_at
+        ts_epoch = _parse_ts_epoch(ts_utc) or 0.0
+
+        title = str(it.get("title") or "").strip() or rid
+        kind = str(it.get("kind") or "").strip().lower()
+        status = str(it.get("status") or "").strip().lower()
+
+        summary = ""
+        links_doc = list(links0)
+        if max_docs and int(stats["report_docs_loaded"]) < int(max_docs):
+            # Best-effort: enrich from YAML doc (summary + canonical links).
+            for ext in ("yml", "yaml"):
+                p = reports_dir / f"{rid}.{ext}"
+                if not p.exists() or not p.is_file():
+                    continue
+                try:
+                    doc2 = _yaml_safe_load_path(p, max_bytes=2 * 1024 * 1024) or {}
+                except Exception:
+                    doc2 = {}
+                if isinstance(doc2, dict):
+                    stats["report_docs_loaded"] += 1
+                    rep = doc2.get("report")
+                    if isinstance(rep, dict):
+                        s_raw = rep.get("summary")
+                        if isinstance(s_raw, list):
+                            summary = "\n".join(str(x).strip() for x in s_raw if str(x).strip())
+                        elif isinstance(s_raw, str):
+                            summary = s_raw.strip()
+                    links_doc, _warns = extract_links_from_doc(doc2)
+                    links_doc = list(links_doc)
+                break
+
+        links_extra: List[str] = [f"report:{rid}"]
+        links = _normalize_links(list(links_doc) + links_extra)
+
+        out.append(
+            Entry(
+                ts_utc=ts_utc,
+                ts_epoch=ts_epoch,
+                source="report",
+                entry_id=rid,
+                title=title,
+                summary=summary[:4000],
+                status=status or kind,
+                links=tuple(links),
+                path="",
+                active=True,
+                noise=False,
+                extra=tuple(sorted({"kind": kind, "status": status}.items())),
+            )
+        )
+
+    stats["emitted"] = len(out)
+    return out, stats
+
+
+def _scan_hypotheses(
+    st_root: Path, *, search_tokens: Set[str]
+) -> Tuple[List[Entry], Dict[str, Any]]:
+    hypo_path = (st_root / "hypothesis" / "hypotheses.yml").resolve()
+    stats: Dict[str, Any] = {
+        "source": "hypothesis",
+        "path": str(hypo_path),
+        "hypotheses": 0,
+        "emitted": 0,
+    }
+    if not hypo_path.exists():
+        return [], {**stats, "missing": True}
+
+    # Performance: do not yaml.safe_load this file (can be multi-MB and slow).
+    # We line-scan the "hypotheses:" mapping and extract per-hypothesis summary keys.
+    id_re = re.compile(r"^  (H[0-9]{5}):\s*$")
+    key_re = re.compile(r"^    (?P<k>[a-z_]+):\s*(?P<v>.*)$")
+    list_item_re = re.compile(r"^    -\s+(?P<v>.+)$")
+
+    toks = {t for t in search_tokens if t and ":" in t}
+
+    out: List[Entry] = []
+    in_hypotheses = False
+    cur_id: Optional[str] = None
+    cur: Dict[str, Any] = {}
+    cur_links: List[str] = []
+    in_links_list = False
+
+    def _flush() -> None:
+        nonlocal cur_id, cur, cur_links, out, in_links_list
+        if not cur_id:
+            return
+        stats["hypotheses"] += 1
+        links = _normalize_links(
+            list(cur_links)
+            + [f"hypothesis:{cur_id}"]
+            + _extract_links_from_text_fields([cur.get("title"), cur.get("statement")])
+        )
+        if toks and not any(t in links for t in toks):
+            cur_id = None
+            cur = {}
+            cur_links = []
+            return
+        ts_utc = str(cur.get("updated_at") or cur.get("created_at") or "").strip()
+        ts_epoch = _parse_ts_epoch(ts_utc) or 0.0
+        status_raw = str(cur.get("status") or "").strip()
+        active = (not status_raw) or (
+            status_raw.strip().lower() in _HYPOTHESIS_VISIBLE_STATUSES
+        )
+        out.append(
+            Entry(
+                ts_utc=ts_utc,
+                ts_epoch=ts_epoch,
+                source="hypothesis",
+                entry_id=cur_id,
+                title=str(cur.get("title") or "").strip(),
+                summary=str(cur.get("statement") or "")[:4000],
+                status=status_raw,
+                links=tuple(links),
+                path="",
+                active=bool(active),
+                noise=False,
+                extra=tuple(
+                    sorted(
+                        {
+                            "scope": cur.get("scope"),
+                            "confidence": cur.get("confidence"),
+                            "status_raw": status_raw,
+                        }.items()
+                    )
+                ),
+            )
+        )
+        cur_id = None
+        cur = {}
+        cur_links = []
+        in_links_list = False
+
+    try:
+        with hypo_path.open("r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.rstrip("\n")
+                if not in_hypotheses:
+                    if line == "hypotheses:":
+                        in_hypotheses = True
+                    continue
+
+                # End of hypotheses section: top-level key.
+                if line and not line.startswith(" ") and line != "hypotheses:":
+                    _flush()
+                    break
+
+                m_id = id_re.match(line)
+                if m_id:
+                    _flush()
+                    cur_id = m_id.group(1)
+                    continue
+
+                if not cur_id:
+                    continue
+
+                # Collect basic scalar keys (title/status/updated_at/created_at/...)
+                m_key = key_re.match(line)
+                if m_key:
+                    k = m_key.group("k").strip()
+                    v = m_key.group("v").strip()
+                    in_links_list = k == "links"
+                    # ignore nested dicts/lists; only record single-line scalars
+                    if v and v not in {"|", "|-", ">", ">-"}:
+                        cur[k] = v.strip("'\"")
+                    continue
+
+                # Collect links list items when we are in a list context. The store uses:
+                #   links:
+                #   - script:...
+                # i.e. list items at indent=4.
+                if in_links_list:
+                    m_li = list_item_re.match(line)
+                    if m_li:
+                        cur_links.append(m_li.group("v").strip())
+                        continue
+    except Exception as exc:
+        return [], {**stats, "error": f"read_error: {exc}"}
+
+    _flush()
+    stats["emitted"] = len(out)
+    return out, stats
+
+
+def _scan_quantaudit(
+    artifacts_root: Path, *, search_tokens: Set[str]
+) -> Tuple[List[Entry], Dict[str, Any]]:
+    """
+    Scan quantaudit artefacts under `<artifacts_root>/audit/*`.
+
+    Supported bundle formats:
+    - `<bundle>/quantaudit_main.yaml` (or `.yml`) — full report
+    - `<bundle>/audit_manifest.yaml` (or `.yml`) + optional `<bundle>/findings.yaml`
+    """
+
+    audit_root = (artifacts_root / "audit").resolve()
+    stats: Dict[str, Any] = {
+        "source": "quantaudit",
+        "path": str(audit_root),
+        "bundles": 0,
+        "files": 0,
+        "yaml_loaded": 0,
+        "emitted": 0,
+    }
+    if not audit_root.exists() or not audit_root.is_dir():
+        return [], {**stats, "missing": True}
+
+    toks = [t for t in sorted(search_tokens) if t and ":" in t]
+    max_bytes = int(os.environ.get("CAIA_SCRIPTINFO_QUANTAUDIT_MAX_BYTES", str(4 * 1024 * 1024)))
+    if max_bytes <= 0:
+        max_bytes = 4 * 1024 * 1024
+
+    out: List[Entry] = []
+    for bundle_dir in sorted([p for p in audit_root.iterdir() if p.is_dir()]):
+        stats["bundles"] += 1
+
+        cand: Optional[Path] = None
+        for name in ("quantaudit_main.yaml", "quantaudit_main.yml", "audit_manifest.yaml", "audit_manifest.yml"):
+            p = (bundle_dir / name).resolve()
+            if p.exists() and p.is_file():
+                cand = p
+                break
+        if cand is None:
+            continue
+
+        stats["files"] += 1
+        try:
+            text = _read_text_limited(cand, max_bytes=max_bytes)
+        except Exception:
+            continue
+        if toks and not any(t in text for t in toks):
+            continue
+
+        try:
+            doc = _yaml_safe_load_path(cand, max_bytes=max_bytes) or {}
+        except Exception:
+            continue
+        stats["yaml_loaded"] += 1
+        if not isinstance(doc, dict):
+            continue
+
+        report_id = "main"
+        stem = cand.stem.strip().lower()
+        if stem.startswith("quantaudit_"):
+            report_id2 = stem.split("_", 1)[1].strip()
+            if report_id2:
+                report_id = report_id2
+
+        bundle = bundle_dir.name
+        qa_id = f"quantaudit:{bundle}:{report_id}"
+
+        # Timestamp: prefer meta fields, then fall back to file mtime.
+        meta = doc.get("tessairact_meta") if isinstance(doc.get("tessairact_meta"), dict) else {}
+        ts_utc = str(meta.get("updated_at_utc") or meta.get("created_at_utc") or "").strip()
+        if not ts_utc:
+            ts_utc = _file_mtime_utc_iso(cand)
+        ts_epoch = _parse_ts_epoch(ts_utc) or 0.0
+
+        # Summary: scope + top findings (when present).
+        summary_parts: List[str] = []
+        am = doc.get("audit_manifest") if isinstance(doc.get("audit_manifest"), dict) else {}
+        scope = am.get("scope") if isinstance(am.get("scope"), dict) else {}
+        if isinstance(scope, dict) and scope:
+            mode = str(scope.get("mode") or "").strip()
+            horizon = scope.get("horizon_H_seconds")
+            instruments = scope.get("instruments") if isinstance(scope.get("instruments"), list) else []
+            instr_txt = ", ".join([str(x).strip() for x in instruments if str(x).strip()][:5])
+            scope_bits: List[str] = []
+            if mode:
+                scope_bits.append(f"mode={mode}")
+            if horizon is not None and str(horizon).strip():
+                scope_bits.append(f"H={horizon}s")
+            if instr_txt:
+                scope_bits.append(f"instruments=[{instr_txt}]")
+            if scope_bits:
+                summary_parts.append("Scope: " + "; ".join(scope_bits) + ".")
+
+        findings_list = doc.get("findings") if isinstance(doc.get("findings"), list) else []
+        if not findings_list and cand.name.startswith("audit_manifest"):
+            # Bundle layout: findings.yaml is separate; use it for a compact "top findings" snippet.
+            fp = (bundle_dir / "findings.yaml").resolve()
+            if fp.exists() and fp.is_file():
+                try:
+                    fdoc = _yaml_safe_load_path(fp, max_bytes=max_bytes) or {}
+                except Exception:
+                    fdoc = {}
+                if isinstance(fdoc, dict) and isinstance(fdoc.get("findings"), list):
+                    findings_list = fdoc.get("findings")  # type: ignore[assignment]
+
+        def _sev_rank(sev_raw: Any) -> int:
+            sev = str(sev_raw or "").strip().lower()
+            return _SEVERITY_ORDER.get(sev, 99)
+
+        if isinstance(findings_list, list) and findings_list:
+            tops: List[str] = []
+            for f in sorted(
+                [x for x in findings_list if isinstance(x, dict)],
+                key=lambda d: (_sev_rank(d.get("severity")), str(d.get("id") or "")),
+            )[:3]:
+                sev = str(f.get("severity") or "").strip()
+                title = str(f.get("title") or "").strip()
+                if title:
+                    tops.append(f"{sev} {title}".strip())
+            if tops:
+                summary_parts.append("Top findings: " + "; ".join(tops) + ".")
+
+        summary = " ".join([s.strip() for s in summary_parts if str(s).strip()]).strip()
+        if not summary:
+            summary = f"Quantaudit bundle {bundle} ({report_id})."
+
+        links_doc, _warns = extract_links_from_doc(doc)
+        links = _normalize_links(list(links_doc) + [qa_id])
+
+        out.append(
+            Entry(
+                ts_utc=ts_utc,
+                ts_epoch=ts_epoch,
+                source="quantaudit",
+                entry_id=qa_id,
+                title=f"Quantaudit {bundle} ({report_id})",
+                summary=summary[:4000],
+                status="",
+                links=tuple(links),
+                path="",
+                active=True,
+                noise=False,
+                extra=tuple(
+                    sorted(
+                        {
+                            "bundle": bundle,
+                            "report_id": report_id,
+                            "file": _best_effort_repo_rel_from_store_path(cand),
+                        }.items()
+                    )
+                ),
+            )
+        )
+
+    stats["emitted"] = len(out)
+    return out, stats
+
+
+def _scan_quantitative_audits(
+    artifacts_root: Path, *, search_tokens: Set[str]
+) -> Tuple[List[Entry], Dict[str, Any]]:
+    """
+    Scan quantitative audit YAMLs under `<artifacts_root>/evaluations/quantitative_audit/`.
+
+    We emit one entry per audit file, using the newest audit_version for timestamp and summary.
+    """
+
+    qa_root = (artifacts_root / "evaluations" / "quantitative_audit").resolve()
+    stats: Dict[str, Any] = {
+        "source": "audit_file",
+        "path": str(qa_root),
+        "files": 0,
+        "yaml_loaded": 0,
+        "emitted": 0,
+    }
+    if not qa_root.exists() or not qa_root.is_dir():
+        return [], {**stats, "missing": True}
+
+    toks = [t for t in sorted(search_tokens) if t and ":" in t]
+    max_bytes = int(os.environ.get("CAIA_SCRIPTINFO_AUDIT_FILE_MAX_BYTES", str(6 * 1024 * 1024)))
+    if max_bytes <= 0:
+        max_bytes = 6 * 1024 * 1024
+
+    out: List[Entry] = []
+    files = sorted(set(list(qa_root.glob("*.yml")) + list(qa_root.glob("*.yaml"))))
+    for p in files:
+        if not p.is_file():
+            continue
+        stats["files"] += 1
+        try:
+            text = _read_text_limited(p, max_bytes=max_bytes)
+        except Exception:
+            continue
+        if toks and not any(t in text for t in toks):
+            continue
+
+        try:
+            doc = _yaml_safe_load_path(p, max_bytes=max_bytes) or {}
+        except Exception:
+            continue
+        stats["yaml_loaded"] += 1
+        if not isinstance(doc, dict):
+            continue
+
+        versions = doc.get("audit_versions")
+        if not isinstance(versions, list) or not versions:
+            continue
+
+        def _v_ts(v: Any) -> float:
+            if not isinstance(v, dict):
+                return 0.0
+            return _parse_ts_epoch(str(v.get("timestamp_utc") or "")) or 0.0
+
+        latest = max([v for v in versions if isinstance(v, dict)], key=_v_ts, default={})
+        if not isinstance(latest, dict):
+            continue
+
+        audit_id = str(latest.get("audit_id") or "").strip() or p.stem
+        ts_utc = str(latest.get("timestamp_utc") or "").strip()
+        if not ts_utc:
+            ts_utc = _file_mtime_utc_iso(p)
+        ts_epoch = _parse_ts_epoch(ts_utc) or 0.0
+
+        target = latest.get("target") if isinstance(latest.get("target"), dict) else {}
+        target_name = str((target or {}).get("name") or "").strip()
+        target_kind = str((target or {}).get("kind") or "").strip()
+
+        verdict = latest.get("verdict") if isinstance(latest.get("verdict"), dict) else {}
+        fitness = str((verdict or {}).get("fitness") or "").strip()
+        confidence = str((verdict or {}).get("confidence") or "").strip()
+
+        findings = latest.get("findings") if isinstance(latest.get("findings"), list) else []
+
+        def _sev_rank(sev_raw: Any) -> int:
+            sev = str(sev_raw or "").strip().lower()
+            return _SEVERITY_ORDER.get(sev, 99)
+
+        top_findings: List[str] = []
+        for f in sorted(
+            [x for x in findings if isinstance(x, dict)],
+            key=lambda d: (_sev_rank(d.get("severity")), str(d.get("title") or "")),
+        )[:3]:
+            sev = str(f.get("severity") or "").strip()
+            title = str(f.get("title") or "").strip()
+            if title:
+                top_findings.append(f"{sev} {title}".strip())
+
+        parts: List[str] = []
+        if target_kind or target_name:
+            parts.append(f"Target: {target_kind}:{target_name}.".strip(":").strip())
+        if fitness or confidence:
+            bits = []
+            if fitness:
+                bits.append(f"fitness={fitness}")
+            if confidence:
+                bits.append(f"confidence={confidence}")
+            if bits:
+                parts.append("Verdict: " + ", ".join(bits) + ".")
+        if top_findings:
+            parts.append("Top findings: " + "; ".join(top_findings) + ".")
+
+        summary = " ".join([s.strip() for s in parts if str(s).strip()]).strip()
+        if not summary:
+            summary = f"Quantitative audit file {p.name}."
+
+        links_doc, _warns = extract_links_from_doc(doc)
+        links_extra = [f"audit_file:{p.name}"]
+        if audit_id:
+            links_extra.append(f"audit_id:{audit_id}")
+        links = _normalize_links(list(links_doc) + links_extra)
+
+        out.append(
+            Entry(
+                ts_utc=ts_utc,
+                ts_epoch=ts_epoch,
+                source="audit_file",
+                entry_id=f"audit_file:{p.name}",
+                title=target_name or p.stem,
+                summary=summary[:4000],
+                status=fitness,
+                links=tuple(links),
+                path="",
+                active=True,
+                noise=False,
+                extra=tuple(
+                    sorted(
+                        {
+                            "audit_id": audit_id,
+                            "fitness": fitness,
+                            "confidence": confidence,
+                        }.items()
+                    )
+                ),
+            )
+        )
+
+    stats["emitted"] = len(out)
+    return out, stats
+
+
+def _compute_walk_tokens(
+    direct_entries: Sequence[Entry], *, extensive: bool
+) -> Set[str]:
+    out: Set[str] = set()
+    for e in direct_entries:
+        for tok in e.links:
+            if ":" not in tok:
+                continue
+            kind, ident = tok.split(":", 1)
+            if (
+                not extensive
+                and e.source == "fixreport"
+                and kind == "fixreport"
+                and ident != e.entry_id
+            ):
+                # Prevent fixreport→fixreport link explosions in default mode (meta/synthesis fixreports
+                # can link hundreds of BF IDs, which then drags unrelated artifacts via 1-hop walk).
+                continue
+            pat = _WALK_KIND_PATTERNS.get(kind)
+            if not pat:
+                continue
+            if not pat.fullmatch(ident):
+                continue
+            out.add(tok)
+    return out
+
+
+def _entry_sort_key(e: Entry) -> Tuple[float, str, str]:
+    return (-float(e.ts_epoch or 0.0), str(e.source), str(e.entry_id))
+
+
+def _is_entry_visible(e: Entry, *, include_closed: bool, include_noise: bool) -> bool:
+    if not include_closed and not e.active:
+        return False
+    if not include_noise and e.noise:
+        return False
+    return True
+
+
+def _utc_now_iso() -> str:
+    return (
+        datetime.now(tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _file_mtime_utc_iso(path: Path) -> str:
+    try:
+        ts = float(path.stat().st_mtime)
+    except Exception:
+        return ""
+    return (
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _prompt_trunc(s: str, *, max_chars: int) -> str:
+    v = (s or "").replace("\x00", "").strip()
+    if max_chars <= 0 or len(v) <= max_chars:
+        return v
+    return v[:max_chars].rstrip() + "…"
+
+
+def _entry_for_llm_prompt(e: Entry, *, max_summary_chars: int) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "ts_utc": e.ts_utc,
+        "id": e.entry_id,
+        "title": e.title,
+        "summary": _prompt_trunc(e.summary, max_chars=max_summary_chars),
+    }
+    if e.status:
+        out["status"] = e.status
+
+    if e.source == "task_event":
+        meta = {k: v for k, v in e.extra if k in {"task_id", "actor", "kind"}}
+        if meta:
+            out["meta"] = meta
+    elif e.source == "chat_msg":
+        meta = {k: v for k, v in e.extra if k in {"author", "channel"}}
+        if meta:
+            out["meta"] = meta
+    elif e.source == "scripthistory_event":
+        meta = {k: v for k, v in e.extra if k in {"agent"}}
+        if meta:
+            out["meta"] = meta
+    elif e.source == "finding":
+        meta = {k: v for k, v in e.extra if k in {"severity"}}
+        if meta:
+            out["meta"] = meta
+    elif e.source == "fixreport":
+        meta = {k: v for k, v in e.extra if k in {"severity"}}
+        if meta:
+            out["meta"] = meta
+    elif e.source == "code_change_review":
+        meta = {k: v for k, v in e.extra if k in {"checked", "ok"}}
+        if meta:
+            out["meta"] = meta
+    elif e.source == "hypothesis":
+        meta = {k: v for k, v in e.extra if k in {"scope", "confidence"}}
+        if meta:
+            out["meta"] = meta
+    return out
+
+
+def _summary_llm_schema() -> Dict[str, Any]:
+    # Draft 2020-12 JSON schema (used by llm/backends/backend.py).
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "summary": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 16,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2400,
+                    # Keep output effectively ASCII-only for operator UX, but allow a small set
+                    # of common Unicode punctuation that we normalize deterministically:
+                    # - NBSP, en/em dash, curly quotes, ellipsis.
+                    "pattern": "^[\\x20-\\x7E\\u00A0\\u2013\\u2014\\u2018\\u2019\\u201C\\u201D\\u2026]*$",
+                },
+            },
+        },
+        "required": ["summary"],
+    }
+
+
+def _meta_summary_llm_schema() -> Dict[str, Any]:
+    # Draft 2020-12 JSON schema (used by llm/backends/backend.py).
+    #
+    # IMPORTANT: We enforce ASCII-only output to keep the operator UX consistent
+    # and avoid mixed-language (e.g. CJK) drift in summaries.
+    # NOTE:
+    # We keep schema constraints *tight enough* to prevent garbage, but not so tight that
+    # sporadic model under-length outputs fail the entire summary (bad UX in portal).
+    #
+    # The prompt already enforces a substantial target length; the schema should primarily
+    # enforce structure + boundedness.
+    para = {
+        "type": "string",
+        "minLength": 40,
+        "maxLength": 4000,
+        # Keep output effectively ASCII-only for operator UX, but allow a small set
+        # of common Unicode punctuation that we normalize deterministically:
+        # - NBSP, en/em dash, curly quotes, ellipsis.
+        "pattern": "^[\\x20-\\x7E\\u00A0\\u2013\\u2014\\u2018\\u2019\\u201C\\u201D\\u2026]*$",
+    }
+    # IMPORTANT:
+    # - We allow a single paragraph for scripts with sparse linkage, but instruct the model
+    #   to produce multiple paragraphs when there is substantial evidence.
+    # - Failing the whole meta summary due to "minItems" is worse UX than a shorter summary.
+    section = {"type": "array", "minItems": 1, "maxItems": 10, "items": para}
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "evolution": section,
+            "known_challenges": section,
+            "open_work": section,
+            "science": section,
+        },
+        "required": ["evolution", "known_challenges", "open_work", "science"],
+    }
+
+
+_LLM_PUNCT_TRANSLATION = str.maketrans(
+    {
+        "\u00A0": " ",  # NBSP
+        "\u2013": "-",  # en dash
+        "\u2014": "-",  # em dash
+        "\u2018": "'",  # left single quote
+        "\u2019": "'",  # right single quote
+        "\u201C": '"',  # left double quote
+        "\u201D": '"',  # right double quote
+        "\u2026": "...",  # ellipsis
+    }
+)
+
+
+def _normalize_llm_text(text: str) -> str:
+    """
+    Deterministically normalize LLM text to a single-line ASCII-safe string.
+
+    We keep the strict UX contract while being robust to common Unicode punctuation
+    emitted by LLMs (e.g. '…', '–', curly quotes) by mapping them to ASCII.
+    """
+    s = str(text or "")
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = s.translate(_LLM_PUNCT_TRANSLATION)
+    s = re.sub(r"\\s+", " ", s).strip()
+    return s
+
+
+_META_SUMMARY_ALLOWED_BACKENDS = ("deepinfra", "openai", "openrouter")
+
+
+def _parse_backend_list(raw: str, *, default: Sequence[str]) -> List[str]:
+    """
+    Parse a comma/space-separated backend list (case-insensitive) with stable ordering.
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return list(default)
+    parts: List[str] = []
+    for tok in re.split(r"[\\s,;]+", s):
+        t = str(tok or "").strip().lower()
+        if not t:
+            continue
+        parts.append(t)
+    # Preserve order, drop duplicates and unknown backends.
+    out: List[str] = []
+    seen: Set[str] = set()
+    for b in parts:
+        if b in seen:
+            continue
+        if b not in _META_SUMMARY_ALLOWED_BACKENDS:
+            continue
+        out.append(b)
+        seen.add(b)
+    return out if out else list(default)
+
+
+def _describe_llm_call_obj(obj: Any) -> Tuple[str, str, float]:
+    """
+    Best-effort extraction of (backend, model, timeout_s) for telemetry/attempt logs.
+    """
+    backend = ""
+    model = ""
+    timeout_s = 0.0
+    if isinstance(obj, dict):
+        backend = str(obj.get("backend") or "").strip()
+        model = str(obj.get("model") or "").strip()
+        try:
+            timeout_s = float(obj.get("timeout_s") or 0.0)
+        except Exception:
+            timeout_s = 0.0
+    else:
+        backend = str(getattr(obj, "backend", "") or "").strip()
+        model = str(getattr(obj, "model", "") or "").strip()
+        try:
+            timeout_s = float(getattr(obj, "timeout_s", 0.0) or 0.0)
+        except Exception:
+            timeout_s = 0.0
+    return backend, model, timeout_s
+
+
+def _call_strict_json_schema_with_failover(
+    *,
+    backends: Sequence[str],
+    total_timeout_s: float,
+    min_fallback_timeout_s: float,
+    make_call: Any,
+    call_fn: Any,
+) -> Tuple[Optional[Any], List[Dict[str, Any]]]:
+    """
+    Deterministic sequential backend failover for strict JSON-schema calls.
+
+    This is intentionally simple and single-flight (no hedged requests) to avoid
+    double-charging providers under normal conditions.
+    """
+    t0 = time.perf_counter()
+
+    remaining = float(total_timeout_s)
+    if remaining <= 0:
+        remaining = 0.0
+    min_fallback = float(min_fallback_timeout_s)
+    if min_fallback < 0:
+        min_fallback = 0.0
+
+    attempts: List[Dict[str, Any]] = []
+    for i, backend in enumerate(list(backends) or []):
+        backend_norm = str(backend or "").strip().lower()
+        if backend_norm not in _META_SUMMARY_ALLOWED_BACKENDS:
+            continue
+
+        # Reserve a minimal budget for remaining backends (if configured).
+        remaining_backends = int(len(backends) - i - 1)
+        reserve = float(min_fallback) * float(max(0, remaining_backends))
+        budget = float(remaining - reserve)
+        if budget <= 0.0:
+            continue
+
+        call_obj = make_call(backend_norm, float(budget))
+        b2, m2, timeout2 = _describe_llm_call_obj(call_obj)
+        call_start = time.perf_counter()
+        try:
+            resp = call_fn(call_obj)
+        except Exception as exc:
+            dt = float(time.perf_counter() - call_start)
+            attempts.append(
+                {
+                    "backend": b2 or backend_norm,
+                    "model": m2,
+                    "timeout_s": float(timeout2) if timeout2 else float(budget),
+                    "ok": False,
+                    "error": str(exc)[:2000],
+                    "elapsed_s": float(dt),
+                }
+            )
+            remaining = float(total_timeout_s) - float(time.perf_counter() - t0)
+            continue
+
+        dt = float(time.perf_counter() - call_start)
+        attempts.append(
+            {
+                "backend": b2 or backend_norm,
+                "model": m2,
+                "timeout_s": float(timeout2) if timeout2 else float(budget),
+                "ok": True,
+                "elapsed_s": float(dt),
+            }
+        )
+        return resp, attempts
+
+    return None, attempts
+
+
+def _summarize_meta(
+    *,
+    script_path: str,
+    wiki_doc: Mapping[str, Any],
+    overview_full: Mapping[str, Any],
+    categories: Mapping[str, Sequence[Entry]],
+    include_timings: bool,
+) -> Dict[str, Any]:
+    """
+    One LLM call (with deterministic multi-backend failover) that produces a structured
+    "what is going on with this script?"
+    briefing with the following sections:
+    - Evolution (scripthistory + tasks + relevant chat context)
+    - Known Challenges (bugfixes/fixreports + do-not-regress patterns)
+    - Open Work (open tasks/findings/reviews)
+    - Science (quantaudit + hypothesis + quantitative audits)
+
+    We intentionally do this as a single call to:
+    - avoid slow multi-call fanout and category timeouts
+    - allow cross-category synthesis while staying script-specific
+    """
+
+    stub = (os.getenv("CAIA_SCRIPTINFO_SUMMARY_STUB") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+    order = [
+        "tasks",
+        "findings",
+        "fixreports",
+        "reports",
+        "reviews",
+        "hypotheses",
+        "quantaudit",
+        "audit_file",
+        "scripthistory",
+        "chat",
+    ]
+
+    # Try to use the full context window of the selected model.
+    n_per_cat = int(
+        os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_N_PER_CATEGORY", "200")
+    )
+    if n_per_cat <= 0:
+        n_per_cat = 200
+    max_summary_chars = int(
+        os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_ENTRY_MAX_CHARS", "900")
+    )
+    if max_summary_chars <= 0:
+        max_summary_chars = 900
+
+    deepinfra_model = (os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_DEEPINFRA_MODEL") or "").strip()
+    if not deepinfra_model:
+        deepinfra_model = (os.environ.get("CAIA_SCRIPTINFO_SUMMARY_DEEPINFRA_MODEL") or "").strip()
+    if not deepinfra_model:
+        deepinfra_model = "Qwen/Qwen3-Coder-480B-A35B-Instruct-Turbo"
+
+    openai_model = (os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_OPENAI_MODEL") or "").strip()
+    if not openai_model:
+        openai_model = (os.environ.get("CAIA_SCRIPTINFO_SUMMARY_OPENAI_MODEL") or "").strip()
+    if not openai_model:
+        openai_model = "gpt-5.2"
+
+    openai_effort = (os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_OPENAI_EFFORT") or "").strip()
+    if not openai_effort:
+        openai_effort = (os.environ.get("CAIA_SCRIPTINFO_SUMMARY_OPENAI_EFFORT") or "").strip()
+    if not openai_effort:
+        openai_effort = "high"
+
+    openai_base_url = (os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_OPENAI_BASE_URL") or "").strip()
+    if not openai_base_url:
+        openai_base_url = (os.environ.get("CAIA_SCRIPTINFO_SUMMARY_OPENAI_BASE_URL") or "").strip()
+
+    openai_api_key_env = (os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_OPENAI_API_KEY_ENV") or "").strip()
+    if not openai_api_key_env:
+        openai_api_key_env = (os.environ.get("CAIA_SCRIPTINFO_SUMMARY_OPENAI_API_KEY_ENV") or "").strip()
+
+    openai_auth_mode = (os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_OPENAI_AUTH_MODE") or "").strip()
+    if not openai_auth_mode:
+        openai_auth_mode = (os.environ.get("CAIA_SCRIPTINFO_SUMMARY_OPENAI_AUTH_MODE") or "").strip()
+
+    openai_wire_api = (os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_OPENAI_WIRE_API") or "").strip()
+    if not openai_wire_api:
+        openai_wire_api = (os.environ.get("CAIA_SCRIPTINFO_SUMMARY_OPENAI_WIRE_API") or "").strip()
+
+    openrouter_model = (os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_OPENROUTER_MODEL") or "").strip()
+    if not openrouter_model:
+        openrouter_model = (os.environ.get("CAIA_SCRIPTINFO_SUMMARY_OPENROUTER_MODEL") or "").strip()
+    if not openrouter_model:
+        openrouter_model = "google/gemini-2.5-flash-lite"
+
+    timeout_s = float(os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_TIMEOUT_S", "180"))
+    if timeout_s <= 0:
+        timeout_s = 180.0
+
+    min_fallback_timeout_s = float(
+        os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_FALLBACK_MIN_TIMEOUT_S", "0")
+    )
+    if min_fallback_timeout_s < 0:
+        min_fallback_timeout_s = 0.0
+
+    # Output budget: keep high enough to allow a thorough 4-section briefing without truncation.
+    max_tokens = int(os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_MAX_TOKENS", "3800"))
+    if max_tokens <= 0:
+        max_tokens = 2600
+
+    # Prompt budget: default near a ~128k-token class context window (chars are a rough proxy).
+    max_prompt_chars = int(
+        os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_MAX_PROMPT_CHARS", "520000")
+    )
+    if max_prompt_chars <= 0:
+        max_prompt_chars = 450000
+
+    schema = _meta_summary_llm_schema()
+
+    call_strict_json_schema = None
+    StrictJSONSchemaCall = None
+    if not stub:
+        from llm.backends.backend import StrictJSONSchemaCall, call_strict_json_schema
+
+    t0 = time.perf_counter()
+
+    # Prompt payload (deterministic, stable keys).
+    wiki_lines_raw = wiki_doc.get("lines") if isinstance(wiki_doc, dict) else None
+    wiki_lines = [str(x) for x in wiki_lines_raw] if isinstance(wiki_lines_raw, list) else []
+
+    target_token = f"script:{script_path}"
+
+    counts = overview_full.get("counts") if isinstance(overview_full.get("counts"), dict) else {}
+    top = overview_full.get("top") if isinstance(overview_full.get("top"), dict) else {}
+
+    prompt_overview: Dict[str, Any] = {
+        "counts": dict(counts),
+        "top": {
+            "tasks": list(top.get("tasks") or []),
+            "findings": list(top.get("findings") or []),
+            "reviews": list(top.get("reviews") or []),
+            "hypotheses": list(top.get("hypotheses") or []),
+            "recent_changes": list(top.get("recent_changes") or []),
+            "recent_fixreports": list(top.get("recent_fixreports") or []),
+            "recent_reports": list(top.get("recent_reports") or []),
+        },
+    }
+
+    prompt_cats: Dict[str, Any] = {}
+    included_counts: Dict[str, Dict[str, int]] = {}
+    for cat in order:
+        items_all = list(categories.get(cat, []))
+        items_sorted = sorted(items_all, key=_entry_sort_key)
+        items = items_sorted[:n_per_cat]
+        if not items:
+            continue
+        prompt_entries: List[Dict[str, Any]] = []
+        for e in items:
+            d = _entry_for_llm_prompt(e, max_summary_chars=max_summary_chars)
+            d["relation"] = "direct_script" if (e.path == script_path or e.has_link(target_token)) else "related_via_links"
+            prompt_entries.append(d)
+        prompt_cats[cat] = {
+            "total": len(items_sorted),
+            "included": len(prompt_entries),
+            "items_newest_first": prompt_entries,
+        }
+        included_counts[cat] = {"total": len(items_sorted), "included": len(prompt_entries)}
+
+    if stub:
+        def _n(cat: str) -> int:
+            try:
+                return int((included_counts.get(cat) or {}).get("included") or 0)
+            except Exception:
+                return 0
+
+        sections = {
+            "evolution": [
+                f"[stub] Evolution for {script_path}: tasks={_n('tasks')}, scripthistory={_n('scripthistory')}, reports={_n('reports')}, chat={_n('chat')}.",
+                "[stub] Mentions key refactors/behavior changes, plus the work threads in tasks and chat.",
+            ],
+            "known_challenges": [
+                f"[stub] Known challenges for {script_path}: fixreports={_n('fixreports')}.",
+                "Do-not-regress patterns: [stub] Keep base-path/auth/import invariants stable; avoid silent failures.",
+            ],
+            "open_work": [
+                f"[stub] Open work for {script_path}: tasks={_n('tasks')}, findings={_n('findings')}, reviews={_n('reviews')}.",
+                "[stub] Summarizes what is currently in-flight (open tasks/findings/reviews) for this script.",
+            ],
+            "science": [
+                f"[stub] Science for {script_path}: hypotheses={_n('hypotheses')}, quantaudit={_n('quantaudit')}, audit_file={_n('audit_file')}.",
+                "[stub] Summarizes hypotheses and any linked quantaudit/quantitative-audit artefacts.",
+            ],
+        }
+
+        out: Dict[str, Any] = {
+            "ok": True,
+            "backend": "stub",
+            "model": "",
+            "generated_at_utc": _utc_now_iso(),
+            "sections": sections,
+            "items": included_counts,
+        }
+        if include_timings:
+            out["timings_sec"] = {"meta": float(time.perf_counter() - t0)}
+        return out
+
+    system = "\n".join(
+        [
+            "You are an expert operator-platform engineer.",
+            "Output language: English ONLY.",
+            "Allowed characters: ASCII 0x20-0x7E only.",
+            "Do NOT use any Unicode punctuation (no '…', no '–'/'—', no '“”'). Use '...' and '-' and plain quotes.",
+            "Return STRICT JSON matching the provided schema. No extra keys.",
+            "Be accurate, specific, and non-hallucinatory. Do not invent details.",
+            "Do not propose next steps, recommendations, or 'what you should do'.",
+            "Do not include any non-English words; if the input contains other languages, translate/normalize.",
+            "IMPORTANT: This is a script-specific briefing. Avoid generic filler. Every major claim should be anchored by at least one concrete artifact (ID, file/module path, or quoted name) from the provided data.",
+        ]
+    )
+
+    prompt_payload = {
+        "script_path": script_path,
+        "generated_at_utc": _utc_now_iso(),
+        "wiki_markdown_lines": wiki_lines,
+        "overview": prompt_overview,
+        "categories": prompt_cats,
+        "notes": {
+            "filters": "Closed/noisy items are excluded unless explicitly included by the caller. Wiki omits Open Questions and Safety sections in non-extensive mode.",
+            "per_entry_summary_trunc_chars": max_summary_chars,
+        },
+    }
+
+    def _build_user(payload: Mapping[str, Any]) -> str:
+        return "\n".join(
+            [
+                "You will receive a wiki article (Markdown lines) and a cross-store timeline snapshot for ONE repo script.",
+                "Goal: produce a concise but thorough briefing so another engineer/agent immediately understands what is going on with the script.",
+                "",
+                "Output (STRICT JSON; no extra keys):",
+                "- `evolution`: ARRAY of 1–8 paragraphs. Summarize the evolution of the script: major changes, refactors, and the main work threads. Use tasks + scripthistory + reports (+ chat when clearly relevant).",
+                "- `known_challenges`: ARRAY of 1–8 paragraphs. Summarize recurring problems and what has been fixed before. Use fixreports (and findings if present).",
+                "  If fixreports exist: include EXACTLY ONE paragraph that starts with 'Do-not-regress patterns:' and lists 3–7 high-signal invariants/failure modes, referencing 2–6 BF IDs inline.",
+                "- `open_work`: ARRAY of 1–8 paragraphs. Summarize CURRENT open work (open tasks/findings/reviews) and what it is about. Use overview.counts + overview.top plus relevant entries. Mention concrete IDs.",
+                "- `science`: ARRAY of 1–8 paragraphs. Summarize hypotheses + quantaudit + quantitative audits (`audit_file`) for this script (if present). If none exist, say so briefly.",
+                "",
+                "All paragraphs must be SINGLE LINE strings (no newline characters).",
+                "Target length (total across all sections): if there is substantial data (>=40 total entries), aim for ~1200–2200 words total (minimum ~800).",
+                "",
+                "Style constraints:",
+                "- English only; ASCII only.",
+                "- Script-specific, not generic: when you mention a theme, cite 1-2 concrete IDs inline in parentheses (task IDs, BF IDs, CCR IDs, H IDs, E IDs, chat message IDs) or reference a concrete file/module path.",
+                "- Prefer items where relation=direct_script. Only mention relation=related_via_links when it clearly informs the script story.",
+                "- Do not just enumerate items; synthesize what 'has been going on' with this script and why.",
+                "- No recommendations/next steps. No speculation. Do not invent details.",
+                "",
+                "Data (JSON; newest-first where applicable):",
+                json.dumps(dict(payload), ensure_ascii=True, sort_keys=True),
+            ]
+        )
+
+    user = _build_user(prompt_payload)
+    if len(user) > max_prompt_chars:
+        # Fail-closed on "just slice the prompt": slicing can break JSON structure
+        # and leads to worse summaries. Instead, trim oldest entries first.
+        prompt_payload["notes"]["prompt_truncated"] = True
+
+        trim_order = [
+            "chat",
+            "tasks",
+            "fixreports",
+            "reports",
+            "scripthistory",
+            "reviews",
+            "findings",
+            "hypotheses",
+        ]
+        max_iters = 200
+        iters = 0
+        while len(user) > max_prompt_chars and iters < max_iters:
+            iters += 1
+            changed = False
+
+            for cat in trim_order:
+                cat_block = prompt_cats.get(cat)
+                if not isinstance(cat_block, dict):
+                    continue
+                items_list = cat_block.get("items_newest_first")
+                if not isinstance(items_list, list) or not items_list:
+                    continue
+
+                # Drop a chunk of the oldest items (newest-first list → pop from end).
+                drop = 25 if len(items_list) > 50 else 1
+                del items_list[-drop:]
+                cat_block["included"] = len(items_list)
+                if cat in included_counts:
+                    included_counts[cat]["included"] = len(items_list)
+                if not items_list:
+                    prompt_cats.pop(cat, None)
+                    included_counts.pop(cat, None)
+                changed = True
+                break
+
+            if not changed:
+                # Last resort: trim wiki lines (from the end).
+                if wiki_lines:
+                    wiki_lines.pop()
+                    prompt_payload["wiki_markdown_lines"] = wiki_lines
+                    changed = True
+
+            if not changed:
+                break
+            user = _build_user(prompt_payload)
+
+        if len(user) > max_prompt_chars:
+            raise RuntimeError(
+                f"meta_prompt_too_large: {len(user)} chars > {max_prompt_chars}"
+            )
+
+    backend_raw = (os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_BACKENDS") or "").strip()
+    backends = _parse_backend_list(
+        backend_raw,
+        default=("openai", "deepinfra", "openrouter"),
+    )
+
+    max_output_retries = int(
+        os.environ.get("CAIA_SCRIPTINFO_META_SUMMARY_DEEPINFRA_MAX_OUTPUT_RETRIES", "5")
+    )
+    if max_output_retries < 0:
+        max_output_retries = 0
+
+    def _make_call(backend: str, attempt_timeout_s: float) -> Any:
+        b = str(backend or "").strip().lower()
+        if b == "openai":
+            extra_body: Optional[Dict[str, Any]] = None
+            eff = str(openai_effort or "").strip()
+            if eff:
+                extra_body = {"reasoning_effort": eff}
+            return StrictJSONSchemaCall(
+                backend="openai",
+                model=str(openai_model),
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                schema=schema,
+                max_tokens=int(max_tokens),
+                request_label=f"scriptinfo_meta_summary:{script_path}",
+                timeout_s=float(attempt_timeout_s),
+                temperature=0.0,
+                extra_body=extra_body,
+                base_url=openai_base_url or None,
+                openai_api_key_env=openai_api_key_env or None,
+                openai_auth_mode=openai_auth_mode or None,
+                openai_wire_api=openai_wire_api or None,
+            )
+        if b == "openrouter":
+            return StrictJSONSchemaCall(
+                backend="openrouter",
+                model=str(openrouter_model),
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                schema=schema,
+                max_tokens=int(max_tokens),
+                request_label=f"scriptinfo_meta_summary:{script_path}",
+                timeout_s=float(attempt_timeout_s),
+                temperature=0.0,
+            )
+        return StrictJSONSchemaCall(
+            backend="deepinfra",
+            model=str(deepinfra_model),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            schema=schema,
+            max_tokens=int(max_tokens),
+            deepinfra_max_output_retries=max_output_retries,
+            request_label=f"scriptinfo_meta_summary:{script_path}",
+            timeout_s=float(attempt_timeout_s),
+            temperature=0.0,
+        )
+
+    resp, attempts = _call_strict_json_schema_with_failover(
+        backends=backends,
+        total_timeout_s=float(timeout_s),
+        min_fallback_timeout_s=float(min_fallback_timeout_s),
+        make_call=_make_call,
+        call_fn=call_strict_json_schema,
+    )
+
+    if resp is None:
+        last = attempts[-1] if attempts else {}
+        last_backend = str(last.get("backend") or (backends[-1] if backends else ""))
+        last_model = str(last.get("model") or "")
+        err_bits: List[str] = []
+        for a in attempts[:8]:
+            b = str(a.get("backend") or "").strip() or "unknown_backend"
+            e = str(a.get("error") or "").strip()
+            if e:
+                err_bits.append(f"{b}: {e[:240]}")
+        out_err: Dict[str, Any] = {
+            "ok": False,
+            "backend": last_backend or "unknown_backend",
+            "model": last_model,
+            "generated_at_utc": _utc_now_iso(),
+            "error": ("all_backends_failed: " + "; ".join(err_bits))[:2000]
+            if err_bits
+            else "all_backends_failed",
+            "attempts": attempts,
+            "items": included_counts,
+        }
+        if include_timings:
+            out_err["timings_sec"] = {"meta": float(time.perf_counter() - t0)}
+        return out_err
+
+    if not isinstance(resp, dict):
+        last = attempts[-1] if attempts else {}
+        last_backend = str(last.get("backend") or (backends[-1] if backends else ""))
+        last_model = str(last.get("model") or "")
+        out_bad: Dict[str, Any] = {
+            "ok": False,
+            "backend": last_backend or "unknown_backend",
+            "model": last_model,
+            "generated_at_utc": _utc_now_iso(),
+            "error": "invalid_llm_response_type",
+            "detail": str(type(resp)),
+            "attempts": attempts,
+            "items": included_counts,
+        }
+        if include_timings:
+            out_bad["timings_sec"] = {"meta": float(time.perf_counter() - t0)}
+        return out_bad
+
+    sections: Dict[str, Any] = {}
+    for key in ["evolution", "known_challenges", "open_work", "science"]:
+        v = resp.get(key)
+        if isinstance(v, list) and v:
+            sections[key] = [_normalize_llm_text(str(x)) for x in v if str(x).strip()]
+        else:
+            sections[key] = []
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "backend": str((attempts[-1] if attempts else {}).get("backend") or "").strip()
+        or str(backends[-1] if backends else "deepinfra"),
+        "model": str((attempts[-1] if attempts else {}).get("model") or "").strip()
+        or "",
+        "generated_at_utc": _utc_now_iso(),
+        "sections": sections,
+        "items": included_counts,
+        "attempts": attempts,
+    }
+    if include_timings:
+        out["timings_sec"] = {"meta": float(time.perf_counter() - t0)}
+    return out
+
+
+def _category_prompt(category: str) -> str:
+    cat = str(category or "").strip().lower()
+    if cat == "tasks":
+        return (
+            "Summarize what work is being done around this script. "
+            "Highlight current intent and recurring themes. "
+            "Do not propose next steps or recommendations. "
+            "Do not invent details that are not in the entries."
+        )
+    if cat == "findings":
+        return (
+            "Summarize open problems/smells for this script. "
+            "Highlight severity and root-cause themes. "
+            "Do not propose fixes; just summarize."
+        )
+    if cat == "fixreports":
+        return (
+            "Summarize what was fixed before (and how). "
+            "Highlight recurring failure modes and what not to regress. "
+            "Do not propose new actions; just summarize."
+        )
+    if cat == "reviews":
+        return (
+            "Summarize review feedback and unresolved review concerns. "
+            "If reviews are all green, say so. "
+            "Do not propose actions; just summarize."
+        )
+    if cat == "scripthistory":
+        return (
+            "Summarize recent code changes and why they happened. "
+            "Do not propose follow-ups; just summarize."
+        )
+    if cat == "chat":
+        return (
+            "Summarize recent discussions/decisions related to this script. "
+            "Avoid speculation; do not propose new actions."
+        )
+    if cat == "hypotheses":
+        return (
+            "Summarize the active hypotheses related to this script. "
+            "Highlight what is being claimed/tested and the current status. "
+            "Do not propose actions; just summarize."
+        )
+    return "Summarize the entries for this category. Do not propose actions; just summarize."
+
+
+def _summarize_categories(
+    *,
+    script_path: str,
+    categories: Mapping[str, Sequence[Entry]],
+    include_timings: bool,
+) -> Dict[str, Any]:
+    """
+    Per-category DeepInfra summaries over the last 20 entries.
+
+    Important: This summary is intentionally *not* based on the wiki article (to keep
+    prompt tokens bounded and avoid duplication).
+    """
+
+    stub = (os.getenv("CAIA_SCRIPTINFO_SUMMARY_STUB") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+    n_items = int(os.environ.get("CAIA_SCRIPTINFO_SUMMARY_N", "20"))
+    if n_items <= 0:
+        n_items = 20
+    max_summary_chars = int(
+        os.environ.get("CAIA_SCRIPTINFO_SUMMARY_ENTRY_MAX_CHARS", "900")
+    )
+    if max_summary_chars <= 0:
+        max_summary_chars = 900
+
+    # DeepInfra can be bursty/variable under load; keep concurrency bounded by default
+    # to reduce long-tail queueing and hard timeouts.
+    max_workers = int(os.environ.get("CAIA_SCRIPTINFO_SUMMARY_MAX_WORKERS", "4"))
+    if max_workers <= 0:
+        max_workers = 1
+
+    model = (os.environ.get("CAIA_SCRIPTINFO_SUMMARY_DEEPINFRA_MODEL") or "").strip()
+    if not model:
+        # Default to a strong code-native model for "what's going on with this script?"
+        # summaries. Operators can override via CAIA_SCRIPTINFO_SUMMARY_DEEPINFRA_MODEL.
+        model = "Qwen/Qwen3-Coder-480B-A35B-Instruct-Turbo"
+
+    timeout_s = float(os.environ.get("CAIA_SCRIPTINFO_SUMMARY_TIMEOUT_S", "90"))
+    if timeout_s <= 0:
+        timeout_s = 90.0
+
+    # Default budget is intentionally above baseline DeepInfra defaults to avoid truncation
+    # (which can yield invalid JSON in JSON mode).
+    max_tokens = int(os.environ.get("CAIA_SCRIPTINFO_SUMMARY_MAX_TOKENS", "1200"))
+    if max_tokens <= 0:
+        max_tokens = 1200
+
+    schema = _summary_llm_schema()
+
+    call_strict_json_schema = None
+    StrictJSONSchemaCall = None
+    if not stub:
+        # Local import: avoids adding LLM backend deps to the baseline tool path.
+        from llm.backends.backend import StrictJSONSchemaCall, call_strict_json_schema
+
+    out_categories: Dict[str, Any] = {}
+    timings: Dict[str, float] = {}
+
+    def _run_one(cat: str) -> Tuple[str, Dict[str, Any], float]:
+        t0 = time.perf_counter()
+        items_all = list(categories.get(cat, []))
+        items = sorted(items_all, key=_entry_sort_key)[:n_items]
+        if not items:
+            return (
+                cat,
+                {"ok": True, "skipped": True, "reason": "no_entries", "items": 0},
+                time.perf_counter() - t0,
+            )
+
+        prompt_entries = [
+            _entry_for_llm_prompt(e, max_summary_chars=max_summary_chars) for e in items
+        ]
+
+        if stub:
+            payload = {
+                "ok": True,
+                "stub": True,
+                "items": len(prompt_entries),
+                "summary": [
+                    f"[stub] {cat}: {len(prompt_entries)} entries for {script_path}"
+                ],
+            }
+            return cat, payload, time.perf_counter() - t0
+
+        system = "\n".join(
+            [
+                "You are an expert operator-platform engineer.",
+                "Output language: English.",
+                "You will receive up to 20 recent timeline entries for ONE category related to a repo script.",
+                "Return STRICT JSON matching the provided schema. No extra keys.",
+                "Be accurate, specific, and non-hallucinatory. Do not invent details.",
+                "Do not include recommendations, risks, or next steps.",
+            ]
+        )
+
+        user = "\n".join(
+            [
+                f"Script: {script_path}",
+                f"Category: {cat}",
+                "",
+                "Instruction:",
+                _category_prompt(cat),
+                "",
+                "Entries (newest first):",
+                json.dumps(prompt_entries, ensure_ascii=False, sort_keys=True),
+                "",
+                "Output requirements:",
+                "- Output JSON with ONLY the key `summary`.",
+                "- `summary`: ARRAY of 4–8 paragraphs (strings). Each string must NOT contain newline characters.",
+                "- Target length: if you have >=15 entries, aim for ~450–900 words total (minimum ~280).",
+                "- Mention important IDs inline (task IDs, BF IDs, CCR IDs, H IDs, E IDs, chat message IDs).",
+                "- Focus on what is happening around the script in THIS category; ignore unrelated system chatter.",
+            ]
+        )
+
+        try:
+            max_output_retries = int(
+                os.environ.get(
+                    "CAIA_SCRIPTINFO_SUMMARY_DEEPINFRA_MAX_OUTPUT_RETRIES", "2"
+                )
+            )
+            if max_output_retries < 0:
+                max_output_retries = 0
+            resp = call_strict_json_schema(
+                StrictJSONSchemaCall(
+                    backend="deepinfra",
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    schema=schema,
+                    max_tokens=int(max_tokens),
+                    deepinfra_max_output_retries=max_output_retries,
+                    request_label=f"scriptinfo_summary:{cat}:{script_path}",
+                    timeout_s=float(timeout_s),
+                    temperature=0.0,
+                )
+            )
+        except Exception as exc:
+            return (
+                cat,
+                {
+                    "ok": False,
+                    "items": len(prompt_entries),
+                    "error": str(exc)[:2000],
+                },
+                time.perf_counter() - t0,
+            )
+
+        if not isinstance(resp, dict):
+            return (
+                cat,
+                {
+                    "ok": False,
+                    "items": len(prompt_entries),
+                    "error": "invalid_llm_response_type",
+                    "detail": str(type(resp)),
+                },
+                time.perf_counter() - t0,
+            )
+        payload = {"ok": True, "items": len(prompt_entries), **resp}
+        return cat, payload, time.perf_counter() - t0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_run_one, cat): cat for cat in categories.keys()}
+        for fut in as_completed(futs):
+            cat = futs[fut]
+            try:
+                cat2, payload, dt = fut.result()
+            except Exception as exc:
+                cat2 = cat
+                payload = {"ok": False, "items": 0, "error": f"worker_error: {exc}"}
+                dt = 0.0
+            out_categories[cat2] = payload
+            timings[cat2] = float(dt)
+
+    # Preserve deterministic order.
+    ordered: Dict[str, Any] = {}
+    for cat in categories.keys():
+        ordered[cat] = out_categories.get(cat) or {
+            "ok": False,
+            "items": 0,
+            "error": "missing_category_result",
+        }
+    out: Dict[str, Any] = {
+        "ok": True,
+        "backend": "deepinfra" if not stub else "stub",
+        "model": model if not stub else "",
+        "generated_at_utc": _utc_now_iso(),
+        "categories": ordered,
+    }
+    if include_timings:
+        out["timings_sec"] = timings
+    return out
+
+
+def _wiki_doc_path(script_path: str) -> Path:
+    return (
+        REPO_ROOT / "docs" / "wiki" / "auto" / "python" / f"{script_path}.md"
+    ).resolve()
+
+
+def _read_wiki_article(
+    script_path: str,
+    *,
+    extensive: bool,
+    summary_mode: bool = False,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    Read the per-script wiki article (docs/wiki/auto/python/<path>.md).
+
+    Baseline mode intentionally hides "Open Questions" and "Safety" sections to
+    keep the one-call overview focused. Use `--extensive` to include them.
+    """
+    wiki_path = _wiki_doc_path(script_path)
+    rel = _best_effort_repo_rel_from_store_path(wiki_path)
+    if not wiki_path.exists():
+        return {
+            "ok": False,
+            "path": rel or str(wiki_path),
+            "reason": "missing",
+        }, "missing"
+
+    max_bytes = int(
+        os.environ.get("CAIA_SCRIPTINFO_WIKI_MAX_BYTES", str(2 * 1024 * 1024))
+    )
+    if max_bytes <= 0:
+        max_bytes = 2 * 1024 * 1024
+    try:
+        raw = _read_text_limited(wiki_path, max_bytes=max_bytes)
+    except Exception as exc:
+        return (
+            {
+                "ok": False,
+                "path": rel or str(wiki_path),
+                "reason": f"read_error: {exc}",
+            },
+            "read_error",
+        )
+
+    lines_in = raw.splitlines()
+    # Skip leading HTML comments / metadata until the first heading.
+    start = 0
+    while start < len(lines_in) and not lines_in[start].lstrip().startswith("#"):
+        start += 1
+    lines = lines_in[start:] if start < len(lines_in) else []
+    if not lines:
+        return (
+            {
+                "ok": False,
+                "path": rel or str(wiki_path),
+                "reason": "empty_or_no_heading",
+            },
+            "empty_or_no_heading",
+        )
+
+    heading_re = re.compile(r"^(?P<h>#{1,6})\s+(?P<t>.+?)\s*$")
+
+    omitted: List[str] = []
+    out_lines: List[str] = []
+    skip = False
+    skip_level = 0
+    title = ""
+
+    def _should_omit_section(heading: str) -> bool:
+        if extensive:
+            return False
+        norm = heading.strip().lower()
+        if norm == "open questions":
+            return True
+        return "safety" in norm
+
+    for line in lines:
+        m = heading_re.match(line)
+        if m:
+            level = len(m.group("h"))
+            heading = m.group("t").strip()
+            if level == 1 and not title:
+                title = heading
+
+            if skip and level > skip_level:
+                continue
+            if skip and level <= skip_level:
+                skip = False
+                skip_level = 0
+
+            if level >= 2 and _should_omit_section(heading):
+                omitted.append(heading)
+                skip = True
+                skip_level = level
+                continue
+
+            out_lines.append(line)
+            continue
+
+        if skip:
+            continue
+        out_lines.append(line)
+
+    if summary_mode:
+        # Summary-mode default: include the full wiki content (minus omitted sections)
+        # so the summary output can stand alone as a "context pack".
+        #
+        # Optional opt-in to the previous short mode (useful for very large wiki pages):
+        short = (os.getenv("CAIA_SCRIPTINFO_WIKI_SUMMARY_MODE_SHORT") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+        if short:
+            summary_body = _extract_wiki_summary_lines(out_lines)
+            repo_role_body = _extract_wiki_h2_section_lines(
+                out_lines, headings={"repo role", "role", "repo purpose", "purpose"}
+            )
+            responsibilities_body = _extract_wiki_h2_section_lines(
+                out_lines, headings={"responsibilities", "responsibility"}
+            )
+
+            # Keep H1 + preface lines until the first H2+.
+            prefix: List[str] = []
+            saw_h1 = False
+            for line in out_lines:
+                m = heading_re.match(line)
+                if m and len(m.group("h")) == 1:
+                    saw_h1 = True
+                    prefix.append(line)
+                    continue
+                if not saw_h1:
+                    continue
+                if m and len(m.group("h")) >= 2:
+                    break
+                prefix.append(line)
+
+            picked: List[str] = []
+            if summary_body:
+                picked.extend(["## Summary", "", *summary_body, ""])
+            if repo_role_body:
+                picked.extend(["## Repo Role", "", *repo_role_body, ""])
+            if responsibilities_body:
+                picked.extend(["## Responsibilities", "", *responsibilities_body, ""])
+
+            if picked:
+                out_lines = prefix + picked
+            else:
+                # No explicit high-signal sections: keep only the header/preface.
+                out_lines = prefix
+
+    max_lines = int(os.environ.get("CAIA_SCRIPTINFO_WIKI_MAX_LINES", "2000"))
+    if max_lines > 0 and len(out_lines) > max_lines:
+        out_lines = out_lines[:max_lines] + ["", "... (truncated)"]
+
+    doc: Dict[str, Any] = {
+        "ok": True,
+        "path": rel or str(wiki_path),
+        "lines": out_lines,
+    }
+    if title:
+        doc["title"] = title
+    if omitted and not extensive:
+        doc["omitted_sections"] = omitted
+    return doc, None
+
+
+def _indexer_script_dir(script_path: str) -> Path:
+    return (REPO_ROOT / "common" / "indexer" / "scripts" / script_path).resolve()
+
+
+def _read_indexer_overview(
+    script_path: str,
+    *,
+    extensive: bool,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Return a lightweight indexer summary, or (None, reason) if not available.
+
+    We keep this intentionally bounded: manifest + chunk metadata only.
+    """
+    script_dir = _indexer_script_dir(script_path)
+    manifest_path = script_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None, "missing_manifest"
+
+    try:
+        manifest = json.loads(
+            _read_text_limited(manifest_path, max_bytes=2 * 1024 * 1024)
+        )
+    except Exception as exc:
+        return None, f"manifest_read_error: {exc}"
+
+    if not isinstance(manifest, dict):
+        return None, "manifest_not_object"
+
+    chunk_files = manifest.get("chunk_files")
+    chunk_files_list = chunk_files if isinstance(chunk_files, list) else []
+    chunk_files_list = [str(x) for x in chunk_files_list if isinstance(x, str)]
+
+    max_chunks = int(os.environ.get("CAIA_SCRIPTINFO_INDEXER_CHUNK_CAP", "30"))
+    if max_chunks <= 0:
+        max_chunks = 0
+
+    llm_summaries: List[Dict[str, Any]] = []
+    chunks_out: List[Dict[str, Any]] = []
+    for fname in chunk_files_list[:max_chunks]:
+        p = script_dir / "chunks" / fname
+        if not p.exists():
+            continue
+        try:
+            chunk_doc = json.loads(_read_text_limited(p, max_bytes=2 * 1024 * 1024))
+        except Exception:
+            continue
+        if not isinstance(chunk_doc, dict):
+            continue
+        meta = chunk_doc.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+        chunk_type = str(meta.get("chunk_type") or "").strip()
+        symbol = str(meta.get("symbol") or "").strip()
+        start_line = meta.get("start_line")
+        end_line = meta.get("end_line")
+        llm_summary = meta.get("llm_summary")
+        if extensive:
+            chunks_out.append(
+                {
+                    "title": str(chunk_doc.get("title") or "").strip(),
+                    "chunk_type": chunk_type,
+                    "symbol": symbol,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                }
+            )
+        if isinstance(llm_summary, str) and llm_summary.strip():
+            llm_summaries.append(
+                {
+                    "symbol": symbol,
+                    "chunk_type": chunk_type,
+                    "summary": llm_summary.strip()[:1200],
+                }
+            )
+
+    current_path = script_dir / "current.json"
+    current: Optional[Dict[str, Any]] = None
+    if current_path.exists():
+        try:
+            cur = json.loads(_read_text_limited(current_path, max_bytes=256 * 1024))
+            if isinstance(cur, dict):
+                current = cur
+        except Exception:
+            current = None
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "repo_path": str(manifest.get("repo_path") or script_path),
+        "script_dir": str(script_dir),
+        "manifest_path": str(manifest_path),
+        "current_path": str(current_path),
+        "parse_ok": bool(manifest.get("parse_ok") is True),
+        "parse_error": manifest.get("parse_error"),
+        "file_sha256": manifest.get("file_sha256"),
+        "file_mtime_utc": manifest.get("file_mtime_utc"),
+        "generated_at_utc": manifest.get("generated_at_utc"),
+        "n_chunks": int(manifest.get("n_chunks") or 0),
+        "chunks_cap": int(max_chunks),
+    }
+    if llm_summaries:
+        out["llm_summaries"] = llm_summaries
+    if extensive and chunks_out:
+        out["chunks"] = chunks_out
+    if current:
+        out["current"] = {
+            "deleted": bool(current.get("deleted") is True),
+            "indexed_at_utc": current.get("indexed_at_utc"),
+            "revision_sha256": current.get("revision_sha256"),
+        }
+    return out, None
+
+
+def _build_overview(*, script_path: str, entries: Sequence[Entry]) -> Dict[str, Any]:
+    tasks_open = [e for e in entries if e.source == "task" and e.active]
+    findings_open = [e for e in entries if e.source == "finding" and e.active]
+    reviews_open = [e for e in entries if e.source == "code_change_review" and e.active]
+    hypos_open = [e for e in entries if e.source == "hypothesis" and e.active]
+
+    def _sev_rank(e: Entry) -> Tuple[int, float, str]:
+        sev = ""
+        for k, v in e.extra:
+            if k == "severity":
+                sev = str(v or "").strip().lower()
+                break
+        return (_SEVERITY_ORDER.get(sev, 99), -float(e.ts_epoch or 0.0), e.entry_id)
+
+    tasks_open_sorted = sorted(tasks_open, key=_entry_sort_key)
+    findings_open_sorted = sorted(findings_open, key=_sev_rank)
+    reviews_open_sorted = sorted(reviews_open, key=_entry_sort_key)
+    hypos_open_sorted = sorted(hypos_open, key=_entry_sort_key)
+
+    recent_changes = [e for e in entries if e.source == "scripthistory_event"]
+    recent_fixreports = [e for e in entries if e.source == "fixreport"]
+    recent_reports = [e for e in entries if e.source == "report"]
+    recent_changes_sorted = sorted(recent_changes, key=_entry_sort_key)[:5]
+    recent_fixreports_sorted = sorted(recent_fixreports, key=_entry_sort_key)[:3]
+    recent_reports_sorted = sorted(recent_reports, key=_entry_sort_key)[:3]
+
+    def _brief(e: Entry, *, keep_summary: bool = False) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "id": e.entry_id,
+            "title": e.title,
+            "ts_utc": e.ts_utc,
+            "status": e.status,
+        }
+        if keep_summary:
+            summary = str(e.summary or "").strip()
+            if summary:
+                max_chars = int(
+                    os.environ.get("CAIA_SCRIPTINFO_OVERVIEW_SUMMARY_MAX_CHARS", "1200")
+                )
+                if max_chars > 0 and len(summary) > max_chars:
+                    summary = summary[:max_chars].rstrip() + "…"
+                out["summary"] = summary
+        if e.extra:
+            meta = {
+                k: v
+                for k, v in e.extra
+                if k in {"severity", "priority", "assignee", "checked", "ok"}
+            }
+            if meta:
+                out["meta"] = meta
+        return out
+
+    def _brief_task(e: Entry) -> Dict[str, Any]:
+        out = {
+            "id": e.entry_id,
+            "title": e.title,
+            "ts_utc": e.ts_utc,
+            "status": e.status,
+        }
+        summary = str(e.summary or "").strip()
+        if summary:
+            max_chars = int(
+                os.environ.get("CAIA_SCRIPTINFO_OVERVIEW_TASK_SUMMARY_MAX_CHARS", "800")
+            )
+            if max_chars > 0 and len(summary) > max_chars:
+                summary = summary[:max_chars].rstrip() + "…"
+            out["summary"] = summary
+        return out
+
+    actions: List[Dict[str, Any]] = []
+    if reviews_open_sorted:
+        actions.append(
+            {
+                "kind": "review",
+                "title": "Check CCR reviews (no mark)",
+                "command": f"checkreview check --no-mark {script_path}",
+            }
+        )
+    for t in tasks_open_sorted[:3]:
+        actions.append(
+            {
+                "kind": "task",
+                "title": f"Open task {t.entry_id}",
+                "command": f"tasks read --id {t.entry_id}",
+            }
+        )
+    for f in findings_open_sorted[:3]:
+        actions.append(
+            {
+                "kind": "finding",
+                "title": f"Open finding {f.entry_id}",
+                "command": f"findings get --id {f.entry_id}",
+            }
+        )
+
+    return {
+        "counts": {
+            "tasks_open": len(tasks_open_sorted),
+            "findings_open": len(findings_open_sorted),
+            "reviews_open": len(reviews_open_sorted),
+            "hypotheses_open": len(hypos_open_sorted),
+            "scripthistory_events": len(recent_changes),
+            "fixreports": len(recent_fixreports),
+            "reports": len(recent_reports),
+        },
+        "top": {
+            "tasks": [_brief_task(e) for e in tasks_open_sorted[:5]],
+            "findings": [
+                _brief(e, keep_summary=True) for e in findings_open_sorted[:5]
+            ],
+            "reviews": [_brief(e, keep_summary=True) for e in reviews_open_sorted[:5]],
+            "hypotheses": [_brief(e, keep_summary=True) for e in hypos_open_sorted[:5]],
+            "recent_changes": [
+                _brief(e, keep_summary=True) for e in recent_changes_sorted
+            ],
+            "recent_fixreports": [
+                _brief(e, keep_summary=True) for e in recent_fixreports_sorted
+            ],
+            "recent_reports": [
+                _brief(e, keep_summary=True) for e in recent_reports_sorted
+            ],
+        },
+        "actions": actions,
+    }
+
+
+def _collect(
+    *,
+    script_query: str,
+    limit: int,
+    walk: bool,
+    pretty: bool,
+    include_closed: bool,
+    include_noise: bool,
+    include_chat: bool,
+    include_findings: bool,
+    include_indexer: bool,
+    extensive: bool,
+    summary: bool,
+) -> Dict[str, Any]:
+    if limit < 50:
+        _fail_json(
+            "invalid_limit",
+            "limit must be >= 50",
+            status=2,
+            pretty=pretty,
+            extra={"limit": limit},
+        )
+
+    script_path = _norm_rel_path(script_query)
+    if not script_path:
+        _fail_json(
+            "invalid_path",
+            "empty or invalid path",
+            status=2,
+            pretty=pretty,
+            extra={"path": script_query},
+        )
+    if not _is_safe_repo_rel_path(script_path):
+        _fail_json(
+            "invalid_path",
+            "path traversal is not allowed",
+            status=2,
+            pretty=pretty,
+            extra={"path": script_query, "normalized": script_path},
+        )
+
+    target_token = f"script:{script_path}"
+
+    # Wiki is always emitted. In non-extensive mode we omit Open Questions and Safety
+    # sections to keep the one-call overview focused.
+    wiki_doc, wiki_reason = _read_wiki_article(
+        script_path,
+        extensive=extensive,
+        summary_mode=bool(summary and not extensive),
+    )
+
+    # Fast sources first
+    st_root = stores_root(repo_root=REPO_ROOT)
+    entries: List[Entry] = []
+    warnings: List[str] = []
+    stats: Dict[str, Any] = {"stores_root": str(st_root)}
+    timings: Dict[str, float] = {}
+
+    def _timed_scan(source: str, fn: Any, *args: Any, **kwargs: Any) -> Tuple[List[Entry], Dict[str, Any], float]:
+        t0 = time.perf_counter()
+        try:
+            out_entries, out_stats = fn(*args, **kwargs)
+        except Exception as exc:
+            out_entries = []
+            out_stats = {"source": source, "error": f"exception: {type(exc).__name__}: {exc}"}
+        dt = time.perf_counter() - t0
+        if not isinstance(out_stats, dict):
+            out_stats = {"source": source, "error": "invalid_stats"}
+        return out_entries, out_stats, float(dt)
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        fut_tasks = ex.submit(_timed_scan, "tasks", _scan_tasks, _tasks_board_path())
+        fut_chat = ex.submit(_timed_scan, "chat", _scan_chat, _chat_path()) if include_chat else None
+        fut_findings = ex.submit(_timed_scan, "findings", _scan_findings_index, st_root) if include_findings else None
+        fut_ccr = ex.submit(
+            _timed_scan,
+            "code_change_review",
+            _scan_code_change_reviews,
+            st_root,
+            search_tokens={target_token, script_path},
+        )
+
+        board_entries, st, dt = fut_tasks.result()
+        timings["tasks"] = dt
+        stats["tasks"] = st
+        if "error" in st:
+            warnings.append(f"tasks:{st['error']}")
+        entries.extend(board_entries)
+
+        if include_chat and fut_chat is not None:
+            chat_entries, st, dt = fut_chat.result()
+            timings["chat"] = dt
+            stats["chat"] = st
+            if "error" in st:
+                warnings.append(f"chat:{st['error']}")
+            entries.extend(chat_entries)
+        else:
+            timings["chat"] = 0.0
+            stats["chat"] = {"source": "chat", "skipped": True}
+
+        if include_findings and fut_findings is not None:
+            fin_entries, st, dt = fut_findings.result()
+            timings["findings"] = dt
+            stats["findings"] = st
+            if "error" in st:
+                warnings.append(f"findings:{st['error']}")
+            entries.extend(fin_entries)
+        else:
+            timings["findings"] = 0.0
+            stats["findings"] = {"source": "findings", "skipped": True}
+
+        ccr_entries, st, dt = fut_ccr.result()
+        timings["code_change_review"] = dt
+        stats["code_change_review"] = st
+        if "error" in st:
+            warnings.append(f"code_change_review:{st['error']}")
+        entries.extend(ccr_entries)
+
+    direct = [e for e in entries if e.has_link(target_token) or e.path == script_path]
+    walk_tokens = _compute_walk_tokens(direct, extensive=extensive) if walk else set()
+    event_ids = {
+        tok.split(":", 1)[1]
+        for tok in walk_tokens
+        if tok.startswith("scripthistory_event:")
+    }
+
+    t0 = time.perf_counter()
+    sh_entries, st = _scan_scripthistory(
+        _scripthistory_path(),
+        script_path=script_path,
+        event_ids=event_ids,
+    )
+    timings["scripthistory"] = time.perf_counter() - t0
+    stats["scripthistory"] = st
+    if "error" in st:
+        warnings.append(f"scripthistory:{st['error']}")
+    entries.extend(sh_entries)
+
+    # Recompute seeds now that scripthistory contributed event IDs.
+    direct = [e for e in entries if e.has_link(target_token) or e.path == script_path]
+    walk_tokens = _compute_walk_tokens(direct, extensive=extensive) if walk else set()
+    search_tokens = set(walk_tokens)
+    search_tokens.add(target_token)
+
+    # Fixreports can be many → prefilter using text search.
+    t0 = time.perf_counter()
+    fr_entries, st = _scan_fixreports(st_root, search_tokens=search_tokens)
+    timings["fixreport"] = time.perf_counter() - t0
+    stats["fixreport"] = st
+    if "error" in st:
+        warnings.append(f"fixreport:{st['error']}")
+    entries.extend(fr_entries)
+
+    # Recompute seeds now that fixreports contributed additional IDs.
+    direct = [e for e in entries if e.has_link(target_token) or e.path == script_path]
+    walk_tokens = _compute_walk_tokens(direct, extensive=extensive) if walk else set()
+    search_tokens = set(walk_tokens)
+    search_tokens.add(target_token)
+
+    # Reports: index prefilter, bounded YAML enrichment (summary + canonical links).
+    t0 = time.perf_counter()
+    rpt_entries, st = _scan_reports(st_root, search_tokens=search_tokens)
+    timings["report"] = time.perf_counter() - t0
+    stats["report"] = st
+    if "error" in st:
+        warnings.append(f"report:{st['error']}")
+    entries.extend(rpt_entries)
+
+    # Recompute seeds now that reports contributed additional IDs.
+    direct = [e for e in entries if e.has_link(target_token) or e.path == script_path]
+    walk_tokens = _compute_walk_tokens(direct, extensive=extensive) if walk else set()
+    search_tokens = set(walk_tokens)
+    search_tokens.add(target_token)
+
+    # Hypotheses store is large → fast line scan with token prefilter.
+    hypo_search_tokens = search_tokens if extensive else {target_token}
+
+    # Science/evaluation artefacts live under artifacts/ (not stores/). We derive the
+    # artifacts root from the stores root so tests/offloads can override deterministically.
+    artifacts_root = st_root.parent
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        fut_hypo = ex.submit(_timed_scan, "hypothesis", _scan_hypotheses, st_root, search_tokens=hypo_search_tokens)
+        fut_qa = ex.submit(_timed_scan, "quantaudit", _scan_quantaudit, artifacts_root, search_tokens=search_tokens)
+        fut_audit = ex.submit(
+            _timed_scan,
+            "audit_file",
+            _scan_quantitative_audits,
+            artifacts_root,
+            search_tokens=search_tokens,
+        )
+
+        hypo_entries, st, dt = fut_hypo.result()
+        timings["hypothesis"] = dt
+        stats["hypothesis"] = st
+        if "error" in st:
+            warnings.append(f"hypothesis:{st['error']}")
+        entries.extend(hypo_entries)
+
+        qa_entries, st, dt = fut_qa.result()
+        timings["quantaudit"] = dt
+        stats["quantaudit"] = st
+        if "error" in st:
+            warnings.append(f"quantaudit:{st['error']}")
+        entries.extend(qa_entries)
+
+        audit_entries, st, dt = fut_audit.result()
+        timings["audit_file"] = dt
+        stats["audit_file"] = st
+        if "error" in st:
+            warnings.append(f"audit_file:{st['error']}")
+        entries.extend(audit_entries)
+
+    # Final membership: direct script links plus (optional) 1-hop walk.
+    if not walk:
+        related = [
+            e for e in entries if e.has_link(target_token) or e.path == script_path
+        ]
+    else:
+        direct = [
+            e for e in entries if e.has_link(target_token) or e.path == script_path
+        ]
+        walk_tokens = _compute_walk_tokens(direct, extensive=extensive)
+        walk_tokens.add(target_token)
+        related = [e for e in entries if e.has_any_link(walk_tokens)]
+
+    related.sort(key=_entry_sort_key)
+
+    related_chat = [e for e in related if e.source == "chat_msg"]
+    related_non_chat = [e for e in related if e.source != "chat_msg"]
+
+    hidden_inactive = 0
+    hidden_noise = 0
+    visible_non_chat: List[Entry] = []
+    for e in related_non_chat:
+        if not include_closed and not e.active:
+            hidden_inactive += 1
+            continue
+        if not include_noise and e.noise:
+            hidden_noise += 1
+            continue
+        visible_non_chat.append(e)
+
+    # Chat relevance:
+    # - In default mode we want chat messages that are clearly about this script (or its direct action
+    #   items), not messages that merely share some secondary link token.
+    # - Using *all* visible link tokens causes link explosions (e.g. meta fixreports link many BF IDs)
+    #   and drags unrelated chat into the script context.
+    chat_anchor_tokens: Set[str] = {target_token}
+    for e in visible_non_chat:
+        if e.source == "task":
+            chat_anchor_tokens.add(f"task:{e.entry_id}")
+            continue
+        if e.source == "task_event":
+            meta = {k: v for k, v in e.extra}
+            task_id = str(meta.get("task_id") or "").strip()
+            if task_id:
+                chat_anchor_tokens.add(f"task:{task_id}")
+            continue
+        if e.source == "finding":
+            chat_anchor_tokens.add(f"finding:{e.entry_id}")
+            continue
+        if e.source == "fixreport":
+            chat_anchor_tokens.add(f"fixreport:{e.entry_id}")
+            continue
+        if e.source == "scripthistory_event":
+            chat_anchor_tokens.add(f"scripthistory_event:{e.entry_id}")
+            continue
+        if e.source == "hypothesis":
+            chat_anchor_tokens.add(f"hypothesis:{e.entry_id}")
+            continue
+        if e.source == "code_change_review":
+            chat_anchor_tokens.add(f"code_change_review:{e.entry_id}")
+
+    visible_chat: List[Entry] = []
+    hidden_chat = 0
+    if include_chat:
+        for e in related_chat:
+            if not include_noise and e.noise:
+                hidden_noise += 1
+                continue
+            if not include_closed and not e.active:
+                hidden_inactive += 1
+                continue
+            if e.has_any_link(chat_anchor_tokens):
+                visible_chat.append(e)
+            else:
+                hidden_chat += 1
+    else:
+        hidden_chat = len(related_chat)
+
+    visible_all = sorted(visible_non_chat + visible_chat, key=_entry_sort_key)
+    sliced = visible_all[: int(limit)]
+
+    overview_full = _build_overview(script_path=script_path, entries=visible_non_chat)
+
+    llm_summary: Optional[Dict[str, Any]] = None
+    if summary:
+        categories: Dict[str, Sequence[Entry]] = {
+            "tasks": [
+                e for e in visible_non_chat if e.source in {"task", "task_event"}
+            ],
+            "findings": [e for e in visible_non_chat if e.source == "finding"],
+            "fixreports": [e for e in visible_non_chat if e.source == "fixreport"],
+            "reports": [e for e in visible_non_chat if e.source == "report"],
+            "reviews": [
+                e for e in visible_non_chat if e.source == "code_change_review"
+            ],
+            "hypotheses": [e for e in visible_non_chat if e.source == "hypothesis"],
+            "quantaudit": [e for e in visible_non_chat if e.source == "quantaudit"],
+            "audit_file": [e for e in visible_non_chat if e.source == "audit_file"],
+            "scripthistory": [
+                e for e in visible_non_chat if e.source == "scripthistory_event"
+            ],
+            "chat": visible_chat if include_chat else [],
+        }
+        try:
+            llm_summary = _summarize_meta(
+                script_path=script_path,
+                wiki_doc=wiki_doc,
+                overview_full=overview_full,
+                categories=categories,
+                include_timings=bool(extensive),
+            )
+        except Exception as exc:
+            llm_summary = {"ok": False, "error": f"summary_error: {exc}"}
+    indexer: Dict[str, Any] = {}
+    if include_indexer and extensive:
+        idx, idx_reason = _read_indexer_overview(script_path, extensive=extensive)
+        if idx is not None:
+            indexer = idx
+        elif idx_reason:
+            stats["indexer"] = {
+                "source": "indexer",
+                "available": False,
+                "reason": idx_reason,
+            }
+
+    exists = (REPO_ROOT / script_path).exists()
+    if wiki_reason:
+        stats["wiki"] = {"source": "wiki", "available": False, "reason": wiki_reason}
+        warnings.append(f"wiki:{wiki_reason}")
+
+    overview: Dict[str, Any] = overview_full
+    if summary and not extensive:
+        # Summary mode is meant to be compact (LLM-driven). Keep only the actionable bits.
+        overview = {
+            "counts": dict(overview_full.get("counts") or {}),
+            "top": dict(overview_full.get("top") or {}),
+            "actions": list(overview_full.get("actions") or []),
+        }
+
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "script": {"query": script_query, "path": script_path, "exists": bool(exists)},
+        "wiki": wiki_doc,
+        "overview": overview,
+    }
+    if not (summary and not extensive):
+        payload["entries"] = [e.to_dict(extensive=extensive) for e in sliced]
+    if llm_summary is not None:
+        payload["llm_summary"] = llm_summary
+    if extensive:
+        payload.update(
+            {
+                "limit": int(limit),
+                "walk": bool(walk),
+                "filters": {
+                    "extensive": bool(extensive),
+                    "include_closed": bool(include_closed),
+                    "include_noise": bool(include_noise),
+                    "include_chat": bool(include_chat),
+                    "include_findings": bool(include_findings),
+                    "include_indexer": bool(include_indexer),
+                },
+                "indexer": indexer,
+                "entries_total": len(related),
+                "entries_visible_total": len(visible_all),
+                "entries_hidden": {
+                    "inactive": int(hidden_inactive),
+                    "noise": int(hidden_noise),
+                    "chat_irrelevant": int(hidden_chat),
+                },
+                "stats": {**stats, "timings_sec": timings},
+                "warnings": sorted(set(warnings)),
+            }
+        )
+    else:
+        warnings_out = sorted(set(warnings))
+        if warnings_out:
+            payload["warnings"] = warnings_out
+    return payload
+
+
+class _ScriptInfoArgparseError(Exception):
+    """Raised when argparse usage errors should be emitted as JSON envelopes."""
+
+    def __init__(self, message: str, usage: str = "") -> None:
+        super().__init__(message)
+        self.message = str(message)
+        self.usage = str(usage or "")
+
+
+class _ScriptInfoArgumentParser(argparse.ArgumentParser):
+    """Argument parser variant that preserves JSON-only stdout on failures."""
+
+    def error(self, message: str) -> None:  # noqa: A003 (argparse API)
+        raise _ScriptInfoArgparseError(str(message), self.format_usage())
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = _ScriptInfoArgumentParser(
+        prog="scriptinfo",
+        description=(
+            "Script-centric cross-store timeline and briefing tool.\n\n"
+            "Related tools:\n"
+            "  - tasks/findings/fixreport for execution + incident lifecycle\n"
+            "  - scripthistory/hypothesis for provenance and scientific evidence\n"
+            "  - rules for canonical governance constraints\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--json-pretty", action="store_true", help="Pretty-print JSON output."
+    )
+    parser.add_argument(
+        "--json-compact",
+        action="store_true",
+        help="Compact JSON output (no indentation).",
+    )
+    parser.add_argument(
+        "command_or_path",
+        nargs="?",
+        help="Either 'schema' or a repo-relative script path (preferred).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Max entries to return (default: 50; must be >= 50).",
+    )
+    parser.add_argument(
+        "--no-walk",
+        action="store_true",
+        help="Disable 1-hop link-graph walk; only include entries that explicitly mention the script.",
+    )
+    parser.add_argument(
+        "--extensive",
+        action="store_true",
+        help="Include full link lists and broader related items (e.g. hypotheses via ID-walk).",
+    )
+    parser.add_argument(
+        "--include-closed",
+        action="store_true",
+        help="Include inactive/closed items (done tasks, addressed/resolved findings, checked reviews).",
+    )
+    parser.add_argument(
+        "--include-noise",
+        action="store_true",
+        help="Include noisy automation/system events (e.g. task_moved/task_updated, agent_touch).",
+    )
+    parser.add_argument(
+        "--no-chat",
+        action="store_true",
+        help="Do not scan/include chat messages.",
+    )
+    parser.add_argument(
+        "--no-findings",
+        action="store_true",
+        help="Do not scan/include findings index entries.",
+    )
+    parser.add_argument(
+        "--no-indexer",
+        action="store_true",
+        help="Do not include indexer metadata.",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Produce a human-first Markdown briefing (wiki + LLM meta summary with multi-backend failover). Default on TTY. Use --json-pretty/--json-compact with --summary to get JSON instead.",
+    )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Disable LLM summary and return the full JSON timeline/overview (more detail; deterministic; no network).",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.environ.get("SCRIPTINFO_LOG_LEVEL", "WARNING"),
+        help="stderr log level (default: WARNING).",
+    )
+
+    arg_list = list(argv) if argv is not None else list(sys.argv[1:])
+    pretty_guess = "--json-pretty" in arg_list and "--json-compact" not in arg_list
+    try:
+        args = parser.parse_args(argv)
+    except _ScriptInfoArgparseError as exc:
+        usage = (exc.usage or "").strip()
+        _fail_json(
+            "invalid_arguments",
+            exc.message,
+            status=2,
+            pretty=pretty_guess,
+            error_code="ARGPARSE_ERROR",
+            retryable=False,
+            extra={"usage": usage} if usage else None,
+        )
+    if bool(getattr(args, "json_pretty", False)) and bool(
+        getattr(args, "json_compact", False)
+    ):
+        _fail_json(
+            "invalid_arguments",
+            "--json-pretty and --json-compact are mutually exclusive",
+            status=2,
+            pretty=pretty_guess,
+            error_code="ARGPARSE_ERROR",
+            retryable=False,
+        )
+    if bool(getattr(args, "summary", False)) and bool(getattr(args, "no_llm", False)):
+        _fail_json(
+            "invalid_arguments",
+            "--summary and --no-llm are mutually exclusive",
+            status=2,
+            pretty=pretty_guess,
+            error_code="ARGPARSE_ERROR",
+            retryable=False,
+        )
+
+    if bool(getattr(args, "json_compact", False)):
+        pretty = False
+    elif bool(getattr(args, "json_pretty", False)):
+        pretty = True
+    else:
+        # Default ergonomics: when used interactively, pretty JSON is far more readable.
+        pretty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+    logging.basicConfig(
+        level=str(args.log_level).upper(),
+        stream=sys.stderr,
+        format="%(asctime)s [%(levelname)s] %(name)s %(message)s",
+    )
+
+    if str(getattr(args, "command_or_path", "") or "").strip().lower() == "schema":
+        _emit_json({"ok": True, "schema": _schema()}, pretty=pretty)
+        return 0
+
+    if not args.command_or_path:
+        _fail_json(
+            "missing_path",
+            "Provide a repo-relative path (e.g. consumer/portal/app.py).",
+            status=2,
+            pretty=pretty,
+        )
+
+    # Default ergonomics:
+    # - interactive use (TTY) defaults to `--summary` because it is the most useful
+    #   "one-call briefing" view.
+    # - non-interactive use (pipes/tool-loops) defaults to JSON timeline/overview.
+    want_summary = bool(getattr(args, "summary", False))
+    if not want_summary:
+        if bool(getattr(args, "no_llm", False)):
+            want_summary = False
+        else:
+            want_summary = bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+    # `--summary` is a short, script-specific briefing; default to `--no-walk` semantics
+    # to avoid pulling in loosely related artefacts via 1-hop ID walks.
+    walk = not bool(args.no_walk)
+    if bool(want_summary) and not bool(args.extensive):
+        walk = False
+
+    payload = _collect(
+        script_query=str(args.command_or_path),
+        limit=int(args.limit),
+        walk=bool(walk),
+        pretty=pretty,
+        include_closed=bool(args.include_closed),
+        include_noise=bool(args.include_noise),
+        include_chat=not bool(args.no_chat),
+        include_findings=not bool(args.no_findings),
+        include_indexer=not bool(args.no_indexer),
+        extensive=bool(args.extensive),
+        summary=bool(want_summary),
+    )
+    if (
+        bool(want_summary)
+        and not bool(args.extensive)
+        and not bool(getattr(args, "json_pretty", False))
+        and not bool(getattr(args, "json_compact", False))
+    ):
+        _emit_markdown(_render_summary_markdown(payload))
+    else:
+        _emit_json(payload, pretty=pretty)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

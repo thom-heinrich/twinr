@@ -1,0 +1,4 @@
+interface:
+  display_name: "Instrument"
+  short_description: "Correlated, redacted runtime instrumentation for Python"
+  default_prompt: "Use $instrument to add structured logs, traces, run IDs, timeline events, and reproducible forensic artifacts with redaction-by-default."

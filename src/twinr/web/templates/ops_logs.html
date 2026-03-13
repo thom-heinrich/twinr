@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Latest structured events</h2>
+      <p class="section-description">The log is intentionally small and local: button presses, turns, prints, self-tests, support bundles, and errors.</p>
+    </div>
+  </div>
+  {% if logs %}
+  <div class="log-list">
+    {% for entry in logs %}
+    <article class="log-entry">
+      <div class="log-entry-header">
+        <span class="log-level is-{{ entry.level }}">{{ entry.level }}</span>
+        <span class="log-event">{{ entry.event }}</span>
+        <span class="log-time">{{ entry.created_at }}</span>
+      </div>
+      <div class="log-message">{{ entry.message }}</div>
+      {% if entry.data_pretty %}
+      <pre class="log-data">{{ entry.data_pretty }}</pre>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No structured ops events exist yet.</div>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,2694 @@
+#!/usr/bin/env python3
+##REFACTOR: 2026-01-16##
+"""Script history & knowledge log CLI for AI agents.
+
+Overview
+--------
+`scripthistory` provides a machine-oriented, append-only history and knowledge
+log for scripts, services, and tools in this repository. It lets multiple
+agents attach:
+
+* Initialization events (when a script is first created or adopted).
+* Change events (what was changed and why).
+* Knowledge events (insights, caveats, performance notes, etc.).
+
+Key properties:
+- Pure Python standard library (no external dependencies).
+- Stores its state in a JSON file in the current working directory by default.
+- File-based locking to avoid corruption when multiple agents update history.
+- JSON-only, deterministic stdout output tuned for LLM / agent consumption.
+- Tight integration with the `hypothesis` tool via `hypothesis sync-scripthistory`:
+  if comments mention hypothesis ids like `H00012`, they can be ingested as
+  structured (inconclusive) evidence linked back to script evolution.
+- Lightweight, built-in guardrails:
+  * Enforces single `init-script` per script.
+  * Dedupe of identical back-to-back events (to avoid repeated writes on retries).
+  * Optional `lint` command to detect structural misuse (duplicates, multiple
+    init events, long-open investigations without closure events).
+
+Concepts
+--------
+- Script:
+    A logical unit identified by a path-like string (e.g.
+    "scripts/install_agentic_tools.sh", "agentic_tools/worklock"). Scripts have
+    a creation timestamp, optional description and metadata, and an ordered
+    list of events.
+
+- Event:
+    A single history entry attached to a script. Events have:
+      - id: A stable identifier (e.g. "E00001").
+      - type: One of {"init-script", "change", "knowledge"}.
+      - comment: Human-readable short description.
+      - agent: Optional identifier of the agent/human adding the entry.
+      - created_at: Timestamp.
+      - metadata: Optional JSON object for richer context.
+
+Store layout
+------------
+The history file is a JSON object of the form:
+
+  {
+    "version": 1,
+    "created_at": "...",
+    "updated_at": "...",
+    "revision": 3,
+    "next_event_id": 7,
+    "scripts": {
+      "agentic_tools/worklock": {
+        "path": "agentic_tools/worklock",
+        "created_at": "...",
+        "updated_at": "...",
+        "description": "Worklock CLI for agent coordination",
+        "metadata": { ... },
+        "events": [
+          {
+            "id": "E00001",
+            "type": "init-script",
+            "comment": "Initial creation of worklock CLI",
+            "agent": "agent-architect",
+            "created_at": "...",
+            "metadata": { "designlog_ref": "dec_00123" }
+          },
+          {
+            "id": "E00002",
+            "type": "knowledge",
+            "comment": "Locks are TTL-based; no permanent locks.",
+            "agent": "agent-observer",
+            "created_at": "...",
+            "metadata": {}
+          }
+        ]
+      }
+    }
+  }
+
+Typical workflows
+-----------------
+1. Initialize the history store (optional, auto-created on first write):
+   scripthistory init
+
+2. Record that a new script was created:
+   scripthistory init-script --path "agentic_tools/worklock" \
+       --comment "Initial worklock CLI implementation" \
+       --agent "agent-architect"
+
+3. Append a change entry:
+   scripthistory add-change --path "agentic_tools/worklock" \
+       --comment "Fix TTL expiry bug using UTC" \
+       --agent "agent-bugfix"
+
+4. Append a knowledge entry:
+   scripthistory add-knowledge --path "agentic_tools/worklock" \
+       --comment "Locks are TTL-based; no permanent locks." \
+       --agent "agent-ops"
+
+5. Retrieve history for a script:
+   scripthistory get --path "agentic_tools/worklock"
+
+6. Lint a script or the entire store for structural issues:
+   scripthistory lint --path "agentic_tools/worklock"
+"""
+
+import argparse
+import calendar
+import errno
+import inspect
+import json
+import logging
+import os
+import random
+import re
+import stat
+import sys
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from common.links.tessairact_meta import dedupe_link_tokens, extract_link_tokens_from_texts
+
+from _store_layout import ensure_parent_dir, resolve_repo_path, resolve_store_file
+from agentic_tools._governance_locking import resolve_retry_budget as _resolve_governance_retry_budget
+from agentic_tools._governance_locking import resolve_retry_poll as _resolve_governance_retry_poll
+from agentic_tools._governance_locking import run_mutation_with_retry as _run_governance_mutation_with_retry
+from agentic_tools.process_hints import enrich_payload_with_hints
+from agentic_tools.process_hints import hints_schema_fragment
+
+SCRIPTHISTORY_DEFAULT_FILENAME = str(
+    resolve_store_file(
+        env_keys=("SCRIPTHISTORY_FILE",),
+        legacy_rel=".scripthistory.json",
+        canonical_rel="scripthistory/scripthistory.json",
+        repo_root=REPO_ROOT,
+    )
+)
+
+# Guardrail configuration (env-tunable, backward compatible)
+SCRIPTHISTORY_DEDUP_ENABLE = os.environ.get(
+    "SCRIPTHISTORY_DEDUP_ENABLE", "1"
+).lower() not in ("0", "false", "no")
+
+# Time window (seconds) in which identical events (type+comment+agent+metadata)
+# will be treated as accidental duplicates (e.g. retries) and deduped.
+SCRIPTHISTORY_DEDUP_WINDOW_SECONDS = float(
+    os.environ.get("SCRIPTHISTORY_DEDUP_WINDOW_SECONDS", "10.0")
+)
+
+# Maximum age (seconds) after which a lock is treated as stale and reaped.
+SCRIPTHISTORY_LOCK_STALE_SECONDS = float(
+    os.environ.get("SCRIPTHISTORY_LOCK_STALE_SECONDS", "120.0")
+)
+
+# JSON formatting controls (backward compatible defaults).
+def _parse_json_indent(raw: str) -> Optional[int]:
+    s = (raw or "").strip().lower()
+    if s in ("", "none", "null"):
+        return None
+    try:
+        value = int(s)
+    except ValueError:
+        return 2
+    if value < 0:
+        return 2
+    return value
+
+
+SCRIPTHISTORY_JSON_INDENT: Optional[int] = _parse_json_indent(
+    os.environ.get("SCRIPTHISTORY_JSON_INDENT", "2")
+)
+
+# Validation control (default keeps historical strict behavior).
+SCRIPTHISTORY_VALIDATE_FULL = os.environ.get(
+    "SCRIPTHISTORY_VALIDATE_FULL", "1"
+).lower() not in ("0", "false", "no")
+
+SCRIPTHISTORY_VALIDATE_LINKS = os.environ.get(
+    "SCRIPTHISTORY_VALIDATE_LINKS", "0"
+).lower() not in ("0", "false", "no")
+
+
+GOVERNANCE_HINT_SCRIPTHISTORY = (
+    "Governance: When you log changes or knowledge for a script as part of a task, "
+    "make sure the corresponding entry in the `tasks` board reflects that work "
+    "(status, description, links). If the change adds evidence for or against a "
+    "trading/analytics hypothesis, also update it via the `hypothesis` tool so "
+    "code evolution, tasks, and reasoning stay in sync."
+)
+
+LINK_TOKEN_RE = re.compile(r"^[a-z][a-z0-9_]{0,32}:[^\s]+$")
+
+ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+ERROR_CODE_TOKEN_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def _strip_ansi(s: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", s or "")
+
+
+def _merge_links(existing: List[str], inferred: List[str]) -> List[str]:
+    if not inferred:
+        return existing
+    return dedupe_link_tokens(list(existing) + list(inferred))
+
+
+def attach_governance_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach a cross-tool governance hint to every top-level JSON response."""
+    if isinstance(payload, dict):
+        payload = enrich_payload_with_hints(payload, tool="scripthistory")
+    if isinstance(payload, dict) and "governance_hint" not in payload:
+        payload["governance_hint"] = GOVERNANCE_HINT_SCRIPTHISTORY
+    return payload
+
+
+def now_iso() -> str:
+    """Return current UTC timestamp in ISO8601 format with 'Z' suffix."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def parse_iso_utc(ts: str) -> Optional[float]:
+    """Parse an ISO8601 '...Z' timestamp into a UNIX epoch seconds float."""
+    try:
+        parsed = time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+        return float(calendar.timegm(parsed))
+    except Exception:
+        return None
+
+
+def _linux_proc_start_ticks(pid: int) -> Optional[int]:
+    """Best-effort process identity marker on Linux via /proc/<pid>/stat starttime ticks."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        stat_path = Path(f"/proc/{pid}/stat")
+        raw = stat_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    # /proc/<pid>/stat: field 2 is comm in parentheses and may contain spaces.
+    # We find the last ')' to split safely.
+    rparen = raw.rfind(")")
+    if rparen < 0:
+        return None
+    after = raw[rparen + 2 :]  # skip ") "
+    fields = after.split()
+    # starttime is field 22 overall -> index 19 in "after" (field 3 is fields[0]).
+    if len(fields) <= 19:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def _windows_process_info(pid: int) -> Tuple[Optional[bool], Optional[int]]:
+    """Best-effort (alive?, create_time_filetime) on Windows.
+
+    Returns:
+      - alive: True/False if conclusive, None if unknown.
+      - create_time_filetime: 64-bit int FILETIME if available.
+    """
+    if os.name != "nt":
+        return None, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return None, None
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+
+    OpenProcess = kernel32.OpenProcess
+    OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    OpenProcess.restype = wintypes.HANDLE
+
+    GetExitCodeProcess = kernel32.GetExitCodeProcess
+    GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    GetExitCodeProcess.restype = wintypes.BOOL
+
+    GetProcessTimes = kernel32.GetProcessTimes
+    GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    ]
+    GetProcessTimes.restype = wintypes.BOOL
+
+    CloseHandle = kernel32.CloseHandle
+    CloseHandle.argtypes = [wintypes.HANDLE]
+    CloseHandle.restype = wintypes.BOOL
+
+    handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        err = ctypes.get_last_error()
+        # ERROR_INVALID_PARAMETER (87) is typical for "pid does not exist".
+        if err == 87:
+            return False, None
+        # Access denied or others: unknown.
+        return None, None
+
+    try:
+        exit_code = wintypes.DWORD()
+        if not GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return None, None
+        if int(exit_code.value) != STILL_ACTIVE:
+            return False, None
+
+        create = wintypes.FILETIME()
+        exit_ft = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not GetProcessTimes(
+            handle,
+            ctypes.byref(create),
+            ctypes.byref(exit_ft),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return True, None
+
+        create_val = (int(create.dwHighDateTime) << 32) | int(create.dwLowDateTime)
+        return True, create_val
+    finally:
+        CloseHandle(handle)
+
+
+def _current_process_identity() -> Tuple[Optional[str], Optional[int]]:
+    """Return (kind, value) process identity marker for the current process."""
+    pid = os.getpid()
+    if os.name == "nt":
+        alive, create_ft = _windows_process_info(pid)
+        if create_ft is not None:
+            return "win_filetime", create_ft
+        return None, None
+    if sys.platform.startswith("linux"):
+        ticks = _linux_proc_start_ticks(pid)
+        if ticks is not None:
+            return "linux_start_ticks", ticks
+    return None, None
+
+
+def _pid_alive_with_identity(
+    pid: Optional[int],
+    expected_kind: Optional[str],
+    expected_value: Optional[int],
+) -> Tuple[Optional[bool], Optional[bool]]:
+    """Return (alive?, identity_matches?).
+
+    alive:
+      - True/False: conclusive
+      - None: unknown
+
+    identity_matches:
+      - True/False: conclusive comparison, only meaningful if alive is True
+      - None: unknown/not applicable
+    """
+    if pid is None:
+        return None, None
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return None, None
+    if pid_int <= 0:
+        return None, None
+
+    if os.name == "nt":
+        alive, create_ft = _windows_process_info(pid_int)
+        if alive is not True:
+            return alive, None
+        if (
+            expected_kind == "win_filetime"
+            and expected_value is not None
+            and create_ft is not None
+        ):
+            return True, (int(create_ft) == int(expected_value))
+        return True, None
+
+    # POSIX
+    try:
+        os.kill(pid_int, 0)
+    except ProcessLookupError:
+        return False, None
+    except PermissionError:
+        return True, None
+    except OSError:
+        return None, None
+
+    # Alive; best-effort identity check (Linux only).
+    if expected_kind == "linux_start_ticks" and expected_value is not None:
+        actual = _linux_proc_start_ticks(pid_int)
+        if actual is None:
+            return True, None
+        return True, (int(actual) == int(expected_value))
+    return True, None
+
+
+class FileLockTimeout(Exception):
+    """Raised when the file-level lock cannot be acquired within the timeout."""
+
+
+class _LinkLockUnsupported(Exception):
+    """Internal: hard-link based lock acquisition is unsupported on this platform/fs."""
+
+
+@dataclass
+class FileLock:
+    """Simple cross-process file lock using atomic create/unlink of a lock file.
+
+    Implementation notes (internal):
+    - On POSIX, prefers a hard-link based lock pattern to be safer on some NFS setups.
+      Falls back to O_CREAT|O_EXCL when hard links are unsupported.
+    - Adds an ownership token; release only removes the lock if the token matches,
+      preventing accidental unlock of another process' lock.
+    - Stale reaping is conservative: it only reaps when the recorded owner is
+      conclusively dead or the PID has been reused (identity mismatch).
+    """
+
+    path: Path
+    timeout: float = 10.0
+    poll_interval: float = 0.05
+    _token: Optional[str] = field(default=None, init=False, repr=False)
+    _acquired: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        raw_timeout = os.environ.get("CAIA_SCRIPTHISTORY_LOCK_TIMEOUT_SEC") or os.environ.get("SCRIPTHISTORY_LOCK_TIMEOUT")
+        if raw_timeout and str(raw_timeout).strip():
+            try:
+                self.timeout = max(0.01, float(str(raw_timeout).strip()))
+            except Exception:
+                pass
+        raw_poll = os.environ.get("CAIA_SCRIPTHISTORY_LOCK_POLL_SEC")
+        if raw_poll and str(raw_poll).strip():
+            try:
+                self.poll_interval = max(0.01, float(str(raw_poll).strip()))
+            except Exception:
+                pass
+
+    def _lock_payload(self) -> Dict[str, Any]:
+        kind, ident = _current_process_identity()
+        payload: Dict[str, Any] = {
+            "created_at": now_iso(),
+            "pid": os.getpid(),
+            "rand": random.random(),
+            "token": self._token,
+        }
+        if kind and ident is not None:
+            payload["proc_identity_kind"] = kind
+            payload["proc_identity"] = ident
+        return payload
+
+    def _write_json_fd(self, fd: int, payload: Dict[str, Any]) -> None:
+        data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        os.write(fd, data.encode("utf-8"))
+
+    def _try_acquire_link_lock(self, payload: Dict[str, Any]) -> None:
+        """Attempt to acquire lock via hard-link pattern (POSIX)."""
+        if os.name == "nt":
+            raise _LinkLockUnsupported("hard-link locking not used on Windows")
+
+        # Create a unique temp file in the same directory and link it to the lock path.
+        # This pattern is commonly recommended when O_EXCL on the lock path may be unreliable on NFS.
+        pid = os.getpid()
+        token = payload.get("token") or "notoken"
+        tmp_name = f".{self.path.name}.{pid}.{token}.tmp"
+        tmp_path = self.path.with_name(tmp_name)
+
+        fd: Optional[int] = None
+        try:
+            fd = os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                self._write_json_fd(fd, payload)
+            finally:
+                os.close(fd)
+                fd = None
+
+            try:
+                os.link(tmp_path, self.path)
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                # Hard links may be unsupported on the filesystem.
+                if exc.errno in (
+                    errno.EPERM,
+                    errno.EACCES,
+                    errno.ENOTSUP,
+                    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+                    errno.EXDEV,
+                ):
+                    raise _LinkLockUnsupported(str(exc))
+                raise
+        finally:
+            # Best-effort cleanup of the temp file.
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                # Don't fail lock acquisition solely due to temp cleanup.
+                logging.debug("Failed to clean lock temp file %s", tmp_path, exc_info=True)
+
+    def _try_acquire_excl_lock(self, payload: Dict[str, Any]) -> None:
+        """Attempt to acquire lock via O_CREAT|O_EXCL."""
+        fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            self._write_json_fd(fd, payload)
+        finally:
+            os.close(fd)
+
+    def _read_lock_data(self) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
+        """Return (data_dict_or_none, mtime_epoch_or_none) for the lock file."""
+        try:
+            st = self.path.stat()
+            mtime = float(st.st_mtime)
+        except FileNotFoundError:
+            return None, None
+        except Exception:
+            mtime = None
+
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                return None, mtime
+            return data, mtime
+        except FileNotFoundError:
+            return None, None
+        except Exception:
+            return None, mtime
+
+    def _reap_stale_lock(self) -> bool:
+        """Attempt to remove a stale lock file; return True if removed."""
+        data, mtime = self._read_lock_data()
+        if data is None:
+            # If unreadable, only reap if it's clearly old (mtime-based).
+            if mtime is None:
+                return False
+            age = time.time() - mtime
+            if age > SCRIPTHISTORY_LOCK_STALE_SECONDS:
+                logging.warning(
+                    "Lock file %s unreadable and older than stale threshold (age=%.2fs); removing defensively.",
+                    self.path,
+                    age,
+                )
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    return False
+                except Exception:
+                    return False
+                return True
+            return False
+
+        created_at = data.get("created_at")
+        created_epoch = parse_iso_utc(created_at) if isinstance(created_at, str) else None
+        if created_epoch is not None:
+            age = time.time() - created_epoch
+        elif mtime is not None:
+            age = time.time() - mtime
+        else:
+            age = None
+
+        pid_raw = data.get("pid")
+        pid_int: Optional[int] = None
+        pid_valid = True
+        try:
+            pid_int = int(pid_raw)
+            if pid_int <= 0:
+                pid_valid = False
+                pid_int = None
+        except (TypeError, ValueError):
+            pid_valid = False
+            pid_int = None
+
+        expected_kind = (
+            data.get("proc_identity_kind")
+            if isinstance(data.get("proc_identity_kind"), str)
+            else None
+        )
+        expected_value = data.get("proc_identity") if isinstance(data.get("proc_identity"), int) else None
+
+        alive, identity_match = _pid_alive_with_identity(
+            pid_int if pid_valid else None, expected_kind, expected_value
+        )
+
+        # Conservative stale logic:
+        # - If owner is conclusively dead: reap.
+        # - If PID is alive but identity mismatches (PID reused): reap.
+        # - If PID is missing/invalid AND lock is old: reap.
+        if alive is False:
+            logging.warning(
+                "Removing stale lock %s (pid=%s not alive, age=%.2fs).",
+                self.path,
+                pid_raw,
+                age if age is not None else -1.0,
+            )
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                return False
+            return True
+
+        if alive is True and identity_match is False:
+            logging.warning(
+                "Removing stale lock %s (pid=%s reused; identity mismatch, age=%.2fs).",
+                self.path,
+                pid_raw,
+                age if age is not None else -1.0,
+            )
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                return False
+            return True
+
+        if (not pid_valid) and age is not None and age > SCRIPTHISTORY_LOCK_STALE_SECONDS:
+            logging.warning(
+                "Removing stale lock %s (pid missing/invalid; age=%.2fs).",
+                self.path,
+                age,
+            )
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                return False
+            return True
+
+        return False
+
+    def acquire(self) -> None:
+        """Acquire the lock by atomically creating a lock file."""
+        # Ensure lock directory exists (handles custom --file paths in nested dirs).
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.time() + self.timeout
+        self._token = uuid.uuid4().hex
+        while True:
+            payload = self._lock_payload()
+            try:
+                # POSIX: try hard-link based lock first for better behavior on some NFS setups.
+                if os.name != "nt":
+                    try:
+                        self._try_acquire_link_lock(payload)
+                    except _LinkLockUnsupported:
+                        self._try_acquire_excl_lock(payload)
+                else:
+                    self._try_acquire_excl_lock(payload)
+
+                self._acquired = True
+                return
+            except FileExistsError:
+                if self._reap_stale_lock():
+                    continue
+                if time.time() > deadline:
+                    raise FileLockTimeout(f"Timed out acquiring lock {self.path}")
+                jitter = random.random() * self.poll_interval
+                time.sleep(self.poll_interval + jitter)
+
+    def release(self) -> None:
+        """Release the lock by removing the lock file (only if ownership token matches)."""
+        if not self._acquired:
+            return
+        token = self._token
+        if not token:
+            return
+
+        # Only unlink if the current lock file still belongs to us.
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return
+        except Exception:
+            logging.warning("Lock file %s unreadable during release; leaving in place.", self.path)
+            return
+
+        if not isinstance(data, dict):
+            logging.warning("Lock file %s malformed during release; leaving in place.", self.path)
+            return
+
+        if data.get("token") != token:
+            logging.warning(
+                "Not releasing lock %s due to ownership token mismatch (expected=%s got=%s).",
+                self.path,
+                token,
+                data.get("token"),
+            )
+            return
+
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            return
+
+    def __enter__(self) -> "FileLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.release()
+
+
+def configure_logging() -> None:
+    """Configure verbose logging to stderr for observability."""
+    kwargs = dict(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] scripthistory %(message)s",
+        stream=sys.stderr,
+    )
+    # basicConfig(force=True) is available on modern Python; feature-detect for safety.
+    if "force" in inspect.signature(logging.basicConfig).parameters:
+        kwargs["force"] = True
+    logging.basicConfig(**kwargs)
+
+
+def emit_error(
+    error: str,
+    detail: str,
+    *,
+    file: Optional[Path] = None,
+    error_code: str = "",
+    retryable: Optional[bool] = None,
+    extra: Optional[Dict[str, Any]] = None,
+    exit_code: int = 1,
+) -> None:
+    """Print a JSON error payload and exit."""
+    normalized_error = str(error or "")
+    normalized_error_code = (
+        str(error_code or "").strip()
+        or ERROR_CODE_TOKEN_RE.sub("_", normalized_error).strip("_").upper()
+        or "UNKNOWN_ERROR"
+    )
+    if retryable is None:
+        code = normalized_error_code.upper()
+        retryable = code in {"LOCK_TIMEOUT", "TIMEOUT", "IO_ERROR"} or "TIMEOUT" in code or "LOCK" in code
+
+    payload: Dict[str, Any] = {
+        "ok": False,
+        "error": normalized_error,
+        "error_code": normalized_error_code,
+        "detail": str(detail or ""),
+        "retryable": bool(retryable),
+    }
+    if file is not None:
+        payload["file"] = str(file)
+    if extra:
+        payload.update(extra)
+    print(json.dumps(attach_governance_hint(payload)))
+    sys.exit(exit_code)
+
+
+_MUTATING_SCRIPTHISTORY_HANDLERS = frozenset(
+    {"cmd_init", "cmd_init_script", "cmd_add_change", "cmd_add_knowledge"}
+)
+
+
+def _classify_scripthistory_exception(exc: BaseException) -> Tuple[str, Optional[bool]]:
+    if isinstance(exc, FileLockTimeout):
+        return ("LOCK_TIMEOUT", True)
+    if isinstance(exc, PermissionError):
+        return ("PERMISSION_DENIED", False)
+    if isinstance(exc, FileNotFoundError):
+        return ("NOT_FOUND", False)
+    if isinstance(exc, TimeoutError):
+        return ("TIMEOUT", True)
+    if isinstance(exc, ValueError):
+        return ("VALIDATION_ERROR", False)
+    if isinstance(exc, OSError):
+        return ("IO_ERROR", True)
+    return ("UNHANDLED_EXCEPTION", None)
+
+
+def _scripthistory_cli_retry_budget_sec() -> float:
+    return _resolve_governance_retry_budget(
+        retry_timeout_env="CAIA_SCRIPTHISTORY_CLI_RETRY_TIMEOUT_SEC",
+        lock_timeout_envs=("CAIA_SCRIPTHISTORY_LOCK_TIMEOUT_SEC", "SCRIPTHISTORY_LOCK_TIMEOUT"),
+        default_lock_timeout=10.0,
+    )
+
+
+def _scripthistory_cli_retry_poll_sec() -> float:
+    return _resolve_governance_retry_poll(
+        retry_poll_env="CAIA_SCRIPTHISTORY_CLI_RETRY_POLL_SEC",
+        default_poll_sec=0.25,
+    )
+
+
+def _emit_scripthistory_retry(action: str, error_code: str, attempt: int, sleep_s: float, exc: BaseException) -> None:
+    logging.warning(
+        "Retrying scripthistory mutation after %s action=%s attempt=%s sleep_s=%.3f error=%s",
+        error_code,
+        action,
+        attempt,
+        sleep_s,
+        exc,
+    )
+
+
+def _run_scripthistory_mutation_with_retry(action: str, op: Any) -> None:
+    _run_governance_mutation_with_retry(
+        action=action,
+        op=op,
+        classify_exception=_classify_scripthistory_exception,
+        retry_budget_sec=_scripthistory_cli_retry_budget_sec(),
+        retry_poll_sec=_scripthistory_cli_retry_poll_sec(),
+        emit_retry=lambda error_code, attempt, sleep_s, exc: _emit_scripthistory_retry(
+            action,
+            error_code,
+            attempt,
+            sleep_s,
+            exc,
+        ),
+    )
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that emits JSON errors instead of plain text."""
+
+    def error(self, message: str) -> None:
+        logging.error("Argument parsing failed: %s", message)
+        usage = _strip_ansi(self.format_usage().strip())
+        emit_error(
+            error="invalid_arguments",
+            error_code="ARGPARSE_ERROR",
+            detail=message,
+            retryable=False,
+            extra={"usage": usage},
+            exit_code=2,
+        )
+
+
+def default_store() -> Dict[str, Any]:
+    """Return a fresh, empty script history store structure."""
+    now = now_iso()
+    return {
+        "version": 1,
+        "created_at": now,
+        "updated_at": now,
+        "revision": 0,
+        "next_event_id": 1,
+        "scripts": {},  # path -> script
+    }
+
+
+def ensure_store_shape(store: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure mandatory top-level keys exist on the store."""
+    if "version" not in store:
+        store["version"] = 1
+    if "created_at" not in store:
+        store["created_at"] = now_iso()
+    if "updated_at" not in store:
+        store["updated_at"] = now_iso()
+    if "revision" not in store:
+        store["revision"] = 0
+    if "next_event_id" not in store:
+        store["next_event_id"] = 1
+    if "scripts" not in store or not isinstance(store["scripts"], dict):
+        store["scripts"] = {}
+    return store
+
+
+def validate_store(store: Dict[str, Any], path: Path, *, full: bool = True) -> None:
+    """Validate the structural integrity of the store.
+
+    When full=False, performs a shallow validation intended for very large stores.
+    Default remains full validation for backward-compatible strictness.
+    """
+    scripts = store.get("scripts", {})
+    if not isinstance(scripts, dict):
+        emit_error(
+            error="invalid_store",
+            detail="'scripts' must be an object mapping paths to script entries.",
+            file=path,
+        )
+    for script_path, script in scripts.items():
+        if not isinstance(script, dict):
+            emit_error(
+                error="invalid_store",
+                detail="Script entry must be a JSON object.",
+                file=path,
+                extra={"path": script_path},
+            )
+        events = script.get("events", [])
+        if not isinstance(events, list):
+            emit_error(
+                error="invalid_store",
+                detail="Script 'events' must be a list.",
+                file=path,
+                extra={"path": script_path},
+            )
+        if not full:
+            continue
+        for idx, event in enumerate(events):
+            if not isinstance(event, dict):
+                emit_error(
+                    error="invalid_store",
+                    detail="Each event must be a JSON object.",
+                    file=path,
+                    extra={"path": script_path, "event_index": idx},
+                )
+            for field in ("id", "type", "comment", "created_at"):
+                if field not in event:
+                    emit_error(
+                        error="invalid_store",
+                        detail=f"Event missing required field '{field}'.",
+                        file=path,
+                        extra={"path": script_path, "event_index": idx},
+                    )
+            if event.get("type") not in {"init-script", "change", "knowledge"}:
+                emit_error(
+                    error="invalid_store",
+                    detail=f"Unexpected event type '{event.get('type')}'.",
+                    file=path,
+                    extra={"path": script_path, "event_index": idx},
+                )
+
+
+def load_store(path: Path) -> Dict[str, Any]:
+    """Load the script history store from disk, or create a new one."""
+    if not path.exists():
+        logging.info(
+            "Script history store %s does not exist, using in-memory default until first write.",
+            path,
+        )
+        return default_store()
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            store = json.load(handle)
+    except json.JSONDecodeError as exc:
+        emit_error(
+            error="invalid_json",
+            detail=f"Failed to parse script history JSON: {exc}",
+            file=path,
+        )
+    except OSError as exc:
+        emit_error(
+            error="io_error",
+            detail=f"Failed to read script history store: {exc}",
+            file=path,
+        )
+    if not isinstance(store, dict):
+        emit_error(
+            error="invalid_store",
+            detail="Script history store root must be a JSON object.",
+            file=path,
+        )
+    store = ensure_store_shape(store)
+    validate_store(store, path, full=SCRIPTHISTORY_VALIDATE_FULL)
+    return store
+
+
+def _fsync_dir(path: Path) -> None:
+    """Best-effort fsync of a directory entry on POSIX to improve durability."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except Exception:
+        return
+    try:
+        os.fsync(fd)
+    except Exception:
+        return
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
+def save_store(path: Path, store: Dict[str, Any]) -> None:
+    """Persist the script history store atomically to disk."""
+    store["updated_at"] = now_iso()
+    store["revision"] = int(store.get("revision", 0)) + 1
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+
+    existing_mode: Optional[int] = None
+    try:
+        st = path.stat()
+        existing_mode = stat.S_IMODE(st.st_mode)
+    except FileNotFoundError:
+        existing_mode = None
+    except Exception:
+        existing_mode = None
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(
+                store,
+                handle,
+                ensure_ascii=False,
+                indent=SCRIPTHISTORY_JSON_INDENT,
+                sort_keys=True,
+            )
+            handle.write("\n")
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except Exception:
+                # Best-effort: do not fail persistence if fsync is unsupported.
+                pass
+
+        if existing_mode is not None:
+            try:
+                os.chmod(tmp_path, existing_mode)
+            except Exception:
+                pass
+
+        tmp_path.replace(path)
+        _fsync_dir(path.parent)
+    except OSError as exc:
+        emit_error(
+            error="io_error",
+            detail=f"Failed to persist script history store: {exc}",
+            file=path,
+        )
+    logging.info(
+        "Persisted script history store to %s (revision=%s).",
+        path,
+        store["revision"],
+    )
+
+
+def parse_json_arg(raw: Optional[str], arg_name: str) -> Dict[str, Any]:
+    """Parse a JSON argument that must be an object, or return {} if None."""
+    if raw is None:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        emit_error(
+            error="invalid_json_arg",
+            detail=f"Failed to parse JSON for {arg_name}: {exc}",
+        )
+    if not isinstance(value, dict):
+        emit_error(
+            error="invalid_json_arg",
+            detail=f"Expected JSON object for {arg_name}.",
+        )
+    return value
+
+
+def normalize_links(raw: Optional[List[str]]) -> List[str]:
+    """Normalize a list of `links` tokens.
+
+    Backward compatible default:
+    - Preserve values as provided (stringified), without validation or deduplication.
+    Optional strict mode:
+    - If SCRIPTHISTORY_VALIDATE_LINKS=1, enforce kind:id (no whitespace), strip,
+      drop empties, and dedupe.
+    """
+    if not raw:
+        return []
+    tokens = [str(item) for item in raw]
+    if not SCRIPTHISTORY_VALIDATE_LINKS:
+        return tokens
+
+    out: List[str] = []
+    seen = set()
+    for item in tokens:
+        s = str(item or "").strip()
+        if not s:
+            continue
+        if not LINK_TOKEN_RE.match(s):
+            emit_error(
+                error="invalid_link_token",
+                detail=f"Invalid link token (expected kind:id, no whitespace): {s!r}",
+                extra={"token": s},
+            )
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+WINDOWS_DRIVE_ABS_RE = re.compile(r"^[A-Za-z]:/")
+
+
+def canonicalize_script_path(path_str: str) -> str:
+    """Normalize script path to avoid duplicate aliases.
+
+    Backward compatible behavior:
+    - Keeps absolute paths representable; if an absolute path resolves under REPO_ROOT,
+      it is canonicalized to a repo-relative path.
+    - Normalizes '.', '..' segments to reduce aliasing (e.g. 'a/../b' -> 'b').
+    - Normalizes backslashes to forward slashes.
+    """
+    raw = str(path_str or "").strip()
+    if not raw:
+        return "."
+
+    s = raw.replace("\\", "/")
+
+    # If path is absolute in this OS sense and is under repo root, store repo-relative.
+    try:
+        p = Path(s)
+        if p.is_absolute():
+            try:
+                rel = p.resolve().relative_to(REPO_ROOT)
+                s = rel.as_posix()
+            except Exception:
+                s = p.as_posix()
+    except Exception:
+        pass
+
+    # Strip common prefix noise.
+    if s.startswith("./"):
+        s = s[2:]
+
+    abs_prefix = ""
+    drive_prefix = ""
+    rest = s
+
+    m_drive = WINDOWS_DRIVE_ABS_RE.match(rest)
+    if m_drive:
+        drive_prefix = rest[:2]  # "C:"
+        rest = rest[3:]  # after "C:/"
+    elif rest.startswith("/"):
+        abs_prefix = "/"
+        rest = rest[1:]
+
+    parts_in = rest.split("/")
+    parts_out: List[str] = []
+    for part in parts_in:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts_out and parts_out[-1] != "..":
+                parts_out.pop()
+            else:
+                # For absolute paths, ignore attempts to go above root.
+                if not (abs_prefix or drive_prefix):
+                    parts_out.append("..")
+            continue
+        parts_out.append(part)
+
+    if drive_prefix:
+        if not parts_out:
+            # Backward compatible for "C:/"-like inputs: keep as "C:".
+            return drive_prefix
+        normalized = drive_prefix + "/" + "/".join(parts_out)
+        normalized = normalized.rstrip("/")
+        return normalized
+
+    normalized = "/".join(parts_out).rstrip("/")
+
+    if abs_prefix:
+        # Backward compatible: avoid creating a bare "/" key; map to "." like earlier behavior.
+        return (abs_prefix + normalized) if normalized else "."
+    return normalized or "."
+
+
+def generate_event_id(store: Dict[str, Any]) -> str:
+    """Generate a new human-friendly event ID of the form 'E00001'."""
+    next_id = int(store.get("next_event_id", 1))
+    scripts = store.get("scripts", {})
+
+    # Fast path: assume next_event_id is correct; only scan on collision.
+    candidate = f"E{next_id:05d}"
+    exists = any(
+        any(event.get("id") == candidate for event in script.get("events", []))
+        for script in scripts.values()
+    )
+    if not exists:
+        store["next_event_id"] = next_id + 1
+        return candidate
+
+    # Slow path: advance until a free id is found.
+    while True:
+        next_id += 1
+        candidate = f"E{next_id:05d}"
+        exists = any(
+            any(event.get("id") == candidate for event in script.get("events", []))
+            for script in scripts.values()
+        )
+        if not exists:
+            store["next_event_id"] = next_id + 1
+            return candidate
+
+
+def script_to_public(script: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a stable public representation of a script entry."""
+    return dict(script)
+
+
+def event_to_public(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a stable public representation of an event."""
+    return dict(event)
+
+
+def recent_events_for_script(
+    script: Dict[str, Any],
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Return the most recent events for a script, up to ``limit``.
+
+    The events are returned in chronological order (oldest → newest) within
+    the selected tail window so that agents can read the recent history in a
+    natural timeline while still focusing on the latest entries.
+    """
+    if limit <= 0:
+        return []
+    events = script.get("events", []) or []
+    if not events:
+        return []
+    tail = events[-limit:]
+    return [event_to_public(e) for e in tail]
+
+
+def _as_string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        out: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                out.append(text)
+        return out
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    return []
+
+
+def _pick_first_nonempty(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _dedupe_keep_order(values: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _normalize_script_explain(path_str: str, script: Dict[str, Any]) -> Dict[str, Any]:
+    events = list(script.get("events", []) or [])
+    changes = [e for e in events if str(e.get("type") or "") == "change"]
+    knowledge = [e for e in events if str(e.get("type") or "") == "knowledge"]
+    init_events = [e for e in events if str(e.get("type") or "") == "init-script"]
+    latest_events = events[-6:] if len(events) > 6 else events
+
+    what = _pick_first_nonempty(
+        script.get("description"),
+        (init_events[0].get("comment") if init_events else ""),
+        path_str,
+    )
+    why = _pick_first_nonempty(
+        (knowledge[-1].get("comment") if knowledge else ""),
+        (changes[-1].get("comment") if changes else ""),
+        "Maintain append-only provenance for this script.",
+    )
+
+    how_values: List[str] = []
+    for event in latest_events:
+        event_type = str(event.get("type") or "").strip()
+        comment = str(event.get("comment") or "").strip()
+        if not comment:
+            continue
+        how_values.append(f"{event_type}: {comment}")
+    if not how_values:
+        how_values.append("Record init/change/knowledge events with explicit comments.")
+
+    guardrails = [
+        "Keep exactly one `init-script` event per script path.",
+        "Do not lose chronology; preserve append-only event order.",
+        "Use `scripthistory lint` to detect duplicate/open investigation patterns.",
+    ]
+
+    links: List[str] = []
+    for event in events:
+        links.extend(_as_string_list(event.get("links")))
+    links = dedupe_link_tokens(links)
+
+    conflicts = [
+        issue.get("code")
+        for issue in _lint_script(path_str, script)
+        if isinstance(issue, dict) and str(issue.get("code") or "").strip()
+    ]
+
+    evidence: List[str] = []
+    evidence.extend(links)
+    evidence.extend(
+        [
+            f"event:{str(e.get('id') or '').strip()}"
+            for e in latest_events
+            if str(e.get("id") or "").strip()
+        ]
+    )
+
+    return {
+        "what": what,
+        "why": why,
+        "how": _dedupe_keep_order(how_values),
+        "guardrails": guardrails,
+        "evidence": _dedupe_keep_order(evidence),
+        "conflicts": _dedupe_keep_order([str(x) for x in conflicts if str(x).strip()]),
+        "links": links,
+    }
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    """Initialize a new script history store file."""
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    if path.exists() and not args.force:
+        emit_error(
+            error="store_exists",
+            detail=(
+                f"Script history store already exists at {path}. "
+                "Use --force to overwrite."
+            ),
+            file=path,
+            exit_code=1,
+        )
+
+    store = default_store()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(store, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        emit_error(
+            error="io_error",
+            detail=f"Failed to initialize script history store: {exc}",
+            file=path,
+        )
+    logging.info("Initialized new script history store at %s.", path)
+    print(
+        json.dumps(
+            attach_governance_hint(
+                {
+                    "ok": True,
+                    "action": "init",
+                    "file": str(path),
+                    "version": store["version"],
+                }
+            )
+        )
+    )
+
+
+def cmd_schema(args: argparse.Namespace) -> None:
+    """Output JSON schema for the script history store."""
+    schema = {
+        "ok": True,
+        "schema": {
+            "store": {
+                "fields": {
+                    "version": "int",
+                    "created_at": "iso8601",
+                    "updated_at": "iso8601",
+                    "revision": "int",
+                    "next_event_id": "int",
+                    "scripts": "dict[str, Script]",
+                }
+            },
+            "script": {
+                "required_fields": ["path", "created_at", "updated_at", "events"],
+                "optional_fields": ["description", "metadata"],
+            },
+            "event": {
+                "required_fields": [
+                    "id",
+                    "type",
+                    "comment",
+                    "created_at",
+                ],
+                "optional_fields": [
+                    "agent",
+                    "metadata",
+                    "links",
+                ],
+            },
+            "hint_envelope": hints_schema_fragment(),
+        },
+        "commands": {
+            "init": "Initialize a script history store file.",
+            "schema": "Output JSON schema for the store.",
+            "show-all": "Show the entire store.",
+            "list-scripts": "List all scripts that have history.",
+            "init-script": "Initialize history for a script (single init-script per path).",
+            "add-change": "Append a change event to a script.",
+            "add-knowledge": "Append a knowledge event to a script.",
+            "get": "Retrieve full history for a script.",
+            "lint": "Analyze one script or the whole store for structural issues.",
+        },
+        "guidelines": {
+            "init-script": [
+                "Call exactly once per logical script path.",
+                "Use the comment to describe the script's purpose, not a specific bugfix.",
+            ],
+            "add-change": [
+                "Describe WHAT changed and WHY in one short line.",
+                "If you rerun the same command on retry, identical events within a short window are deduped.",
+            ],
+            "add-knowledge": [
+                "Capture insights, caveats, performance notes or operational tips.",
+                "Use explicit words like 'resolved', 'fixed', or 'retired' in comments when closing investigations.",
+                "If you rerun the same command on retry, identical events within a short window are deduped.",
+            ],
+            "lint": [
+                "Use 'scripthistory lint' to detect duplicate events, multiple init-script events, and long-open investigations without closing notes."
+            ],
+        },
+    }
+    print(json.dumps(attach_governance_hint(schema)))
+
+
+def cmd_show_all(args: argparse.Namespace) -> None:
+    """Show the entire script history store."""
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    store = load_store(path)
+    scripts = {p: script_to_public(s) for p, s in store.get("scripts", {}).items()}
+    out = dict(store)
+    out["scripts"] = scripts
+    print(
+        json.dumps(
+            attach_governance_hint(
+                {
+                    "ok": True,
+                    "action": "show-all",
+                    "file": str(path),
+                    "store": out,
+                }
+            )
+        )
+    )
+
+
+def cmd_list_scripts(args: argparse.Namespace) -> None:
+    """List all scripts that have history entries."""
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    store = load_store(path)
+    scripts: List[Dict[str, Any]] = []
+    search = str(getattr(args, "search", "") or "").strip().lower()
+    for p, s in sorted(store.get("scripts", {}).items(), key=lambda item: item[0]):
+        item = {
+            "path": p,
+            "created_at": s.get("created_at"),
+            "updated_at": s.get("updated_at"),
+            "description": s.get("description"),
+            "event_count": len(s.get("events", [])),
+        }
+        if search:
+            hay = " ".join([str(item.get("path") or ""), str(item.get("description") or "")]).lower()
+            if search not in hay:
+                continue
+        scripts.append(item)
+    limit = int(getattr(args, "limit", 0) or 0)
+    if limit > 0 and len(scripts) > limit:
+        scripts = scripts[:limit]
+    print(
+        json.dumps(
+            attach_governance_hint(
+                {
+                    "ok": True,
+                    "action": "list-scripts",
+                    "file": str(path),
+                    "scripts": scripts,
+                    "count": len(scripts),
+                    "search": search or None,
+                    "limit": limit if limit > 0 else None,
+                }
+            )
+        )
+    )
+
+
+def cmd_overview(args: argparse.Namespace) -> None:
+    """Return compact store-wide summary for fast agent orientation."""
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    store = load_store(path)
+    scripts = store.get("scripts", {}) or {}
+
+    total_events = 0
+    by_event_type: Dict[str, int] = {}
+    top_by_events: List[Dict[str, Any]] = []
+    open_investigation = 0
+    for script_path, script in scripts.items():
+        events = script.get("events", []) or []
+        event_count = len(events)
+        total_events += event_count
+        for event in events:
+            event_type = str(event.get("type") or "unknown")
+            by_event_type[event_type] = int(by_event_type.get(event_type, 0)) + 1
+        issues = _lint_script(str(script_path), script if isinstance(script, dict) else {})
+        if any(str(issue.get("code") or "") == "open_investigation" for issue in issues if isinstance(issue, dict)):
+            open_investigation += 1
+        top_by_events.append(
+            {
+                "path": str(script_path),
+                "event_count": event_count,
+                "updated_at": script.get("updated_at"),
+                "description": script.get("description"),
+            }
+        )
+
+    top_by_events.sort(key=lambda item: (-int(item.get("event_count") or 0), str(item.get("path") or "")))
+    sample_limit = max(1, min(int(getattr(args, "sample_limit", 12) or 12), 100))
+
+    print(
+        json.dumps(
+            attach_governance_hint(
+                {
+                    "ok": True,
+                    "action": "overview",
+                    "file": str(path),
+                    "summary": {
+                        "script_count": len(scripts),
+                        "event_count": total_events,
+                        "counts_by_event_type": by_event_type,
+                        "open_investigation_scripts": open_investigation,
+                    },
+                    "top_scripts": top_by_events[:sample_limit],
+                    "recommended_next_calls": [
+                        "scripthistory list-scripts --limit 30",
+                        "scripthistory explain --path <repo_relative_path>",
+                        "scripthistory lint --path <repo_relative_path>",
+                    ],
+                }
+            )
+        )
+    )
+
+
+def cmd_explain(args: argparse.Namespace) -> None:
+    """Explain one script in normalized what/why/how form."""
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    store = load_store(path)
+    canonical_path = canonicalize_script_path(args.path)
+    located = _locate_script_entry(store, canonical_path)
+    script = located[1] if located else None
+    if not script:
+        emit_error(
+            error="unknown_script",
+            detail=f"Script '{args.path}' is not known to scripthistory.",
+            file=path,
+            extra={"path": args.path},
+        )
+
+    events = script.get("events", [])
+    events_out = [event_to_public(e) for e in (events[-int(max(1, min(args.events_limit, 200))) :] if events else [])]
+    explanation = _normalize_script_explain(canonical_path, script)
+    print(
+        json.dumps(
+            attach_governance_hint(
+                {
+                    "ok": True,
+                    "action": "explain",
+                    "file": str(path),
+                    "path": canonical_path,
+                    "script": script_to_public({k: v for k, v in script.items() if k != "events"}),
+                    "explanation": explanation,
+                    "recent_events": events_out,
+                    "recent_count": len(events_out),
+                    "next_steps": [
+                        {
+                            "text": "Run lint for this script before broader changes.",
+                            "commands": [f"scripthistory lint --path {canonical_path}"],
+                            "links": [f"script:{canonical_path}"],
+                        },
+                        {
+                            "text": "If this script is active work, align task status/logs.",
+                            "commands": ["tasks overview"],
+                            "links": [f"script:{canonical_path}"],
+                        },
+                    ],
+                }
+            )
+        )
+    )
+
+
+def _locate_script_entry(
+    store: Dict[str, Any], canonical_path: str
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """Return (stored_path, script) for a canonical path, if present."""
+    scripts = store.get("scripts", {}) or {}
+    direct = scripts.get(canonical_path)
+    if direct is not None:
+        return canonical_path, direct
+    for path_key, script in scripts.items():
+        if path_key == canonical_path:
+            continue
+        if canonicalize_script_path(path_key) == canonical_path:
+            return path_key, script
+    return None
+
+
+def _ensure_script(
+    store: Dict[str, Any],
+    path_str: str,
+    create_if_missing: bool,
+) -> Dict[str, Any]:
+    """Get or optionally create a script entry."""
+    canonical_path = canonicalize_script_path(path_str)
+    scripts = store.get("scripts", {}) or {}
+    located = _locate_script_entry(store, canonical_path)
+    if located:
+        existing_path, script = located
+        # Migrate alias to canonical key to avoid fragmentation.
+        if existing_path != canonical_path:
+            scripts.pop(existing_path, None)
+            script["path"] = canonical_path
+            scripts[canonical_path] = script
+            store["scripts"] = scripts
+        return script
+
+    if not create_if_missing:
+        emit_error(
+            error="unknown_script",
+            detail=(
+                f"Script '{canonical_path}' is not known to scripthistory. "
+                "Use 'init-script' first."
+            ),
+            extra={"path": canonical_path},
+        )
+    now = now_iso()
+    script = {
+        "path": canonical_path,
+        "created_at": now,
+        "updated_at": now,
+        "description": None,
+        "metadata": {},
+        "events": [],
+    }
+    scripts[canonical_path] = script
+    store["scripts"] = scripts
+    return script
+
+
+def _maybe_dedupe_event(
+    script: Dict[str, Any],
+    event_type: str,
+    comment: str,
+    agent: Optional[str],
+    metadata: Dict[str, Any],
+    links: List[str],
+    now_epoch: float,
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Check whether a new event would be a duplicate of the last one.
+
+    Returns (event, True) if a duplicate should be reused, (None, False) otherwise.
+    """
+    if not SCRIPTHISTORY_DEDUP_ENABLE:
+        return None, False
+
+    events = script.get("events", []) or []
+    if not events:
+        return None, False
+
+    last = events[-1]
+    if last.get("type") != event_type:
+        return None, False
+    if (last.get("comment") or "") != (comment or ""):
+        return None, False
+    if (last.get("agent") or None) != (agent or None):
+        return None, False
+    if (last.get("metadata") or {}) != (metadata or {}):
+        return None, False
+    if (last.get("links") or []) != (links or []):
+        return None, False
+
+    last_ts = last.get("created_at")
+    last_epoch = parse_iso_utc(last_ts) if isinstance(last_ts, str) else None
+    if last_epoch is None:
+        return None, False
+
+    if abs(now_epoch - last_epoch) <= SCRIPTHISTORY_DEDUP_WINDOW_SECONDS:
+        # Treat as duplicate.
+        return last, True
+
+    return None, False
+
+
+def _append_event(
+    store: Dict[str, Any],
+    script: Dict[str, Any],
+    event_type: str,
+    comment: str,
+    agent: Optional[str],
+    metadata: Dict[str, Any],
+    links: List[str],
+) -> Tuple[Dict[str, Any], bool]:
+    """Append an event to a script and update store timestamps.
+
+    Returns (event, changed_bool). If changed_bool is False, the event is a
+    deduped re-use of the last event and the store MUST NOT be rewritten.
+    """
+    now_str = now_iso()
+    now_epoch = parse_iso_utc(now_str) or time.time()
+
+    # Dedupe identical back-to-back events within a short time window.
+    reused, is_dup = _maybe_dedupe_event(
+        script, event_type, comment, agent, metadata, links, now_epoch
+    )
+    if is_dup and reused is not None:
+        logging.info(
+            "Deduplicated %s event for script '%s' (reusing id=%s).",
+            event_type,
+            script.get("path"),
+            reused.get("id"),
+        )
+        return reused, False
+
+    event_id = generate_event_id(store)
+    event = {
+        "id": event_id,
+        "type": event_type,
+        "comment": comment,
+        "agent": agent,
+        "created_at": now_str,
+        "metadata": metadata,
+    }
+    if links:
+        event["links"] = links
+    script.setdefault("events", []).append(event)
+    script["updated_at"] = now_str
+    return event, True
+
+
+def cmd_init_script(args: argparse.Namespace) -> None:
+    """
+    Initialize history for a script.
+
+    Semantics
+    ---------
+    - If the script does not yet exist in the store, a new script entry is
+      created and a single 'init-script' event is appended.
+    - If the script already exists and already has an init-script event, this
+      command is idempotent: it returns ok=true with status='exists' and the
+      existing script plus recent events, without creating a second init event.
+    - If the script already exists but is missing an init-script event (e.g.
+      created via --auto-init on other commands), this command backfills a single
+      init-script event to restore invariants.
+    """
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    metadata = parse_json_arg(args.data, "--data")
+    links = normalize_links(getattr(args, "links", None))
+    inferred_links = extract_link_tokens_from_texts([args.comment or ""])
+    links = _merge_links(links, inferred_links)
+    canonical_path = canonicalize_script_path(args.path)
+
+    has_init = False
+    existing: Optional[Dict[str, Any]] = None
+    with lock:
+        store = load_store(path)
+        located = _locate_script_entry(store, canonical_path)
+        existing = located[1] if located else None
+        if existing is not None:
+            has_init = any(
+                (e.get("type") == "init-script")
+                for e in (existing.get("events", []) or [])
+                if isinstance(e, dict)
+            )
+            if has_init:
+                recent_events = recent_events_for_script(existing, limit=10)
+                print(
+                    json.dumps(
+                        attach_governance_hint(
+                            {
+                                "ok": True,
+                                "action": "init-script",
+                                "status": "exists",
+                                "file": str(path),
+                                "script": script_to_public(existing),
+                                "recent_events": recent_events,
+                                "recent_count": len(recent_events),
+                                "recent_limit": 10,
+                            }
+                        )
+                    )
+                )
+                return
+            script = existing
+        else:
+            script = _ensure_script(store, canonical_path, create_if_missing=True)
+
+        # Set or update description/metadata.
+        now = now_iso()
+        if args.comment and not script.get("description"):
+            script["description"] = args.comment
+        if metadata:
+            merged = dict(script.get("metadata", {}))
+            merged.update(metadata)
+            script["metadata"] = merged
+        script["updated_at"] = now
+
+        # Append (or backfill) an init-script event.
+        init_comment = args.comment or "Initialize script history."
+        event, changed = _append_event(
+            store,
+            script,
+            event_type="init-script",
+            comment=init_comment,
+            agent=args.agent,
+            metadata=metadata,
+            links=links,
+        )
+        if changed:
+            save_store(path, store)
+        else:
+            logging.info(
+                "Init-script dedupe triggered for '%s'; store not rewritten.", args.path
+            )
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "action": "init-script",
+        "file": str(path),
+        "script": script_to_public(script),
+        "event": event_to_public(event),
+    }
+    if existing is not None and not has_init:
+        out["status"] = "backfilled"
+    print(json.dumps(attach_governance_hint(out)))
+
+
+def cmd_add_change(args: argparse.Namespace) -> None:
+    """Append a 'change' event to a script."""
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    metadata = parse_json_arg(args.data, "--data")
+    links = normalize_links(getattr(args, "links", None))
+    inferred_links = extract_link_tokens_from_texts([args.comment or ""])
+    links = _merge_links(links, inferred_links)
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    with lock:
+        store = load_store(path)
+        script = _ensure_script(store, args.path, create_if_missing=args.auto_init)
+        event, changed = _append_event(
+            store,
+            script,
+            event_type="change",
+            comment=args.comment,
+            agent=args.agent,
+            metadata=metadata,
+            links=links,
+        )
+        if changed:
+            save_store(path, store)
+        else:
+            logging.info(
+                "Skipped writing duplicate 'change' event for %s (id=%s).",
+                args.path,
+                event.get("id"),
+            )
+
+    print(
+        json.dumps(
+            attach_governance_hint(
+                {
+                    "ok": True,
+                    "action": "add-change",
+                    "file": str(path),
+                    "script": script_to_public(script),
+                    "event": event_to_public(event),
+                }
+            )
+        )
+    )
+
+
+def cmd_add_knowledge(args: argparse.Namespace) -> None:
+    """Append a 'knowledge' event to a script."""
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    metadata = parse_json_arg(args.data, "--data")
+    links = normalize_links(getattr(args, "links", None))
+    inferred_links = extract_link_tokens_from_texts([args.comment or ""])
+    links = _merge_links(links, inferred_links)
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    with lock:
+        store = load_store(path)
+        script = _ensure_script(store, args.path, create_if_missing=args.auto_init)
+        event, changed = _append_event(
+            store,
+            script,
+            event_type="knowledge",
+            comment=args.comment,
+            agent=args.agent,
+            metadata=metadata,
+            links=links,
+        )
+        if changed:
+            save_store(path, store)
+        else:
+            logging.info(
+                "Skipped writing duplicate 'knowledge' event for %s (id=%s).",
+                args.path,
+                event.get("id"),
+            )
+
+    print(
+        json.dumps(
+            attach_governance_hint(
+                {
+                    "ok": True,
+                    "action": "add-knowledge",
+                    "file": str(path),
+                    "script": script_to_public(script),
+                    "event": event_to_public(event),
+                }
+            )
+        )
+    )
+
+
+def cmd_get(args: argparse.Namespace) -> None:
+    """Retrieve full history for a script."""
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    store = load_store(path)
+    canonical_path = canonicalize_script_path(args.path)
+    located = _locate_script_entry(store, canonical_path)
+    script = located[1] if located else None
+    if not script:
+        emit_error(
+            error="unknown_script",
+            detail=f"Script '{args.path}' is not known to scripthistory.",
+            file=path,
+            extra={"path": args.path},
+        )
+
+    events = script.get("events", [])
+    if args.type:
+        events = [e for e in events if e.get("type") == args.type]
+    events_out = [event_to_public(e) for e in events]
+    print(
+        json.dumps(
+            attach_governance_hint(
+                {
+                    "ok": True,
+                    "action": "get",
+                    "file": str(path),
+                    "path": args.path,
+                    "script": script_to_public(
+                        {k: v for k, v in script.items() if k != "events"}
+                    ),
+                    "events": events_out,
+                    "count": len(events_out),
+                    "type_filter": args.type,
+                }
+            )
+        )
+    )
+
+
+def _load_json_doc(path: Path, *, label: str) -> Dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"missing {label}: {path}") from exc
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid json for {label}: {path}: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ValueError(f"invalid {label}: expected json object at {path}")
+    return doc
+
+
+def cmd_code_revisions(args: argparse.Namespace) -> None:
+    """
+    Read the script-indexer artifacts for a repo-relative script path.
+
+    This is separate from the scripthistory store itself; it provides a quick
+    inspection view over `common/indexer/scripts/<path>/...`.
+    """
+    rr_raw = str(getattr(args, "repo_root", "") or "").strip()
+    if rr_raw:
+        rr = Path(rr_raw).expanduser()
+        rr = rr.resolve() if rr.is_absolute() else (Path.cwd() / rr).resolve()
+    else:
+        rr = REPO_ROOT.resolve()
+
+    script_path = str(getattr(args, "path", "") or "").strip()
+    if not script_path:
+        emit_error(error="invalid_path", detail="--path is required", extra={"path": script_path})
+
+    p_rel = Path(script_path.lstrip("/"))
+    if p_rel.is_absolute() or ".." in p_rel.parts:
+        emit_error(error="invalid_path", detail="--path must be repo-relative and must not contain '..'", extra={"path": script_path})
+
+    # Compatibility: during the 2026-01 LLM path migration, historical code-index
+    # artifacts may exist under either `llm/...` or `artifacts/llm/...` depending
+    # on which revision created the index entry.
+    #
+    # We treat both as aliases for the purpose of reading the code-index store.
+    candidates: List[Path] = [p_rel]
+    if p_rel.parts and p_rel.parts[0] == "llm":
+        candidates.append(Path("artifacts") / p_rel)
+    if len(p_rel.parts) >= 2 and p_rel.parts[0] == "artifacts" and p_rel.parts[1] == "llm":
+        candidates.append(Path(*p_rel.parts[1:]))
+
+    seen: set[str] = set()
+    uniq: List[Path] = []
+    for cand in candidates:
+        s = str(cand).replace("\\", "/")
+        if s in seen:
+            continue
+        seen.add(s)
+        uniq.append(Path(s))
+    candidates = uniq
+
+    base: Optional[Path] = None
+    current_path: Optional[Path] = None
+    current: Optional[Dict[str, Any]] = None
+    path_indexed = ""
+    rev = ""
+
+    found_current_json: List[str] = []
+    for cand in candidates:
+        base2 = (rr / "common" / "indexer" / "scripts" / cand).resolve()
+        cur2 = (base2 / "current.json").resolve()
+        if not cur2.is_file():
+            continue
+        found_current_json.append(str(cur2))
+        doc2 = _load_json_doc(cur2, label="current.json")
+        rev2 = str((doc2.get("revision_sha256") or "").strip())
+        if not rev2:
+            continue
+        base = base2
+        current_path = cur2
+        current = doc2
+        path_indexed = str(cand).replace("\\", "/")
+        rev = rev2
+        break
+
+    if base is None or current_path is None or current is None:
+        if found_current_json:
+            emit_error(
+                error="missing_revision",
+                detail="current.json missing revision_sha256 for all candidate paths",
+                extra={"path": script_path, "current_json": found_current_json[:20]},
+            )
+        emit_error(
+            error="missing_index_artifacts",
+            detail=(
+                "Missing code-index artifacts for path. "
+                "Expected: common/indexer/scripts/<path>/current.json."
+            ),
+            extra={"path": script_path, "candidates": [str(c) for c in candidates]},
+        )
+
+    selected_revision: Dict[str, Any] = dict(current)
+
+    events: List[Dict[str, Any]] = []
+    events_dir = (base / "events").resolve()
+    if events_dir.exists() and events_dir.is_dir():
+        files = sorted([p for p in events_dir.iterdir() if p.is_file() and p.name.endswith(".json")], key=lambda x: x.name)
+        limit_events = int(getattr(args, "limit_events", 0) or 0)
+        for p in files:
+            if limit_events and len(events) >= limit_events:
+                break
+            try:
+                events.append(_load_json_doc(p, label="event"))
+            except Exception as exc:
+                logging.warning("Skipping invalid event json %s: %s", p, exc)
+
+    chunks: List[Dict[str, Any]] = []
+    if bool(getattr(args, "include_chunks", False)):
+        chunks_dir = (base / "revisions" / rev / "chunks").resolve()
+        if chunks_dir.exists() and chunks_dir.is_dir():
+            files = sorted([p for p in chunks_dir.iterdir() if p.is_file() and p.name.endswith(".json")], key=lambda x: x.name)
+            limit_chunks = int(getattr(args, "limit_chunks", 0) or 0)
+            omit_text = bool(getattr(args, "omit_text", False))
+            for p in files:
+                if limit_chunks and len(chunks) >= limit_chunks:
+                    break
+                try:
+                    doc = _load_json_doc(p, label="chunk")
+                except Exception as exc:
+                    logging.warning("Skipping invalid chunk json %s: %s", p, exc)
+                    continue
+                if omit_text:
+                    doc.pop("text", None)
+                chunks.append(doc)
+
+    print(
+        json.dumps(
+            attach_governance_hint(
+                {
+                    "ok": True,
+                    "action": "code_revisions",
+                    "repo_root": str(rr),
+                    "path": script_path,
+                    "path_indexed": path_indexed,
+                    "path_candidates": [str(c) for c in candidates],
+                    "index_dir": str(base),
+                    "current": current,
+                    "selected_revision": selected_revision,
+                    "events": events,
+                    "chunks": chunks,
+                }
+            )
+        )
+    )
+
+
+def _lint_script(path_str: str, script: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return a list of structural issues for a single script."""
+    issues: List[Dict[str, Any]] = []
+    events = script.get("events", []) or []
+
+    # 1) Multiple init-script events.
+    init_events = [e for e in events if e.get("type") == "init-script"]
+    if len(init_events) == 0:
+        issues.append(
+            {
+                "path": path_str,
+                "severity": "warning",
+                "code": "missing_init_script",
+                "message": "Script has no 'init-script' event; consider adding one to document its purpose.",
+                "event_ids": [],
+            }
+        )
+    elif len(init_events) > 1:
+        issues.append(
+            {
+                "path": path_str,
+                "severity": "error",
+                "code": "multiple_init_script",
+                "message": "Script has multiple 'init-script' events; only one is expected per logical script.",
+                "event_ids": [e.get("id") for e in init_events if e.get("id")],
+            }
+        )
+
+    # 2) Duplicate events (type+comment+agent+metadata).
+    key_to_events: Dict[str, List[Dict[str, Any]]] = {}
+    for e in events:
+        key_obj = {
+            "type": e.get("type"),
+            "comment": e.get("comment"),
+            "agent": e.get("agent"),
+            "metadata": e.get("metadata") or {},
+            "links": e.get("links") or [],
+        }
+        key = json.dumps(key_obj, sort_keys=True, ensure_ascii=False)
+        key_to_events.setdefault(key, []).append(e)
+
+    for group in key_to_events.values():
+        if len(group) > 1:
+            group_sorted = sorted(group, key=lambda ev: ev.get("created_at") or "")
+            issues.append(
+                {
+                    "path": path_str,
+                    "severity": "warning",
+                    "code": "duplicate_events",
+                    "message": (
+                        "Multiple events share identical type/comment/agent/metadata; "
+                        "ensure duplicates are intentional or rely on dedupe when writing."
+                    ),
+                    "event_ids": [ev.get("id") for ev in group_sorted if ev.get("id")],
+                }
+            )
+
+    # 3) Open investigations: events that look like investigations without a visible closure.
+    investigating_events: List[Dict[str, Any]] = []
+    for e in events:
+        comment = (e.get("comment") or "").lower()
+        if any(token in comment for token in ("investigat", "inspect", "audit")):
+            investigating_events.append(e)
+
+    if investigating_events:
+        last_investigation = investigating_events[-1]
+        try:
+            idx_last = events.index(last_investigation)
+        except ValueError:
+            idx_last = len(events) - 1
+        later_events = events[idx_last + 1 :]
+        resolved = False
+        for e2 in later_events:
+            c2 = (e2.get("comment") or "").lower()
+            if any(
+                token in c2
+                for token in ("resolved", "fixed", "retired", "closed", "decommission")
+            ):
+                resolved = True
+                break
+        if not resolved:
+            issues.append(
+                {
+                    "path": path_str,
+                    "severity": "info",
+                    "code": "open_investigation",
+                    "message": (
+                        "Latest investigation/audit-style event has no obvious "
+                        "closing event (resolved/fixed/retired/closed)."
+                    ),
+                    "event_ids": [last_investigation.get("id")],
+                }
+            )
+
+    return issues
+
+
+def cmd_lint(args: argparse.Namespace) -> None:
+    """Analyze one script or the whole store for structural issues."""
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    store = load_store(path)
+    scripts = store.get("scripts", {}) or {}
+
+    issues: List[Dict[str, Any]] = []
+    lint_path: Optional[str] = None
+    if args.path:
+        canonical = canonicalize_script_path(args.path)
+        located = _locate_script_entry(store, canonical)
+        script = located[1] if located else None
+        if not script:
+            emit_error(
+                error="unknown_script",
+                detail=f"Script '{args.path}' is not known to scripthistory.",
+                file=path,
+                extra={"path": args.path},
+            )
+        lint_path = args.path
+        issues = _lint_script(lint_path, script)
+    else:
+        for p, s in scripts.items():
+            issues.extend(_lint_script(p, s))
+
+    print(
+        json.dumps(
+            attach_governance_hint(
+                {
+                    "ok": True,
+                    "action": "lint",
+                    "file": str(path),
+                    "path": lint_path,
+                    "issue_count": len(issues),
+                    "issues": issues,
+                }
+            )
+        )
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the top-level argument parser with rich help text."""
+    description = (
+        "Script history & knowledge log CLI for AI agents.\n\n"
+        "Use this tool to maintain an append-only history and knowledge base\n"
+        "for each script or service in this repository. This helps agents\n"
+        "understand why scripts exist, how they evolved, and which caveats or\n"
+        "insights apply.\n\n"
+        "Related tools:\n"
+        "  - tasks: execution backlog and agent coordination.\n"
+        "  - findings/fixreport: bug lifecycle from intake to closure.\n"
+        "  - hypothesis: falsifiable reasoning and evidence timelines.\n"
+        "  - scriptinfo: cross-store timeline + wiki/indexer context.\n\n"
+        "Guardrails:\n"
+        "  - Exactly one 'init-script' event per script path (enforced).\n"
+        "  - Automatic deduplication of identical back-to-back events within\n"
+        "    a short time window (configurable via env vars).\n"
+        "  - Optional 'lint' subcommand to detect duplicated events, multiple\n"
+        "    init entries, and long-open investigations without closure.\n\n"
+        "Common workflows:\n"
+        "  - Initialize the history store:\n"
+        "      scripthistory init\n"
+        "  - Record initial creation of a script:\n"
+        "      scripthistory init-script --path scripts/ops/install_agentic_tools.sh \\\n"
+        "          --comment \"Initial install script\" --agent agent-ops\n"
+        "  - Add a change entry:\n"
+        "      scripthistory add-change --path agentic_tools/worklock \\\n"
+        "          --comment \"Fix TTL expiry using UTC\" --agent agent-bugfix\n"
+        "  - Add a knowledge entry:\n"
+        "      scripthistory add-knowledge --path agentic_tools/worklock \\\n"
+        "          --comment \"Always check lock status with 'who' first\" \\\n"
+        "          --agent agent-ops\n"
+        "  - Retrieve the full history for a script:\n"
+        "      scripthistory get --path agentic_tools/worklock\n"
+        "  - Lint for structural issues:\n"
+        "      scripthistory lint --path agentic_tools/worklock\n"
+        "  - Explain one script in normalized fields:\n"
+        "      scripthistory explain --path agentic_tools/worklock\n"
+        "  - Get compact store-wide orientation:\n"
+        "      scripthistory overview\n"
+    )
+    epilog = (
+        "Exit codes:\n"
+        "  0  Command succeeded.\n"
+        "  1  Command failed (e.g. invalid arguments, unknown script).\n\n"
+        "All commands print a single JSON object to stdout.\n"
+        "Errors are also returned as JSON with at least: ok=false, error, detail.\n"
+        "Verbose logs and heartbeats are written to stderr for observability.\n"
+    )
+
+    parser_kwargs: Dict[str, Any] = dict(
+        prog="scripthistory",
+        description=description,
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # Python 3.14+ supports argparse color; disable to keep deterministic machine output.
+    if "color" in inspect.signature(argparse.ArgumentParser).parameters:
+        parser_kwargs["color"] = False
+
+    parser = JsonArgumentParser(**parser_kwargs)
+    parser.add_argument(
+        "--file",
+        default=SCRIPTHISTORY_DEFAULT_FILENAME,
+        help=(
+            "Path to script history JSON file "
+            "(default: %(default)s; override with SCRIPTHISTORY_FILE env var)."
+        ),
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p_init = subparsers.add_parser(
+        "init",
+        help="Initialize a script history store file.",
+        description=(
+            "Initialize a new script history JSON file.\n\n"
+            "If the file already exists, the command fails unless --force is\n"
+            "provided. This command is optional; other commands auto-create an\n"
+            "in-memory default when the file does not yet exist."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing script history store file if it exists.",
+    )
+    p_init.set_defaults(func=cmd_init)
+
+    p_schema = subparsers.add_parser(
+        "schema",
+        help="Output JSON schema for the store.",
+        description=(
+            "Print the JSON schema describing the script history store, as well\n"
+            "as the shape of individual script and event entries. Useful for\n"
+            "agents that want to validate or introspect the data model and\n"
+            "understand built-in guardrails such as deduplication."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_schema.set_defaults(func=cmd_schema)
+
+    p_show_all = subparsers.add_parser(
+        "show-all",
+        help="Show the entire script history store.",
+        description=(
+            "Show the entire script history store, including all scripts and\n"
+            "their events. Intended primarily for inspection and debugging."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_show_all.set_defaults(func=cmd_show_all)
+
+    p_list_scripts = subparsers.add_parser(
+        "list-scripts",
+        help="List all scripts that have history.",
+        description=(
+            "List all scripts that have at least one history or knowledge\n"
+            "entry, along with basic counts and timestamps."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_list_scripts.add_argument(
+        "--search",
+        help="Optional case-insensitive substring over path/description.",
+    )
+    p_list_scripts.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional result cap (0 = no cap).",
+    )
+    p_list_scripts.set_defaults(func=cmd_list_scripts)
+
+    p_overview = subparsers.add_parser(
+        "overview",
+        help="Compact store summary for quick agent orientation.",
+        description=(
+            "Return aggregate counts and top scripts by event volume.\n"
+            "Use this before deep dives to identify hot scripts and open investigations."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_overview.add_argument(
+        "--sample-limit",
+        type=int,
+        default=12,
+        help="Max scripts in top_scripts output (default: %(default)s).",
+    )
+    p_overview.set_defaults(func=cmd_overview)
+
+    p_init_script = subparsers.add_parser(
+        "init-script",
+        help="Initialize history for a script.",
+        description=(
+            "Initialize history for a script (or ensure it exists) and append\n"
+            "an 'init-script' event. This is typically called when a new script\n"
+            "is created or adopted. There must be at most one 'init-script'\n"
+            "event per script path; repeated calls will fail with a JSON error\n"
+            "containing the existing script and its recent events."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_init_script.add_argument(
+        "--path",
+        required=True,
+        help="Logical path of the script (e.g. 'scripts/ops/install_agentic_tools.sh').",
+    )
+    p_init_script.add_argument(
+        "--comment",
+        "--description",
+        "--text",
+        help="Optional comment describing the initialization or purpose.",
+    )
+    p_init_script.add_argument(
+        "--agent",
+        help="Optional identifier of the agent/human creating the entry.",
+    )
+    p_init_script.add_argument(
+        "--data",
+        help="Optional JSON metadata object attached to the script and event.",
+    )
+    p_init_script.add_argument(
+        "--link",
+        "--links",
+        action="append",
+        dest="links",
+        default=[],
+        help="Repeatable outbound link token of the form kind:id (see architecture/LINKS_CONTRACT.md).",
+    )
+    p_init_script.set_defaults(func=cmd_init_script)
+
+    p_add_change = subparsers.add_parser(
+        "add-change",
+        help="Append a 'change' event to a script.",
+        description=(
+            "Append a 'change' event to a script, describing what changed and\n"
+            "why. By default the script must already exist (via init-script),\n"
+            "but --auto-init can be used to implicitly create it.\n\n"
+            "When a change comment refers to a hypothesis managed by the\n"
+            "agentic 'hypothesis' tool, include the hypothesis id explicitly\n"
+            "in canonical form (e.g. 'H00012: adjusted backtest parameters').\n"
+            "This allows 'hypothesis sync-scripthistory' to link script\n"
+            "evolution events as structured, inconclusive evidence.\n\n"
+            "Guardrail: Identical back-to-back 'change' events (same type,\n"
+            "comment, agent and metadata within a short time window) are\n"
+            "treated as retries and automatically deduplicated. The CLI still\n"
+            "returns ok=true and surfaces the existing event."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_add_change.add_argument(
+        "--path",
+        required=True,
+        help="Logical path of the script (e.g. 'agentic_tools/worklock').",
+    )
+    p_add_change.add_argument(
+        "--comment",
+        "--description",
+        "--text",
+        required=True,
+        help="Short comment describing the change.",
+    )
+    p_add_change.add_argument(
+        "--agent",
+        help="Optional identifier of the agent/human creating the entry.",
+    )
+    p_add_change.add_argument(
+        "--data",
+        help="Optional JSON metadata object attached to the event.",
+    )
+    p_add_change.add_argument(
+        "--link",
+        "--links",
+        action="append",
+        dest="links",
+        default=[],
+        help="Repeatable outbound link token of the form kind:id (see architecture/LINKS_CONTRACT.md).",
+    )
+    p_add_change.add_argument(
+        "--auto-init",
+        action="store_true",
+        help="Automatically initialize the script if it does not yet exist.",
+    )
+    p_add_change.set_defaults(func=cmd_add_change)
+
+    p_add_knowledge = subparsers.add_parser(
+        "add-knowledge",
+        help="Append a 'knowledge' event to a script.",
+        description=(
+            "Append a 'knowledge' event to a script, capturing insights,\n"
+            "caveats, performance notes or operational tips. By default the\n"
+            "script must already exist (via init-script), but --auto-init can\n"
+            "be used to implicitly create it.\n\n"
+            "When knowledge comments discuss a hypothesis, include the\n"
+            "hypothesis id explicitly in canonical form (e.g. 'H00012: new\n"
+            "observations from production rollout') so that 'hypothesis\n"
+            "sync-scripthistory' can ingest the event as evidence.\n\n"
+            "Guardrail: Identical back-to-back 'knowledge' events are treated\n"
+            "as retries and deduplicated within a short time window."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_add_knowledge.add_argument(
+        "--path",
+        required=True,
+        help="Logical path of the script (e.g. 'agentic_tools/worklock').",
+    )
+    p_add_knowledge.add_argument(
+        "--comment",
+        "--description",
+        "--text",
+        required=True,
+        help="Short comment describing the knowledge or insight.",
+    )
+    p_add_knowledge.add_argument(
+        "--agent",
+        help="Optional identifier of the agent/human creating the entry.",
+    )
+    p_add_knowledge.add_argument(
+        "--data",
+        help="Optional JSON metadata object attached to the event.",
+    )
+    p_add_knowledge.add_argument(
+        "--link",
+        "--links",
+        action="append",
+        dest="links",
+        default=[],
+        help="Repeatable outbound link token of the form kind:id (see architecture/LINKS_CONTRACT.md).",
+    )
+    p_add_knowledge.add_argument(
+        "--auto-init",
+        action="store_true",
+        help="Automatically initialize the script if it does not yet exist.",
+    )
+    p_add_knowledge.set_defaults(func=cmd_add_knowledge)
+
+    p_get = subparsers.add_parser(
+        "get",
+        help="Retrieve full history for a script.",
+        description=(
+            "Retrieve the full history for a script, optionally filtered by\n"
+            "event type (init-script, change, knowledge)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_get.add_argument(
+        "--path",
+        required=True,
+        help="Logical path of the script (e.g. 'agentic_tools/worklock').",
+    )
+    p_get.add_argument(
+        "--type",
+        choices=["init-script", "change", "knowledge"],
+        help="Optional filter for event type.",
+    )
+    p_get.set_defaults(func=cmd_get)
+
+    p_explain = subparsers.add_parser(
+        "explain",
+        help="Explain one script in normalized what/why/how form.",
+        description=(
+            "Explain one script using normalized fields (what, why, how,\n"
+            "guardrails, evidence, conflicts, links) plus recent events."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_explain.add_argument(
+        "--path",
+        required=True,
+        help="Logical path of the script (e.g. 'agentic_tools/worklock').",
+    )
+    p_explain.add_argument(
+        "--events-limit",
+        type=int,
+        default=12,
+        help="Number of recent events to include (default: %(default)s).",
+    )
+    p_explain.set_defaults(func=cmd_explain)
+
+    p_code_revs = subparsers.add_parser(
+        "code-revisions",
+        help="Read code-indexer revisions/chunks for a repo path.",
+        description=(
+            "Read the script-indexer artifacts under common/indexer/scripts/<path>/.\n"
+            "This is a read-only inspection helper (separate from the scripthistory JSON store).\n"
+            "\n"
+            "Typical usage:\n"
+            "  scripthistory code-revisions --path services/foo.py --include-chunks --omit-text\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_code_revs.add_argument(
+        "--repo-root",
+        default="",
+        help="Repo root to read from (absolute or relative to CWD). Default: this repo root.",
+    )
+    p_code_revs.add_argument("--path", required=True, help="Repo-relative script path (e.g. services/foo.py).")
+    p_code_revs.add_argument("--include-chunks", action="store_true", help="Include chunk docs for the selected revision.")
+    p_code_revs.add_argument("--omit-text", action="store_true", help="Drop chunk 'text' fields (size/privacy).")
+    p_code_revs.add_argument("--limit-chunks", type=int, default=0, help="Max chunks to return (0 = no limit).")
+    p_code_revs.add_argument("--limit-events", type=int, default=0, help="Max events to return (0 = no limit).")
+    p_code_revs.set_defaults(func=cmd_code_revisions)
+
+    p_lint = subparsers.add_parser(
+        "lint",
+        help="Analyze scripts for structural issues.",
+        description=(
+            "Analyze one script or the entire store for structural issues such\n"
+            "as multiple 'init-script' events, duplicated events, and open\n"
+            "investigations without obvious closure events. This is a read-only\n"
+            "operation; it never mutates the store."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_lint.add_argument(
+        "--path",
+        help=(
+            "Logical path of the script to lint. If omitted, all scripts in the\n"
+            "store are analyzed."
+        ),
+    )
+    p_lint.set_defaults(func=cmd_lint)
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    """Entry point for the CLI."""
+    configure_logging()
+    parser = build_parser()
+    args: Optional[argparse.Namespace] = None
+    try:
+        args = parser.parse_args(argv)
+        handler = getattr(args, "func", None)
+        handler_name = getattr(handler, "__name__", "")
+        if handler_name in _MUTATING_SCRIPTHISTORY_HANDLERS:
+            _run_scripthistory_mutation_with_retry(handler_name.replace("cmd_", ""), lambda: handler(args))
+        else:
+            handler(args)
+    except FileLockTimeout as exc:
+        emit_error(
+            error="lock_timeout",
+            detail=str(exc),
+            file=Path(getattr(args, "file", SCRIPTHISTORY_DEFAULT_FILENAME)),
+        )
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logging.exception("Unhandled scripthistory exception")
+        file_arg = getattr(args, "file", SCRIPTHISTORY_DEFAULT_FILENAME) if args else None
+        emit_error(
+            error="internal_error",
+            detail=str(exc),
+            file=Path(file_arg) if file_arg else None,
+        )
+
+
+if __name__ == "__main__":
+    main()

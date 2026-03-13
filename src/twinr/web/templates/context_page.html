@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>{{ raw_section_title }}</h2>
+      <p class="section-description">{{ raw_section_description }}</p>
+    </div>
+  </div>
+  <form method="post" action="{{ base_form_action }}" class="stack">
+    <input type="hidden" name="_action" value="save_base">
+    {% for field in raw_fields %}
+    <label class="field">
+      <span class="field-label">{{ field.label }}</span>
+      <textarea name="{{ field.key }}" rows="14">{{ field.value }}</textarea>
+      {% if field.help_text %}
+      <span class="field-help">{{ field.help_text }}</span>
+      {% endif %}
+    </label>
+    {% endfor %}
+    <div class="actions">
+      <button type="submit">Save base text</button>
+    </div>
+  </form>
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>{{ managed_section_title }}</h2>
+      <p class="section-description">{{ managed_section_description }}</p>
+    </div>
+  </div>
+  {% if managed_entries %}
+  <div class="memory-list">
+    {% for entry in managed_entries %}
+    <article class="memory-turn">
+      <div class="memory-turn-meta">
+        <span class="role-badge role-system">{{ entry.key }}</span>
+      </div>
+      <div class="memory-content">{{ entry.instruction }}</div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No managed updates are stored yet.</div>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>{{ managed_form_title }}</h2>
+      <p class="section-description">{{ managed_form_description }}</p>
+    </div>
+  </div>
+  <form method="post" action="{{ managed_form_action }}" class="stack">
+    <input type="hidden" name="_action" value="upsert_managed">
+    <div class="form-grid">
+      <label class="field">
+        <span class="field-label">Category</span>
+        <input type="text" name="category" value="" placeholder="{{ managed_category_placeholder }}">
+        <span class="field-help">{{ managed_category_help }}</span>
+      </label>
+      <label class="field field-span-2">
+        <span class="field-label">Instruction</span>
+        <textarea name="instruction" rows="5" placeholder="{{ managed_instruction_placeholder }}"></textarea>
+        <span class="field-help">{{ managed_instruction_help }}</span>
+      </label>
+    </div>
+    <div class="actions">
+      <button type="submit">Add or update rule</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

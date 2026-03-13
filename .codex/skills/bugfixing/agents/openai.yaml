@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bugfixing"
+  short_description: "Route bugfix work to the right subskill and close it cleanly"
+  default_prompt: "Use $bugfixing to run a root-cause-first Twinr bugfix through systematic debugging, optional instrumentation, validation, and clean closure artifacts."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Refactor"
+  short_description: "Refactor Twinr code while preserving behavior and operator-facing contracts"
+  default_prompt: "Use $refactor to restructure Twinr code without changing intended behavior, button semantics, config expectations, or operator-facing interfaces."

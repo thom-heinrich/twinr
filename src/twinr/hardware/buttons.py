@@ -254,6 +254,13 @@ class GpioButtonMonitor:
             if event is not None:
                 yield event
 
+    def snapshot_values(self) -> dict[int, int]:
+        if self._chip is None and not self._last_values:
+            self.open()
+        values = self._read_current_values()
+        self._last_values.update(values)
+        return dict(values)
+
 
 def configured_button_monitor(config: TwinrConfig) -> GpioButtonMonitor:
     bindings = build_button_bindings(config)

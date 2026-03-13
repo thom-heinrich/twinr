@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from collections.abc import Iterator
 from typing import Any, Callable, Sequence
 import mimetypes
+import re
+from zoneinfo import ZoneInfo
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.personality import load_personality_instructions, merge_instructions
+from twinr.ops.usage import TokenUsage, extract_model_name, extract_token_usage
 
 PRINT_FORMATTER_INSTRUCTIONS = (
     "You rewrite assistant answers for a narrow thermal receipt printer. "
@@ -24,8 +29,20 @@ PRINT_COMPOSER_INSTRUCTIONS = (
     "Aim for 3 to 6 short lines when there is enough concrete content. "
     "Do not invent facts, do not add explanations about formatting, and do not output markdown."
 )
+SEARCH_AGENT_INSTRUCTIONS = (
+    "You are Twinr's live-information search agent. "
+    "Use web search to answer any freshness-sensitive or externally verifiable question, not just predefined categories. "
+    "Respond in clear standard German for a senior user. "
+    "Use plain text only, with no markdown, tables, or bullet lists. "
+    "Prefer concrete facts, names, phone numbers, times, weather values, and exact dates when available. "
+    "Resolve relative dates like today, tomorrow, heute, morgen, this afternoon, and next Monday against the provided local date/time context. "
+    "Answer in at most two short sentences whenever possible. "
+    "Keep the spoken answer concise, practical, and trustworthy. "
+    "If important uncertainty remains, say so briefly."
+)
 STT_MODEL_FALLBACKS = ("whisper-1",)
 TTS_MODEL_FALLBACKS = ("tts-1", "tts-1-hd")
+SEARCH_MODEL_FALLBACKS = ("gpt-5.2-chat-latest",)
 _LEGACY_TTS_VOICES = {"nova", "shimmer", "echo", "onyx", "fable", "alloy", "ash", "sage", "coral"}
 _LEGACY_TTS_FALLBACK_VOICE = "sage"
 
@@ -35,7 +52,47 @@ class OpenAITextResponse:
     text: str
     response_id: str | None = None
     request_id: str | None = None
+    model: str | None = None
+    token_usage: TokenUsage | None = None
     used_web_search: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAISearchResult:
+    answer: str
+    sources: tuple[str, ...] = ()
+    response_id: str | None = None
+    request_id: str | None = None
+    model: str | None = None
+    token_usage: TokenUsage | None = None
+    used_web_search: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIImageInput:
+    data: bytes
+    content_type: str
+    filename: str = "image"
+    detail: str | None = None
+    label: str | None = None
+
+    @classmethod
+    def from_path(
+        cls,
+        path: str | Path,
+        *,
+        detail: str | None = None,
+        label: str | None = None,
+    ) -> "OpenAIImageInput":
+        file_path = Path(path)
+        content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        return cls(
+            data=file_path.read_bytes(),
+            content_type=content_type,
+            filename=file_path.name,
+            detail=detail,
+            label=label,
+        )
 
 
 ConversationLike = Sequence[tuple[str, str]] | Sequence[object]
@@ -79,7 +136,12 @@ class OpenAIBackend:
         self.config = config
         factory = client_factory or _default_client_factory
         self._client = client or factory(config)
-        self._base_instructions = base_instructions if base_instructions is not None else load_personality_instructions(config)
+        self._base_instructions_override = base_instructions
+
+    def _resolve_base_instructions(self) -> str | None:
+        if self._base_instructions_override is not None:
+            return self._base_instructions_override
+        return load_personality_instructions(self.config)
 
     def transcribe(
         self,
@@ -151,7 +213,7 @@ class OpenAIBackend:
         request = self._build_response_request(
             prompt,
             conversation=conversation,
-            instructions=merge_instructions(self._base_instructions, instructions),
+            instructions=merge_instructions(self._resolve_base_instructions(), instructions),
             allow_web_search=allow_web_search,
             model=self.config.default_model,
             reasoning_effort=self.config.openai_reasoning_effort,
@@ -161,6 +223,56 @@ class OpenAIBackend:
             text=self._extract_output_text(response),
             response_id=getattr(response, "id", None),
             request_id=getattr(response, "_request_id", None),
+            model=extract_model_name(response, request["model"]),
+            token_usage=extract_token_usage(response),
+            used_web_search=self._used_web_search(response),
+        )
+
+    def respond_to_images(
+        self,
+        prompt: str,
+        *,
+        images: Sequence[OpenAIImageInput],
+        conversation: ConversationLike | None = None,
+        instructions: str | None = None,
+        allow_web_search: bool | None = None,
+    ) -> str:
+        return self.respond_to_images_with_metadata(
+            prompt,
+            images=images,
+            conversation=conversation,
+            instructions=instructions,
+            allow_web_search=allow_web_search,
+        ).text
+
+    def respond_to_images_with_metadata(
+        self,
+        prompt: str,
+        *,
+        images: Sequence[OpenAIImageInput],
+        conversation: ConversationLike | None = None,
+        instructions: str | None = None,
+        allow_web_search: bool | None = None,
+    ) -> OpenAITextResponse:
+        if not images:
+            raise ValueError("At least one image is required for a vision request")
+
+        request = self._build_response_request(
+            prompt,
+            conversation=conversation,
+            instructions=merge_instructions(self._resolve_base_instructions(), instructions),
+            allow_web_search=allow_web_search,
+            model=self.config.default_model,
+            reasoning_effort=self.config.openai_reasoning_effort,
+            extra_user_content=self._build_image_content(images),
+        )
+        response = self._client.responses.create(**request)
+        return OpenAITextResponse(
+            text=self._extract_output_text(response),
+            response_id=getattr(response, "id", None),
+            request_id=getattr(response, "_request_id", None),
+            model=extract_model_name(response, request["model"]),
+            token_usage=extract_token_usage(response),
             used_web_search=self._used_web_search(response),
         )
 
@@ -176,7 +288,7 @@ class OpenAIBackend:
         request = self._build_response_request(
             prompt,
             conversation=conversation,
-            instructions=merge_instructions(self._base_instructions, instructions),
+            instructions=merge_instructions(self._resolve_base_instructions(), instructions),
             allow_web_search=allow_web_search,
             model=self.config.default_model,
             reasoning_effort=self.config.openai_reasoning_effort,
@@ -192,8 +304,60 @@ class OpenAIBackend:
             text=self._extract_output_text(response),
             response_id=getattr(response, "id", None),
             request_id=getattr(response, "_request_id", None),
+            model=extract_model_name(response, request["model"]),
+            token_usage=extract_token_usage(response),
             used_web_search=self._used_web_search(response),
         )
+
+    def search_live_info_with_metadata(
+        self,
+        question: str,
+        *,
+        conversation: ConversationLike | None = None,
+        location_hint: str | None = None,
+        date_context: str | None = None,
+    ) -> OpenAISearchResult:
+        normalized_question = question.strip()
+        if not normalized_question:
+            raise RuntimeError("search_live_info requires a non-empty question")
+        prompt = self._build_search_prompt(
+            normalized_question,
+            location_hint=location_hint,
+            date_context=date_context,
+        )
+        instructions = merge_instructions(self._resolve_base_instructions(), SEARCH_AGENT_INSTRUCTIONS)
+        best_result: OpenAISearchResult | None = None
+
+        for model in self._candidate_search_models():
+            for max_output_tokens in (320, 480):
+                request = self._build_response_request(
+                    prompt,
+                    conversation=conversation,
+                    instructions=instructions,
+                    allow_web_search=True,
+                    model=model,
+                    reasoning_effort="medium",
+                    max_output_tokens=max_output_tokens,
+                )
+                request["include"] = ["web_search_call.action.sources"]
+                response = self._client.responses.create(**request)
+                candidate = OpenAISearchResult(
+                    answer=self._sanitize_search_answer(self._extract_output_text(response)),
+                    sources=self._extract_web_search_sources(response),
+                    response_id=getattr(response, "id", None),
+                    request_id=getattr(response, "_request_id", None),
+                    model=extract_model_name(response, model),
+                    token_usage=extract_token_usage(response),
+                    used_web_search=self._used_web_search(response),
+                )
+                if candidate.answer and not self._response_has_incomplete_message(response):
+                    return candidate
+                if candidate.answer and (best_result is None or len(candidate.answer) > len(best_result.answer)):
+                    best_result = candidate
+
+        if best_result is not None:
+            return best_result
+        raise RuntimeError("OpenAI web search returned no usable answer text")
 
     def synthesize(
         self,
@@ -312,6 +476,8 @@ class OpenAIBackend:
             text=self._extract_output_text(response),
             response_id=getattr(response, "id", None),
             request_id=getattr(response, "_request_id", None),
+            model=extract_model_name(response, request["model"]),
+            token_usage=extract_token_usage(response),
             used_web_search=False,
         )
 
@@ -364,6 +530,8 @@ class OpenAIBackend:
             text=final_text,
             response_id=getattr(response, "id", None),
             request_id=getattr(response, "_request_id", None),
+            model=extract_model_name(response, request["model"]),
+            token_usage=extract_token_usage(response),
             used_web_search=False,
         )
 
@@ -416,10 +584,11 @@ class OpenAIBackend:
         model: str,
         reasoning_effort: str,
         max_output_tokens: int | None = None,
+        extra_user_content: Sequence[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": model,
-            "input": self._build_input(prompt, conversation),
+            "input": self._build_input(prompt, conversation, extra_user_content=extra_user_content),
             "reasoning": {"effort": reasoning_effort},
             "store": False,
         }
@@ -439,6 +608,8 @@ class OpenAIBackend:
         self,
         prompt: str,
         conversation: ConversationLike | None = None,
+        *,
+        extra_user_content: Sequence[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         if conversation:
@@ -452,13 +623,35 @@ class OpenAIBackend:
                         "content": [{"type": self._content_type_for_role(role), "text": content}],
                     }
                 )
-        messages.append(
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": prompt.strip()}],
-            }
-        )
+        user_content: list[dict[str, Any]] = []
+        prompt_text = prompt.strip()
+        if prompt_text:
+            user_content.append({"type": "input_text", "text": prompt_text})
+        if extra_user_content:
+            user_content.extend(extra_user_content)
+        messages.append({"role": "user", "content": user_content})
         return messages
+
+    def _build_image_content(self, images: Sequence[OpenAIImageInput]) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = []
+        for image in images:
+            if image.label:
+                content.append({"type": "input_text", "text": image.label})
+            image_item: dict[str, Any] = {
+                "type": "input_image",
+                "image_url": self._image_data_url(image),
+            }
+            detail = (image.detail or self.config.openai_vision_detail or "").strip()
+            if detail:
+                image_item["detail"] = detail
+            content.append(image_item)
+        return content
+
+    def _image_data_url(self, image: OpenAIImageInput) -> str:
+        if not image.content_type.startswith("image/"):
+            raise ValueError(f"Unsupported image content type: {image.content_type}")
+        encoded = base64.b64encode(image.data).decode("ascii")
+        return f"data:{image.content_type};base64,{encoded}"
 
     def _coerce_message(self, item: object) -> tuple[str, str]:
         if isinstance(item, tuple) and len(item) == 2:
@@ -497,6 +690,23 @@ class OpenAIBackend:
         if not any(value for key, value in fields.items() if key != "type"):
             return None
         return {key: value for key, value in fields.items() if value}
+
+    def _build_search_prompt(
+        self,
+        question: str,
+        *,
+        location_hint: str | None,
+        date_context: str | None,
+    ) -> str:
+        parts = [f"User question: {question}"]
+        resolved_location = (location_hint or self.config.openai_web_search_city or "").strip()
+        if resolved_location:
+            parts.append(f"Location hint: {resolved_location}")
+        resolved_date_context = (date_context or self._relative_date_context()).strip()
+        if resolved_date_context:
+            parts.append(f"Local date/time context: {resolved_date_context}")
+        parts.append("Answer now with the best live information you can verify from web search.")
+        return "\n".join(parts)
 
     def _extract_output_text(self, response: Any) -> str:
         text = str(getattr(response, "output_text", "")).strip()
@@ -611,3 +821,66 @@ class OpenAIBackend:
             if getattr(item, "type", None) in {"web_search_call", "web_search_preview_call"}:
                 return True
         return False
+
+    def _extract_web_search_sources(self, response: Any) -> tuple[str, ...]:
+        urls: list[str] = []
+        for item in getattr(response, "output", None) or []:
+            if getattr(item, "type", None) not in {"web_search_call", "web_search_preview_call"}:
+                continue
+            action = getattr(item, "action", None)
+            sources = getattr(action, "sources", None)
+            if sources is None and isinstance(action, dict):
+                sources = action.get("sources")
+            for source in sources or []:
+                url = getattr(source, "url", None)
+                if url is None and isinstance(source, dict):
+                    url = source.get("url")
+                normalized = str(url or "").strip()
+                if normalized and normalized not in urls:
+                    urls.append(normalized)
+        return tuple(urls)
+
+    def _relative_date_context(self) -> str:
+        timezone_name = self.config.openai_web_search_timezone or "Europe/Berlin"
+        try:
+            zone = ZoneInfo(timezone_name)
+        except Exception:
+            zone = ZoneInfo("UTC")
+            timezone_name = "UTC"
+        now = datetime.now(zone)
+        return f"{now.strftime('%A, %Y-%m-%d %H:%M')} ({timezone_name})"
+
+    def _candidate_search_models(self) -> tuple[str, ...]:
+        candidates: list[str] = []
+        for model in (
+            self.config.openai_search_model,
+            *SEARCH_MODEL_FALLBACKS,
+            self.config.default_model,
+        ):
+            normalized = str(model or "").strip()
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
+        return tuple(candidates)
+
+    def _response_has_incomplete_message(self, response: Any) -> bool:
+        for item in getattr(response, "output", None) or []:
+            if getattr(item, "type", None) != "message":
+                continue
+            if getattr(item, "status", None) == "incomplete":
+                return True
+        return False
+
+    def _sanitize_search_answer(self, text: str) -> str:
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace("**", "").strip()
+        if not normalized:
+            return normalized
+        cleaned_lines: list[str] = []
+        for raw_line in normalized.split("\n"):
+            line = re.sub(r"^[-*•]\s*", "", raw_line.strip())
+            line = " ".join(line.split())
+            if line:
+                cleaned_lines.append(line)
+        cleaned = " ".join(cleaned_lines).strip() or normalized
+        while cleaned and cleaned[-1] in "([{-–,:;":
+            cleaned = cleaned[:-1].rstrip()
+        return cleaned

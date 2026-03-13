@@ -1,0 +1,105 @@
+# Bug Finding Template (shipped)
+#
+# This template is copied into `artifacts/stores/findings/templates/` by `findings init`.
+#
+# Notes:
+# - Keep this file tracked under git (unlike state/).
+# - Prefer stable IDs produced by `findings create` (default: FND000001 style).
+# - Boundary: Findings = observed bugs/smells (actionable intake). Hypotheses = falsifiable theories/predictions + evidence.
+
+finding:
+  id: "FND000001"
+  status: "open"                 # open|triaged|in_progress|blocked|resolved|wont_fix|duplicate
+  addressed: false               # "checkmark": true once converted into a Task/UserTask/Work item
+  addressed_at_utc: ""           # UTC ISO8601 '...Z' (optional; set when addressed=true)
+  severity: "p2"                 # p0|p1|p2|p3
+
+  scope: "trading"               # trading|analytics|infra|codebase|ops|portal|research
+  mode: "dev"                    # live|shadow|backtest|replay|backfill|train|eval|dev|test
+  repo_area: "services"          # services|scripts|tests|clickhouse|systemd|config|contracts|analytics|migration|consumer|common|infra|docs
+
+  target:
+    kind: "script"               # service|script|test|sql|proto|systemd|config|lib|contract|doc|topic|table|other
+    path: "services/..."         # repo-relative when applicable
+    systemd_unit: ""             # optional: caia-*.service
+    topics: []                   # optional: ["analytics.foo", ...]
+    tables_views: []             # optional: ["caia.v_cost_truth_pf_xbtusd", ...]
+    horizon_H_seconds: null      # optional but strongly recommended for trading/analytics findings
+    asset: ""                    # optional (e.g., btc)
+    venue: ""                    # optional (e.g., kraken_futures)
+    instrument: ""               # optional (e.g., pf_xbtusd)
+
+  title: ""
+  summary: ""                    # 1–3 sentences; search-friendly
+
+  provenance:
+    discovered_at_utc: "YYYY-MM-DDTHH:MM:SSZ"
+    author: ""
+    skill: ""                    # bugfinding|intersect|quantaudit|manual
+    run_id: ""
+    commit: ""
+
+  classification:
+    bug_type: ""
+    symptom: ""
+    root_cause: ""
+    failure_mode: ""
+    impact_area: ""
+
+  related:
+    task_ids: []
+    hypothesis_ids: []
+    fixreport_ids: []
+    quantaudit:
+      bundle: ""
+      report_id: ""
+      local_finding_id: ""
+
+links:
+  - "script:services/..."
+
+narrative:
+  repro: ""
+  expected: ""
+  observed: ""
+  impact: ""
+  notes: ""
+
+evidence:
+  code:
+    - file: "services/..."
+      lines: "L123-L170"
+      snippet: ""
+  logs:
+    - path: "logs/..."
+      excerpt: ""
+  data:
+    - kind: "clickhouse_query"
+      query: ""
+      result_hint: ""
+  research:
+    - source: ""
+      locator: ""
+      quote_or_paraphrase: ""
+
+actions:
+  - id: "A0001"
+    kind: "task"                 # task|fix|research|monitoring|rollback
+    priority: "p2"
+    title: ""
+    description: ""
+    suggested_task:
+      board_task_id: ""
+      tags: ["finding"]
+      links:
+        - "finding:FND000001"
+        - "script:services/..."
+    acceptance_criteria: []
+    validation_steps:
+      - command: ""
+      - check: ""
+
+resolution:
+  resolved_at_utc: ""
+  fixreport_id: ""
+  notes: ""

@@ -31,3 +31,5 @@ The Python helper in `src/twinr/hardware/buttons.py` exposes:
 - `build_button_bindings()` for mapping config to green/yellow buttons
 - `configured_button_monitor()` for the main Twinr event loop
 - `GpioButtonMonitor` for direct GPIO polling and edge handling
+
+The PIR motion sensor lives separately under `hardware/pir/` and should not share the button GPIO lines.

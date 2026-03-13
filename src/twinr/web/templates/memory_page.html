@@ -5,7 +5,7 @@
   <div class="section-header">
     <div>
       <h2>Live memory snapshot</h2>
-      <p class="section-description">This is the current memory content from the active Twinr runtime process.</p>
+      <p class="section-description">This is the current structured memory state from the active Twinr runtime process.</p>
     </div>
   </div>
   <div class="stats-grid">
@@ -14,7 +14,7 @@
       <span class="stat-value">{{ snapshot.status }}</span>
     </div>
     <div class="stat-tile">
-      <span class="stat-label">Turns</span>
+      <span class="stat-label">Context turns</span>
       <span class="stat-value">{{ snapshot.memory_count }}</span>
     </div>
     <div class="stat-tile">
@@ -25,8 +25,65 @@
       <span class="stat-label">Updated</span>
       <span class="stat-value stat-value-small">{{ snapshot.updated_at or "—" }}</span>
     </div>
+    <div class="stat-tile">
+      <span class="stat-label">Raw tail</span>
+      <span class="stat-value">{{ snapshot.memory_raw_tail|length }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Ledger</span>
+      <span class="stat-value">{{ snapshot.memory_ledger|length }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Search results</span>
+      <span class="stat-value">{{ snapshot.memory_search_results|length }}</span>
+    </div>
   </div>
 
+  <div class="section-header">
+    <div>
+      <h2>Memory state</h2>
+      <p class="section-description">Compact state fields drive the next turn without replaying the full conversation.</p>
+    </div>
+  </div>
+  <div class="stats-grid">
+    <div class="stat-tile">
+      <span class="stat-label">Active topic</span>
+      <span class="stat-value stat-value-small">{{ snapshot.memory_state.active_topic or "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Last user goal</span>
+      <span class="stat-value stat-value-small">{{ snapshot.memory_state.last_user_goal or "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Pending printable</span>
+      <span class="stat-value stat-value-small">{{ snapshot.memory_state.pending_printable or "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Last search summary</span>
+      <span class="stat-value stat-value-small">{{ snapshot.memory_state.last_search_summary or "—" }}</span>
+    </div>
+  </div>
+  <div class="memory-list">
+    <article class="memory-turn">
+      <div class="memory-turn-meta">
+        <span class="role-badge role-system">open_loops</span>
+      </div>
+      <div class="memory-content">
+        {% if snapshot.memory_state.open_loops %}
+        {{ snapshot.memory_state.open_loops|join(" | ") }}
+        {% else %}
+        —
+        {% endif %}
+      </div>
+    </article>
+  </div>
+
+  <div class="section-header">
+    <div>
+      <h2>Context sent to the model</h2>
+      <p class="section-description">This is the compacted view Twinr currently replays into the next turn.</p>
+    </div>
+  </div>
   {% if snapshot.memory_turns %}
   <div class="memory-list">
     {% for turn in snapshot.memory_turns %}
@@ -40,11 +97,158 @@
     {% endfor %}
   </div>
   {% else %}
-  <div class="empty-state">No turns are stored yet. Start a conversation and refresh this page.</div>
+  <div class="empty-state">No context turns are stored yet. Start a conversation and refresh this page.</div>
+  {% endif %}
+
+  <div class="section-header">
+    <div>
+      <h2>Raw tail</h2>
+      <p class="section-description">Most recent verbatim turns kept before compaction.</p>
+    </div>
+  </div>
+  {% if snapshot.memory_raw_tail %}
+  <div class="memory-list">
+    {% for turn in snapshot.memory_raw_tail %}
+    <article class="memory-turn">
+      <div class="memory-turn-meta">
+        <span class="role-badge role-{{ turn.role }}">{{ turn.role }}</span>
+        <span class="memory-time">{{ turn.created_at }}</span>
+      </div>
+      <div class="memory-content">{{ turn.content }}</div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No raw-tail turns are stored yet.</div>
+  {% endif %}
+
+  <div class="section-header">
+    <div>
+      <h2>Ledger</h2>
+      <p class="section-description">Compacted facts and summaries that survive tail compaction.</p>
+    </div>
+  </div>
+  {% if snapshot.memory_ledger %}
+  <div class="memory-list">
+    {% for item in snapshot.memory_ledger %}
+    <article class="memory-turn">
+      <div class="memory-turn-meta">
+        <span class="role-badge role-system">{{ item.kind }}</span>
+        <span class="memory-time">{{ item.created_at }}</span>
+      </div>
+      <div class="memory-content">{{ item.content }}</div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No ledger entries are stored yet.</div>
+  {% endif %}
+
+  <div class="section-header">
+    <div>
+      <h2>Recent search results</h2>
+      <p class="section-description">Typed web lookups preserved for later turns, printing, and operator inspection.</p>
+    </div>
+  </div>
+  {% if snapshot.memory_search_results %}
+  <div class="memory-list">
+    {% for item in snapshot.memory_search_results %}
+    <article class="memory-turn">
+      <div class="memory-turn-meta">
+        <span class="role-badge role-system">search</span>
+        <span class="memory-time">{{ item.created_at }}</span>
+      </div>
+      <div class="memory-content">
+        <strong>Question:</strong> {{ item.question }}<br>
+        <strong>Answer:</strong> {{ item.answer }}<br>
+        <strong>Sources:</strong>
+        {% if item.sources %}
+        {{ item.sources|join(", ") }}
+        {% else %}
+        —
+        {% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No search results are stored yet.</div>
   {% endif %}
 </section>
 
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Durable memories</h2>
+      <p class="section-description">Only explicit “remember this” items belong here. This list is separate from the rolling conversation snapshot.</p>
+    </div>
+  </div>
+  <div class="stats-grid">
+    <div class="stat-tile">
+      <span class="stat-label">File</span>
+      <span class="stat-value stat-value-small">{{ durable_memory_path }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Saved items</span>
+      <span class="stat-value">{{ durable_memory_entries|length }}</span>
+    </div>
+  </div>
+  {% if durable_memory_entries %}
+  <div class="memory-list">
+    {% for entry in durable_memory_entries %}
+    <article class="memory-turn">
+      <div class="memory-turn-meta">
+        <span class="role-badge role-system">{{ entry.kind }}</span>
+        <span class="memory-time">{{ entry.updated_at.isoformat() }}</span>
+      </div>
+      <div class="memory-content">
+        <strong>{{ entry.summary }}</strong>
+        {% if entry.details %}
+        <br>{{ entry.details }}
+        {% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No durable memories are stored yet.</div>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Add durable memory</h2>
+      <p class="section-description">Use this only for facts Twinr should keep for later, such as appointments, contacts, or long-lived preferences.</p>
+    </div>
+  </div>
+  <form method="post" action="{{ form_action }}" class="stack">
+    <input type="hidden" name="_action" value="add_memory">
+    <div class="form-grid">
+      <label class="field">
+        <span class="field-label">Type</span>
+        <input type="text" name="memory_kind" value="" placeholder="appointment">
+        <span class="field-help">Short category such as appointment, contact, medication, or preference.</span>
+      </label>
+      <label class="field field-span-2">
+        <span class="field-label">Summary</span>
+        <textarea name="memory_summary" rows="4" placeholder="Arzttermin am Montag um 14 Uhr."></textarea>
+        <span class="field-help">Keep it short. This becomes the primary durable memory line.</span>
+      </label>
+      <label class="field field-span-2">
+        <span class="field-label">Details</span>
+        <textarea name="memory_details" rows="4" placeholder="Bei Dr. Meyer in Hamburg."></textarea>
+        <span class="field-help">Optional extra detail if the memory needs more context.</span>
+      </label>
+    </div>
+    <div class="actions">
+      <button type="submit">Save durable memory</button>
+    </div>
+  </form>
+</section>
+
 <form method="post" action="{{ form_action }}" class="stack">
+  <input type="hidden" name="_action" value="save_settings">
   {% for section in sections %}
   <section class="panel">
     <div class="section-header">

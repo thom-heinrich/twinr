@@ -218,7 +218,9 @@ h2 {
 .card-grid,
 .stats-grid,
 .key-value-grid,
-.form-grid {
+.form-grid,
+.detail-grid,
+.action-grid {
   display: grid;
   gap: var(--space-4);
 }
@@ -237,10 +239,22 @@ h2 {
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
 }
 
+.detail-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.action-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
 .card,
 .panel,
 .stat-tile,
-.memory-turn {
+.memory-turn,
+.detail-card,
+.action-card,
+.log-entry,
+.check-row {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   box-shadow: var(--shadow-surface);
@@ -249,6 +263,13 @@ h2 {
 .card,
 .panel {
   border-radius: var(--radius-lg);
+}
+
+.detail-card,
+.action-card,
+.log-entry,
+.check-row {
+  border-radius: var(--radius-md);
 }
 
 .card {
@@ -295,6 +316,13 @@ h2 {
   margin-bottom: var(--space-4);
 }
 
+.detail-card,
+.action-card,
+.log-entry,
+.check-row {
+  padding: var(--space-4);
+}
+
 .section-header {
   display: flex;
   align-items: flex-start;
@@ -317,9 +345,15 @@ h2 {
   gap: var(--space-3);
 }
 
+.top-gap {
+  margin-top: var(--space-4);
+}
+
 .key-value,
 .field,
-.stat-tile {
+.stat-tile,
+.detail-card,
+.action-card {
   display: grid;
 }
 
@@ -336,18 +370,40 @@ h2 {
 
 .stat-label,
 .field-label,
-.key {
+.key,
+.detail-label {
   font-size: var(--font-size-sm);
 }
 
 .stat-label,
-.field-label {
+.field-label,
+.detail-label {
   color: var(--color-text-muted);
   font-weight: 600;
 }
 
+.detail-body {
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+}
+
+.detail-body-copy {
+  font-size: var(--font-size-md);
+  font-weight: 500;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.detail-card-wide {
+  grid-column: 1 / -1;
+}
+
 .field-control {
   display: block;
+}
+
+.field-span-2 {
+  grid-column: span 2;
 }
 
 input,
@@ -388,6 +444,10 @@ button {
 .actions {
   display: flex;
   justify-content: flex-end;
+}
+
+.actions-start {
+  justify-content: flex-start;
 }
 
 .stack {
@@ -455,6 +515,130 @@ button {
   background: rgba(14, 21, 48, 0.5);
 }
 
+.compact-grid {
+  margin-top: var(--space-4);
+}
+
+.link-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  margin-top: var(--space-4);
+}
+
+.inline-link {
+  color: #b9ccff;
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.inline-link:hover {
+  text-decoration: underline;
+}
+
+.muted-inline {
+  color: var(--color-text-muted);
+}
+
+.status-pill,
+.log-level {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 10px;
+  border-radius: var(--radius-pill);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.status-pill.is-ok,
+.log-level.is-info {
+  background: rgba(89, 199, 181, 0.16);
+  color: #9ce6db;
+}
+
+.status-pill.is-warn,
+.log-level.is-warn {
+  background: rgba(198, 160, 95, 0.18);
+  color: #efcf9d;
+}
+
+.status-pill.is-fail,
+.log-level.is-error {
+  background: rgba(208, 85, 117, 0.18);
+  color: #ffb4c4;
+}
+
+.action-card {
+  gap: var(--space-3);
+}
+
+.action-card-copy,
+.check-row-detail,
+.log-time {
+  color: var(--color-text-muted);
+}
+
+.action-card-title,
+.check-row-title,
+.log-event {
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+}
+
+.check-list,
+.log-list {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.compact-log-list {
+  margin-top: var(--space-3);
+}
+
+.check-row,
+.log-entry {
+  gap: var(--space-2);
+}
+
+.check-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: var(--space-4);
+}
+
+.check-row-main {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.log-entry-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+}
+
+.log-message {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-data {
+  margin: 0;
+  padding: var(--space-4);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
+  background: #0e1530;
+  color: var(--color-text-muted);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 @media (max-width: 900px) {
   .shell {
     grid-template-columns: 1fr;
@@ -472,7 +656,8 @@ button {
   }
 
   .page-header,
-  .memory-turn-meta {
+  .memory-turn-meta,
+  .check-row {
     flex-direction: column;
     align-items: flex-start;
   }

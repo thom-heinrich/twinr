@@ -17,6 +17,7 @@ class TwinrEvent(StrEnum):
     GREEN_BUTTON_PRESSED = "green_button_pressed"
     SPEECH_PAUSE_DETECTED = "speech_pause_detected"
     RESPONSE_READY = "response_ready"
+    PROACTIVE_PROMPT_READY = "proactive_prompt_ready"
     TTS_FINISHED = "tts_finished"
     YELLOW_BUTTON_PRESSED = "yellow_button_pressed"
     PRINT_REQUESTED = "print_requested"
@@ -33,6 +34,7 @@ _TRANSITIONS: dict[TwinrStatus, dict[TwinrEvent, TwinrStatus]] = {
     TwinrStatus.WAITING: {
         TwinrEvent.GREEN_BUTTON_PRESSED: TwinrStatus.LISTENING,
         TwinrEvent.YELLOW_BUTTON_PRESSED: TwinrStatus.PRINTING,
+        TwinrEvent.PROACTIVE_PROMPT_READY: TwinrStatus.ANSWERING,
     },
     TwinrStatus.LISTENING: {
         TwinrEvent.SPEECH_PAUSE_DETECTED: TwinrStatus.PROCESSING,

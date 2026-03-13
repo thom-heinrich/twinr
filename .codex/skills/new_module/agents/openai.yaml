@@ -1,0 +1,4 @@
+interface:
+  display_name: "New Module"
+  short_description: "Build Twinr modules in the correct repo location with tests and operator clarity"
+  default_prompt: "Use $new_module to design and implement a new Twinr capability in the correct repo area with tests, docs, and clear operational boundaries."

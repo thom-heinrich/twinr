@@ -1,0 +1,3323 @@
+#!/usr/bin/env python3
+"""Multi-agent collaboration task tracker CLI for AI/human agents.
+
+Key properties:
+- Pure Python standard library (no external dependencies).
+- Stores its state in a JSON file in the current working directory by default.
+- File-based locking to avoid corruption when multiple agents modify the board.
+- JSON-only, deterministic output tuned for LLM / agent consumption.
+- Supports task leasing so agents can "pull" work without collisions.
+- Adds explicit multi-agent collaboration metadata, events, and per-agent plans.
+
+Design goals:
+- Simple, explicit commands (read, add, update, move, pull, release, delete,
+  init, schema, relate, log, events, agent-touch, agent-view, plan).
+- No dependence on stable agent IDs; leases use whatever identifier
+  the caller provides.
+- All commands are idempotent where practical, safe to call from tools.
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from common.links.tessairact_meta import extract_link_tokens_from_texts
+
+from _store_layout import ensure_parent_dir, resolve_repo_path, resolve_store_file
+
+from agentic_tools._governance_locking import FileLockTimeout as _GovernanceFileLockTimeout
+from agentic_tools._governance_locking import GovernanceFileLock as _GovernanceFileLock
+from agentic_tools._governance_locking import resolve_lock_settings as _resolve_governance_lock_settings
+from agentic_tools._governance_locking import resolve_retry_budget as _resolve_governance_retry_budget
+from agentic_tools._governance_locking import resolve_retry_poll as _resolve_governance_retry_poll
+from agentic_tools._governance_locking import run_mutation_with_retry as _run_governance_mutation_with_retry
+from agentic_tools.codexctx import append_codex_links
+from agentic_tools.process_hints import enrich_payload_with_hints
+from agentic_tools.process_hints import hints_schema_fragment
+from agentic_tools.process_hints import next_steps_for_task_action
+
+# Canonical store filename for the shared task board (legacy-safe).
+BOARD_DEFAULT_FILENAME = str(
+    resolve_store_file(
+        env_keys=("TASKS_FILE", "KANBAN_FILE"),
+        legacy_rel=".kanban_board.json",
+        canonical_rel="tasks/board.json",
+        repo_root=REPO_ROOT,
+    )
+)
+DEFAULT_COLUMNS = ["backlog", "todo", "doing", "review", "done"]
+DONE_STATUSES = {"done", "archived"}
+IN_PROGRESS_STATUSES = {"in_progress", "review"}
+MAX_EVENTS = int(
+    os.environ.get("TASKS_MAX_EVENTS")
+    or os.environ.get("KANBAN_MAX_EVENTS", "20000")
+)
+LINK_TOKEN_RE = re.compile(r"^[a-z][a-z0-9_]{0,32}:[A-Za-z0-9._:/@+-]{1,256}$")
+_ERROR_CODE_TOKEN_RE = re.compile(r"[^A-Za-z0-9]+")
+_TASK_ID_HEX_RE = re.compile(r"^[0-9a-f]{8,64}$")
+
+_JSON_PRETTY = False
+
+
+GOVERNANCE_HINT_TASKS = (
+    "Governance: When you work on a task and modify scripts or services, "
+    "record a brief entry in `scripthistory` (for example with "
+    "`scripthistory add-change` or `add-knowledge`). If your work creates, "
+    "tests, or updates a trading/analytics hypothesis, also use the "
+    "`hypothesis` tool to capture or update it so reasoning and provenance "
+    "stay aligned. IMPORTANT: By default, new tasks MUST be anchored with at "
+    "least one explicit `script:<repo_relative_path>` token in task.links "
+    "(see architecture/LINKS_CONTRACT.md). If you are creating an *intake* "
+    "task that intentionally has no script anchor yet (e.g. a portal "
+    "user-request), pass `--allow-no-script-anchor` to `tasks add`."
+)
+
+
+def attach_governance_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach a cross-tool governance hint to every API-style response."""
+    if isinstance(payload, dict):
+        _normalize_error_envelope(payload)
+        payload = enrich_payload_with_hints(payload, tool="tasks")
+    if isinstance(payload, dict) and "governance_hint" not in payload:
+        payload["governance_hint"] = GOVERNANCE_HINT_TASKS
+    return payload
+
+
+def _looks_like_task_id(value: str) -> bool:
+    """
+    Heuristic: identify a task id passed positionally where argparse expects a column.
+
+    Tasks created by this tool typically use short hex ids (e.g. 'aeded7f52295').
+    We intentionally keep this conservative to avoid misclassifying real column names.
+    """
+    s = str(value or "").strip().lower()
+    return bool(s and _TASK_ID_HEX_RE.fullmatch(s))
+
+
+def _derive_error_code(error: Any) -> str:
+    value = str(error or "").strip()
+    if not value:
+        return "UNKNOWN_ERROR"
+    return _ERROR_CODE_TOKEN_RE.sub("_", value).strip("_").upper() or "UNKNOWN_ERROR"
+
+
+def _default_retryable(error_code: str) -> bool:
+    code = str(error_code or "").upper()
+    if code in {"LOCK_TIMEOUT", "TIMEOUT", "IO_ERROR"}:
+        return True
+    if "TIMEOUT" in code or "LOCK" in code:
+        return True
+    return False
+
+
+def _normalize_error_envelope(payload: Dict[str, Any]) -> None:
+    """Ensure all error payloads expose the standard machine envelope."""
+    if not isinstance(payload, dict):
+        return
+    if payload.get("ok") is not False:
+        return
+    error = str(payload.get("error") or "unknown_error")
+    payload["error"] = error
+    payload["detail"] = str(payload.get("detail") or "")
+    error_code = str(payload.get("error_code") or "").strip() or _derive_error_code(error)
+    payload["error_code"] = error_code
+    if "retryable" not in payload:
+        payload["retryable"] = _default_retryable(error_code)
+
+
+class _TaskUserError(Exception):
+    """Raised when a JSON payload should be emitted and the CLI should exit."""
+
+    def __init__(self, payload: Dict[str, Any], exit_code: int = 1) -> None:
+        super().__init__(str(payload.get("error") or "task_user_error"))
+        self.payload = payload
+        self.exit_code = int(exit_code)
+
+
+def _json_dumps(payload: Any, *, pretty: bool) -> str:
+    if pretty:
+        return json.dumps(payload, indent=2, sort_keys=True)
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def _emit_json(payload: Any, *, pretty: Optional[bool] = None) -> None:
+    if pretty is None:
+        pretty = bool(_JSON_PRETTY)
+    out = attach_governance_hint(payload) if isinstance(payload, dict) else payload
+    try:
+        sys.stdout.write(_json_dumps(out, pretty=bool(pretty)) + "\n")
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+
+
+class _TaskArgparseError(Exception):
+    """Raised when argument parsing fails and a JSON envelope should be emitted."""
+
+    def __init__(self, message: str, usage: str = "") -> None:
+        super().__init__(message)
+        self.message = str(message)
+        self.usage = str(usage or "")
+
+
+class _TaskArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser variant that keeps stdout machine-oriented on failures."""
+
+    def error(self, message: str) -> None:  # noqa: A003 (argparse API)
+        raise _TaskArgparseError(str(message), self.format_usage())
+
+
+_MUTATING_TASK_HANDLERS = frozenset(
+    {
+        "cmd_init",
+        "cmd_add",
+        "cmd_update",
+        "cmd_move",
+        "cmd_delete",
+        "cmd_pull",
+        "cmd_release",
+        "cmd_relate",
+        "cmd_log",
+        "cmd_agent_touch",
+        "cmd_plan",
+    }
+)
+
+
+def _classify_task_exception(exc: BaseException) -> Tuple[str, Optional[bool]]:
+    if isinstance(exc, _TaskArgparseError):
+        return ("ARGPARSE_ERROR", False)
+    if isinstance(exc, _TaskUserError):
+        return ("TASK_USER_ERROR", False)
+    if isinstance(exc, (FileLockTimeout, _GovernanceFileLockTimeout)):
+        return ("LOCK_TIMEOUT", True)
+    if isinstance(exc, PermissionError):
+        return ("PERMISSION_DENIED", False)
+    if isinstance(exc, FileNotFoundError):
+        return ("NOT_FOUND", False)
+    if isinstance(exc, TimeoutError):
+        return ("TIMEOUT", True)
+    if isinstance(exc, ValueError):
+        return ("VALIDATION_ERROR", False)
+    if isinstance(exc, OSError):
+        return ("IO_ERROR", True)
+    return ("UNHANDLED_EXCEPTION", None)
+
+
+def _tasks_cli_retry_budget_sec() -> float:
+    return _resolve_governance_retry_budget(
+        retry_timeout_env="CAIA_TASKS_CLI_RETRY_TIMEOUT_SEC",
+        lock_timeout_envs=("CAIA_TASKS_LOCK_TIMEOUT_SEC", "TASKS_LOCK_TIMEOUT"),
+        default_lock_timeout=10.0,
+    )
+
+
+def _tasks_cli_retry_poll_sec() -> float:
+    return _resolve_governance_retry_poll(
+        retry_poll_env="CAIA_TASKS_CLI_RETRY_POLL_SEC",
+        default_poll_sec=0.25,
+    )
+
+
+def _emit_tasks_retry(action: str, error_code: str, attempt: int, sleep_s: float, exc: BaseException) -> None:
+    print(
+        f"tasks {action}: retrying after {error_code} (attempt={attempt}, sleep_s={sleep_s:.3f})",
+        file=sys.stderr,
+    )
+
+
+def _run_task_mutation_with_retry(action: str, op: Any) -> None:
+    _run_governance_mutation_with_retry(
+        action=action,
+        op=op,
+        classify_exception=_classify_task_exception,
+        retry_budget_sec=_tasks_cli_retry_budget_sec(),
+        retry_poll_sec=_tasks_cli_retry_poll_sec(),
+        emit_retry=lambda error_code, attempt, sleep_s, exc: _emit_tasks_retry(
+            action,
+            error_code,
+            attempt,
+            sleep_s,
+            exc,
+        ),
+    )
+
+
+def now_iso() -> str:
+    """Return current UTC timestamp in ISO8601 format with 'Z'."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _scan_repo_files_for_script_anchors(repo_root: Path) -> List[str]:
+    """
+    Return candidate repo-relative file paths for script:<path> anchors.
+
+    IMPORTANT: We intentionally avoid `git` here. This repo is often deployed without a
+    git worktree, and agents must still be able to validate script anchors deterministically.
+    """
+    # Keep this intentionally cheap. Most anchors in tasks should be explicit repo-relative paths.
+    # Basename-only anchors are strongly discouraged; we only support repo-root files here.
+    out: List[str] = []
+    for child in repo_root.iterdir():
+        if child.is_file():
+            out.append(child.name)
+    return sorted(set(out))
+
+
+def _git_ls_files(repo_root: Path) -> List[str]:
+    """
+    Backward-compatible test seam for legacy callers that monkeypatch git-backed discovery.
+
+    The tasks tool no longer shells out to `git ls-files`; it uses deterministic local
+    repo scanning instead. This shim preserves the historical hook name for tests and
+    other read-only integrations that still patch it.
+    """
+    return _scan_repo_files_for_script_anchors(Path(repo_root))
+
+
+def _build_repo_file_index(repo_root: Path) -> Tuple[set[str], Dict[str, List[str]]]:
+    repo_files = _scan_repo_files_for_script_anchors(repo_root)
+    repo_files_set = set(repo_files)
+    by_basename: Dict[str, List[str]] = {}
+    for p in repo_files:
+        by_basename.setdefault(Path(p).name, []).append(p)
+    return repo_files_set, by_basename
+
+
+def _is_reasonable_script_anchor_path(path: str) -> bool:
+    p = (path or "").strip()
+    if not p:
+        return False
+    if p.startswith(
+        (
+            "state/",
+            "reports/",
+            "research/",
+            "artifacts/stores/",
+            "artifacts/reports/",
+            "logs/",
+            "exports/",
+        )
+    ):
+        return False
+    if p.startswith("__ignore__/"):
+        return False
+    if "/__pycache__/" in p or p.endswith("/__pycache__/"):
+        return False
+    return True
+
+
+def _normalize_repo_path(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if s.startswith("./"):
+        s = s[2:]
+    rp = str(REPO_ROOT) + "/"
+    if s.startswith(rp):
+        s = s[len(rp) :]
+    rp_noslash = str(REPO_ROOT).lstrip("/") + "/"
+    if s.startswith(rp_noslash):
+        s = s[len(rp_noslash) :]
+    if s.startswith("/etc/systemd/system/"):
+        unit = s.split("/etc/systemd/system/", 1)[1]
+        s = f"systemd/units/{unit}"
+    return s
+
+
+def _resolve_repo_path(
+    raw: str,
+    *,
+    repo_files_set: set[str],
+    by_basename: Dict[str, List[str]],
+) -> Optional[str]:
+    s = _normalize_repo_path(raw)
+    if not s:
+        return None
+
+    if any(part == ".." for part in Path(s).parts):
+        return None
+
+    if not _is_reasonable_script_anchor_path(s):
+        return None
+
+    # Prefer filesystem truth over any external index. Some deployments lack a git worktree
+    # (or include untracked-but-real repo files like audit/*), but anchors should still resolve.
+    if (REPO_ROOT / s).is_file():
+        return s
+    if repo_files_set and s in repo_files_set:
+        return s
+
+    # Basename-only fallback (unique only).
+    if "/" not in s:
+        # Accept repo-root files directly (e.g. ".env.example").
+        if (REPO_ROOT / s).is_file():
+            return s
+        candidates = sorted(set(by_basename.get(Path(s).name, [])))
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
+
+def _path_rank(path: str) -> Tuple[int, str]:
+    if path.startswith("services/"):
+        return (0, path)
+    if path.startswith("scripts/"):
+        return (1, path)
+    if path.startswith("systemd/units/"):
+        return (2, path)
+    if path.startswith("agentic_tools/"):
+        return (3, path)
+    if path.startswith("llm/"):
+        return (4, path)
+    if path.startswith("artifacts/llm/"):
+        return (4, path)
+    if path.startswith("artifacts/evaluations/"):
+        return (5, path)
+    if path.startswith("artifacts/audit/"):
+        return (6, path)
+    return (10, path)
+
+
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for x in items:
+        x = str(x).strip()
+        if not x or x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def _as_string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        out: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                out.append(text)
+        return out
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    return []
+
+
+def _pick_first_nonempty(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _collect_text_blobs_for_link_extraction(value: Any, *, max_items: int = 200) -> List[str]:
+    """
+    Collect string blobs for link extraction from an arbitrary JSON-like value.
+
+    Policy:
+    - recurse through dict/list structures
+    - skip common non-text keys (links/metadata) to avoid echoing already-normalized tokens
+    - cap items to keep work bounded
+    """
+    out: List[str] = []
+
+    def _walk(v: Any) -> None:
+        if len(out) >= int(max_items):
+            return
+        if isinstance(v, str):
+            s = v.strip()
+            if s:
+                out.append(s)
+            return
+        if isinstance(v, dict):
+            for k, vv in v.items():
+                if len(out) >= int(max_items):
+                    return
+                if str(k) in {"links", "metadata"}:
+                    continue
+                _walk(vv)
+            return
+        if isinstance(v, list):
+            for vv in v:
+                if len(out) >= int(max_items):
+                    return
+                _walk(vv)
+            return
+
+    _walk(value)
+    return out
+
+
+def _normalize_and_validate_links(
+    links: List[str],
+    *,
+    repo_files_set: set[str],
+    by_basename: Dict[str, List[str]],
+    require_script_anchor: bool,
+) -> List[str]:
+    raw = [str(x).strip() for x in links if isinstance(x, str) and str(x).strip()]
+    raw = _dedupe_keep_order(raw)
+
+    bad = [x for x in raw if not LINK_TOKEN_RE.fullmatch(x)]
+    if bad:
+        raise _TaskUserError(
+            {
+                "ok": False,
+                "error": "invalid_link",
+                "detail": "Invalid link token(s). Expected '<kind>:<id>' (no whitespace). See architecture/LINKS_CONTRACT.md.",
+                "bad": bad[:20],
+            }
+        )
+
+    normalized: List[str] = []
+    unresolved_scripts: List[str] = []
+    for token in raw:
+        if not token.startswith("script:"):
+            normalized.append(token)
+            continue
+        raw_path = token.split("script:", 1)[1].strip()
+        rp = _resolve_repo_path(raw_path, repo_files_set=repo_files_set, by_basename=by_basename)
+        if rp is None:
+            unresolved_scripts.append(raw_path)
+            continue
+        normalized.append(f"script:{rp}")
+
+    if unresolved_scripts:
+        raise _TaskUserError(
+            {
+                "ok": False,
+                "error": "invalid_script_anchor",
+                "detail": "One or more script:<path> anchors could not be resolved to a safe repo file path. Use a repo-relative file path under /home/thh/tessairact.",
+                "bad_paths": unresolved_scripts[:20],
+            }
+        )
+
+    # Stable ordering for script anchors improves diffability.
+    scripts = [t for t in normalized if t.startswith("script:")]
+    others = [t for t in normalized if not t.startswith("script:")]
+    scripts_sorted = sorted({t.split("script:", 1)[1] for t in scripts}, key=_path_rank)
+    normalized = _dedupe_keep_order([f"script:{p}" for p in scripts_sorted] + others)
+
+    if require_script_anchor and not any(t.startswith("script:") for t in normalized):
+        raise _TaskUserError(
+            {
+                "ok": False,
+                "error": "missing_script_anchor",
+                "detail": (
+                    "New tasks MUST include at least one explicit script anchor in task.links. "
+                    "Pass --script <repo_relative_path> (repeatable) or --link script:<repo_relative_path>. "
+                    "If this is an unanchored intake task, pass --allow-no-script-anchor."
+                ),
+            }
+        )
+
+    return normalized
+
+
+class FileLockTimeout(_GovernanceFileLockTimeout):
+    """Raised when the shared governance lock budget is exhausted."""
+
+
+class FileLock(_GovernanceFileLock):
+    """Tasks board lock backed by the shared governance lock primitive."""
+
+    def __init__(self, path: Path, timeout: float = 10.0, poll_interval: float = 0.05) -> None:
+        settings = _resolve_governance_lock_settings(
+            timeout_envs=("CAIA_TASKS_LOCK_TIMEOUT_SEC", "TASKS_LOCK_TIMEOUT"),
+            timeout_default=float(timeout),
+            poll_env="CAIA_TASKS_LOCK_POLL_SEC",
+            poll_default=float(poll_interval),
+            stale_env="CAIA_TASKS_LOCK_STALE_SEC",
+            stale_default=120,
+            heartbeat_env="CAIA_TASKS_LOCK_HEARTBEAT_SEC",
+        )
+        super().__init__(
+            path=Path(path),
+            timeout_sec=settings.timeout_sec,
+            poll_sec=settings.poll_sec,
+            stale_after_sec=settings.stale_after_sec,
+            heartbeat_sec=settings.heartbeat_sec,
+        )
+
+
+def column_to_status(column: Optional[str]) -> str:
+    mapping = {
+        "backlog": "open",
+        "todo": "ready",
+        "doing": "in_progress",
+        "review": "review",
+        "done": "done",
+    }
+    if column is None:
+        return "open"
+    return mapping.get(column, "open")
+
+
+def normalize_task(task: Dict[str, Any]) -> None:
+    """Ensure a task dict has all fields needed for collaboration features."""
+    if "column" not in task or not task.get("column"):
+        task["column"] = "backlog"
+
+    if "status" not in task or not isinstance(task["status"], str):
+        task["status"] = column_to_status(task.get("column"))
+
+    if "priority" not in task or task["priority"] is None:
+        task["priority"] = "normal"
+
+    tags = task.get("tags")
+    if tags is None:
+        task["tags"] = []
+    elif not isinstance(tags, list):
+        task["tags"] = [tags]
+
+    relations = task.get("relations")
+    if relations is None:
+        task["relations"] = []
+    elif not isinstance(relations, list):
+        task["relations"] = []
+
+    links = task.get("links")
+    if links is None:
+        task["links"] = []
+    elif not isinstance(links, list):
+        task["links"] = []
+
+    metadata = task.get("metadata")
+    if metadata is None or not isinstance(metadata, dict):
+        task["metadata"] = {}
+
+    if "lease_owner" not in task:
+        task["lease_owner"] = None
+    if "lease_expires_at" not in task:
+        task["lease_expires_at"] = None
+
+    now = now_iso()
+    if "created_at" not in task:
+        task["created_at"] = now
+    if "updated_at" not in task:
+        task["updated_at"] = now
+
+
+def load_board(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        now = now_iso()
+        return {
+            "version": 2,
+            "created_at": now,
+            "updated_at": now,
+            "revision": 0,
+            "columns": list(DEFAULT_COLUMNS),
+            "tasks": {},
+            "events": [],
+            "agents": {},
+        }
+    with path.open("r", encoding="utf-8") as f:
+        try:
+            board = json.load(f)
+        except json.JSONDecodeError as e:
+            raise _TaskUserError(
+                {
+                    "ok": False,
+                    "error": "invalid_json",
+                    "detail": f"Failed to parse board JSON: {e}",
+                }
+            ) from e
+    if "tasks" not in board or not isinstance(board["tasks"], dict):
+        board["tasks"] = {}
+    if "columns" not in board or not isinstance(board["columns"], list):
+        board["columns"] = list(DEFAULT_COLUMNS)
+    if "revision" not in board:
+        board["revision"] = 0
+    if "version" not in board:
+        board["version"] = 1
+    if "events" not in board or not isinstance(board["events"], list):
+        board["events"] = []
+    if "agents" not in board or not isinstance(board["agents"], dict):
+        board["agents"] = {}
+
+    for task in board["tasks"].values():
+        if isinstance(task, dict):
+            normalize_task(task)
+
+    return board
+
+
+def save_board(path: Path, board: Dict[str, Any]) -> None:
+    board["updated_at"] = now_iso()
+    board["revision"] = int(board.get("revision", 0)) + 1
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(board, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write("\n")
+    tmp_path.replace(path)
+
+
+def generate_task_id(board: Dict[str, Any]) -> str:
+    # Short UUID-based id to avoid collisions and keep it machine-friendly.
+    tasks = board.get("tasks", {})
+    while True:
+        candidate = uuid.uuid4().hex[:12]
+        if candidate not in tasks:
+            return candidate
+
+
+def task_to_public(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a stable, public representation of a task.
+
+    This function can be used to filter out any internal-only fields later if needed.
+    For now it just returns the task as-is.
+    """
+    return dict(task)
+
+
+def task_status_lower(task: Dict[str, Any]) -> str:
+    """Return task status in lower-case, falling back to column mapping."""
+    status = task.get("status")
+    if isinstance(status, str) and status:
+        return status.lower()
+    return column_to_status(task.get("column")).lower()
+
+
+def task_matches_filters(
+    task: Dict[str, Any],
+    tags: Optional[List[str]] = None,
+    assignee: Optional[str] = None,
+    statuses: Optional[List[str]] = None,
+    search: Optional[str] = None,
+) -> bool:
+    """Return True if task matches all provided filters."""
+    if tags:
+        desired_tags = [str(t).lower() for t in tags if t]
+        task_tags = [str(t).lower() for t in (task.get("tags") or [])]
+        if not all(t in task_tags for t in desired_tags):
+            return False
+
+    if assignee:
+        task_assignee = task.get("assignee")
+        task_assignee_str = task_assignee if isinstance(task_assignee, str) else ""
+        if task_assignee_str.lower() != assignee.lower():
+            return False
+
+    if statuses:
+        desired_statuses = {str(s).lower() for s in statuses if s}
+        if task_status_lower(task) not in desired_statuses:
+            return False
+
+    if search:
+        q = search.lower()
+        fields: List[str] = []
+        for key in ("id", "title", "description", "assignee", "column", "status"):
+            val = task.get(key)
+            if isinstance(val, str) and val:
+                fields.append(val)
+        tags_val = task.get("tags") or []
+        if isinstance(tags_val, list):
+            fields.extend([str(t) for t in tags_val if t is not None])
+        links_val = task.get("links") or []
+        if isinstance(links_val, list):
+            fields.extend([str(x) for x in links_val if x is not None])
+        meta = task.get("metadata")
+        if isinstance(meta, dict) and meta:
+            try:
+                fields.append(json.dumps(meta, ensure_ascii=False, sort_keys=True))
+            except (TypeError, ValueError):
+                pass
+        haystack = " ".join(fields).lower()
+        if q not in haystack:
+            return False
+
+    return True
+
+
+def ensure_column(board: Dict[str, Any], column: str) -> None:
+    if column not in board["columns"]:
+        raise _TaskUserError(
+            {
+                "ok": False,
+                "error": "unknown_column",
+                "detail": f"Column '{column}' is not defined.",
+                "columns": board["columns"],
+            }
+        )
+
+
+def current_in_progress_tasks(board: Dict[str, Any], limit: int = 20) -> List[Dict[str, Any]]:
+    """Return a list of tasks that are currently in progress.
+
+    A task is considered in progress if:
+    - It is in the "doing" column, or
+    - It has a non-null lease_owner (leased to an agent), regardless of column.
+    """
+    tasks = board.get("tasks", {})
+    if not isinstance(tasks, dict):
+        return []
+
+    in_progress: List[Dict[str, Any]] = []
+    for task in tasks.values():
+        column = task.get("column")
+        lease_owner = task.get("lease_owner")
+        if column == "doing" or lease_owner:
+            in_progress.append(task)
+
+    # Sort by most recently updated, then id for stability.
+    in_progress.sort(
+        key=lambda t: (t.get("updated_at", t.get("created_at", "")), t.get("id", ""))
+    )
+    if limit is not None and limit > 0 and len(in_progress) > limit:
+        in_progress = in_progress[-limit:]
+
+    return [task_to_public(t) for t in in_progress]
+
+
+def priority_rank(priority: Any) -> int:
+    if isinstance(priority, (int, float)):
+        return int(priority)
+    if not isinstance(priority, str):
+        return 50
+    p = priority.lower()
+    mapping = {
+        "urgent": 0,
+        "now": 0,
+        "high": 1,
+        "medium": 2,
+        "normal": 2,
+        "low": 3,
+    }
+    return mapping.get(p, 50)
+
+
+def build_task_index(board: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    tasks = board.get("tasks", {})
+    index: Dict[str, Dict[str, Any]] = {}
+    if isinstance(tasks, dict):
+        for tid, task in tasks.items():
+            if isinstance(task, dict):
+                if "id" not in task:
+                    task["id"] = tid
+                index[tid] = task
+    return index
+
+
+def task_is_blocked(task: Dict[str, Any], tasks_by_id: Dict[str, Dict[str, Any]]) -> bool:
+    relations = task.get("relations") or []
+    for rel in relations:
+        if not isinstance(rel, dict):
+            continue
+        rel_type = rel.get("type")
+        other_id = rel.get("task_id")
+        if rel_type not in ("blocked_by", "depends_on"):
+            continue
+        if not other_id:
+            continue
+        other = tasks_by_id.get(other_id)
+        if not other:
+            continue
+        status = other.get("status") or column_to_status(other.get("column"))
+        if status.lower() not in DONE_STATUSES:
+            return True
+    return False
+
+
+def append_event(board: Dict[str, Any], event: Dict[str, Any]) -> None:
+    events = board.setdefault("events", [])
+    if not isinstance(events, list):
+        events = []
+        board["events"] = events
+    events.append(event)
+    if MAX_EVENTS > 0 and len(events) > MAX_EVENTS:
+        # Drop oldest events.
+        del events[0 : len(events) - MAX_EVENTS]
+
+
+def make_event(
+    kind: str,
+    actor: Optional[str],
+    task_id: Optional[str],
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "id": uuid.uuid4().hex[:16],
+        "ts": now_iso(),
+        "kind": kind,
+        "actor": actor,
+        "task_id": task_id,
+        "payload": payload or {},
+    }
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    if path.exists() and not args.force:
+        _emit_json(
+            {
+                "ok": False,
+                "error": "exists",
+                "detail": f"Board file already exists: {path}",
+                "file": str(path),
+            }
+        )
+        sys.exit(1)
+
+    columns = args.columns or list(DEFAULT_COLUMNS)
+    now = now_iso()
+    board = {
+        "version": 2,
+        "created_at": now,
+        "updated_at": now,
+        "revision": 0,
+        "columns": columns,
+        "tasks": {},
+        "events": [],
+        "agents": {},
+    }
+    path.write_text(
+        json.dumps(board, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _emit_json({"ok": True, "file": str(path), "columns": columns})
+
+
+def cmd_schema(args: argparse.Namespace) -> None:
+    schema = {
+        "ok": True,
+        "schema": {
+            "board": {
+                "fields": {
+                    "version": "int",
+                    "created_at": "iso8601",
+                    "updated_at": "iso8601",
+                    "revision": "int",
+                    "columns": "list[str]",
+                    "tasks": "dict[str, Task]",
+                    "events": "list[Event]",
+                    "agents": "dict[str, Agent]",
+                }
+            },
+            "task": {
+                "required_fields": ["id", "title", "column", "created_at", "updated_at"],
+                "optional_fields": [
+                    "status",
+                    "description",
+                    "priority",
+                    "assignee",
+                    "tags",
+                    "links",
+                    "metadata",
+                    "lease_owner",
+                    "lease_expires_at",
+                    "relations",
+                    "metrics",
+                    "hypotheses",
+                    "evidence",
+                    "origin",
+                    "last_activity_at",
+                    "last_activity_actor",
+                ],
+            },
+            "event": {
+                "fields": {
+                    "id": "str",
+                    "ts": "iso8601",
+                    "kind": "str",
+                    "actor": "str|null",
+                    "task_id": "str|null",
+                    "payload": "dict",
+                }
+            },
+            "agent": {
+                "fields": {
+                    "id": "str",
+                    "kind": "str",
+                    "role": "str",
+                    "skills": "list[str]",
+                    "wip_limit": "int|null",
+                    "last_seen_at": "iso8601",
+                    "metadata": "dict",
+                }
+            },
+            "collab_context": {
+                "fields": {
+                    "board": {
+                        "total_tasks": "int",
+                        "status_counts": "dict[str,int]",
+                        "column_counts": "dict[str,int]",
+                        "in_progress_sample": "list[Task]",
+                    },
+                    "agent": "Agent-specific view (optional)",
+                    "recommended_next_calls": "list[CommandHint]",
+                    "usage_hint": "str",
+                }
+            },
+            "hint_envelope": hints_schema_fragment(),
+        },
+        "linking_policy": {
+            "task_requires_script_anchor_on_create": True,
+            "task_requires_script_anchor_on_create_override_flag": "--allow-no-script-anchor",
+            "script_anchor_kind": "script",
+            "script_anchor_examples": [
+                "script:services/analytics/analytics_evidence_gate_v1.py",
+                "script:scripts/ops/audit_meta_links.py",
+                "script:systemd/units/caia-analytics-evidence-gate.service",
+            ],
+            "notes": [
+                "For Meta graph truth edges, every new task SHOULD include at least one script:<repo_relative_path> token in task.links.",
+                "Override for unanchored intake tasks: pass --allow-no-script-anchor to `tasks add` (and optionally `tasks update`).",
+                "Use architecture/LINKS_CONTRACT.md as the canonical contract.",
+            ],
+        },
+        "commands": {
+            "init": "Initialize a board file.",
+            "overview": "Compact board summary for quick orientation.",
+            "read": "Read tasks or whole board.",
+            "explain": "Explain a task in normalized what/why/how form.",
+            "add": "Add a task to a column.",
+            "update": "Update fields on an existing task.",
+            "move": "Move a task to a different column.",
+            "delete": "Delete a task.",
+            "pull": "Lease tasks from a column for an agent.",
+            "release": "Release a task lease.",
+            "relate": "Add or remove relations between tasks.",
+            "log": "Attach structured log/comment entries to tasks.",
+            "events": "Read collaboration event stream.",
+            "agent-touch": "Update or create agent metadata / heartbeat.",
+            "agent-view": "Per-agent collaboration view (WIP, ready, blocked, suggested).",
+            "plan": "Compact per-agent execution plan (next tasks).",
+        },
+        "related_tools": {
+            "findings": "Bug/smell intake linked via links tokens.",
+            "fixreport": "Closure and prevention for bugfix work.",
+            "scripthistory": "Script-level evolution and reasoning history.",
+            "hypothesis": "Evidence-backed scientific hypotheses tied to tasks.",
+            "rules": "Global governance constraints and normalized explanations.",
+            "ssot": "Canonical subsystem/path registry.",
+        },
+        "recommended_workflow": [
+            "tasks overview",
+            "tasks list --column todo --limit 20",
+            "tasks explain --id <task_id>",
+            "tasks plan --agent <agent_id>",
+        ],
+    }
+    _emit_json(schema)
+
+
+def _task_relation_conflicts(
+    task: Dict[str, Any], tasks_by_id: Dict[str, Dict[str, Any]]
+) -> List[str]:
+    out: List[str] = []
+    relations = task.get("relations")
+    if not isinstance(relations, list):
+        return out
+
+    for rel in relations:
+        if not isinstance(rel, dict):
+            continue
+        rel_type = str(rel.get("type") or "").strip()
+        other_id = str(rel.get("task_id") or "").strip()
+        if not rel_type or not other_id:
+            continue
+        other = tasks_by_id.get(other_id)
+        if rel_type not in {"blocked_by", "depends_on"}:
+            continue
+        if not other:
+            out.append(f"{rel_type}:{other_id} (missing dependency task)")
+            continue
+        other_status = str(other.get("status") or column_to_status(other.get("column"))).lower()
+        if other_status not in DONE_STATUSES:
+            other_title = str(other.get("title") or other_id).strip() or other_id
+            out.append(f"{rel_type}:{other_id} ({other_title}, status={other_status})")
+    return _dedupe_keep_order(out)
+
+
+def _normalize_task_explain(
+    task: Dict[str, Any], tasks_by_id: Dict[str, Dict[str, Any]]
+) -> Dict[str, Any]:
+    metadata = task.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    links = _dedupe_keep_order([str(x).strip() for x in (task.get("links") or []) if str(x).strip()])
+    title = str(task.get("title") or "").strip()
+    description = str(task.get("description") or "").strip()
+    status = str(task.get("status") or column_to_status(task.get("column"))).strip().lower()
+    conflicts = _task_relation_conflicts(task, tasks_by_id)
+
+    how_values: List[str] = []
+    how_values.extend(_as_string_list(metadata.get("how")))
+    how_values.extend(_as_string_list(metadata.get("steps")))
+    how_values.extend(_as_string_list(metadata.get("acceptance_criteria")))
+    if not how_values and description:
+        how_values.append(description)
+    if conflicts:
+        for item in conflicts:
+            how_values.append(f"Resolve dependency before execution: {item}")
+    if not how_values:
+        how_values.append("Advance this task through workflow columns with verifiable outputs.")
+
+    guardrails: List[str] = []
+    guardrails.extend(_as_string_list(metadata.get("guardrails")))
+    guardrails.extend(_as_string_list(metadata.get("tests_or_guardrails")))
+    guardrails.append("Maintain at least one `script:<repo_relative_path>` anchor in task.links.")
+    if str(task.get("lease_owner") or "").strip():
+        lease_owner = str(task.get("lease_owner") or "").strip()
+        lease_expires_at = str(task.get("lease_expires_at") or "").strip()
+        if lease_expires_at:
+            guardrails.append(f"Respect active lease by {lease_owner} until {lease_expires_at}.")
+        else:
+            guardrails.append(f"Respect active lease by {lease_owner}.")
+
+    evidence: List[str] = []
+    evidence.extend(_as_string_list(metadata.get("evidence")))
+    evidence.extend(
+        [x for x in links if any(x.startswith(prefix) for prefix in ("finding:", "fixreport:", "hypothesis:", "task:", "audit_id:", "audit_file:"))]
+    )
+
+    why = _pick_first_nonempty(
+        metadata.get("rationale"),
+        metadata.get("why"),
+        description,
+        "Task tracked for execution and coordination.",
+    )
+
+    return {
+        "what": _pick_first_nonempty(title, task.get("id"), "Task"),
+        "why": why,
+        "how": _dedupe_keep_order(how_values),
+        "guardrails": _dedupe_keep_order(guardrails),
+        "evidence": _dedupe_keep_order(evidence),
+        "conflicts": conflicts,
+        "links": links,
+        "status": status,
+    }
+
+
+def cmd_overview(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    board = load_board(path)
+    tasks_by_id = build_task_index(board)
+    tasks = list(tasks_by_id.values())
+
+    by_column: Dict[str, int] = {}
+    by_status: Dict[str, int] = {}
+    by_priority: Dict[str, int] = {}
+    blocked = 0
+    for task in tasks:
+        column = str(task.get("column") or "unknown")
+        status = str(task.get("status") or column_to_status(column)).lower()
+        priority = str(task.get("priority") or "normal").lower()
+        by_column[column] = int(by_column.get(column, 0)) + 1
+        by_status[status] = int(by_status.get(status, 0)) + 1
+        by_priority[priority] = int(by_priority.get(priority, 0)) + 1
+        if task_is_blocked(task, tasks_by_id):
+            blocked += 1
+
+    sample_limit = max(1, min(int(getattr(args, "sample_limit", 8) or 8), 50))
+
+    def _task_preview(task: Dict[str, Any]) -> Dict[str, Any]:
+        public = task_to_public(task)
+        description = str(public.get("description") or "").strip()
+        if len(description) > 180:
+            description = description[:177] + "..."
+        links = public.get("links") or []
+        return {
+            "id": str(public.get("id") or ""),
+            "title": str(public.get("title") or ""),
+            "column": str(public.get("column") or ""),
+            "status": str(public.get("status") or column_to_status(public.get("column"))).lower(),
+            "priority": str(public.get("priority") or ""),
+            "created_at": str(public.get("created_at") or ""),
+            "updated_at": str(public.get("updated_at") or ""),
+            "description_preview": description,
+            "links_count": len(links) if isinstance(links, list) else 0,
+        }
+
+    def _sample(selector: Any) -> List[Dict[str, Any]]:
+        selected: List[Dict[str, Any]] = []
+        for task in tasks:
+            if selector(task):
+                selected.append(_task_preview(task))
+        selected.sort(key=lambda t: (priority_rank(t.get("priority")), str(t.get("created_at") or ""), str(t.get("id") or "")))
+        if len(selected) > sample_limit:
+            selected = selected[:sample_limit]
+        return selected
+
+    output = {
+        "ok": True,
+        "action": "overview",
+        "file": str(path),
+        "board": {
+            "total_tasks": len(tasks),
+            "columns": list(board.get("columns") or []),
+            "counts_by_column": by_column,
+            "counts_by_status": by_status,
+            "counts_by_priority": by_priority,
+            "blocked_count": blocked,
+            "events_count": len(board.get("events") or []),
+            "agents_count": len(board.get("agents") or {}),
+        },
+        "samples": {
+            "in_progress": _sample(lambda t: str(t.get("status") or column_to_status(t.get("column"))).lower() in IN_PROGRESS_STATUSES),
+            "blocked": _sample(lambda t: task_is_blocked(t, tasks_by_id)),
+            "high_priority_todo": _sample(
+                lambda t: str(t.get("column") or "") in {"todo", "doing", "review"}
+                and priority_rank(t.get("priority")) <= 1
+            ),
+        },
+        "recommended_next_calls": [
+            "tasks list --column todo --limit 20",
+            "tasks plan --agent <agent_id>",
+            "tasks explain --id <task_id>",
+        ],
+    }
+    _emit_json(output)
+
+
+def cmd_explain(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    board = load_board(path)
+    tasks_by_id = build_task_index(board)
+    task_id = (
+        str(getattr(args, "id", "") or "").strip()
+        or str(getattr(args, "id_positional", "") or "").strip()
+    )
+    if not task_id:
+        _emit_json(
+            {
+                "ok": False,
+                "error": "invalid_arguments",
+                "detail": "Missing task id. Provide --id <task_id> or a positional task id.",
+                "error_code": "ARGPARSE_ERROR",
+                "retryable": False,
+            }
+        )
+        sys.exit(2)
+    task = tasks_by_id.get(task_id)
+    if not task:
+        _emit_json(
+            {
+                "ok": False,
+                "error": "not_found",
+                "detail": f"Task '{task_id}' not found.",
+            }
+        )
+        sys.exit(1)
+
+    public_task = task_to_public(task)
+    next_steps = next_steps_for_task_action(
+        action="read",
+        task_id=str(public_task.get("id") or ""),
+        title=str(public_task.get("title") or ""),
+        column=str(public_task.get("column") or ""),
+        status=str(public_task.get("status") or ""),
+        links=list(public_task.get("links") or []),
+        agent=str(getattr(args, "agent", "") or ""),
+    )
+    explanation = _normalize_task_explain(task, tasks_by_id)
+    _emit_json(
+        {
+            "ok": True,
+            "action": "explain",
+            "file": str(path),
+            "task": public_task,
+            "explanation": explanation,
+            "next_steps": next_steps,
+        }
+    )
+
+
+def cmd_read(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    board = load_board(path)
+    invoked_command = str(getattr(args, "command", "read") or "read").strip().lower() or "read"
+    include_events = bool(getattr(args, "include_events", False))
+    # LLM-friendly guardrails:
+    # - `tasks read <task_id>` is a common mistake (positional is meant to be column).
+    # - `tasks get <task_id>` is now supported as an alias; it uses `id_positional`.
+    id_positional = str(getattr(args, "id_positional", "") or "").strip()
+    if not getattr(args, "id", None) and id_positional:
+        args.id = id_positional
+    if not getattr(args, "id", None):
+        col_pos = str(getattr(args, "column_positional", "") or "").strip()
+        col_flag = str(getattr(args, "column", "") or "").strip()
+        if col_pos and (not col_flag) and _looks_like_task_id(col_pos):
+            args.id = col_pos
+            args.column_positional = None
+    if args.id:
+        task = board["tasks"].get(args.id)
+        if not task:
+            _emit_json(
+                {
+                    "ok": False,
+                    "error": "not_found",
+                    "detail": f"Task '{args.id}' not found.",
+                }
+            )
+            sys.exit(1)
+        public_task = task_to_public(task)
+        next_steps = next_steps_for_task_action(
+            action="read",
+            task_id=str(public_task.get("id") or ""),
+            title=str(public_task.get("title") or ""),
+            column=str(public_task.get("column") or ""),
+            status=str(public_task.get("status") or ""),
+            links=list(public_task.get("links") or []),
+            agent=str(getattr(args, "agent", "") or ""),
+        )
+        _emit_json(
+            {
+                "ok": True,
+                "action": invoked_command,
+                "file": str(path),
+                "task": public_task,
+                "next_steps": next_steps,
+            }
+        )
+        return
+
+    column = args.column or args.column_positional
+    if column:
+        ensure_column(board, column)
+
+    tags = getattr(args, "tags", None) or []
+    tags = [t for t in tags if t]
+    statuses = getattr(args, "statuses", None) or []
+    statuses = [s for s in statuses if s]
+    assignee = getattr(args, "assignee", None)
+    search = getattr(args, "search", None)
+    filters_present = bool(tags or statuses or assignee or search)
+    limit = int(getattr(args, "limit", 0) or 0)
+
+    if column or filters_present:
+        tasks_list = [
+            task_to_public(t)
+            for t in board["tasks"].values()
+            if (not column or t.get("column") == column)
+        ]
+        if filters_present:
+            tasks_list = [
+                t
+                for t in tasks_list
+                if task_matches_filters(
+                    t,
+                    tags=tags or None,
+                    assignee=assignee,
+                    statuses=statuses or None,
+                    search=search,
+                )
+            ]
+        tasks_list.sort(key=lambda t: (t.get("created_at", ""), t.get("id", "")))
+        total_count = len(tasks_list)
+        truncated = False
+        if limit > 0 and len(tasks_list) > limit:
+            tasks_list = tasks_list[:limit]
+            truncated = True
+        out: Dict[str, Any] = {
+            "ok": True,
+            "action": invoked_command,
+            "file": str(path),
+            "tasks": tasks_list,
+            "count": len(tasks_list),
+        }
+        if truncated:
+            out["total_count"] = total_count
+            out["truncated"] = True
+            out["limit"] = limit
+        if column:
+            out["column"] = column
+        if filters_present:
+            out["filters"] = {
+                "tags": tags or None,
+                "assignee": assignee or None,
+                "status": statuses or None,
+                "search": search or None,
+            }
+        out["recommended_next_calls"] = [
+            "tasks explain --id <task_id>",
+            "tasks move --id <task_id> --column doing",
+            "tasks log --id <task_id> --kind progress --text \"...\"",
+        ]
+        out["next_steps"] = [
+            {
+                "text": "Explain a task to see normalized what/why/how and links.",
+                "commands": ["tasks explain --id <task_id>"],
+                "links": [],
+            },
+            {
+                "text": "Move a task through the workflow once you start/finish work.",
+                "commands": ["tasks move --id <task_id> --column doing"],
+                "links": [],
+            },
+        ]
+        _emit_json(out)
+        return
+
+    # `tasks list` (no filters) should be safe and match the mental model: list tasks, not the entire board.
+    # `tasks read` remains the canonical "show board" entrypoint.
+    if invoked_command == "list":
+        tasks_list = [task_to_public(t) for t in board["tasks"].values()]
+        tasks_list.sort(
+            key=lambda t: (
+                str(t.get("updated_at") or ""),
+                str(t.get("created_at") or ""),
+                str(t.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        total_count = len(tasks_list)
+        truncated = False
+        if limit > 0 and len(tasks_list) > limit:
+            tasks_list = tasks_list[:limit]
+            truncated = True
+        out: Dict[str, Any] = {
+            "ok": True,
+            "action": invoked_command,
+            "file": str(path),
+            "tasks": tasks_list,
+            "count": len(tasks_list),
+        }
+        if truncated:
+            out["total_count"] = total_count
+            out["truncated"] = True
+            out["limit"] = limit
+        out["recommended_next_calls"] = [
+            "tasks overview",
+            "tasks explain --id <task_id>",
+            "tasks list --column todo --limit 20",
+        ]
+        out["next_steps"] = [
+            {
+                "text": "Use the compact overview to pick the next actionable work item.",
+                "commands": ["tasks overview"],
+                "links": [],
+            },
+            {
+                "text": "Explain a task to see normalized what/why/how and links.",
+                "commands": ["tasks explain --id <task_id>"],
+                "links": [],
+            },
+        ]
+        _emit_json(out)
+        return
+
+    tasks = {tid: task_to_public(t) for tid, t in board["tasks"].items()}
+    out_board = dict(board)
+    out_board["tasks"] = tasks
+    events = out_board.get("events", [])
+    events_list = events if isinstance(events, list) else []
+    out_board["events_count"] = len(events_list)
+    if not include_events:
+        out_board["events"] = []
+        out_board["events_truncated"] = len(events_list) > 0
+    out: Dict[str, Any] = {"ok": True, "action": invoked_command, "file": str(path), "board": out_board}
+    out["recommended_next_calls"] = [
+        "tasks overview",
+        "tasks list --column todo --limit 20",
+        "tasks events --limit 100",
+    ]
+    out["next_steps"] = [
+        {
+            "text": "Prefer the compact overview for agent orientation.",
+            "commands": ["tasks overview"],
+            "links": [],
+        },
+        {
+            "text": "Inspect recent collaboration events via the dedicated events command.",
+            "commands": ["tasks events --limit 100"],
+            "links": [],
+        },
+    ]
+    _emit_json(out)
+
+
+def parse_json_arg(raw: Optional[str], arg_name: str) -> Dict[str, Any]:
+    if raw is None:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise _TaskUserError(
+            {
+                "ok": False,
+                "error": "invalid_json_arg",
+                "detail": f"Failed to parse JSON for {arg_name}: {e}",
+            }
+        ) from e
+    if not isinstance(value, dict):
+        raise _TaskUserError(
+            {
+                "ok": False,
+                "error": "invalid_json_arg",
+                "detail": f"Expected JSON object for {arg_name}.",
+            }
+        )
+    return value
+
+
+def build_agent_plan(
+    board: Dict[str, Any],
+    agent_id: str,
+    limit: int,
+    include_blocked: bool,
+    include_done: bool,
+) -> Dict[str, Any]:
+    tasks = list(board.get("tasks", {}).values())
+    tasks_by_id = build_task_index(board)
+    agents = board.get("agents", {})
+    agent = agents.get(agent_id) or {"id": agent_id}
+    skills = set(agent.get("skills") or [])
+
+    def task_status(task: Dict[str, Any]) -> str:
+        status = task.get("status")
+        if isinstance(status, str):
+            return status.lower()
+        return column_to_status(task.get("column")).lower()
+
+    def score_task(task: Dict[str, Any]) -> Tuple[int, bool, int, str, str]:
+        prio_rank = priority_rank(task.get("priority"))
+        blocked = task_is_blocked(task, tasks_by_id)
+        tags = set(task.get("tags") or [])
+        skill_match = len(skills & tags)
+        created_at = task.get("created_at", "")
+        tid = task.get("id", "")
+        # Lower tuple is better: priority, blocked, -skill_match, created_at, id
+        return (prio_rank, blocked, -skill_match, created_at, tid)
+
+    wip: List[Dict[str, Any]] = []
+    ready: List[Dict[str, Any]] = []
+    blocked_list: List[Dict[str, Any]] = []
+    done_list: List[Dict[str, Any]] = []
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        status = task_status(task)
+        if status in DONE_STATUSES:
+            done_list.append(task)
+            if not include_done:
+                continue
+
+        is_wip = task.get("lease_owner") == agent_id or task.get("assignee") == agent_id
+        if is_wip and status not in DONE_STATUSES:
+            wip.append(task)
+            continue
+
+        blocked_flag = task_is_blocked(task, tasks_by_id)
+        if blocked_flag:
+            blocked_list.append(task)
+        else:
+            if status in DONE_STATUSES and not include_done:
+                continue
+            ready.append(task)
+
+    wip_sorted = sorted(wip, key=score_task)
+    ready_sorted = sorted(ready, key=score_task)
+    blocked_sorted = sorted(blocked_list, key=score_task)
+
+    limit = max(1, limit)
+    suggestions: List[Dict[str, Any]] = ready_sorted[:limit]
+    if include_blocked and len(suggestions) < limit:
+        suggestions = suggestions + blocked_sorted[: limit - len(suggestions)]
+
+    status_counts: Dict[str, int] = {}
+    for task in tasks:
+        status = (task.get("status") or column_to_status(task.get("column"))).lower()
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    summary = {
+        "total_tasks": len(tasks),
+        "status_counts": status_counts,
+        "agent_wip": len(wip_sorted),
+        "agent_ready_candidates": len(ready_sorted),
+        "agent_blocked_candidates": len(blocked_sorted),
+        "agent_suggestions": len(suggestions),
+    }
+
+    return {
+        "agent": agent,
+        "wip": [task_to_public(t) for t in wip_sorted],
+        "ready": [task_to_public(t) for t in ready_sorted],
+        "blocked": [task_to_public(t) for t in blocked_sorted],
+        "done": [task_to_public(t) for t in done_list] if include_done else [],
+        "suggested": [task_to_public(t) for t in suggestions],
+        "summary": summary,
+    }
+
+
+def build_collab_context(
+    board: Dict[str, Any],
+    agent_id: Optional[str] = None,
+    suggestion_limit: int = 8,
+) -> Dict[str, Any]:
+    """Build a compact collaboration context snapshot for agents.
+
+    Agents sollen dieses Tool als globalen, gemeinsamen Zustand betrachten:
+    - Vor jedem Planungsschritt erneut synchronisieren.
+    - Nach jeder Änderung den Zustand wieder hier reinschreiben.
+    """
+    tasks_by_id = build_task_index(board)
+    total_tasks = len(tasks_by_id)
+
+    status_counts: Dict[str, int] = {}
+    column_counts: Dict[str, int] = {}
+    for t in tasks_by_id.values():
+        status = (t.get("status") or column_to_status(t.get("column"))).lower()
+        status_counts[status] = status_counts.get(status, 0) + 1
+        col = t.get("column") or "backlog"
+        column_counts[col] = column_counts.get(col, 0) + 1
+
+    in_progress_sample = current_in_progress_tasks(board, limit=20)
+
+    context: Dict[str, Any] = {
+        "board": {
+            "total_tasks": total_tasks,
+            "status_counts": status_counts,
+            "column_counts": column_counts,
+            "in_progress_sample": in_progress_sample,
+        },
+        "usage_hint": (
+            "Agents: This tool is the single shared source of truth for tasks. "
+            "On EVERY reasoning/planning step BEFORE deciding next actions, "
+            "re-sync with `agent-view` or `plan`. AFTER acting, update the "
+            "relevant tasks here so other agents see the fresh state. "
+            "Do NOT cache task state in your own memory; always trust the board. "
+            "Also, whenever you touch scripts or services for a task, record the change in `scripthistory` so provenance stays accurate, "
+            "and if your work updates or tests a trading/analytics hypothesis, capture that via the `hypothesis` tool as well."
+        ),
+    }
+
+    if agent_id:
+        plan = build_agent_plan(
+            board,
+            agent_id=agent_id,
+            limit=suggestion_limit,
+            include_blocked=False,
+            include_done=False,
+        )
+        context["agent"] = {
+            "id": agent_id,
+            "summary": plan["summary"],
+            "wip": plan["wip"],
+            "suggested_next_tasks": plan["suggested"],
+        }
+        recommended_args_agent = agent_id
+    else:
+        recommended_args_agent = "<agent-id>"
+
+    context["recommended_next_calls"] = [
+        {
+            "command": "agent-view",
+            "args": {"--agent": recommended_args_agent, "--limit": suggestion_limit},
+            "purpose": (
+                "Get your fresh WIP and suggested next tasks BEFORE deciding "
+                "what to do next."
+            ),
+        },
+        {
+            "command": "events",
+            "args": {"--agent": recommended_args_agent, "--limit": 50},
+            "purpose": "Inspect recent collaboration events relevant to you.",
+        },
+    ]
+
+    return context
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    repo_files_set, by_basename = _build_repo_file_index(REPO_ROOT)
+    in_progress: List[Dict[str, Any]] = []
+    collab_context: Optional[Dict[str, Any]] = None
+    with lock:
+        board = load_board(path)
+        ensure_column(board, args.column)
+
+        payload = parse_json_arg(args.data, "--data")
+        title = payload.get("title") or args.title
+        if not title:
+            raise _TaskUserError(
+                {
+                    "ok": False,
+                    "error": "missing_title",
+                    "detail": "Task title is required (in --title or --data).",
+                }
+            )
+
+        description = payload.get("description")
+        if getattr(args, "description", None):
+            description = args.description
+
+        priority = payload.get("priority")
+        if getattr(args, "priority", None):
+            priority = args.priority
+        if priority is None:
+            priority = "normal"
+
+        assignee = payload.get("assignee")
+        if getattr(args, "assignee", None):
+            assignee = args.assignee
+
+        tags = payload.get("tags", []) or []
+        cli_tags = getattr(args, "tags", None) or []
+        if cli_tags:
+            tags = list(tags) + cli_tags
+
+        links = payload.get("links", []) or []
+        cli_links = getattr(args, "links", None) or []
+        if cli_links:
+            links = list(links) + cli_links
+
+        cli_scripts = getattr(args, "scripts", None) or []
+        if cli_scripts:
+            links = list(links) + [f"script:{s}" for s in cli_scripts if str(s).strip()]
+
+        text_links = extract_link_tokens_from_texts([str(title or ""), str(description or "")])
+        links = list(links) + list(text_links)
+        links = append_codex_links(list(links))
+
+        require_script_anchor = not bool(getattr(args, "allow_no_script_anchor", False))
+        links = _normalize_and_validate_links(
+            list(links),
+            repo_files_set=repo_files_set,
+            by_basename=by_basename,
+            require_script_anchor=require_script_anchor,
+        )
+
+        metadata = payload.get("metadata", {}) or {}
+
+        task_id = args.id or generate_task_id(board)
+        now_ts = now_iso()
+        status = payload.get("status") or column_to_status(args.column)
+        task = {
+            "id": task_id,
+            "title": title,
+            "column": args.column,
+            "status": status,
+            "created_at": now_ts,
+            "updated_at": now_ts,
+            "description": description,
+            "priority": priority,
+            "assignee": assignee,
+            "tags": tags,
+            "links": links,
+            "metadata": metadata,
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "relations": payload.get("relations", []) or [],
+        }
+        for k, v in payload.items():
+            if k not in task:
+                task[k] = v
+
+        board["tasks"][task_id] = task
+        append_event(
+            board,
+            make_event(
+                "task_created",
+                getattr(args, "agent", None),
+                task_id,
+                {
+                    "title": title,
+                    "column": args.column,
+                    "status": status,
+                    "priority": priority,
+                    "assignee": assignee,
+                    "tags": tags,
+                },
+            ),
+        )
+        in_progress = current_in_progress_tasks(board, limit=20)
+        collab_context = build_collab_context(
+            board,
+            agent_id=getattr(args, "agent", None),
+        )
+        save_board(path, board)
+
+    public_task = task_to_public(task)
+    next_steps = next_steps_for_task_action(
+        action="add",
+        task_id=str(public_task.get("id") or ""),
+        title=str(public_task.get("title") or ""),
+        column=str(public_task.get("column") or ""),
+        status=str(public_task.get("status") or ""),
+        links=list(public_task.get("links") or []),
+        agent=str(getattr(args, "agent", "") or ""),
+    )
+    _emit_json(
+        {
+            "ok": True,
+            "task": public_task,
+            "next_steps": next_steps,
+            "current_in_progress_tasks": {
+                "note": (
+                    "Keep in mind what other agents are currently working on "
+                    "(tasks in 'doing' or leased)."
+                ),
+                "limit": 20,
+                "count": len(in_progress),
+                "tasks": in_progress,
+            },
+            "collab_context": collab_context,
+        }
+    )
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    repo_files_set, by_basename = _build_repo_file_index(REPO_ROOT)
+    in_progress: List[Dict[str, Any]] = []
+    collab_context: Optional[Dict[str, Any]] = None
+    with lock:
+        board = load_board(path)
+        task = board["tasks"].get(args.id)
+        if not task:
+            _emit_json(
+                {
+                    "ok": False,
+                    "error": "not_found",
+                    "detail": f"Task '{args.id}' not found.",
+                }
+            )
+            sys.exit(1)
+
+        raw_set = getattr(args, "set", None)
+        patch = parse_json_arg(raw_set, "--set") if raw_set is not None else {}
+        if "column" in patch:
+            ensure_column(board, patch["column"])
+
+        # Link mutations (do not force callers to hand-write JSON patches).
+        links_add = getattr(args, "links_add", None) or []
+        links_remove = getattr(args, "links_remove", None) or []
+        scripts_add = getattr(args, "scripts_add", None) or []
+        scripts_remove = getattr(args, "scripts_remove", None) or []
+        if links_add or links_remove:
+            cur = task.get("links")
+            cur_list: List[str] = list(cur) if isinstance(cur, list) else []
+            if links_add:
+                cur_list.extend([str(x) for x in links_add if x])
+            if links_remove:
+                rm = {str(x) for x in links_remove if x}
+                cur_list = [x for x in cur_list if str(x) not in rm]
+            patch["links"] = cur_list
+
+        if scripts_add or scripts_remove:
+            cur = patch.get("links", task.get("links"))
+            cur_list = list(cur) if isinstance(cur, list) else []
+            if scripts_add:
+                cur_list.extend([f"script:{str(x).strip()}" for x in scripts_add if str(x).strip()])
+            if scripts_remove:
+                rm = {f"script:{str(x).strip()}" for x in scripts_remove if str(x).strip()}
+                cur_list = [x for x in cur_list if str(x).strip() not in rm]
+            patch["links"] = cur_list
+
+        if "links" in patch:
+            require_script_anchor = not bool(getattr(args, "allow_no_script_anchor", False))
+            patch["links"] = append_codex_links(list(patch.get("links") or []))
+            patch["links"] = _normalize_and_validate_links(
+                list(patch.get("links") or []),
+                repo_files_set=repo_files_set,
+                by_basename=by_basename,
+                require_script_anchor=require_script_anchor,
+            )
+        else:
+            title = patch.get("title", task.get("title", ""))
+            desc = patch.get("description", task.get("description", ""))
+            text_links = extract_link_tokens_from_texts([str(title or ""), str(desc or "")])
+            if text_links:
+                cur_links = task.get("links")
+                cur_list: List[str] = list(cur_links) if isinstance(cur_links, list) else []
+                merged = cur_list + list(text_links)
+                require_script_anchor = not bool(getattr(args, "allow_no_script_anchor", False))
+                merged = append_codex_links(list(merged))
+                patch["links"] = _normalize_and_validate_links(
+                    list(merged),
+                    repo_files_set=repo_files_set,
+                    by_basename=by_basename,
+                    require_script_anchor=require_script_anchor,
+                )
+
+        if not patch:
+            _emit_json(
+                {
+                    "ok": False,
+                    "error": "no_changes",
+                    "detail": "No changes specified (provide --set and/or --link-add/--link-remove).",
+                }
+            )
+            sys.exit(1)
+
+        for k, v in patch.items():
+            if v is None and k in task:
+                del task[k]
+            else:
+                task[k] = v
+
+        if "column" in patch and "status" not in patch:
+            task["status"] = column_to_status(task.get("column"))
+        if "status" in patch and "column" not in patch and not task.get("column"):
+            if task["status"] == "in_progress":
+                task["column"] = "doing"
+            elif task["status"] == "ready":
+                task["column"] = "todo"
+
+        # Backward-compatible: never force link re-validation when the caller did not touch links.
+        # We only append Codex context tokens at the end (if missing) to enable high-precision joins.
+        cur_links = task.get("links")
+        cur_links_list: List[str] = list(cur_links) if isinstance(cur_links, list) else []
+        links_with_codex = append_codex_links(cur_links_list)
+        if links_with_codex != cur_links_list:
+            task["links"] = links_with_codex
+
+        task["updated_at"] = now_iso()
+        board["tasks"][args.id] = task
+        append_event(
+            board,
+            make_event(
+                "task_updated",
+                getattr(args, "agent", None),
+                args.id,
+                {"set": patch, "changed_fields": sorted(patch.keys())},
+            ),
+        )
+        in_progress = current_in_progress_tasks(board, limit=20)
+        collab_context = build_collab_context(
+            board,
+            agent_id=getattr(args, "agent", None),
+        )
+        save_board(path, board)
+
+    public_task = task_to_public(task)
+    next_steps = next_steps_for_task_action(
+        action="update",
+        task_id=str(public_task.get("id") or ""),
+        title=str(public_task.get("title") or ""),
+        column=str(public_task.get("column") or ""),
+        status=str(public_task.get("status") or ""),
+        links=list(public_task.get("links") or []),
+        agent=str(getattr(args, "agent", "") or ""),
+    )
+    _emit_json(
+        {
+            "ok": True,
+            "task": public_task,
+            "next_steps": next_steps,
+            "current_in_progress_tasks": {
+                "note": (
+                    "Keep in mind what other agents are currently working on "
+                    "(tasks in 'doing' or leased)."
+                ),
+                "limit": 20,
+                "count": len(in_progress),
+                "tasks": in_progress,
+            },
+            "collab_context": collab_context,
+        }
+    )
+
+
+def cmd_move(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    in_progress: List[Dict[str, Any]] = []
+    collab_context: Optional[Dict[str, Any]] = None
+    with lock:
+        board = load_board(path)
+        task = board["tasks"].get(args.id)
+        if not task:
+            _emit_json(
+                {
+                    "ok": False,
+                    "error": "not_found",
+                    "detail": f"Task '{args.id}' not found.",
+                }
+            )
+            sys.exit(1)
+        old_column = task.get("column")
+        ensure_column(board, args.to_column)
+        task["column"] = args.to_column
+        task["status"] = column_to_status(args.to_column)
+        task["updated_at"] = now_iso()
+        board["tasks"][args.id] = task
+        append_event(
+            board,
+            make_event(
+                "task_moved",
+                getattr(args, "agent", None),
+                args.id,
+                {"from": old_column, "to": args.to_column, "status": task.get("status")},
+            ),
+        )
+        in_progress = current_in_progress_tasks(board, limit=20)
+        collab_context = build_collab_context(
+            board,
+            agent_id=getattr(args, "agent", None),
+        )
+        save_board(path, board)
+    public_task = task_to_public(task)
+    next_steps = next_steps_for_task_action(
+        action="move",
+        task_id=str(public_task.get("id") or ""),
+        title=str(public_task.get("title") or ""),
+        column=str(public_task.get("column") or ""),
+        status=str(public_task.get("status") or ""),
+        links=list(public_task.get("links") or []),
+        agent=str(getattr(args, "agent", "") or ""),
+        moved_from=str(old_column or ""),
+        moved_to=str(args.to_column or ""),
+    )
+    _emit_json(
+        {
+            "ok": True,
+            "task": public_task,
+            "next_steps": next_steps,
+            "current_in_progress_tasks": {
+                "note": (
+                    "Keep in mind what other agents are currently working on "
+                    "(tasks in 'doing' or leased)."
+                ),
+                "limit": 20,
+                "count": len(in_progress),
+                "tasks": in_progress,
+            },
+            "collab_context": collab_context,
+        }
+    )
+
+
+def cmd_delete(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    in_progress: List[Dict[str, Any]] = []
+    collab_context: Optional[Dict[str, Any]] = None
+    with lock:
+        board = load_board(path)
+        if args.id not in board["tasks"]:
+            _emit_json(
+                {
+                    "ok": False,
+                    "error": "not_found",
+                    "detail": f"Task '{args.id}' not found.",
+                }
+            )
+            sys.exit(1)
+        task = board["tasks"].pop(args.id)
+        append_event(
+            board,
+            make_event(
+                "task_deleted",
+                getattr(args, "agent", None),
+                args.id,
+                {"title": task.get("title"), "column": task.get("column")},
+            ),
+        )
+        in_progress = current_in_progress_tasks(board, limit=20)
+        collab_context = build_collab_context(
+            board,
+            agent_id=getattr(args, "agent", None),
+        )
+        save_board(path, board)
+    public_task = task_to_public(task)
+    next_steps = next_steps_for_task_action(
+        action="delete",
+        task_id=str(public_task.get("id") or ""),
+        title=str(public_task.get("title") or ""),
+        column=str(public_task.get("column") or ""),
+        status=str(public_task.get("status") or ""),
+        links=list(public_task.get("links") or []),
+        agent=str(getattr(args, "agent", "") or ""),
+        deleted=True,
+    )
+    _emit_json(
+        {
+            "ok": True,
+            "deleted": True,
+            "task": public_task,
+            "next_steps": next_steps,
+            "current_in_progress_tasks": {
+                "note": (
+                    "Keep in mind what other agents are currently working on "
+                    "(tasks in 'doing' or leased)."
+                ),
+                "limit": 20,
+                "count": len(in_progress),
+                "tasks": in_progress,
+            },
+            "collab_context": collab_context,
+        }
+    )
+
+
+def task_is_available_for_lease(task: Dict[str, Any], now_ts: float) -> bool:
+    lease_owner = task.get("lease_owner")
+    lease_expires_at = task.get("lease_expires_at")
+    if not lease_owner and not lease_expires_at:
+        return True
+    if not lease_expires_at:
+        return False
+    try:
+        time_struct = time.strptime(lease_expires_at, "%Y-%m-%dT%H:%M:%SZ")
+        exp_ts = time.mktime(time_struct)
+    except Exception:
+        return False
+    return exp_ts <= now_ts
+
+
+def cmd_pull(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    if not args.agent:
+        raise _TaskUserError(
+            {
+                "ok": False,
+                "error": "missing_agent",
+                "detail": "Argument --agent is required for pull.",
+            }
+        )
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    in_progress: List[Dict[str, Any]] = []
+    collab_context: Optional[Dict[str, Any]] = None
+    with lock:
+        board = load_board(path)
+        ensure_column(board, args.column)
+        now_ts = time.time()
+        candidates = [
+            t
+            for t in board["tasks"].values()
+            if t.get("column") == args.column and task_is_available_for_lease(t, now_ts)
+        ]
+        candidates.sort(
+            key=lambda t: (
+                priority_rank(t.get("priority")),
+                t.get("created_at", ""),
+                t.get("id", ""),
+            )
+        )
+
+        limit = max(1, args.limit)
+        selected: List[Dict[str, Any]] = []
+        lease_seconds = max(1, args.lease_seconds)
+        expires_at = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_ts + lease_seconds)
+        )
+
+        for task in candidates[:limit]:
+            task["lease_owner"] = args.agent
+            task["lease_expires_at"] = expires_at
+            task["updated_at"] = now_iso()
+            selected.append(task_to_public(task))
+            append_event(
+                board,
+                make_event(
+                    "task_leased",
+                    args.agent,
+                    task.get("id"),
+                    {
+                        "column": task.get("column"),
+                        "lease_expires_at": expires_at,
+                    },
+                ),
+            )
+
+        in_progress = current_in_progress_tasks(board, limit=20)
+        collab_context = build_collab_context(board, agent_id=args.agent)
+        save_board(path, board)
+
+    pull_steps: List[Dict[str, Any]] = []
+    for t in selected[:5]:
+        pull_steps.extend(
+            next_steps_for_task_action(
+                action="pull",
+                task_id=str(t.get("id") or ""),
+                title=str(t.get("title") or ""),
+                column=str(t.get("column") or ""),
+                status=str(t.get("status") or ""),
+                links=list(t.get("links") or []),
+                agent=str(args.agent or ""),
+                leased=True,
+            )[:4]
+        )
+    _emit_json(
+        {
+            "ok": True,
+            "column": args.column,
+            "agent": args.agent,
+            "lease_seconds": lease_seconds,
+            "tasks": selected,
+            "count": len(selected),
+            "next_steps": pull_steps,
+            "current_in_progress_tasks": {
+                "note": (
+                    "Keep in mind what other agents are currently working on "
+                    "(tasks in 'doing' or leased)."
+                ),
+                "limit": 20,
+                "count": len(in_progress),
+                "tasks": in_progress,
+            },
+            "collab_context": collab_context,
+        }
+    )
+
+
+def cmd_release(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    in_progress: List[Dict[str, Any]] = []
+    collab_context: Optional[Dict[str, Any]] = None
+    with lock:
+        board = load_board(path)
+        task = board["tasks"].get(args.id)
+        if not task:
+            _emit_json(
+                {
+                    "ok": False,
+                    "error": "not_found",
+                    "detail": f"Task '{args.id}' not found.",
+                }
+            )
+            sys.exit(1)
+        lease_owner = task.get("lease_owner")
+        if lease_owner is None and not args.force:
+            _emit_json(
+                {
+                    "ok": False,
+                    "error": "no_lease",
+                    "detail": f"Task '{args.id}' is not leased.",
+                }
+            )
+            sys.exit(1)
+        if args.agent and lease_owner and lease_owner != args.agent and not args.force:
+            _emit_json(
+                {
+                    "ok": False,
+                    "error": "lease_owned_by_other",
+                    "detail": f"Task '{args.id}' is leased by '{lease_owner}', not '{args.agent}'.",
+                    "lease_owner": lease_owner,
+                }
+            )
+            sys.exit(1)
+
+        task["lease_owner"] = None
+        task["lease_expires_at"] = None
+        task["updated_at"] = now_iso()
+        board["tasks"][args.id] = task
+        append_event(
+            board,
+            make_event(
+                "task_released",
+                getattr(args, "agent", None),
+                args.id,
+                {"previous_lease_owner": lease_owner, "force": args.force},
+            ),
+        )
+        in_progress = current_in_progress_tasks(board, limit=20)
+        collab_context = build_collab_context(
+            board,
+            agent_id=getattr(args, "agent", None),
+        )
+        save_board(path, board)
+
+    public_task = task_to_public(task)
+    next_steps = next_steps_for_task_action(
+        action="release",
+        task_id=str(public_task.get("id") or ""),
+        title=str(public_task.get("title") or ""),
+        column=str(public_task.get("column") or ""),
+        status=str(public_task.get("status") or ""),
+        links=list(public_task.get("links") or []),
+        agent=str(getattr(args, "agent", "") or ""),
+    )
+    _emit_json(
+        {
+            "ok": True,
+            "task": public_task,
+            "next_steps": next_steps,
+            "current_in_progress_tasks": {
+                "note": (
+                    "Keep in mind what other agents are currently working on "
+                    "(tasks in 'doing' or leased)."
+                ),
+                "limit": 20,
+                "count": len(in_progress),
+                "tasks": in_progress,
+            },
+            "collab_context": collab_context,
+        }
+    )
+
+
+def cmd_relate(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    collab_context: Optional[Dict[str, Any]] = None
+    with lock:
+        board = load_board(path)
+        tasks = board.get("tasks", {})
+        src = tasks.get(args.source_id)
+        dst = tasks.get(args.target_id)
+        if not src or not dst:
+            missing = []
+            if not src:
+                missing.append(args.source_id)
+            if not dst:
+                missing.append(args.target_id)
+            _emit_json(
+                {
+                    "ok": False,
+                    "error": "not_found",
+                    "detail": f"Task(s) not found: {', '.join(missing)}.",
+                }
+            )
+            sys.exit(1)
+
+        if "relations" not in src or not isinstance(src.get("relations"), list):
+            src["relations"] = []
+        if "relations" not in dst or not isinstance(dst.get("relations"), list):
+            dst["relations"] = []
+
+        rel_type = args.relation_type
+        remove = args.remove
+
+        def _remove_relation(task: Dict[str, Any], other_id: str, rtype: str) -> None:
+            rels = task.get("relations") or []
+            task["relations"] = [
+                r
+                for r in rels
+                if not (
+                    isinstance(r, dict)
+                    and r.get("task_id") == other_id
+                    and r.get("type") == rtype
+                )
+            ]
+
+        def _add_relation(task: Dict[str, Any], other_id: str, rtype: str) -> None:
+            rels = task.get("relations") or []
+            for r in rels:
+                if (
+                    isinstance(r, dict)
+                    and r.get("task_id") == other_id
+                    and r.get("type") == rtype
+                ):
+                    return
+            rels.append({"task_id": other_id, "type": rtype})
+            task["relations"] = rels
+
+        if remove:
+            _remove_relation(src, args.target_id, rel_type)
+            if rel_type in ("relates_to", "duplicate_of"):
+                _remove_relation(dst, args.source_id, rel_type)
+        else:
+            _add_relation(src, args.target_id, rel_type)
+            if rel_type in ("relates_to", "duplicate_of"):
+                _add_relation(dst, args.source_id, rel_type)
+
+        now_ts = now_iso()
+        src["updated_at"] = now_ts
+        dst["updated_at"] = now_ts
+        tasks[src["id"]] = src
+        tasks[dst["id"]] = dst
+
+        append_event(
+            board,
+            make_event(
+                "task_relation_removed" if remove else "task_relation_added",
+                getattr(args, "agent", None),
+                args.source_id,
+                {
+                    "from": args.source_id,
+                    "to": args.target_id,
+                    "type": rel_type,
+                    "symmetric": rel_type in ("relates_to", "duplicate_of"),
+                },
+            ),
+        )
+        collab_context = build_collab_context(
+            board,
+            agent_id=getattr(args, "agent", None),
+        )
+        save_board(path, board)
+
+    src_pub = task_to_public(src)
+    dst_pub = task_to_public(dst)
+    next_steps = []
+    next_steps.extend(
+        next_steps_for_task_action(
+            action="relate",
+            task_id=str(src_pub.get("id") or ""),
+            title=str(src_pub.get("title") or ""),
+            column=str(src_pub.get("column") or ""),
+            status=str(src_pub.get("status") or ""),
+            links=list(src_pub.get("links") or []),
+            agent=str(getattr(args, "agent", "") or ""),
+        )[:4]
+    )
+    _emit_json(
+        {
+            "ok": True,
+            "source": src_pub,
+            "target": dst_pub,
+            "next_steps": next_steps,
+            "collab_context": collab_context,
+        }
+    )
+
+
+def cmd_log(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    collab_context: Optional[Dict[str, Any]] = None
+    with lock:
+        board = load_board(path)
+        task = board["tasks"].get(args.task_id)
+        if not task:
+            _emit_json(
+                {
+                    "ok": False,
+                    "error": "not_found",
+                    "detail": f"Task '{args.task_id}' not found.",
+                }
+            )
+            sys.exit(1)
+
+        payload = parse_json_arg(args.data, "--data")
+        if args.text:
+            payload.setdefault("text", args.text)
+
+        # Auto-link: scan event payload text blobs and persist inferred link tokens.
+        # This intentionally updates only payload.links (not task.links) so task-event edges
+        # can be ingested deterministically with span-grounded evidence.
+        payload_texts = _collect_text_blobs_for_link_extraction(payload, max_items=200)
+        text_links = extract_link_tokens_from_texts(payload_texts)
+        if text_links:
+            existing = payload.get("links")
+            existing_list: List[str] = list(existing) if isinstance(existing, list) else []
+            merged = _dedupe_keep_order(existing_list + list(text_links))
+            merged = [t for t in merged if LINK_TOKEN_RE.fullmatch(t)]
+            if merged:
+                payload["links"] = merged
+
+        now_ts = now_iso()
+        task["updated_at"] = now_ts
+        task["last_activity_at"] = now_ts
+        if args.agent:
+            task["last_activity_actor"] = args.agent
+
+        cur_links = task.get("links")
+        cur_links_list: List[str] = list(cur_links) if isinstance(cur_links, list) else []
+        links_with_codex = append_codex_links(cur_links_list)
+        if links_with_codex != cur_links_list:
+            task["links"] = links_with_codex
+        board["tasks"][args.task_id] = task
+
+        event = make_event(args.kind, args.agent, args.task_id, payload)
+        append_event(board, event)
+        collab_context = build_collab_context(
+            board,
+            agent_id=getattr(args, "agent", None),
+        )
+        save_board(path, board)
+
+    public_task = task_to_public(task)
+    next_steps = next_steps_for_task_action(
+        action="log",
+        task_id=str(public_task.get("id") or ""),
+        title=str(public_task.get("title") or ""),
+        column=str(public_task.get("column") or ""),
+        status=str(public_task.get("status") or ""),
+        links=list(public_task.get("links") or []),
+        agent=str(getattr(args, "agent", "") or ""),
+    )
+    _emit_json(
+        {
+            "ok": True,
+            "event": event,
+            "task": public_task,
+            "next_steps": next_steps,
+            "collab_context": collab_context,
+        }
+    )
+
+
+def cmd_events(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    board = load_board(path)
+    events = board.get("events", []) or []
+    filtered: List[Dict[str, Any]] = []
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if args.task_id and ev.get("task_id") != args.task_id:
+            continue
+        if args.agent and ev.get("actor") != args.agent:
+            continue
+        if args.kind and ev.get("kind") != args.kind:
+            continue
+        if args.since and ev.get("ts", "") < args.since:
+            continue
+        filtered.append(ev)
+
+    filtered.sort(key=lambda e: (e.get("ts", ""), e.get("id", "")))
+    if args.limit and args.limit > 0 and len(filtered) > args.limit:
+        filtered = filtered[-args.limit :]
+
+    _emit_json(
+        {
+            "ok": True,
+            "count": len(filtered),
+            "events": filtered,
+        }
+    )
+
+
+def cmd_agent_touch(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    ensure_parent_dir(path)
+    lock = FileLock(path.with_suffix(path.suffix + ".lock"))
+    collab_context: Optional[Dict[str, Any]] = None
+    with lock:
+        board = load_board(path)
+        agents = board.setdefault("agents", {})
+        agent = agents.get(args.agent) or {"id": args.agent}
+        if args.kind:
+            agent["kind"] = args.kind
+        if args.role:
+            agent["role"] = args.role
+
+        skills = agent.get("skills") or []
+        if not isinstance(skills, list):
+            skills = [skills]
+        if args.skills:
+            skills = list(set(skills) | set(args.skills))
+        agent["skills"] = sorted(skills)
+
+        if args.wip_limit is not None:
+            agent["wip_limit"] = int(args.wip_limit)
+
+        metadata = agent.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        extra_meta = parse_json_arg(args.metadata, "--metadata")
+        if extra_meta:
+            metadata.update(extra_meta)
+        agent["metadata"] = metadata
+
+        agent["last_seen_at"] = now_iso()
+        agents[args.agent] = agent
+
+        append_event(
+            board,
+            make_event(
+                "agent_touch",
+                args.agent,
+                None,
+                {
+                    "role": agent.get("role"),
+                    "kind": agent.get("kind"),
+                    "skills": agent.get("skills"),
+                },
+            ),
+        )
+        collab_context = build_collab_context(board, agent_id=args.agent)
+        save_board(path, board)
+
+    _emit_json({"ok": True, "agent": agent, "collab_context": collab_context})
+
+
+def cmd_agent_view(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    board = load_board(path)
+    plan = build_agent_plan(
+        board,
+        agent_id=args.agent,
+        limit=args.limit,
+        include_blocked=args.include_blocked,
+        include_done=args.include_done,
+    )
+
+    wip_ids = {t["id"] for t in plan["wip"] if isinstance(t, dict) and "id" in t}
+    events = board.get("events", []) or []
+    recent: List[Dict[str, Any]] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("actor") == args.agent or (ev.get("task_id") in wip_ids):
+            recent.append(ev)
+    recent.sort(key=lambda e: (e.get("ts", ""), e.get("id", "")))
+    if len(recent) > 50:
+        recent = recent[-50:]
+
+    collab_context = build_collab_context(board, agent_id=args.agent)
+
+    def _augment(items: Any, *, action: str) -> Any:
+        if not isinstance(items, list):
+            return items
+        out: List[Dict[str, Any]] = []
+        for t in items:
+            if not isinstance(t, dict):
+                continue
+            tt = dict(t)
+            tt["next_steps"] = next_steps_for_task_action(
+                action=action,
+                task_id=str(tt.get("id") or ""),
+                title=str(tt.get("title") or ""),
+                column=str(tt.get("column") or ""),
+                status=str(tt.get("status") or ""),
+                links=list(tt.get("links") or []),
+                agent=str(args.agent or ""),
+            )
+            out.append(tt)
+        return out
+
+    wip = _augment(plan["wip"], action="agent-view")
+    ready = _augment(plan["ready"], action="agent-view")
+    blocked = _augment(plan["blocked"], action="agent-view")
+    done = _augment(plan["done"], action="agent-view")
+    suggested = _augment(plan["suggested"], action="agent-view")
+
+    view_next_steps: List[Dict[str, Any]] = []
+    if isinstance(suggested, list) and suggested:
+        s0 = suggested[0] if isinstance(suggested[0], dict) else {}
+        tid = str(s0.get("id") or "").strip() or "<task_id>"
+        view_next_steps.append(
+            {
+                "text": "Pick one suggested task, move it to doing, and start logging progress.",
+                "commands": [
+                    f"tasks move --id {tid} --to-column doing --agent {args.agent}",
+                    f"tasks log --id {tid} --agent {args.agent} --log '{{\"kind\":\"note\",\"text\":\"starting\"}}'",
+                ],
+                "links": [f"task:{tid}"],
+            }
+        )
+    if isinstance(wip, list) and wip:
+        view_next_steps.append(
+            {
+                "text": "You already have WIP. Prefer finishing/closing WIP (or release leases) before starting more work.",
+                "commands": [f"tasks plan --agent {args.agent}"],
+                "links": [],
+            }
+        )
+
+    _emit_json(
+        {
+            "ok": True,
+            "agent": plan["agent"],
+            "summary": plan["summary"],
+            "wip": wip,
+            "ready": ready,
+            "blocked": blocked,
+            "done": done,
+            "suggested": suggested,
+            "next_steps": view_next_steps,
+            "recent_events": recent,
+            "collab_context": collab_context,
+        }
+    )
+
+
+def cmd_plan(args: argparse.Namespace) -> None:
+    path = resolve_repo_path(args.file, repo_root=REPO_ROOT)
+    board = load_board(path)
+    plan = build_agent_plan(
+        board,
+        agent_id=args.agent,
+        limit=args.limit,
+        include_blocked=args.include_blocked,
+        include_done=args.include_done,
+    )
+    collab_context = build_collab_context(board, agent_id=args.agent)
+
+    def _augment(items: Any, *, action: str) -> Any:
+        if not isinstance(items, list):
+            return items
+        out: List[Dict[str, Any]] = []
+        for t in items:
+            if not isinstance(t, dict):
+                continue
+            tt = dict(t)
+            tt["next_steps"] = next_steps_for_task_action(
+                action=action,
+                task_id=str(tt.get("id") or ""),
+                title=str(tt.get("title") or ""),
+                column=str(tt.get("column") or ""),
+                status=str(tt.get("status") or ""),
+                links=list(tt.get("links") or []),
+                agent=str(args.agent or ""),
+            )
+            out.append(tt)
+        return out
+
+    wip = _augment(plan["wip"], action="plan")
+    suggested = _augment(plan["suggested"], action="plan")
+
+    plan_next_steps: List[Dict[str, Any]] = []
+    if isinstance(suggested, list) and suggested:
+        s0 = suggested[0] if isinstance(suggested[0], dict) else {}
+        tid = str(s0.get("id") or "").strip() or "<task_id>"
+        plan_next_steps.append(
+            {
+                "text": "Start the top suggested task: move to doing and log the first action.",
+                "commands": [
+                    f"tasks move --id {tid} --to-column doing --agent {args.agent}",
+                    f"tasks log --id {tid} --agent {args.agent} --log '{{\"kind\":\"note\",\"text\":\"starting\"}}'",
+                ],
+                "links": [f"task:{tid}"],
+            }
+        )
+    if isinstance(wip, list) and wip:
+        plan_next_steps.append(
+            {
+                "text": "If you are blocked, log blockers and relate tasks so dependencies are visible.",
+                "commands": [f"tasks log --id <task_id> --agent {args.agent} --log '{{\"kind\":\"blocker\",\"text\":\"...\"}}'"],
+                "links": [],
+            }
+        )
+    _emit_json(
+        {
+            "ok": True,
+            "agent": plan["agent"],
+            "summary": plan["summary"],
+            "wip": wip,
+            "suggested": suggested,
+            "next_steps": plan_next_steps,
+            "collab_context": collab_context,
+        }
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _TaskArgumentParser(
+        prog="tasks",
+        description=(
+            "Multi-agent collaboration task tracker CLI for AI/human agents.\n\n"
+            "Related tools:\n"
+            "  - `findings` for bug/smell intake linked to tasks.\n"
+            "  - `fixreport` for closure and prevention after bug fixes.\n"
+            "  - `rules`/`ssot` for governance and canonical references.\n"
+            "  - `scripthistory`/`hypothesis` for provenance and scientific reasoning.\n\n"
+            "Recommended workflow:\n"
+            "  1) tasks overview\n"
+            "  2) tasks list --column todo --limit 20\n"
+            "  3) tasks explain --id <task_id>\n"
+            "  4) tasks plan --agent <agent_id>\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--json-pretty",
+        action="store_true",
+        help="Pretty-print JSON output (indent=2). Default: compact JSON.",
+    )
+    parser.add_argument(
+        "--file",
+        default=BOARD_DEFAULT_FILENAME,
+        help="Path to board JSON file (default: %(default)s)",
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        parser_class=_TaskArgumentParser,
+    )
+
+    p_init = subparsers.add_parser("init", help="Initialize a board file.")
+    p_init.add_argument(
+        "--columns",
+        nargs="*",
+        help="List of column names (default: backlog todo doing review done)",
+    )
+    p_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing board file if it exists.",
+    )
+    p_init.set_defaults(func=cmd_init)
+
+    p_schema = subparsers.add_parser("schema", help="Output JSON schema for board/tasks.")
+    p_schema.set_defaults(func=cmd_schema)
+
+    p_read = subparsers.add_parser("read", help="Read tasks or whole board.")
+    p_read.add_argument(
+        "column_positional",
+        nargs="?",
+        help="Column name to read (optional; can also be given as --column).",
+    )
+    p_read.add_argument(
+        "--column",
+        help="Column name to read (alias for positional COLUMN).",
+    )
+    p_read.add_argument("--id", help="Task id to read.")
+    p_read.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional cap for list results (0 = no cap).",
+    )
+    p_read.add_argument(
+        "--include-events",
+        action="store_true",
+        help=(
+            "Include collaboration events in full-board output. Default is to omit them "
+            "to keep JSON agent-safe; use `tasks events` for filtered retrieval."
+        ),
+    )
+    p_read.set_defaults(func=cmd_read)
+
+    # Alias for `read` to better match mental model "list tasks".
+    p_list = subparsers.add_parser(
+        "list",
+        help="Alias for 'read' (list tasks or full board).",
+    )
+    p_list.add_argument(
+        "column_positional",
+        nargs="?",
+        help="Column name to read (optional; can also be given as --column).",
+    )
+    p_list.add_argument(
+        "--column",
+        help="Column name to read (alias for positional COLUMN).",
+    )
+    p_list.add_argument("--id", help="Task id to read.")
+    p_list.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional cap for list results (0 = no cap).",
+    )
+    p_list.add_argument(
+        "--include-events",
+        action="store_true",
+        help=(
+            "Include collaboration events in full-board output. Default is to omit them "
+            "to keep JSON agent-safe; use `tasks events` for filtered retrieval."
+        ),
+    )
+    p_list.set_defaults(func=cmd_read)
+
+    p_overview = subparsers.add_parser(
+        "overview",
+        help="Compact board summary for quick agent orientation.",
+    )
+    p_overview.add_argument(
+        "--sample-limit",
+        type=int,
+        default=8,
+        help="Max number of tasks per overview sample bucket (default: %(default)s).",
+    )
+    p_overview.set_defaults(func=cmd_overview)
+
+    p_explain = subparsers.add_parser(
+        "explain",
+        help="Explain one task in normalized what/why/how form.",
+    )
+    p_explain.add_argument(
+        "id_positional",
+        nargs="?",
+        help="Task id to explain (positional alias for --id).",
+    )
+    p_explain.add_argument(
+        "--id",
+        default="",
+        help="Task id to explain.",
+    )
+    p_explain.set_defaults(func=cmd_explain)
+
+    p_get = subparsers.add_parser(
+        "get",
+        help="Alias for 'read --id <task_id>' (LLM-friendly).",
+    )
+    p_get.add_argument(
+        "id_positional",
+        nargs="?",
+        help="Task id to read (positional alias for --id).",
+    )
+    p_get.add_argument("--id", default="", help="Task id to read.")
+    p_get.set_defaults(func=cmd_read)
+
+    p_add = subparsers.add_parser("add", help="Add a task to a column.")
+    p_add.add_argument("column", help="Target column name.")
+    p_add.add_argument(
+        "--title",
+        "--name",
+        help="Task title (fallback if not set in --data).",
+    )
+    p_add.add_argument("--id", help="Explicit task id (optional).")
+    p_add.add_argument(
+        "--description",
+        "--text",
+        dest="description",
+        help=(
+            "Optional long-form task description "
+            "(overrides description in --data if provided)."
+        ),
+    )
+    p_add.add_argument(
+        "--priority",
+        help=(
+            "Optional priority label "
+            "(overrides priority in --data; default: normal)."
+        ),
+    )
+    p_add.add_argument(
+        "--assignee",
+        help="Optional assignee/owner for the task (overrides assignee in --data).",
+    )
+    p_add.add_argument(
+        "--tag",
+        "--topic",
+        dest="tags",
+        action="append",
+        help=(
+            "Optional tag/topic label for the task; "
+            "can be specified multiple times."
+        ),
+    )
+    p_add.add_argument(
+        "--link",
+        "--links",
+        dest="links",
+        action="append",
+        help=(
+            "Optional cross-tool link token '<kind>:<id>' "
+            "(can be specified multiple times). See architecture/LINKS_CONTRACT.md."
+        ),
+    )
+    p_add.add_argument(
+        "--script",
+        dest="scripts",
+        action="append",
+        help=(
+            "Repo-relative path to anchor this task to (repeatable). "
+            "This is REQUIRED for new tasks unless `--allow-no-script-anchor` is provided. "
+            "Stored as `script:<repo_relative_path>` in task.links."
+        ),
+    )
+    p_add.add_argument(
+        "--allow-no-script-anchor",
+        action="store_true",
+        help=(
+            "Allow creating a task without any script:<path> anchors in task.links. "
+            "Use sparingly (e.g. portal intake / user-request tasks) and add a script anchor later."
+        ),
+    )
+    p_add.add_argument(
+        "--data",
+        help=(
+            "JSON object with initial task fields "
+            "(title, description, priority, tags, metadata, etc.)."
+        ),
+    )
+    p_add.add_argument(
+        "--agent",
+        help="Optional agent identifier creating the task (for audit trail).",
+    )
+    p_add.set_defaults(func=cmd_add)
+
+    p_update = subparsers.add_parser("update", help="Patch fields on an existing task.")
+    p_update.add_argument(
+        "--id",
+        "--task-id",
+        required=True,
+        help="Task id to update.",
+    )
+    p_update.add_argument(
+        "--set",
+        help="JSON object with fields to set (null deletes a field).",
+    )
+    p_update.add_argument(
+        "--link-add",
+        "--links-add",
+        dest="links_add",
+        action="append",
+        help="Append a cross-tool link token '<kind>:<id>' to task.links (repeatable).",
+    )
+    p_update.add_argument(
+        "--link-remove",
+        "--links-remove",
+        dest="links_remove",
+        action="append",
+        help="Remove a cross-tool link token from task.links (repeatable).",
+    )
+    p_update.add_argument(
+        "--script-add",
+        dest="scripts_add",
+        action="append",
+        help="Append a script anchor path to task.links as `script:<repo_relative_path>` (repeatable).",
+    )
+    p_update.add_argument(
+        "--script-remove",
+        dest="scripts_remove",
+        action="append",
+        help="Remove a script anchor path from task.links (repeatable). Provide the repo-relative path without the 'script:' prefix.",
+    )
+    p_update.add_argument(
+        "--allow-no-script-anchor",
+        action="store_true",
+        help=(
+            "Allow updating task.links to a state with no script:<path> anchors. "
+            "Use sparingly (primarily for unanchored intake tasks)."
+        ),
+    )
+    p_update.add_argument(
+        "--agent",
+        help="Agent identifier performing the update (for audit trail).",
+    )
+    p_update.set_defaults(func=cmd_update)
+
+    p_move = subparsers.add_parser("move", help="Move a task to another column.")
+    p_move.add_argument(
+        "--id",
+        "--task-id",
+        required=True,
+        help="Task id to move.",
+    )
+    p_move.add_argument(
+        "--to",
+        "--to-column",
+        dest="to_column",
+        required=True,
+        help="Destination column name.",
+    )
+    p_move.add_argument(
+        "--agent",
+        help="Agent identifier performing the move (for audit trail).",
+    )
+    p_move.set_defaults(func=cmd_move)
+
+    p_delete = subparsers.add_parser("delete", help="Delete a task.")
+    p_delete.add_argument(
+        "--id",
+        "--task-id",
+        required=True,
+        help="Task id to delete.",
+    )
+    p_delete.add_argument(
+        "--agent",
+        help="Agent identifier deleting the task (for audit trail).",
+    )
+    p_delete.set_defaults(func=cmd_delete)
+
+    p_pull = subparsers.add_parser("pull", help="Lease tasks from a column for an agent.")
+    p_pull.add_argument("column", help="Column to pull tasks from (e.g. backlog).")
+    p_pull.add_argument(
+        "--agent",
+        required=True,
+        help="Arbitrary identifier for the calling agent (can be ephemeral).",
+    )
+    p_pull.add_argument(
+        "--limit",
+        type=int,
+        default=1,
+        help="Maximum number of tasks to lease (default: 1).",
+    )
+    p_pull.add_argument(
+        "--lease-seconds",
+        type=int,
+        default=900,
+        help="Lease duration in seconds (default: 900 = 15 minutes).",
+    )
+    p_pull.set_defaults(func=cmd_pull)
+
+    p_release = subparsers.add_parser("release", help="Release a task lease.")
+    p_release.add_argument(
+        "--id",
+        "--task-id",
+        required=True,
+        help="Task id.",
+    )
+    p_release.add_argument(
+        "--agent",
+        help="Agent identifier releasing the lease (optional but recommended).",
+    )
+    p_release.add_argument(
+        "--force",
+        action="store_true",
+        help="Force release even if leased by another agent or not leased.",
+    )
+    p_release.set_defaults(func=cmd_release)
+
+    p_relate = subparsers.add_parser("relate", help="Add or remove relations between tasks.")
+    p_relate.add_argument(
+        "--from",
+        "--src",
+        dest="source_id",
+        required=True,
+        help="Source task id.",
+    )
+    p_relate.add_argument(
+        "--to",
+        "--dst",
+        dest="target_id",
+        required=True,
+        help="Target task id.",
+    )
+    p_relate.add_argument(
+        "--type",
+        dest="relation_type",
+        default="relates_to",
+        help="Relation type (e.g. blocked_by, blocks, duplicate_of, relates_to).",
+    )
+    p_relate.add_argument(
+        "--remove",
+        action="store_true",
+        help="Remove relation instead of adding.",
+    )
+    p_relate.add_argument(
+        "--agent",
+        help="Agent identifier performing the relation change.",
+    )
+    p_relate.set_defaults(func=cmd_relate)
+
+    p_log = subparsers.add_parser("log", help="Attach structured collaboration log to a task.")
+    p_log.add_argument(
+        "--id",
+        "--task-id",
+        dest="task_id",
+        required=True,
+        help="Task id to log to.",
+    )
+    p_log.add_argument(
+        "--agent",
+        help="Agent identifier emitting the log.",
+    )
+    p_log.add_argument(
+        "--kind",
+        default="comment",
+        help="Application-specific event kind (default: comment).",
+    )
+    p_log.add_argument(
+        "--text",
+        help="Short human-readable text for the log entry.",
+    )
+    p_log.add_argument(
+        "--data",
+        help="Optional JSON object with structured payload for the log.",
+    )
+    p_log.set_defaults(func=cmd_log)
+
+    p_events = subparsers.add_parser("events", help="Read collaboration events.")
+    p_events.add_argument(
+        "--task-id",
+        help="Filter events by task id.",
+    )
+    p_events.add_argument(
+        "--agent",
+        help="Filter events by agent/actor.",
+    )
+    p_events.add_argument(
+        "--kind",
+        help="Filter events by kind.",
+    )
+    p_events.add_argument(
+        "--since",
+        help="Only include events at or after this ISO8601 timestamp.",
+    )
+    p_events.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum number of events to return (default: 100).",
+    )
+    p_events.set_defaults(func=cmd_events)
+
+    p_agent_touch = subparsers.add_parser(
+        "agent-touch",
+        help="Update or create agent metadata / heartbeat.",
+    )
+    p_agent_touch.add_argument(
+        "--agent",
+        required=True,
+        help="Agent identifier.",
+    )
+    p_agent_touch.add_argument(
+        "--kind",
+        help="Agent type (e.g. llm, human, system).",
+    )
+    p_agent_touch.add_argument(
+        "--role",
+        help="Short role description.",
+    )
+    p_agent_touch.add_argument(
+        "--skill",
+        "--tag",
+        dest="skills",
+        action="append",
+        help="Skill tag for this agent (can be given multiple times).",
+    )
+    p_agent_touch.add_argument(
+        "--wip-limit",
+        type=int,
+        help="Soft WIP limit for this agent.",
+    )
+    p_agent_touch.add_argument(
+        "--metadata",
+        help="JSON object with additional agent metadata.",
+    )
+    p_agent_touch.set_defaults(func=cmd_agent_touch)
+
+    p_agent_view = subparsers.add_parser(
+        "agent-view",
+        help="Per-agent collaboration view (WIP, ready, blocked, suggested).",
+    )
+    p_agent_view.add_argument(
+        "--agent",
+        required=True,
+        help="Agent identifier.",
+    )
+    p_agent_view.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of suggested tasks (default: 20).",
+    )
+    p_agent_view.add_argument(
+        "--include-blocked",
+        action="store_true",
+        help="Include blocked tasks in suggestion candidates.",
+    )
+    p_agent_view.add_argument(
+        "--include-done",
+        action="store_true",
+        help="Include done/archived tasks in agent view.",
+    )
+    p_agent_view.set_defaults(func=cmd_agent_view)
+
+    p_plan = subparsers.add_parser(
+        "plan",
+        help="Compact per-agent execution plan (suggested next tasks).",
+    )
+    p_plan.add_argument(
+        "--agent",
+        required=True,
+        help="Agent identifier.",
+    )
+    p_plan.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum number of suggested tasks (default: 10).",
+    )
+    p_plan.add_argument(
+        "--include-blocked",
+        action="store_true",
+        help="Include blocked tasks in suggestion candidates.",
+    )
+    p_plan.add_argument(
+        "--include-done",
+        action="store_true",
+        help="Include done/archived tasks in planning.",
+    )
+    p_plan.set_defaults(func=cmd_plan)
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = build_parser()
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    pretty_guess = "--json-pretty" in argv_list
+
+    # Allow global flags to appear after the subcommand (LLM/tool friendly).
+    _global_arity = {"--json-pretty": 0, "--file": 1}
+    moved: List[str] = []
+    rest: List[str] = []
+    i = 0
+    while i < len(argv_list):
+        a = argv_list[i]
+        if a in _global_arity:
+            n = _global_arity[a]
+            if n:
+                # Missing value: do not reorder (let argparse report).
+                if i + n >= len(argv_list):
+                    rest.append(a)
+                    i += 1
+                    continue
+                moved.append(a)
+                moved.extend(argv_list[i + 1 : i + 1 + n])
+                i += 1 + n
+                continue
+            moved.append(a)
+            i += 1
+            continue
+        if a.startswith("--file="):
+            moved.append(a)
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    argv_list = moved + rest
+
+    try:
+        args = parser.parse_args(argv_list)
+    except _TaskArgparseError as exc:
+        payload: Dict[str, Any] = {
+            "ok": False,
+            "error": "invalid_arguments",
+            "error_code": "ARGPARSE_ERROR",
+            "detail": exc.message,
+            "retryable": False,
+        }
+        usage = (exc.usage or "").strip()
+        if usage:
+            payload["usage"] = usage
+        _emit_json(payload, pretty=pretty_guess)
+        sys.exit(2)
+    except SystemExit:
+        raise
+
+    global _JSON_PRETTY
+    _JSON_PRETTY = bool(getattr(args, "json_pretty", False))
+
+    try:
+        handler = getattr(args, "func", None)
+        handler_name = getattr(handler, "__name__", "")
+        if handler_name in _MUTATING_TASK_HANDLERS:
+            _run_task_mutation_with_retry(handler_name.replace("cmd_", ""), lambda: handler(args))
+        else:
+            handler(args)
+    except _TaskUserError as exc:
+        _emit_json(exc.payload)
+        sys.exit(int(exc.exit_code))
+    except FileLockTimeout as e:
+        _emit_json(
+            {
+                "ok": False,
+                "error": "lock_timeout",
+                "detail": str(e),
+            }
+        )
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

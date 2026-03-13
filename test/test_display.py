@@ -12,6 +12,47 @@ from twinr.display import WaveshareEPD4In2V2
 
 
 class WaveshareDisplayTests(unittest.TestCase):
+    def test_split_footer_parts_separates_time_suffix(self) -> None:
+        display = WaveshareEPD4In2V2(
+            project_root=Path("."),
+            vendor_dir=Path("hardware/display/vendor"),
+            width=400,
+            height=300,
+            rotation_degrees=270,
+        )
+
+        left, right = display._split_footer_parts("Internet ok | AI ok | System ok (12:34)")
+
+        self.assertEqual(left, "Internet ok | AI ok | System ok")
+        self.assertEqual(right, "(12:34)")
+
+    def test_render_status_image_draws_health_footer(self) -> None:
+        display = WaveshareEPD4In2V2(
+            project_root=Path("."),
+            vendor_dir=Path("hardware/display/vendor"),
+            width=400,
+            height=300,
+            rotation_degrees=270,
+        )
+
+        plain = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=(),
+            animation_frame=0,
+        )
+        with_footer = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Betrieb ok | 54C",),
+            animation_frame=0,
+        )
+
+        plain_footer = plain.crop((24, 244, 376, 296))
+        rendered_footer = with_footer.crop((24, 244, 376, 296))
+
+        self.assertNotEqual(list(plain_footer.getdata()), list(rendered_footer.getdata()))
+
     def test_prepare_image_applies_configured_rotation(self) -> None:
         display = WaveshareEPD4In2V2(
             project_root=Path("."),
@@ -269,6 +310,74 @@ class WaveshareDisplayTests(unittest.TestCase):
                     ("init_fast", 7),
                     ("buffer", "second"),
                     ("display_fast", "second"),
+                ],
+            )
+
+    def test_show_image_can_force_full_refresh_on_configured_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            vendor_dir = Path(temp_dir) / "vendor" / "waveshare_epd"
+            vendor_dir.mkdir(parents=True)
+            (vendor_dir / "__init__.py").write_text("", encoding="utf-8")
+            (vendor_dir / "epdconfig.py").write_text(
+                textwrap.dedent(
+                    """
+                    RST_PIN = 17
+                    DC_PIN = 25
+                    CS_PIN = 8
+                    BUSY_PIN = 24
+                    PWR_PIN = 18
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (vendor_dir / "epd4in2_V2.py").write_text(
+                textwrap.dedent(
+                    """
+                    EVENTS = []
+
+                    class EPD:
+                        width = 400
+                        height = 300
+
+                        def init(self):
+                            EVENTS.append("init")
+
+                        def getbuffer(self, image):
+                            EVENTS.append(("buffer", image))
+                            return image
+
+                        def display(self, buffer):
+                            EVENTS.append(("display", buffer))
+
+                        def display_Partial(self, buffer):
+                            EVENTS.append(("display_partial", buffer))
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            display = WaveshareEPD4In2V2(
+                project_root=Path(temp_dir),
+                vendor_dir=Path(temp_dir) / "vendor",
+                full_refresh_interval=2,
+            )
+
+            display.show_image("first", clear_first=False)
+            display.show_image("second", clear_first=False)
+            display.show_image("third", clear_first=False)
+
+            module = display._load_driver_module()
+            self.assertEqual(
+                module.EVENTS,
+                [
+                    "init",
+                    ("buffer", "first"),
+                    ("display", "first"),
+                    ("buffer", "second"),
+                    ("display_partial", "second"),
+                    "init",
+                    ("buffer", "third"),
+                    ("display", "third"),
                 ],
             )
 

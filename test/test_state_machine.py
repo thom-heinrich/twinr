@@ -44,9 +44,30 @@ class TwinrRuntimeTests(unittest.TestCase):
         memory.remember("assistant", "four")
         memory.remember("user", "five")
 
+        self.assertEqual(tuple(turn.content for turn in memory.raw_tail), ("four", "five"))
+        self.assertEqual(memory.ledger[0].kind, "conversation_summary")
+        self.assertIn("User asked: one", memory.ledger[0].content)
         self.assertEqual(memory.turns[0].role, "system")
-        self.assertIn("Compact conversation summary", memory.turns[0].content)
+        self.assertIn("Twinr memory summary", memory.turns[0].content)
         self.assertLessEqual(len(memory.turns), 3)
+
+    def test_memory_stores_search_results_as_typed_entries(self) -> None:
+        memory = OnDeviceMemory(max_turns=6, keep_recent=3)
+        memory.remember("user", "Wie wird das Wetter morgen?")
+        memory.remember_search(
+            question="Wie wird das Wetter morgen in Schwarzenbek?",
+            answer="Morgen wird es 11 Grad und windig.",
+            sources=("https://example.com/weather",),
+            location_hint="Schwarzenbek",
+            date_context="2026-03-14",
+        )
+
+        self.assertEqual(len(memory.search_results), 1)
+        self.assertEqual(memory.search_results[0].question, "Wie wird das Wetter morgen in Schwarzenbek?")
+        self.assertEqual(memory.search_results[0].sources, ("https://example.com/weather",))
+        self.assertEqual(memory.ledger[-1].kind, "search_result")
+        self.assertIn("Verified web lookup", memory.turns[0].content)
+        self.assertIn("Morgen wird es 11 Grad und windig.", memory.turns[0].content)
 
     def test_tool_print_can_resume_answering(self) -> None:
         runtime = TwinrRuntime(config=TwinrConfig())
@@ -59,6 +80,19 @@ class TwinrRuntimeTests(unittest.TestCase):
 
         runtime.resume_answering_after_print()
         self.assertEqual(runtime.status, TwinrStatus.ANSWERING)
+
+    def test_proactive_prompt_can_speak_without_user_turn(self) -> None:
+        runtime = TwinrRuntime(config=TwinrConfig())
+
+        spoken = runtime.begin_proactive_prompt("Ist alles in Ordnung?")
+
+        self.assertEqual(spoken, "Ist alles in Ordnung?")
+        self.assertEqual(runtime.status, TwinrStatus.ANSWERING)
+        self.assertEqual(runtime.last_response, None)
+        self.assertEqual(runtime.memory.last_assistant_message(), "Ist alles in Ordnung?")
+
+        runtime.finish_speaking()
+        self.assertEqual(runtime.status, TwinrStatus.WAITING)
 
     def test_runtime_persists_snapshot_for_web_ui(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -84,6 +118,11 @@ class TwinrRuntimeTests(unittest.TestCase):
             runtime.press_green_button()
             runtime.submit_transcript("Bitte merke dir den Zahnarzttermin.")
             runtime.complete_agent_turn("Zahnarzttermin ist am Montag um 14 Uhr.")
+            runtime.remember_search_result(
+                question="Wann ist mein Zahnarzttermin?",
+                answer="Am Montag um 14 Uhr.",
+                sources=("https://example.com/termin",),
+            )
             runtime.finish_speaking()
 
             restarted = TwinrRuntime(
@@ -97,6 +136,29 @@ class TwinrRuntimeTests(unittest.TestCase):
                 restarted.press_yellow_button(),
                 "Zahnarzttermin ist am Montag um 14 Uhr.",
             )
+            self.assertEqual(restarted.memory.search_results[0].answer, "Am Montag um 14 Uhr.")
+            self.assertIn("Verified web lookup", restarted.memory.turns[0].content)
+
+    def test_runtime_persists_generic_memory_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "runtime-state.json"
+            runtime = TwinrRuntime(config=TwinrConfig(runtime_state_path=str(snapshot_path)))
+
+            runtime.remember_note(
+                kind="preference",
+                content="Behavior update (response_style): Keep answers very short and calm.",
+                metadata={"category": "response_style"},
+            )
+
+            restarted = TwinrRuntime(
+                config=TwinrConfig(
+                    runtime_state_path=str(snapshot_path),
+                    restore_runtime_state_on_startup=True,
+                )
+            )
+
+        self.assertEqual(restarted.memory.ledger[-1].kind, "preference")
+        self.assertIn("Keep answers very short and calm.", restarted.memory.turns[0].content)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Create redacted support bundle</h2>
+      <p class="section-description">The bundle includes the runtime snapshot, recent structured logs, config checks, and relevant environment keys with secrets masked.</p>
+    </div>
+  </div>
+  <form method="post" action="/ops/support" class="actions actions-start">
+    <button type="submit">Build support bundle</button>
+  </form>
+</section>
+
+{% if bundle %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Latest bundle</h2>
+      <p class="section-description">Bundle creation finished on this machine.</p>
+    </div>
+  </div>
+  <div class="detail-grid">
+    <article class="detail-card detail-card-wide">
+      <span class="detail-label">Bundle path</span>
+      <div class="detail-body detail-body-copy">{{ bundle.bundle_path }}</div>
+    </article>
+    <article class="detail-card">
+      <span class="detail-label">Created at</span>
+      <div class="detail-body">{{ bundle.created_at }}</div>
+    </article>
+    <article class="detail-card">
+      <span class="detail-label">Files inside</span>
+      <div class="detail-body">{{ bundle.file_count }}</div>
+    </article>
+  </div>
+  <div class="link-row">
+    <a class="inline-link" href="/ops/support/download/{{ bundle.bundle_name }}">Download {{ bundle.bundle_name }}</a>
+  </div>
+  {% if bundle.includes %}
+  <ul class="plain-list top-gap">
+    {% for item in bundle.includes %}
+    <li>{{ item }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Recent bundles</h2>
+    </div>
+  </div>
+  {% if bundles %}
+  <ul class="plain-list">
+    {% for item in bundles %}
+    <li><a class="inline-link" href="{{ item.download_href }}">{{ item.name }}</a> <span class="muted-inline">{{ item.path }}</span></li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <div class="empty-state">No support bundles have been created yet.</div>
+  {% endif %}
+</section>
+{% endblock %}

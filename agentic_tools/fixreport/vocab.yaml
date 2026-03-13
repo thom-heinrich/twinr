@@ -1,0 +1,593 @@
+# bugfix_vocab.yaml
+# Controlled vocabulary + schema rules for bugfix entries.
+# Goal: high-precision retrieval with 1-token values (snake_case) wherever possible.
+
+vocab_version: 2
+
+rules:
+  token_style: snake_case
+  single_token_fields_should_be_one_word_or_snake: true
+  multi_value_fields_are_lists: true
+  timestamps:
+    format: iso_8601_utc
+    example: "2025-12-31T17:21:13Z"
+
+schema:
+  # ---- Identity + provenance ----
+  bf_id:
+    type: token
+    required: true
+    free: false
+    pattern: "^BF[0-9]{6}$"
+    example: "BF000237"
+
+  ts_utc:
+    type: timestamp
+    required: true
+    free: false
+    example: "2025-12-31T17:21:13Z"
+
+  commit:
+    type: token
+    required: true
+    free: true         # short sha; do not enumerate
+    example: "8f26280"
+
+  repo_area:
+    type: enum
+    required: true
+    free: false
+    allowed:
+      - services
+      - scripts
+      - tests
+      - clickhouse
+      - systemd
+      - config
+      - contracts
+      - analytics
+      - migration
+      - consumer
+      - common
+      - infra
+      - docs
+
+  # ---- Target locator ----
+  target_kind:
+    type: enum
+    required: true
+    free: false
+    allowed:
+      - service
+      - script
+      - test
+      - sql
+      - proto
+      - systemd
+      - config
+      - lib
+      - contract
+      - doc
+
+  target_path:
+    type: path
+    required: true
+    free: true
+    example: "services/analytics/analytics_flow_toxicity_v2.py"
+
+  paths_touched:
+    type: list_path
+    required: false
+    free: true
+
+  systemd_unit:
+    type: token
+    required: false
+    free: true
+    example: "caia-analytics-world-model-pf-xbtusd-h900"
+
+  contracts:
+    type: list_token
+    required: false
+    free: true
+    examples:
+      - "contracts/ex.analytics.cc_state.yaml"
+
+  topics:
+    type: list_token
+    required: false
+    free: true
+    examples:
+      - "analytics.l2_footprint"
+      - "analytics.mark_price.v2.ch"
+
+  tables_views:
+    type: list_token
+    required: false
+    free: true
+    examples:
+      - "caia.analytics_mark_price_1m"
+      - "caia.v_cost_truth_pf_xbtusd"
+
+  # ---- Domain context ----
+  scope:
+    type: enum
+    required: true
+    free: false
+    allowed:
+      - trading
+      - analytics
+      - infra
+      - codebase
+      - ops
+      - portal
+      - research
+
+  asset:
+    type: token
+    required: false
+    free: true
+    example: "btc"
+
+  venue:
+    type: token
+    required: false
+    free: true
+    example: "kraken_futures"
+
+  instrument:
+    type: token
+    required: false
+    free: true
+    example: "pf_xbtusd"
+
+  horizon:
+    type: enum
+    required: false
+    free: false
+    allowed:
+      - h1s
+      - h2s
+      - h5s
+      - h10s
+      - h15s
+      - h30s
+      - h60s
+      - h300s
+      - h600s
+      - h900s
+      - h1800s
+      - h3600s
+      - h2h
+      - h4h
+      - h8h
+      - h24h
+
+  mode:
+    type: enum
+    required: true
+    free: false
+    allowed:
+      - live
+      - shadow
+      - backtest
+      - replay
+      - backfill
+      - train
+      - eval
+      - dev
+      - test
+
+
+  # ---- Classification (retrieval core) ----
+  bug_type:
+    type: enum
+    required: true
+    free: false
+    allowed:
+      # code correctness classes
+      - syntax
+      - runtime
+      - logic
+      - algorithm
+      - assumption
+      - math
+      - stats
+      - numerical
+      # integration/system classes
+      - api_contract
+      - io
+      - concurrency
+      - performance
+      - config
+      - data_quality
+      - time_semantics
+      - schema_drift
+      - security
+      - observability
+      - docs
+      # meta/process/toolchain classes
+      - build
+      - packaging
+      - evaluation_method
+      - governance
+
+  symptom:
+    type: enum
+    required: true
+    free: false
+    allowed:
+      # hard failures
+      - syntax_error
+      - import_error
+      - crash
+      - hang
+      - timeout
+      - oom
+      - decode_fail
+      - encode_fail
+      - schema_parse_fail
+      # silent/soft wrongness
+      - silent_wrong
+      - wrong_output
+      - wrong_metric
+      - wrong_pnl
+      - negative_pnl
+      - pnl_spike
+      - sign_inversion
+      - unit_mismatch
+      - nan_poison
+      - inf_poison
+      - overflow
+      - underflow
+      - nondeterministic
+      - unstable
+      # decisioning/trading behavior
+      - no_trade
+      - overtrade
+      - undertrade
+      - gate_abstain
+      - gate_bypass
+      - gate_noop
+      - calibration_collapse
+      - train_eval_mismatch
+      # pipeline / data
+      - duplicate_rows
+      - missing_rows
+      - outlier_value
+      - stale_data
+      - coverage_gap
+      - lag_spike
+      - throughput_drop
+      - high_latency
+      - backpressure
+      - partial_result
+      # metrics/research hygiene
+      - metric_drift
+      - selection_bias
+      # ops/alerts
+      - alert_fire
+      - alert_miss
+
+  root_cause:
+    type: enum
+    required: true
+    free: false
+    allowed:
+      # reasoning / modeling / algorithm errors
+      - wrong_assumption
+      - wrong_algorithm
+      - wrong_objective
+      - wrong_loss
+      - wrong_threshold
+      - wrong_default
+      - wrong_constant
+      - wrong_sign
+      - wrong_units
+      - wrong_distribution
+      - wrong_normalization
+      - wrong_feature
+      - wrong_label
+      - wrong_cost_model
+      # classic code bugs
+      - swapped_fields
+      - off_by_one
+      - index_mismatch
+      - dtype_mismatch
+      - shape_mismatch
+      - wrong_column
+      - wrong_key
+      - wrong_order
+      - null_handling
+      - nan_fill_policy
+      - float_precision
+      # time/causality/leakage
+      - lookahead
+      - leakage
+      - ts_event_vs_ts_ingest
+      - asof_join_missing
+      - join_window_wrong
+      - join_key_wrong
+      - out_of_order
+      - clock_skew
+      # data integrity
+      - data_poison
+      - fallback_poison
+      - dedupe_missing
+      - dedupe_wrong
+      - double_count
+      - missing_field
+      - missing_value
+      # integration / contracts
+      - schema_mismatch
+      - proto_drift
+      - contract_mismatch
+      - api_misuse
+      - version_skew
+      - incompatible_dep
+      # config / wiring
+      - config_miswire
+      - config_drift
+      - env_var_expand
+      - path_wrong
+      - wrong_flag
+      # reliability / ops
+      - retry_missing
+      - timeout_too_low
+      - error_swallow
+      - exception_shadowing
+      - restart_nonidempotent
+      - ttl_drop
+      - resource_limit
+      - partition_cold
+      - query_pathological
+      - race_condition
+      - deadlock
+      - missing_lock
+      # model lifecycle
+      - stale_cache
+      - cache_key_collision
+      - model_version_missing
+      # evaluation bias / multiple testing
+      - selection_bias
+      - multiple_testing
+      - data_snooping
+      - survivorship_bias
+      # toolchain
+      - optional_dep_missing
+      - build_misconfig
+      # gates
+      - gate_noop
+
+  archetypes:
+    type: list_token
+    required: false
+    free: false
+    allowed:
+      - stateful_agent_workflow
+      - hnsw_manager
+      - async_job
+      - portal_ui
+      - llm_tooling
+      - retrieval_index
+      - streaming_sink
+      - kafka_consumer
+      - clickhouse_sink
+      - schema_contract
+      - api_client
+      - config_runtime
+      - systemd_service
+      - scheduler_orchestrator
+      - observability_pipeline
+      - data_quality_gate
+      - evaluation_pipeline
+      - cost_modeling
+      - time_semantics_guardrail
+      - security_boundary
+      - automation_workflow
+    note: "Mandatory for new FixReports (create/new). Use 1-5 tokens that describe the bug archetype."
+
+  failure_mode:
+    type: enum
+    required: true
+    free: false
+    allowed:
+      # control-plane semantics
+      - fail_open
+      - fail_closed
+      - bypass_guard
+      - error_swallow
+      - gate_noop
+      - calibration_collapse
+      - governance_drift
+      # data/feature/label corruption
+      - corrupt_feature
+      - corrupt_label
+      - corrupt_cost
+      - corrupt_metric
+      - corrupt_state
+      - corrupt_cache
+      - corrupt_output
+      # pipeline emission pathologies
+      - duplicate_emit
+      - missing_emit
+      - stale_emit
+      - reorder_emit
+      - misroute
+      - data_loss
+      # evaluation/training pathologies
+      - eval_wrong
+      - train_wrong
+      - backfill_wrong
+      - train_eval_mismatch
+      # trading decisioning errors
+      - trade_rule_wrong
+      - sizing_wrong
+      - gating_wrong
+      - routing_wrong
+      # degradation outcomes
+      - degrade_edge
+      - degrade_pnl
+      - degrade_latency
+      - degrade_throughput
+      - degrade_stability
+      # security/ops outcomes
+      - security_exposure
+      - ops_incident
+
+  # ---- Fix + impact + verification ----
+  fix_type:
+    type: enum
+    required: true
+    free: false
+    allowed:
+      # direct fixes
+      - syntax_fix
+      - logic_fix
+      - algorithm_fix
+      - assumption_fix
+      - math_fix
+      - stats_fix
+      - numerical_fix
+      - sign_fix
+      - unit_fix
+      - constant_fix
+      - threshold_fix
+      - default_fix
+      - column_fix
+      - key_fix
+      # time/leakage/dq
+      - align_time
+      - align_units
+      - join_fix
+      - leak_fix
+      - dedupe
+      - dq_gate
+      - fallback_fix
+      # infra/ops hardening
+      - retry_timeout
+      - performance_opt
+      - memory_opt
+      - concurrency_fix
+      - restart_fix
+      - instrumentation
+      - monitoring
+      - config_fix
+      - contract_fix
+      - schema_fix
+      - migration
+      - backfill
+      # research/eval hygiene
+      - calibration_fix
+      - snooping_fix
+      # toolchain
+      - dependency_fix
+      - build_fix
+      # engineering hygiene
+      - refactor
+      - test_add
+      - doc_fix
+      - cleanup
+      - revert
+      - rollback_flag
+      - governance_fix
+
+  impact_area:
+    type: enum
+    required: true
+    free: false
+    allowed:
+      - correctness
+      - pnl
+      - dq
+      - latency
+      - coverage
+      - stability
+      - safety
+      - ops
+
+  severity:
+    type: enum
+    required: true
+    free: false
+    allowed: [p0, p1, p2, p3]
+
+  verification:
+    type: enum
+    required: true
+    free: false
+    allowed:
+      - unit_test
+      - regression_test
+      - domain_eval
+      - backtest
+      - live_canary
+      - ops_monitor
+      # extended (optional but allowed)
+      - integration_test
+      - property_test
+      - replay_eval
+      - shadow_compare
+      - lint
+      - typecheck
+      - manual_check
+
+  tests_added:
+    type: enum
+    required: false
+    free: false
+    allowed: [yes, no]
+
+  breaking:
+    type: enum
+    required: false
+    free: false
+    allowed: [yes, no]
+
+  backfill_needed:
+    type: enum
+    required: false
+    free: false
+    allowed: [yes, no]
+
+  # ---- Cross-links ----
+  hypothesis_ids:
+    type: list_token
+    required: false
+    free: true
+    pattern_hint: "^H[0-9]{5}$"
+
+  task_ids:
+    type: list_token
+    required: false
+    free: true
+
+  ops_msg_ids:
+    type: list_token
+    required: false
+    free: true
+    pattern_hint: "^M[0-9]{5}$"
+
+  audit_ids:
+    type: list_token
+    required: false
+    free: true
+
+  links:
+    type: list_token
+    required: false
+    free: true
+    note: "Generic outbound links (kind:id), see architecture/LINKS_CONTRACT.md."
+
+  # ---- Free-form retrieval escape hatches ----
+  signature:
+    type: token
+    required: false
+    free: true
+    note: "Stable incident/fix key; prefer reusable tokens like ch_code_241, ts_future_2299."
+
+  tags:
+    type: list_token
+    required: false
+    free: true
+    note: "Escape hatch for nuances not captured by enums; keep to snake_case tokens."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bugfinding"
+  short_description: "Root-cause bug intake, triage, and fix closure workflow"
+  default_prompt: "Use $bugfinding to turn this Twinr bug into a durable finding, link the work in tasks if needed, and close it with validation and fixreport evidence."

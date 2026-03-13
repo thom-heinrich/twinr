@@ -20,7 +20,6 @@ DEFAULT_BUTTON_PROBE_LINES = (
     23,
     24,
     25,
-    26,
     27,
 )
 
@@ -81,6 +80,7 @@ class TwinrConfig:
     openai_send_project_header: bool | None = None
     project_root: str = "."
     personality_dir: str = "personality"
+    user_display_name: str | None = None
     default_model: str = "gpt-5.2"
     openai_reasoning_effort: str = "medium"
     openai_stt_model: str = "whisper-1"
@@ -100,10 +100,15 @@ class TwinrConfig:
     audio_beep_duration_ms: int = 180
     audio_beep_volume: float = 0.8
     audio_beep_settle_ms: int = 120
+    search_feedback_tones_enabled: bool = True
+    search_feedback_delay_ms: int = 1200
+    search_feedback_pause_ms: int = 900
+    search_feedback_volume: float = 0.14
     audio_speech_start_chunks: int = 1
     audio_follow_up_speech_start_chunks: int = 4
     audio_follow_up_ignore_ms: int = 300
     openai_enable_web_search: bool = False
+    openai_search_model: str = "gpt-5.2-chat-latest"
     openai_web_search_context_size: str = "medium"
     openai_web_search_country: str | None = None
     openai_web_search_region: str | None = None
@@ -119,9 +124,27 @@ class TwinrConfig:
     audio_speech_threshold: int = 700
     audio_start_timeout_s: float = 8.0
     audio_max_record_seconds: float = 20.0
+    camera_device: str = "/dev/video0"
+    camera_width: int = 640
+    camera_height: int = 480
+    camera_framerate: int = 30
+    camera_input_format: str | None = None
+    camera_ffmpeg_path: str = "ffmpeg"
+    vision_reference_image_path: str | None = None
+    openai_vision_detail: str = "auto"
+    proactive_enabled: bool = False
+    proactive_poll_interval_s: float = 4.0
+    proactive_capture_interval_s: float = 6.0
+    proactive_motion_window_s: float = 20.0
+    proactive_low_motion_after_s: float = 12.0
+    proactive_audio_enabled: bool = False
+    proactive_audio_input_device: str | None = None
+    proactive_audio_sample_ms: int = 1000
+    proactive_audio_distress_enabled: bool = False
     web_host: str = "0.0.0.0"
     web_port: int = 1337
     runtime_state_path: str = "/tmp/twinr-runtime-state.json"
+    memory_markdown_path: str = "state/MEMORY.md"
     restore_runtime_state_on_startup: bool = False
     speech_pause_ms: int = 1200
     memory_max_turns: int = 12
@@ -129,6 +152,10 @@ class TwinrConfig:
     gpio_chip: str = "gpiochip0"
     green_button_gpio: int | None = None
     yellow_button_gpio: int | None = None
+    pir_motion_gpio: int | None = None
+    pir_active_high: bool = True
+    pir_bias: str = "pull-down"
+    pir_debounce_ms: int = 120
     button_active_low: bool = True
     button_bias: str = "pull-up"
     button_debounce_ms: int = 80
@@ -144,6 +171,7 @@ class TwinrConfig:
     display_width: int = 400
     display_height: int = 300
     display_rotation_degrees: int = 270
+    display_full_refresh_interval: int = 0
     display_poll_interval_s: float = 0.5
     printer_queue: str = "Thermal_GP58"
     printer_device_uri: str | None = None
@@ -164,10 +192,15 @@ class TwinrConfig:
             mapping["yellow"] = self.yellow_button_gpio
         return mapping
 
+    @property
+    def pir_enabled(self) -> bool:
+        return self.pir_motion_gpio is not None
+
     @classmethod
     def from_env(cls, env_path: str | Path = ".env") -> "TwinrConfig":
         path = Path(env_path)
         file_values = _read_dotenv(path)
+        project_root = path.parent.resolve()
 
         def get_value(name: str, default: str | None = None) -> str | None:
             if name in os.environ:
@@ -178,8 +211,9 @@ class TwinrConfig:
             openai_api_key=get_value("OPENAI_API_KEY"),
             openai_project_id=get_value("OPENAI_PROJ_ID"),
             openai_send_project_header=_parse_optional_bool(get_value("OPENAI_SEND_PROJECT_HEADER")),
-            project_root=str(path.parent.resolve()),
+            project_root=str(project_root),
             personality_dir=get_value("TWINR_PERSONALITY_DIR", "personality") or "personality",
+            user_display_name=get_value("TWINR_USER_DISPLAY_NAME"),
             default_model=get_value("OPENAI_MODEL", "gpt-5.2") or "gpt-5.2",
             openai_reasoning_effort=get_value("OPENAI_REASONING_EFFORT", "medium") or "medium",
             openai_stt_model=get_value("OPENAI_STT_MODEL", "whisper-1") or "whisper-1",
@@ -210,12 +244,17 @@ class TwinrConfig:
             audio_beep_duration_ms=int(get_value("TWINR_AUDIO_BEEP_DURATION_MS", "180") or "180"),
             audio_beep_volume=_parse_float(get_value("TWINR_AUDIO_BEEP_VOLUME"), 0.8),
             audio_beep_settle_ms=int(get_value("TWINR_AUDIO_BEEP_SETTLE_MS", "120") or "120"),
+            search_feedback_tones_enabled=_parse_bool(get_value("TWINR_SEARCH_FEEDBACK_TONES_ENABLED"), True),
+            search_feedback_delay_ms=int(get_value("TWINR_SEARCH_FEEDBACK_DELAY_MS", "1200") or "1200"),
+            search_feedback_pause_ms=int(get_value("TWINR_SEARCH_FEEDBACK_PAUSE_MS", "900") or "900"),
+            search_feedback_volume=_parse_float(get_value("TWINR_SEARCH_FEEDBACK_VOLUME"), 0.14),
             audio_speech_start_chunks=int(get_value("TWINR_AUDIO_SPEECH_START_CHUNKS", "1") or "1"),
             audio_follow_up_speech_start_chunks=int(
                 get_value("TWINR_AUDIO_FOLLOW_UP_SPEECH_START_CHUNKS", "4") or "4"
             ),
             audio_follow_up_ignore_ms=int(get_value("TWINR_AUDIO_FOLLOW_UP_IGNORE_MS", "300") or "300"),
             openai_enable_web_search=_parse_bool(get_value("TWINR_OPENAI_ENABLE_WEB_SEARCH"), False),
+            openai_search_model=get_value("OPENAI_SEARCH_MODEL", "gpt-5.2-chat-latest") or "gpt-5.2-chat-latest",
             openai_web_search_context_size=get_value("TWINR_OPENAI_WEB_SEARCH_CONTEXT_SIZE", "medium") or "medium",
             openai_web_search_country=get_value("TWINR_OPENAI_WEB_SEARCH_COUNTRY"),
             openai_web_search_region=get_value("TWINR_OPENAI_WEB_SEARCH_REGION"),
@@ -231,10 +270,38 @@ class TwinrConfig:
             audio_speech_threshold=int(get_value("TWINR_AUDIO_SPEECH_THRESHOLD", "700") or "700"),
             audio_start_timeout_s=_parse_float(get_value("TWINR_AUDIO_START_TIMEOUT_S"), 8.0),
             audio_max_record_seconds=_parse_float(get_value("TWINR_AUDIO_MAX_RECORD_SECONDS"), 20.0),
+            camera_device=get_value("TWINR_CAMERA_DEVICE", "/dev/video0") or "/dev/video0",
+            camera_width=int(get_value("TWINR_CAMERA_WIDTH", "640") or "640"),
+            camera_height=int(get_value("TWINR_CAMERA_HEIGHT", "480") or "480"),
+            camera_framerate=int(get_value("TWINR_CAMERA_FRAMERATE", "30") or "30"),
+            camera_input_format=get_value("TWINR_CAMERA_INPUT_FORMAT"),
+            camera_ffmpeg_path=get_value("TWINR_CAMERA_FFMPEG_PATH", "ffmpeg") or "ffmpeg",
+            vision_reference_image_path=get_value("TWINR_VISION_REFERENCE_IMAGE"),
+            openai_vision_detail=get_value("OPENAI_VISION_DETAIL", "auto") or "auto",
+            proactive_enabled=_parse_bool(get_value("TWINR_PROACTIVE_ENABLED"), False),
+            proactive_poll_interval_s=_parse_float(get_value("TWINR_PROACTIVE_POLL_INTERVAL_S"), 4.0),
+            proactive_capture_interval_s=_parse_float(get_value("TWINR_PROACTIVE_CAPTURE_INTERVAL_S"), 6.0),
+            proactive_motion_window_s=_parse_float(get_value("TWINR_PROACTIVE_MOTION_WINDOW_S"), 20.0),
+            proactive_low_motion_after_s=_parse_float(get_value("TWINR_PROACTIVE_LOW_MOTION_AFTER_S"), 12.0),
+            proactive_audio_enabled=_parse_bool(get_value("TWINR_PROACTIVE_AUDIO_ENABLED"), False),
+            proactive_audio_input_device=get_value("TWINR_PROACTIVE_AUDIO_DEVICE"),
+            proactive_audio_sample_ms=int(get_value("TWINR_PROACTIVE_AUDIO_SAMPLE_MS", "1000") or "1000"),
+            proactive_audio_distress_enabled=_parse_bool(
+                get_value("TWINR_PROACTIVE_AUDIO_DISTRESS_ENABLED"),
+                False,
+            ),
             web_host=get_value("TWINR_WEB_HOST", "0.0.0.0") or "0.0.0.0",
             web_port=int(get_value("TWINR_WEB_PORT", "1337") or "1337"),
-            runtime_state_path=get_value("TWINR_RUNTIME_STATE_PATH", "/tmp/twinr-runtime-state.json")
-            or "/tmp/twinr-runtime-state.json",
+            runtime_state_path=get_value(
+                "TWINR_RUNTIME_STATE_PATH",
+                str(project_root / "state" / "runtime-state.json"),
+            )
+            or str(project_root / "state" / "runtime-state.json"),
+            memory_markdown_path=get_value(
+                "TWINR_MEMORY_MARKDOWN_PATH",
+                str(project_root / "state" / "MEMORY.md"),
+            )
+            or str(project_root / "state" / "MEMORY.md"),
             restore_runtime_state_on_startup=_parse_bool(
                 get_value("TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP"),
                 False,
@@ -245,6 +312,10 @@ class TwinrConfig:
             gpio_chip=get_value("TWINR_GPIO_CHIP", "gpiochip0") or "gpiochip0",
             green_button_gpio=_parse_optional_int(get_value("TWINR_GREEN_BUTTON_GPIO")),
             yellow_button_gpio=_parse_optional_int(get_value("TWINR_YELLOW_BUTTON_GPIO")),
+            pir_motion_gpio=_parse_optional_int(get_value("TWINR_PIR_MOTION_GPIO")),
+            pir_active_high=_parse_bool(get_value("TWINR_PIR_ACTIVE_HIGH"), True),
+            pir_bias=(get_value("TWINR_PIR_BIAS", "pull-down") or "pull-down").strip().lower(),
+            pir_debounce_ms=int(get_value("TWINR_PIR_DEBOUNCE_MS", "120") or "120"),
             button_active_low=_parse_bool(get_value("TWINR_BUTTON_ACTIVE_LOW"), True),
             button_bias=(get_value("TWINR_BUTTON_BIAS", "pull-up") or "pull-up").strip().lower(),
             button_debounce_ms=int(get_value("TWINR_BUTTON_DEBOUNCE_MS", "80") or "80"),
@@ -264,6 +335,7 @@ class TwinrConfig:
             display_width=int(get_value("TWINR_DISPLAY_WIDTH", "400") or "400"),
             display_height=int(get_value("TWINR_DISPLAY_HEIGHT", "300") or "300"),
             display_rotation_degrees=int(get_value("TWINR_DISPLAY_ROTATION_DEGREES", "270") or "270"),
+            display_full_refresh_interval=int(get_value("TWINR_DISPLAY_FULL_REFRESH_INTERVAL", "0") or "0"),
             display_poll_interval_s=_parse_float(get_value("TWINR_DISPLAY_POLL_INTERVAL_S"), 0.5),
             printer_queue=get_value("TWINR_PRINTER_QUEUE", "Thermal_GP58") or "Thermal_GP58",
             printer_device_uri=get_value("TWINR_PRINTER_DEVICE_URI"),

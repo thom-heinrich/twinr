@@ -56,6 +56,132 @@
 
 <section class="panel two-column">
   <div>
+    <h2>LLM usage</h2>
+    <div class="stats-grid compact-grid">
+      <div class="stat-tile">
+        <span class="stat-label">Requests 24h</span>
+        <span class="stat-value">{{ usage_summary.requests_total }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Tokens 24h</span>
+        <span class="stat-value">{{ usage_summary.total_tokens }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Latest model</span>
+        <span class="stat-value stat-value-small">{{ usage_summary.latest_model or "—" }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Latest kind</span>
+        <span class="stat-value stat-value-small">{{ usage_summary.latest_request_kind or "—" }}</span>
+      </div>
+    </div>
+    <div class="link-row">
+      <a class="inline-link" href="/ops/usage">Open detailed usage</a>
+    </div>
+  </div>
+  <div>
+    <h2>System health</h2>
+    <div class="stats-grid compact-grid">
+      <div class="stat-tile">
+        <span class="stat-label">Health</span>
+        <span class="stat-value">{{ health_snapshot.status }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">CPU temp</span>
+        <span class="stat-value">{{ "%.1fC"|format(health_snapshot.cpu_temperature_c) if health_snapshot.cpu_temperature_c is not none else "—" }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Memory used</span>
+        <span class="stat-value">{{ "%.1f%%"|format(health_snapshot.memory_used_percent) if health_snapshot.memory_used_percent is not none else "—" }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Disk used</span>
+        <span class="stat-value">{{ "%.1f%%"|format(health_snapshot.disk_used_percent) if health_snapshot.disk_used_percent is not none else "—" }}</span>
+      </div>
+    </div>
+    <div class="link-row">
+      <a class="inline-link" href="/ops/health">Open system health</a>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Status and failures</h2>
+      <p class="section-description">This is the small operations view that matters most for local support.</p>
+    </div>
+  </div>
+  <div class="detail-grid">
+    <article class="detail-card">
+      <span class="detail-label">Current status</span>
+      <div class="detail-body">{{ snapshot.status }}</div>
+    </article>
+    <article class="detail-card">
+      <span class="detail-label">Updated at</span>
+      <div class="detail-body">{{ snapshot.updated_at or "—" }}</div>
+    </article>
+    <article class="detail-card">
+      <span class="detail-label">Last transcript</span>
+      <div class="detail-body detail-body-copy">{{ snapshot.last_transcript or "—" }}</div>
+    </article>
+    <article class="detail-card">
+      <span class="detail-label">Last response</span>
+      <div class="detail-body detail-body-copy">{{ snapshot.last_response or "—" }}</div>
+    </article>
+    <article class="detail-card detail-card-wide">
+      <span class="detail-label">Last error</span>
+      <div class="detail-body detail-body-copy">{{ snapshot.error_message or "No current runtime error." }}</div>
+    </article>
+  </div>
+</section>
+
+<section class="panel two-column">
+  <div>
+    <h2>Ops summary</h2>
+    <div class="stats-grid compact-grid">
+      <div class="stat-tile">
+        <span class="stat-label">Checks OK</span>
+        <span class="stat-value">{{ check_summary.ok }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Warnings</span>
+        <span class="stat-value">{{ check_summary.warn }}</span>
+      </div>
+      <div class="stat-tile">
+        <span class="stat-label">Failures</span>
+        <span class="stat-value">{{ check_summary.fail }}</span>
+      </div>
+    </div>
+    <div class="link-row">
+      <a class="inline-link" href="/ops/self-test">Run hardware self-tests</a>
+      <a class="inline-link" href="/ops/config">Open config checks</a>
+      <a class="inline-link" href="/ops/support">Build support bundle</a>
+    </div>
+  </div>
+  <div>
+    <h2>Recent errors</h2>
+    {% if recent_errors %}
+    <div class="log-list compact-log-list">
+      {% for entry in recent_errors %}
+      <article class="log-entry">
+        <div class="log-entry-header">
+          <span class="log-level is-error">{{ entry.level }}</span>
+          <span class="log-event">{{ entry.event }}</span>
+          <span class="log-time">{{ entry.created_at }}</span>
+        </div>
+        <div class="log-message">{{ entry.message }}</div>
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">No recent errors are recorded in the local ops log.</div>
+    {% endif %}
+  </div>
+</section>
+
+<section class="panel two-column">
+  <div>
     <h2>Current config</h2>
     <ul class="plain-list">
       <li><strong>Host</strong> {{ config.web_host }}</li>

@@ -43,7 +43,9 @@
         <section class="flash success">Saved.</section>
         {% endif %}
 
+        {% if restart_notice %}
         <section class="flash subtle">{{ restart_notice }}</section>
+        {% endif %}
 
         {% block content %}{% endblock %}
       </main>

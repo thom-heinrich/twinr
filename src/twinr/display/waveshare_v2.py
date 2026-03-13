@@ -24,6 +24,7 @@ class WaveshareEPD4In2V2:
     width: int = 400
     height: int = 300
     rotation_degrees: int = 270
+    full_refresh_interval: int = 0
     _driver_module: object | None = field(default=None, init=False, repr=False)
     _epd: object | None = field(default=None, init=False, repr=False)
     _render_count: int = field(default=0, init=False, repr=False)
@@ -43,6 +44,7 @@ class WaveshareEPD4In2V2:
             width=config.display_width,
             height=config.display_height,
             rotation_degrees=config.display_rotation_degrees,
+            full_refresh_interval=config.display_full_refresh_interval,
         )
 
     @property
@@ -86,7 +88,7 @@ class WaveshareEPD4In2V2:
             self._render_count = 1
             return
 
-        if self._render_count % 48 == 0:
+        if self.full_refresh_interval > 0 and self._render_count % self.full_refresh_interval == 0:
             self._init_full(epd)
             prepared = epd.getbuffer(prepared_image)
             epd.display(prepared)
@@ -149,6 +151,12 @@ class WaveshareEPD4In2V2:
             draw,
             status=status.lower(),
             animation_frame=animation_frame,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+        )
+        self._draw_details_footer(
+            draw,
+            details=details,
             canvas_width=canvas_width,
             canvas_height=canvas_height,
         )
@@ -239,6 +247,33 @@ class WaveshareEPD4In2V2:
             status=status,
             animation_frame=animation_frame,
         )
+
+    def _draw_details_footer(
+        self,
+        draw: object,
+        *,
+        details: tuple[str, ...],
+        canvas_width: int,
+        canvas_height: int,
+    ) -> None:
+        lines = [line.strip() for line in details if line and line.strip()][:1]
+        if not lines:
+            return
+
+        divider_y = canvas_height - 40
+        draw.line((28, divider_y, canvas_width - 28, divider_y), fill=0, width=2)
+        text_y = divider_y + 12
+        for line in lines:
+            left_text, right_text = self._split_footer_parts(line)
+            right_width = self._text_width(draw, right_text)
+            right_margin = 24
+            right_x = max(canvas_width - right_width - right_margin, 24)
+            max_left_width = max(right_x - 36, 120)
+            trimmed_left = self._truncate_text(draw, left_text, max_width=max_left_width)
+            draw.text((24, text_y), trimmed_left, fill=0)
+            if right_text:
+                draw.text((right_x, text_y), right_text, fill=0)
+            text_y += 16
 
     def _draw_eye(
         self,
@@ -472,3 +507,28 @@ class WaveshareEPD4In2V2:
         main_y = center_y + int(eye["highlight_dy"])
         draw.ellipse((main_x - 8, main_y - 8, main_x + 8, main_y + 8), fill=255)
         draw.ellipse((main_x + 10, main_y + 8, main_x + 16, main_y + 14), fill=255)
+
+    def _split_footer_parts(self, text: str) -> tuple[str, str]:
+        compact = text.strip()
+        if compact.endswith(")") and " (" in compact:
+            prefix, suffix = compact.rsplit(" (", 1)
+            return prefix.strip(), f"({suffix}"
+        return compact, ""
+
+    def _text_width(self, draw: object, text: str) -> int:
+        if not text:
+            return 0
+        width = len(text) * 6
+        with suppress(Exception):
+            text_box = draw.textbbox((0, 0), text)
+            width = int(text_box[2] - text_box[0])
+        return width
+
+    def _truncate_text(self, draw: object, text: str, *, max_width: int) -> str:
+        compact = text.strip()
+        if self._text_width(draw, compact) <= max_width:
+            return compact
+        ellipsis = "..."
+        while compact and self._text_width(draw, compact + ellipsis) > max_width:
+            compact = compact[:-1].rstrip()
+        return (compact + ellipsis) if compact else ellipsis

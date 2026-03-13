@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Usage summary</h2>
+      <p class="section-description">Tracked OpenAI response calls from the local Twinr runtime. Token counts appear when the provider returns them.</p>
+    </div>
+  </div>
+  <div class="stats-grid compact-grid">
+    <div class="stat-tile">
+      <span class="stat-label">Requests 24h</span>
+      <span class="stat-value">{{ summary_24h.requests_total }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Tokens 24h</span>
+      <span class="stat-value">{{ summary_24h.total_tokens }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Latest model</span>
+      <span class="stat-value stat-value-small">{{ summary_24h.latest_model or "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Latest kind</span>
+      <span class="stat-value stat-value-small">{{ summary_24h.latest_request_kind or "—" }}</span>
+    </div>
+  </div>
+</section>
+
+<section class="panel two-column">
+  <div>
+    <h2>All-time totals</h2>
+    <ul class="plain-list">
+      <li><strong>Requests</strong> {{ summary_all.requests_total }}</li>
+      <li><strong>Requests with token data</strong> {{ summary_all.requests_with_token_data }}</li>
+      <li><strong>Input tokens</strong> {{ summary_all.total_input_tokens }}</li>
+      <li><strong>Output tokens</strong> {{ summary_all.total_output_tokens }}</li>
+      <li><strong>Total tokens</strong> {{ summary_all.total_tokens }}</li>
+      <li><strong>Cached input tokens</strong> {{ summary_all.cached_input_tokens }}</li>
+      <li><strong>Reasoning tokens</strong> {{ summary_all.reasoning_tokens }}</li>
+    </ul>
+  </div>
+  <div>
+    <h2>Store</h2>
+    <ul class="plain-list">
+      <li><strong>Usage file</strong> {{ usage_path }}</li>
+      <li><strong>Models seen</strong> {{ summary_all.by_model|length }}</li>
+      <li><strong>Kinds seen</strong> {{ summary_all.by_kind|length }}</li>
+      <li><strong>Latest record</strong> {{ summary_all.latest_created_at or "—" }}</li>
+    </ul>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Recent usage records</h2>
+      <p class="section-description">Newest tracked calls first.</p>
+    </div>
+  </div>
+  {% if usage_rows %}
+  <div class="log-list">
+    {% for row in usage_rows %}
+    <article class="log-entry">
+      <div class="log-entry-header">
+        <span class="log-level is-ok">{{ row.request_kind }}</span>
+        <span class="log-event">{{ row.model }}</span>
+        <span class="log-time">{{ row.created_at }}</span>
+      </div>
+      <div class="log-message">
+        source={{ row.source }} · total_tokens={{ row.total_tokens }} · input={{ row.input_tokens }} · output={{ row.output_tokens }} · cached={{ row.cached_input_tokens }} · reasoning={{ row.reasoning_tokens }} · web_search={{ row.used_web_search }}
+      </div>
+      <div class="log-message">response_id={{ row.response_id }} · request_id={{ row.request_id }}</div>
+      {% if row.metadata_pretty %}
+      <pre class="log-data">{{ row.metadata_pretty }}</pre>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No LLM usage records exist yet.</div>
+  {% endif %}
+</section>
+{% endblock %}

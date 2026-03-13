@@ -1,4 +1,11 @@
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.context_store import (
+    ManagedContextEntry,
+    ManagedContextFileStore,
+    PersistentMemoryEntry,
+    PersistentMemoryMarkdownStore,
+    PromptContextStore,
+)
 from twinr.agent.base_agent.personality import load_personality_instructions, merge_instructions
 from twinr.agent.base_agent.runtime import TwinrRuntime
 from twinr.agent.base_agent.runtime_state import RuntimeSnapshot, RuntimeSnapshotStore
@@ -11,6 +18,11 @@ from twinr.agent.base_agent.state_machine import (
 
 __all__ = [
     "InvalidTransitionError",
+    "ManagedContextEntry",
+    "ManagedContextFileStore",
+    "PersistentMemoryEntry",
+    "PersistentMemoryMarkdownStore",
+    "PromptContextStore",
     "RuntimeSnapshot",
     "RuntimeSnapshotStore",
     "TwinrConfig",

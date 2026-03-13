@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.context_store import PersistentMemoryMarkdownStore
 
 _SECTION_FILES = (
     ("SYSTEM", "SYSTEM.md"),
@@ -45,6 +46,9 @@ def load_personality_context(config: TwinrConfig) -> PersonalityContext:
         if not content:
             continue
         sections.append((title, content))
+    memory_context = PersistentMemoryMarkdownStore(config.memory_markdown_path).render_context()
+    if memory_context:
+        sections.append(("MEMORY", memory_context))
     return PersonalityContext(sections=tuple(sections))
 
 

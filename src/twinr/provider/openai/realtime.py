@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.personality import load_personality_instructions, merge_instructions
+from twinr.ops.usage import TokenUsage, extract_model_name, extract_token_usage
 from twinr.provider.openai.backend import _should_send_project_header
 
 _DEFAULT_REALTIME_INSTRUCTIONS = (
@@ -15,6 +16,11 @@ _DEFAULT_REALTIME_INSTRUCTIONS = (
     "Keep responses concise, practical, and easy for a senior user to understand. "
     "Do not use an English accent. "
     "If the user explicitly asks for a printout, use the print_receipt tool with a short focus hint and optional exact text. "
+    "If the user asks for any current, external, or otherwise freshness-sensitive information that benefits from web research, first say one short German sentence that you are checking the web and that this may take a moment, then call the search_live_info tool. "
+    "If the user explicitly asks you to remember an important fact for future turns, use the remember_memory tool. "
+    "If the user explicitly asks you to change your future speaking style or behavior, use the update_personality tool. "
+    "If the user explicitly asks you to remember a stable user-profile fact or preference, use the update_user_profile tool. "
+    "If the user asks you to look at them, an object, a document, or something they are showing to the camera, call the inspect_camera tool. "
     "If the user clearly wants to stop or pause the conversation for now, call the end_conversation tool and then say a short goodbye."
 )
 
@@ -24,6 +30,8 @@ class OpenAIRealtimeTurn:
     transcript: str
     response_text: str
     response_id: str | None = None
+    model: str | None = None
+    token_usage: TokenUsage | None = None
     end_conversation: bool = False
 
 
@@ -57,7 +65,7 @@ class OpenAIRealtimeSession:
         self.config = config
         factory = client_factory or _default_async_client_factory
         self._client = client or factory(config)
-        self._base_instructions = base_instructions if base_instructions is not None else load_personality_instructions(config)
+        self._base_instructions_override = base_instructions
         self._tool_handlers = dict(tool_handlers or {})
         self._runner: asyncio.Runner | None = None
         self._manager = None
@@ -224,6 +232,8 @@ class OpenAIRealtimeSession:
         input_transcript_fragments: list[str] = []
         response_text_fragments: list[str] = []
         response_id: str | None = None
+        model: str | None = None
+        token_usage: TokenUsage | None = None
         end_conversation = False
 
         while True:
@@ -277,6 +287,8 @@ class OpenAIRealtimeSession:
             if event_type == "response.done":
                 response = getattr(event, "response", None)
                 response_id = getattr(response, "id", None)
+                model = extract_model_name(response)
+                token_usage = extract_token_usage(response)
                 function_calls = self._extract_function_calls(response)
                 if function_calls:
                     handled_tools = await self._handle_function_calls(function_calls)
@@ -298,6 +310,8 @@ class OpenAIRealtimeSession:
             transcript=transcript,
             response_text=response_text,
             response_id=response_id,
+            model=model,
+            token_usage=token_usage,
             end_conversation=end_conversation,
         )
 
@@ -333,10 +347,15 @@ class OpenAIRealtimeSession:
 
     def _session_instructions(self) -> str:
         return merge_instructions(
-            self._base_instructions,
+            self._resolve_base_instructions(),
             _DEFAULT_REALTIME_INSTRUCTIONS,
             self.config.openai_realtime_instructions,
         ) or _DEFAULT_REALTIME_INSTRUCTIONS
+
+    def _resolve_base_instructions(self) -> str | None:
+        if self._base_instructions_override is not None:
+            return self._base_instructions_override
+        return load_personality_instructions(self.config)
 
     def _session_tools(self) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
@@ -368,6 +387,116 @@ class OpenAIRealtimeSession:
                     },
                 }
             )
+        if "search_live_info" in self._tool_handlers:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "search_live_info",
+                    "description": (
+                        "Look up fresh or externally verifiable web information for the user. "
+                        "Use this for broad web research, not only a fixed list of example domains."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "The exact question to research on the web.",
+                            },
+                            "location_hint": {
+                                "type": "string",
+                                "description": "Optional location such as a city or district relevant to the search.",
+                            },
+                            "date_context": {
+                                "type": "string",
+                                "description": "Optional absolute date or time context if the user referred to relative dates.",
+                            },
+                        },
+                        "required": ["question"],
+                        "additionalProperties": False,
+                    },
+                }
+            )
+        if "remember_memory" in self._tool_handlers:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "remember_memory",
+                    "description": (
+                        "Store an important memory for future turns when the user explicitly asks you to remember something. "
+                        "Use only for clear remember/save requests, not for ordinary conversation."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "description": "Short type such as appointment, contact, reminder, preference, fact, or task.",
+                            },
+                            "summary": {
+                                "type": "string",
+                                "description": "Short factual summary of what should be remembered.",
+                            },
+                            "details": {
+                                "type": "string",
+                                "description": "Optional extra detail that helps later recall.",
+                            },
+                        },
+                        "required": ["summary"],
+                        "additionalProperties": False,
+                    },
+                }
+            )
+        if "update_user_profile" in self._tool_handlers:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "update_user_profile",
+                    "description": (
+                        "Update stable user profile or preference context for future turns when the user explicitly asks you to remember it."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "category": {
+                                "type": "string",
+                                "description": "Short category such as preferred_name, location, preference, contact, or routine.",
+                            },
+                            "instruction": {
+                                "type": "string",
+                                "description": "Short, durable instruction or fact to store in the user profile.",
+                            },
+                        },
+                        "required": ["category", "instruction"],
+                        "additionalProperties": False,
+                    },
+                }
+            )
+        if "update_personality" in self._tool_handlers:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "update_personality",
+                    "description": (
+                        "Update how Twinr should speak or behave in future turns when the user explicitly asks for a behavior change."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "category": {
+                                "type": "string",
+                                "description": "Short category such as response_style, humor, language, verbosity, or greeting_style.",
+                            },
+                            "instruction": {
+                                "type": "string",
+                                "description": "Short future-behavior instruction to store in Twinr personality context.",
+                            },
+                        },
+                        "required": ["category", "instruction"],
+                        "additionalProperties": False,
+                    },
+                }
+            )
         if "end_conversation" in self._tool_handlers:
             tools.append(
                 {
@@ -386,6 +515,28 @@ class OpenAIRealtimeSession:
                             }
                         },
                         "required": [],
+                        "additionalProperties": False,
+                    },
+                }
+            )
+        if "inspect_camera" in self._tool_handlers:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "inspect_camera",
+                    "description": (
+                        "Inspect the current live camera view when the user asks you to look at them, "
+                        "an object, a document, or something they are showing."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "The exact user request about what should be inspected in the camera view.",
+                            }
+                        },
+                        "required": ["question"],
                         "additionalProperties": False,
                     },
                 }

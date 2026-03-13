@@ -1,0 +1,4 @@
+interface:
+  display_name: "Systematic Debugging"
+  short_description: "Four-phase root-cause debugging before any implementation fix"
+  default_prompt: "Use $systematic-debugging to run root-cause investigation, pattern analysis, hypothesis testing, and only then implement a minimal fix."

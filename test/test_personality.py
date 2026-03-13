@@ -14,20 +14,42 @@ class PersonalityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             personality_dir = Path(tmpdir) / "personality"
             personality_dir.mkdir()
+            state_dir = Path(tmpdir) / "state"
+            state_dir.mkdir()
             (personality_dir / "SYSTEM.md").write_text("System context", encoding="utf-8")
             (personality_dir / "PERSONALITY.md").write_text("Style context", encoding="utf-8")
             (personality_dir / "USER.md").write_text("User profile", encoding="utf-8")
+            (state_dir / "MEMORY.md").write_text(
+                "\n".join(
+                    [
+                        "# Twinr Memory",
+                        "",
+                        "## Entries",
+                        "",
+                        "### MEM-20260313T120000Z",
+                        "- kind: appointment",
+                        "- created_at: 2026-03-13T12:00:00+00:00",
+                        "- updated_at: 2026-03-13T12:00:00+00:00",
+                        "- summary: Arzttermin am Montag um 14 Uhr.",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
             instructions = load_personality_instructions(
                 TwinrConfig(
                     project_root=tmpdir,
                     personality_dir="personality",
+                    memory_markdown_path=str(state_dir / "MEMORY.md"),
                 )
             )
 
         self.assertIsNotNone(instructions)
         self.assertLess(instructions.index("SYSTEM:\nSystem context"), instructions.index("PERSONALITY:\nStyle context"))
         self.assertLess(instructions.index("PERSONALITY:\nStyle context"), instructions.index("USER:\nUser profile"))
+        self.assertLess(instructions.index("USER:\nUser profile"), instructions.index("MEMORY:\nDurable remembered items"))
+        self.assertIn("Arzttermin am Montag um 14 Uhr.", instructions)
 
     def test_merge_instructions_skips_empty_parts(self) -> None:
         merged = merge_instructions("Base", None, " ", "Task")

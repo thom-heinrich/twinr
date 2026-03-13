@@ -165,6 +165,22 @@ memory:
     purpose:
       - retain_recent_conversations
       - compact_history_when_needed
+    structure:
+      - raw_tail
+      - ledger
+      - search_results
+      - state
+    guarantees:
+      - search_tool_results_persist_as_typed_entries
+      - compacted_context_stays_replayable
+      - runtime_snapshot_restores_structured_memory
+    persistence:
+      runtime_snapshot_path: state/runtime-state.json
+      durable_memory_markdown_path: state/MEMORY.md
+      durable_memory_write_rule: explicit_user_request_only
+      managed_profile_updates:
+        - personality/USER.md
+        - personality/PERSONALITY.md
   print_memory:
     purpose:
       - store_last_response
@@ -208,6 +224,19 @@ web_interface:
     - connect
     - settings
     - user
+  memory_page_features:
+    - live_runtime_snapshot
+    - durable_memory_markdown_inspection
+    - durable_memory_manual_add
+  personality_page_features:
+    - edit_system_base_text
+    - edit_personality_base_text
+    - inspect_managed_personality_updates
+    - manual_managed_personality_upsert
+  user_page_features:
+    - edit_user_base_text
+    - inspect_managed_user_updates
+    - manual_managed_user_upsert
   live_runtime_snapshot: true
 
 non_functional_requirements:
@@ -234,6 +263,7 @@ repository_layout:
   hardware/mic: Microphone integrations
   hardware/printer: Thermal printer integrations
   personality: System, user, and personality context files
+  state: Runtime-generated persistent snapshot and durable remembered facts
   src/twinr/agent: Python package for agent orchestration
   src/twinr/display: Python package for Waveshare display adapters
   src/twinr/provider: Python package for provider adapters
