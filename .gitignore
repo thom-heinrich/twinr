@@ -1,7 +1,20 @@
 .env
 .venv/
+
+# Local workflow tooling.
+agentic_tools/
+common/
+
+# Local runtime and ops artifacts.
 artifacts/
+artifacts/stores/ops/
+artifacts/ops/self_tests/
+artifacts/ops/support_bundles/
 state/
+state/runtime-state.json
+state/MEMORY.md
+state/*.lock
+
 __pycache__/
 *.pyc
 *.egg-info/
