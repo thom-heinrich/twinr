@@ -1,3 +1,15 @@
-from twinr.memory.on_device import ConversationTurn, OnDeviceMemory
+from twinr.memory.on_device import (
+    ConversationTurn,
+    MemoryLedgerItem,
+    MemoryState,
+    OnDeviceMemory,
+    SearchMemoryEntry,
+)
 
-__all__ = ["ConversationTurn", "OnDeviceMemory"]
+__all__ = [
+    "ConversationTurn",
+    "MemoryLedgerItem",
+    "MemoryState",
+    "OnDeviceMemory",
+    "SearchMemoryEntry",
+]

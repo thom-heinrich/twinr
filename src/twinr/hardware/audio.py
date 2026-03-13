@@ -6,6 +6,7 @@ import math
 import os
 from collections import deque
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 import select
 import subprocess
@@ -15,6 +16,16 @@ import wave
 from twinr.agent.base_agent.config import TwinrConfig
 
 _SAMPLE_WIDTH_BYTES = 2
+
+
+@dataclass(frozen=True, slots=True)
+class AmbientAudioLevelSample:
+    duration_ms: int
+    chunk_count: int
+    active_chunk_count: int
+    average_rms: int
+    peak_rms: int
+    active_ratio: float
 
 
 class SilenceDetectedRecorder:
@@ -188,6 +199,116 @@ class SilenceDetectedRecorder:
                 process.wait(timeout=1.0)
 
 
+class AmbientAudioSampler:
+    def __init__(
+        self,
+        *,
+        device: str = "default",
+        sample_rate: int = 16000,
+        channels: int = 1,
+        chunk_ms: int = 100,
+        speech_threshold: int = 700,
+        default_duration_ms: int = 1000,
+    ) -> None:
+        self.device = device
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.chunk_ms = max(20, chunk_ms)
+        self.speech_threshold = speech_threshold
+        self.default_duration_ms = max(self.chunk_ms, default_duration_ms)
+
+    @classmethod
+    def from_config(cls, config: TwinrConfig) -> "AmbientAudioSampler":
+        device = (config.proactive_audio_input_device or config.audio_input_device).strip()
+        return cls(
+            device=device,
+            sample_rate=config.audio_sample_rate,
+            channels=config.audio_channels,
+            chunk_ms=config.audio_chunk_ms,
+            speech_threshold=config.audio_speech_threshold,
+            default_duration_ms=config.proactive_audio_sample_ms,
+        )
+
+    def sample_levels(self, *, duration_ms: int | None = None) -> AmbientAudioLevelSample:
+        effective_duration_ms = max(self.chunk_ms, duration_ms or self.default_duration_ms)
+        chunk_bytes = max(
+            _SAMPLE_WIDTH_BYTES * self.channels,
+            int((self.sample_rate * self.channels * _SAMPLE_WIDTH_BYTES * self.chunk_ms) / 1000),
+        )
+        target_chunk_count = max(1, math.ceil(effective_duration_ms / self.chunk_ms))
+        command = [
+            "arecord",
+            "-D",
+            self.device,
+            "-q",
+            "-t",
+            "raw",
+            "-f",
+            "S16_LE",
+            "-c",
+            str(self.channels),
+            "-r",
+            str(self.sample_rate),
+        ]
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        rms_values: list[int] = []
+
+        try:
+            while len(rms_values) < target_chunk_count:
+                if process.poll() is not None:
+                    self._raise_process_error(process)
+                if process.stdout is None:
+                    raise RuntimeError("arecord did not expose stdout")
+                ready, _write_ready, _error_ready = select.select([process.stdout], [], [], 0.25)
+                if not ready:
+                    continue
+                chunk = os.read(process.stdout.fileno(), chunk_bytes)
+                if not chunk:
+                    continue
+                if len(chunk) % _SAMPLE_WIDTH_BYTES:
+                    chunk = chunk[: -(len(chunk) % _SAMPLE_WIDTH_BYTES)]
+                if not chunk:
+                    continue
+                rms_values.append(audioop.rms(chunk, _SAMPLE_WIDTH_BYTES))
+        finally:
+            self._stop_process(process)
+
+        if not rms_values:
+            raise RuntimeError("Ambient audio capture ended without usable samples")
+
+        active_chunk_count = sum(1 for rms in rms_values if rms >= self.speech_threshold)
+        average_rms = int(sum(rms_values) / len(rms_values))
+        peak_rms = max(rms_values)
+        return AmbientAudioLevelSample(
+            duration_ms=effective_duration_ms,
+            chunk_count=len(rms_values),
+            active_chunk_count=active_chunk_count,
+            average_rms=average_rms,
+            peak_rms=peak_rms,
+            active_ratio=active_chunk_count / max(1, len(rms_values)),
+        )
+
+    def _raise_process_error(self, process: subprocess.Popen[bytes]) -> None:
+        stderr = b""
+        if process.stderr is not None:
+            stderr = process.stderr.read().strip()
+        message = stderr.decode("utf-8", errors="ignore") if stderr else f"exit code {process.returncode}"
+        raise RuntimeError(f"Ambient audio capture failed: {message}")
+
+    def _stop_process(self, process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1.0)
+
+
 class WaveAudioPlayer:
     def __init__(self, *, device: str = "default") -> None:
         self.device = device
@@ -212,12 +333,41 @@ class WaveAudioPlayer:
         volume: float = 0.8,
         sample_rate: int = 24000,
     ) -> None:
-        amplitude = max(0.0, min(volume, 1.0)) * 32767.0 * 0.6
-        frame_count = max(1, int(sample_rate * (duration_ms / 1000.0)))
+        self.play_pcm16_chunks(
+            [
+                self._render_tone_pcm(
+                    frequency_hz=frequency_hz,
+                    duration_ms=duration_ms,
+                    volume=volume,
+                    sample_rate=sample_rate,
+                )
+            ],
+            sample_rate=sample_rate,
+            channels=1,
+        )
+
+    def play_tone_sequence(
+        self,
+        tones: Iterable[tuple[int, int]],
+        *,
+        volume: float = 0.28,
+        sample_rate: int = 24000,
+        gap_ms: int = 34,
+    ) -> None:
         pcm = bytearray()
-        for frame_index in range(frame_count):
-            sample = int(amplitude * math.sin(2.0 * math.pi * frequency_hz * frame_index / sample_rate))
-            pcm.extend(sample.to_bytes(2, byteorder="little", signed=True))
+        for index, (frequency_hz, duration_ms) in enumerate(tones):
+            if index > 0 and gap_ms > 0:
+                pcm.extend(self._render_silence_pcm(duration_ms=gap_ms, sample_rate=sample_rate))
+            pcm.extend(
+                self._render_tone_pcm(
+                    frequency_hz=frequency_hz,
+                    duration_ms=duration_ms,
+                    volume=volume,
+                    sample_rate=sample_rate,
+                )
+            )
+        if not pcm:
+            return
         self.play_pcm16_chunks([bytes(pcm)], sample_rate=sample_rate, channels=1)
 
     def play_wav_chunks(self, chunks: Iterable[bytes]) -> None:
@@ -295,3 +445,23 @@ class WaveAudioPlayer:
             stderr = process.stderr.read().strip()
         message = stderr.decode("utf-8", errors="ignore") if stderr else f"exit code {process.returncode}"
         raise RuntimeError(f"Audio playback failed: {message}")
+
+    def _render_tone_pcm(
+        self,
+        *,
+        frequency_hz: int,
+        duration_ms: int,
+        volume: float,
+        sample_rate: int,
+    ) -> bytes:
+        amplitude = max(0.0, min(volume, 1.0)) * 32767.0 * 0.6
+        frame_count = max(1, int(sample_rate * (duration_ms / 1000.0)))
+        pcm = bytearray()
+        for frame_index in range(frame_count):
+            sample = int(amplitude * math.sin(2.0 * math.pi * frequency_hz * frame_index / sample_rate))
+            pcm.extend(sample.to_bytes(2, byteorder="little", signed=True))
+        return bytes(pcm)
+
+    def _render_silence_pcm(self, *, duration_ms: int, sample_rate: int) -> bytes:
+        frame_count = max(1, int(sample_rate * (duration_ms / 1000.0)))
+        return b"\x00\x00" * frame_count

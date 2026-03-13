@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Run local hardware checks</h2>
+      <p class="section-description">These are synchronous device checks for support and bring-up. Run them one at a time.</p>
+    </div>
+  </div>
+  <div class="action-grid">
+    {% for key, label, description in tests %}
+    <form method="post" action="/ops/self-test" class="action-card">
+      <input type="hidden" name="test_name" value="{{ key }}">
+      <div class="action-card-title">{{ label }}</div>
+      <p class="action-card-copy">{{ description }}</p>
+      <button type="submit">Run {{ label }}</button>
+    </form>
+    {% endfor %}
+  </div>
+</section>
+
+{% if result %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Last result</h2>
+      <p class="section-description">Most recent self-test execution result.</p>
+    </div>
+    <span class="status-pill is-{{ result.status }}">{{ result.status }}</span>
+  </div>
+  <div class="detail-grid">
+    <article class="detail-card detail-card-wide">
+      <span class="detail-label">Summary</span>
+      <div class="detail-body detail-body-copy">{{ result.summary }}</div>
+    </article>
+    <article class="detail-card">
+      <span class="detail-label">Finished at</span>
+      <div class="detail-body">{{ result.finished_at or "—" }}</div>
+    </article>
+    <article class="detail-card">
+      <span class="detail-label">Artifact</span>
+      <div class="detail-body">
+        {% if artifact_href %}
+        <a class="inline-link" href="{{ artifact_href }}">{{ result.artifact_name }}</a>
+        {% else %}
+        —
+        {% endif %}
+      </div>
+    </article>
+  </div>
+  {% if result.details %}
+  <ul class="plain-list top-gap">
+    {% for line in result.details %}
+    <li>{{ line }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

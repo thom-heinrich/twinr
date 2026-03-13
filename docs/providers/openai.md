@@ -32,6 +32,13 @@ TWINR_AUDIO_BEEP_SETTLE_MS=140
 OPENAI_SEND_PROJECT_HEADER=false
 TWINR_OPENAI_ENABLE_WEB_SEARCH=true
 TWINR_OPENAI_WEB_SEARCH_CONTEXT_SIZE=medium
+OPENAI_VISION_DETAIL=auto
+TWINR_CAMERA_DEVICE=/dev/video0
+TWINR_CAMERA_WIDTH=640
+TWINR_CAMERA_HEIGHT=480
+TWINR_CAMERA_FRAMERATE=30
+TWINR_CAMERA_INPUT_FORMAT=bayer_grbg8
+TWINR_VISION_REFERENCE_IMAGE=/home/thh/reference-user.jpg
 ```
 
 `OPENAI_SEND_PROJECT_HEADER=false` is recommended when the API key is already project-scoped (`sk-proj-...`). In that setup, sending an additional explicit project header can break audio requests even when LLM access works.
@@ -48,7 +55,12 @@ cd /twinr
 PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --openai-prompt "Reply with exactly OK."
 PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --openai-prompt "What happened in the world today?" --openai-web-search
 PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --tts-text "Hello from Twinr" --tts-output /tmp/twinr.wav
+PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --camera-capture-output /tmp/twinr-camera.png
+PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --vision-prompt "Bild 1 ist das Live-Kamerabild. Bild 2 ist das Referenzfoto des Nutzers. Ist es dieselbe Person? Antworte nur mit JA oder NEIN." --vision-camera-capture --vision-save-capture /tmp/twinr-camera.png --vision-image /home/thh/reference-user.jpg
 ```
+
+The vision flow can attach multiple images in one OpenAI Responses API request. Twinr labels the live camera frame separately from any user-supplied reference images so the model can compare them.
+The standard hardware loop can trigger this automatically for common visual requests and will include the configured reference image when a stored user portrait path is available.
 
 ## Realtime voice loop
 
@@ -60,3 +72,4 @@ twinr --env-file /twinr/.env --run-realtime-loop
 
 This path uses the Realtime API for direct audio input/output. It is the low-latency voice mode. The current implementation does not call the OpenAI `web_search` tool from inside the Realtime session.
 When follow-up mode is enabled, Twinr beeps before listening and automatically opens a short follow-up listening window after each answer.
+The Realtime path can now also call a camera inspection tool for requests such as "Schau mich mal an" or "Was zeige ich dir?" and will use the configured reference image when the operator has set one.

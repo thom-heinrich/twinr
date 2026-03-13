@@ -1,14 +1,29 @@
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import base64
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
 from twinr.providers.openai_realtime import OpenAIRealtimeSession
+
+
+def _fake_usage(
+    *,
+    input_tokens: int = 80,
+    output_tokens: int = 24,
+    total_tokens: int = 104,
+):
+    return SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        input_tokens_details=SimpleNamespace(cached_tokens=8),
+        output_tokens_details=SimpleNamespace(reasoning_tokens=5),
+    )
 
 
 class FakeSessionResource:
@@ -147,17 +162,77 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             "Keep responses concise, practical, and easy for a senior user to understand. "
             "Do not use an English accent. "
             "If the user explicitly asks for a printout, use the print_receipt tool with a short focus hint and optional exact text. "
+            "If the user asks for any current, external, or otherwise freshness-sensitive information that benefits from web research, first say one short German sentence that you are checking the web and that this may take a moment, then call the search_live_info tool. "
+            "If the user explicitly asks you to remember an important fact for future turns, use the remember_memory tool. "
+            "If the user explicitly asks you to change your future speaking style or behavior, use the update_personality tool. "
+            "If the user explicitly asks you to remember a stable user-profile fact or preference, use the update_user_profile tool. "
+            "If the user asks you to look at them, an object, a document, or something they are showing to the camera, call the inspect_camera tool. "
             "If the user clearly wants to stop or pause the conversation for now, call the end_conversation tool and then say a short goodbye.\n\n"
             "Speak concise German.",
         )
 
-    def test_open_includes_print_tool_when_handler_exists(self) -> None:
+    def test_open_loads_latest_hidden_context_from_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            personality_dir = Path(temp_dir) / "personality"
+            personality_dir.mkdir()
+            state_dir = Path(temp_dir) / "state"
+            state_dir.mkdir()
+            (personality_dir / "SYSTEM.md").write_text("System context", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text("Old style context", encoding="utf-8")
+            (personality_dir / "USER.md").write_text("User profile", encoding="utf-8")
+            (state_dir / "MEMORY.md").write_text(
+                "\n".join(
+                    [
+                        "# Twinr Memory",
+                        "",
+                        "## Entries",
+                        "",
+                        "### MEM-20260313T120000Z",
+                        "- kind: appointment",
+                        "- created_at: 2026-03-13T12:00:00+00:00",
+                        "- updated_at: 2026-03-13T12:00:00+00:00",
+                        "- summary: Arzttermin am Montag um 14 Uhr.",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(state_dir / "MEMORY.md"),
+                openai_realtime_model="gpt-4o-realtime-preview",
+                openai_realtime_voice="sage",
+            )
+            connection = FakeRealtimeConnection([])
+            session = OpenAIRealtimeSession(
+                config,
+                client=FakeRealtimeClient(FakeConnectionManager(connection)),
+            )
+            (personality_dir / "PERSONALITY.md").write_text("Updated style context", encoding="utf-8")
+
+            with session:
+                pass
+
+        instructions = connection.session.calls[0]["instructions"]
+        self.assertIn("SYSTEM:\nSystem context", instructions)
+        self.assertIn("PERSONALITY:\nUpdated style context", instructions)
+        self.assertIn("MEMORY:\nDurable remembered items explicitly saved for future turns:", instructions)
+        self.assertIn("Arzttermin am Montag um 14 Uhr.", instructions)
+
+    def test_open_includes_expected_tools_when_handlers_exist(self) -> None:
         session, connection, _manager = self.make_session()
         session = OpenAIRealtimeSession(
             self.config,
             client=FakeRealtimeClient(FakeConnectionManager(connection)),
             tool_handlers={
                 "print_receipt": lambda _arguments: {"status": "printed"},
+                "search_live_info": lambda _arguments: {"status": "ok", "answer": "Antwort"},
+                "remember_memory": lambda _arguments: {"status": "saved"},
+                "update_user_profile": lambda _arguments: {"status": "updated"},
+                "update_personality": lambda _arguments: {"status": "updated"},
+                "inspect_camera": lambda _arguments: {"status": "ok", "answer": "Kamerabild"},
                 "end_conversation": lambda _arguments: {"status": "ending"},
             },
         )
@@ -168,10 +243,23 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertEqual(connection.session.calls[0]["tool_choice"], "auto")
         self.assertEqual(
             [tool["name"] for tool in connection.session.calls[0]["tools"]],
-            ["print_receipt", "end_conversation"],
+            [
+                "print_receipt",
+                "search_live_info",
+                "remember_memory",
+                "update_user_profile",
+                "update_personality",
+                "end_conversation",
+                "inspect_camera",
+            ],
         )
         self.assertIn("focus_hint", connection.session.calls[0]["tools"][0]["parameters"]["properties"])
-        self.assertIn("reason", connection.session.calls[0]["tools"][1]["parameters"]["properties"])
+        self.assertIn("question", connection.session.calls[0]["tools"][1]["parameters"]["properties"])
+        self.assertIn("summary", connection.session.calls[0]["tools"][2]["parameters"]["properties"])
+        self.assertIn("instruction", connection.session.calls[0]["tools"][3]["parameters"]["properties"])
+        self.assertIn("instruction", connection.session.calls[0]["tools"][4]["parameters"]["properties"])
+        self.assertIn("reason", connection.session.calls[0]["tools"][5]["parameters"]["properties"])
+        self.assertIn("question", connection.session.calls[0]["tools"][6]["parameters"]["properties"])
 
     def test_run_audio_turn_streams_audio_and_collects_text(self) -> None:
         audio_chunks: list[bytes] = []
@@ -181,7 +269,14 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             SimpleNamespace(type="response.output_audio_transcript.delta", delta="Guten "),
             SimpleNamespace(type="response.output_audio.delta", delta=base64.b64encode(b"PCM").decode("ascii")),
             SimpleNamespace(type="response.output_audio_transcript.delta", delta="Tag"),
-            SimpleNamespace(type="response.done", response=SimpleNamespace(id="resp_rt_123")),
+            SimpleNamespace(
+                type="response.done",
+                response=SimpleNamespace(
+                    id="resp_rt_123",
+                    model="gpt-4o-realtime-preview",
+                    usage=_fake_usage(),
+                ),
+            ),
         )
 
         with session:
@@ -195,6 +290,9 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertEqual(turn.transcript, "Hallo Twinr")
         self.assertEqual(turn.response_text, "Guten Tag")
         self.assertEqual(turn.response_id, "resp_rt_123")
+        self.assertEqual(turn.model, "gpt-4o-realtime-preview")
+        assert turn.token_usage is not None
+        self.assertEqual(turn.token_usage.total_tokens, 104)
         self.assertEqual(audio_chunks, [b"PCM"])
         self.assertEqual(text_deltas, ["Guten ", "Tag"])
         self.assertEqual(connection.conversation.item.calls[0]["role"], "system")
@@ -298,6 +396,56 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertEqual(end_calls, [{"reason": "user said stop"}])
         self.assertTrue(turn.end_conversation)
         self.assertEqual(turn.response_text, "Bis bald.")
+
+    def test_run_audio_turn_handles_search_function_call_and_continues_response(self) -> None:
+        search_calls: list[dict] = []
+        session, connection, _manager = self.make_session(
+            SimpleNamespace(
+                type="response.done",
+                response=SimpleNamespace(
+                    id="resp_search_1",
+                    output=[
+                        SimpleNamespace(
+                            type="function_call",
+                            name="search_live_info",
+                            call_id="call_search_1",
+                            arguments='{"question":"Wie wird das Wetter morgen?","location_hint":"Schwarzenbek"}',
+                        )
+                    ],
+                ),
+            ),
+            SimpleNamespace(type="response.output_audio_transcript.delta", delta="Morgen wird es kuehl und nass."),
+            SimpleNamespace(
+                type="response.done",
+                response=SimpleNamespace(
+                    id="resp_search_2",
+                    output=[
+                        SimpleNamespace(
+                            type="message",
+                            content=[SimpleNamespace(transcript="Morgen wird es kuehl und nass.", text=None)],
+                        )
+                    ],
+                ),
+            ),
+        )
+        session = OpenAIRealtimeSession(
+            self.config,
+            client=FakeRealtimeClient(FakeConnectionManager(connection)),
+            tool_handlers={
+                "search_live_info": lambda arguments: search_calls.append(arguments) or {"status": "ok", "answer": "11 Grad"}
+            },
+        )
+
+        with session:
+            turn = session.run_audio_turn(b"\x01\x02" * 100)
+
+        self.assertEqual(
+            search_calls,
+            [{"question": "Wie wird das Wetter morgen?", "location_hint": "Schwarzenbek"}],
+        )
+        self.assertEqual(turn.response_text, "Morgen wird es kuehl und nass.")
+        self.assertEqual(connection.conversation.item.calls[0]["type"], "function_call_output")
+        self.assertEqual(connection.response.calls, [{}, {}])
 
     def test_run_text_turn_creates_user_message(self) -> None:
         session, connection, _manager = self.make_session(

@@ -1,12 +1,15 @@
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+import tempfile
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
-from twinr.providers.openai_backend import OpenAITextResponse
+from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority
+from twinr.providers.openai_backend import OpenAIImageInput, OpenAITextResponse
 from twinr.runner import TwinrHardwareLoop
 from twinr.runtime import TwinrRuntime
 
@@ -15,6 +18,9 @@ class FakeBackend:
     def __init__(self) -> None:
         self.transcribe_calls: list[tuple[bytes, str, str]] = []
         self.respond_calls: list[tuple[str, tuple[tuple[str, str], ...] | None, bool | None]] = []
+        self.respond_to_images_calls: list[
+            tuple[str, list[OpenAIImageInput], tuple[tuple[str, str], ...] | None, bool | None]
+        ] = []
         self.synthesize_calls: list[str] = []
         self.print_calls: list[tuple[tuple[tuple[str, str], ...] | None, str | None, str | None, str]] = []
         self.transcript = "Hello Twinr"
@@ -34,6 +40,23 @@ class FakeBackend:
             response_id="resp_123",
             request_id="req_123",
             used_web_search=True,
+        )
+
+    def respond_to_images_with_metadata(
+        self,
+        prompt: str,
+        *,
+        images,
+        conversation=None,
+        allow_web_search=None,
+        instructions=None,
+    ) -> OpenAITextResponse:
+        self.respond_to_images_calls.append((prompt, list(images), conversation, allow_web_search))
+        return OpenAITextResponse(
+            text=self.answer,
+            response_id="resp_vision_123",
+            request_id="req_vision_123",
+            used_web_search=False,
         )
 
     def synthesize(self, text: str) -> bytes:
@@ -86,20 +109,79 @@ class FakePrinter:
         return "request id is Test-1 (1 file(s))"
 
 
+class FakeCamera:
+    def __init__(self) -> None:
+        self.capture_calls = 0
+
+    def capture_photo(self, *, output_path=None, filename: str = "camera-capture.png"):
+        self.capture_calls += 1
+        return SimpleNamespace(
+            data=b"\x89PNG\r\n\x1a\ncamera",
+            content_type="image/png",
+            filename=filename,
+            source_device="/dev/video0",
+            input_format="bayer_grbg8",
+        )
+
+
+class FakeIdleButtonMonitor:
+    def __init__(self) -> None:
+        self.entered = False
+        self.exited = False
+        self.poll_calls = 0
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.exited = True
+
+    def poll(self, timeout=None):
+        self.poll_calls += 1
+        if timeout:
+            time.sleep(min(timeout, 0.001))
+        return None
+
+
+class FakeProactiveMonitor:
+    def __init__(self) -> None:
+        self.entered = False
+        self.exited = False
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.exited = True
+
+
 class HardwareLoopTests(unittest.TestCase):
-    def make_loop(self, *, backend=None) -> tuple[TwinrHardwareLoop, list[str], FakeRecorder, FakePlayer, FakePrinter]:
+    def make_loop(
+        self,
+        *,
+        backend=None,
+        config: TwinrConfig | None = None,
+        camera=None,
+        button_monitor=None,
+        proactive_monitor=None,
+    ) -> tuple[TwinrHardwareLoop, list[str], FakeRecorder, FakePlayer, FakePrinter]:
         lines: list[str] = []
         recorder = FakeRecorder()
         player = FakePlayer()
         printer = FakePrinter()
+        config = config or TwinrConfig()
         loop = TwinrHardwareLoop(
-            config=TwinrConfig(),
-            runtime=TwinrRuntime(config=TwinrConfig()),
+            config=config,
+            runtime=TwinrRuntime(config=config),
             backend=backend or FakeBackend(),
-            button_monitor=SimpleNamespace(__enter__=lambda self: self, __exit__=lambda self, exc_type, exc, tb: None),
+            button_monitor=button_monitor or SimpleNamespace(__enter__=lambda self: self, __exit__=lambda self, exc_type, exc, tb: None),
             recorder=recorder,
             player=player,
             printer=printer,
+            camera=camera or FakeCamera(),
+            proactive_monitor=proactive_monitor,
             emit=lines.append,
             sleep=lambda _seconds: None,
             error_reset_seconds=0.0,
@@ -116,6 +198,7 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertEqual(backend.transcribe_calls[0][0], b"WAVDATA")
         self.assertEqual(backend.transcribe_calls[0][1], "twinr-listen.wav")
         self.assertEqual(backend.respond_calls[0][0], "Hello Twinr")
+        self.assertEqual(backend.respond_to_images_calls, [])
         self.assertFalse(backend.respond_calls[0][2])
         self.assertEqual(player.played, [b"RIFF"])
         self.assertEqual(loop.runtime.last_response, "Hello back.")
@@ -157,6 +240,112 @@ class HardwareLoopTests(unittest.TestCase):
         loop.handle_button_press("green")
 
         self.assertTrue(backend.respond_calls[0][2])
+        self.assertEqual(len(loop.runtime.memory.search_results), 1)
+        self.assertEqual(loop.runtime.memory.search_results[0].question, "What is the weather today in Berlin?")
+        self.assertEqual(loop.runtime.memory.search_results[0].answer, "Hello back.")
+
+    def test_visual_queries_use_camera_and_multimodal_request(self) -> None:
+        backend = FakeBackend()
+        backend.transcript = "Schau mich mal an"
+        camera = FakeCamera()
+        loop, lines, _recorder, player, _printer = self.make_loop(backend=backend, camera=camera)
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(camera.capture_calls, 1)
+        self.assertEqual(len(backend.respond_to_images_calls), 1)
+        prompt, images, conversation, allow_web_search = backend.respond_to_images_calls[0]
+        self.assertIn("Image 1 is the current live camera frame", prompt)
+        self.assertEqual(conversation, ())
+        self.assertFalse(allow_web_search)
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0].label, "Image 1: live camera frame from the device.")
+        self.assertEqual(player.played, [b"RIFF"])
+        self.assertIn("camera_used=true", lines)
+        self.assertIn("vision_image_count=1", lines)
+
+    def test_visual_queries_attach_reference_image_when_configured(self) -> None:
+        backend = FakeBackend()
+        backend.transcript = "Wie sehe ich heute aus?"
+        camera = FakeCamera()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference_path = Path(temp_dir) / "user-reference.jpg"
+            reference_path.write_bytes(b"\xff\xd8\xffreference")
+            config = TwinrConfig(vision_reference_image_path=str(reference_path))
+            loop, lines, _recorder, _player, _printer = self.make_loop(
+                backend=backend,
+                config=config,
+                camera=camera,
+            )
+
+            loop.handle_button_press("green")
+
+        self.assertEqual(len(backend.respond_to_images_calls), 1)
+        prompt, images, _conversation, _allow_web_search = backend.respond_to_images_calls[0]
+        self.assertIn("Image 2 is a stored reference image of the main user.", prompt)
+        self.assertEqual(len(images), 2)
+        self.assertEqual(images[1].label, "Image 2: stored reference image of the main user. Use it only for person or identity comparison.")
+        self.assertTrue(any(line.startswith("vision_reference_image=") for line in lines))
+
+    def test_social_trigger_speaks_proactive_prompt(self) -> None:
+        backend = FakeBackend()
+        loop, lines, _recorder, player, _printer = self.make_loop(backend=backend)
+
+        spoke = loop.handle_social_trigger(
+            SocialTriggerDecision(
+                trigger_id="attention_window",
+                prompt="Kann ich dir bei etwas helfen?",
+                reason="Person looked toward the device and stayed quiet.",
+                observed_at=42.0,
+                priority=SocialTriggerPriority.ATTENTION_WINDOW,
+            )
+        )
+
+        self.assertTrue(spoke)
+        self.assertEqual(loop.runtime.status.value, "waiting")
+        self.assertEqual(player.played, [b"RIFF"])
+        self.assertEqual(loop.runtime.last_response, None)
+        self.assertIn("status=answering", lines)
+        self.assertIn("social_trigger=attention_window", lines)
+        self.assertIn("social_prompt=Kann ich dir bei etwas helfen?", lines)
+
+    def test_social_trigger_is_skipped_when_runtime_is_busy(self) -> None:
+        backend = FakeBackend()
+        loop, lines, _recorder, player, _printer = self.make_loop(backend=backend)
+        loop.runtime.press_green_button()
+
+        spoke = loop.handle_social_trigger(
+            SocialTriggerDecision(
+                trigger_id="showing_intent",
+                prompt="Möchtest du mir etwas zeigen?",
+                reason="Hand or object near the camera.",
+                observed_at=42.0,
+                priority=SocialTriggerPriority.SHOWING_INTENT,
+            )
+        )
+
+        self.assertFalse(spoke)
+        self.assertEqual(player.played, [])
+        self.assertIn("social_trigger_skipped=busy", lines)
+
+    def test_run_opens_and_closes_proactive_monitor(self) -> None:
+        backend = FakeBackend()
+        button_monitor = FakeIdleButtonMonitor()
+        proactive_monitor = FakeProactiveMonitor()
+        loop, _lines, _recorder, _player, _printer = self.make_loop(
+            backend=backend,
+            button_monitor=button_monitor,
+            proactive_monitor=proactive_monitor,
+        )
+
+        result = loop.run(duration_s=0.01, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(button_monitor.entered)
+        self.assertTrue(button_monitor.exited)
+        self.assertTrue(proactive_monitor.entered)
+        self.assertTrue(proactive_monitor.exited)
 
 
 if __name__ == "__main__":

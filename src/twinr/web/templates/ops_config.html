@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Configuration plausibility</h2>
+      <p class="section-description">This page checks whether the local machine is plausibly ready for Twinr, without turning into a raw config browser.</p>
+    </div>
+  </div>
+  <div class="stats-grid compact-grid">
+    <div class="stat-tile">
+      <span class="stat-label">Checks OK</span>
+      <span class="stat-value">{{ summary.ok }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Warnings</span>
+      <span class="stat-value">{{ summary.warn }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Failures</span>
+      <span class="stat-value">{{ summary.fail }}</span>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="check-list">
+    {% for check in checks %}
+    <article class="check-row">
+      <div class="check-row-main">
+        <div class="check-row-title">{{ check.label }}</div>
+        <div class="check-row-detail">{{ check.detail }}</div>
+      </div>
+      <span class="status-pill is-{{ check.status }}">{{ check.status }}</span>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel two-column">
+  <div>
+    <h2>Paths</h2>
+    <ul class="plain-list">
+      <li><strong>Project root</strong> {{ config.project_root }}</li>
+      <li><strong>Runtime snapshot</strong> {{ config.runtime_state_path }}</li>
+      <li><strong>Artifacts root</strong> {{ artifacts_root }}</li>
+    </ul>
+  </div>
+  <div>
+    <h2>Redacted env view</h2>
+    {% if redacted_env %}
+    <pre class="log-data">{{ redacted_env | tojson(indent=2) }}</pre>
+    {% else %}
+    <div class="empty-state">No relevant environment keys were found.</div>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

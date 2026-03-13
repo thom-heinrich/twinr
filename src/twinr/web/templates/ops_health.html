@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Live system health</h2>
+      <p class="section-description">Current Raspberry Pi and Twinr process health, read directly from the local machine.</p>
+    </div>
+    <span class="status-pill is-{{ health.status }}">{{ health.status }}</span>
+  </div>
+  <div class="stats-grid compact-grid">
+    <div class="stat-tile">
+      <span class="stat-label">CPU temp</span>
+      <span class="stat-value">{{ "%.1fC"|format(health.cpu_temperature_c) if health.cpu_temperature_c is not none else "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Memory used</span>
+      <span class="stat-value">{{ "%.1f%%"|format(health.memory_used_percent) if health.memory_used_percent is not none else "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Disk used</span>
+      <span class="stat-value">{{ "%.1f%%"|format(health.disk_used_percent) if health.disk_used_percent is not none else "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Recent errors</span>
+      <span class="stat-value">{{ health.recent_error_count }}</span>
+    </div>
+  </div>
+</section>
+
+<section class="panel two-column">
+  <div>
+    <h2>Device metrics</h2>
+    <ul class="plain-list">
+      <li><strong>Hostname</strong> {{ health.hostname }}</li>
+      <li><strong>Captured at</strong> {{ health.captured_at }}</li>
+      <li><strong>Uptime seconds</strong> {{ "%.0f"|format(health.uptime_seconds) if health.uptime_seconds is not none else "—" }}</li>
+      <li><strong>Load avg</strong> {{ health.load_1m if health.load_1m is not none else "—" }} / {{ health.load_5m if health.load_5m is not none else "—" }} / {{ health.load_15m if health.load_15m is not none else "—" }}</li>
+      <li><strong>Memory</strong> {{ health.memory_available_mb if health.memory_available_mb is not none else "—" }} MB free of {{ health.memory_total_mb if health.memory_total_mb is not none else "—" }} MB</li>
+      <li><strong>Disk</strong> {{ health.disk_free_gb if health.disk_free_gb is not none else "—" }} GB free of {{ health.disk_total_gb if health.disk_total_gb is not none else "—" }} GB</li>
+    </ul>
+  </div>
+  <div>
+    <h2>Runtime snapshot</h2>
+    <ul class="plain-list">
+      <li><strong>Status</strong> {{ snapshot.status }}</li>
+      <li><strong>Updated at</strong> {{ snapshot.updated_at or "—" }}</li>
+      <li><strong>Last transcript</strong> {{ snapshot.last_transcript or "—" }}</li>
+      <li><strong>Last response</strong> {{ snapshot.last_response or "—" }}</li>
+      <li><strong>Runtime error</strong> {{ health.runtime_error or "—" }}</li>
+    </ul>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Services</h2>
+      <p class="section-description">Expected local Twinr workers as seen from the host process list.</p>
+    </div>
+  </div>
+  <div class="check-list">
+    {% for service in health.services %}
+    <article class="check-row">
+      <div class="check-row-main">
+        <div class="check-row-title">{{ service.label }}</div>
+        <div class="check-row-detail">{{ service.detail }}</div>
+      </div>
+      <span class="status-pill is-{{ 'ok' if service.running else 'warn' }}">{{ service.count if service.running else 'missing' }}</span>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Recent errors</h2>
+      <p class="section-description">Newest runtime errors first.</p>
+    </div>
+  </div>
+  {% if recent_errors %}
+  <div class="log-list compact-log-list">
+    {% for entry in recent_errors %}
+    <article class="log-entry">
+      <div class="log-entry-header">
+        <span class="log-level is-error">{{ entry.level }}</span>
+        <span class="log-event">{{ entry.event }}</span>
+        <span class="log-time">{{ entry.created_at }}</span>
+      </div>
+      <div class="log-message">{{ entry.message }}</div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No recent runtime errors are recorded.</div>
+  {% endif %}
+</section>
+{% endblock %}

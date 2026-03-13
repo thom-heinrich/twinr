@@ -4,7 +4,7 @@ Twinr is a minimal digital, maximal haptic, senior-citizen-optimized physical AI
 
 The product is designed around simple physical interaction instead of app-first complexity. A user presses a green button, speaks naturally, and Twinr listens until a short pause is detected. Twinr then transcribes the utterance with a speech-to-text provider, sends the result to a foundation model, performs agentic tasks when needed, and answers via text-to-speech. A yellow button prints the latest answer as a short, easy-to-read thermal receipt.
 
-Twinr also uses a small status display with animated eyes to communicate its current state: waiting, listening, processing, answering, printing, and error.
+Twinr also uses a small status display with animated eyes to communicate its current state: waiting, listening, processing, answering, printing, and error. A small footer line under the face shows a calm device-health summary such as `Betrieb ok`, `warm`, or `Achtung`.
 
 ## Core principles
 
@@ -49,7 +49,20 @@ Supported states:
 
 ### On-device memory
 
-Twinr keeps a short rolling conversation memory on-device by default. This memory stores recent exchanges and compacts them when needed to stay lightweight and efficient.
+Twinr keeps a short rolling conversation memory on-device by default. The active short-term schema is structured, not just a flat transcript:
+
+- `raw_tail` keeps the most recent verbatim user/assistant turns
+- `ledger` keeps compacted summaries and typed durable notes
+- `search_results` stores recent web lookups as first-class entries
+- `state` tracks the active topic, last user goal, pending printable, and open loops
+
+When the tail grows beyond the configured cap, Twinr compacts older turns into the ledger and keeps only the newest conversational tail for replay.
+
+By default, the live runtime snapshot is persisted to `state/runtime-state.json` instead of `/tmp`, so the local dashboard and restart flow can restore structured state after bounded restarts.
+
+Durable remembered facts that the user explicitly asks Twinr to keep are written to `state/MEMORY.md`. This file is separate from the rolling runtime snapshot and is only meant for explicit “remember this” items, not every turn.
+
+Explicit requests to change future user-profile context or future speaking/behavior rules are written into managed sections inside `personality/USER.md` and `personality/PERSONALITY.md`. Twinr reloads those files on the next provider request instead of baking them permanently into code.
 
 ### Long-term memory (optional)
 
@@ -82,6 +95,8 @@ The web interface should stay simple enough for caregivers, family members, or o
 The current implementation uses a server-rendered local dashboard with these sections:
 
 - Dashboard
+- LLM Usage
+- System Health
 - Personality
 - Memory
 - Connect
@@ -89,6 +104,10 @@ The current implementation uses a server-rendered local dashboard with these sec
 - User
 
 The `Memory` page reads a live runtime snapshot from the active Twinr process, so operators can inspect the current on-device conversation memory without attaching to the running loop.
+The `Memory` page also exposes the durable `state/MEMORY.md` store, so operators can inspect and add explicit long-lived remembered items without touching the rolling runtime snapshot.
+The `Personality` and `User` pages now separate the hand-written base text from Twinr-managed updates, so tool-written behavior/profile changes stay visible and editable without clobbering the base files.
+The `LLM Usage` page reads the local usage store for tracked OpenAI calls, including model names, request ids, and token counts when the provider returns them.
+The `System Health` page reads live Raspberry Pi metrics and Twinr worker presence so caregivers can see whether the box itself looks healthy.
 
 ## High-level architecture
 
@@ -96,6 +115,7 @@ The `Memory` page reads a live runtime snapshot from the active Twinr process, s
 
 - Green hardware button
 - Yellow hardware button
+- PIR motion sensor input
 - Microphone audio
 - Web configuration UI
 
@@ -119,13 +139,14 @@ The `Memory` page reads a live runtime snapshot from the active Twinr process, s
 
 - `docs/` — documentation and structured specifications
 - `docs/providers/` — provider-specific notes and setup guides
-- `hardware/` — Raspberry Pi setup scripts for buttons, audio, printer, and display hardware
+- `hardware/` — Raspberry Pi setup scripts for buttons, PIR, audio, printer, and display hardware
 - `personality/` — prompt-context files for system, user, and assistant style
+- `state/` — runtime-generated persistent snapshot and durable remembered facts (`gitignored`)
 - `src/twinr/agent/` — runtime orchestration, state machine, and hardware workflows
 - `src/twinr/display/` — Waveshare display wrapper and image rendering helpers
 - `src/twinr/provider/` — provider implementations such as OpenAI
 - `src/twinr/memory/` — on-device conversation memory
-- `src/twinr/hardware/` — audio, button, and printer adapters
+- `src/twinr/hardware/` — audio, button, PIR, camera, and printer adapters
 - `src/twinr/providers/` — compatibility wrappers for legacy import paths
 - `test/` — tests and validation assets
 
@@ -138,6 +159,8 @@ Twinr should feel calm, obvious, and trustworthy. A user should not need to unde
 This repository defines the foundation for:
 
 - Button-driven voice capture
+- Passive PIR motion sensing for local hardware bring-up and future presence-aware behavior
+- A stateful social-trigger engine for cautious presence, attention, and safety nudges
 - Provider-based STT / LLM / TTS orchestration
 - Agentic task execution
 - Paper-based answer printing
@@ -167,9 +190,62 @@ python3 hardware/buttons/probe_buttons.py --env-file /twinr/.env --configured --
 
 The runtime-facing GPIO helpers live in `src/twinr/hardware/buttons.py`.
 
+### PIR motion sensor
+
+Twinr now supports a dedicated PIR motion input for hardware validation and future presence-aware behavior.
+
+Persist the current prototype mapping with:
+
+```bash
+cd /twinr
+hardware/pir/setup_pir.sh --motion 26 --probe
+```
+
+Probe the configured PIR input with:
+
+```bash
+cd /twinr
+python3 hardware/pir/probe_pir.py --env-file /twinr/.env --duration 30
+```
+
+The current prototype wiring is:
+
+- `OUT -> GPIO26` on the Pi (`physical pin 37`, often labeled `IO26`)
+- `GND -> GND`
+- `VCC ->` the voltage required by the PIR module
+
+Software defaults assume `active_high=true` and `bias=pull-down`. The GPIO signal presented to the Pi must stay at or below `3.3V`.
+
+The runtime-facing PIR helpers live in `src/twinr/hardware/pir.py`.
+
+### Social trigger engine
+
+Twinr now has a dedicated proactive subsystem in `src/twinr/proactive/`.
+It does not try to "diagnose emotions". Instead it turns explicit sensor observations into cautious prompts such as:
+
+- `person_returned`
+- `attention_window`
+- `slumped_quiet`
+- `possible_fall`
+- `floor_stillness`
+- `showing_intent`
+- `distress_possible`
+- `positive_contact`
+
+The core trigger engine is stateful and enforces per-trigger cooldowns. It consumes bounded observations from PIR, audio, and camera paths, then returns at most one suggested spoken nudge at a time.
+The proactive monitor now runs as its own modular package and can be enabled behind config while the normal green/yellow button behavior stays unchanged.
+Current implementation notes:
+
+- PIR is used as the cheap wake-up signal.
+- The proactive path currently uses a dedicated vision classifier prompt over still frames.
+- Ambient audio can now sample the configured microphone in short bounded windows, typically the PS-Eye microphone when `TWINR_PROACTIVE_AUDIO_DEVICE` points at it.
+- Background audio sampling uses a shared lock with active recording so Twinr does not open the same ALSA input twice at once.
+- The hardware and realtime loops expose `handle_social_trigger(...)` so the proactive monitor can speak without pretending the user pressed the green button.
+
 ### Audio
 
 Twinr currently uses the `Jabra SPEAK 510 USB` attached to the Raspberry Pi as its default microphone and speaker.
+For proactive background listening, Twinr can additionally use the `PlayStation Eye` USB microphone as a separate capture path.
 
 Configure the audio defaults with:
 
@@ -177,6 +253,19 @@ Configure the audio defaults with:
 cd /twinr
 sudo hardware/mic/setup_audio.sh --device-match Jabra
 ```
+
+To keep Jabra as the main default device while also wiring the PS-Eye microphone into the proactive path, run:
+
+```bash
+cd /twinr
+sudo hardware/mic/setup_audio.sh \
+  --device-match Jabra \
+  --proactive-device-match Camera-B4.09.24.1 \
+  --proactive-sample-ms 900 \
+  --test
+```
+
+That writes the `TWINR_PROACTIVE_AUDIO_*` env keys and also runs a short direct capture smoke test against the proactive mic when configured.
 
 ### Printer
 
@@ -258,6 +347,26 @@ TWINR_AUDIO_BEEP_SETTLE_MS=140
 OPENAI_SEND_PROJECT_HEADER=false
 TWINR_OPENAI_ENABLE_WEB_SEARCH=true
 TWINR_OPENAI_WEB_SEARCH_CONTEXT_SIZE=medium
+TWINR_USER_DISPLAY_NAME=Thom
+OPENAI_VISION_DETAIL=auto
+TWINR_CAMERA_DEVICE=/dev/video0
+TWINR_CAMERA_WIDTH=640
+TWINR_CAMERA_HEIGHT=480
+TWINR_CAMERA_FRAMERATE=30
+# PS Eye often works reliably with:
+TWINR_CAMERA_INPUT_FORMAT=bayer_grbg8
+# Optional: a stored portrait/reference image of the main user
+TWINR_VISION_REFERENCE_IMAGE=/home/thh/reference-user.jpg
+TWINR_PROACTIVE_ENABLED=true
+TWINR_PROACTIVE_POLL_INTERVAL_S=4.0
+TWINR_PROACTIVE_CAPTURE_INTERVAL_S=6.0
+TWINR_PROACTIVE_MOTION_WINDOW_S=20.0
+TWINR_PROACTIVE_LOW_MOTION_AFTER_S=12.0
+TWINR_PROACTIVE_AUDIO_ENABLED=true
+# Optional: dedicate proactive background listening to the PS-Eye mic instead of the normal input device
+TWINR_PROACTIVE_AUDIO_DEVICE=plughw:CARD=CameraB409241,DEV=0
+TWINR_PROACTIVE_AUDIO_SAMPLE_MS=1000
+TWINR_PROACTIVE_AUDIO_DISTRESS_ENABLED=false
 ```
 
 When the OpenAI secret is already project-scoped (`sk-proj-...`), keep `OPENAI_SEND_PROJECT_HEADER=false`. That avoids a redundant project header that can block STT/TTS while `gpt-5.2` still works.
@@ -268,7 +377,15 @@ Smoke examples:
 PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --openai-prompt "Reply with exactly OK."
 PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --openai-prompt "What happened in the world today?" --openai-web-search
 PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --tts-text "Hello from Twinr" --tts-output /tmp/twinr.wav
+PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --camera-capture-output /tmp/twinr-camera.png
+PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --vision-prompt "Bild 1 ist das Live-Kamerabild. Bild 2 ist das Referenzfoto des Nutzers. Ist es dieselbe Person? Antworte nur mit JA oder NEIN." --vision-camera-capture --vision-save-capture /tmp/twinr-camera.png --vision-image /home/thh/reference-user.jpg
+PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --proactive-observe-once
+PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --proactive-audio-observe-once
 ```
+
+The vision path requires `ffmpeg` on the device because Twinr captures still images from V4L2 and then sends one or more images to the OpenAI Responses API in a single request.
+The live hardware loop can also trigger the camera automatically for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
+With `TWINR_PROACTIVE_ENABLED=true`, the hardware and realtime loops also start the proactive monitor and let it issue bounded conversation starters while Twinr is idle.
 
 Run the live hardware loop with:
 
@@ -288,6 +405,7 @@ twinr --env-file /twinr/.env --run-realtime-loop
 
 The Realtime loop keeps the same button UX but uses OpenAI Realtime for direct audio input/output. The current Realtime path does not invoke web search; keep the existing `--run-hardware-loop` path for search-enabled answers.
 With `TWINR_CONVERSATION_FOLLOW_UP_ENABLED=true`, Twinr emits a short beep before listening, answers, then automatically beeps and listens again for a short follow-up window so a short back-and-forth conversation works without pressing the button every turn.
+The Realtime loop can now also inspect the camera view for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
 
 Latency notes:
 

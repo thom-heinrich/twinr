@@ -38,6 +38,8 @@ So if you are a builder, UX person, maker… and want to join add me on LinkedIn
 
 2 x Buttons (I used 12mm SPST-NO from Same-Sky)
 
+1 x PIR motion sensor with 3.3V-safe GPIO output
+
 1 x Thermal-Printer (DFRobot DFR0503-EN)
 
 1 x Power for the Termal-Printer (9-24V/2,5A)
@@ -115,12 +117,48 @@ Waveshare documents the Pi connection through the 40-pin header and gives this S
 
 Use the buttons as simple GPIO inputs with the Pi’s internal pull-up resistors. That is the cleanest wiring for SPST-NO buttons.
 
-Recommended mapping:
+Current Twinr mapping:
 
-“Hey” button: one side to GPIO5 (physical pin 29)
+“Hey” button: one side to GPIO23 (physical pin 16)
 
-“Print” button: one side to GPIO6 (physical pin 31)
+“Print” button: one side to GPIO22 (physical pin 15)
 
 The other side of both buttons goes to GND
 
 No external resistor is required for this setup if your software uses the normal pull-up configuration. In gpiozero, the Button class defaults to pull_up=True, which means one side of the button goes to ground and the other to a GPIO pin. Ground pins on the Pi are electrically common, so any convenient GND pin is fine. Never connect a button input to 5 V; Pi GPIO inputs must stay at 3.3 V max.
+
+*7. Connect the PIR motion sensor*
+
+Twinr now has a dedicated PIR motion input.
+
+Current Twinr mapping:
+
+PIR `OUT` -> GPIO26 (physical pin 37)
+
+PIR `GND` -> GND
+
+PIR `VCC` -> the supply voltage expected by your PIR module
+
+Software defaults assume:
+
+- `active_high=true`
+- `bias=pull-down`
+
+Important guardrail: the signal arriving at the Raspberry Pi GPIO input must never exceed `3.3V`. Many PIR breakout boards work safely, but do not assume that blindly. If your module is not explicitly GPIO-safe, add level shifting before wiring `OUT` to the Pi.
+
+Some breakout boards or notes label this line as `IO26`. In Twinr that means BCM `GPIO26`.
+
+Current Twinr config variables for the PIR path:
+
+- `TWINR_PIR_MOTION_GPIO`
+- `TWINR_PIR_ACTIVE_HIGH`
+- `TWINR_PIR_BIAS`
+- `TWINR_PIR_DEBOUNCE_MS`
+
+Useful local commands:
+
+```bash
+cd /twinr
+hardware/pir/setup_pir.sh --motion 26 --probe
+python3 hardware/pir/probe_pir.py --env-file /twinr/.env --duration 30
+```

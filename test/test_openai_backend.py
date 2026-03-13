@@ -2,12 +2,30 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
-from twinr.providers.openai_backend import OpenAIBackend, _default_client_factory
+from twinr.providers.openai_backend import OpenAIBackend, OpenAIImageInput, _default_client_factory
+
+
+def _fake_usage(
+    *,
+    input_tokens: int = 120,
+    output_tokens: int = 48,
+    total_tokens: int = 168,
+    cached_tokens: int = 12,
+    reasoning_tokens: int = 7,
+):
+    return SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        input_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
+        output_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens),
+    )
 
 
 class FakeBinaryResponse:
@@ -37,6 +55,8 @@ class FakeResponsesAPI:
         return SimpleNamespace(
             id="resp_123",
             _request_id="req_123",
+            model=kwargs["model"],
+            usage=_fake_usage(),
             output_text=output_text,
             output=self.output,
         )
@@ -59,6 +79,8 @@ class FakeResponsesAPI:
                 return SimpleNamespace(
                     id="resp_stream",
                     _request_id="req_stream",
+                    model=kwargs["model"],
+                    usage=_fake_usage(input_tokens=96, output_tokens=32, total_tokens=128),
                     output_text="Hello there",
                     output=[],
                 )
@@ -141,6 +163,7 @@ class OpenAIBackendTests(unittest.TestCase):
             openai_web_search_country="DE",
             openai_web_search_city="Berlin",
             openai_web_search_timezone="Europe/Berlin",
+            openai_vision_detail="high",
         )
         self.backend = OpenAIBackend(config=self.config, client=self.client)
 
@@ -155,6 +178,12 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertTrue(response.used_web_search)
         self.assertEqual(response.response_id, "resp_123")
         self.assertEqual(response.request_id, "req_123")
+        self.assertEqual(response.model, "gpt-5.2")
+        assert response.token_usage is not None
+        self.assertEqual(response.token_usage.input_tokens, 120)
+        self.assertEqual(response.token_usage.output_tokens, 48)
+        self.assertEqual(response.token_usage.cached_input_tokens, 12)
+        self.assertEqual(response.token_usage.reasoning_tokens, 7)
 
         request = self.responses.calls[0]
         self.assertEqual(request["model"], "gpt-5.2")
@@ -181,6 +210,82 @@ class OpenAIBackendTests(unittest.TestCase):
 
         request = self.responses.calls[0]
         self.assertEqual(request["instructions"], "Base context\n\nTask context")
+
+    def test_respond_loads_latest_hidden_context_from_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            personality_dir = Path(temp_dir) / "personality"
+            personality_dir.mkdir()
+            state_dir = Path(temp_dir) / "state"
+            state_dir.mkdir()
+            (personality_dir / "SYSTEM.md").write_text("System context", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text("Old style context", encoding="utf-8")
+            (personality_dir / "USER.md").write_text("User profile", encoding="utf-8")
+            (state_dir / "MEMORY.md").write_text(
+                "\n".join(
+                    [
+                        "# Twinr Memory",
+                        "",
+                        "## Entries",
+                        "",
+                        "### MEM-20260313T120000Z",
+                        "- kind: contact",
+                        "- created_at: 2026-03-13T12:00:00+00:00",
+                        "- updated_at: 2026-03-13T12:00:00+00:00",
+                        "- summary: Telefonnummer Rathaus Schwarzenbek 04151 8810.",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = replace(
+                self.config,
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(state_dir / "MEMORY.md"),
+            )
+            backend = OpenAIBackend(config=config, client=self.client)
+            (personality_dir / "PERSONALITY.md").write_text("Updated style context", encoding="utf-8")
+
+            backend.respond_with_metadata("Hallo")
+
+        request = self.responses.calls[-1]
+        self.assertIn("SYSTEM:\nSystem context", request["instructions"])
+        self.assertIn("PERSONALITY:\nUpdated style context", request["instructions"])
+        self.assertIn("MEMORY:\nDurable remembered items explicitly saved for future turns:", request["instructions"])
+        self.assertIn("04151 8810", request["instructions"])
+
+    def test_respond_to_images_sends_multiple_input_images(self) -> None:
+        response = self.backend.respond_to_images_with_metadata(
+            "Compare both images.",
+            images=[
+                OpenAIImageInput(
+                    data=b"\x89PNG\r\n\x1a\ncamera",
+                    content_type="image/png",
+                    filename="camera.png",
+                    label="Image 1: live camera frame.",
+                ),
+                OpenAIImageInput(
+                    data=b"\xff\xd8\xffreference",
+                    content_type="image/jpeg",
+                    filename="reference.jpg",
+                    label="Image 2: reference user portrait.",
+                    detail="low",
+                ),
+            ],
+        )
+
+        self.assertEqual(response.text, "Backend answer")
+        request = self.responses.calls[0]
+        user_message = request["input"][0]
+        self.assertEqual(user_message["role"], "user")
+        self.assertEqual(
+            [item["type"] for item in user_message["content"]],
+            ["input_text", "input_text", "input_image", "input_text", "input_image"],
+        )
+        self.assertEqual(user_message["content"][2]["detail"], "high")
+        self.assertEqual(user_message["content"][4]["detail"], "low")
+        self.assertTrue(user_message["content"][2]["image_url"].startswith("data:image/png;base64,"))
+        self.assertTrue(user_message["content"][4]["image_url"].startswith("data:image/jpeg;base64,"))
 
     def test_transcribe_passes_audio_tuple(self) -> None:
         transcript = self.backend.transcribe(b"RIFF", filename="sample.wav", content_type="audio/wav")
@@ -243,6 +348,90 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(response.request_id, "req_stream")
         self.assertFalse(response.used_web_search)
         self.assertEqual(self.responses.stream_calls[0]["model"], "gpt-5.2")
+
+    def test_search_live_info_uses_web_search_and_extracts_sources(self) -> None:
+        self.responses.output_text = "Morgen in Schwarzenbek 11 Grad, leichter Regen."
+        self.responses.output = [
+            SimpleNamespace(
+                type="web_search_call",
+                action=SimpleNamespace(
+                    sources=[
+                        SimpleNamespace(url="https://weather.example/forecast"),
+                        SimpleNamespace(url="https://weather.example/forecast"),
+                        SimpleNamespace(url="https://stadt.example/wetter"),
+                    ]
+                ),
+            )
+        ]
+
+        result = self.backend.search_live_info_with_metadata(
+            "Wie wird das Wetter morgen?",
+            location_hint="Schwarzenbek",
+            date_context="Friday, 2026-03-13 10:00 (Europe/Berlin)",
+        )
+
+        self.assertEqual(result.answer, "Morgen in Schwarzenbek 11 Grad, leichter Regen.")
+        self.assertEqual(
+            result.sources,
+            (
+                "https://weather.example/forecast",
+                "https://stadt.example/wetter",
+            ),
+        )
+        request = self.responses.calls[0]
+        self.assertEqual(request["model"], "gpt-5.2-chat-latest")
+        self.assertEqual(request["include"], ["web_search_call.action.sources"])
+        self.assertEqual(request["tools"][0]["type"], "web_search")
+        self.assertIn("Location hint: Schwarzenbek", request["input"][-1]["content"][0]["text"])
+        self.assertIn("Local date/time context: Friday, 2026-03-13 10:00", request["input"][-1]["content"][0]["text"])
+
+    def test_search_live_info_falls_back_to_chat_latest_when_primary_search_model_returns_blank(self) -> None:
+        class BlankThenAnswerResponses:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                model = kwargs["model"]
+                if model == "gpt-5.2":
+                    return SimpleNamespace(
+                        id="resp_blank",
+                        _request_id="req_blank",
+                        output_text="",
+                        output=[SimpleNamespace(type="web_search_call")],
+                    )
+                return SimpleNamespace(
+                    id="resp_chat",
+                    _request_id="req_chat",
+                    output_text="Morgen in Schwarzenbek bis 11 Grad und zeitweise Regen.",
+                    output=[
+                        SimpleNamespace(type="web_search_call"),
+                        SimpleNamespace(
+                            type="message",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text="Morgen in Schwarzenbek bis 11 Grad und zeitweise Regen.")],
+                        ),
+                    ],
+                )
+
+        backend = OpenAIBackend(
+            config=replace(self.config, openai_search_model="gpt-5.2"),
+            client=SimpleNamespace(
+                responses=BlankThenAnswerResponses(),
+                audio=SimpleNamespace(
+                    transcriptions=self.transcriptions,
+                    speech=self.speech,
+                ),
+            ),
+        )
+
+        result = backend.search_live_info_with_metadata("Wie wird das Wetter morgen?")
+
+        self.assertEqual(result.answer, "Morgen in Schwarzenbek bis 11 Grad und zeitweise Regen.")
+        self.assertEqual(
+            [call["model"] for call in backend._client.responses.calls],
+            ["gpt-5.2", "gpt-5.2", "gpt-5.2-chat-latest"],
+        )
 
     def test_compose_print_job_uses_context_and_request_source(self) -> None:
         self.responses.output_text = "TERMINE\nMontag 14 Uhr\nAdresse Praxis"
