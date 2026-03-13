@@ -64,6 +64,37 @@ Durable remembered facts that the user explicitly asks Twinr to keep are written
 
 Scheduled reminders and timers are stored separately in `state/reminders.json`. The voice agent writes to this store only via the reminder tool, and the idle loops deliver due reminders later with bounded retry handling if speech output fails.
 
+Basic local automations are stored in `state/automations.json`. This store is meant for explicit operator-created rules and covers two trigger families today: time-based schedules and simple if-then rules over named facts/events.
+
+The active voice agent now exposes a dedicated automation toolset for:
+
+- listing existing automations
+- creating time-based automations
+- creating sensor-triggered automations
+- updating time-based automations
+- updating sensor-triggered automations
+- deleting automations
+
+Time-based automations can either:
+
+- speak static text
+- print static text
+- generate spoken content from an LLM prompt
+- generate printed content from an LLM prompt
+
+For scheduled live-information jobs such as daily weather, daily news, or printed headlines, Twinr stores the automation as an `llm_prompt` action with web search enabled and executes it later from the idle loop.
+
+Sensor-triggered automations currently support the following operator-facing trigger kinds:
+
+- `pir_motion_detected`
+- `pir_no_motion` with a required hold duration
+- `vad_speech_detected`
+- `vad_quiet` with a required hold duration
+- `camera_person_visible`
+- `camera_hand_or_object_near_camera`
+
+The proactive monitor now feeds stable PIR, camera, and VAD facts into the automation engine while Twinr is idle. This lets voice-created if-then automations react to sensor facts without exposing raw camera frames or raw audio chunks as tool-level inputs.
+
 Explicit requests to change future user-profile context or future speaking/behavior rules are written into managed sections inside `personality/USER.md` and `personality/PERSONALITY.md`. Twinr reloads those files on the next provider request instead of baking them permanently into code.
 
 ### Long-term memory (optional)
@@ -86,6 +117,7 @@ Example configuration areas:
 
 - Personality and tone
 - User preferences
+- Automations
 - Provider selection
 - Device settings
 - Memory settings
@@ -97,8 +129,10 @@ The web interface should stay simple enough for caregivers, family members, or o
 The current implementation uses a server-rendered local dashboard with these sections:
 
 - Dashboard
+- Devices
 - LLM Usage
 - System Health
+- Automations
 - Personality
 - Memory
 - Connect
@@ -107,10 +141,16 @@ The current implementation uses a server-rendered local dashboard with these sec
 
 The `Memory` page reads a live runtime snapshot from the active Twinr process, so operators can inspect the current on-device conversation memory without attaching to the running loop.
 The `Memory` page also exposes the durable `state/MEMORY.md` store, so operators can inspect and add explicit long-lived remembered items without touching the rolling runtime snapshot.
+The same `Memory` page now exposes scheduled reminders from `state/reminders.json`, including pending and delivered reminders plus simple operator controls to add, complete, or delete reminder entries.
+The `Automations` page reads `state/automations.json`, groups stored rules by automation family, and exposes explicit create/edit/delete controls for scheduled and sensor-triggered rules. Integration modules now register their own reserved family blocks through an integration-side registry, so later mail/calendar/integration automations can land in their own UI sections without rewriting the core page.
 The `Personality` and `User` pages now separate the hand-written base text from Twinr-managed updates, so tool-written behavior/profile changes stay visible and editable without clobbering the base files.
+The `Devices` page shows the current local hardware view for printer, camera, audio, PIR, and buttons, plus the newest self-test evidence Twinr can confirm. Signals that the current path cannot expose, such as paper status on the raw USB printer path, are shown as unknown instead of guessed.
 The `LLM Usage` page reads the local usage store for tracked OpenAI calls, including model names, request ids, and token counts when the provider returns them.
 The `System Health` page reads live Raspberry Pi metrics and Twinr worker presence so caregivers can see whether the box itself looks healthy.
 The `Ops Logs` page reads the persistent local event log under `artifacts/stores/ops/events.jsonl`, including proactive observation changes, proactive trigger detections, and spoken proactive prompts.
+The `Voice Profile` page manages a local-only speaker template. Phase 1 uses the normal conversation microphone only, stores no raw enrollment audio, and exposes only a soft confidence signal such as `likely user`, `uncertain`, or `unknown voice`. Support bundles omit the live voice-assessment fields.
+In realtime voice mode, Twinr can now also manage that profile by spoken request: it can enroll the current spoken turn into the local voice profile, read the current profile status, or reset the profile when the user explicitly asks for it.
+The live speaker signal is injected into the LLM context as a short redacted system hint, not as raw audio or a biometric template. When the signal is `uncertain` or `unknown voice`, Twinr now asks for extra confirmation before persistent changes such as saved memory/profile/personality updates or automation changes.
 
 ## High-level architecture
 
@@ -149,7 +189,9 @@ The `Ops Logs` page reads the persistent local event log under `artifacts/stores
 - `src/twinr/display/` — Waveshare display wrapper and image rendering helpers
 - `src/twinr/providers/` — provider implementations such as OpenAI
 - `src/twinr/memory/` — on-device memory, durable memory stores, and reminders
+- `src/twinr/automations/` — canonical automation definitions, evaluation, and persistent CRUD store
 - `src/twinr/hardware/` — audio, button, PIR, camera, and printer adapters
+- `state/voice_profile.json` — local speaker-template store for the optional voice-confidence layer
 - `test/` — tests and validation assets
 
 ## Intended user experience
@@ -272,6 +314,7 @@ That writes the `TWINR_PROACTIVE_AUDIO_*` env keys and also runs a short direct 
 ### Printer
 
 The current thermal printer is the DFRobot `DFR0503-EN`, exposed to CUPS as a Gprinter `GP-58` compatible raw printer.
+This printer needs its own `9-24V` power supply for real paper output; a USB connection alone can still enumerate the device without being able to heat/feed paper.
 
 Configure or re-create the printer queue with:
 
@@ -281,6 +324,7 @@ sudo hardware/printer/setup_printer.sh --default --test
 ```
 
 The setup script defaults to the `Thermal_GP58` queue and accepts an explicit `--device-uri` when auto-detection is not sufficient.
+Both the setup smoke and the portal printer self-test only prove that a bounded print job was handed to the printer path; the operator still has to confirm the physical paper output on the device.
 
 ### Display
 

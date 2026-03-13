@@ -4,6 +4,7 @@ from twinr.proactive.engine import (
     SocialObservation,
     SocialTriggerDecision,
     SocialTriggerEngine,
+    SocialTriggerEvaluation,
     SocialTriggerPriority,
     SocialTriggerThresholds,
     SocialVisionObservation,
@@ -15,6 +16,14 @@ from twinr.proactive.observers import (
     ProactiveAudioSnapshot,
     ProactiveVisionSnapshot,
     parse_vision_observation_text,
+)
+from twinr.proactive.scoring import (
+    TriggerScoreEvidence,
+    WeightedTriggerScore,
+    bool_score,
+    hold_progress,
+    recent_progress,
+    weighted_trigger_score,
 )
 from twinr.proactive.service import (
     ProactiveCoordinator,
@@ -35,9 +44,16 @@ __all__ = [
     "SocialObservation",
     "SocialTriggerDecision",
     "SocialTriggerEngine",
+    "SocialTriggerEvaluation",
     "SocialTriggerPriority",
     "SocialTriggerThresholds",
     "SocialVisionObservation",
+    "TriggerScoreEvidence",
+    "WeightedTriggerScore",
+    "bool_score",
     "build_default_proactive_monitor",
+    "hold_progress",
     "parse_vision_observation_text",
+    "recent_progress",
+    "weighted_trigger_score",
 ]

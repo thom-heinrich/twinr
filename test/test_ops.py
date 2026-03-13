@@ -20,6 +20,7 @@ from twinr.ops import (
     collect_system_health,
     run_config_checks,
 )
+from twinr.ops.locks import loop_instance_lock
 
 
 class OpsModuleTests(unittest.TestCase):
@@ -92,6 +93,9 @@ class OpsModuleTests(unittest.TestCase):
                 ),
                 last_transcript="Hallo Twinr",
                 last_response="Guten Morgen",
+                user_voice_status="likely_user",
+                user_voice_confidence=0.82,
+                user_voice_checked_at="2026-03-13T08:05:00+00:00",
             )
             event_store = TwinrOpsEventStore.from_config(config)
             event_store.append(event="turn_started", message="Green button started a turn.")
@@ -116,6 +120,9 @@ class OpsModuleTests(unittest.TestCase):
         self.assertEqual(redacted_env["OPENAI_API_KEY"], "sk-t…1234")
         self.assertEqual(events[-1]["event"], "error")
         self.assertEqual(snapshot["last_response"], "Guten Morgen")
+        self.assertNotIn("user_voice_status", snapshot)
+        self.assertNotIn("user_voice_confidence", snapshot)
+        self.assertNotIn("user_voice_checked_at", snapshot)
         self.assertIn("status", health)
         self.assertEqual(usage_summary["total_tokens"], 140)
 
@@ -220,6 +227,39 @@ class OpsModuleTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.summary, "PIR motion detected.")
 
+    def test_button_self_test_is_blocked_while_realtime_loop_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                green_button_gpio=23,
+                yellow_button_gpio=22,
+            )
+            runner = TwinrSelfTestRunner(config)
+
+            with loop_instance_lock(config, "realtime-loop"):
+                result = runner.run("buttons")
+
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("realtime loop", result.summary)
+        self.assertIn("Stop it first", result.summary)
+
+    def test_pir_self_test_is_blocked_while_hardware_loop_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                pir_motion_gpio=26,
+            )
+            runner = TwinrSelfTestRunner(config)
+
+            with loop_instance_lock(config, "hardware-loop"):
+                result = runner.run("pir")
+
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("hardware loop", result.summary)
+        self.assertIn("Stop it first", result.summary)
+
     def test_proactive_mic_self_test_uses_configured_background_device(self) -> None:
         class FakeAmbientSampler:
             def __init__(self) -> None:
@@ -255,6 +295,32 @@ class OpsModuleTests(unittest.TestCase):
         self.assertEqual(result.summary, "Proactive background-microphone sample captured.")
         self.assertIn("plughw:CARD=CameraB409241,DEV=0", result.details[0])
         self.assertIn("Speech-like activity: yes", result.details[-1])
+
+    def test_printer_self_test_requires_manual_confirmation(self) -> None:
+        class FakePrinter:
+            def __init__(self) -> None:
+                self.payloads: list[str] = []
+
+            def print_text(self, text: str) -> str:
+                self.payloads.append(text)
+                return "request id is Thermal_GP58-31 (1 file(s))"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir, printer_queue="Thermal_GP58")
+            fake_printer = FakePrinter()
+            runner = TwinrSelfTestRunner(
+                config,
+                printer_factory=lambda _config: fake_printer,
+            )
+
+            result = runner.run("printer")
+
+        self.assertEqual(fake_printer.payloads, ["Twinr self-test\nPrinter path OK."])
+        self.assertEqual(result.status, "warn")
+        self.assertEqual(result.summary, "Printer job submitted. Confirm the paper output on the device.")
+        self.assertIn("Queue: Thermal_GP58", result.details)
+        self.assertIn("CUPS response: request id is Thermal_GP58-31 (1 file(s))", result.details)
+        self.assertIn("Physical paper output must be confirmed at the printer.", result.details)
 
 
 if __name__ == "__main__":

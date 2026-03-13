@@ -141,15 +141,41 @@ class TwinrConfig:
     proactive_audio_input_device: str | None = None
     proactive_audio_sample_ms: int = 1000
     proactive_audio_distress_enabled: bool = False
+    proactive_person_returned_absence_s: float = 20.0 * 60.0
+    proactive_person_returned_recent_motion_s: float = 30.0
+    proactive_attention_window_s: float = 6.0
+    proactive_slumped_quiet_s: float = 20.0
+    proactive_possible_fall_stillness_s: float = 10.0
+    proactive_floor_stillness_s: float = 20.0
+    proactive_showing_intent_hold_s: float = 1.5
+    proactive_positive_contact_hold_s: float = 1.5
+    proactive_distress_hold_s: float = 3.0
+    proactive_fall_transition_window_s: float = 8.0
+    proactive_person_returned_score_threshold: float = 0.9
+    proactive_attention_window_score_threshold: float = 0.86
+    proactive_slumped_quiet_score_threshold: float = 0.9
+    proactive_possible_fall_score_threshold: float = 0.82
+    proactive_floor_stillness_score_threshold: float = 0.9
+    proactive_showing_intent_score_threshold: float = 0.84
+    proactive_positive_contact_score_threshold: float = 0.84
+    proactive_distress_possible_score_threshold: float = 0.85
     web_host: str = "0.0.0.0"
     web_port: int = 1337
     runtime_state_path: str = "/tmp/twinr-runtime-state.json"
     memory_markdown_path: str = "state/MEMORY.md"
     reminder_store_path: str = "state/reminders.json"
+    automation_store_path: str = "state/automations.json"
+    voice_profile_store_path: str = "state/voice_profile.json"
     restore_runtime_state_on_startup: bool = False
     reminder_poll_interval_s: float = 1.0
     reminder_retry_delay_s: float = 90.0
     reminder_max_entries: int = 48
+    automation_poll_interval_s: float = 5.0
+    automation_max_entries: int = 96
+    voice_profile_min_sample_ms: int = 1200
+    voice_profile_likely_threshold: float = 0.72
+    voice_profile_uncertain_threshold: float = 0.55
+    voice_profile_max_samples: int = 6
     speech_pause_ms: int = 1200
     memory_max_turns: int = 12
     memory_keep_recent: int = 6
@@ -298,6 +324,78 @@ class TwinrConfig:
                 get_value("TWINR_PROACTIVE_AUDIO_DISTRESS_ENABLED"),
                 False,
             ),
+            proactive_person_returned_absence_s=_parse_float(
+                get_value("TWINR_PROACTIVE_PERSON_RETURNED_ABSENCE_S"),
+                20.0 * 60.0,
+            ),
+            proactive_person_returned_recent_motion_s=_parse_float(
+                get_value("TWINR_PROACTIVE_PERSON_RETURNED_RECENT_MOTION_S"),
+                30.0,
+            ),
+            proactive_attention_window_s=_parse_float(
+                get_value("TWINR_PROACTIVE_ATTENTION_WINDOW_S"),
+                6.0,
+            ),
+            proactive_slumped_quiet_s=_parse_float(
+                get_value("TWINR_PROACTIVE_SLUMPED_QUIET_S"),
+                20.0,
+            ),
+            proactive_possible_fall_stillness_s=_parse_float(
+                get_value("TWINR_PROACTIVE_POSSIBLE_FALL_STILLNESS_S"),
+                10.0,
+            ),
+            proactive_floor_stillness_s=_parse_float(
+                get_value("TWINR_PROACTIVE_FLOOR_STILLNESS_S"),
+                20.0,
+            ),
+            proactive_showing_intent_hold_s=_parse_float(
+                get_value("TWINR_PROACTIVE_SHOWING_INTENT_HOLD_S"),
+                1.5,
+            ),
+            proactive_positive_contact_hold_s=_parse_float(
+                get_value("TWINR_PROACTIVE_POSITIVE_CONTACT_HOLD_S"),
+                1.5,
+            ),
+            proactive_distress_hold_s=_parse_float(
+                get_value("TWINR_PROACTIVE_DISTRESS_HOLD_S"),
+                3.0,
+            ),
+            proactive_fall_transition_window_s=_parse_float(
+                get_value("TWINR_PROACTIVE_FALL_TRANSITION_WINDOW_S"),
+                8.0,
+            ),
+            proactive_person_returned_score_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_PERSON_RETURNED_SCORE_THRESHOLD"),
+                0.9,
+            ),
+            proactive_attention_window_score_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_ATTENTION_WINDOW_SCORE_THRESHOLD"),
+                0.86,
+            ),
+            proactive_slumped_quiet_score_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_SLUMPED_QUIET_SCORE_THRESHOLD"),
+                0.9,
+            ),
+            proactive_possible_fall_score_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_POSSIBLE_FALL_SCORE_THRESHOLD"),
+                0.82,
+            ),
+            proactive_floor_stillness_score_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_FLOOR_STILLNESS_SCORE_THRESHOLD"),
+                0.9,
+            ),
+            proactive_showing_intent_score_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_SHOWING_INTENT_SCORE_THRESHOLD"),
+                0.84,
+            ),
+            proactive_positive_contact_score_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_POSITIVE_CONTACT_SCORE_THRESHOLD"),
+                0.84,
+            ),
+            proactive_distress_possible_score_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_DISTRESS_POSSIBLE_SCORE_THRESHOLD"),
+                0.85,
+            ),
             web_host=get_value("TWINR_WEB_HOST", "0.0.0.0") or "0.0.0.0",
             web_port=int(get_value("TWINR_WEB_PORT", "1337") or "1337"),
             runtime_state_path=get_value(
@@ -315,6 +413,16 @@ class TwinrConfig:
                 str(project_root / "state" / "reminders.json"),
             )
             or str(project_root / "state" / "reminders.json"),
+            automation_store_path=get_value(
+                "TWINR_AUTOMATION_STORE_PATH",
+                str(project_root / "state" / "automations.json"),
+            )
+            or str(project_root / "state" / "automations.json"),
+            voice_profile_store_path=get_value(
+                "TWINR_VOICE_PROFILE_STORE_PATH",
+                str(project_root / "state" / "voice_profile.json"),
+            )
+            or str(project_root / "state" / "voice_profile.json"),
             restore_runtime_state_on_startup=_parse_bool(
                 get_value("TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP"),
                 False,
@@ -322,6 +430,18 @@ class TwinrConfig:
             reminder_poll_interval_s=_parse_float(get_value("TWINR_REMINDER_POLL_INTERVAL_S"), 1.0),
             reminder_retry_delay_s=_parse_float(get_value("TWINR_REMINDER_RETRY_DELAY_S"), 90.0),
             reminder_max_entries=int(get_value("TWINR_REMINDER_MAX_ENTRIES", "48") or "48"),
+            automation_poll_interval_s=_parse_float(get_value("TWINR_AUTOMATION_POLL_INTERVAL_S"), 5.0),
+            automation_max_entries=int(get_value("TWINR_AUTOMATION_MAX_ENTRIES", "96") or "96"),
+            voice_profile_min_sample_ms=int(get_value("TWINR_VOICE_PROFILE_MIN_SAMPLE_MS", "1200") or "1200"),
+            voice_profile_likely_threshold=_parse_float(
+                get_value("TWINR_VOICE_PROFILE_LIKELY_THRESHOLD"),
+                0.72,
+            ),
+            voice_profile_uncertain_threshold=_parse_float(
+                get_value("TWINR_VOICE_PROFILE_UNCERTAIN_THRESHOLD"),
+                0.55,
+            ),
+            voice_profile_max_samples=int(get_value("TWINR_VOICE_PROFILE_MAX_SAMPLES", "6") or "6"),
             speech_pause_ms=int(get_value("TWINR_SPEECH_PAUSE_MS", "1200") or "1200"),
             memory_max_turns=int(get_value("TWINR_MEMORY_MAX_TURNS", "12") or "12"),
             memory_keep_recent=int(get_value("TWINR_MEMORY_KEEP_RECENT", "6") or "6"),

@@ -14,6 +14,7 @@ usage() {
 Usage: setup_printer.sh [--queue NAME] [--device-uri URI] [--default] [--test]
 
 Configure the DFRobot DFR0503-EN thermal printer as a raw CUPS queue.
+This model needs its own power supply for real paper output; USB enumeration alone is not enough.
 
 Options:
   --queue NAME        Queue name to create or replace (default: Thermal_GP58)
@@ -125,6 +126,13 @@ lpstat -p "$QUEUE_NAME"
 lpstat -v | awk -v queue="$QUEUE_NAME" '$3 == queue":" {print}'
 
 if [[ "$RUN_TEST" -eq 1 ]]; then
-  printf 'Twinr printer setup OK\nThermal path is ready.\n\n\n' | lp -d "$QUEUE_NAME" -o raw
+  test_payload="$(mktemp)"
+  trap 'rm -f "$test_payload"' EXIT
+  printf 'Twinr printer setup OK\nThermal path is ready.\n\n\n' >"$test_payload"
+  lp -d "$QUEUE_NAME" -o raw "$test_payload"
+  rm -f "$test_payload"
+  trap - EXIT
   printf 'Queued raw test print on %s\n' "$QUEUE_NAME"
+  printf 'Confirm the paper output on the printer itself.\n'
+  printf "If nothing prints, check paper, USB cabling, and the printer's own 9-24V power supply.\n"
 fi

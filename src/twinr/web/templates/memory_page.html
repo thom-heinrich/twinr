@@ -180,6 +180,168 @@
 <section class="panel">
   <div class="section-header">
     <div>
+      <h2>Scheduled reminders</h2>
+      <p class="section-description">Explicit reminder and timer requests live here. Twinr checks this store while idle and speaks due reminders later.</p>
+    </div>
+  </div>
+  <div class="stats-grid">
+    <div class="stat-tile">
+      <span class="stat-label">File</span>
+      <span class="stat-value stat-value-small">{{ reminder_path }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Pending</span>
+      <span class="stat-value">{{ reminder_entries|length }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Delivered</span>
+      <span class="stat-value">{{ delivered_reminder_entries|length }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Timezone</span>
+      <span class="stat-value stat-value-small">{{ timezone_name }}</span>
+    </div>
+  </div>
+
+  <div class="section-header">
+    <div>
+      <h2>Pending reminders</h2>
+      <p class="section-description">These are still scheduled and can trigger later while Twinr is idle.</p>
+    </div>
+  </div>
+  {% if reminder_entries %}
+  <div class="memory-list">
+    {% for entry in reminder_entries %}
+    <article class="memory-turn">
+      <div class="memory-turn-meta">
+        <div class="page-notes">
+          <span class="role-badge role-system">{{ entry.kind }}</span>
+          <span class="status-pill is-muted">{{ entry.status_label }}</span>
+          <span class="memory-time">Due {{ entry.due_label }}</span>
+        </div>
+        <div class="memory-turn-actions">
+          <form method="post" action="{{ form_action }}">
+            <input type="hidden" name="_action" value="mark_reminder_delivered">
+            <input type="hidden" name="reminder_id" value="{{ entry.reminder_id }}">
+            <button type="submit" class="button-secondary">Mark delivered</button>
+          </form>
+          <form method="post" action="{{ form_action }}">
+            <input type="hidden" name="_action" value="delete_reminder">
+            <input type="hidden" name="reminder_id" value="{{ entry.reminder_id }}">
+            <button type="submit" class="button-secondary">Delete</button>
+          </form>
+        </div>
+      </div>
+      <div class="memory-content">
+        <strong>{{ entry.summary }}</strong>
+        {% if entry.details %}
+        <br>{{ entry.details }}
+        {% endif %}
+        {% if entry.original_request %}
+        <br><strong>Original request:</strong> {{ entry.original_request }}
+        {% endif %}
+        <br><strong>Source:</strong> {{ entry.source }}
+        {% if entry.delivery_attempts %}
+        <br><strong>Attempts:</strong> {{ entry.delivery_attempts }}
+        {% endif %}
+        {% if entry.last_error %}
+        <br><strong>Last error:</strong> {{ entry.last_error }}
+        {% endif %}
+        {% if entry.next_attempt_label %}
+        <br><strong>Next retry:</strong> {{ entry.next_attempt_label }}
+        {% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No pending reminders are stored yet.</div>
+  {% endif %}
+
+  <div class="section-header">
+    <div>
+      <h2>Add reminder</h2>
+      <p class="section-description">Use this for explicit reminders or timers. Twinr resolves spoken reminders itself; this form is for operator edits.</p>
+    </div>
+  </div>
+  <form method="post" action="{{ form_action }}" class="stack">
+    <input type="hidden" name="_action" value="add_reminder">
+    <div class="form-grid">
+      <label class="field">
+        <span class="field-label">Due at</span>
+        <input type="datetime-local" name="reminder_due_at" value="{{ reminder_default_due_at }}">
+        <span class="field-help">Local time on this Pi. Keep reminders short and specific.</span>
+      </label>
+      <label class="field">
+        <span class="field-label">Type</span>
+        <input type="text" name="reminder_kind" value="" placeholder="appointment">
+        <span class="field-help">Short category such as appointment, medication, timer, or call.</span>
+      </label>
+      <label class="field field-span-2">
+        <span class="field-label">Summary</span>
+        <textarea name="reminder_summary" rows="4" placeholder="Morgen um 12 Uhr an den Arzttermin erinnern."></textarea>
+        <span class="field-help">This becomes the main reminder sentence Twinr uses later.</span>
+      </label>
+      <label class="field field-span-2">
+        <span class="field-label">Details</span>
+        <textarea name="reminder_details" rows="4" placeholder="Dr. Meyer, Unterlagen mitnehmen."></textarea>
+        <span class="field-help">Optional extra details for the later spoken reminder.</span>
+      </label>
+      <label class="field field-span-2">
+        <span class="field-label">Original request</span>
+        <textarea name="reminder_original_request" rows="3" placeholder="Erinnere mich morgen um 12 Uhr an den Arzttermin."></textarea>
+        <span class="field-help">Optional. Useful for operator traceability.</span>
+      </label>
+    </div>
+    <div class="actions">
+      <button type="submit">Save reminder</button>
+    </div>
+  </form>
+
+  <div class="section-header">
+    <div>
+      <h2>Delivered reminders</h2>
+      <p class="section-description">Recently completed reminders stay visible here until they are deleted or trimmed by the store limit.</p>
+    </div>
+  </div>
+  {% if delivered_reminder_entries %}
+  <div class="memory-list">
+    {% for entry in delivered_reminder_entries %}
+    <article class="memory-turn">
+      <div class="memory-turn-meta">
+        <div class="page-notes">
+          <span class="role-badge role-system">{{ entry.kind }}</span>
+          <span class="status-pill is-ok">{{ entry.status_label }}</span>
+          <span class="memory-time">Due {{ entry.due_label }}</span>
+        </div>
+        <div class="memory-turn-actions">
+          <form method="post" action="{{ form_action }}">
+            <input type="hidden" name="_action" value="delete_reminder">
+            <input type="hidden" name="reminder_id" value="{{ entry.reminder_id }}">
+            <button type="submit" class="button-secondary">Delete</button>
+          </form>
+        </div>
+      </div>
+      <div class="memory-content">
+        <strong>{{ entry.summary }}</strong>
+        {% if entry.details %}
+        <br>{{ entry.details }}
+        {% endif %}
+        {% if entry.delivered_at_label %}
+        <br><strong>Delivered:</strong> {{ entry.delivered_at_label }}
+        {% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No delivered reminders are stored yet.</div>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
       <h2>Durable memories</h2>
       <p class="section-description">Only explicit “remember this” items belong here. This list is separate from the rolling conversation snapshot.</p>
     </div>

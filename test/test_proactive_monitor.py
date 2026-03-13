@@ -222,6 +222,39 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertIsNotNone(result.decision)
         self.assertEqual(result.decision.trigger_id, "person_returned")
 
+    def test_coordinator_pauses_completely_when_idle_predicate_is_false(self) -> None:
+        config = TwinrConfig(
+            proactive_enabled=True,
+            proactive_capture_interval_s=1.0,
+            proactive_motion_window_s=20.0,
+        )
+        runtime = TwinrRuntime(config=config)
+        vision_observer = FakeVisionObserver(
+            [SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT)]
+        )
+        audio_observer = FakeAudioObserver(SocialAudioObservation(speech_detected=True))
+        handled: list[str] = []
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(user_name="Thom"),
+            trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
+            vision_observer=vision_observer,
+            pir_monitor=FakePirMonitor(events=[True], level=True),
+            audio_observer=audio_observer,
+            idle_predicate=lambda: False,
+            emit=lambda _line: None,
+            clock=MutableClock(5.0),
+        )
+
+        result = coordinator.tick()
+
+        self.assertFalse(result.inspected)
+        self.assertIsNone(result.decision)
+        self.assertEqual(vision_observer.calls, 0)
+        self.assertEqual(audio_observer.calls, 0)
+        self.assertEqual(handled, [])
+
     def test_coordinator_does_not_inspect_without_recent_motion(self) -> None:
         config = TwinrConfig(proactive_enabled=True)
         runtime = TwinrRuntime(config=config)
@@ -256,7 +289,7 @@ class ProactiveMonitorTests(unittest.TestCase):
 
         self.assertFalse(result.inspected)
         self.assertEqual(vision_observer.calls, 0)
-        self.assertEqual(audio_observer.sampler.calls, 0)
+        self.assertEqual(audio_observer.sampler.calls, 1)
 
     def test_coordinator_persists_changed_observations_without_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -315,6 +348,9 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(observation_events[0]["data"]["person_visible"], True)
         self.assertEqual(observation_events[0]["data"]["body_pose"], "upright")
         self.assertEqual(observation_events[0]["data"]["speech_detected"], False)
+        self.assertIn("top_trigger", observation_events[0]["data"])
+        self.assertIn("top_score", observation_events[0]["data"])
+        self.assertIn("top_threshold", observation_events[0]["data"])
 
     def test_coordinator_logs_trigger_detection_and_absence_transition(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -361,8 +397,62 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(len(trigger_events), 1)
         self.assertEqual(trigger_events[0]["data"]["trigger"], "person_returned")
         self.assertIn("Wie geht's dir?", trigger_events[0]["data"]["prompt"])
+        self.assertGreaterEqual(trigger_events[0]["data"]["score"], trigger_events[0]["data"]["threshold"])
+        self.assertTrue(trigger_events[0]["data"]["evidence"])
         observation_events = [entry for entry in events if entry.get("event") == "proactive_observation"]
         self.assertEqual(observation_events[-1]["data"]["person_visible"], False)
+        self.assertEqual(observation_events[-1]["data"]["inspected"], False)
+
+    def test_coordinator_dispatches_absence_path_trigger_when_inspection_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=10.0,
+                proactive_motion_window_s=5.0,
+                proactive_low_motion_after_s=1.0,
+                proactive_possible_fall_stillness_s=4.0,
+                proactive_possible_fall_score_threshold=0.65,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(0.0)
+            pir_monitor = FakePirMonitor(events=[True], level=True)
+            handled: list[str] = []
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT),
+                    ]
+                ),
+                pir_monitor=pir_monitor,
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            coordinator.tick()
+            clock.now = 2.5
+            pir_monitor.level = False
+            result = coordinator.tick()
+            self.assertIsNone(result.decision)
+            self.assertFalse(result.inspected)
+
+            clock.now = 12.6
+            result = coordinator.tick()
+
+            events = runtime.ops_events.tail(limit=20)
+
+        self.assertEqual(handled, ["possible_fall"])
+        self.assertIsNotNone(result.decision)
+        self.assertEqual(result.decision.trigger_id, "possible_fall")
+        self.assertFalse(result.inspected)
+        trigger_events = [entry for entry in events if entry.get("event") == "proactive_trigger_detected"]
+        self.assertEqual(trigger_events[-1]["data"]["trigger"], "possible_fall")
+        observation_events = [entry for entry in events if entry.get("event") == "proactive_observation"]
         self.assertEqual(observation_events[-1]["data"]["inspected"], False)
 
     def test_build_default_monitor_requires_pir(self) -> None:
@@ -381,6 +471,59 @@ class ProactiveMonitorTests(unittest.TestCase):
         )
 
         self.assertIsNone(monitor)
+
+    def test_coordinator_emits_sensor_facts_and_events_for_automations(self) -> None:
+        config = TwinrConfig(
+            proactive_enabled=True,
+            proactive_capture_interval_s=1.0,
+            proactive_motion_window_s=20.0,
+        )
+        runtime = TwinrRuntime(config=config)
+        clock = MutableClock(2.0)
+        observations: list[tuple[dict[str, object], tuple[str, ...]]] = []
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(),
+            trigger_handler=lambda _decision: True,
+            vision_observer=FakeVisionObserver(
+                [
+                    SocialVisionObservation(
+                        person_visible=True,
+                        looking_toward_device=True,
+                        hand_or_object_near_camera=True,
+                        body_pose=SocialBodyPose.UPRIGHT,
+                    ),
+                    SocialVisionObservation(
+                        person_visible=True,
+                        looking_toward_device=True,
+                        hand_or_object_near_camera=True,
+                        body_pose=SocialBodyPose.UPRIGHT,
+                    ),
+                ]
+            ),
+            pir_monitor=FakePirMonitor(events=[True], level=True),
+            audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=True)),
+            observation_handler=lambda facts, event_names: observations.append((facts, event_names)),
+            emit=lambda _line: None,
+            clock=clock,
+        )
+
+        coordinator.tick()
+        clock.now = 8.0
+        coordinator.tick()
+
+        self.assertEqual(len(observations), 2)
+        first_facts, first_events = observations[0]
+        second_facts, second_events = observations[1]
+        self.assertIn("pir.motion_detected", first_events)
+        self.assertIn("camera.person_visible", first_events)
+        self.assertIn("camera.hand_or_object_near_camera", first_events)
+        self.assertIn("vad.speech_detected", first_events)
+        self.assertEqual(first_facts["camera"]["person_visible"], True)
+        self.assertEqual(first_facts["vad"]["speech_detected"], True)
+        self.assertEqual(second_events, ())
+        self.assertGreaterEqual(second_facts["camera"]["person_visible_for_s"], 6.0)
 
 
 if __name__ == "__main__":

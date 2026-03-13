@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+
+{% block content %}
+{% if action_result %}
+<section class="flash {% if action_result.status == 'ok' %}success{% elif action_result.status == 'muted' %}subtle{% else %}subtle{% endif %}">
+  <strong>{{ action_result.title }}</strong> {{ action_result.detail }}
+</section>
+{% endif %}
+
+{% if action_error %}
+<section class="flash error">{{ action_error }}</section>
+{% endif %}
+
+<section class="panel two-column">
+  <div>
+    <h2>Live voice status</h2>
+    <ul class="plain-list">
+      <li><strong>Current runtime view</strong> {{ voice_snapshot_label }}</li>
+      <li><strong>Stored samples</strong> {{ profile_summary.sample_count if profile_summary.enrolled else 0 }}</li>
+      <li><strong>Updated at</strong> {{ profile_summary.updated_at or "—" }}</li>
+      <li><strong>Average sample</strong> {{ profile_summary.average_duration_ms if profile_summary.enrolled else 0 }} ms</li>
+    </ul>
+  </div>
+  <div>
+    <h2>Safety</h2>
+    <ul class="plain-list">
+      <li><strong>Storage</strong> Local template only, no raw audio kept</li>
+      <li><strong>Microphone</strong> Main conversation mic only in phase 1</li>
+      <li><strong>Support bundle</strong> Live voice fields are omitted</li>
+      <li><strong>Store path</strong> {{ profile_summary.store_path }}</li>
+    </ul>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Actions</h2>
+      <p class="section-description">Use enrollment to teach Twinr one local user voice template. Verification records no audio and only shows a local confidence signal.</p>
+    </div>
+  </div>
+  {% if capture_block_reason %}
+  <section class="flash subtle">{{ capture_block_reason }}</section>
+  {% endif %}
+  <div class="actions actions-start">
+    <form method="post" action="/voice-profile">
+      <input type="hidden" name="_action" value="enroll">
+      <button type="submit">Capture and enroll sample</button>
+    </form>
+    <form method="post" action="/voice-profile">
+      <input type="hidden" name="_action" value="verify">
+      <button type="submit">Verify now</button>
+    </form>
+    <form method="post" action="/voice-profile">
+      <input type="hidden" name="_action" value="reset">
+      <button type="submit">Reset profile</button>
+    </form>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Policy</h2>
+      <p class="section-description">This is intentionally a soft signal. It should never replace help access, and it should not be the only gate for sending mail or other sensitive actions.</p>
+    </div>
+  </div>
+  <div class="check-list">
+    <article class="check-row">
+      <div class="check-row-main">
+        <div class="check-row-title">Likely user</div>
+        <div class="check-row-detail">Twinr may trust personalization more, but still keeps explicit confirmation for risky actions.</div>
+      </div>
+      <span class="status-pill is-ok">Soft allow</span>
+    </article>
+    <article class="check-row">
+      <div class="check-row-main">
+        <div class="check-row-title">Uncertain or unknown</div>
+        <div class="check-row-detail">Twinr should stay polite and cautious, not harder to use.</div>
+      </div>
+      <span class="status-pill is-warn">Ask again</span>
+    </article>
+  </div>
+</section>
+{% endblock %}

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import errno
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware.audio import AmbientAudioSampler, SilenceDetectedRecorder, WaveAudioPlayer
@@ -11,6 +12,7 @@ from twinr.hardware.camera import V4L2StillCamera
 from twinr.hardware.pir import configured_pir_monitor
 from twinr.hardware.printer import RawReceiptPrinter
 from twinr.ops.events import TwinrOpsEventStore
+from twinr.ops.locks import loop_lock_owner
 from twinr.ops.paths import resolve_ops_paths_for_config
 
 
@@ -29,6 +31,10 @@ class SelfTestResult:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+class SelfTestBlockedError(RuntimeError):
+    pass
 
 
 class TwinrSelfTestRunner:
@@ -64,7 +70,11 @@ class TwinrSelfTestRunner:
                 "Sample a short bounded window from the proactive background microphone and report activity levels.",
             ),
             ("speaker", "Speaker-Beep", "Play a local confirmation beep through the configured output."),
-            ("printer", "Printer-Testdruck", "Print a short service ticket on the configured receipt printer."),
+            (
+                "printer",
+                "Printer-Testdruck",
+                "Submit a short service ticket to the configured receipt printer and then confirm the paper output on the device.",
+            ),
             ("camera", "Kamera-Testbild", "Capture a fresh still image and store it as a PNG artifact."),
             ("buttons", "Button-State", "Read the configured GPIO button levels once."),
             ("pir", "PIR motion", "Wait for a motion trigger on the configured PIR input."),
@@ -95,6 +105,19 @@ class TwinrSelfTestRunner:
                 result = self._run_pir_test()
             else:
                 raise ValueError(f"Unsupported self-test: {test_name}")
+        except SelfTestBlockedError as exc:
+            self.event_store.append(
+                event="self_test_blocked",
+                level="warn",
+                message=f"Self-test `{normalized}` blocked.",
+                data={"test_name": normalized, "reason": str(exc)},
+            )
+            return SelfTestResult(
+                test_name=normalized,
+                status="blocked",
+                summary=str(exc),
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
         except Exception as exc:
             self.event_store.append(
                 event="self_test_failed",
@@ -190,10 +213,12 @@ class TwinrSelfTestRunner:
         details = [f"Queue: {self.config.printer_queue}"]
         if print_job:
             details.append(f"CUPS response: {print_job}")
+        details.append("Physical paper output must be confirmed at the printer.")
+        details.append("If nothing prints, check paper, cabling, and the printer's own power supply.")
         return SelfTestResult(
             test_name="printer",
-            status="ok",
-            summary="Printer test ticket sent.",
+            status="warn",
+            summary="Printer job submitted. Confirm the paper output on the device.",
             details=tuple(details),
             finished_at=datetime.now(timezone.utc).isoformat(),
         )
@@ -218,14 +243,19 @@ class TwinrSelfTestRunner:
         )
 
     def _run_button_test(self) -> SelfTestResult:
-        with configured_button_monitor(self.config) as monitor:
-            levels = monitor.snapshot_values()
+        if not self.config.button_gpios:
+            raise RuntimeError("No configured button GPIOs are available for probing.")
+        self._ensure_gpio_self_test_available("Button self-test")
+        try:
+            with configured_button_monitor(self.config) as monitor:
+                levels = monitor.snapshot_values()
+        except OSError as exc:
+            self._raise_gpio_busy("Button self-test", exc)
+            raise
         details = tuple(
             f"{name}: GPIO {line_offset} raw={levels.get(line_offset, '?')}"
             for name, line_offset in sorted(self.config.button_gpios.items())
         )
-        if not details:
-            raise RuntimeError("No configured button GPIOs are available for probing.")
         return SelfTestResult(
             test_name="buttons",
             status="ok",
@@ -237,9 +267,14 @@ class TwinrSelfTestRunner:
     def _run_pir_test(self) -> SelfTestResult:
         if not self.config.pir_enabled:
             raise RuntimeError("No PIR motion GPIO is configured.")
-        with self.pir_monitor_factory(self.config) as monitor:
-            current_value = monitor.snapshot_value()
-            event = monitor.wait_for_motion(duration_s=12.0, poll_timeout=0.2)
+        self._ensure_gpio_self_test_available("PIR self-test")
+        try:
+            with self.pir_monitor_factory(self.config) as monitor:
+                current_value = monitor.snapshot_value()
+                event = monitor.wait_for_motion(duration_s=12.0, poll_timeout=0.2)
+        except OSError as exc:
+            self._raise_gpio_busy("PIR self-test", exc)
+            raise
         if event is None:
             raise RuntimeError("No PIR motion event detected within 12 seconds.")
         trigger_kind = "current high level" if event.raw_edge == "level" else f"{event.raw_edge} edge"
@@ -256,6 +291,27 @@ class TwinrSelfTestRunner:
             ),
             finished_at=datetime.now(timezone.utc).isoformat(),
         )
+
+    def _ensure_gpio_self_test_available(self, label: str) -> None:
+        active_loops: list[str] = []
+        for loop_name, loop_label in (("realtime-loop", "realtime loop"), ("hardware-loop", "hardware loop")):
+            owner = loop_lock_owner(self.config, loop_name)
+            if owner is None:
+                continue
+            active_loops.append(f"{loop_label} (pid {owner})")
+        if not active_loops:
+            return
+        joined = ", ".join(active_loops)
+        raise SelfTestBlockedError(
+            f"{label} is unavailable while the Twinr {joined} is running. Stop it first."
+        )
+
+    def _raise_gpio_busy(self, label: str, exc: OSError) -> None:
+        if exc.errno != errno.EBUSY:
+            return
+        raise SelfTestBlockedError(
+            f"{label} could not access the configured GPIO line because it is busy. Stop the active Twinr loop or other GPIO consumer and try again."
+        ) from exc
 
     def _build_mic_test_recorder(self, config: TwinrConfig) -> SilenceDetectedRecorder:
         return SilenceDetectedRecorder(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from twinr.automations import AutomationStore
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.context_store import PersistentMemoryMarkdownStore
 from twinr.memory.reminders import ReminderStore
@@ -58,6 +59,13 @@ def load_personality_context(config: TwinrConfig) -> PersonalityContext:
     ).render_context()
     if reminder_context:
         sections.append(("REMINDERS", reminder_context))
+    automation_context = AutomationStore(
+        config.automation_store_path,
+        timezone_name=config.local_timezone_name,
+        max_entries=config.automation_max_entries,
+    ).render_context()
+    if automation_context:
+        sections.append(("AUTOMATIONS", automation_context))
     return PersonalityContext(sections=tuple(sections))
 
 

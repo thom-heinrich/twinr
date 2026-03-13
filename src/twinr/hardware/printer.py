@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import textwrap
 import unicodedata
+from pathlib import Path
 
 from twinr.agent.base_agent.config import TwinrConfig
 
@@ -58,29 +60,30 @@ class RawReceiptPrinter:
         )
 
     def print_text(self, text: str) -> str:
-        payload = self._build_text_payload(text)
-        result = subprocess.run(
-            self._lp_command(),
-            input=payload,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="ignore").strip()
-            raise RuntimeError(f"Printing failed: {stderr or result.returncode}")
-        return result.stdout.decode("utf-8", errors="ignore").strip()
+        return self.print_bytes(self._build_text_payload(text))
 
     def print_bytes(self, payload: bytes) -> str:
-        result = subprocess.run(
-            self._lp_command(),
-            input=payload,
-            capture_output=True,
-            check=False,
-        )
+        spool_path = None
+        with tempfile.NamedTemporaryFile(prefix="twinr-print-", suffix=".bin", delete=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            spool_path = handle.name
+        try:
+            result = subprocess.run(
+                [*self._lp_command(), spool_path],
+                capture_output=True,
+                check=False,
+            )
+        finally:
+            if spool_path:
+                Path(spool_path).unlink(missing_ok=True)
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="ignore").strip()
             raise RuntimeError(f"Printing failed: {stderr or result.returncode}")
-        return result.stdout.decode("utf-8", errors="ignore").strip()
+        stdout = result.stdout.decode("utf-8", errors="ignore").strip()
+        if "(0 file(s))" in stdout:
+            raise RuntimeError("Printing failed: CUPS accepted the job but received no document data.")
+        return stdout
 
     def _build_text_payload(self, text: str) -> bytes:
         return self._compose_receipt_text(text).encode("ascii", errors="strict")

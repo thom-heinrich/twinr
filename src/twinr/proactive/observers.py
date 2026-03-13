@@ -155,7 +155,9 @@ _VISION_CLASSIFIER_PROMPT = (
     "- Report only what is visually obvious in the image.\n"
     "- If uncertain, use no or unknown.\n"
     "- Do not infer identity, emotions, diagnosis, age, or intent beyond the listed keys.\n"
-    "- `floor` means the visible person is low to the floor or clearly lying down.\n"
+    "- `person_visible=yes` if any meaningful part of a person is visible, even when the body is partly cropped.\n"
+    "- `floor` means the visible person is low to the floor, clearly lying down, collapsed at ground level, or only partially visible near the floor after a drop.\n"
+    "- Prefer `floor` over `unknown` when a person is obviously very low in the scene.\n"
     "- `slumped` means seated or standing but visibly collapsed forward or drooping.\n"
 )
 

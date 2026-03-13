@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% from "_form_fields.html" import render_setting_field %}
+
+{% block content %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Integration overview</h2>
+      <p class="section-description">Manage safe external connections here. Email drafts and sends still require explicit approval in the Twinr interaction flow.</p>
+    </div>
+  </div>
+  <div class="check-list">
+    {% for item in overview_rows %}
+    <article class="check-row">
+      <div class="check-row-main">
+        <div class="check-row-title">{{ item.label }}</div>
+        <div class="check-row-detail">{{ item.detail }}</div>
+      </div>
+      <span class="status-pill is-{{ item.status }}">{{ item.summary }}</span>
+    </article>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel two-column">
+  <div>
+    <h2>Storage</h2>
+    <ul class="plain-list">
+      <li><strong>Integration store</strong> {{ integration_store_path }}</li>
+      <li><strong>Secrets</strong> {{ env_path }}</li>
+    </ul>
+  </div>
+  <div>
+    <h2>Scope</h2>
+    <ul class="plain-list">
+      <li><strong>Email</strong> IMAP/SMTP setup, Gmail-friendly, approval-first</li>
+      <li><strong>Calendar</strong> Read-only ICS feed setup for agenda views</li>
+    </ul>
+  </div>
+</section>
+
+<form method="post" action="/integrations" class="stack">
+  <input type="hidden" name="_integration_id" value="email_mailbox">
+  {% for section in email_sections %}
+  <section class="panel">
+    <div class="section-header">
+      <div>
+        <h2>{{ section.title }}</h2>
+        <p class="section-description">{{ section.description }}</p>
+      </div>
+    </div>
+    <div class="form-grid">
+      {% for field in section.fields %}
+      {{ render_setting_field(field) }}
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+  <div class="actions">
+    <button type="submit">Save email integration</button>
+  </div>
+</form>
+
+<form method="post" action="/integrations" class="stack top-gap">
+  <input type="hidden" name="_integration_id" value="calendar_agenda">
+  {% for section in calendar_sections %}
+  <section class="panel">
+    <div class="section-header">
+      <div>
+        <h2>{{ section.title }}</h2>
+        <p class="section-description">{{ section.description }}</p>
+      </div>
+    </div>
+    <div class="form-grid">
+      {% for field in section.fields %}
+      {{ render_setting_field(field) }}
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+  <div class="actions">
+    <button type="submit">Save calendar integration</button>
+  </div>
+</form>
+{% endblock %}

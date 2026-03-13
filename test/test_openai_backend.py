@@ -380,6 +380,28 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertIn("Reminder details: Bei Dr. Meyer", request["input"][0]["content"][0]["text"])
         self.assertIn("speaking a due reminder", request["instructions"])
 
+    def test_phrase_proactive_prompt_uses_recent_context_and_repeat_guard(self) -> None:
+        response = self.backend.phrase_proactive_prompt_with_metadata(
+            trigger_id="showing_intent",
+            reason="Person looked toward the device while holding an object near the camera.",
+            default_prompt="Möchtest du mir etwas zeigen?",
+            priority=30,
+            conversation=[("user", "Ich suche meinen Ausweis."), ("assistant", "Ich helfe dir gern.")],
+            recent_prompts=("Möchtest du mir etwas zeigen?", "Willst du mir das kurz zeigen?"),
+        )
+
+        self.assertEqual(response.text, "Backend answer")
+        request = self.responses.calls[-1]
+        self.assertEqual(request["model"], "gpt-5.2")
+        self.assertIn("short proactive sentence", request["instructions"])
+        self.assertIn("Trigger id: showing_intent", request["input"][-1]["content"][0]["text"])
+        self.assertIn(
+            "Recent proactive wording to avoid repeating too closely",
+            request["input"][-1]["content"][0]["text"],
+        )
+        self.assertEqual(request["input"][0]["role"], "user")
+        self.assertEqual(request["input"][1]["role"], "assistant")
+
     def test_respond_streaming_emits_text_deltas_and_returns_metadata(self) -> None:
         deltas: list[str] = []
 

@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Hardware devices</h2>
+      <p class="section-description">Current device visibility, configured paths, and the newest local self-test evidence Twinr can actually confirm.</p>
+    </div>
+    <span class="pill">{{ overview.captured_at }}</span>
+  </div>
+</section>
+
+<section class="action-grid">
+  {% for device in overview.devices %}
+  <article class="panel">
+    <div class="section-header">
+      <div>
+        <h2>{{ device.label }}</h2>
+        <p class="section-description">{{ device.summary }}</p>
+      </div>
+      <span class="status-pill is-{{ device.status }}">{{ device.status }}</span>
+    </div>
+
+    <ul class="plain-list">
+      {% for fact in device.facts %}
+      <li><strong>{{ fact.label }}</strong> {{ fact.value }}</li>
+      {% endfor %}
+    </ul>
+
+    {% if device.notes %}
+    <div class="flash subtle">
+      {% for note in device.notes %}
+      <div>{{ note }}</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </article>
+  {% endfor %}
+</section>
+{% endblock %}

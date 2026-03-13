@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import audioop
 import io
 import math
 import os
+import sys
+from array import array
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -16,6 +17,17 @@ import wave
 from twinr.agent.base_agent.config import TwinrConfig
 
 _SAMPLE_WIDTH_BYTES = 2
+
+
+def _pcm16_rms(samples: bytes) -> int:
+    if not samples:
+        return 0
+    pcm_samples = array("h")
+    pcm_samples.frombytes(samples)
+    if sys.byteorder != "little":
+        pcm_samples.byteswap()
+    mean_square = sum(sample * sample for sample in pcm_samples) / len(pcm_samples)
+    return int(math.sqrt(mean_square))
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +152,7 @@ class SilenceDetectedRecorder:
                 if not chunk:
                     continue
 
-                rms = audioop.rms(chunk, _SAMPLE_WIDTH_BYTES)
+                rms = _pcm16_rms(chunk)
                 now = time.monotonic()
 
                 if not heard_speech:
@@ -273,7 +285,7 @@ class AmbientAudioSampler:
                     chunk = chunk[: -(len(chunk) % _SAMPLE_WIDTH_BYTES)]
                 if not chunk:
                     continue
-                rms_values.append(audioop.rms(chunk, _SAMPLE_WIDTH_BYTES))
+                rms_values.append(_pcm16_rms(chunk))
         finally:
             self._stop_process(process)
 

@@ -1,20 +1,49 @@
+from array import array
 from datetime import datetime, timezone
+import io
+import math
 from pathlib import Path
 from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from fastapi.testclient import TestClient
 
 from twinr.agent.base_agent import RuntimeSnapshotStore, TwinrConfig
+from twinr.automations import AutomationAction, AutomationStore, build_sensor_trigger
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
+from twinr.memory.reminders import ReminderStore
 from twinr.memory import ConversationTurn, MemoryLedgerItem, MemoryState, SearchMemoryEntry
-from twinr.ops import TwinrOpsEventStore, resolve_ops_paths
+from twinr.integrations import ManagedIntegrationConfig, TwinrIntegrationStore
+from twinr.ops import DeviceFact, DeviceOverview, DeviceStatus, TwinrOpsEventStore, resolve_ops_paths
 from twinr.web import create_app
+
+
+def _voice_sample_wav_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0.35, duration_s: float = 1.8) -> bytes:
+    sample_rate = 16000
+    total_frames = int(sample_rate * duration_s)
+    frames = array("h")
+    for index in range(total_frames):
+        t = index / sample_rate
+        envelope = min(1.0, index / (sample_rate * 0.2), (total_frames - index) / (sample_rate * 0.2))
+        sample = amplitude * envelope * (
+            (0.70 * math.sin(2.0 * math.pi * frequency_hz * t))
+            + (0.20 * math.sin(2.0 * math.pi * frequency_hz * 2.0 * t))
+            + (0.10 * math.sin(2.0 * math.pi * (frequency_hz + 35.0) * t))
+        )
+        frames.append(max(-32767, min(32767, int(sample * 32767))))
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(frames.tobytes())
+    return buffer.getvalue()
 
 
 class WebAppTests(unittest.TestCase):
@@ -51,6 +80,7 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Twinr", response.text)
         self.assertIn("Dashboard", response.text)
+        self.assertIn("Reminders", response.text)
         self.assertIn("sk-t…1234", response.text)
         self.assertIn("Status and failures", response.text)
 
@@ -64,6 +94,310 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("The main OpenAI secret used for chat, speech, vision, and realtime requests.", response.text)
         self.assertIn("Controls which backend answers normal text questions.", response.text)
         self.assertIn("(?)", response.text)
+
+    def test_integrations_page_renders_mail_and_calendar_forms(self) -> None:
+        client, _env_path = self.make_client()
+
+        response = client.get("/integrations")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Integration overview", response.text)
+        self.assertIn("Save email integration", response.text)
+        self.assertIn("Save calendar integration", response.text)
+        self.assertIn("Gmail", response.text)
+        self.assertIn("ICS file", response.text)
+
+    def test_integrations_post_saves_email_config_and_secret(self) -> None:
+        client, env_path = self.make_client()
+
+        response = client.post(
+            "/integrations",
+            data={
+                "_integration_id": "email_mailbox",
+                "enabled": "true",
+                "profile": "gmail",
+                "account_email": "anna@gmail.com",
+                "from_address": "anna@gmail.com",
+                "TWINR_INTEGRATION_EMAIL_APP_PASSWORD": "abcd efgh ijkl mnop",
+                "imap_host": "",
+                "imap_port": "",
+                "imap_mailbox": "INBOX",
+                "smtp_host": "",
+                "smtp_port": "",
+                "unread_only_default": "true",
+                "restrict_reads_to_known_senders": "false",
+                "restrict_recipients_to_known_contacts": "false",
+                "known_contacts_text": "Anna <anna@gmail.com>",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        env_text = env_path.read_text(encoding="utf-8")
+        self.assertIn('TWINR_INTEGRATION_EMAIL_APP_PASSWORD="abcd efgh ijkl mnop"', env_text)
+        record = TwinrIntegrationStore.from_project_root(env_path.parent).get("email_mailbox")
+        self.assertTrue(record.enabled)
+        self.assertEqual(record.value("imap_host"), "imap.gmail.com")
+        self.assertEqual(record.value("smtp_host"), "smtp.gmail.com")
+        self.assertEqual(record.value("account_email"), "anna@gmail.com")
+        store_text = TwinrIntegrationStore.from_project_root(env_path.parent).path.read_text(encoding="utf-8")
+        self.assertNotIn("abcd efgh ijkl mnop", store_text)
+
+        response = client.get("/integrations")
+        self.assertNotIn("abcd", response.text)
+        self.assertNotIn("mnop", response.text)
+        self.assertIn("Credential state: Configured.", response.text)
+        self.assertIn("credential stored separately in .env", response.text)
+
+    def test_integrations_post_saves_calendar_config(self) -> None:
+        client, env_path = self.make_client()
+        calendar_path = env_path.parent / "state" / "calendar.ics"
+        calendar_path.parent.mkdir(parents=True, exist_ok=True)
+        calendar_path.write_text("BEGIN:VCALENDAR\nEND:VCALENDAR\n", encoding="utf-8")
+
+        response = client.post(
+            "/integrations",
+            data={
+                "_integration_id": "calendar_agenda",
+                "enabled": "true",
+                "source_kind": "ics_file",
+                "source_value": "state/calendar.ics",
+                "timezone": "Europe/Berlin",
+                "default_upcoming_days": "5",
+                "max_events": "10",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        record = TwinrIntegrationStore.from_project_root(env_path.parent).get("calendar_agenda")
+        self.assertTrue(record.enabled)
+        self.assertEqual(record.value("source_value"), "state/calendar.ics")
+        response = client.get("/integrations")
+        self.assertIn("Ready", response.text)
+        self.assertIn("state/calendar.ics", response.text)
+
+    def test_integrations_post_rejects_calendar_url_with_query_token(self) -> None:
+        client, env_path = self.make_client()
+
+        response = client.post(
+            "/integrations",
+            data={
+                "_integration_id": "calendar_agenda",
+                "enabled": "true",
+                "source_kind": "ics_url",
+                "source_value": "https://calendar.example.com/feed.ics?token=super-secret",
+                "timezone": "Europe/Berlin",
+                "default_upcoming_days": "5",
+                "max_events": "10",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertIn("error=", response.headers["location"])
+        record = TwinrIntegrationStore.from_project_root(env_path.parent).get("calendar_agenda")
+        self.assertFalse(record.enabled)
+        if TwinrIntegrationStore.from_project_root(env_path.parent).path.exists():
+            store_text = TwinrIntegrationStore.from_project_root(env_path.parent).path.read_text(encoding="utf-8")
+            self.assertNotIn("super-secret", store_text)
+
+    def test_voice_profile_page_renders_status_and_actions(self) -> None:
+        client, _env_path = self.make_client()
+
+        response = client.get("/voice-profile")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Live voice status", response.text)
+        self.assertIn("Capture and enroll sample", response.text)
+        self.assertIn("Verify now", response.text)
+        self.assertIn("Reset profile", response.text)
+        self.assertIn("No raw enrollment audio is stored", response.text)
+
+    def test_voice_profile_post_enroll_verify_and_reset(self) -> None:
+        client, env_path = self.make_client()
+        sample = _voice_sample_wav_bytes()
+        voice_store_path = env_path.parent / "state" / "voice_profile.json"
+
+        with patch("twinr.web.app._capture_voice_profile_sample", return_value=sample):
+            enroll_response = client.post("/voice-profile", data={"_action": "enroll"})
+        self.assertTrue(voice_store_path.exists())
+
+        with patch("twinr.web.app._capture_voice_profile_sample", return_value=sample):
+            verify_response = client.post("/voice-profile", data={"_action": "verify"})
+        reset_response = client.post("/voice-profile", data={"_action": "reset"})
+
+        self.assertEqual(enroll_response.status_code, 200)
+        self.assertIn("Profile updated", enroll_response.text)
+        self.assertIn("No raw audio was kept.", enroll_response.text)
+
+        self.assertEqual(verify_response.status_code, 200)
+        self.assertIn("Likely user", verify_response.text)
+        self.assertIn("Confidence", verify_response.text)
+
+        self.assertEqual(reset_response.status_code, 200)
+        self.assertIn("Profile reset", reset_response.text)
+        self.assertFalse(voice_store_path.exists())
+
+    def test_automations_page_renders_family_sections_and_forms(self) -> None:
+        client, env_path = self.make_client()
+        store = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin")
+        store.create_time_automation(
+            name="Morning weather",
+            description="Speak the weather every morning.",
+            schedule="daily",
+            time_of_day="08:00",
+            timezone_name="Europe/Berlin",
+            actions=(
+                AutomationAction(
+                    kind="llm_prompt",
+                    text="Tell Thom the morning weather in Schwarzenbek.",
+                    payload={"delivery": "spoken", "allow_web_search": True},
+                ),
+            ),
+        )
+        sensor_trigger = build_sensor_trigger("vad_quiet", hold_seconds=30, cooldown_seconds=180)
+        store.create_if_then_automation(
+            name="Quiet room check-in",
+            description="Offer help if the room stays quiet.",
+            event_name=sensor_trigger.event_name,
+            all_conditions=sensor_trigger.all_conditions,
+            any_conditions=sensor_trigger.any_conditions,
+            cooldown_seconds=sensor_trigger.cooldown_seconds,
+            actions=(AutomationAction(kind="say", text="Ich bin weiter hier, falls du etwas brauchst."),),
+        )
+
+        response = client.get("/automations")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Automation families", response.text)
+        self.assertIn("Scheduled", response.text)
+        self.assertIn("Sensor-triggered", response.text)
+        self.assertIn("Email Mailbox automations", response.text)
+        self.assertIn("Calendar Agenda automations", response.text)
+        self.assertIn("Integration not configured", response.text)
+        self.assertIn("Morning weather", response.text)
+        self.assertIn("Quiet room check-in", response.text)
+        self.assertIn("Add scheduled automation", response.text)
+        self.assertIn("Add sensor automation", response.text)
+        self.assertIn("Tell Thom the morning weather in Schwarzenbek.", response.text)
+        self.assertIn("background microphone has been quiet", response.text)
+
+    def test_automations_page_shows_configured_integration_family_state(self) -> None:
+        client, env_path = self.make_client()
+        TwinrIntegrationStore.from_project_root(env_path.parent).save(
+            ManagedIntegrationConfig(
+                integration_id="email_mailbox",
+                enabled=True,
+                settings={"account_email": "anna@example.com"},
+            )
+        )
+
+        response = client.get("/automations")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Email Mailbox automations", response.text)
+        self.assertIn("Integration configured", response.text)
+
+    def test_automations_post_creates_time_automation(self) -> None:
+        client, env_path = self.make_client()
+
+        response = client.post(
+            "/automations",
+            data={
+                "_action": "save_time_automation",
+                "automation_id": "",
+                "name": "Daily headlines",
+                "description": "Print the top headlines each morning.",
+                "enabled": "true",
+                "schedule": "daily",
+                "due_at": "",
+                "time_of_day": "08:00",
+                "weekdays_text": "",
+                "timezone_name": "Europe/Berlin",
+                "tags_text": "news, morning",
+                "delivery": "printed",
+                "content_mode": "llm_prompt",
+                "allow_web_search": "true",
+                "content": "Print the top headlines of the day in short German bullet points.",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        entries = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin").load_entries()
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry.name, "Daily headlines")
+        self.assertEqual(entry.trigger.schedule, "daily")
+        self.assertEqual(entry.trigger.time_of_day, "08:00")
+        self.assertEqual(entry.actions[0].kind, "llm_prompt")
+        self.assertEqual(entry.actions[0].payload["delivery"], "printed")
+        self.assertTrue(entry.actions[0].payload["allow_web_search"])
+        self.assertEqual(entry.tags, ("news", "morning"))
+
+    def test_automations_post_creates_sensor_automation(self) -> None:
+        client, env_path = self.make_client()
+
+        response = client.post(
+            "/automations",
+            data={
+                "_action": "save_sensor_automation",
+                "automation_id": "",
+                "name": "Welcome after motion",
+                "description": "Greet after motion is seen.",
+                "enabled": "true",
+                "trigger_kind": "pir_motion_detected",
+                "hold_seconds": "",
+                "cooldown_seconds": "120",
+                "tags_text": "sensor, welcome",
+                "delivery": "spoken",
+                "content_mode": "static_text",
+                "allow_web_search": "false",
+                "content": "Hallo, ich bin bereit.",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        entries = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin").load_entries()
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry.name, "Welcome after motion")
+        self.assertEqual(entry.actions[0].kind, "say")
+        self.assertEqual(entry.actions[0].text, "Hallo, ich bin bereit.")
+        self.assertEqual(entry.trigger.event_name, "pir.motion_detected")
+        self.assertEqual(entry.tags, ("sensor", "welcome"))
+
+    def test_automations_post_toggles_and_deletes_automation(self) -> None:
+        client, env_path = self.make_client()
+        store = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin")
+        entry = store.create_time_automation(
+            name="Morning greeting",
+            schedule="daily",
+            time_of_day="09:00",
+            timezone_name="Europe/Berlin",
+            actions=(AutomationAction(kind="say", text="Guten Morgen."),),
+        )
+
+        toggle_response = client.post(
+            "/automations",
+            data={"_action": "toggle_automation", "automation_id": entry.automation_id},
+            follow_redirects=False,
+        )
+        self.assertEqual(toggle_response.status_code, 303)
+        toggled = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin").get(entry.automation_id)
+        self.assertIsNotNone(toggled)
+        self.assertFalse(toggled.enabled)
+
+        delete_response = client.post(
+            "/automations",
+            data={"_action": "delete_automation", "automation_id": entry.automation_id},
+            follow_redirects=False,
+        )
+        self.assertEqual(delete_response.status_code, 303)
+        remaining = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin").load_entries()
+        self.assertEqual(remaining, ())
 
     def test_settings_post_updates_env(self) -> None:
         client, env_path = self.make_client()
@@ -109,11 +443,14 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Search", response.text)
         self.assertIn("Camera and vision", response.text)
         self.assertIn("Proactive behavior", response.text)
+        self.assertIn("Proactive timing", response.text)
+        self.assertIn("Proactive sensitivity", response.text)
         self.assertIn("Buttons and motion sensor", response.text)
         self.assertIn("Display and printer", response.text)
         self.assertIn("field-tooltip", response.text)
         self.assertIn("How much image detail Twinr asks OpenAI to inspect.", response.text)
         self.assertIn("Optional speaking instructions sent with text-to-speech requests.", response.text)
+        self.assertIn("After this many quiet seconds without motion, the scene is treated as idle / low-motion.", response.text)
 
     def test_settings_post_updates_extended_env_values(self) -> None:
         client, env_path = self.make_client()
@@ -155,9 +492,14 @@ class WebAppTests(unittest.TestCase):
                 "TWINR_USER_DISPLAY_NAME": "Thom",
                 "TWINR_PROACTIVE_ENABLED": "true",
                 "TWINR_PROACTIVE_POLL_INTERVAL_S": "3.5",
+                "TWINR_PROACTIVE_CAPTURE_INTERVAL_S": "7.0",
+                "TWINR_PROACTIVE_LOW_MOTION_AFTER_S": "14.0",
                 "TWINR_PROACTIVE_AUDIO_ENABLED": "true",
                 "TWINR_PROACTIVE_AUDIO_DEVICE": "plughw:CARD=CameraB409241,DEV=0",
                 "TWINR_PROACTIVE_AUDIO_SAMPLE_MS": "900",
+                "TWINR_PROACTIVE_ATTENTION_WINDOW_S": "8.5",
+                "TWINR_PROACTIVE_FLOOR_STILLNESS_S": "26.0",
+                "TWINR_PROACTIVE_SHOWING_INTENT_SCORE_THRESHOLD": "0.76",
                 "TWINR_WEB_HOST": "127.0.0.1",
                 "TWINR_WEB_PORT": "1441",
                 "TWINR_PERSONALITY_DIR": "personality",
@@ -203,6 +545,9 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("TWINR_CAMERA_DEVICE=/dev/video2", env_text)
         self.assertIn("OPENAI_VISION_DETAIL=high", env_text)
         self.assertIn("TWINR_PROACTIVE_AUDIO_DEVICE=plughw:CARD=CameraB409241,DEV=0", env_text)
+        self.assertIn("TWINR_PROACTIVE_LOW_MOTION_AFTER_S=14.0", env_text)
+        self.assertIn("TWINR_PROACTIVE_ATTENTION_WINDOW_S=8.5", env_text)
+        self.assertIn("TWINR_PROACTIVE_SHOWING_INTENT_SCORE_THRESHOLD=0.76", env_text)
         self.assertIn("TWINR_RUNTIME_STATE_PATH=/tmp/twinr-runtime-state.json", env_text)
         self.assertIn("TWINR_BUTTON_PROBE_LINES=23,22,24", env_text)
         self.assertIn("TWINR_PRINTER_DEVICE_URI=usb://Acme/Printer", env_text)
@@ -215,6 +560,20 @@ class WebAppTests(unittest.TestCase):
             summary="Arzttermin am Montag um 14 Uhr.",
             details="Bei Dr. Meyer in Hamburg.",
         )
+        reminder_store = ReminderStore(env_path.parent / "state" / "reminders.json")
+        reminder_store.schedule(
+            due_at="2026-03-14T09:00",
+            kind="medication",
+            summary="An die Tabletten erinnern.",
+            details="Nach dem Fruehstueck.",
+        )
+        delivered = reminder_store.schedule(
+            due_at="2026-03-14T12:00",
+            kind="appointment",
+            summary="An den Arzttermin erinnern.",
+            details="Dr. Meyer in Hamburg.",
+        )
+        reminder_store.mark_delivered(delivered.reminder_id, delivered_at=datetime(2026, 3, 13, 12, 5, tzinfo=timezone.utc))
         store.save(
             status="waiting",
             memory_turns=(
@@ -283,6 +642,11 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Memory state", response.text)
         self.assertIn("Raw tail", response.text)
         self.assertIn("Recent search results", response.text)
+        self.assertIn("Scheduled reminders", response.text)
+        self.assertIn("Pending reminders", response.text)
+        self.assertIn("Delivered reminders", response.text)
+        self.assertIn("An die Tabletten erinnern.", response.text)
+        self.assertIn("An den Arzttermin erinnern.", response.text)
         self.assertIn("Arzttermin am Montag um 14 Uhr.", response.text)
         self.assertIn("Erinnere mich an den Termin", response.text)
         self.assertIn("Der Termin ist um 14 Uhr.", response.text)
@@ -308,6 +672,72 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(len(memory_entries), 1)
         self.assertEqual(memory_entries[0].kind, "appointment")
         self.assertEqual(memory_entries[0].summary, "Arzttermin am Montag um 14 Uhr.")
+
+    def test_memory_post_adds_reminder_entry(self) -> None:
+        client, env_path = self.make_client()
+
+        response = client.post(
+            "/memory",
+            data={
+                "_action": "add_reminder",
+                "reminder_due_at": "2026-03-14T12:00",
+                "reminder_kind": "appointment",
+                "reminder_summary": "An den Arzttermin erinnern.",
+                "reminder_details": "Unterlagen mitnehmen.",
+                "reminder_original_request": "Erinnere mich morgen um 12 Uhr an den Arzttermin.",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        reminder_entries = ReminderStore(env_path.parent / "state" / "reminders.json").load_entries()
+        self.assertEqual(len(reminder_entries), 1)
+        self.assertEqual(reminder_entries[0].kind, "appointment")
+        self.assertEqual(reminder_entries[0].summary, "An den Arzttermin erinnern.")
+
+    def test_memory_post_marks_reminder_delivered(self) -> None:
+        client, env_path = self.make_client()
+        reminder_store = ReminderStore(env_path.parent / "state" / "reminders.json")
+        reminder = reminder_store.schedule(
+            due_at="2026-03-14T12:00",
+            kind="appointment",
+            summary="An den Arzttermin erinnern.",
+        )
+
+        response = client.post(
+            "/memory",
+            data={
+                "_action": "mark_reminder_delivered",
+                "reminder_id": reminder.reminder_id,
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        entries = ReminderStore(env_path.parent / "state" / "reminders.json").load_entries()
+        self.assertTrue(entries[0].delivered)
+
+    def test_memory_post_deletes_reminder(self) -> None:
+        client, env_path = self.make_client()
+        reminder_store = ReminderStore(env_path.parent / "state" / "reminders.json")
+        reminder = reminder_store.schedule(
+            due_at="2026-03-14T12:00",
+            kind="appointment",
+            summary="An den Arzttermin erinnern.",
+        )
+
+        response = client.post(
+            "/memory",
+            data={
+                "_action": "delete_reminder",
+                "reminder_id": reminder.reminder_id,
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        entries = ReminderStore(env_path.parent / "state" / "reminders.json").load_entries()
+        self.assertEqual(entries, ())
 
     def test_personality_post_updates_base_files_and_preserves_managed_section(self) -> None:
         client, env_path = self.make_client()
@@ -421,12 +851,50 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Live system health", response.text)
         self.assertIn("Services", response.text)
 
+    def test_ops_devices_page_renders_device_status(self) -> None:
+        client, _env_path = self.make_client()
+        fake_overview = DeviceOverview(
+            captured_at="2026-03-13T16:10:00+00:00",
+            devices=(
+                DeviceStatus(
+                    key="printer",
+                    label="Printer",
+                    status="warn",
+                    summary="Queue is visible, but paper output must be confirmed on the device.",
+                    facts=(
+                        DeviceFact("Queue", "Thermal_GP58"),
+                        DeviceFact("Paper status", "unknown on the current raw USB/CUPS path"),
+                    ),
+                    notes=("Twinr cannot prove real paper output from this printer path.",),
+                ),
+                DeviceStatus(
+                    key="camera",
+                    label="Camera",
+                    status="ok",
+                    summary="Camera device `/dev/video0` is present.",
+                    facts=(DeviceFact("Device", "/dev/video0"),),
+                ),
+            ),
+        )
+
+        with patch("twinr.web.app.collect_device_overview", return_value=fake_overview):
+            response = client.get("/ops/devices")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Hardware devices", response.text)
+        self.assertIn("Queue is visible, but paper output must be confirmed on the device.", response.text)
+        self.assertIn("Paper status", response.text)
+        self.assertIn("unknown on the current raw USB/CUPS path", response.text)
+        self.assertIn("Camera device `/dev/video0` is present.", response.text)
+
     def test_ops_self_test_page_lists_pir_motion_and_proactive_mic(self) -> None:
         client, _env_path = self.make_client()
 
         response = client.get("/ops/self-test")
 
         self.assertEqual(response.status_code, 200)
+        self.assertIn("Printer-Testdruck", response.text)
+        self.assertIn("confirm the paper output on the device", response.text)
         self.assertIn("PIR motion", response.text)
         self.assertIn("Wait for a motion trigger on the configured PIR input.", response.text)
         self.assertIn("Proaktives Mikrofon", response.text)

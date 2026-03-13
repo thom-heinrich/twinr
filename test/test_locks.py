@@ -6,7 +6,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.ops.locks import TwinrInstanceLock, loop_instance_lock, loop_lock_path
+from twinr.ops.locks import TwinrInstanceLock, loop_instance_lock, loop_lock_owner, loop_lock_path
 
 
 class LoopLockTests(unittest.TestCase):
@@ -45,6 +45,22 @@ class LoopLockTests(unittest.TestCase):
 
             with loop_instance_lock(config, "display-loop"):
                 self.assertTrue(loop_lock_path(config, "display-loop").exists())
+
+    def test_loop_lock_owner_reports_active_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+
+            self.assertIsNone(loop_lock_owner(config, "realtime-loop"))
+
+            with loop_instance_lock(config, "realtime-loop"):
+                owner = loop_lock_owner(config, "realtime-loop")
+
+            self.assertIsInstance(owner, int)
+            self.assertGreater(owner or 0, 0)
+            self.assertIsNone(loop_lock_owner(config, "realtime-loop"))
 
 
 if __name__ == "__main__":

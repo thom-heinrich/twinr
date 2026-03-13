@@ -158,7 +158,8 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         instructions = connection.session.calls[0]["instructions"]
         self.assertTrue(instructions.startswith("Base context\n\n"))
         self.assertIn("use the schedule_reminder tool", instructions)
-        self.assertIn("Local date/time context for resolving reminders and timers:", instructions)
+        self.assertIn("create_time_automation", instructions)
+        self.assertIn("Local date/time context for resolving reminders, timers, and scheduled automations:", instructions)
         self.assertTrue(instructions.endswith("Speak concise German."))
 
     def test_open_loads_latest_hidden_context_from_files(self) -> None:
@@ -206,12 +207,50 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (state_dir / "automations.json").write_text(
+                (
+                    '{\n'
+                    '  "entries": [\n'
+                    '    {\n'
+                    '      "automation_id": "AUTO-20260314T070000000000Z",\n'
+                    '      "name": "Morning weather",\n'
+                    '      "description": "Speak the weather each morning.",\n'
+                    '      "enabled": true,\n'
+                    '      "trigger": {\n'
+                    '        "kind": "time",\n'
+                    '        "schedule": "daily",\n'
+                    '        "time_of_day": "08:00",\n'
+                    '        "weekdays": [],\n'
+                    '        "timezone_name": "Europe/Berlin"\n'
+                    '      },\n'
+                    '      "actions": [\n'
+                    '        {\n'
+                    '          "kind": "llm_prompt",\n'
+                    '          "text": "Give the morning weather report.",\n'
+                    '          "payload": {\n'
+                    '            "delivery": "spoken",\n'
+                    '            "allow_web_search": true\n'
+                    '          },\n'
+                    '          "enabled": true\n'
+                    '        }\n'
+                    '      ],\n'
+                    '      "created_at": "2026-03-13T12:00:00+01:00",\n'
+                    '      "updated_at": "2026-03-13T12:00:00+01:00",\n'
+                    '      "source": "tool",\n'
+                    '      "tags": ["weather"]\n'
+                    '    }\n'
+                    '  ]\n'
+                    '}\n'
+                ),
+                encoding="utf-8",
+            )
             config = TwinrConfig(
                 openai_api_key="test-key",
                 project_root=temp_dir,
                 personality_dir="personality",
                 memory_markdown_path=str(state_dir / "MEMORY.md"),
                 reminder_store_path=str(state_dir / "reminders.json"),
+                automation_store_path=str(state_dir / "automations.json"),
                 openai_realtime_model="gpt-4o-realtime-preview",
                 openai_realtime_voice="sage",
             )
@@ -230,8 +269,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("PERSONALITY:\nUpdated style context", instructions)
         self.assertIn("MEMORY:\nDurable remembered items explicitly saved for future turns:", instructions)
         self.assertIn("REMINDERS:\nScheduled reminders and timers:", instructions)
+        self.assertIn("AUTOMATIONS:\nActive automations:", instructions)
         self.assertIn("Arzttermin am Montag um 14 Uhr.", instructions)
         self.assertIn("Muell rausstellen", instructions)
+        self.assertIn("Morning weather", instructions)
 
     def test_open_includes_expected_tools_when_handlers_exist(self) -> None:
         session, connection, _manager = self.make_session()
@@ -242,9 +283,18 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "print_receipt": lambda _arguments: {"status": "printed"},
                 "search_live_info": lambda _arguments: {"status": "ok", "answer": "Antwort"},
                 "schedule_reminder": lambda _arguments: {"status": "scheduled"},
+                "list_automations": lambda _arguments: {"status": "ok", "automations": []},
+                "create_time_automation": lambda _arguments: {"status": "created"},
+                "create_sensor_automation": lambda _arguments: {"status": "created"},
+                "update_time_automation": lambda _arguments: {"status": "updated"},
+                "update_sensor_automation": lambda _arguments: {"status": "updated"},
+                "delete_automation": lambda _arguments: {"status": "deleted"},
                 "remember_memory": lambda _arguments: {"status": "saved"},
                 "update_user_profile": lambda _arguments: {"status": "updated"},
                 "update_personality": lambda _arguments: {"status": "updated"},
+                "enroll_voice_profile": lambda _arguments: {"status": "enrolled"},
+                "get_voice_profile_status": lambda _arguments: {"status": "ok"},
+                "reset_voice_profile": lambda _arguments: {"status": "reset"},
                 "inspect_camera": lambda _arguments: {"status": "ok", "answer": "Kamerabild"},
                 "end_conversation": lambda _arguments: {"status": "ending"},
             },
@@ -260,22 +310,48 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "print_receipt",
                 "search_live_info",
                 "schedule_reminder",
+                "list_automations",
+                "create_time_automation",
+                "create_sensor_automation",
+                "update_time_automation",
+                "update_sensor_automation",
+                "delete_automation",
                 "remember_memory",
                 "update_user_profile",
                 "update_personality",
+                "enroll_voice_profile",
+                "get_voice_profile_status",
+                "reset_voice_profile",
                 "end_conversation",
                 "inspect_camera",
             ],
         )
-        self.assertIn("focus_hint", connection.session.calls[0]["tools"][0]["parameters"]["properties"])
-        self.assertIn("question", connection.session.calls[0]["tools"][1]["parameters"]["properties"])
-        self.assertIn("due_at", connection.session.calls[0]["tools"][2]["parameters"]["properties"])
-        self.assertIn("summary", connection.session.calls[0]["tools"][2]["parameters"]["properties"])
-        self.assertIn("summary", connection.session.calls[0]["tools"][3]["parameters"]["properties"])
-        self.assertIn("instruction", connection.session.calls[0]["tools"][4]["parameters"]["properties"])
-        self.assertIn("instruction", connection.session.calls[0]["tools"][5]["parameters"]["properties"])
-        self.assertIn("reason", connection.session.calls[0]["tools"][6]["parameters"]["properties"])
-        self.assertIn("question", connection.session.calls[0]["tools"][7]["parameters"]["properties"])
+        tools_by_name = {tool["name"]: tool for tool in connection.session.calls[0]["tools"]}
+        self.assertIn("focus_hint", tools_by_name["print_receipt"]["parameters"]["properties"])
+        self.assertIn("question", tools_by_name["search_live_info"]["parameters"]["properties"])
+        self.assertIn("due_at", tools_by_name["schedule_reminder"]["parameters"]["properties"])
+        self.assertIn("summary", tools_by_name["schedule_reminder"]["parameters"]["properties"])
+        self.assertIn("include_disabled", tools_by_name["list_automations"]["parameters"]["properties"])
+        self.assertIn("content", tools_by_name["create_time_automation"]["parameters"]["properties"])
+        self.assertIn("trigger_kind", tools_by_name["create_sensor_automation"]["parameters"]["properties"])
+        self.assertIn("automation_ref", tools_by_name["update_time_automation"]["parameters"]["properties"])
+        self.assertIn("automation_ref", tools_by_name["update_sensor_automation"]["parameters"]["properties"])
+        self.assertIn("summary", tools_by_name["remember_memory"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["remember_memory"]["parameters"]["properties"])
+        self.assertIn("instruction", tools_by_name["update_user_profile"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["update_user_profile"]["parameters"]["properties"])
+        self.assertIn("instruction", tools_by_name["update_personality"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["update_personality"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["create_time_automation"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["create_sensor_automation"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["update_time_automation"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["update_sensor_automation"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["delete_automation"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["enroll_voice_profile"]["parameters"]["properties"])
+        self.assertEqual(tools_by_name["get_voice_profile_status"]["parameters"]["properties"], {})
+        self.assertIn("confirmed", tools_by_name["reset_voice_profile"]["parameters"]["properties"])
+        self.assertIn("reason", tools_by_name["end_conversation"]["parameters"]["properties"])
+        self.assertIn("question", tools_by_name["inspect_camera"]["parameters"]["properties"])
 
     def test_run_audio_turn_streams_audio_and_collects_text(self) -> None:
         audio_chunks: list[bytes] = []

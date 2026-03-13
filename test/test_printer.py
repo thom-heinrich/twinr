@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -61,6 +62,38 @@ class RawReceiptPrinterTests(unittest.TestCase):
                 "job-sheets=none,none",
             ],
         )
+
+    def test_print_bytes_spools_payload_as_temp_file(self) -> None:
+        printer = RawReceiptPrinter(queue="Test")
+        observed: dict[str, object] = {}
+
+        def fake_run(command, *, capture_output: bool, check: bool):
+            spool_path = Path(command[-1])
+            observed["command"] = command
+            observed["payload"] = spool_path.read_bytes()
+            observed["path_exists_during_run"] = spool_path.exists()
+            return type("CompletedProcess", (), {"returncode": 0, "stdout": b"request id is Test-2 (1 file(s))", "stderr": b""})()
+
+        with patch("twinr.hardware.printer.subprocess.run", side_effect=fake_run):
+            response = printer.print_bytes(b"HELLO\n")
+
+        self.assertEqual(response, "request id is Test-2 (1 file(s))")
+        self.assertEqual(observed["payload"], b"HELLO\n")
+        self.assertTrue(observed["path_exists_during_run"])
+        self.assertFalse(Path(observed["command"][-1]).exists())
+
+    def test_print_bytes_rejects_zero_file_cups_response(self) -> None:
+        printer = RawReceiptPrinter(queue="Test")
+
+        with patch(
+            "twinr.hardware.printer.subprocess.run",
+            return_value=type("CompletedProcess", (), {"returncode": 0, "stdout": b"request id is Test-3 (0 file(s))", "stderr": b""})(),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "CUPS accepted the job but received no document data",
+            ):
+                printer.print_bytes(b"HELLO\n")
 
 
 if __name__ == "__main__":

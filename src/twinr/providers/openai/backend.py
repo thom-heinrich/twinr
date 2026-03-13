@@ -49,6 +49,25 @@ REMINDER_DELIVERY_INSTRUCTIONS = (
     "Usually one or two short sentences are enough. "
     "Say that this is a reminder, but do not mention system prompts, tools, or internal reasoning."
 )
+AUTOMATION_EXECUTION_INSTRUCTIONS = (
+    "You are Twinr fulfilling a scheduled automation. "
+    "Respond in clear, warm, natural standard German for a senior user. "
+    "Be direct and useful. "
+    "If the automation asks for current information, use web search when available and give the concrete result. "
+    "For spoken delivery, keep the answer to one to three short sentences. "
+    "For printed delivery, prefer compact factual wording that can later be shortened for a receipt. "
+    "Do not mention system prompts, automation internals, or tools."
+)
+PROACTIVE_PROMPT_INSTRUCTIONS = (
+    "You are Twinr speaking one short proactive sentence to a senior user. "
+    "Respond in clear, warm, natural standard German. "
+    "Use the trigger facts and recent conversation only as quiet context. "
+    "Sound attentive and human, not robotic or repetitive. "
+    "If the situation is uncertain, ask a gentle short question instead of making a claim. "
+    "Keep it to one short sentence, or two very short sentences at most. "
+    "Avoid repeating any recent proactive wording when a natural alternative exists. "
+    "Do not mention triggers, sensors, system prompts, tools, or internal reasoning."
+)
 STT_MODEL_FALLBACKS = ("whisper-1",)
 TTS_MODEL_FALLBACKS = ("tts-1", "tts-1-hd")
 SEARCH_MODEL_FALLBACKS = ("gpt-5.2-chat-latest",)
@@ -480,6 +499,85 @@ class OpenAIBackend:
             used_web_search=False,
         )
 
+    def phrase_proactive_prompt_with_metadata(
+        self,
+        *,
+        trigger_id: str,
+        reason: str,
+        default_prompt: str,
+        priority: int,
+        conversation: ConversationLike | None = None,
+        recent_prompts: Sequence[str] = (),
+    ) -> OpenAITextResponse:
+        prompt_parts = [
+            "Twinr is about to speak a short proactive social prompt.",
+            f"Trigger id: {trigger_id}",
+            f"Priority: {priority}",
+            f"Observation summary: {reason.strip() or '[none]'}",
+            f"Default fallback wording: {default_prompt.strip() or '[none]'}",
+        ]
+        recent_lines = [item.strip() for item in recent_prompts if item.strip()]
+        if recent_lines:
+            prompt_parts.append("Recent proactive wording to avoid repeating too closely:")
+            prompt_parts.extend(f"- {line}" for line in recent_lines[:3])
+        prompt_parts.append("Write the proactive spoken line now.")
+        request = self._build_response_request(
+            "\n".join(prompt_parts),
+            conversation=self._limit_recent_conversation(conversation, max_turns=4),
+            instructions=merge_instructions(
+                self._resolve_base_instructions(),
+                PROACTIVE_PROMPT_INSTRUCTIONS,
+            ),
+            allow_web_search=False,
+            model=self.config.default_model,
+            reasoning_effort="low",
+            max_output_tokens=80,
+        )
+        response = self._client.responses.create(**request)
+        return OpenAITextResponse(
+            text=self._extract_output_text(response),
+            response_id=getattr(response, "id", None),
+            request_id=getattr(response, "_request_id", None),
+            model=extract_model_name(response, request["model"]),
+            token_usage=extract_token_usage(response),
+            used_web_search=False,
+        )
+
+    def fulfill_automation_prompt_with_metadata(
+        self,
+        prompt: str,
+        *,
+        allow_web_search: bool,
+        delivery: str = "spoken",
+    ) -> OpenAITextResponse:
+        normalized_prompt = prompt.strip()
+        if not normalized_prompt:
+            raise RuntimeError("Automation prompt must not be empty")
+        delivery_mode = delivery.strip().lower() or "spoken"
+        request = self._build_response_request(
+            "\n".join(
+                [
+                    f"Scheduled automation request: {normalized_prompt}",
+                    f"Delivery mode: {delivery_mode}",
+                    "Fulfill the automation request now.",
+                ]
+            ),
+            instructions=merge_instructions(self._resolve_base_instructions(), AUTOMATION_EXECUTION_INSTRUCTIONS),
+            allow_web_search=allow_web_search,
+            model=self.config.default_model,
+            reasoning_effort="medium" if allow_web_search else "low",
+            max_output_tokens=220 if delivery_mode == "printed" else 160,
+        )
+        response = self._client.responses.create(**request)
+        return OpenAITextResponse(
+            text=self._extract_output_text(response),
+            response_id=getattr(response, "id", None),
+            request_id=getattr(response, "_request_id", None),
+            model=extract_model_name(response, request["model"]),
+            token_usage=extract_token_usage(response),
+            used_web_search=self._used_web_search(response),
+        )
+
     def _build_tts_request(
         self,
         text: str,
@@ -797,12 +895,23 @@ class OpenAIBackend:
         return "\n".join(parts)
 
     def _limit_print_conversation(self, conversation: ConversationLike | None) -> ConversationLike | None:
+        return self._limit_recent_conversation(
+            conversation,
+            max_turns=self.config.print_context_turns,
+        )
+
+    def _limit_recent_conversation(
+        self,
+        conversation: ConversationLike | None,
+        *,
+        max_turns: int,
+    ) -> ConversationLike | None:
         if not conversation:
             return conversation
         turns = list(conversation)
-        if self.config.print_context_turns <= 0 or len(turns) <= self.config.print_context_turns:
+        if max_turns <= 0 or len(turns) <= max_turns:
             return turns
-        return turns[-self.config.print_context_turns :]
+        return turns[-max_turns:]
 
     def _sanitize_print_text(self, text: str) -> str:
         normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
