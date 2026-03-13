@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_form_fields.html" import render_setting_field %}
 
 {% block content %}
 <section class="panel">
@@ -259,23 +260,7 @@
     </div>
     <div class="form-grid">
       {% for field in section.fields %}
-      <label class="field">
-        <span class="field-label">{{ field.label }}</span>
-        <span class="field-control">
-          {% if field.input_type == "select" %}
-          <select name="{{ field.key }}">
-            {% for option_value, option_label in field.options %}
-            <option value="{{ option_value }}" {% if field.value == option_value %}selected{% endif %}>{{ option_label }}</option>
-            {% endfor %}
-          </select>
-          {% else %}
-          <input type="text" name="{{ field.key }}" value="{{ field.value }}" placeholder="{{ field.placeholder }}">
-          {% endif %}
-        </span>
-        {% if field.help_text %}
-        <span class="field-help">{{ field.help_text }}</span>
-        {% endif %}
-      </label>
+      {{ render_setting_field(field) }}
       {% endfor %}
     </div>
   </section>

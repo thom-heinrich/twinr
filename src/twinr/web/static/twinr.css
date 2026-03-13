@@ -382,6 +382,28 @@ h2 {
   font-weight: 600;
 }
 
+.field-label-row {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.field-tooltip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-subtle);
+  cursor: help;
+  user-select: none;
+  border-bottom: 1px dotted var(--color-border-strong);
+}
+
+.field-tooltip:hover,
+.field-tooltip:focus {
+  color: var(--color-accent);
+  outline: none;
+}
+
 .detail-body {
   font-size: var(--font-size-lg);
   font-weight: 700;
@@ -429,6 +451,10 @@ textarea:focus {
 textarea {
   resize: vertical;
   min-height: 220px;
+}
+
+.textarea-compact {
+  min-height: 112px;
 }
 
 button {

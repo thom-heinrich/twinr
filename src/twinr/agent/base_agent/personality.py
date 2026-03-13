@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.context_store import PersistentMemoryMarkdownStore
+from twinr.memory.context_store import PersistentMemoryMarkdownStore
+from twinr.memory.reminders import ReminderStore
 
 _SECTION_FILES = (
     ("SYSTEM", "SYSTEM.md"),
@@ -49,6 +50,14 @@ def load_personality_context(config: TwinrConfig) -> PersonalityContext:
     memory_context = PersistentMemoryMarkdownStore(config.memory_markdown_path).render_context()
     if memory_context:
         sections.append(("MEMORY", memory_context))
+    reminder_context = ReminderStore(
+        config.reminder_store_path,
+        timezone_name=config.local_timezone_name,
+        retry_delay_s=config.reminder_retry_delay_s,
+        max_entries=config.reminder_max_entries,
+    ).render_context()
+    if reminder_context:
+        sections.append(("REMINDERS", reminder_context))
     return PersonalityContext(sections=tuple(sections))
 
 

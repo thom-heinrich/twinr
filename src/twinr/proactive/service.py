@@ -11,7 +11,7 @@ from twinr.hardware import GpioPirMonitor, V4L2StillCamera, configured_pir_monit
 from twinr.hardware.audio import AmbientAudioSampler
 from twinr.proactive.engine import SocialAudioObservation, SocialObservation, SocialTriggerDecision, SocialTriggerEngine, SocialVisionObservation
 from twinr.proactive.observers import AmbientAudioObservationProvider, NullAudioObservationProvider, OpenAIVisionObservationProvider
-from twinr.provider.openai.backend import OpenAIBackend
+from twinr.providers.openai.backend import OpenAIBackend
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +46,7 @@ class ProactiveCoordinator:
         self.clock = clock
         self._last_motion_at: float | None = None
         self._last_capture_at: float | None = None
+        self._last_observation_key: tuple[object, ...] | None = None
 
     def tick(self) -> ProactiveTickResult:
         now = self.clock()
@@ -53,21 +54,30 @@ class ProactiveCoordinator:
         if self.runtime.status.value != "waiting":
             return ProactiveTickResult()
         if not self._should_inspect(now, motion_active=motion_active):
-            self._feed_absence(now=now, motion_active=motion_active)
+            observation = self._feed_absence(now=now, motion_active=motion_active)
+            self._record_observation_if_changed(
+                observation,
+                inspected=False,
+            )
             return ProactiveTickResult(inspected=False, person_visible=False)
 
         snapshot = self.vision_observer.observe()
         self._last_capture_at = now
         audio_snapshot = self.audio_observer.observe()
         low_motion = self._is_low_motion(now, motion_active=motion_active)
-        decision = self.engine.observe(
-            SocialObservation(
-                observed_at=now,
-                pir_motion_detected=motion_active,
-                low_motion=low_motion,
-                vision=snapshot.observation,
-                audio=audio_snapshot.observation,
-            )
+        observation = SocialObservation(
+            observed_at=now,
+            pir_motion_detected=motion_active,
+            low_motion=low_motion,
+            vision=snapshot.observation,
+            audio=audio_snapshot.observation,
+        )
+        decision = self.engine.observe(observation)
+        self._record_observation_if_changed(
+            observation,
+            inspected=True,
+            vision_snapshot=snapshot,
+            audio_snapshot=audio_snapshot,
         )
         self.emit(f"proactive_person_visible={str(snapshot.observation.person_visible).lower()}")
         self.emit(
@@ -82,6 +92,7 @@ class ProactiveCoordinator:
         if audio_snapshot.sample is not None:
             self.emit(f"proactive_audio_peak_rms={audio_snapshot.sample.peak_rms}")
         if decision is not None:
+            self._record_trigger_detected(decision, observation=observation)
             handled = self.trigger_handler(decision)
             if handled:
                 self.emit(f"proactive_trigger={decision.trigger_id}")
@@ -95,16 +106,16 @@ class ProactiveCoordinator:
             person_visible=snapshot.observation.person_visible,
         )
 
-    def _feed_absence(self, *, now: float, motion_active: bool) -> None:
-        self.engine.observe(
-            SocialObservation(
-                observed_at=now,
-                pir_motion_detected=motion_active,
-                low_motion=self._is_low_motion(now, motion_active=motion_active),
-                vision=SocialVisionObservation(person_visible=False),
-                audio=SocialAudioObservation(),
-            )
+    def _feed_absence(self, *, now: float, motion_active: bool) -> SocialObservation:
+        observation = SocialObservation(
+            observed_at=now,
+            pir_motion_detected=motion_active,
+            low_motion=self._is_low_motion(now, motion_active=motion_active),
+            vision=SocialVisionObservation(person_visible=False),
+            audio=SocialAudioObservation(),
         )
+        self.engine.observe(observation)
+        return observation
 
     def _update_motion(self, now: float) -> bool:
         if self.pir_monitor is None:
@@ -143,6 +154,90 @@ class ProactiveCoordinator:
             return True
         return (now - self._last_motion_at) >= self.config.proactive_low_motion_after_s
 
+    def _record_observation_if_changed(
+        self,
+        observation: SocialObservation,
+        *,
+        inspected: bool,
+        vision_snapshot=None,
+        audio_snapshot=None,
+    ) -> None:
+        observation_key = (
+            inspected,
+            observation.pir_motion_detected,
+            observation.low_motion,
+            observation.vision.person_visible,
+            observation.vision.looking_toward_device,
+            observation.vision.body_pose.value,
+            observation.vision.smiling,
+            observation.vision.hand_or_object_near_camera,
+            observation.audio.speech_detected,
+            observation.audio.distress_detected,
+        )
+        if observation_key == self._last_observation_key:
+            return
+        if not inspected and self._last_observation_key is None:
+            self._last_observation_key = observation_key
+            return
+        self._last_observation_key = observation_key
+        data = {
+            "inspected": inspected,
+            "pir_motion_detected": observation.pir_motion_detected,
+            "low_motion": observation.low_motion,
+            "person_visible": observation.vision.person_visible,
+            "looking_toward_device": observation.vision.looking_toward_device,
+            "body_pose": observation.vision.body_pose.value,
+            "smiling": observation.vision.smiling,
+            "hand_or_object_near_camera": observation.vision.hand_or_object_near_camera,
+            "speech_detected": observation.audio.speech_detected,
+            "distress_detected": observation.audio.distress_detected,
+        }
+        if vision_snapshot is not None:
+            data.update(
+                {
+                    "vision_model": vision_snapshot.model,
+                    "vision_request_id": vision_snapshot.request_id,
+                    "vision_response_id": vision_snapshot.response_id,
+                }
+            )
+        if audio_snapshot is not None and audio_snapshot.sample is not None:
+            data.update(
+                {
+                    "audio_average_rms": audio_snapshot.sample.average_rms,
+                    "audio_peak_rms": audio_snapshot.sample.peak_rms,
+                    "audio_active_ratio": audio_snapshot.sample.active_ratio,
+                    "audio_active_chunks": audio_snapshot.sample.active_chunk_count,
+                    "audio_chunk_count": audio_snapshot.sample.chunk_count,
+                }
+            )
+        self.runtime.ops_events.append(
+            event="proactive_observation",
+            message="Proactive monitor recorded a changed observation.",
+            data=data,
+        )
+
+    def _record_trigger_detected(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        observation: SocialObservation,
+    ) -> None:
+        self.runtime.ops_events.append(
+            event="proactive_trigger_detected",
+            message="Proactive trigger conditions were met.",
+            data={
+                "trigger": decision.trigger_id,
+                "reason": decision.reason,
+                "priority": int(decision.priority),
+                "prompt": decision.prompt,
+                "person_visible": observation.vision.person_visible,
+                "body_pose": observation.vision.body_pose.value,
+                "speech_detected": observation.audio.speech_detected,
+                "distress_detected": observation.audio.distress_detected,
+                "low_motion": observation.low_motion,
+            },
+        )
+
 
 class ProactiveMonitorService:
     def __init__(
@@ -164,6 +259,11 @@ class ProactiveMonitorService:
         self._stop_event.clear()
         self._thread = Thread(target=self._run, daemon=True, name="twinr-proactive")
         self._thread.start()
+        self.coordinator.runtime.ops_events.append(
+            event="proactive_monitor_started",
+            message="Proactive monitor started.",
+            data={"poll_interval_s": self.poll_interval_s},
+        )
         self.emit("proactive_monitor=started")
         return self
 
@@ -176,6 +276,11 @@ class ProactiveMonitorService:
         self._thread = None
         if self.coordinator.pir_monitor is not None:
             self.coordinator.pir_monitor.close()
+        self.coordinator.runtime.ops_events.append(
+            event="proactive_monitor_stopped",
+            message="Proactive monitor stopped.",
+            data={},
+        )
         self.emit("proactive_monitor=stopped")
 
     def __enter__(self) -> "ProactiveMonitorService":

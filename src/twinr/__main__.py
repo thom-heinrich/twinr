@@ -152,7 +152,7 @@ def main() -> int:
     try:
         backend = None
         if uses_openai:
-            from twinr.provider.openai import OpenAIBackend
+            from twinr.providers.openai import OpenAIBackend
 
             backend = OpenAIBackend(config=config)
 
@@ -273,7 +273,7 @@ def main() -> int:
                 print(f"proactive_audio_active_ratio={snapshot.sample.active_ratio:.2f}")
 
         if args.vision_prompt and backend is not None:
-            from twinr.provider.openai import OpenAIImageInput
+            from twinr.providers.openai import OpenAIImageInput
 
             images: list[OpenAIImageInput] = []
             if args.vision_camera_capture:

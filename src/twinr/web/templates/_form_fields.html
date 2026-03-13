@@ -1,0 +1,38 @@
+{% macro render_setting_field(field) -%}
+<label class="field{% if field.wide %} field-span-2{% endif %}">
+  <span class="field-label-row">
+    <span class="field-label">{{ field.label }}</span>
+    {% if field.tooltip_text %}
+    <span
+      class="field-tooltip"
+      tabindex="0"
+      title="{{ field.tooltip_text }}"
+      aria-label="{{ field.tooltip_text }}"
+    >(?)</span>
+    {% endif %}
+  </span>
+  <span class="field-control">
+    {% if field.input_type == "select" %}
+    <select name="{{ field.key }}">
+      {% for option_value, option_label in field.options %}
+      <option value="{{ option_value }}" {% if field.value == option_value %}selected{% endif %}>{{ option_label }}</option>
+      {% endfor %}
+    </select>
+    {% elif field.input_type == "password" %}
+    <input type="password" name="{{ field.key }}" value="" placeholder="{{ field.placeholder }}">
+    {% elif field.input_type == "textarea" %}
+    <textarea
+      name="{{ field.key }}"
+      rows="{{ field.rows }}"
+      placeholder="{{ field.placeholder }}"
+      class="{% if field.rows <= 4 %}textarea-compact{% endif %}"
+    >{{ field.value }}</textarea>
+    {% else %}
+    <input type="text" name="{{ field.key }}" value="{{ field.value }}" placeholder="{{ field.placeholder }}">
+    {% endif %}
+  </span>
+  {% if field.help_text %}
+  <span class="field-help">{{ field.help_text }}</span>
+  {% endif %}
+</label>
+{%- endmacro %}

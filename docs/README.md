@@ -62,6 +62,8 @@ By default, the live runtime snapshot is persisted to `state/runtime-state.json`
 
 Durable remembered facts that the user explicitly asks Twinr to keep are written to `state/MEMORY.md`. This file is separate from the rolling runtime snapshot and is only meant for explicit “remember this” items, not every turn.
 
+Scheduled reminders and timers are stored separately in `state/reminders.json`. The voice agent writes to this store only via the reminder tool, and the idle loops deliver due reminders later with bounded retry handling if speech output fails.
+
 Explicit requests to change future user-profile context or future speaking/behavior rules are written into managed sections inside `personality/USER.md` and `personality/PERSONALITY.md`. Twinr reloads those files on the next provider request instead of baking them permanently into code.
 
 ### Long-term memory (optional)
@@ -108,6 +110,7 @@ The `Memory` page also exposes the durable `state/MEMORY.md` store, so operators
 The `Personality` and `User` pages now separate the hand-written base text from Twinr-managed updates, so tool-written behavior/profile changes stay visible and editable without clobbering the base files.
 The `LLM Usage` page reads the local usage store for tracked OpenAI calls, including model names, request ids, and token counts when the provider returns them.
 The `System Health` page reads live Raspberry Pi metrics and Twinr worker presence so caregivers can see whether the box itself looks healthy.
+The `Ops Logs` page reads the persistent local event log under `artifacts/stores/ops/events.jsonl`, including proactive observation changes, proactive trigger detections, and spoken proactive prompts.
 
 ## High-level architecture
 
@@ -144,10 +147,9 @@ The `System Health` page reads live Raspberry Pi metrics and Twinr worker presen
 - `state/` — runtime-generated persistent snapshot and durable remembered facts (`gitignored`)
 - `src/twinr/agent/` — runtime orchestration, state machine, and hardware workflows
 - `src/twinr/display/` — Waveshare display wrapper and image rendering helpers
-- `src/twinr/provider/` — provider implementations such as OpenAI
-- `src/twinr/memory/` — on-device conversation memory
+- `src/twinr/providers/` — provider implementations such as OpenAI
+- `src/twinr/memory/` — on-device memory, durable memory stores, and reminders
 - `src/twinr/hardware/` — audio, button, PIR, camera, and printer adapters
-- `src/twinr/providers/` — compatibility wrappers for legacy import paths
 - `test/` — tests and validation assets
 
 ## Intended user experience
@@ -185,7 +187,7 @@ Probe the configured buttons with:
 
 ```bash
 cd /twinr
-python3 hardware/buttons/probe_buttons.py --env-file /twinr/.env --configured --duration 15
+./.venv/bin/python hardware/buttons/probe_buttons.py --env-file /twinr/.env --configured --duration 15
 ```
 
 The runtime-facing GPIO helpers live in `src/twinr/hardware/buttons.py`.
@@ -205,7 +207,7 @@ Probe the configured PIR input with:
 
 ```bash
 cd /twinr
-python3 hardware/pir/probe_pir.py --env-file /twinr/.env --duration 30
+./.venv/bin/python hardware/pir/probe_pir.py --env-file /twinr/.env --duration 30
 ```
 
 The current prototype wiring is:
@@ -304,7 +306,7 @@ Run a manual test card at any time with:
 
 ```bash
 cd /twinr
-python3 hardware/display/display_test.py --env-file /twinr/.env
+./.venv/bin/python hardware/display/display_test.py --env-file /twinr/.env
 ```
 
 ## Web dashboard
@@ -374,13 +376,13 @@ When the OpenAI secret is already project-scoped (`sk-proj-...`), keep `OPENAI_S
 Smoke examples:
 
 ```bash
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --openai-prompt "Reply with exactly OK."
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --openai-prompt "What happened in the world today?" --openai-web-search
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --tts-text "Hello from Twinr" --tts-output /tmp/twinr.wav
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --camera-capture-output /tmp/twinr-camera.png
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --vision-prompt "Bild 1 ist das Live-Kamerabild. Bild 2 ist das Referenzfoto des Nutzers. Ist es dieselbe Person? Antworte nur mit JA oder NEIN." --vision-camera-capture --vision-save-capture /tmp/twinr-camera.png --vision-image /home/thh/reference-user.jpg
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --proactive-observe-once
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --proactive-audio-observe-once
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --openai-prompt "Reply with exactly OK."
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --openai-prompt "What happened in the world today?" --openai-web-search
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --tts-text "Hello from Twinr" --tts-output /tmp/twinr.wav
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --camera-capture-output /tmp/twinr-camera.png
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --vision-prompt "Bild 1 ist das Live-Kamerabild. Bild 2 ist das Referenzfoto des Nutzers. Ist es dieselbe Person? Antworte nur mit JA oder NEIN." --vision-camera-capture --vision-save-capture /tmp/twinr-camera.png --vision-image /home/thh/reference-user.jpg
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --proactive-observe-once
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --proactive-audio-observe-once
 ```
 
 The vision path requires `ffmpeg` on the device because Twinr captures still images from V4L2 and then sends one or more images to the OpenAI Responses API in a single request.
@@ -403,9 +405,10 @@ source .venv/bin/activate
 twinr --env-file /twinr/.env --run-realtime-loop
 ```
 
-The Realtime loop keeps the same button UX but uses OpenAI Realtime for direct audio input/output. The current Realtime path does not invoke web search; keep the existing `--run-hardware-loop` path for search-enabled answers.
+The Realtime loop keeps the same button UX but uses OpenAI Realtime for direct audio input/output. It now also exposes bounded tools for web research, durable memory writes, reminder/timer scheduling, print requests, camera inspection, and ending the follow-up loop.
 With `TWINR_CONVERSATION_FOLLOW_UP_ENABLED=true`, Twinr emits a short beep before listening, answers, then automatically beeps and listens again for a short follow-up window so a short back-and-forth conversation works without pressing the button every turn.
 The Realtime loop can now also inspect the camera view for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
+If the user says things like `Erinnere mich morgen um 12 Uhr an den Arzttermin`, the realtime agent resolves the time into an absolute due time, stores the reminder in `state/reminders.json`, and later speaks a fresh reminder generated from the stored reminder facts.
 
 Latency notes:
 
@@ -416,6 +419,8 @@ Latency notes:
 ## Developer bootstrap
 
 A minimal Python package skeleton now lives in `src/twinr`.
+
+Twinr requires Python `3.11+`. Use the repo-local `.venv` instead of relying on a machine-global `python3`.
 
 Typical local development flow:
 
@@ -428,12 +433,11 @@ Typical local development flow:
 Example commands:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-PYTHONPATH=src python3 -m unittest discover -s test -v
-PYTHONPATH=src python3 -m twinr --demo-transcript "Hello Twinr"
+python3.11 -m venv .venv
+./.venv/bin/python -m pip install -e . pytest
+PYTHONPATH=src ./.venv/bin/python -m unittest discover -s test -v
+PYTHONPATH=src ./.venv/bin/python -m twinr --demo-transcript "Hello Twinr"
 hardware/buttons/setup_buttons.sh --green 23 --yellow 22
 sudo hardware/mic/setup_audio.sh --device-match Jabra
-python3 hardware/buttons/probe_buttons.py --env-file /twinr/.env --configured --duration 15
+./.venv/bin/python hardware/buttons/probe_buttons.py --env-file /twinr/.env --configured --duration 15
 ```

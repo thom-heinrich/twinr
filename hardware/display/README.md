@@ -24,12 +24,12 @@ Standalone test run:
 
 ```bash
 cd /twinr
-python3 hardware/display/display_test.py --env-file /twinr/.env
+./.venv/bin/python hardware/display/display_test.py --env-file /twinr/.env
 ```
 
 Run the status-display loop:
 
 ```bash
 cd /twinr
-python3 hardware/display/run_display_loop.py --env-file /twinr/.env
+./.venv/bin/python hardware/display/run_display_loop.py --env-file /twinr/.env
 ```

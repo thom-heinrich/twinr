@@ -160,5 +160,5 @@ Useful local commands:
 ```bash
 cd /twinr
 hardware/pir/setup_pir.sh --motion 26 --probe
-python3 hardware/pir/probe_pir.py --env-file /twinr/.env --duration 30
+./.venv/bin/python hardware/pir/probe_pir.py --env-file /twinr/.env --duration 30
 ```

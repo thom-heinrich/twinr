@@ -28,7 +28,7 @@ This writes the PIR settings into `/twinr/.env` and can run a short motion probe
 
 ```bash
 cd /twinr
-python3 hardware/pir/probe_pir.py --env-file /twinr/.env --duration 30
+./.venv/bin/python hardware/pir/probe_pir.py --env-file /twinr/.env --duration 30
 ```
 
 Move in front of the PIR while the probe is running. The script prints the current level and every detected motion edge.

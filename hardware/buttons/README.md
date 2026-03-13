@@ -21,7 +21,7 @@ This script writes the button mapping into `/twinr/.env` and can run a short con
 
 ```bash
 cd /twinr
-python3 hardware/buttons/probe_buttons.py --env-file /twinr/.env --configured --duration 15
+./.venv/bin/python hardware/buttons/probe_buttons.py --env-file /twinr/.env --configured --duration 15
 ```
 
 ## Runtime integration

@@ -6,7 +6,7 @@ from threading import Lock
 from twinr.hardware.audio import AmbientAudioLevelSample, AmbientAudioSampler
 from twinr.hardware.camera import V4L2StillCamera
 from twinr.proactive.engine import SocialAudioObservation, SocialBodyPose, SocialVisionObservation
-from twinr.provider.openai.backend import OpenAIBackend, OpenAIImageInput
+from twinr.providers.openai.backend import OpenAIBackend, OpenAIImageInput
 
 
 @dataclass(frozen=True, slots=True)

@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
-from twinr.providers.openai_realtime import OpenAIRealtimeSession
+from twinr.providers.openai.realtime import OpenAIRealtimeSession
 
 
 def _fake_usage(
@@ -155,21 +155,11 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         with session:
             pass
 
-        self.assertEqual(
-            connection.session.calls[0]["instructions"],
-            "Base context\n\n"
-            "Speak in clear, warm, natural standard German. "
-            "Keep responses concise, practical, and easy for a senior user to understand. "
-            "Do not use an English accent. "
-            "If the user explicitly asks for a printout, use the print_receipt tool with a short focus hint and optional exact text. "
-            "If the user asks for any current, external, or otherwise freshness-sensitive information that benefits from web research, first say one short German sentence that you are checking the web and that this may take a moment, then call the search_live_info tool. "
-            "If the user explicitly asks you to remember an important fact for future turns, use the remember_memory tool. "
-            "If the user explicitly asks you to change your future speaking style or behavior, use the update_personality tool. "
-            "If the user explicitly asks you to remember a stable user-profile fact or preference, use the update_user_profile tool. "
-            "If the user asks you to look at them, an object, a document, or something they are showing to the camera, call the inspect_camera tool. "
-            "If the user clearly wants to stop or pause the conversation for now, call the end_conversation tool and then say a short goodbye.\n\n"
-            "Speak concise German.",
-        )
+        instructions = connection.session.calls[0]["instructions"]
+        self.assertTrue(instructions.startswith("Base context\n\n"))
+        self.assertIn("use the schedule_reminder tool", instructions)
+        self.assertIn("Local date/time context for resolving reminders and timers:", instructions)
+        self.assertTrue(instructions.endswith("Speak concise German."))
 
     def test_open_loads_latest_hidden_context_from_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -197,11 +187,31 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            (state_dir / "reminders.json").write_text(
+                (
+                    '{\n'
+                    '  "entries": [\n'
+                    '    {\n'
+                    '      "reminder_id": "REM-20260314T120000000000Z",\n'
+                    '      "kind": "reminder",\n'
+                    '      "summary": "Muell rausstellen",\n'
+                    '      "due_at": "2026-03-14T12:00:00+01:00",\n'
+                    '      "created_at": "2026-03-13T12:00:00+01:00",\n'
+                    '      "updated_at": "2026-03-13T12:00:00+01:00",\n'
+                    '      "source": "tool",\n'
+                    '      "delivery_attempts": 0\n'
+                    '    }\n'
+                    '  ]\n'
+                    '}\n'
+                ),
+                encoding="utf-8",
+            )
             config = TwinrConfig(
                 openai_api_key="test-key",
                 project_root=temp_dir,
                 personality_dir="personality",
                 memory_markdown_path=str(state_dir / "MEMORY.md"),
+                reminder_store_path=str(state_dir / "reminders.json"),
                 openai_realtime_model="gpt-4o-realtime-preview",
                 openai_realtime_voice="sage",
             )
@@ -219,7 +229,9 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("SYSTEM:\nSystem context", instructions)
         self.assertIn("PERSONALITY:\nUpdated style context", instructions)
         self.assertIn("MEMORY:\nDurable remembered items explicitly saved for future turns:", instructions)
+        self.assertIn("REMINDERS:\nScheduled reminders and timers:", instructions)
         self.assertIn("Arzttermin am Montag um 14 Uhr.", instructions)
+        self.assertIn("Muell rausstellen", instructions)
 
     def test_open_includes_expected_tools_when_handlers_exist(self) -> None:
         session, connection, _manager = self.make_session()
@@ -229,6 +241,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             tool_handlers={
                 "print_receipt": lambda _arguments: {"status": "printed"},
                 "search_live_info": lambda _arguments: {"status": "ok", "answer": "Antwort"},
+                "schedule_reminder": lambda _arguments: {"status": "scheduled"},
                 "remember_memory": lambda _arguments: {"status": "saved"},
                 "update_user_profile": lambda _arguments: {"status": "updated"},
                 "update_personality": lambda _arguments: {"status": "updated"},
@@ -246,6 +259,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             [
                 "print_receipt",
                 "search_live_info",
+                "schedule_reminder",
                 "remember_memory",
                 "update_user_profile",
                 "update_personality",
@@ -255,11 +269,13 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         )
         self.assertIn("focus_hint", connection.session.calls[0]["tools"][0]["parameters"]["properties"])
         self.assertIn("question", connection.session.calls[0]["tools"][1]["parameters"]["properties"])
+        self.assertIn("due_at", connection.session.calls[0]["tools"][2]["parameters"]["properties"])
         self.assertIn("summary", connection.session.calls[0]["tools"][2]["parameters"]["properties"])
-        self.assertIn("instruction", connection.session.calls[0]["tools"][3]["parameters"]["properties"])
+        self.assertIn("summary", connection.session.calls[0]["tools"][3]["parameters"]["properties"])
         self.assertIn("instruction", connection.session.calls[0]["tools"][4]["parameters"]["properties"])
-        self.assertIn("reason", connection.session.calls[0]["tools"][5]["parameters"]["properties"])
-        self.assertIn("question", connection.session.calls[0]["tools"][6]["parameters"]["properties"])
+        self.assertIn("instruction", connection.session.calls[0]["tools"][5]["parameters"]["properties"])
+        self.assertIn("reason", connection.session.calls[0]["tools"][6]["parameters"]["properties"])
+        self.assertIn("question", connection.session.calls[0]["tools"][7]["parameters"]["properties"])
 
     def test_run_audio_turn_streams_audio_and_collects_text(self) -> None:
         audio_chunks: list[bytes] = []
@@ -446,6 +462,59 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertEqual(turn.response_text, "Morgen wird es kuehl und nass.")
         self.assertEqual(connection.conversation.item.calls[0]["type"], "function_call_output")
         self.assertEqual(connection.response.calls, [{}, {}])
+
+    def test_run_audio_turn_handles_schedule_reminder_tool_call(self) -> None:
+        reminder_calls: list[dict] = []
+        session, connection, _manager = self.make_session(
+            SimpleNamespace(
+                type="response.done",
+                response=SimpleNamespace(
+                    id="resp_reminder_1",
+                    output=[
+                        SimpleNamespace(
+                            type="function_call",
+                            name="schedule_reminder",
+                            call_id="call_reminder_1",
+                            arguments=(
+                                '{"due_at":"2026-03-14T12:00:00+01:00",'
+                                '"summary":"Arzttermin",'
+                                '"kind":"appointment"}'
+                            ),
+                        )
+                    ],
+                ),
+            ),
+            SimpleNamespace(type="response.output_audio_transcript.delta", delta="Alles klar, ich erinnere dich."),
+            SimpleNamespace(
+                type="response.done",
+                response=SimpleNamespace(
+                    id="resp_reminder_2",
+                    output=[
+                        SimpleNamespace(
+                            type="message",
+                            content=[SimpleNamespace(transcript="Alles klar, ich erinnere dich.", text=None)],
+                        )
+                    ],
+                ),
+            ),
+        )
+        session = OpenAIRealtimeSession(
+            self.config,
+            client=FakeRealtimeClient(FakeConnectionManager(connection)),
+            tool_handlers={
+                "schedule_reminder": lambda arguments: reminder_calls.append(arguments) or {"status": "scheduled"}
+            },
+        )
+
+        with session:
+            turn = session.run_audio_turn(b"\x01\x02" * 100)
+
+        self.assertEqual(
+            reminder_calls,
+            [{"due_at": "2026-03-14T12:00:00+01:00", "summary": "Arzttermin", "kind": "appointment"}],
+        )
+        self.assertEqual(turn.response_text, "Alles klar, ich erinnere dich.")
+        self.assertEqual(connection.conversation.item.calls[0]["type"], "function_call_output")
 
     def test_run_text_turn_creates_user_message(self) -> None:
         session, connection, _manager = self.make_session(

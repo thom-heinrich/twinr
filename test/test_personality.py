@@ -36,12 +36,32 @@ class PersonalityTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            (state_dir / "reminders.json").write_text(
+                (
+                    '{\n'
+                    '  "entries": [\n'
+                    '    {\n'
+                    '      "reminder_id": "REM-20260314T110000000000Z",\n'
+                    '      "kind": "reminder",\n'
+                    '      "summary": "Muell rausstellen",\n'
+                    '      "due_at": "2026-03-14T11:00:00+01:00",\n'
+                    '      "created_at": "2026-03-13T12:00:00+01:00",\n'
+                    '      "updated_at": "2026-03-13T12:00:00+01:00",\n'
+                    '      "source": "tool",\n'
+                    '      "delivery_attempts": 0\n'
+                    '    }\n'
+                    '  ]\n'
+                    '}\n'
+                ),
+                encoding="utf-8",
+            )
 
             instructions = load_personality_instructions(
                 TwinrConfig(
                     project_root=tmpdir,
                     personality_dir="personality",
                     memory_markdown_path=str(state_dir / "MEMORY.md"),
+                    reminder_store_path=str(state_dir / "reminders.json"),
                 )
             )
 
@@ -49,7 +69,9 @@ class PersonalityTests(unittest.TestCase):
         self.assertLess(instructions.index("SYSTEM:\nSystem context"), instructions.index("PERSONALITY:\nStyle context"))
         self.assertLess(instructions.index("PERSONALITY:\nStyle context"), instructions.index("USER:\nUser profile"))
         self.assertLess(instructions.index("USER:\nUser profile"), instructions.index("MEMORY:\nDurable remembered items"))
+        self.assertLess(instructions.index("MEMORY:\nDurable remembered items"), instructions.index("REMINDERS:\nScheduled reminders and timers:"))
         self.assertIn("Arzttermin am Montag um 14 Uhr.", instructions)
+        self.assertIn("Muell rausstellen", instructions)
 
     def test_merge_instructions_skips_empty_parts(self) -> None:
         merged = merge_instructions("Base", None, " ", "Task")

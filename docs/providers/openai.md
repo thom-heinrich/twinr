@@ -45,18 +45,18 @@ TWINR_VISION_REFERENCE_IMAGE=/home/thh/reference-user.jpg
 
 ## Python entry points
 
-- `src/twinr/provider/openai/backend.py`
+- `src/twinr/providers/openai/backend.py`
 - `src/twinr/__main__.py`
 
 ## Smoke examples
 
 ```bash
 cd /twinr
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --openai-prompt "Reply with exactly OK."
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --openai-prompt "What happened in the world today?" --openai-web-search
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --tts-text "Hello from Twinr" --tts-output /tmp/twinr.wav
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --camera-capture-output /tmp/twinr-camera.png
-PYTHONPATH=src python3 -m twinr --env-file /twinr/.env --vision-prompt "Bild 1 ist das Live-Kamerabild. Bild 2 ist das Referenzfoto des Nutzers. Ist es dieselbe Person? Antworte nur mit JA oder NEIN." --vision-camera-capture --vision-save-capture /tmp/twinr-camera.png --vision-image /home/thh/reference-user.jpg
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --openai-prompt "Reply with exactly OK."
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --openai-prompt "What happened in the world today?" --openai-web-search
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --tts-text "Hello from Twinr" --tts-output /tmp/twinr.wav
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --camera-capture-output /tmp/twinr-camera.png
+PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --vision-prompt "Bild 1 ist das Live-Kamerabild. Bild 2 ist das Referenzfoto des Nutzers. Ist es dieselbe Person? Antworte nur mit JA oder NEIN." --vision-camera-capture --vision-save-capture /tmp/twinr-camera.png --vision-image /home/thh/reference-user.jpg
 ```
 
 The vision flow can attach multiple images in one OpenAI Responses API request. Twinr labels the live camera frame separately from any user-supplied reference images so the model can compare them.

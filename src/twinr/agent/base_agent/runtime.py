@@ -12,6 +12,7 @@ from twinr.agent.base_agent.state_machine import (
     TwinrStatus,
 )
 from twinr.memory import ConversationTurn, MemoryLedgerItem, MemoryState, OnDeviceMemory, SearchMemoryEntry
+from twinr.memory.reminders import ReminderEntry, ReminderStore, format_due_label
 from twinr.ops.events import TwinrOpsEventStore, compact_text
 
 
@@ -20,6 +21,7 @@ class TwinrRuntime:
     config: TwinrConfig
     state_machine: TwinrStateMachine = field(default_factory=TwinrStateMachine)
     memory: OnDeviceMemory = field(init=False)
+    reminder_store: ReminderStore = field(init=False)
     snapshot_store: RuntimeSnapshotStore = field(init=False)
     ops_events: TwinrOpsEventStore = field(init=False)
     last_transcript: str | None = None
@@ -29,6 +31,12 @@ class TwinrRuntime:
         self.memory = OnDeviceMemory(
             max_turns=self.config.memory_max_turns,
             keep_recent=self.config.memory_keep_recent,
+        )
+        self.reminder_store = ReminderStore(
+            self.config.reminder_store_path,
+            timezone_name=self.config.local_timezone_name,
+            retry_delay_s=self.config.reminder_retry_delay_s,
+            max_entries=self.config.reminder_max_entries,
         )
         self.snapshot_store = RuntimeSnapshotStore(self.config.runtime_state_path)
         self.ops_events = TwinrOpsEventStore.from_config(self.config)
@@ -70,15 +78,29 @@ class TwinrRuntime:
         return status
 
     def begin_proactive_prompt(self, prompt: str) -> str:
+        return self._begin_background_prompt(
+            prompt,
+            event="proactive_prompt_started",
+            message="Twinr started a proactive spoken prompt.",
+        )
+
+    def begin_reminder_prompt(self, prompt: str) -> str:
+        return self._begin_background_prompt(
+            prompt,
+            event="reminder_prompt_started",
+            message="Twinr started speaking a due reminder.",
+        )
+
+    def _begin_background_prompt(self, prompt: str, *, event: str, message: str) -> str:
         spoken_prompt = prompt.strip()
         if not spoken_prompt:
-            raise RuntimeError("Proactive prompt text must not be empty")
+            raise RuntimeError("Background prompt text must not be empty")
         status = self.state_machine.transition(TwinrEvent.PROACTIVE_PROMPT_READY)
         self.memory.remember("assistant", spoken_prompt)
         self._persist_snapshot()
         self.ops_events.append(
-            event="proactive_prompt_started",
-            message="Twinr started a proactive spoken prompt.",
+            event=event,
+            message=message,
             data={
                 "status": status.value,
                 "response_preview": compact_text(spoken_prompt),
@@ -162,6 +184,75 @@ class TwinrRuntime:
             },
         )
         return item
+
+    def schedule_reminder(
+        self,
+        *,
+        due_at: str,
+        summary: str,
+        details: str | None = None,
+        kind: str = "reminder",
+        source: str = "tool",
+        original_request: str | None = None,
+    ) -> ReminderEntry:
+        entry = self.reminder_store.schedule(
+            due_at=due_at,
+            summary=summary,
+            details=details,
+            kind=kind,
+            source=source,
+            original_request=original_request,
+        )
+        due_label = format_due_label(entry.due_at, timezone_name=self.config.local_timezone_name)
+        self.remember_note(
+            kind="reminder",
+            content=f"Reminder scheduled for {due_label}: {entry.summary}",
+            source=source,
+            metadata={"reminder_id": entry.reminder_id, "reminder_kind": entry.kind},
+        )
+        self.ops_events.append(
+            event="reminder_scheduled",
+            message="A reminder or timer was scheduled.",
+            data={
+                "reminder_id": entry.reminder_id,
+                "kind": entry.kind,
+                "due_at": entry.due_at.isoformat(),
+                "summary": compact_text(entry.summary),
+            },
+        )
+        return entry
+
+    def reserve_due_reminders(self, *, limit: int = 1) -> tuple[ReminderEntry, ...]:
+        return self.reminder_store.reserve_due(limit=limit)
+
+    def mark_reminder_delivered(self, reminder_id: str) -> ReminderEntry:
+        entry = self.reminder_store.mark_delivered(reminder_id)
+        self.remember_note(
+            kind="reminder",
+            content=f"Reminder delivered: {entry.summary}",
+            source="reminder_delivery",
+            metadata={"reminder_id": entry.reminder_id},
+        )
+        self.ops_events.append(
+            event="reminder_delivered",
+            message="A due reminder was delivered successfully.",
+            data={"reminder_id": entry.reminder_id, "summary": compact_text(entry.summary)},
+        )
+        return entry
+
+    def mark_reminder_failed(self, reminder_id: str, *, error: str) -> ReminderEntry:
+        entry = self.reminder_store.mark_failed(reminder_id, error=error)
+        self.ops_events.append(
+            event="reminder_delivery_failed",
+            level="error",
+            message="A due reminder could not be delivered.",
+            data={
+                "reminder_id": entry.reminder_id,
+                "summary": compact_text(entry.summary),
+                "error": error,
+            },
+        )
+        return entry
 
     def complete_agent_turn(self, answer: str) -> str:
         self.begin_answering()

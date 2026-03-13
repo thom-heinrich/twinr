@@ -15,7 +15,7 @@ from twinr.hardware.buttons import ButtonAction, configured_button_monitor
 from twinr.hardware.printer import RawReceiptPrinter
 from twinr.ops import TwinrUsageStore
 from twinr.proactive import SocialTriggerDecision, build_default_proactive_monitor
-from twinr.provider.openai.backend import OpenAIBackend, OpenAIImageInput
+from twinr.providers.openai.backend import OpenAIBackend, OpenAIImageInput
 
 _WEB_SEARCH_KEYWORDS = (
     "latest",
@@ -127,6 +127,7 @@ class TwinrHardwareLoop:
         self.error_reset_seconds = error_reset_seconds
         self._last_status: str | None = None
         self._last_print_request_at: float | None = None
+        self._next_reminder_check_at: float = 0.0
         self.proactive_monitor = proactive_monitor or build_default_proactive_monitor(
             config=config,
             runtime=self.runtime,
@@ -149,7 +150,10 @@ class TwinrHardwareLoop:
                 if duration_s is not None and time.monotonic() - started_at >= duration_s:
                     return 0
                 event = monitor.poll(timeout=poll_timeout)
-                if event is None or event.action != ButtonAction.PRESSED:
+                if event is None:
+                    self._maybe_deliver_due_reminder()
+                    continue
+                if event.action != ButtonAction.PRESSED:
                     continue
                 self.emit(f"button={event.name}")
                 self._record_event(
@@ -180,6 +184,8 @@ class TwinrHardwareLoop:
                 "Social trigger prompt was skipped because Twinr was not idle.",
                 trigger=trigger.trigger_id,
                 reason=trigger.reason,
+                prompt=trigger.prompt,
+                priority=int(trigger.priority),
             )
             return False
 
@@ -201,6 +207,7 @@ class TwinrHardwareLoop:
             trigger=trigger.trigger_id,
             reason=trigger.reason,
             priority=int(trigger.priority),
+            prompt=prompt,
         )
         return True
 
@@ -494,6 +501,59 @@ class TwinrHardwareLoop:
             token_usage=token_usage,
             metadata=metadata,
         )
+
+    def _maybe_deliver_due_reminder(self) -> bool:
+        now_monotonic = time.monotonic()
+        if now_monotonic < self._next_reminder_check_at:
+            return False
+        self._next_reminder_check_at = now_monotonic + self.config.reminder_poll_interval_s
+        if self.runtime.status.value != "waiting":
+            return False
+        due_entries = self.runtime.reserve_due_reminders(limit=1)
+        if not due_entries:
+            return False
+        return self._deliver_due_reminder(due_entries[0])
+
+    def _deliver_due_reminder(self, reminder) -> bool:
+        response = None
+        spoken_prompt = ""
+        try:
+            response = self.backend.phrase_due_reminder_with_metadata(reminder)
+            spoken_prompt = self.runtime.begin_reminder_prompt(response.text)
+            self._emit_status(force=True)
+            tts_ms, first_audio_ms = self._speak_full_answer(spoken_prompt, turn_started=time.monotonic())
+            self.runtime.finish_speaking()
+            self._emit_status(force=True)
+            delivered = self.runtime.mark_reminder_delivered(reminder.reminder_id)
+            self.emit("reminder_delivered=true")
+            self.emit(f"reminder_due_at={delivered.due_at.isoformat()}")
+            self.emit(f"reminder_text={spoken_prompt}")
+            if response.response_id:
+                self.emit(f"reminder_response_id={response.response_id}")
+            if response.request_id:
+                self.emit(f"reminder_request_id={response.request_id}")
+            self.emit(f"timing_reminder_tts_ms={tts_ms}")
+            if first_audio_ms is not None:
+                self.emit(f"timing_reminder_first_audio_ms={first_audio_ms}")
+            self._record_usage(
+                request_kind="reminder_delivery",
+                source="hardware_loop",
+                model=response.model,
+                response_id=response.response_id,
+                request_id=response.request_id,
+                used_web_search=False,
+                token_usage=response.token_usage,
+                reminder_id=delivered.reminder_id,
+                reminder_kind=delivered.kind,
+            )
+            return True
+        except Exception as exc:
+            if self.runtime.status.value == "answering":
+                self.runtime.finish_speaking()
+                self._emit_status(force=True)
+            self.runtime.mark_reminder_failed(reminder.reminder_id, error=str(exc))
+            self.emit(f"reminder_error={exc}")
+            return False
 
     def _should_use_web_search(self, transcript: str) -> bool:
         mode = self.config.conversation_web_search.strip().lower()

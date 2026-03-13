@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ENV_FILE="${TWINR_ENV_FILE:-$REPO_ROOT/.env}"
+PYTHON_BIN=""
 GPIO_CHIP=""
 GREEN_GPIO=""
 YELLOW_GPIO=""
@@ -34,6 +35,22 @@ HELP
 fail() {
   printf 'error: %s\n' "$*" >&2
   exit 1
+}
+
+resolve_python_bin() {
+  if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
+  elif command -v python3.11 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3.11)"
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  else
+    fail "Python 3.11+ not found. Create $REPO_ROOT/.venv or install python3.11."
+  fi
+  "$PYTHON_BIN" - <<'PY' || fail "Twinr requires Python 3.11+ for setup_buttons.sh"
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
 }
 
 while [[ $# -gt 0 ]]; do
@@ -88,11 +105,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -f "$ENV_FILE" ]] || fail "Env file not found: $ENV_FILE"
-command -v python3 >/dev/null 2>&1 || fail "python3 not found"
+resolve_python_bin
 
 read_current() {
   local key="$1"
-  python3 - <<PY
+  "$PYTHON_BIN" - <<PY
 from pathlib import Path
 path = Path(r'''$ENV_FILE''')
 value = None
@@ -133,7 +150,7 @@ case "${BIAS,,}" in
   *) fail "--bias must be one of: pull-up, pull-down, disable, as-is" ;;
 esac
 
-python3 - <<PY
+"$PYTHON_BIN" - <<PY
 from pathlib import Path
 path = Path(r'''$ENV_FILE''')
 updates = {
@@ -165,7 +182,7 @@ path.write_text("\n".join(result) + "\n", encoding='utf-8')
 PY
 
 cd "$REPO_ROOT"
-PYTHONPATH=src python3 - <<PY
+PYTHONPATH=src "$PYTHON_BIN" - <<PY
 from twinr.config import TwinrConfig
 from twinr.hardware.buttons import build_button_bindings
 config = TwinrConfig.from_env(r'''$ENV_FILE''')
@@ -178,5 +195,5 @@ print(f"bias={config.button_bias}")
 PY
 
 if [[ "$RUN_PROBE" -eq 1 ]]; then
-  exec python3 hardware/buttons/probe_buttons.py --env-file "$ENV_FILE" --configured --duration "$PROBE_DURATION"
+  exec "$PYTHON_BIN" hardware/buttons/probe_buttons.py --env-file "$ENV_FILE" --configured --duration "$PROBE_DURATION"
 fi
