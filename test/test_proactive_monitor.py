@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -10,7 +11,9 @@ from twinr.hardware.audio import AmbientAudioLevelSample
 from twinr.proactive import (
     AmbientAudioObservationProvider,
     OpenAIVisionObservationProvider,
+    ProactiveAudioSnapshot,
     ProactiveCoordinator,
+    SocialAudioObservation,
     SocialBodyPose,
     SocialTriggerEngine,
     SocialVisionObservation,
@@ -97,6 +100,16 @@ class FakeAudioSampler:
         self.calls += 1
         self.durations.append(duration_ms)
         return self.sample
+
+
+class FakeAudioObserver:
+    def __init__(self, observation: SocialAudioObservation, *, sample: AmbientAudioLevelSample | None = None) -> None:
+        self.snapshot = ProactiveAudioSnapshot(observation=observation, sample=sample)
+        self.calls = 0
+
+    def observe(self):
+        self.calls += 1
+        return self.snapshot
 
 
 class MutableClock:
@@ -244,6 +257,113 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertFalse(result.inspected)
         self.assertEqual(vision_observer.calls, 0)
         self.assertEqual(audio_observer.sampler.calls, 0)
+
+    def test_coordinator_persists_changed_observations_without_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=1.0,
+                proactive_motion_window_s=20.0,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(1.0)
+            sample = AmbientAudioLevelSample(
+                duration_ms=900,
+                chunk_count=5,
+                active_chunk_count=0,
+                average_rms=140,
+                peak_rms=220,
+                active_ratio=0.0,
+            )
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            looking_toward_device=True,
+                            body_pose=SocialBodyPose.UPRIGHT,
+                        ),
+                        SocialVisionObservation(
+                            person_visible=True,
+                            looking_toward_device=True,
+                            body_pose=SocialBodyPose.UPRIGHT,
+                        ),
+                    ]
+                ),
+                pir_monitor=FakePirMonitor(events=[True], level=True),
+                audio_observer=FakeAudioObserver(
+                    SocialAudioObservation(speech_detected=False),
+                    sample=sample,
+                ),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            coordinator.tick()
+            clock.now = 2.5
+            coordinator.tick()
+
+            events = runtime.ops_events.tail(limit=10)
+
+        observation_events = [entry for entry in events if entry.get("event") == "proactive_observation"]
+        self.assertEqual(len(observation_events), 1)
+        self.assertEqual(observation_events[0]["data"]["person_visible"], True)
+        self.assertEqual(observation_events[0]["data"]["body_pose"], "upright")
+        self.assertEqual(observation_events[0]["data"]["speech_detected"], False)
+
+    def test_coordinator_logs_trigger_detection_and_absence_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=1.0,
+                proactive_motion_window_s=5.0,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(0.0)
+            pir_monitor = FakePirMonitor(level=False)
+            handled: list[str] = []
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(user_name="Thom"),
+                trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT),
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT),
+                    ]
+                ),
+                pir_monitor=pir_monitor,
+                audio_observer=FakeAudioObserver(SocialAudioObservation()),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            coordinator.tick()
+            clock.now = 21.0 * 60.0
+            pir_monitor.events = [True]
+            pir_monitor.level = True
+            coordinator.tick()
+            clock.now = (21.0 * 60.0) + 10.0
+            pir_monitor.level = False
+            coordinator.tick()
+
+            events = runtime.ops_events.tail(limit=20)
+
+        self.assertEqual(handled, ["person_returned"])
+        trigger_events = [entry for entry in events if entry.get("event") == "proactive_trigger_detected"]
+        self.assertEqual(len(trigger_events), 1)
+        self.assertEqual(trigger_events[0]["data"]["trigger"], "person_returned")
+        self.assertIn("Wie geht's dir?", trigger_events[0]["data"]["prompt"])
+        observation_events = [entry for entry in events if entry.get("event") == "proactive_observation"]
+        self.assertEqual(observation_events[-1]["data"]["person_visible"], False)
+        self.assertEqual(observation_events[-1]["data"]["inspected"], False)
 
     def test_build_default_monitor_requires_pir(self) -> None:
         config = TwinrConfig(proactive_enabled=True)

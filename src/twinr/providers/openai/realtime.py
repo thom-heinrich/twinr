@@ -4,12 +4,14 @@ import asyncio
 import base64
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.personality import load_personality_instructions, merge_instructions
 from twinr.ops.usage import TokenUsage, extract_model_name, extract_token_usage
-from twinr.provider.openai.backend import _should_send_project_header
+from twinr.providers.openai.backend import _should_send_project_header
 
 _DEFAULT_REALTIME_INSTRUCTIONS = (
     "Speak in clear, warm, natural standard German. "
@@ -17,6 +19,8 @@ _DEFAULT_REALTIME_INSTRUCTIONS = (
     "Do not use an English accent. "
     "If the user explicitly asks for a printout, use the print_receipt tool with a short focus hint and optional exact text. "
     "If the user asks for any current, external, or otherwise freshness-sensitive information that benefits from web research, first say one short German sentence that you are checking the web and that this may take a moment, then call the search_live_info tool. "
+    "If the user asks to be reminded later, asks you to set a timer, or says things like erinnere mich, remind me, timer, wecker, or alarm, use the schedule_reminder tool. "
+    "For schedule_reminder you must resolve relative times like heute, morgen, uebermorgen, this evening, in ten minutes, and next Monday against the local date/time context and pass due_at as an absolute ISO 8601 datetime with timezone offset. "
     "If the user explicitly asks you to remember an important fact for future turns, use the remember_memory tool. "
     "If the user explicitly asks you to change your future speaking style or behavior, use the update_personality tool. "
     "If the user explicitly asks you to remember a stable user-profile fact or preference, use the update_user_profile tool. "
@@ -349,6 +353,7 @@ class OpenAIRealtimeSession:
         return merge_instructions(
             self._resolve_base_instructions(),
             _DEFAULT_REALTIME_INSTRUCTIONS,
+            self._reminder_time_context(),
             self.config.openai_realtime_instructions,
         ) or _DEFAULT_REALTIME_INSTRUCTIONS
 
@@ -413,6 +418,44 @@ class OpenAIRealtimeSession:
                             },
                         },
                         "required": ["question"],
+                        "additionalProperties": False,
+                    },
+                }
+            )
+        if "schedule_reminder" in self._tool_handlers:
+            tools.append(
+                {
+                    "type": "function",
+                    "name": "schedule_reminder",
+                    "description": (
+                        "Schedule a future reminder or timer when the user asks to be reminded later or to set a timer. "
+                        "Always send due_at as an absolute ISO 8601 local datetime with timezone offset."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "due_at": {
+                                "type": "string",
+                                "description": "Absolute local due time in ISO 8601 format, for example 2026-03-14T12:00:00+01:00.",
+                            },
+                            "summary": {
+                                "type": "string",
+                                "description": "Short summary of what Twinr should remind the user about.",
+                            },
+                            "details": {
+                                "type": "string",
+                                "description": "Optional extra detail to include when the reminder is spoken.",
+                            },
+                            "kind": {
+                                "type": "string",
+                                "description": "Short type such as reminder, timer, appointment, medication, task, or alarm.",
+                            },
+                            "original_request": {
+                                "type": "string",
+                                "description": "Optional short quote or paraphrase of the user's original reminder request.",
+                            },
+                        },
+                        "required": ["due_at", "summary"],
                         "additionalProperties": False,
                     },
                 }
@@ -542,6 +585,19 @@ class OpenAIRealtimeSession:
                 }
             )
         return tools
+
+    def _reminder_time_context(self) -> str:
+        try:
+            zone = ZoneInfo(self.config.local_timezone_name)
+            timezone_name = self.config.local_timezone_name
+        except Exception:
+            zone = ZoneInfo("UTC")
+            timezone_name = "UTC"
+        now = datetime.now(zone)
+        return (
+            "Local date/time context for resolving reminders and timers: "
+            f"{now.strftime('%A, %Y-%m-%d %H:%M:%S %z')} ({timezone_name})."
+        )
 
     def _format_error(self, event: Any) -> str:
         error = getattr(event, "error", None)

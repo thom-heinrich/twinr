@@ -133,7 +133,8 @@ providers:
     default_openai_voice: sage
     input_audio_format: pcm16_24khz_mono
     output_audio_format: pcm16_24khz_mono
-    web_search_capable: false
+    web_search_capable: true
+    reminder_tool_capable: true
     follow_up_listening: true
     audible_listen_beep: true
   meta_llm:
@@ -177,7 +178,9 @@ memory:
     persistence:
       runtime_snapshot_path: state/runtime-state.json
       durable_memory_markdown_path: state/MEMORY.md
+      reminder_store_path: state/reminders.json
       durable_memory_write_rule: explicit_user_request_only
+      reminder_write_rule: explicit_user_request_only_via_tool
       managed_profile_updates:
         - personality/USER.md
         - personality/PERSONALITY.md
@@ -266,10 +269,9 @@ repository_layout:
   state: Runtime-generated persistent snapshot and durable remembered facts
   src/twinr/agent: Python package for agent orchestration
   src/twinr/display: Python package for Waveshare display adapters
-  src/twinr/provider: Python package for provider adapters
-  src/twinr/provider/openai: OpenAI provider implementation
-  src/twinr/providers: Legacy import wrappers
-  src/twinr/memory: Python package for memory implementations
+  src/twinr/providers: Python package for provider adapters
+  src/twinr/providers/openai: OpenAI provider implementation
+  src/twinr/memory: Python package for on-device memory, durable memory, and reminders
   src/twinr/memory/on_device: Rolling local conversation memory
   src/twinr/hardware: Python package for hardware adapters
   test: Tests and validation

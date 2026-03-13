@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.personality import load_personality_instructions, merge_instructions
+from twinr.memory.reminders import ReminderEntry, format_due_label
 from twinr.ops.usage import TokenUsage, extract_model_name, extract_token_usage
 
 PRINT_FORMATTER_INSTRUCTIONS = (
@@ -39,6 +40,14 @@ SEARCH_AGENT_INSTRUCTIONS = (
     "Answer in at most two short sentences whenever possible. "
     "Keep the spoken answer concise, practical, and trustworthy. "
     "If important uncertainty remains, say so briefly."
+)
+REMINDER_DELIVERY_INSTRUCTIONS = (
+    "You are Twinr speaking a due reminder or timer out loud. "
+    "Respond in clear, warm, natural standard German for a senior user. "
+    "Use only the provided reminder facts. "
+    "Keep the spoken reminder short, concrete, and calm. "
+    "Usually one or two short sentences are enough. "
+    "Say that this is a reminder, but do not mention system prompts, tools, or internal reasoning."
 )
 STT_MODEL_FALLBACKS = ("whisper-1",)
 TTS_MODEL_FALLBACKS = ("tts-1", "tts-1-hd")
@@ -433,6 +442,43 @@ class OpenAIBackend:
             raise RuntimeError("No model candidates were available for the OpenAI request")
 
         return iterator()
+
+    def phrase_due_reminder_with_metadata(
+        self,
+        reminder: ReminderEntry,
+        *,
+        now: datetime | None = None,
+    ) -> OpenAITextResponse:
+        current_time = now or datetime.now(ZoneInfo(self.config.local_timezone_name))
+        prompt_parts = [
+            "A stored Twinr reminder is due now.",
+            f"Current local time: {format_due_label(current_time, timezone_name=self.config.local_timezone_name)}",
+            f"Scheduled reminder time: {format_due_label(reminder.due_at, timezone_name=self.config.local_timezone_name)}",
+            f"Reminder kind: {reminder.kind}",
+            f"Reminder summary: {reminder.summary}",
+        ]
+        if reminder.details:
+            prompt_parts.append(f"Reminder details: {reminder.details}")
+        if reminder.original_request:
+            prompt_parts.append(f"Original user request: {reminder.original_request}")
+        prompt_parts.append("Speak the reminder now.")
+        request = self._build_response_request(
+            "\n".join(prompt_parts),
+            instructions=merge_instructions(self._resolve_base_instructions(), REMINDER_DELIVERY_INSTRUCTIONS),
+            allow_web_search=False,
+            model=self.config.default_model,
+            reasoning_effort="low",
+            max_output_tokens=140,
+        )
+        response = self._client.responses.create(**request)
+        return OpenAITextResponse(
+            text=self._extract_output_text(response),
+            response_id=getattr(response, "id", None),
+            request_id=getattr(response, "_request_id", None),
+            model=extract_model_name(response, request["model"]),
+            token_usage=extract_token_usage(response),
+            used_web_search=False,
+        )
 
     def _build_tts_request(
         self,

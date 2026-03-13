@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_FILE="${ROOT_DIR}/.env"
 VENDOR_DIR="${ROOT_DIR}/hardware/display/vendor"
+PYTHON_BIN=""
 SPI_BUS=0
 SPI_DEVICE=0
 CS_GPIO=8
@@ -28,6 +29,23 @@ Options:
   --skip-test           Skip the final display smoke test
   --help                Show this help text
 EOF
+}
+
+resolve_python_bin() {
+  if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
+    PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
+  elif command -v python3.11 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3.11)"
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  else
+    echo "Python 3.11+ not found. Create ${ROOT_DIR}/.venv or install python3.11." >&2
+    exit 1
+  fi
+  "$PYTHON_BIN" - <<'PY' || { echo "Twinr requires Python 3.11+ for setup_display.sh" >&2; exit 1; }
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
 }
 
 while [[ $# -gt 0 ]]; do
@@ -81,13 +99,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 mkdir -p "${VENDOR_DIR}/waveshare_epd"
+resolve_python_bin
 
 export ROOT_DIR ENV_FILE VENDOR_DIR SPI_BUS SPI_DEVICE CS_GPIO DC_GPIO RESET_GPIO BUSY_GPIO
 
 apt-get update
 apt-get install -y python3-pil python3-spidev python3-gpiozero python3-lgpio python3-libgpiod
 
-python3 <<'PY'
+"$PYTHON_BIN" <<'PY'
 from pathlib import Path
 import os
 import re
@@ -134,7 +153,7 @@ upsert_env() {
 }
 
 upsert_env "TWINR_DISPLAY_DRIVER" "waveshare_4in2_v2"
-upsert_env "TWINR_DISPLAY_VENDOR_DIR" "$(python3 - <<'PY'
+upsert_env "TWINR_DISPLAY_VENDOR_DIR" "$("$PYTHON_BIN" - <<'PY'
 from pathlib import Path
 import os
 root = Path(os.environ["ROOT_DIR"]).resolve()
@@ -158,11 +177,11 @@ cd "${ROOT_DIR}"
 if [[ -x "${ROOT_DIR}/.venv/bin/pip" ]]; then
   "${ROOT_DIR}/.venv/bin/pip" install -e .
 else
-  python3 -m pip install -e .
+  "$PYTHON_BIN" -m pip install -e .
 fi
 
 if [[ "${SKIP_TEST}" -eq 0 ]]; then
-  timeout 120 python3 hardware/display/display_test.py --env-file "${ENV_FILE}"
+  timeout 120 "$PYTHON_BIN" hardware/display/display_test.py --env-file "${ENV_FILE}"
 fi
 
 echo "Display driver installed in ${VENDOR_DIR}/waveshare_epd"

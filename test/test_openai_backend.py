@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
-from twinr.providers.openai_backend import OpenAIBackend, OpenAIImageInput, _default_client_factory
+from twinr.providers.openai.backend import OpenAIBackend, OpenAIImageInput, _default_client_factory
 
 
 def _fake_usage(
@@ -237,11 +237,31 @@ class OpenAIBackendTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            (state_dir / "reminders.json").write_text(
+                (
+                    '{\n'
+                    '  "entries": [\n'
+                    '    {\n'
+                    '      "reminder_id": "REM-20260314T120000000000Z",\n'
+                    '      "kind": "reminder",\n'
+                    '      "summary": "Muell rausstellen",\n'
+                    '      "due_at": "2026-03-14T12:00:00+01:00",\n'
+                    '      "created_at": "2026-03-13T12:00:00+01:00",\n'
+                    '      "updated_at": "2026-03-13T12:00:00+01:00",\n'
+                    '      "source": "tool",\n'
+                    '      "delivery_attempts": 0\n'
+                    '    }\n'
+                    '  ]\n'
+                    '}\n'
+                ),
+                encoding="utf-8",
+            )
             config = replace(
                 self.config,
                 project_root=temp_dir,
                 personality_dir="personality",
                 memory_markdown_path=str(state_dir / "MEMORY.md"),
+                reminder_store_path=str(state_dir / "reminders.json"),
             )
             backend = OpenAIBackend(config=config, client=self.client)
             (personality_dir / "PERSONALITY.md").write_text("Updated style context", encoding="utf-8")
@@ -252,7 +272,9 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertIn("SYSTEM:\nSystem context", request["instructions"])
         self.assertIn("PERSONALITY:\nUpdated style context", request["instructions"])
         self.assertIn("MEMORY:\nDurable remembered items explicitly saved for future turns:", request["instructions"])
+        self.assertIn("REMINDERS:\nScheduled reminders and timers:", request["instructions"])
         self.assertIn("04151 8810", request["instructions"])
+        self.assertIn("Muell rausstellen", request["instructions"])
 
     def test_respond_to_images_sends_multiple_input_images(self) -> None:
         response = self.backend.respond_to_images_with_metadata(
@@ -332,6 +354,31 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(chunks, [b"AU", b"DIO"])
         self.assertEqual(self.speech.calls[0]["model"], "gpt-4o-mini-tts")
         self.assertEqual(self.speech.calls[0]["instructions"], "Speak in natural German.")
+
+    def test_phrase_due_reminder_builds_short_reminder_request(self) -> None:
+        from twinr.memory.reminders import ReminderEntry, now_in_timezone
+
+        due_at = now_in_timezone("Europe/Berlin")
+        reminder = ReminderEntry(
+            reminder_id="REM-1",
+            kind="appointment",
+            summary="Arzttermin",
+            details="Bei Dr. Meyer",
+            due_at=due_at,
+            created_at=due_at,
+            updated_at=due_at,
+        )
+
+        response = self.backend.phrase_due_reminder_with_metadata(reminder)
+
+        self.assertEqual(response.text, "Backend answer")
+        request = self.responses.calls[-1]
+        self.assertEqual(request["model"], "gpt-5.2")
+        self.assertEqual(request["reasoning"], {"effort": "low"})
+        self.assertIn("A stored Twinr reminder is due now.", request["input"][0]["content"][0]["text"])
+        self.assertIn("Reminder summary: Arzttermin", request["input"][0]["content"][0]["text"])
+        self.assertIn("Reminder details: Bei Dr. Meyer", request["input"][0]["content"][0]["text"])
+        self.assertIn("speaking a due reminder", request["instructions"])
 
     def test_respond_streaming_emits_text_deltas_and_returns_metadata(self) -> None:
         deltas: list[str] = []

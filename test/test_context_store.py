@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
+from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 
 
 class ContextStoreTests(unittest.TestCase):

@@ -145,7 +145,11 @@ class TwinrConfig:
     web_port: int = 1337
     runtime_state_path: str = "/tmp/twinr-runtime-state.json"
     memory_markdown_path: str = "state/MEMORY.md"
+    reminder_store_path: str = "state/reminders.json"
     restore_runtime_state_on_startup: bool = False
+    reminder_poll_interval_s: float = 1.0
+    reminder_retry_delay_s: float = 90.0
+    reminder_max_entries: int = 48
     speech_pause_ms: int = 1200
     memory_max_turns: int = 12
     memory_keep_recent: int = 6
@@ -195,6 +199,10 @@ class TwinrConfig:
     @property
     def pir_enabled(self) -> bool:
         return self.pir_motion_gpio is not None
+
+    @property
+    def local_timezone_name(self) -> str:
+        return (self.openai_web_search_timezone or "Europe/Berlin").strip() or "Europe/Berlin"
 
     @classmethod
     def from_env(cls, env_path: str | Path = ".env") -> "TwinrConfig":
@@ -302,10 +310,18 @@ class TwinrConfig:
                 str(project_root / "state" / "MEMORY.md"),
             )
             or str(project_root / "state" / "MEMORY.md"),
+            reminder_store_path=get_value(
+                "TWINR_REMINDER_STORE_PATH",
+                str(project_root / "state" / "reminders.json"),
+            )
+            or str(project_root / "state" / "reminders.json"),
             restore_runtime_state_on_startup=_parse_bool(
                 get_value("TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP"),
                 False,
             ),
+            reminder_poll_interval_s=_parse_float(get_value("TWINR_REMINDER_POLL_INTERVAL_S"), 1.0),
+            reminder_retry_delay_s=_parse_float(get_value("TWINR_REMINDER_RETRY_DELAY_S"), 90.0),
+            reminder_max_entries=int(get_value("TWINR_REMINDER_MAX_ENTRIES", "48") or "48"),
             speech_pause_ms=int(get_value("TWINR_SPEECH_PAUSE_MS", "1200") or "1200"),
             memory_max_turns=int(get_value("TWINR_MEMORY_MAX_TURNS", "12") or "12"),
             memory_keep_recent=int(get_value("TWINR_MEMORY_KEEP_RECENT", "6") or "6"),

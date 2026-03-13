@@ -79,7 +79,11 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_WEB_HOST=0.0.0.0",
                         "TWINR_RUNTIME_STATE_PATH=/tmp/twinr-state-test.json",
                         "TWINR_MEMORY_MARKDOWN_PATH=/tmp/twinr-memory-test.md",
+                        "TWINR_REMINDER_STORE_PATH=/tmp/twinr-reminders-test.json",
                         "TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP=true",
+                        "TWINR_REMINDER_POLL_INTERVAL_S=2.5",
+                        "TWINR_REMINDER_RETRY_DELAY_S=45.0",
+                        "TWINR_REMINDER_MAX_ENTRIES=72",
                         "TWINR_GREEN_BUTTON_GPIO=17",
                         "TWINR_YELLOW_BUTTON_GPIO=27",
                         "TWINR_PIR_MOTION_GPIO=26",
@@ -179,7 +183,11 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.web_host, "0.0.0.0")
         self.assertEqual(config.runtime_state_path, "/tmp/twinr-state-test.json")
         self.assertEqual(config.memory_markdown_path, "/tmp/twinr-memory-test.md")
+        self.assertEqual(config.reminder_store_path, "/tmp/twinr-reminders-test.json")
         self.assertTrue(config.restore_runtime_state_on_startup)
+        self.assertEqual(config.reminder_poll_interval_s, 2.5)
+        self.assertEqual(config.reminder_retry_delay_s, 45.0)
+        self.assertEqual(config.reminder_max_entries, 72)
         self.assertEqual(config.green_button_gpio, 17)
         self.assertEqual(config.yellow_button_gpio, 27)
         self.assertEqual(config.pir_motion_gpio, 26)

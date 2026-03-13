@@ -77,9 +77,12 @@ class FileBackedSetting:
     label: str
     value: str
     help_text: str = ""
+    tooltip_text: str = ""
     input_type: str = "text"
     options: tuple[tuple[str, str], ...] = ()
     placeholder: str = ""
+    rows: int = 4
+    wide: bool = False
     secret: bool = False
 
 

@@ -8,9 +8,10 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.memory.reminders import now_in_timezone
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority
-from twinr.providers.openai_backend import OpenAITextResponse
-from twinr.providers.openai_realtime import OpenAIRealtimeTurn
+from twinr.providers.openai import OpenAITextResponse
+from twinr.providers.openai.realtime import OpenAIRealtimeTurn
 from twinr.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.runtime import TwinrRuntime
 
@@ -69,6 +70,7 @@ class FakePrintBackend:
         self.vision_calls: list[tuple[str, list[object], tuple[tuple[str, str], ...] | None, bool | None]] = []
         self.search_sleep_s = 0.0
         self.synthesize_calls: list[str] = []
+        self.reminder_calls: list[object] = []
 
     def compose_print_job_with_metadata(
         self,
@@ -117,6 +119,15 @@ class FakePrintBackend:
     def synthesize_stream(self, text: str):
         self.synthesize_calls.append(text)
         yield b"PCM"
+
+    def phrase_due_reminder_with_metadata(self, reminder):
+        self.reminder_calls.append(reminder)
+        return OpenAITextResponse(
+            text=f"Erinnerung: {reminder.summary}",
+            response_id="resp_reminder_1",
+            request_id="req_reminder_1",
+            used_web_search=False,
+        )
 
 
 class FakeRecorder:
@@ -440,6 +451,60 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime.memory.ledger[-1].kind, "fact")
         self.assertIn("memory_tool_call=true", lines)
 
+    def test_schedule_reminder_tool_call_writes_reminder_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reminder_path = Path(temp_dir) / "state" / "reminders.json"
+            config = TwinrConfig(
+                project_root=temp_dir,
+                reminder_store_path=str(reminder_path),
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+
+            result = loop._handle_schedule_reminder_tool_call(
+                {
+                    "due_at": "2026-03-14T12:00:00+01:00",
+                    "summary": "Arzttermin",
+                    "details": "Bei Dr. Meyer",
+                    "kind": "appointment",
+                }
+            )
+
+            reminder_text = reminder_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "scheduled")
+        self.assertIn("Arzttermin", reminder_text)
+        self.assertIn("appointment", reminder_text)
+        self.assertEqual(loop.runtime.memory.ledger[-1].kind, "reminder")
+        self.assertIn("reminder_tool_call=true", lines)
+
+    def test_idle_loop_delivers_due_reminder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                reminder_store_path=str(Path(temp_dir) / "state" / "reminders.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                reminder_poll_interval_s=0.0,
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            loop.runtime.schedule_reminder(
+                due_at=now_in_timezone(config.local_timezone_name).isoformat(),
+                summary="Medikament nehmen",
+                kind="medication",
+                source="test",
+            )
+
+            delivered = loop._maybe_deliver_due_reminder()
+            stored_entries = loop.runtime.reminder_store.load_entries()
+
+        self.assertTrue(delivered)
+        self.assertEqual(len(print_backend.reminder_calls), 1)
+        self.assertEqual(print_backend.synthesize_calls, ["Erinnerung: Medikament nehmen"])
+        self.assertEqual(player.played, [b"PCM"])
+        self.assertIn("reminder_delivered=true", lines)
+        self.assertTrue(stored_entries[0].delivered)
+
     def test_update_user_profile_tool_call_updates_user_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             personality_dir = Path(temp_dir) / "personality"
@@ -579,6 +644,9 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(player.played, [b"PCM"])
         self.assertIn("social_trigger=person_returned", lines)
         self.assertTrue(any(line.startswith("timing_social_tts_ms=") for line in lines))
+        social_events = [entry for entry in loop.runtime.ops_events.tail(limit=20) if entry["event"] == "social_trigger_prompted"]
+        self.assertEqual(len(social_events), 1)
+        self.assertEqual(social_events[0]["data"]["prompt"], "Hey Thom, schön dich zu sehen. Wie geht's dir?")
 
     def test_social_trigger_is_skipped_when_runtime_is_busy(self) -> None:
         loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()
@@ -597,6 +665,9 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertFalse(spoke)
         self.assertEqual(player.played, [])
         self.assertIn("social_trigger_skipped=busy", lines)
+        social_events = [entry for entry in loop.runtime.ops_events.tail(limit=20) if entry["event"] == "social_trigger_skipped"]
+        self.assertEqual(len(social_events), 1)
+        self.assertEqual(social_events[0]["data"]["prompt"], "Schön, dich zu sehen. Was möchtest du machen?")
 
     def test_run_opens_and_closes_proactive_monitor(self) -> None:
         button_monitor = FakeIdleButtonMonitor()

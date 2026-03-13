@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ENV_FILE="${TWINR_ENV_FILE:-$REPO_ROOT/.env}"
+PYTHON_BIN=""
 DEVICE_MATCH="${TWINR_AUDIO_DEVICE_MATCH:-Jabra}"
 CARD_INDEX=""
 DEVICE_INDEX=0
@@ -43,6 +44,22 @@ HELP
 fail() {
   printf 'error: %s\n' "$*" >&2
   exit 1
+}
+
+resolve_python_bin() {
+  if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
+  elif command -v python3.11 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3.11)"
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  else
+    fail "Python 3.11+ not found. Create $REPO_ROOT/.venv or install python3.11."
+  fi
+  "$PYTHON_BIN" - <<'PY' || fail "Twinr requires Python 3.11+ for setup_audio.sh"
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
 }
 
 while [[ $# -gt 0 ]]; do
@@ -111,7 +128,7 @@ done
 
 command -v aplay >/dev/null 2>&1 || fail "aplay not found"
 command -v arecord >/dev/null 2>&1 || fail "arecord not found"
-command -v python3 >/dev/null 2>&1 || fail "python3 not found"
+resolve_python_bin
 [[ "$DEVICE_INDEX" =~ ^[0-9]+$ ]] || fail "--device-index must be an integer"
 [[ "$PROACTIVE_DEVICE_INDEX" =~ ^[0-9]+$ ]] || fail "--proactive-device-index must be an integer"
 if [[ -n "$PROACTIVE_SAMPLE_MS" ]]; then
@@ -158,7 +175,7 @@ fi
 if [[ -n "$PROACTIVE_DEVICE" ]]; then
   mkdir -p "$(dirname "$ENV_FILE")"
   touch "$ENV_FILE"
-  python3 - <<PY
+  "$PYTHON_BIN" - <<PY
 from pathlib import Path
 
 path = Path(r'''$ENV_FILE''')
@@ -249,7 +266,7 @@ if [[ -n "$PROACTIVE_DEVICE" ]]; then
 fi
 
 if [[ "$RUN_TEST" -eq 1 ]]; then
-  python3 - <<'PY' >/tmp/twinr_audio_test.wav
+  "$PYTHON_BIN" - <<'PY' >/tmp/twinr_audio_test.wav
 import math
 import struct
 import sys

@@ -8,8 +8,9 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.memory.reminders import now_in_timezone
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority
-from twinr.providers.openai_backend import OpenAIImageInput, OpenAITextResponse
+from twinr.providers.openai import OpenAIImageInput, OpenAITextResponse
 from twinr.runner import TwinrHardwareLoop
 from twinr.runtime import TwinrRuntime
 
@@ -23,6 +24,7 @@ class FakeBackend:
         ] = []
         self.synthesize_calls: list[str] = []
         self.print_calls: list[tuple[tuple[tuple[str, str], ...] | None, str | None, str | None, str]] = []
+        self.reminder_calls: list[object] = []
         self.transcript = "Hello Twinr"
         self.answer = "Hello back."
 
@@ -78,6 +80,15 @@ class FakeBackend:
     ) -> OpenAITextResponse:
         self.print_calls.append((conversation, focus_hint, direct_text, request_source))
         return OpenAITextResponse(text="HELLO BACK")
+
+    def phrase_due_reminder_with_metadata(self, reminder) -> OpenAITextResponse:
+        self.reminder_calls.append(reminder)
+        return OpenAITextResponse(
+            text=f"Erinnerung: {reminder.summary}",
+            response_id="resp_reminder_1",
+            request_id="req_reminder_1",
+            used_web_search=False,
+        )
 
 
 class FakeRecorder:
@@ -223,6 +234,33 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertIn("status=printing", lines)
         self.assertEqual(lines[-1], "status=waiting")
 
+    def test_idle_loop_delivers_due_reminder(self) -> None:
+        backend = FakeBackend()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                reminder_store_path=str(Path(temp_dir) / "state" / "reminders.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                reminder_poll_interval_s=0.0,
+            )
+            loop, lines, _recorder, player, _printer = self.make_loop(backend=backend, config=config)
+            loop.runtime.schedule_reminder(
+                due_at=now_in_timezone(config.local_timezone_name).isoformat(),
+                summary="Tabletten nehmen",
+                kind="medication",
+                source="test",
+            )
+
+            delivered = loop._maybe_deliver_due_reminder()
+            stored_entries = loop.runtime.reminder_store.load_entries()
+
+        self.assertTrue(delivered)
+        self.assertEqual(len(backend.reminder_calls), 1)
+        self.assertEqual(backend.synthesize_calls, ["Erinnerung: Tabletten nehmen"])
+        self.assertEqual(player.played, [b"RIFF"])
+        self.assertIn("reminder_delivered=true", lines)
+        self.assertTrue(stored_entries[0].delivered)
+
     def test_errors_reset_runtime_to_waiting(self) -> None:
         loop, lines, _recorder, _player, _printer = self.make_loop(backend=FakeBackend())
 
@@ -309,6 +347,9 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertIn("status=answering", lines)
         self.assertIn("social_trigger=attention_window", lines)
         self.assertIn("social_prompt=Kann ich dir bei etwas helfen?", lines)
+        social_events = [entry for entry in loop.runtime.ops_events.tail(limit=20) if entry["event"] == "social_trigger_prompted"]
+        self.assertEqual(len(social_events), 1)
+        self.assertEqual(social_events[0]["data"]["prompt"], "Kann ich dir bei etwas helfen?")
 
     def test_social_trigger_is_skipped_when_runtime_is_busy(self) -> None:
         backend = FakeBackend()
@@ -328,6 +369,9 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertFalse(spoke)
         self.assertEqual(player.played, [])
         self.assertIn("social_trigger_skipped=busy", lines)
+        social_events = [entry for entry in loop.runtime.ops_events.tail(limit=20) if entry["event"] == "social_trigger_skipped"]
+        self.assertEqual(len(social_events), 1)
+        self.assertEqual(social_events[0]["data"]["prompt"], "Möchtest du mir etwas zeigen?")
 
     def test_run_opens_and_closes_proactive_monitor(self) -> None:
         backend = FakeBackend()
