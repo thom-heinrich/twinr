@@ -69,6 +69,26 @@ class TwinrRuntimeTests(unittest.TestCase):
         self.assertIn("Verified web lookup", memory.turns[0].content)
         self.assertIn("Morgen wird es 11 Grad und windig.", memory.turns[0].content)
 
+    def test_memory_reconfigure_expands_summary_and_preserves_recent_turns(self) -> None:
+        memory = OnDeviceMemory(max_turns=6, keep_recent=3)
+        for index in range(5):
+            memory.remember("user", f"Frage {index}")
+            memory.remember("assistant", f"Antwort {index}")
+        for index in range(5):
+            memory.remember_search(
+                question=f"Suche {index}",
+                answer=f"Antwort Suche {index}",
+                sources=(f"https://example.com/{index}",),
+            )
+
+        memory.reconfigure(max_turns=20, keep_recent=10)
+
+        self.assertEqual(memory.max_turns, 20)
+        self.assertEqual(memory.keep_recent, 10)
+        self.assertEqual(len(memory.raw_tail), 6)
+        self.assertEqual(len(memory.search_results), 4)
+        self.assertGreaterEqual(memory.turns[0].content.count("Verified web lookup"), 3)
+
     def test_tool_print_can_resume_answering(self) -> None:
         runtime = TwinrRuntime(config=TwinrConfig())
 

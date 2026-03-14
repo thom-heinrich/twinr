@@ -149,7 +149,7 @@ a, button, input, select, textarea {
   justify-content: flex-end;
 }
 
-h1, h2 {
+h1, h2, h3 {
   margin: 0;
   line-height: 1.15;
 }
@@ -161,6 +161,11 @@ h1 {
 
 h2 {
   font-size: var(--font-size-xl);
+  margin-bottom: var(--space-2);
+}
+
+h3 {
+  font-size: var(--font-size-lg);
   margin-bottom: var(--space-2);
 }
 
@@ -482,6 +487,10 @@ button {
   justify-content: flex-start;
 }
 
+.inline-form {
+  margin: 0;
+}
+
 .stack {
   display: grid;
   gap: 0;
@@ -696,6 +705,10 @@ button {
 .panel-subsection {
   display: grid;
   gap: var(--space-4);
+}
+
+.subsection-title {
+  margin-bottom: 0;
 }
 
 .panel-subsection-spaced {
