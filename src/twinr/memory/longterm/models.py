@@ -1,0 +1,373 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Mapping
+
+
+LONGTERM_MEMORY_OBJECT_SCHEMA = "twinr_memory_object"
+LONGTERM_MEMORY_OBJECT_VERSION = 1
+LONGTERM_MEMORY_CONFLICT_SCHEMA = "twinr_memory_conflict"
+LONGTERM_MEMORY_CONFLICT_VERSION = 1
+LONGTERM_TURN_EXTRACTION_SCHEMA = "twinr_turn_extraction"
+LONGTERM_TURN_EXTRACTION_VERSION = 1
+LONGTERM_CONSOLIDATION_SCHEMA = "twinr_memory_consolidation"
+LONGTERM_CONSOLIDATION_VERSION = 1
+
+LONGTERM_MEMORY_STATUSES = frozenset(
+    {
+        "candidate",
+        "active",
+        "uncertain",
+        "superseded",
+        "invalid",
+        "expired",
+    }
+)
+LONGTERM_MEMORY_SENSITIVITY = frozenset({"low", "normal", "private", "medical", "sensitive"})
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _normalize_text(value: str | None) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def _drop_none(payload: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _mapping_dict(value: Mapping[str, object] | None) -> dict[str, object] | None:
+    if value is None:
+        return None
+    return dict(value)
+
+
+def _tuple_str(value: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(str(item) for item in value if str(item).strip())
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermConversationTurn:
+    transcript: str
+    response: str
+    source: str = "conversation"
+    created_at: datetime = field(default_factory=_utcnow)
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermEnqueueResult:
+    accepted: bool
+    pending_count: int
+    dropped_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermMemoryContext:
+    subtext_context: str | None = None
+    episodic_context: str | None = None
+    graph_context: str | None = None
+
+    def system_messages(self) -> tuple[str, ...]:
+        messages: list[str] = []
+        if self.subtext_context:
+            messages.append(self.subtext_context)
+        if self.episodic_context:
+            messages.append(self.episodic_context)
+        if self.graph_context:
+            messages.append(self.graph_context)
+        return tuple(messages)
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermSourceRefV1:
+    source_type: str
+    event_ids: tuple[str, ...] = ()
+    speaker: str | None = None
+    modality: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.source_type):
+            raise ValueError("source_type is required.")
+        if self.speaker is not None and not _normalize_text(self.speaker):
+            raise ValueError("speaker cannot be blank when provided.")
+        if self.modality is not None and not _normalize_text(self.modality):
+            raise ValueError("modality cannot be blank when provided.")
+
+    def to_payload(self) -> dict[str, object]:
+        return _drop_none(
+            {
+                "type": self.source_type,
+                "event_ids": list(self.event_ids) if self.event_ids else None,
+                "speaker": self.speaker,
+                "modality": self.modality,
+            }
+        )
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "LongTermSourceRefV1":
+        event_ids = payload.get("event_ids")
+        return cls(
+            source_type=str(payload.get("type", "")),
+            event_ids=tuple(str(item) for item in event_ids if isinstance(item, str)) if isinstance(event_ids, list) else (),
+            speaker=str(payload["speaker"]) if payload.get("speaker") is not None else None,
+            modality=str(payload["modality"]) if payload.get("modality") is not None else None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermGraphEdgeCandidateV1:
+    source_ref: str
+    edge_type: str
+    target_ref: str
+    confidence: float = 0.5
+    confirmed_by_user: bool = False
+    valid_from: str | None = None
+    valid_to: str | None = None
+    attributes: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.source_ref):
+            raise ValueError("source_ref is required.")
+        if not _normalize_text(self.edge_type):
+            raise ValueError("edge_type is required.")
+        if not _normalize_text(self.target_ref):
+            raise ValueError("target_ref is required.")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0.")
+
+    def to_payload(self) -> dict[str, object]:
+        return _drop_none(
+            {
+                "source_ref": self.source_ref,
+                "edge_type": self.edge_type,
+                "target_ref": self.target_ref,
+                "confidence": self.confidence,
+                "confirmed_by_user": self.confirmed_by_user,
+                "valid_from": self.valid_from,
+                "valid_to": self.valid_to,
+                "attributes": _mapping_dict(self.attributes),
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermMemoryObjectV1:
+    memory_id: str
+    kind: str
+    summary: str
+    source: LongTermSourceRefV1
+    details: str | None = None
+    status: str = "candidate"
+    confidence: float = 0.5
+    canonical_language: str = "en"
+    confirmed_by_user: bool = False
+    sensitivity: str = "normal"
+    slot_key: str | None = None
+    value_key: str | None = None
+    valid_from: str | None = None
+    valid_to: str | None = None
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
+    attributes: Mapping[str, object] | None = None
+    conflicts_with: tuple[str, ...] = ()
+    supersedes: tuple[str, ...] = ()
+    schema: str = LONGTERM_MEMORY_OBJECT_SCHEMA
+    version: int = LONGTERM_MEMORY_OBJECT_VERSION
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.memory_id):
+            raise ValueError("memory_id is required.")
+        if not _normalize_text(self.kind):
+            raise ValueError("kind is required.")
+        if not _normalize_text(self.summary):
+            raise ValueError("summary is required.")
+        if self.status not in LONGTERM_MEMORY_STATUSES:
+            raise ValueError(f"status must be one of: {', '.join(sorted(LONGTERM_MEMORY_STATUSES))}.")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0.")
+        if not _normalize_text(self.canonical_language):
+            raise ValueError("canonical_language is required.")
+        if self.sensitivity not in LONGTERM_MEMORY_SENSITIVITY:
+            raise ValueError(f"sensitivity must be one of: {', '.join(sorted(LONGTERM_MEMORY_SENSITIVITY))}.")
+        if self.schema != LONGTERM_MEMORY_OBJECT_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_MEMORY_OBJECT_SCHEMA!r}.")
+        if self.version != LONGTERM_MEMORY_OBJECT_VERSION:
+            raise ValueError(f"version must be {LONGTERM_MEMORY_OBJECT_VERSION}.")
+
+    def to_payload(self) -> dict[str, object]:
+        return _drop_none(
+            {
+                "schema": self.schema,
+                "version": self.version,
+                "memory_id": self.memory_id,
+                "kind": self.kind,
+                "summary": self.summary,
+                "details": self.details,
+                "status": self.status,
+                "confidence": self.confidence,
+                "canonical_language": self.canonical_language,
+                "confirmed_by_user": self.confirmed_by_user,
+                "sensitivity": self.sensitivity,
+                "slot_key": self.slot_key,
+                "value_key": self.value_key,
+                "valid_from": self.valid_from,
+                "valid_to": self.valid_to,
+                "created_at": self.created_at.isoformat(),
+                "updated_at": self.updated_at.isoformat(),
+                "source": self.source.to_payload(),
+                "attributes": _mapping_dict(self.attributes),
+                "conflicts_with": list(self.conflicts_with) if self.conflicts_with else None,
+                "supersedes": list(self.supersedes) if self.supersedes else None,
+            }
+        )
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "LongTermMemoryObjectV1":
+        source_payload = payload.get("source")
+        if not isinstance(source_payload, Mapping):
+            raise ValueError("source payload is required.")
+        attributes = payload.get("attributes")
+        return cls(
+            memory_id=str(payload.get("memory_id", "")),
+            kind=str(payload.get("kind", "")),
+            summary=str(payload.get("summary", "")),
+            source=LongTermSourceRefV1.from_payload(source_payload),
+            details=str(payload["details"]) if payload.get("details") is not None else None,
+            status=str(payload.get("status", "candidate")),
+            confidence=float(payload.get("confidence", 0.5)),
+            canonical_language=str(payload.get("canonical_language", "en")),
+            confirmed_by_user=bool(payload.get("confirmed_by_user", False)),
+            sensitivity=str(payload.get("sensitivity", "normal")),
+            slot_key=str(payload["slot_key"]) if payload.get("slot_key") is not None else None,
+            value_key=str(payload["value_key"]) if payload.get("value_key") is not None else None,
+            valid_from=str(payload["valid_from"]) if payload.get("valid_from") is not None else None,
+            valid_to=str(payload["valid_to"]) if payload.get("valid_to") is not None else None,
+            created_at=datetime.fromisoformat(str(payload["created_at"])) if payload.get("created_at") else _utcnow(),
+            updated_at=datetime.fromisoformat(str(payload["updated_at"])) if payload.get("updated_at") else _utcnow(),
+            attributes=dict(attributes) if isinstance(attributes, Mapping) else None,
+            conflicts_with=_tuple_str(payload.get("conflicts_with") if isinstance(payload.get("conflicts_with"), list) else None),
+            supersedes=_tuple_str(payload.get("supersedes") if isinstance(payload.get("supersedes"), list) else None),
+            schema=str(payload.get("schema", LONGTERM_MEMORY_OBJECT_SCHEMA)),
+            version=int(payload.get("version", LONGTERM_MEMORY_OBJECT_VERSION)),
+        )
+
+    def with_updates(self, **changes: object) -> "LongTermMemoryObjectV1":
+        payload = self.to_payload()
+        payload.update(changes)
+        if "source" not in payload or not isinstance(payload["source"], Mapping):
+            payload["source"] = self.source.to_payload()
+        if "created_at" in payload and isinstance(payload["created_at"], datetime):
+            payload["created_at"] = payload["created_at"].isoformat()
+        if "updated_at" in payload and isinstance(payload["updated_at"], datetime):
+            payload["updated_at"] = payload["updated_at"].isoformat()
+        return LongTermMemoryObjectV1.from_payload(payload)
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermMemoryConflictV1:
+    slot_key: str
+    candidate_memory_id: str
+    existing_memory_ids: tuple[str, ...]
+    question: str
+    reason: str
+    schema: str = LONGTERM_MEMORY_CONFLICT_SCHEMA
+    version: int = LONGTERM_MEMORY_CONFLICT_VERSION
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.slot_key):
+            raise ValueError("slot_key is required.")
+        if not _normalize_text(self.candidate_memory_id):
+            raise ValueError("candidate_memory_id is required.")
+        if not self.existing_memory_ids:
+            raise ValueError("existing_memory_ids cannot be empty.")
+        if not _normalize_text(self.question):
+            raise ValueError("question is required.")
+        if not _normalize_text(self.reason):
+            raise ValueError("reason is required.")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "version": self.version,
+            "slot_key": self.slot_key,
+            "candidate_memory_id": self.candidate_memory_id,
+            "existing_memory_ids": list(self.existing_memory_ids),
+            "question": self.question,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermTurnExtractionV1:
+    turn_id: str
+    occurred_at: datetime
+    episode: LongTermMemoryObjectV1
+    candidate_objects: tuple[LongTermMemoryObjectV1, ...] = ()
+    graph_edges: tuple[LongTermGraphEdgeCandidateV1, ...] = ()
+    warnings: tuple[str, ...] = ()
+    schema: str = LONGTERM_TURN_EXTRACTION_SCHEMA
+    version: int = LONGTERM_TURN_EXTRACTION_VERSION
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.turn_id):
+            raise ValueError("turn_id is required.")
+        if self.schema != LONGTERM_TURN_EXTRACTION_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_TURN_EXTRACTION_SCHEMA!r}.")
+        if self.version != LONGTERM_TURN_EXTRACTION_VERSION:
+            raise ValueError(f"version must be {LONGTERM_TURN_EXTRACTION_VERSION}.")
+
+    def all_objects(self) -> tuple[LongTermMemoryObjectV1, ...]:
+        return (self.episode, *self.candidate_objects)
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermConsolidationResultV1:
+    turn_id: str
+    occurred_at: datetime
+    episodic_objects: tuple[LongTermMemoryObjectV1, ...]
+    durable_objects: tuple[LongTermMemoryObjectV1, ...]
+    deferred_objects: tuple[LongTermMemoryObjectV1, ...]
+    conflicts: tuple[LongTermMemoryConflictV1, ...]
+    graph_edges: tuple[LongTermGraphEdgeCandidateV1, ...]
+    schema: str = LONGTERM_CONSOLIDATION_SCHEMA
+    version: int = LONGTERM_CONSOLIDATION_VERSION
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.turn_id):
+            raise ValueError("turn_id is required.")
+        if self.schema != LONGTERM_CONSOLIDATION_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_CONSOLIDATION_SCHEMA!r}.")
+        if self.version != LONGTERM_CONSOLIDATION_VERSION:
+            raise ValueError(f"version must be {LONGTERM_CONSOLIDATION_VERSION}.")
+
+    @property
+    def clarification_needed(self) -> bool:
+        return bool(self.conflicts)
+
+
+__all__ = [
+    "LONGTERM_CONSOLIDATION_SCHEMA",
+    "LONGTERM_CONSOLIDATION_VERSION",
+    "LONGTERM_MEMORY_CONFLICT_SCHEMA",
+    "LONGTERM_MEMORY_CONFLICT_VERSION",
+    "LONGTERM_MEMORY_OBJECT_SCHEMA",
+    "LONGTERM_MEMORY_OBJECT_VERSION",
+    "LONGTERM_MEMORY_SENSITIVITY",
+    "LONGTERM_MEMORY_STATUSES",
+    "LONGTERM_TURN_EXTRACTION_SCHEMA",
+    "LONGTERM_TURN_EXTRACTION_VERSION",
+    "LongTermConsolidationResultV1",
+    "LongTermConversationTurn",
+    "LongTermEnqueueResult",
+    "LongTermGraphEdgeCandidateV1",
+    "LongTermMemoryConflictV1",
+    "LongTermMemoryContext",
+    "LongTermMemoryObjectV1",
+    "LongTermSourceRefV1",
+    "LongTermTurnExtractionV1",
+]

@@ -1,0 +1,278 @@
+{
+  "schema": {
+    "name": "twinr_graph",
+    "version": 1
+  },
+  "graph_id": "graph:user_main",
+  "subject_node_id": "user:main",
+  "created_at": "2026-03-14T10:00:00Z",
+  "updated_at": "2026-03-14T10:00:00Z",
+  "metadata": {
+    "kind": "personal_graph",
+    "fixture": "goldset_v1"
+  },
+  "nodes": [
+    {
+      "id": "user:main",
+      "type": "user",
+      "label": "Erika"
+    },
+    {
+      "id": "person:corinna_maier",
+      "type": "person",
+      "label": "Corinna Maier",
+      "aliases": [
+        "Corinna"
+      ],
+      "attributes": {
+        "given_name": "Corinna",
+        "family_name": "Maier"
+      }
+    },
+    {
+      "id": "person:corinna_schmidt",
+      "type": "person",
+      "label": "Corinna Schmidt",
+      "aliases": [
+        "Corinna"
+      ],
+      "attributes": {
+        "given_name": "Corinna",
+        "family_name": "Schmidt"
+      }
+    },
+    {
+      "id": "person:anna_becker",
+      "type": "person",
+      "label": "Anna Becker",
+      "aliases": [
+        "Anna"
+      ],
+      "attributes": {
+        "given_name": "Anna",
+        "family_name": "Becker"
+      }
+    },
+    {
+      "id": "phone:corinna_maier_mobile",
+      "type": "phone",
+      "label": "01761234",
+      "attributes": {
+        "canonical": "01761234"
+      }
+    },
+    {
+      "id": "phone:corinna_schmidt_mobile",
+      "type": "phone",
+      "label": "0309988",
+      "attributes": {
+        "canonical": "0309988"
+      }
+    },
+    {
+      "id": "phone:anna_becker_mobile",
+      "type": "phone",
+      "label": "08912345",
+      "attributes": {
+        "canonical": "08912345"
+      }
+    },
+    {
+      "id": "email:anna_becker",
+      "type": "email",
+      "label": "anna@example.com",
+      "attributes": {
+        "canonical": "anna@example.com"
+      }
+    },
+    {
+      "id": "brand:melitta",
+      "type": "brand",
+      "label": "Melitta",
+      "attributes": {
+        "category": "brand"
+      }
+    },
+    {
+      "id": "place:geschaeft_z",
+      "type": "place",
+      "label": "Store Z",
+      "attributes": {
+        "category": "store",
+        "details": "nearby"
+      }
+    },
+    {
+      "id": "plan:walk_today",
+      "type": "plan",
+      "label": "go for a walk",
+      "attributes": {
+        "when_text": "today",
+        "day_key": "__TODAY__"
+      }
+    },
+    {
+      "id": "plan:physio_tomorrow",
+      "type": "plan",
+      "label": "physiotherapy",
+      "attributes": {
+        "when_text": "tomorrow",
+        "day_key": "__TOMORROW__"
+      }
+    },
+    {
+      "id": "day:today",
+      "type": "day",
+      "label": "__TODAY__"
+    },
+    {
+      "id": "day:tomorrow",
+      "type": "day",
+      "label": "__TOMORROW__"
+    }
+  ],
+  "edges": [
+    {
+      "source": "person:corinna_maier",
+      "type": "social_supports_user_as",
+      "target": "user:main",
+      "confirmed_by_user": true,
+      "attributes": {
+        "role": "Physiotherapist",
+        "relation": "therapy"
+      }
+    },
+    {
+      "source": "person:corinna_schmidt",
+      "type": "social_supports_user_as",
+      "target": "user:main",
+      "confirmed_by_user": true,
+      "attributes": {
+        "role": "Neighbor",
+        "relation": "neighbor"
+      }
+    },
+    {
+      "source": "person:anna_becker",
+      "type": "social_supports_user_as",
+      "target": "user:main",
+      "confirmed_by_user": true,
+      "attributes": {
+        "role": "Daughter",
+        "relation": "family"
+      }
+    },
+    {
+      "source": "person:corinna_maier",
+      "type": "general_has_contact_method",
+      "target": "phone:corinna_maier_mobile",
+      "confirmed_by_user": true,
+      "attributes": {
+        "kind": "phone"
+      }
+    },
+    {
+      "source": "person:corinna_schmidt",
+      "type": "general_has_contact_method",
+      "target": "phone:corinna_schmidt_mobile",
+      "confirmed_by_user": true,
+      "attributes": {
+        "kind": "phone"
+      }
+    },
+    {
+      "source": "person:anna_becker",
+      "type": "general_has_contact_method",
+      "target": "phone:anna_becker_mobile",
+      "confirmed_by_user": true,
+      "attributes": {
+        "kind": "phone"
+      }
+    },
+    {
+      "source": "person:anna_becker",
+      "type": "general_has_contact_method",
+      "target": "email:anna_becker",
+      "confirmed_by_user": true,
+      "attributes": {
+        "kind": "email"
+      }
+    },
+    {
+      "source": "user:main",
+      "type": "user_prefers_brand",
+      "target": "brand:melitta",
+      "confirmed_by_user": true,
+      "attributes": {
+        "category": "brand",
+        "for_product": "coffee"
+      }
+    },
+    {
+      "source": "user:main",
+      "type": "user_usually_buys_at",
+      "target": "place:geschaeft_z",
+      "confirmed_by_user": true,
+      "attributes": {
+        "category": "store",
+        "for_product": "coffee"
+      }
+    },
+    {
+      "source": "place:geschaeft_z",
+      "type": "general_carries_brand",
+      "target": "brand:melitta",
+      "confirmed_by_user": true
+    },
+    {
+      "source": "place:geschaeft_z",
+      "type": "spatial_near",
+      "target": "user:main",
+      "confirmed_by_user": true,
+      "attributes": {
+        "distance_m": 850
+      }
+    },
+    {
+      "source": "user:main",
+      "type": "user_plans",
+      "target": "plan:walk_today",
+      "confirmed_by_user": true,
+      "attributes": {
+        "when_text": "today",
+        "day_key": "__TODAY__"
+      }
+    },
+    {
+      "source": "user:main",
+      "type": "user_plans",
+      "target": "plan:physio_tomorrow",
+      "confirmed_by_user": true,
+      "attributes": {
+        "when_text": "tomorrow",
+        "day_key": "__TOMORROW__"
+      }
+    },
+    {
+      "source": "plan:physio_tomorrow",
+      "type": "general_related_to",
+      "target": "person:corinna_maier",
+      "confirmed_by_user": true,
+      "attributes": {
+        "reason": "physiotherapy"
+      }
+    },
+    {
+      "source": "plan:walk_today",
+      "type": "temporal_occurs_on",
+      "target": "day:today",
+      "confirmed_by_user": true
+    },
+    {
+      "source": "plan:physio_tomorrow",
+      "type": "temporal_occurs_on",
+      "target": "day:tomorrow",
+      "confirmed_by_user": true
+    }
+  ]
+}
