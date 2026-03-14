@@ -16,11 +16,17 @@ This layer keeps long-term memory responsibilities separated from:
 ## Module split
 
 - `models.py`
-  - small immutable data models for queued conversation turns and retrieved long-term context
+  - immutable runtime and versioned long-term memory object models
 - `worker.py`
   - bounded background writer thread so durable turn storage does not block the response path
 - `service.py`
   - one orchestration surface for retrieval, explicit memory writes, and background episodic persistence
+- `extract.py`
+  - cautious turn-to-memory decomposition into episode, fact, event, observation, and graph-edge candidates
+- `truth.py`
+  - truth-maintenance primitives for slot conflicts, activation, and clarification gating
+- `consolidator.py`
+  - promotion of extracted candidates into episodic vs durable memory plus conflict-aware graph emission
 - `subtext.py`
   - builds silent personalization cues that should shape replies without explicit memory announcements
 - `subtext_eval.py`
