@@ -277,6 +277,7 @@ class OpenAIToolCallingAgentProvider:
             model=self.config.default_model,
             reasoning_effort=self.config.openai_reasoning_effort,
         )
+        request["store"] = True
         self._merge_tool_schemas(request, tool_schemas)
         return self._run_streaming_request(request, on_text_delta=on_text_delta)
 
@@ -304,7 +305,7 @@ class OpenAIToolCallingAgentProvider:
                 for result in tool_results
             ],
             "reasoning": {"effort": self.config.openai_reasoning_effort},
-            "store": False,
+            "store": True,
         }
         merged_instructions = merge_instructions(
             merge_instructions(self.backend._resolve_base_instructions(), instructions),

@@ -15,6 +15,8 @@ _REALTIME_TOOL_BINDINGS: tuple[tuple[str, str], ...] = (
     ("remember_memory", "handle_remember_memory"),
     ("remember_contact", "handle_remember_contact"),
     ("lookup_contact", "handle_lookup_contact"),
+    ("get_memory_conflicts", "handle_get_memory_conflicts"),
+    ("resolve_memory_conflict", "handle_resolve_memory_conflict"),
     ("remember_preference", "handle_remember_preference"),
     ("remember_plan", "handle_remember_plan"),
     ("update_user_profile", "handle_update_user_profile"),

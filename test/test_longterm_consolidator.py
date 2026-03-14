@@ -8,8 +8,8 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from test.longterm_test_program import make_test_extractor
 from twinr.memory.longterm.consolidator import LongTermMemoryConsolidator
-from twinr.memory.longterm.extract import LongTermTurnExtractor
 from twinr.memory.longterm.models import (
     LongTermGraphEdgeCandidateV1,
     LongTermMemoryObjectV1,
@@ -30,7 +30,7 @@ def _source() -> LongTermSourceRefV1:
 
 class LongTermMemoryConsolidatorTests(unittest.TestCase):
     def test_consolidator_promotes_durable_candidates_and_keeps_contextual_ones_episodic(self) -> None:
-        extractor = LongTermTurnExtractor(timezone_name="Europe/Berlin")
+        extractor = make_test_extractor()
         consolidator = LongTermMemoryConsolidator(truth_maintainer=LongTermTruthMaintainer())
         extraction = extractor.extract_conversation_turn(
             transcript=(

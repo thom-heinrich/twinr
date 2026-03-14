@@ -199,6 +199,21 @@ class ReminderStore:
             self._write_entries(tuple(entries))
         return tuple(selected)
 
+    def peek_due(self, *, now: datetime | None = None, limit: int = 1) -> tuple[ReminderEntry, ...]:
+        current_time = now or now_in_timezone(self.timezone_name)
+        selected: list[ReminderEntry] = []
+        for entry in self.load_entries():
+            if len(selected) >= max(1, limit):
+                break
+            if entry.delivered:
+                continue
+            if entry.due_at > current_time:
+                continue
+            if entry.next_attempt_at is not None and entry.next_attempt_at > current_time:
+                continue
+            selected.append(entry)
+        return tuple(selected)
+
     def mark_delivered(self, reminder_id: str, *, delivered_at: datetime | None = None) -> ReminderEntry:
         current_time = delivered_at or now_in_timezone(self.timezone_name)
         entries = list(self.load_entries())

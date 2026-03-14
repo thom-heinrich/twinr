@@ -474,8 +474,57 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(request["model"], "gpt-5.2-chat-latest")
         self.assertEqual(request["include"], ["web_search_call.action.sources"])
         self.assertEqual(request["tools"][0]["type"], "web_search")
+        self.assertEqual(request["reasoning"], {"effort": "medium"})
         self.assertIn("Location hint: Schwarzenbek", request["input"][-1]["content"][0]["text"])
         self.assertIn("Local date/time context: Friday, 2026-03-13 10:00", request["input"][-1]["content"][0]["text"])
+        self.assertIn("exact target reference for this search", request["input"][-1]["content"][0]["text"])
+
+    def test_search_live_info_uses_only_trimmed_non_system_follow_up_context(self) -> None:
+        self.responses.output_text = "Morgen in Schwarzenbek 11 Grad, leichter Regen."
+
+        backend = OpenAIBackend(
+            config=self.config,
+            client=SimpleNamespace(
+                responses=self.responses,
+                audio=SimpleNamespace(
+                    transcriptions=self.transcriptions,
+                    speech=self.speech,
+                ),
+            ),
+            base_instructions="THIS SHOULD NOT REACH THE SEARCH HELPER",
+        )
+
+        backend.search_live_info_with_metadata(
+            "Und morgen?",
+            conversation=(
+                ("system", "Twinr memory summary:\n- very long system context " * 20),
+                ("user", "Wie ist das Wetter heute in Schwarzenbek?"),
+                ("assistant", "Heute 8 Grad und bewölkt."),
+                ("system", "Long-term system block " * 20),
+                ("user", "Und morgen?"),
+                ("assistant", "Ich prüfe das live."),
+                ("user", "Bitte mit Temperatur und Regen."),
+            ),
+            location_hint="Schwarzenbek",
+        )
+
+        request = self.responses.calls[0]
+        self.assertNotIn("THIS SHOULD NOT REACH THE SEARCH HELPER", request["instructions"])
+        self.assertEqual(
+            [message["role"] for message in request["input"][:-1]],
+            ["user", "assistant", "user"],
+        )
+        self.assertTrue(
+            all(message["role"] != "system" for message in request["input"][:-1])
+        )
+        self.assertEqual(
+            request["input"][:-1][0]["content"][0]["text"],
+            "Und morgen?",
+        )
+        self.assertEqual(
+            request["input"][:-1][-1]["content"][0]["text"],
+            "Bitte mit Temperatur und Regen.",
+        )
 
     def test_search_live_info_falls_back_to_chat_latest_when_primary_search_model_returns_blank(self) -> None:
         class BlankThenAnswerResponses:
@@ -531,7 +580,7 @@ class OpenAIBackendTests(unittest.TestCase):
             conversation=(("user", "Wann ist der Termin?"), ("assistant", "Montag 14 Uhr.")),
             focus_hint="appointment details",
             direct_text="Montag 14 Uhr bei Dr. Meyer",
-            request_source="tool",
+            request_source="button",
         )
 
         request = self.responses.calls[0]
@@ -539,10 +588,24 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(request["reasoning"], {"effort": "medium"})
         self.assertEqual(request["max_output_tokens"], 180)
         self.assertNotIn("tools", request)
-        self.assertIn("Request source: tool", request["input"][-1]["content"][0]["text"])
+        self.assertIn("Request source: button", request["input"][-1]["content"][0]["text"])
         self.assertIn("Focus hint: appointment details", request["input"][-1]["content"][0]["text"])
         self.assertIn("Latest user message: Wann ist der Termin?", request["input"][-1]["content"][0]["text"])
         self.assertIn("Latest assistant message: Montag 14 Uhr.", request["input"][-1]["content"][0]["text"])
+
+    def test_compose_print_job_uses_literal_tool_text_without_llm_rewrite(self) -> None:
+        response = self.backend.compose_print_job_with_metadata(
+            conversation=(
+                ("user", "Wie ist das Wetter morgen in Schwarzenbek?"),
+                ("assistant", "Morgen Regen und kühl."),
+            ),
+            focus_hint="appointment details",
+            direct_text="Zahnarzt Montag 14 Uhr.",
+            request_source="tool",
+        )
+
+        self.assertEqual(response.text, "Zahnarzt Montag 14 Uhr.")
+        self.assertEqual(self.responses.calls, [])
 
     def test_compose_print_job_enforces_output_limits(self) -> None:
         limited_backend = OpenAIBackend(
@@ -572,6 +635,28 @@ class OpenAIBackendTests(unittest.TestCase):
 
         self.assertEqual(response.text, "Montag 14 Uhr\nDr. Meyer, Hamburg")
         self.assertEqual(len(self.responses.calls), 2)
+
+    def test_compose_print_job_falls_back_when_composer_returns_empty_output(self) -> None:
+        self.responses.queued_output_texts = ["", "Zahnarzt Montag 14 Uhr"]
+
+        response = self.backend.compose_print_job_with_metadata(
+            direct_text="Zahnarzt Montag 14 Uhr.",
+            request_source="tool",
+        )
+
+        self.assertEqual(response.text, "Zahnarzt Montag 14 Uhr.")
+        self.assertEqual(len(self.responses.calls), 0)
+
+    def test_compose_print_job_falls_back_when_composer_returns_no_print_content(self) -> None:
+        self.responses.queued_output_texts = ["NO_PRINT_CONTENT", "Zahnarzt Montag 14 Uhr"]
+
+        response = self.backend.compose_print_job_with_metadata(
+            direct_text="Zahnarzt Montag 14 Uhr.",
+            request_source="tool",
+        )
+
+        self.assertEqual(response.text, "Zahnarzt Montag 14 Uhr.")
+        self.assertEqual(len(self.responses.calls), 0)
 
     def test_default_client_factory_skips_project_header_for_project_scoped_key(self) -> None:
         captured_kwargs: dict[str, str] = {}

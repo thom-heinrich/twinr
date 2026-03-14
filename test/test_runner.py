@@ -9,7 +9,9 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult, ToolCallingTurnResponse
 from twinr.hardware import VoiceAssessment
+from twinr.memory.longterm import LongTermConsolidationResultV1, LongTermMemoryObjectV1, LongTermSourceRefV1
 from twinr.memory.reminders import now_in_timezone
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority
 from twinr.providers.openai import OpenAIImageInput, OpenAITextResponse
@@ -28,6 +30,15 @@ def _assert_contains_system_message(testcase: unittest.TestCase, conversation, n
     )
 
 
+def _longterm_source(event_id: str) -> LongTermSourceRefV1:
+    return LongTermSourceRefV1(
+        source_type="conversation_turn",
+        event_ids=(event_id,),
+        speaker="user",
+        modality="voice",
+    )
+
+
 class FakeBackend:
     def __init__(self) -> None:
         self.transcribe_calls: list[tuple[bytes, str, str]] = []
@@ -35,12 +46,14 @@ class FakeBackend:
         self.respond_to_images_calls: list[
             tuple[str, list[OpenAIImageInput], tuple[tuple[str, str], ...] | None, bool | None]
         ] = []
+        self.search_calls: list[tuple[str, tuple[tuple[str, str], ...] | None, str | None, str | None]] = []
         self.synthesize_calls: list[str] = []
         self.print_calls: list[tuple[tuple[tuple[str, str], ...] | None, str | None, str | None, str]] = []
         self.reminder_calls: list[object] = []
         self.proactive_calls: list[tuple[str, str, str, int, tuple[tuple[str, str], ...] | None, tuple[str, ...], tuple[str, ...]]] = []
         self.transcript = "Hello Twinr"
         self.answer = "Hello back."
+        self.used_web_search = False
 
     def transcribe(self, audio_bytes: bytes, *, filename: str, content_type: str) -> str:
         self.transcribe_calls.append((audio_bytes, filename, content_type))
@@ -55,7 +68,7 @@ class FakeBackend:
             text=self.answer,
             response_id="resp_123",
             request_id="req_123",
-            used_web_search=True,
+            used_web_search=self.used_web_search,
         )
 
     def respond_to_images_with_metadata(
@@ -73,6 +86,25 @@ class FakeBackend:
             response_id="resp_vision_123",
             request_id="req_vision_123",
             used_web_search=False,
+        )
+
+    def search_live_info_with_metadata(
+        self,
+        question: str,
+        *,
+        conversation=None,
+        location_hint: str | None = None,
+        date_context: str | None = None,
+    ):
+        self.search_calls.append((question, conversation, location_hint, date_context))
+        return SimpleNamespace(
+            answer=self.answer,
+            sources=("https://example.com/result",),
+            response_id="resp_search_123",
+            request_id="req_search_123",
+            model="gpt-5.2",
+            token_usage=None,
+            used_web_search=True,
         )
 
     def synthesize(self, text: str) -> bytes:
@@ -238,6 +270,70 @@ class FakeProactiveMonitor:
         self.exited = True
 
 
+class FakeToolCallingProvider:
+    def __init__(self, *, tool_name: str, arguments: dict[str, object], final_text: str = "Hello back.") -> None:
+        self.tool_name = tool_name
+        self.arguments = dict(arguments)
+        self.final_text = final_text
+        self.start_calls: list[tuple[str, tuple[tuple[str, str], ...] | None, bool | None]] = []
+        self.continue_calls: list[tuple[str, tuple[AgentToolResult, ...], bool | None]] = []
+
+    def start_turn_streaming(
+        self,
+        prompt: str,
+        *,
+        conversation=None,
+        instructions=None,
+        tool_schemas=(),
+        allow_web_search=None,
+        on_text_delta=None,
+    ) -> ToolCallingTurnResponse:
+        del instructions, tool_schemas, on_text_delta
+        self.start_calls.append((prompt, conversation, allow_web_search))
+        return ToolCallingTurnResponse(
+            text="",
+            tool_calls=(
+                AgentToolCall(
+                    name=self.tool_name,
+                    call_id="call_1",
+                    arguments=dict(self.arguments),
+                ),
+            ),
+            response_id="resp_tool_start",
+            request_id="req_tool_start",
+            model="gpt-5.2",
+            token_usage=None,
+            used_web_search=False,
+            continuation_token="resp_tool_start",
+        )
+
+    def continue_turn_streaming(
+        self,
+        *,
+        continuation_token: str,
+        tool_results,
+        instructions=None,
+        tool_schemas=(),
+        allow_web_search=None,
+        on_text_delta=None,
+    ) -> ToolCallingTurnResponse:
+        del instructions, tool_schemas
+        self.continue_calls.append((continuation_token, tuple(tool_results), allow_web_search))
+        if on_text_delta is not None:
+            for chunk in ("Hello ", "back."):
+                on_text_delta(chunk)
+        return ToolCallingTurnResponse(
+            text=self.final_text,
+            tool_calls=(),
+            response_id="resp_tool_finish",
+            request_id="req_tool_finish",
+            model="gpt-5.2",
+            token_usage=None,
+            used_web_search=False,
+            continuation_token="resp_tool_finish",
+        )
+
+
 class HardwareLoopTests(unittest.TestCase):
     def make_loop(
         self,
@@ -246,6 +342,7 @@ class HardwareLoopTests(unittest.TestCase):
         stt_provider=None,
         agent_provider=None,
         tts_provider=None,
+        tool_agent_provider=None,
         config: TwinrConfig | None = None,
         recorder: FakeRecorder | None = None,
         camera=None,
@@ -260,6 +357,8 @@ class HardwareLoopTests(unittest.TestCase):
         temp_dir_handle = tempfile.TemporaryDirectory()
         temp_root = Path(temp_dir_handle.name)
         config = config or TwinrConfig()
+        original_project_root = Path(config.project_root).resolve()
+        sandbox_project_default = config.project_root == "."
         config = replace(
             config,
             project_root=str(temp_root if config.project_root == "." else Path(config.project_root)),
@@ -267,16 +366,36 @@ class HardwareLoopTests(unittest.TestCase):
                 config.runtime_state_path,
                 temp_root / "runtime-state.json",
                 default="/tmp/twinr-runtime-state.json",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
             ),
             reminder_store_path=self._sandbox_path(
                 config.reminder_store_path,
                 temp_root / "state" / "reminders.json",
                 default="state/reminders.json",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
+            ),
+            memory_markdown_path=self._sandbox_path(
+                config.memory_markdown_path,
+                temp_root / "state" / "MEMORY.md",
+                default="state/MEMORY.md",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
             ),
             adaptive_timing_store_path=self._sandbox_path(
                 config.adaptive_timing_store_path,
                 temp_root / "state" / "adaptive-timing.json",
                 default="state/adaptive_timing.json",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
+            ),
+            long_term_memory_path=self._sandbox_path(
+                config.long_term_memory_path,
+                temp_root / "state" / "chonkydb",
+                default="state/chonkydb",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
             ),
         )
         resolved_backend = (
@@ -291,6 +410,7 @@ class HardwareLoopTests(unittest.TestCase):
             stt_provider=stt_provider,
             agent_provider=agent_provider,
             tts_provider=tts_provider,
+            tool_agent_provider=tool_agent_provider,
             button_monitor=button_monitor or SimpleNamespace(__enter__=lambda self: self, __exit__=lambda self, exc_type, exc, tb: None),
             recorder=recorder,
             player=player,
@@ -306,9 +426,18 @@ class HardwareLoopTests(unittest.TestCase):
         return loop, lines, recorder, player, printer
 
     @staticmethod
-    def _sandbox_path(current: str, isolated: Path, *, default: str) -> str:
+    def _sandbox_path(
+        current: str,
+        isolated: Path,
+        *,
+        default: str,
+        project_root: Path,
+        sandbox_project_default: bool,
+    ) -> str:
         path = Path(current)
-        if current == default or not path.is_absolute():
+        default_path = Path(default)
+        project_default = project_root / default_path if not default_path.is_absolute() else default_path
+        if current == default or not path.is_absolute() or (sandbox_project_default and path == project_default):
             return str(isolated)
         return current
 
@@ -320,12 +449,12 @@ class HardwareLoopTests(unittest.TestCase):
 
         self.assertEqual(recorder.pause_values, [1200])
         self.assertEqual(recorder.start_timeouts, [8.0])
-        self.assertEqual(recorder.pause_grace_values, [900])
+        self.assertEqual(recorder.pause_grace_values, [450])
         self.assertTrue(backend.transcribe_calls[0][0].startswith(b"RIFF"))
         self.assertEqual(backend.transcribe_calls[0][1], "twinr-listen.wav")
         self.assertEqual(backend.respond_calls[0][0], "Hello Twinr")
         self.assertEqual(backend.respond_to_images_calls, [])
-        self.assertFalse(backend.respond_calls[0][2])
+        self.assertIsNone(backend.respond_calls[0][2])
         self.assertEqual(player.played, [b"RIFF"])
         self.assertEqual(loop.runtime.last_response, "Hello back.")
         self.assertIn("status=listening", lines)
@@ -410,6 +539,157 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertIn("reminder_delivered=true", lines)
         self.assertTrue(stored_entries[0].delivered)
 
+    def test_social_trigger_is_governor_blocked_after_recent_reminder(self) -> None:
+        backend = FakeBackend()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                reminder_store_path=str(Path(temp_dir) / "state" / "reminders.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                reminder_poll_interval_s=0.0,
+                proactive_governor_global_prompt_cooldown_s=300.0,
+                proactive_governor_source_repeat_cooldown_s=0.0,
+            )
+            loop, lines, _recorder, player, _printer = self.make_loop(backend=backend, config=config)
+            loop.runtime.schedule_reminder(
+                due_at=now_in_timezone(config.local_timezone_name).isoformat(),
+                summary="Tabletten nehmen",
+                kind="medication",
+                source="test",
+            )
+
+            delivered = loop._maybe_deliver_due_reminder()
+            spoke = loop.handle_social_trigger(
+                SocialTriggerDecision(
+                    trigger_id="attention_window",
+                    prompt="Soll ich dir helfen?",
+                    reason="User seems attentive and quiet.",
+                    observed_at=12.0,
+                    priority=SocialTriggerPriority.ATTENTION_WINDOW,
+                    score=0.92,
+                    threshold=0.86,
+                    evidence=(),
+                )
+            )
+
+        self.assertTrue(delivered)
+        self.assertFalse(spoke)
+        self.assertEqual(player.played, [b"RIFF"])
+        self.assertIn("social_trigger_skipped=governor_global_prompt_cooldown_active", lines)
+
+    def test_idle_loop_delivers_longterm_proactive_candidate(self) -> None:
+        backend = FakeBackend()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                long_term_memory_proactive_enabled=True,
+                long_term_memory_proactive_poll_interval_s=0.0,
+                long_term_memory_proactive_min_confidence=0.7,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _recorder, player, _printer = self.make_loop(backend=backend, config=config)
+            loop.runtime.long_term_memory.object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:thread",
+                    occurred_at=now_in_timezone(config.local_timezone_name),
+                    episodic_objects=(),
+                    durable_objects=(
+                        LongTermMemoryObjectV1(
+                            memory_id="thread:walk_weather",
+                            kind="thread_summary",
+                            summary="Ongoing thread about the user's plan to walk if the weather is nice.",
+                            details="Reflected from multiple related turns.",
+                            source=_longterm_source("turn:thread"),
+                            status="active",
+                            confidence=0.82,
+                            sensitivity="normal",
+                            slot_key="thread:user:main:walk_weather",
+                            value_key="walk_weather",
+                            attributes={"support_count": 4},
+                        ),
+                    ),
+                    deferred_objects=(),
+                    conflicts=(),
+                    graph_edges=(),
+                )
+            )
+
+            delivered = loop._maybe_run_long_term_memory_proactive()
+            history = loop.runtime.long_term_memory.proactive_policy.state_store.load_entries()
+
+        self.assertTrue(delivered)
+        self.assertEqual(len(backend.proactive_calls), 1)
+        self.assertEqual(backend.proactive_calls[0][0], "longterm:candidate:thread_walk_weather:followup")
+        self.assertEqual(player.played, [b"RIFF"])
+        self.assertIn("longterm_proactive_candidate=candidate:thread_walk_weather:followup", lines)
+        self.assertIn("longterm_proactive_prompt_mode=llm", lines)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].delivery_count, 1)
+
+    def test_longterm_proactive_is_governor_blocked_after_recent_social_prompt(self) -> None:
+        backend = FakeBackend()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                long_term_memory_proactive_enabled=True,
+                long_term_memory_proactive_poll_interval_s=0.0,
+                long_term_memory_proactive_min_confidence=0.7,
+                proactive_governor_global_prompt_cooldown_s=300.0,
+                proactive_governor_source_repeat_cooldown_s=0.0,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _recorder, player, _printer = self.make_loop(backend=backend, config=config)
+            loop.runtime.long_term_memory.object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:thread",
+                    occurred_at=now_in_timezone(config.local_timezone_name),
+                    episodic_objects=(),
+                    durable_objects=(
+                        LongTermMemoryObjectV1(
+                            memory_id="thread:walk_weather",
+                            kind="thread_summary",
+                            summary="Ongoing thread about the user's plan to walk if the weather is nice.",
+                            details="Reflected from multiple related turns.",
+                            source=_longterm_source("turn:thread"),
+                            status="active",
+                            confidence=0.82,
+                            sensitivity="normal",
+                            slot_key="thread:user:main:walk_weather",
+                            value_key="walk_weather",
+                            attributes={"support_count": 4},
+                        ),
+                    ),
+                    deferred_objects=(),
+                    conflicts=(),
+                    graph_edges=(),
+                )
+            )
+
+            spoke = loop.handle_social_trigger(
+                SocialTriggerDecision(
+                    trigger_id="attention_window",
+                    prompt="Soll ich dir helfen?",
+                    reason="User seems attentive and quiet.",
+                    observed_at=12.0,
+                    priority=SocialTriggerPriority.ATTENTION_WINDOW,
+                    score=0.92,
+                    threshold=0.86,
+                    evidence=(),
+                )
+            )
+            delivered = loop._maybe_run_long_term_memory_proactive()
+            history = loop.runtime.long_term_memory.proactive_policy.state_store.load_entries()
+
+        self.assertTrue(spoke)
+        self.assertFalse(delivered)
+        self.assertEqual(player.played, [b"RIFF"])
+        self.assertIn("longterm_proactive_skipped=governor_global_prompt_cooldown_active", lines)
+        self.assertEqual(len(history), 0)
+
     def test_errors_reset_runtime_to_waiting(self) -> None:
         loop, lines, _recorder, _player, _printer = self.make_loop(backend=FakeBackend())
 
@@ -419,14 +699,18 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertTrue(any(line.startswith("error=") for line in lines))
         self.assertEqual(loop.runtime.status.value, "waiting")
 
-    def test_auto_web_search_enables_search_for_freshness_queries(self) -> None:
+    def test_auto_web_search_defers_to_backend_default_config(self) -> None:
         backend = FakeBackend()
+        backend.used_web_search = True
         backend.transcript = "What is the weather today in Berlin?"
-        loop, _lines, _recorder, _player, _printer = self.make_loop(backend=backend)
+        loop, _lines, _recorder, _player, _printer = self.make_loop(
+            backend=backend,
+            config=TwinrConfig(openai_enable_web_search=True),
+        )
 
         loop.handle_button_press("green")
 
-        self.assertTrue(backend.respond_calls[0][2])
+        self.assertIsNone(backend.respond_calls[0][2])
         self.assertEqual(len(loop.runtime.memory.search_results), 1)
         self.assertEqual(loop.runtime.memory.search_results[0].question, "What is the weather today in Berlin?")
         self.assertEqual(loop.runtime.memory.search_results[0].answer, "Hello back.")
@@ -435,11 +719,20 @@ class HardwareLoopTests(unittest.TestCase):
         backend = FakeBackend()
         backend.transcript = "Schau mich mal an"
         camera = FakeCamera()
-        loop, lines, _recorder, player, _printer = self.make_loop(backend=backend, camera=camera)
+        tool_agent = FakeToolCallingProvider(
+            tool_name="inspect_camera",
+            arguments={"question": "Schau mich mal an"},
+        )
+        loop, lines, _recorder, player, _printer = self.make_loop(
+            backend=backend,
+            camera=camera,
+            tool_agent_provider=tool_agent,
+        )
 
         loop.handle_button_press("green")
 
         self.assertEqual(camera.capture_calls, 1)
+        self.assertEqual(tool_agent.start_calls[0][0], "Schau mich mal an")
         self.assertEqual(len(backend.respond_to_images_calls), 1)
         prompt, images, conversation, allow_web_search = backend.respond_to_images_calls[0]
         self.assertIn("Image 1 is the current live camera frame", prompt)
@@ -448,22 +741,29 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(images), 1)
         self.assertEqual(images[0].label, "Image 1: live camera frame from the device.")
         self.assertEqual(player.played, [b"RIFF"])
-        self.assertIn("camera_used=true", lines)
+        self.assertIn("camera_tool_call=true", lines)
         self.assertIn("vision_image_count=1", lines)
 
     def test_visual_queries_attach_reference_image_when_configured(self) -> None:
         backend = FakeBackend()
         backend.transcript = "Wie sehe ich heute aus?"
         camera = FakeCamera()
+        tool_agent = FakeToolCallingProvider(
+            tool_name="inspect_camera",
+            arguments={"question": "Wie sehe ich heute aus?"},
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             reference_path = Path(temp_dir) / "user-reference.jpg"
             reference_path.write_bytes(b"\xff\xd8\xffreference")
-            config = TwinrConfig(vision_reference_image_path=str(reference_path))
+            config = TwinrConfig(
+                vision_reference_image_path=str(reference_path),
+            )
             loop, lines, _recorder, _player, _printer = self.make_loop(
                 backend=backend,
                 config=config,
                 camera=camera,
+                tool_agent_provider=tool_agent,
             )
 
             loop.handle_button_press("green")
@@ -474,6 +774,35 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(images), 2)
         self.assertEqual(images[1].label, "Image 2: stored reference image of the main user. Use it only for person or identity comparison.")
         self.assertTrue(any(line.startswith("vision_reference_image=") for line in lines))
+
+    def test_tool_agent_routes_fresh_search_requests_through_search_tool(self) -> None:
+        backend = FakeBackend()
+        backend.transcript = "What is the weather today in Berlin?"
+        tool_agent = FakeToolCallingProvider(
+            tool_name="search_live_info",
+            arguments={
+                "question": "What is the weather today in Berlin?",
+                "location_hint": "Berlin",
+                "date_context": "2026-03-14",
+            },
+        )
+        loop, lines, _recorder, _player, _printer = self.make_loop(
+            backend=backend,
+            tool_agent_provider=tool_agent,
+        )
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(tool_agent.start_calls[0][0], "What is the weather today in Berlin?")
+        self.assertEqual(len(backend.search_calls), 1)
+        question, conversation, location_hint, date_context = backend.search_calls[0]
+        self.assertEqual(question, "What is the weather today in Berlin?")
+        self.assertEqual(location_hint, "Berlin")
+        self.assertEqual(date_context, "2026-03-14")
+        _assert_contains_system_message(self, conversation, "All user-facing spoken and written replies")
+        self.assertIn("search_tool_call=true", lines)
+        self.assertEqual(len(loop.runtime.memory.search_results), 1)
+        self.assertEqual(loop.runtime.memory.search_results[0].question, "What is the weather today in Berlin?")
 
     def test_green_button_updates_runtime_voice_assessment(self) -> None:
         class FakeVoiceProfileMonitor:

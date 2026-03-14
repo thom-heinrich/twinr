@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Callable
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.workflows.working_feedback import WorkingFeedbackKind, start_working_feedback_loop
 from twinr.providers.openai import OpenAIImageInput
 
 _SEARCH_FEEDBACK_TONE_PATTERN: tuple[tuple[int, int], ...] = (
@@ -40,6 +42,8 @@ class TwinrRealtimeSupportMixin:
         updated_config = TwinrConfig.from_env(env_path)
         self.config = updated_config
         self.runtime.apply_live_config(updated_config)
+        if hasattr(self, "_current_turn_audio_sample_rate"):
+            self._current_turn_audio_sample_rate = updated_config.openai_realtime_input_sample_rate
         seen: set[int] = set()
         for provider in (self.stt_provider, self.agent_provider, self.tts_provider, self.print_backend):
             provider_id = id(provider)
@@ -110,6 +114,37 @@ class TwinrRealtimeSupportMixin:
         if self.config.audio_beep_settle_ms > 0:
             self.sleep(self.config.audio_beep_settle_ms / 1000.0)
 
+    def _start_working_feedback_loop(self, kind: WorkingFeedbackKind) -> Callable[[], None]:
+        previous_stop = getattr(self, "_working_feedback_stop", None)
+        previous_generation = getattr(self, "_working_feedback_generation", 0)
+        if callable(previous_stop):
+            previous_stop()
+        generation = previous_generation + 1
+        stop = start_working_feedback_loop(
+            self.player,
+            kind=kind,
+            sample_rate=self.config.openai_realtime_input_sample_rate,
+            emit=self.emit,
+        )
+        self._working_feedback_generation = generation
+        self._working_feedback_stop = stop
+
+        def stop_current() -> None:
+            if getattr(self, "_working_feedback_generation", None) != generation:
+                return
+            active_stop = getattr(self, "_working_feedback_stop", None)
+            self._working_feedback_stop = None
+            if callable(active_stop):
+                active_stop()
+
+        return stop_current
+
+    def _stop_working_feedback(self) -> None:
+        active_stop = getattr(self, "_working_feedback_stop", None)
+        self._working_feedback_stop = None
+        if callable(active_stop):
+            active_stop()
+
     def _start_search_feedback_loop(self) -> Callable[[], None]:
         if not self.config.search_feedback_tones_enabled:
             return lambda: None
@@ -149,12 +184,84 @@ class TwinrRealtimeSupportMixin:
 
         return stop
 
+    def _play_streaming_tts_with_feedback(self, text: str, *, turn_started: float) -> tuple[int, int | None]:
+        tts_started = time.monotonic()
+        first_audio_at: list[float | None] = [None]
+        chunk_queue: Queue[bytes | Exception | object] = Queue()
+        sentinel = object()
+        feedback_started = False
+        stop_answering_feedback: Callable[[], None] = lambda: None
+
+        def synth_worker() -> None:
+            try:
+                for chunk in self.tts_provider.synthesize_stream(text):
+                    chunk_queue.put(chunk)
+            except Exception as exc:
+                chunk_queue.put(exc)
+            finally:
+                chunk_queue.put(sentinel)
+
+        synth_thread = Thread(target=synth_worker, daemon=True)
+        synth_thread.start()
+        first_chunk: bytes | None = None
+        try:
+            while first_chunk is None:
+                try:
+                    item = chunk_queue.get(timeout=0.05)
+                except Empty:
+                    if not feedback_started:
+                        feedback_started = True
+                        stop_answering_feedback = self._start_working_feedback_loop("answering")
+                    continue
+                if item is sentinel:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                first_chunk = item
+            stop_answering_feedback()
+            if first_chunk is None:
+                raise RuntimeError("TTS stream ended without audio")
+
+            def playback_chunks():
+                if first_audio_at[0] is None:
+                    first_audio_at[0] = time.monotonic()
+                yield first_chunk
+                while True:
+                    item = chunk_queue.get()
+                    if item is sentinel:
+                        return
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+
+            with self._audio_lock:
+                self.player.play_wav_chunks(playback_chunks())
+        finally:
+            stop_answering_feedback()
+            synth_thread.join(timeout=1.0)
+
+        tts_ms = int((time.monotonic() - tts_started) * 1000)
+        if first_audio_at[0] is None:
+            return tts_ms, None
+        return tts_ms, int((first_audio_at[0] - turn_started) * 1000)
+
     def _build_vision_images(self) -> list[OpenAIImageInput]:
         with self._camera_lock:
             capture = self.camera.capture_photo(filename="camera-capture.png")
         self.emit(f"camera_device={capture.source_device}")
         self.emit(f"camera_input_format={capture.input_format or 'default'}")
         self.emit(f"camera_capture_bytes={len(capture.data)}")
+        self.runtime.long_term_memory.enqueue_multimodal_evidence(
+            event_name="camera_capture",
+            modality="camera",
+            source="camera_tool",
+            message="Live camera frame captured for device interaction.",
+            data={
+                "purpose": "vision_inspection",
+                "source_device": capture.source_device,
+                "input_format": capture.input_format or "default",
+            },
+        )
         images = [
             OpenAIImageInput(
                 data=capture.data,

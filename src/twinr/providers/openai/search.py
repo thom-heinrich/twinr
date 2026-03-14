@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
-import re
 
-from twinr.agent.base_agent.personality import merge_instructions
 from twinr.ops.usage import extract_model_name, extract_token_usage
 
 from .instructions import SEARCH_AGENT_INSTRUCTIONS, SEARCH_MODEL_FALLBACKS
 from .types import ConversationLike, OpenAISearchResult
+
+_SEARCH_CONTEXT_MAX_TURNS = 4
+_SEARCH_CONTEXT_CHAR_LIMIT = 220
+
+
+def _collapse_whitespace(value: str | None) -> str:
+    return " ".join(str(value or "").split()).strip()
 
 
 class OpenAISearchMixin:
@@ -28,14 +33,15 @@ class OpenAISearchMixin:
             location_hint=location_hint,
             date_context=date_context,
         )
-        instructions = merge_instructions(self._resolve_base_instructions(), SEARCH_AGENT_INSTRUCTIONS)
+        instructions = SEARCH_AGENT_INSTRUCTIONS
+        search_conversation = self._prepare_search_conversation(conversation)
         best_result: OpenAISearchResult | None = None
 
         for model in self._candidate_search_models():
             for max_output_tokens in (320, 480):
                 request = self._build_response_request(
                     prompt,
-                    conversation=conversation,
+                    conversation=search_conversation,
                     instructions=instructions,
                     allow_web_search=True,
                     model=model,
@@ -76,6 +82,13 @@ class OpenAISearchMixin:
         resolved_date_context = (date_context or self._relative_date_context()).strip()
         if resolved_date_context:
             parts.append(f"Local date/time context: {resolved_date_context}")
+            parts.append(
+                "Treat that date/time context as the exact target reference for this search. "
+                "If the user asked about a relative day like today, tomorrow, heute, morgen, or next Monday, "
+                "answer only for the resolved absolute date that matches this reference. "
+                "Do not answer for adjacent dates. If the live sources only mention another date or remain contradictory, "
+                "say that the exact date could not be verified."
+            )
         parts.append("Answer now with the best live information you can verify from web search.")
         return "\n".join(parts)
 
@@ -127,5 +140,29 @@ class OpenAISearchMixin:
         return False
 
     def _sanitize_search_answer(self, text: str) -> str:
-        normalized = re.sub(r"\s+", " ", text.replace("\r", " ").replace("\n", " ")).strip()
-        return normalized
+        return _collapse_whitespace(text.replace("\r", " ").replace("\n", " "))
+
+    def _prepare_search_conversation(
+        self,
+        conversation: ConversationLike | None,
+    ) -> tuple[tuple[str, str], ...] | None:
+        if not conversation:
+            return None
+        filtered: list[tuple[str, str]] = []
+        for item in conversation:
+            role, content = self._coerce_message(item)
+            normalized_role = role.strip().lower()
+            if normalized_role not in {"user", "assistant"}:
+                continue
+            normalized_content = _collapse_whitespace(content)
+            if not normalized_content:
+                continue
+            if len(normalized_content) > _SEARCH_CONTEXT_CHAR_LIMIT:
+                normalized_content = normalized_content[: _SEARCH_CONTEXT_CHAR_LIMIT - 1].rstrip() + "…"
+            filtered.append((normalized_role, normalized_content))
+        if not filtered:
+            return None
+        trimmed = filtered[-_SEARCH_CONTEXT_MAX_TURNS :]
+        if len(trimmed) > 1 and trimmed[0][0] == "assistant":
+            trimmed = trimmed[1:]
+        return tuple(trimmed) if trimmed else None

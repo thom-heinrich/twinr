@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import tempfile
@@ -7,9 +8,16 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from test.longterm_test_program import make_test_extractor
 from twinr.config import TwinrConfig
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
-from twinr.memory.longterm import LongTermMemoryService
+from twinr.memory.longterm import (
+    LongTermConsolidationResultV1,
+    LongTermMemoryConflictV1,
+    LongTermMemoryObjectV1,
+    LongTermMemoryService,
+    LongTermSourceRefV1,
+)
 from twinr.memory.query_normalization import LongTermQueryProfile
 
 
@@ -23,6 +31,14 @@ class _StaticQueryRewriter:
 
 
 class LongTermMemoryServiceTests(unittest.TestCase):
+    def _source(self, event_id: str = "turn:test") -> LongTermSourceRefV1:
+        return LongTermSourceRefV1(
+            source_type="conversation_turn",
+            event_ids=(event_id,),
+            speaker="user",
+            modality="voice",
+        )
+
     def test_background_worker_persists_episodic_turns_in_memory_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -32,13 +48,14 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 long_term_memory_enabled=True,
                 long_term_memory_write_queue_size=4,
             )
-            service = LongTermMemoryService.from_config(config)
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
             result = service.enqueue_conversation_turn(
                 transcript="Wie wird das Wetter heute?",
                 response="Heute ist es sonnig und mild.",
             )
             drained = service.flush(timeout_s=2.0)
             entries = service.prompt_context_store.memory_store.load_entries()
+            stored_objects = service.object_store.load_objects()
             service.shutdown()
 
         self.assertIsNotNone(result)
@@ -47,6 +64,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertEqual(entries[0].kind, "episodic_turn")
         self.assertIn('Conversation about "Wie wird das Wetter heute?"', entries[0].summary)
         self.assertIn('Twinr answered: "Heute ist es sonnig und mild."', entries[0].details or "")
+        self.assertTrue(any(item.kind == "episode" for item in stored_objects))
 
     def test_provider_context_combines_recent_episodes_and_graph_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -65,14 +83,18 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 value="Melitta",
                 for_product="coffee",
             )
-            service = LongTermMemoryService.from_config(config, graph_store=graph_store)
+            service = LongTermMemoryService.from_config(
+                config,
+                graph_store=graph_store,
+                extractor=make_test_extractor(),
+            )
             service.enqueue_conversation_turn(
-                transcript="Morgen wollte ich spazieren gehen.",
-                response="Dann schaue ich morgen gern noch einmal auf das Wetter.",
+                transcript="Heute wollte ich spazieren gehen und vorher noch einmal auf das Wetter schauen.",
+                response="Dann schaue ich heute gern noch einmal auf das Wetter für den Spaziergang.",
             )
             service.flush(timeout_s=2.0)
 
-            context = service.build_provider_context("Wie wird das Wetter heute?")
+            context = service.build_provider_context("Wie wird das Wetter für meinen Spaziergang heute?")
             service.shutdown()
 
         messages = context.system_messages()
@@ -80,9 +102,32 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIn("Silent personalization background for this turn.", messages[0])
         self.assertIn("twinr_silent_personalization_context_v1", messages[0])
         self.assertIn("Structured long-term episodic memory for this turn.", messages[1])
-        self.assertIn("Morgen wollte ich spazieren gehen.", messages[1])
+        self.assertIn("Heute wollte ich spazieren gehen", messages[1])
         self.assertIn("twinr_graph_memory_context_v1", messages[2])
         self.assertIn("Melitta", messages[2])
+
+    def test_provider_context_does_not_fallback_to_irrelevant_episodes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_recall_limit=2,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.enqueue_conversation_turn(
+                transcript="Today I want to go for a walk in the park.",
+                response="Then the weather matters for the walk.",
+            )
+            service.flush(timeout_s=2.0)
+
+            context = service.build_provider_context("Was ist 27 mal 14?")
+            service.shutdown()
+
+        self.assertIsNone(context.episodic_context)
 
     def test_subtext_context_surfaces_personalization_without_explicit_memory_language(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -106,7 +151,11 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 when_text="today",
                 details="The user wanted good weather for the walk.",
             )
-            service = LongTermMemoryService.from_config(config, graph_store=graph_store)
+            service = LongTermMemoryService.from_config(
+                config,
+                graph_store=graph_store,
+                extractor=make_test_extractor(),
+            )
             service.enqueue_conversation_turn(
                 transcript="Tomorrow I want to go for a walk if the weather is nice.",
                 response="I can keep the weather in mind for that walk.",
@@ -162,7 +211,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 personality_dir="personality",
                 memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
             )
-            service = LongTermMemoryService.from_config(config)
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
 
             memory_entry = service.store_explicit_memory(
                 kind="fact",
@@ -198,7 +247,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 long_term_memory_enabled=True,
                 user_display_name="Erika",
             )
-            service = LongTermMemoryService.from_config(config)
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
 
             result = service.analyze_conversation_turn(
                 transcript=(
@@ -212,6 +261,237 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIn("Janina is the user's wife.", durable_summaries)
         self.assertTrue(any("eye laser treatment" in summary for summary in durable_summaries))
         self.assertFalse(result.clarification_needed)
+
+    def test_provider_context_can_include_structured_durable_memory_from_background_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.enqueue_conversation_turn(
+                transcript=(
+                    "Today is a beautiful Sunday, it is really warm. "
+                    "My wife Janina is at the eye doctor and is getting eye laser treatment."
+                ),
+                response="I hope Janina's appointment goes smoothly.",
+            )
+            service.flush(timeout_s=2.0)
+
+            context = service.build_provider_context("How is Janina today?")
+            service.shutdown()
+
+        self.assertIsNotNone(context.durable_context)
+        self.assertIn("twinr_long_term_durable_context_v1", context.durable_context or "")
+        self.assertIn("Janina is the user's wife.", context.durable_context or "")
+        self.assertIn("eye laser treatment", context.durable_context or "")
+        self.assertIn("Ongoing thread about Janina", context.durable_context or "")
+
+    def test_service_can_plan_bounded_proactive_candidates_from_stored_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.enqueue_conversation_turn(
+                transcript=(
+                    "Today is a beautiful Sunday, it is really warm. "
+                    "My wife Janina is at the eye doctor and is getting eye laser treatment."
+                ),
+                response="I hope Janina's appointment goes smoothly.",
+            )
+            service.flush(timeout_s=2.0)
+
+            plan = service.plan_proactive_candidates()
+            service.shutdown()
+
+        candidate_kinds = {item.kind for item in plan.candidates}
+        self.assertIn("same_day_reminder", candidate_kinds)
+        self.assertIn("gentle_follow_up", candidate_kinds)
+
+    def test_service_can_run_retention_and_remove_old_ephemeral_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.object_store.apply_consolidation(
+                service.consolidator.consolidate(
+                    extraction=service.extractor.extract_conversation_turn(
+                        transcript="Today is warm.",
+                        response="It sounds pleasant outside.",
+                    )
+                )
+            )
+            objects = service.object_store.load_objects()
+            old_episode = next(item for item in objects if item.kind == "episode")
+            old_observation = next(item for item in objects if item.kind == "situational_observation")
+            service.object_store.apply_consolidation(
+                service.consolidator.consolidate(
+                    extraction=service.extractor.extract_conversation_turn(
+                        transcript="My wife Janina is getting eye laser treatment today.",
+                        response="I hope it goes smoothly.",
+                    )
+                )
+            )
+            rewritten = []
+            for item in service.object_store.load_objects():
+                if item.memory_id in {old_episode.memory_id, old_observation.memory_id}:
+                    rewritten.append(
+                        item.with_updates(
+                            created_at=datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc),
+                            updated_at=datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc),
+                        )
+                    )
+                else:
+                    rewritten.append(item)
+            service.object_store.apply_retention(
+                service.retention_policy.apply(
+                    objects=tuple(rewritten),
+                    now=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
+                )
+            )
+
+            kept = service.object_store.load_objects()
+            service.shutdown()
+
+        kept_ids = {item.memory_id for item in kept}
+        self.assertNotIn(old_episode.memory_id, kept_ids)
+        self.assertNotIn(old_observation.memory_id, kept_ids)
+        self.assertTrue(any(item.kind == "medical_event" and item.status == "expired" for item in kept))
+
+    def test_service_can_review_memory_without_surface_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.enqueue_conversation_turn(
+                transcript="My wife Janina is at the eye doctor today.",
+                response="I hope Janina's appointment goes smoothly.",
+            )
+            service.flush(timeout_s=2.0)
+
+            review = service.review_memory(query_text="Janina eye doctor", include_episodes=False, limit=5)
+            service.shutdown()
+
+        self.assertGreaterEqual(review.total_count, 2)
+        self.assertTrue(all(item.kind != "episode" for item in review.items))
+        self.assertTrue(any("Janina" in item.summary for item in review.items))
+
+    def test_confirm_memory_can_resolve_open_conflict_via_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:2",
+                    occurred_at=datetime(2026, 3, 14, 12, 0, tzinfo=timezone.utc),
+                    episodic_objects=(),
+                    durable_objects=(
+                        LongTermMemoryObjectV1(
+                            memory_id="fact:corinna_phone_old",
+                            kind="contact_method_fact",
+                            summary="Corinna Maier can be reached at +15555551234.",
+                            source=self._source("turn:1"),
+                            status="active",
+                            confidence=0.95,
+                            slot_key="contact:person:corinna_maier:phone",
+                            value_key="+15555551234",
+                            attributes={"person_ref": "person:corinna_maier"},
+                        ),
+                    ),
+                    deferred_objects=(
+                        LongTermMemoryObjectV1(
+                            memory_id="fact:corinna_phone_new",
+                            kind="contact_method_fact",
+                            summary="Corinna Maier can be reached at +15555558877.",
+                            source=self._source("turn:2"),
+                            status="uncertain",
+                            confidence=0.92,
+                            slot_key="contact:person:corinna_maier:phone",
+                            value_key="+15555558877",
+                            attributes={"person_ref": "person:corinna_maier"},
+                        ),
+                    ),
+                    conflicts=(
+                        LongTermMemoryConflictV1(
+                            slot_key="contact:person:corinna_maier:phone",
+                            candidate_memory_id="fact:corinna_phone_new",
+                            existing_memory_ids=("fact:corinna_phone_old",),
+                            question="Which phone number should I use for Corinna Maier?",
+                            reason="Conflicting phone numbers exist.",
+                        ),
+                    ),
+                    graph_edges=(),
+                )
+            )
+            queue_before = service.select_conflict_queue("What is Corinna's number?")
+
+            resolution = service.confirm_memory(memory_id=queue_before[0].candidate_memory_id)
+            objects = {item.memory_id: item for item in service.object_store.load_objects()}
+            queue_after = service.select_conflict_queue("What is Corinna's number?")
+            service.shutdown()
+
+        self.assertEqual(len(queue_before), 1)
+        self.assertEqual(resolution.selected_memory_id, queue_before[0].candidate_memory_id)
+        self.assertEqual(queue_after, ())
+        self.assertTrue(any(item.status == "active" and item.confirmed_by_user for item in objects.values()))
+        self.assertTrue(any(item.status in {"superseded", "invalid"} for item in objects.values()))
+
+    def test_service_can_invalidate_and_delete_memory_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.object_store.apply_consolidation(
+                service.consolidator.consolidate(
+                    extraction=service.extractor.extract_conversation_turn(
+                        transcript="My wife Janina is at the eye doctor today.",
+                        response="I hope Janina's appointment goes smoothly.",
+                    )
+                )
+            )
+            current_objects = {item.kind: item for item in service.object_store.load_objects() if item.kind != "episode"}
+            relationship = current_objects["relationship_fact"]
+            event = current_objects["medical_event"]
+
+            invalidation = service.invalidate_memory(memory_id=event.memory_id, reason="This appointment was canceled.")
+            deletion = service.delete_memory(memory_id=relationship.memory_id)
+            objects = {item.memory_id: item for item in service.object_store.load_objects()}
+            service.shutdown()
+
+        self.assertEqual(invalidation.action, "invalidate")
+        self.assertEqual(objects[event.memory_id].status, "invalid")
+        self.assertEqual(objects[event.memory_id].attributes["invalidation_reason"], "This appointment was canceled.")
+        self.assertEqual(deletion.action, "delete")
+        self.assertNotIn(relationship.memory_id, objects)
 
 
 if __name__ == "__main__":

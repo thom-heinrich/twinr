@@ -12,13 +12,15 @@ from twinr.agent.base_agent.contracts import (
 from twinr.agent.tools import (
     ToolCallingStreamingLoop,
     build_agent_tool_schemas,
+    build_compact_agent_tool_schemas,
+    build_compact_tool_agent_instructions,
     build_tool_agent_instructions,
     bind_realtime_tool_handlers,
     realtime_tool_names,
 )
 from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.hardware.audio import pcm16_to_wav_bytes
-from twinr.providers.openai import OpenAIProviderBundle
+from twinr.providers.factory import build_streaming_provider_bundle
 
 
 class _StreamingSessionPlaceholder:
@@ -35,7 +37,6 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         streaming_turn_loop: ToolCallingStreamingLoop | None = None,
         **kwargs,
     ) -> None:
-        openai_bundle: OpenAIProviderBundle | None = None
         if (
             tool_agent_provider is None
             and kwargs.get("print_backend") is None
@@ -45,12 +46,13 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 or kwargs.get("tts_provider") is None
             )
         ):
-            openai_bundle = OpenAIProviderBundle.from_config(config)
-            kwargs.setdefault("print_backend", openai_bundle.combined)
-            kwargs.setdefault("stt_provider", openai_bundle.stt)
-            kwargs.setdefault("agent_provider", openai_bundle.agent)
-            kwargs.setdefault("tts_provider", openai_bundle.tts)
-        resolved_tool_agent = tool_agent_provider or (openai_bundle.tool_agent if openai_bundle is not None else None)
+            provider_bundle = build_streaming_provider_bundle(config)
+            kwargs.setdefault("print_backend", provider_bundle.print_backend)
+            kwargs.setdefault("stt_provider", provider_bundle.stt)
+            kwargs.setdefault("agent_provider", provider_bundle.agent)
+            kwargs.setdefault("tts_provider", provider_bundle.tts)
+            tool_agent_provider = provider_bundle.tool_agent
+        resolved_tool_agent = tool_agent_provider
         if resolved_tool_agent is None:
             raise ValueError("TwinrStreamingHardwareLoop requires a tool-capable agent provider")
 
@@ -60,10 +62,17 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             **kwargs,
         )
         self.tool_agent_provider = resolved_tool_agent
+        self._tool_handlers = bind_realtime_tool_handlers(self.tool_executor)
+        tool_schemas = (
+            build_compact_agent_tool_schemas(realtime_tool_names())
+            if (self.config.llm_provider or "").strip().lower() == "groq"
+            else build_agent_tool_schemas(realtime_tool_names())
+        )
         self.streaming_turn_loop = streaming_turn_loop or ToolCallingStreamingLoop(
             provider=self.tool_agent_provider,
-            tool_handlers=bind_realtime_tool_handlers(self.tool_executor),
-            tool_schemas=build_agent_tool_schemas(realtime_tool_names()),
+            tool_handlers=self._tool_handlers,
+            tool_schemas=tool_schemas,
+            stream_final_only=((self.config.llm_provider or "").strip().lower() == "groq"),
         )
 
     def _reload_live_config_from_env(self, env_path: Path) -> None:
@@ -254,9 +263,16 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             response = self.streaming_turn_loop.run(
                 transcript,
                 conversation=self.runtime.provider_conversation_context(),
-                instructions=build_tool_agent_instructions(
-                    self.config,
-                    extra_instructions=self.config.openai_realtime_instructions,
+                instructions=(
+                    build_compact_tool_agent_instructions(
+                        self.config,
+                        extra_instructions=self.config.openai_realtime_instructions,
+                    )
+                    if (self.config.llm_provider or "").strip().lower() == "groq"
+                    else build_tool_agent_instructions(
+                        self.config,
+                        extra_instructions=self.config.openai_realtime_instructions,
+                    )
                 ),
                 allow_web_search=False,
                 on_text_delta=queue_ready_segments,

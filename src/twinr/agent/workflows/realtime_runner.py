@@ -97,6 +97,7 @@ class TwinrRealtimeHardwareLoop(
         self._camera_lock = Lock()
         self._audio_lock = Lock()
         self._current_turn_audio_pcm: bytes | None = None
+        self._current_turn_audio_sample_rate: int = self.config.openai_realtime_input_sample_rate
         self.tool_executor = RealtimeToolExecutor(self)
         self.realtime_session = realtime_session or OpenAIRealtimeSession(
             config=config,
@@ -109,8 +110,15 @@ class TwinrRealtimeHardwareLoop(
         self._last_print_request_at: float | None = None
         self._next_reminder_check_at: float = 0.0
         self._next_automation_check_at: float = 0.0
+        self._next_long_term_memory_proactive_check_at: float = 0.0
+        self._working_feedback_stop: Callable[[], None] | None = None
+        self._working_feedback_generation: int = 0
         self._conversation_session_active = False
         self._sensor_observation_queue: Queue[tuple[dict[str, object], tuple[str, ...]]] = Queue()
+        self._wakeword_ack_cache_lock = Lock()
+        self._wakeword_ack_wav_bytes: bytes | None = None
+        self._wakeword_ack_prefetch_started = False
+        self._wakeword_ack_prefetch_thread: Thread | None = None
         self.proactive_monitor = proactive_monitor or build_default_proactive_monitor(
             config=config,
             runtime=self.runtime,
@@ -128,6 +136,7 @@ class TwinrRealtimeHardwareLoop(
     def run(self, *, duration_s: float | None = None, poll_timeout: float = 0.25) -> int:
         started_at = time.monotonic()
         self._emit_status(force=True)
+        self._ensure_wakeword_ack_prefetch_started()
         with ExitStack() as stack:
             monitor = stack.enter_context(self.button_monitor)
             if self.proactive_monitor is not None:
@@ -142,6 +151,8 @@ class TwinrRealtimeHardwareLoop(
                     if self._maybe_run_due_automation():
                         continue
                     if self._maybe_run_sensor_automation():
+                        continue
+                    if self._maybe_run_long_term_memory_proactive():
                         continue
                     continue
                 if event.action != ButtonAction.PRESSED:
@@ -390,18 +401,26 @@ class TwinrRealtimeHardwareLoop(
     ) -> bool:
         self.runtime.submit_transcript(transcript_seed)
         self._emit_status(force=True)
+        stop_processing_feedback = self._start_working_feedback_loop("processing")
+        stop_answering_feedback: Callable[[], None] = lambda: None
 
         audio_chunks: Queue[bytes | None] = Queue()
         playback_error: list[Exception] = []
         first_audio_at: list[float | None] = [None]
+        first_audio_ms_override: int | None = None
         answer_started = False
+        playback_started = False
+        turn = None
+        turn_error: Exception | None = None
 
         def begin_answering() -> None:
-            nonlocal answer_started
+            nonlocal answer_started, stop_answering_feedback
             if answer_started:
                 return
+            stop_processing_feedback()
             self.runtime.begin_answering()
             self._emit_status(force=True)
+            stop_answering_feedback = self._start_working_feedback_loop("answering")
             answer_started = True
 
         def playback_generator():
@@ -421,13 +440,22 @@ class TwinrRealtimeHardwareLoop(
             except Exception as exc:
                 playback_error.append(exc)
 
-        worker = Thread(target=playback_worker, daemon=True)
-        worker.start()
+        worker: Thread | None = None
+
+        def ensure_playback_started() -> None:
+            nonlocal worker, playback_started
+            if playback_started:
+                return
+            worker = Thread(target=playback_worker, daemon=True)
+            worker.start()
+            playback_started = True
 
         def on_audio_chunk(chunk: bytes) -> None:
             begin_answering()
             if first_audio_at[0] is None:
+                stop_answering_feedback()
                 first_audio_at[0] = time.monotonic()
+                ensure_playback_started()
             audio_chunks.put(chunk)
 
         def on_output_text_delta(_delta: str) -> None:
@@ -436,12 +464,37 @@ class TwinrRealtimeHardwareLoop(
         try:
             with self.realtime_session:
                 turn = turn_runner(on_audio_chunk, on_output_text_delta)
+        except Exception as exc:
+            turn_error = exc
         finally:
-            audio_chunks.put(None)
-        worker.join()
+            stop_processing_feedback()
+            if playback_started:
+                audio_chunks.put(None)
+        if worker is not None:
+            worker.join()
         realtime_ms = int((time.monotonic() - realtime_started) * 1000)
-        if playback_error:
-            raise playback_error[0]
+        try:
+            if turn_error is not None:
+                raise turn_error
+            if playback_error:
+                raise playback_error[0]
+            if turn is None:
+                raise RuntimeError("Realtime turn did not return a result")
+
+            if first_audio_at[0] is None and turn.response_text.strip():
+                if not answer_started:
+                    begin_answering()
+                self.emit("realtime_audio_fallback=true")
+                fallback_tts_ms, fallback_first_audio_ms = self._play_streaming_tts_with_feedback(
+                    turn.response_text,
+                    turn_started=turn_started,
+                )
+                self.emit(f"timing_tts_fallback_ms={fallback_tts_ms}")
+                if fallback_first_audio_ms is not None:
+                    first_audio_ms_override = fallback_first_audio_ms
+        finally:
+            stop_answering_feedback()
+            self._stop_working_feedback()
 
         final_transcript = turn.transcript or transcript_seed
         self.runtime.last_transcript = final_transcript
@@ -471,7 +524,9 @@ class TwinrRealtimeHardwareLoop(
         self.emit(f"timing_capture_ms={capture_ms}")
         self.emit(f"timing_realtime_ms={realtime_ms}")
         self.emit("timing_playback_ms=streamed")
-        if first_audio_at[0] is not None:
+        if first_audio_ms_override is not None:
+            self.emit(f"timing_first_audio_ms={first_audio_ms_override}")
+        elif first_audio_at[0] is not None:
             self.emit(f"timing_first_audio_ms={int((first_audio_at[0] - turn_started) * 1000)}")
         self.emit(f"timing_total_ms={int((time.monotonic() - turn_started) * 1000)}")
         return not turn.end_conversation
@@ -480,18 +535,53 @@ class TwinrRealtimeHardwareLoop(
         prompt = self.runtime.begin_wakeword_prompt("Ja?")
         self._emit_status(force=True)
         self._play_listen_beep()
+        cached_audio = self._cached_wakeword_ack_wav_bytes()
         tts_started = time.monotonic()
         with self._audio_lock:
-            self.player.play_wav_chunks(self.tts_provider.synthesize_stream(prompt))
+            if cached_audio is not None:
+                self.player.play_wav_bytes(cached_audio)
+            else:
+                self._ensure_wakeword_ack_prefetch_started()
+                self.player.play_wav_chunks(self.tts_provider.synthesize_stream(prompt))
         self.runtime.finish_speaking()
         self._emit_status(force=True)
         self.emit(f"wakeword_ack={prompt}")
+        self.emit(f"wakeword_ack_cached={str(cached_audio is not None).lower()}")
         self.emit(f"timing_wakeword_ack_tts_ms={int((time.monotonic() - tts_started) * 1000)}")
         self._record_event(
             "wakeword_acknowledged",
             "Twinr confirmed a wakeword before opening hands-free listening.",
             prompt=prompt,
         )
+
+    def _ensure_wakeword_ack_prefetch_started(self) -> None:
+        if not self.config.wakeword_enabled:
+            return
+        with self._wakeword_ack_cache_lock:
+            if self._wakeword_ack_wav_bytes is not None:
+                return
+            if self._wakeword_ack_prefetch_started:
+                return
+            self._wakeword_ack_prefetch_started = True
+            self._wakeword_ack_prefetch_thread = Thread(
+                target=self._prime_wakeword_ack_cache,
+                name="twinr-wakeword-ack",
+                daemon=True,
+            )
+            self._wakeword_ack_prefetch_thread.start()
+
+    def _cached_wakeword_ack_wav_bytes(self) -> bytes | None:
+        with self._wakeword_ack_cache_lock:
+            return self._wakeword_ack_wav_bytes
+
+    def _prime_wakeword_ack_cache(self) -> None:
+        try:
+            audio_bytes = self.tts_provider.synthesize("Ja?")
+        except Exception as exc:
+            self.emit(f"wakeword_ack_prefetch_failed={type(exc).__name__}")
+            return
+        with self._wakeword_ack_cache_lock:
+            self._wakeword_ack_wav_bytes = audio_bytes
 
     def _listening_window_speech_start_chunks(self, *, initial_source: str, follow_up: bool) -> int | None:
         if initial_source == "button" and not follow_up:
@@ -528,14 +618,17 @@ class TwinrRealtimeHardwareLoop(
             return
         response_to_print = self.runtime.press_yellow_button()
         self._emit_status(force=True)
-
-        composed = self.agent_provider.compose_print_job_with_metadata(
-            conversation=self.runtime.provider_conversation_context(),
-            focus_hint=self.runtime.last_transcript,
-            direct_text=response_to_print,
-            request_source="button",
-        )
-        print_job = self.printer.print_text(composed.text)
+        stop_printing_feedback = self._start_working_feedback_loop("printing")
+        try:
+            composed = self.agent_provider.compose_print_job_with_metadata(
+                conversation=self.runtime.provider_conversation_context(),
+                focus_hint=self.runtime.last_transcript,
+                direct_text=response_to_print,
+                request_source="button",
+            )
+            print_job = self.printer.print_text(composed.text)
+        finally:
+            stop_printing_feedback()
         self.emit(f"print_text={composed.text}")
         if composed.response_id:
             self.emit(f"print_response_id={composed.response_id}")
@@ -556,6 +649,17 @@ class TwinrRealtimeHardwareLoop(
             "Print job was sent to the configured printer.",
             queue=self.config.printer_queue,
             job=print_job,
+        )
+        self.runtime.long_term_memory.enqueue_multimodal_evidence(
+            event_name="print_completed",
+            modality="printer",
+            source="realtime_print",
+            message="Printed Twinr output was delivered from the realtime loop.",
+            data={
+                "request_source": "button",
+                "queue": self.config.printer_queue,
+                "job": print_job or "",
+            },
         )
 
         self.runtime.finish_printing()

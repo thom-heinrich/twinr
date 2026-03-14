@@ -226,6 +226,9 @@ class TwinrRuntimeAutomationMixin:
     def reserve_due_reminders(self, *, limit: int = 1) -> tuple[ReminderEntry, ...]:
         return self.reminder_store.reserve_due(limit=limit)
 
+    def peek_due_reminders(self, *, limit: int = 1) -> tuple[ReminderEntry, ...]:
+        return self.reminder_store.peek_due(limit=limit)
+
     def mark_reminder_delivered(self, reminder_id: str) -> ReminderEntry:
         entry = self.reminder_store.mark_delivered(reminder_id)
         self.remember_note(

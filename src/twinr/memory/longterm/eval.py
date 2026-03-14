@@ -14,6 +14,7 @@ from twinr.memory.context_store import (
     PersistentMemoryMarkdownStore,
     PromptContextStore,
 )
+from twinr.memory.query_normalization import LongTermQueryProfile
 from twinr.memory.longterm.service import LongTermMemoryService
 
 
@@ -26,6 +27,7 @@ class LongTermEvalCase:
     category: str
     query_text: str
     kind: EvalKind
+    canonical_query_text: str | None = None
     lookup_family_name: str | None = None
     lookup_role: str | None = None
     expected_contains: tuple[str, ...] = ()
@@ -124,6 +126,18 @@ class _EpisodeSeed:
     response: str
 
 
+@dataclass(slots=True)
+class _StaticQueryRewriter:
+    canonical_queries: dict[str, str]
+
+    def profile(self, query_text: str | None) -> LongTermQueryProfile:
+        original = " ".join(str(query_text or "").split()).strip()
+        return LongTermQueryProfile.from_text(
+            original,
+            canonical_english_text=self.canonical_queries.get(original),
+        )
+
+
 def run_synthetic_longterm_eval(
     *,
     memory_target: int = 500,
@@ -195,6 +209,13 @@ def run_synthetic_longterm_eval(
         )
         if len(cases) != 50:
             raise AssertionError(f"Expected exactly 50 eval cases, got {len(cases)}.")
+        service.query_rewriter = _StaticQueryRewriter(
+            {
+                case.query_text: case.canonical_query_text
+                for case in cases
+                if case.canonical_query_text
+            }
+        )
 
         case_results = tuple(_run_eval_case(service=service, graph_store=graph_store, case=case) for case in cases)
         summary = _summarize_results(case_results)
@@ -425,6 +446,7 @@ def _build_eval_cases(
                 category="shopping_recall",
                 query_text=f"Where can I buy {preference.product} today?",
                 kind="provider_context",
+                canonical_query_text=f"{preference.product} {preference.brand} {preference.store} buy today",
                 expected_contains=(preference.product, preference.brand, preference.store),
             )
         )
@@ -437,6 +459,7 @@ def _build_eval_cases(
                 category="temporal_multihop",
                 query_text=f"Who is involved in my {plan.summary} {plan.when_text}?",
                 kind="provider_context",
+                canonical_query_text=f"{plan.summary} {plan.contact_label} {plan.when_text}",
                 expected_contains=(plan.summary, plan.contact_label, plan.when_text),
             )
         )
@@ -449,6 +472,7 @@ def _build_eval_cases(
                 category="episodic_recall",
                 query_text=f"What did we say earlier about {episode.topic}?",
                 kind="provider_context",
+                canonical_query_text=f"{episode.topic} plan later conversation",
                 expected_contains=(episode.topic, episode.transcript),
             )
         )

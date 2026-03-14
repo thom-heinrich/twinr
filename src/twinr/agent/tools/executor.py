@@ -45,6 +45,12 @@ class RealtimeToolExecutor:
     def handle_lookup_contact(self, arguments: dict[str, object]) -> dict[str, object]:
         return memory.handle_lookup_contact(self.owner, arguments)
 
+    def handle_get_memory_conflicts(self, arguments: dict[str, object]) -> dict[str, object]:
+        return memory.handle_get_memory_conflicts(self.owner, arguments)
+
+    def handle_resolve_memory_conflict(self, arguments: dict[str, object]) -> dict[str, object]:
+        return memory.handle_resolve_memory_conflict(self.owner, arguments)
+
     def handle_remember_preference(self, arguments: dict[str, object]) -> dict[str, object]:
         return memory.handle_remember_preference(self.owner, arguments)
 

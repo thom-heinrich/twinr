@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -68,8 +69,8 @@ class AdaptiveTimingStoreTests(unittest.TestCase):
                 resumed_after_pause_count=2,
             )
 
-        self.assertEqual(updated.speech_pause_ms, 1440)
-        self.assertEqual(updated.pause_grace_ms, 1080)
+        self.assertEqual(updated.speech_pause_ms, 1340)
+        self.assertEqual(updated.pause_grace_ms, 530)
         self.assertEqual(updated.pause_resume_count, 2)
 
     def test_clean_ends_slowly_trim_pause_values(self) -> None:
@@ -80,7 +81,7 @@ class AdaptiveTimingStoreTests(unittest.TestCase):
                 config=TwinrConfig(
                     adaptive_timing_store_path=str(path),
                     speech_pause_ms=1200,
-                    adaptive_timing_pause_grace_ms=900,
+                    adaptive_timing_pause_grace_ms=450,
                 ),
             )
             store.record_capture(
@@ -95,12 +96,6 @@ class AdaptiveTimingStoreTests(unittest.TestCase):
                 speech_started_after_ms=2200,
                 resumed_after_pause_count=0,
             )
-            store.record_capture(
-                initial_source="button",
-                follow_up=False,
-                speech_started_after_ms=2100,
-                resumed_after_pause_count=0,
-            )
             updated = store.record_capture(
                 initial_source="button",
                 follow_up=False,
@@ -108,9 +103,55 @@ class AdaptiveTimingStoreTests(unittest.TestCase):
                 resumed_after_pause_count=0,
             )
 
-        self.assertEqual(updated.speech_pause_ms, 1400)
-        self.assertEqual(updated.pause_grace_ms, 1060)
+        self.assertEqual(updated.speech_pause_ms, 1280)
+        self.assertEqual(updated.pause_grace_ms, 490)
         self.assertEqual(updated.clean_pause_streak, 0)
+
+    def test_defaults_stay_bounded_for_snappy_turn_end(self) -> None:
+        config = TwinrConfig(speech_pause_ms=800)
+        store = AdaptiveTimingStore(Path("/tmp/unused-adaptive-timing.json"), config=config)
+
+        default_profile = store.default_profile()
+
+        self.assertEqual(default_profile.speech_pause_ms, 800)
+        self.assertEqual(default_profile.pause_grace_ms, 450)
+        self.assertLessEqual(
+            default_profile.speech_pause_ms + default_profile.pause_grace_ms,
+            1300,
+        )
+
+    def test_loaded_outlier_profile_is_clamped_close_to_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "adaptive-timing.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "profile": {
+                            "button_start_timeout_s": 20.0,
+                            "follow_up_start_timeout_s": 11.0,
+                            "speech_pause_ms": 2200,
+                            "pause_grace_ms": 1400,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = AdaptiveTimingStore(
+                path,
+                config=TwinrConfig(
+                    adaptive_timing_store_path=str(path),
+                    speech_pause_ms=800,
+                    adaptive_timing_pause_grace_ms=450,
+                ),
+            )
+
+            profile = store.current()
+
+        self.assertEqual(profile.speech_pause_ms, 1200)
+        self.assertEqual(profile.pause_grace_ms, 650)
+        self.assertEqual(profile.button_start_timeout_s, 14.0)
+        self.assertEqual(profile.follow_up_start_timeout_s, 8.0)
 
 
 if __name__ == "__main__":

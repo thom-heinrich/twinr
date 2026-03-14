@@ -12,14 +12,17 @@ def handle_print_receipt(owner: Any, arguments: dict[str, object]) -> dict[str, 
 
     owner.runtime.maybe_begin_tool_print()
     owner._emit_status(force=True)
-
-    composed = owner.print_backend.compose_print_job_with_metadata(
-        conversation=owner.runtime.provider_conversation_context(),
-        focus_hint=focus_hint or None,
-        direct_text=direct_text or None,
-        request_source="tool",
-    )
-    print_job = owner.printer.print_text(composed.text)
+    stop_printing_feedback = owner._start_working_feedback_loop("printing")
+    try:
+        composed = owner.print_backend.compose_print_job_with_metadata(
+            conversation=owner.runtime.provider_conversation_context(),
+            focus_hint=focus_hint or None,
+            direct_text=direct_text or None,
+            request_source="tool",
+        )
+        print_job = owner.printer.print_text(composed.text)
+    finally:
+        stop_printing_feedback()
     owner.emit("print_tool_call=true")
     owner.emit(f"print_text={composed.text}")
     owner._record_usage(
@@ -34,6 +37,17 @@ def handle_print_receipt(owner: Any, arguments: dict[str, object]) -> dict[str, 
     )
     if print_job:
         owner.emit(f"print_job={print_job}")
+    owner.runtime.long_term_memory.enqueue_multimodal_evidence(
+        event_name="print_completed",
+        modality="printer",
+        source="tool_print",
+        message="Printed Twinr output was delivered from a tool call.",
+        data={
+            "request_source": "tool",
+            "job": print_job or "",
+            "focus_hint": focus_hint or "",
+        },
+    )
     owner._last_print_request_at = time.monotonic()
     return {
         "status": "printed",
@@ -67,16 +81,12 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
     if date_context:
         owner.emit(f"search_date_context={date_context}")
 
-    stop_feedback = owner._start_search_feedback_loop()
-    try:
-        result = owner.print_backend.search_live_info_with_metadata(
-            question,
-            conversation=owner.runtime.provider_conversation_context(),
-            location_hint=location_hint or None,
-            date_context=date_context or None,
-        )
-    finally:
-        stop_feedback()
+    result = owner.print_backend.search_live_info_with_metadata(
+        question,
+        conversation=owner.runtime.provider_conversation_context(),
+        location_hint=location_hint or None,
+        date_context=date_context or None,
+    )
 
     owner.emit(f"search_used_web_search={str(result.used_web_search).lower()}")
     if result.response_id:

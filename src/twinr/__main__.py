@@ -213,15 +213,15 @@ def main() -> int:
         if args.run_streaming_loop:
             from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
             from twinr.ops import loop_instance_lock
-            from twinr.providers.openai import OpenAIProviderBundle
+            from twinr.providers import build_streaming_provider_bundle
 
             if backend is None:
                 raise RuntimeError("Streaming loop requires configured providers")
-            provider_bundle = OpenAIProviderBundle.from_backend(backend)
+            provider_bundle = build_streaming_provider_bundle(config, support_backend=backend)
             loop = TwinrStreamingHardwareLoop(
                 config=config,
                 runtime=runtime,
-                print_backend=provider_bundle.combined,
+                print_backend=provider_bundle.print_backend,
                 stt_provider=provider_bundle.stt,
                 agent_provider=provider_bundle.agent,
                 tts_provider=provider_bundle.tts,

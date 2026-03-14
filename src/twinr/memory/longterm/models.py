@@ -13,6 +13,23 @@ LONGTERM_TURN_EXTRACTION_SCHEMA = "twinr_turn_extraction"
 LONGTERM_TURN_EXTRACTION_VERSION = 1
 LONGTERM_CONSOLIDATION_SCHEMA = "twinr_memory_consolidation"
 LONGTERM_CONSOLIDATION_VERSION = 1
+LONGTERM_REFLECTION_SCHEMA = "twinr_memory_reflection"
+LONGTERM_REFLECTION_VERSION = 1
+LONGTERM_PROACTIVE_PLAN_SCHEMA = "twinr_memory_proactive_plan"
+LONGTERM_PROACTIVE_PLAN_VERSION = 1
+LONGTERM_RETENTION_SCHEMA = "twinr_memory_retention"
+LONGTERM_RETENTION_VERSION = 1
+LONGTERM_MULTIMODAL_EVIDENCE_SCHEMA = "twinr_multimodal_evidence"
+LONGTERM_MULTIMODAL_EVIDENCE_VERSION = 1
+LONGTERM_CONFLICT_QUEUE_SCHEMA = "twinr_memory_conflict_queue"
+LONGTERM_CONFLICT_QUEUE_VERSION = 1
+LONGTERM_CONFLICT_RESOLUTION_SCHEMA = "twinr_memory_conflict_resolution"
+LONGTERM_CONFLICT_RESOLUTION_VERSION = 1
+LONGTERM_MEMORY_REVIEW_SCHEMA = "twinr_memory_review"
+LONGTERM_MEMORY_REVIEW_VERSION = 1
+LONGTERM_MEMORY_MUTATION_SCHEMA = "twinr_memory_mutation"
+LONGTERM_MEMORY_MUTATION_VERSION = 1
+LONGTERM_MEMORY_MUTATION_ACTIONS = frozenset({"confirm", "invalidate", "delete"})
 
 LONGTERM_MEMORY_STATUSES = frozenset(
     {
@@ -67,19 +84,49 @@ class LongTermEnqueueResult:
 
 
 @dataclass(frozen=True, slots=True)
+class LongTermMultimodalEvidence:
+    event_name: str
+    modality: str
+    source: str = "device_event"
+    message: str | None = None
+    data: Mapping[str, object] | None = None
+    created_at: datetime = field(default_factory=_utcnow)
+    schema: str = LONGTERM_MULTIMODAL_EVIDENCE_SCHEMA
+    version: int = LONGTERM_MULTIMODAL_EVIDENCE_VERSION
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.event_name):
+            raise ValueError("event_name is required.")
+        if not _normalize_text(self.modality):
+            raise ValueError("modality is required.")
+        if not _normalize_text(self.source):
+            raise ValueError("source is required.")
+        if self.schema != LONGTERM_MULTIMODAL_EVIDENCE_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_MULTIMODAL_EVIDENCE_SCHEMA!r}.")
+        if self.version != LONGTERM_MULTIMODAL_EVIDENCE_VERSION:
+            raise ValueError(f"version must be {LONGTERM_MULTIMODAL_EVIDENCE_VERSION}.")
+
+
+@dataclass(frozen=True, slots=True)
 class LongTermMemoryContext:
     subtext_context: str | None = None
+    durable_context: str | None = None
     episodic_context: str | None = None
     graph_context: str | None = None
+    conflict_context: str | None = None
 
     def system_messages(self) -> tuple[str, ...]:
         messages: list[str] = []
         if self.subtext_context:
             messages.append(self.subtext_context)
+        if self.durable_context:
+            messages.append(self.durable_context)
         if self.episodic_context:
             messages.append(self.episodic_context)
         if self.graph_context:
             messages.append(self.graph_context)
+        if self.conflict_context:
+            messages.append(self.conflict_context)
         return tuple(messages)
 
 
@@ -250,8 +297,16 @@ class LongTermMemoryObjectV1:
             created_at=datetime.fromisoformat(str(payload["created_at"])) if payload.get("created_at") else _utcnow(),
             updated_at=datetime.fromisoformat(str(payload["updated_at"])) if payload.get("updated_at") else _utcnow(),
             attributes=dict(attributes) if isinstance(attributes, Mapping) else None,
-            conflicts_with=_tuple_str(payload.get("conflicts_with") if isinstance(payload.get("conflicts_with"), list) else None),
-            supersedes=_tuple_str(payload.get("supersedes") if isinstance(payload.get("supersedes"), list) else None),
+            conflicts_with=_tuple_str(
+                payload.get("conflicts_with")
+                if isinstance(payload.get("conflicts_with"), (list, tuple))
+                else None
+            ),
+            supersedes=_tuple_str(
+                payload.get("supersedes")
+                if isinstance(payload.get("supersedes"), (list, tuple))
+                else None
+            ),
             schema=str(payload.get("schema", LONGTERM_MEMORY_OBJECT_SCHEMA)),
             version=int(payload.get("version", LONGTERM_MEMORY_OBJECT_VERSION)),
         )
@@ -350,24 +405,313 @@ class LongTermConsolidationResultV1:
         return bool(self.conflicts)
 
 
+@dataclass(frozen=True, slots=True)
+class LongTermReflectionResultV1:
+    reflected_objects: tuple[LongTermMemoryObjectV1, ...]
+    created_summaries: tuple[LongTermMemoryObjectV1, ...]
+    schema: str = LONGTERM_REFLECTION_SCHEMA
+    version: int = LONGTERM_REFLECTION_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema != LONGTERM_REFLECTION_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_REFLECTION_SCHEMA!r}.")
+        if self.version != LONGTERM_REFLECTION_VERSION:
+            raise ValueError(f"version must be {LONGTERM_REFLECTION_VERSION}.")
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermProactiveCandidateV1:
+    candidate_id: str
+    kind: str
+    summary: str
+    rationale: str
+    due_date: str | None = None
+    confidence: float = 0.5
+    source_memory_ids: tuple[str, ...] = ()
+    sensitivity: str = "normal"
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.candidate_id):
+            raise ValueError("candidate_id is required.")
+        if not _normalize_text(self.kind):
+            raise ValueError("kind is required.")
+        if not _normalize_text(self.summary):
+            raise ValueError("summary is required.")
+        if not _normalize_text(self.rationale):
+            raise ValueError("rationale is required.")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0.")
+        if self.sensitivity not in LONGTERM_MEMORY_SENSITIVITY:
+            raise ValueError(f"sensitivity must be one of: {', '.join(sorted(LONGTERM_MEMORY_SENSITIVITY))}.")
+
+    def to_payload(self) -> dict[str, object]:
+        return _drop_none(
+            {
+                "candidate_id": self.candidate_id,
+                "kind": self.kind,
+                "summary": self.summary,
+                "rationale": self.rationale,
+                "due_date": self.due_date,
+                "confidence": self.confidence,
+                "source_memory_ids": list(self.source_memory_ids) if self.source_memory_ids else None,
+                "sensitivity": self.sensitivity,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermProactivePlanV1:
+    candidates: tuple[LongTermProactiveCandidateV1, ...]
+    schema: str = LONGTERM_PROACTIVE_PLAN_SCHEMA
+    version: int = LONGTERM_PROACTIVE_PLAN_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema != LONGTERM_PROACTIVE_PLAN_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_PROACTIVE_PLAN_SCHEMA!r}.")
+        if self.version != LONGTERM_PROACTIVE_PLAN_VERSION:
+            raise ValueError(f"version must be {LONGTERM_PROACTIVE_PLAN_VERSION}.")
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermRetentionResultV1:
+    kept_objects: tuple[LongTermMemoryObjectV1, ...]
+    expired_objects: tuple[LongTermMemoryObjectV1, ...]
+    pruned_memory_ids: tuple[str, ...]
+    schema: str = LONGTERM_RETENTION_SCHEMA
+    version: int = LONGTERM_RETENTION_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema != LONGTERM_RETENTION_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_RETENTION_SCHEMA!r}.")
+        if self.version != LONGTERM_RETENTION_VERSION:
+            raise ValueError(f"version must be {LONGTERM_RETENTION_VERSION}.")
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermConflictOptionV1:
+    memory_id: str
+    summary: str
+    status: str
+    details: str | None = None
+    value_key: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.memory_id):
+            raise ValueError("memory_id is required.")
+        if not _normalize_text(self.summary):
+            raise ValueError("summary is required.")
+        if self.status not in LONGTERM_MEMORY_STATUSES:
+            raise ValueError(f"status must be one of: {', '.join(sorted(LONGTERM_MEMORY_STATUSES))}.")
+
+    def to_payload(self) -> dict[str, object]:
+        return _drop_none(
+            {
+                "memory_id": self.memory_id,
+                "summary": self.summary,
+                "details": self.details,
+                "status": self.status,
+                "value_key": self.value_key,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermConflictQueueItemV1:
+    slot_key: str
+    question: str
+    reason: str
+    candidate_memory_id: str
+    options: tuple[LongTermConflictOptionV1, ...]
+    schema: str = LONGTERM_CONFLICT_QUEUE_SCHEMA
+    version: int = LONGTERM_CONFLICT_QUEUE_VERSION
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.slot_key):
+            raise ValueError("slot_key is required.")
+        if not _normalize_text(self.question):
+            raise ValueError("question is required.")
+        if not _normalize_text(self.reason):
+            raise ValueError("reason is required.")
+        if not _normalize_text(self.candidate_memory_id):
+            raise ValueError("candidate_memory_id is required.")
+        if not self.options:
+            raise ValueError("options cannot be empty.")
+        if self.schema != LONGTERM_CONFLICT_QUEUE_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_CONFLICT_QUEUE_SCHEMA!r}.")
+        if self.version != LONGTERM_CONFLICT_QUEUE_VERSION:
+            raise ValueError(f"version must be {LONGTERM_CONFLICT_QUEUE_VERSION}.")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "schema": self.schema,
+            "version": self.version,
+            "slot_key": self.slot_key,
+            "question": self.question,
+            "reason": self.reason,
+            "candidate_memory_id": self.candidate_memory_id,
+            "options": [item.to_payload() for item in self.options],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermConflictResolutionV1:
+    slot_key: str
+    selected_memory_id: str
+    updated_objects: tuple[LongTermMemoryObjectV1, ...]
+    remaining_conflicts: tuple[LongTermMemoryConflictV1, ...]
+    schema: str = LONGTERM_CONFLICT_RESOLUTION_SCHEMA
+    version: int = LONGTERM_CONFLICT_RESOLUTION_VERSION
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.slot_key):
+            raise ValueError("slot_key is required.")
+        if not _normalize_text(self.selected_memory_id):
+            raise ValueError("selected_memory_id is required.")
+        if not self.updated_objects:
+            raise ValueError("updated_objects cannot be empty.")
+        if self.schema != LONGTERM_CONFLICT_RESOLUTION_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_CONFLICT_RESOLUTION_SCHEMA!r}.")
+        if self.version != LONGTERM_CONFLICT_RESOLUTION_VERSION:
+            raise ValueError(f"version must be {LONGTERM_CONFLICT_RESOLUTION_VERSION}.")
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermMemoryReviewItemV1:
+    memory_id: str
+    kind: str
+    summary: str
+    status: str
+    confidence: float
+    updated_at: datetime
+    details: str | None = None
+    confirmed_by_user: bool = False
+    sensitivity: str = "normal"
+    slot_key: str | None = None
+    value_key: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _normalize_text(self.memory_id):
+            raise ValueError("memory_id is required.")
+        if not _normalize_text(self.kind):
+            raise ValueError("kind is required.")
+        if not _normalize_text(self.summary):
+            raise ValueError("summary is required.")
+        if self.status not in LONGTERM_MEMORY_STATUSES:
+            raise ValueError(f"status must be one of: {', '.join(sorted(LONGTERM_MEMORY_STATUSES))}.")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be between 0.0 and 1.0.")
+        if self.sensitivity not in LONGTERM_MEMORY_SENSITIVITY:
+            raise ValueError(f"sensitivity must be one of: {', '.join(sorted(LONGTERM_MEMORY_SENSITIVITY))}.")
+
+    def to_payload(self) -> dict[str, object]:
+        return _drop_none(
+            {
+                "memory_id": self.memory_id,
+                "kind": self.kind,
+                "summary": self.summary,
+                "details": self.details,
+                "status": self.status,
+                "confidence": self.confidence,
+                "updated_at": self.updated_at.isoformat(),
+                "confirmed_by_user": self.confirmed_by_user,
+                "sensitivity": self.sensitivity,
+                "slot_key": self.slot_key,
+                "value_key": self.value_key,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermMemoryReviewResultV1:
+    items: tuple[LongTermMemoryReviewItemV1, ...]
+    total_count: int
+    query_text: str | None = None
+    status_filter: str | None = None
+    kind_filter: str | None = None
+    include_episodes: bool = False
+    schema: str = LONGTERM_MEMORY_REVIEW_SCHEMA
+    version: int = LONGTERM_MEMORY_REVIEW_VERSION
+
+    def __post_init__(self) -> None:
+        if self.total_count < 0:
+            raise ValueError("total_count cannot be negative.")
+        if self.status_filter is not None and self.status_filter not in LONGTERM_MEMORY_STATUSES:
+            raise ValueError(f"status_filter must be one of: {', '.join(sorted(LONGTERM_MEMORY_STATUSES))}.")
+        if self.schema != LONGTERM_MEMORY_REVIEW_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_MEMORY_REVIEW_SCHEMA!r}.")
+        if self.version != LONGTERM_MEMORY_REVIEW_VERSION:
+            raise ValueError(f"version must be {LONGTERM_MEMORY_REVIEW_VERSION}.")
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermMemoryMutationResultV1:
+    action: str
+    target_memory_id: str
+    updated_objects: tuple[LongTermMemoryObjectV1, ...] = ()
+    deleted_memory_ids: tuple[str, ...] = ()
+    remaining_conflicts: tuple[LongTermMemoryConflictV1, ...] = ()
+    schema: str = LONGTERM_MEMORY_MUTATION_SCHEMA
+    version: int = LONGTERM_MEMORY_MUTATION_VERSION
+
+    def __post_init__(self) -> None:
+        if self.action not in LONGTERM_MEMORY_MUTATION_ACTIONS:
+            raise ValueError(f"action must be one of: {', '.join(sorted(LONGTERM_MEMORY_MUTATION_ACTIONS))}.")
+        if not _normalize_text(self.target_memory_id):
+            raise ValueError("target_memory_id is required.")
+        if not self.updated_objects and not self.deleted_memory_ids:
+            raise ValueError("mutation result must contain updated objects or deleted ids.")
+        if self.schema != LONGTERM_MEMORY_MUTATION_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_MEMORY_MUTATION_SCHEMA!r}.")
+        if self.version != LONGTERM_MEMORY_MUTATION_VERSION:
+            raise ValueError(f"version must be {LONGTERM_MEMORY_MUTATION_VERSION}.")
+
+
 __all__ = [
     "LONGTERM_CONSOLIDATION_SCHEMA",
     "LONGTERM_CONSOLIDATION_VERSION",
+    "LONGTERM_CONFLICT_QUEUE_SCHEMA",
+    "LONGTERM_CONFLICT_QUEUE_VERSION",
+    "LONGTERM_CONFLICT_RESOLUTION_SCHEMA",
+    "LONGTERM_CONFLICT_RESOLUTION_VERSION",
     "LONGTERM_MEMORY_CONFLICT_SCHEMA",
     "LONGTERM_MEMORY_CONFLICT_VERSION",
+    "LONGTERM_MULTIMODAL_EVIDENCE_SCHEMA",
+    "LONGTERM_MULTIMODAL_EVIDENCE_VERSION",
     "LONGTERM_MEMORY_OBJECT_SCHEMA",
     "LONGTERM_MEMORY_OBJECT_VERSION",
+    "LONGTERM_MEMORY_MUTATION_ACTIONS",
+    "LONGTERM_MEMORY_MUTATION_SCHEMA",
+    "LONGTERM_MEMORY_MUTATION_VERSION",
+    "LONGTERM_MEMORY_REVIEW_SCHEMA",
+    "LONGTERM_MEMORY_REVIEW_VERSION",
     "LONGTERM_MEMORY_SENSITIVITY",
     "LONGTERM_MEMORY_STATUSES",
+    "LONGTERM_PROACTIVE_PLAN_SCHEMA",
+    "LONGTERM_PROACTIVE_PLAN_VERSION",
+    "LONGTERM_RETENTION_SCHEMA",
+    "LONGTERM_RETENTION_VERSION",
+    "LONGTERM_REFLECTION_SCHEMA",
+    "LONGTERM_REFLECTION_VERSION",
     "LONGTERM_TURN_EXTRACTION_SCHEMA",
     "LONGTERM_TURN_EXTRACTION_VERSION",
     "LongTermConsolidationResultV1",
+    "LongTermConflictOptionV1",
+    "LongTermConflictQueueItemV1",
+    "LongTermConflictResolutionV1",
     "LongTermConversationTurn",
     "LongTermEnqueueResult",
     "LongTermGraphEdgeCandidateV1",
     "LongTermMemoryConflictV1",
     "LongTermMemoryContext",
     "LongTermMemoryObjectV1",
+    "LongTermMemoryMutationResultV1",
+    "LongTermMemoryReviewItemV1",
+    "LongTermMemoryReviewResultV1",
+    "LongTermMultimodalEvidence",
+    "LongTermProactiveCandidateV1",
+    "LongTermProactivePlanV1",
+    "LongTermRetentionResultV1",
+    "LongTermReflectionResultV1",
     "LongTermSourceRefV1",
     "LongTermTurnExtractionV1",
 ]

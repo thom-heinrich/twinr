@@ -10,6 +10,7 @@ from twinr.automations import AutomationStore
 from twinr.memory import LongTermMemoryService, OnDeviceMemory, TwinrPersonalGraphStore
 from twinr.memory.reminders import ReminderStore
 from twinr.ops.events import TwinrOpsEventStore
+from twinr.proactive import ProactiveGovernor
 
 
 @dataclass(slots=True)
@@ -24,6 +25,7 @@ class TwinrRuntimeBase:
     adaptive_timing_store: AdaptiveTimingStore = field(init=False)
     snapshot_store: RuntimeSnapshotStore = field(init=False)
     ops_events: TwinrOpsEventStore = field(init=False)
+    proactive_governor: ProactiveGovernor = field(init=False)
     last_transcript: str | None = None
     last_response: str | None = None
     user_voice_status: str | None = None
@@ -59,6 +61,7 @@ class TwinrRuntimeBase:
             self.adaptive_timing_store.ensure_saved()
         self.snapshot_store = RuntimeSnapshotStore(self.config.runtime_state_path)
         self.ops_events = TwinrOpsEventStore.from_config(self.config)
+        self.proactive_governor = ProactiveGovernor.from_config(self.config)
         if self.config.restore_runtime_state_on_startup:
             self._restore_snapshot_context()
         self._persist_snapshot()

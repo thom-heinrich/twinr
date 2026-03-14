@@ -20,6 +20,8 @@ _DURABLE_KINDS = frozenset(
         "plan_fact",
         "medical_event",
         "event_fact",
+        "presence_pattern_fact",
+        "interaction_pattern_fact",
     }
 )
 _EPISODIC_ONLY_KINDS = frozenset({"episode", "situational_observation"})

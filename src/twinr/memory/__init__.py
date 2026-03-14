@@ -6,11 +6,14 @@ from twinr.memory.context_store import (
     PromptContextStore,
 )
 from twinr.memory.longterm import (
+    AsyncLongTermMultimodalWriter,
     AsyncLongTermMemoryWriter,
     LongTermConversationTurn,
     LongTermEnqueueResult,
     LongTermMemoryContext,
     LongTermMemoryService,
+    LongTermMultimodalEvidence,
+    LongTermMultimodalExtractor,
     LongTermSubtextBuilder,
 )
 from twinr.memory.chonkydb import (
@@ -88,8 +91,11 @@ __all__ = [
     "LongTermEnqueueResult",
     "LongTermMemoryContext",
     "LongTermMemoryService",
+    "LongTermMultimodalEvidence",
+    "LongTermMultimodalExtractor",
     "LongTermSubtextBuilder",
     "AsyncLongTermMemoryWriter",
+    "AsyncLongTermMultimodalWriter",
     "MemoryLedgerItem",
     "PersistentMemoryEntry",
     "PersistentMemoryMarkdownStore",

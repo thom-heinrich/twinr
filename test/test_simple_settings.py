@@ -48,18 +48,16 @@ class SimpleSettingsTests(unittest.TestCase):
         self.assertEqual(result.env_updates["OPENAI_REALTIME_VOICE"], "cedar")
         self.assertEqual(result.data["voice"], "cedar")
 
-    def test_spoken_voice_accepts_descriptive_aliases(self) -> None:
+    def test_spoken_voice_requires_supported_catalog_value(self) -> None:
         config = TwinrConfig(openai_tts_voice="marin", openai_realtime_voice="sage")
 
-        result = update_simple_setting(
-            config,
-            setting="spoken_voice",
-            action="set",
-            value="eine männliche Stimme",
-        )
-
-        self.assertTrue(result.changed)
-        self.assertEqual(result.data["voice"], "cedar")
+        with self.assertRaises(ValueError):
+            update_simple_setting(
+                config,
+                setting="spoken_voice",
+                action="set",
+                value="eine männliche Stimme",
+            )
 
     def test_speech_speed_clamps_and_updates_both_audio_paths(self) -> None:
         config = TwinrConfig(openai_tts_speed=1.0, openai_realtime_speed=1.0)

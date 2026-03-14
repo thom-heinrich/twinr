@@ -36,11 +36,13 @@ class ToolCallingStreamingLoop:
         tool_handlers: dict[str, ToolHandler],
         tool_schemas: Sequence[dict[str, Any]],
         max_rounds: int = 6,
+        stream_final_only: bool = False,
     ) -> None:
         self.provider = provider
         self.tool_handlers = dict(tool_handlers)
         self.tool_schemas = tuple(tool_schemas)
         self.max_rounds = max_rounds
+        self.stream_final_only = stream_final_only
 
     def run(
         self,
@@ -60,6 +62,7 @@ class ToolCallingStreamingLoop:
         used_web_search = False
 
         for round_index in range(1, self.max_rounds + 1):
+            round_on_text_delta = None if self.stream_final_only else on_text_delta
             if continuation_token is None:
                 response = self.provider.start_turn_streaming(
                     prompt,
@@ -67,7 +70,7 @@ class ToolCallingStreamingLoop:
                     instructions=instructions,
                     tool_schemas=self.tool_schemas,
                     allow_web_search=allow_web_search,
-                    on_text_delta=on_text_delta,
+                    on_text_delta=round_on_text_delta,
                 )
             else:
                 response = self.provider.continue_turn_streaming(
@@ -76,7 +79,7 @@ class ToolCallingStreamingLoop:
                     instructions=instructions,
                     tool_schemas=self.tool_schemas,
                     allow_web_search=allow_web_search,
-                    on_text_delta=on_text_delta,
+                    on_text_delta=round_on_text_delta,
                 )
 
             last_response = response
@@ -84,8 +87,11 @@ class ToolCallingStreamingLoop:
             used_web_search = used_web_search or response.used_web_search
             all_tool_calls.extend(response.tool_calls)
             if not response.tool_calls:
+                result_text = response.text.strip() if self.stream_final_only else aggregate_text.strip()
+                if self.stream_final_only and result_text and on_text_delta is not None:
+                    on_text_delta(result_text)
                 return StreamingToolLoopResult(
-                    text=aggregate_text.strip(),
+                    text=result_text,
                     rounds=round_index,
                     tool_calls=tuple(all_tool_calls),
                     tool_results=tuple(all_tool_results),

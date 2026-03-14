@@ -8,12 +8,12 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.memory.longterm.extract import LongTermTurnExtractor
+from test.longterm_test_program import make_test_extractor
 
 
 class LongTermTurnExtractorTests(unittest.TestCase):
     def test_single_turn_can_expand_into_multiple_memory_candidates(self) -> None:
-        extractor = LongTermTurnExtractor(timezone_name="Europe/Berlin")
+        extractor = make_test_extractor()
         result = extractor.extract_conversation_turn(
             transcript=(
                 "Today is a beautiful Sunday, it is really warm. "
