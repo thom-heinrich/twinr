@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+
+class TwinrRealtimeToolDelegatesMixin:
+    def _handle_print_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_print_receipt(arguments)
+
+    def _handle_end_conversation_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_end_conversation(arguments)
+
+    def _handle_schedule_reminder_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_schedule_reminder(arguments)
+
+    def _handle_list_automations_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_list_automations(arguments)
+
+    def _handle_create_time_automation_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_create_time_automation(arguments)
+
+    def _handle_create_sensor_automation_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_create_sensor_automation(arguments)
+
+    def _handle_update_time_automation_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_update_time_automation(arguments)
+
+    def _handle_update_sensor_automation_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_update_sensor_automation(arguments)
+
+    def _handle_delete_automation_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_delete_automation(arguments)
+
+    def _handle_remember_memory_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_remember_memory(arguments)
+
+    def _handle_remember_contact_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_remember_contact(arguments)
+
+    def _handle_lookup_contact_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_lookup_contact(arguments)
+
+    def _handle_remember_preference_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_remember_preference(arguments)
+
+    def _handle_remember_plan_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_remember_plan(arguments)
+
+    def _handle_update_user_profile_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_update_user_profile(arguments)
+
+    def _handle_update_personality_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_update_personality(arguments)
+
+    def _handle_update_simple_setting_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_update_simple_setting(arguments)
+
+    def _handle_enroll_voice_profile_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_enroll_voice_profile(arguments)
+
+    def _handle_get_voice_profile_status_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_get_voice_profile_status(arguments)
+
+    def _handle_reset_voice_profile_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_reset_voice_profile(arguments)
+
+    def _handle_search_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_search_live_info(arguments)
+
+    def _handle_inspect_camera_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_inspect_camera(arguments)

@@ -1,4 +1,5 @@
 from array import array
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import math
@@ -13,7 +14,7 @@ from twinr.automations import AutomationAction
 from twinr.config import TwinrConfig
 from twinr.hardware import VoiceAssessment
 from twinr.memory.reminders import now_in_timezone
-from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority
+from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority, WakewordMatch
 from twinr.providers.openai import OpenAITextResponse
 from twinr.providers.openai.realtime import OpenAIRealtimeTurn
 from twinr.realtime_runner import TwinrRealtimeHardwareLoop
@@ -39,6 +40,7 @@ def _voice_sample_pcm_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0
 class FakeRealtimeSession:
     def __init__(self) -> None:
         self.calls: list[bytes] = []
+        self.text_calls: list[str] = []
         self.conversations: list[tuple[tuple[str, str], ...] | None] = []
         self.entered = False
         self.exited = False
@@ -82,6 +84,30 @@ class FakeRealtimeSession:
             end_conversation=False,
         )
 
+    def run_text_turn(
+        self,
+        prompt: str,
+        *,
+        conversation=None,
+        on_audio_chunk=None,
+        on_output_text_delta=None,
+    ) -> OpenAIRealtimeTurn:
+        self.text_calls.append(prompt)
+        self.conversations.append(conversation)
+        if on_output_text_delta is not None:
+            on_output_text_delta("Guten ")
+            on_output_text_delta("Tag")
+        if on_audio_chunk is not None:
+            on_audio_chunk(b"PCM")
+        if self.turns:
+            return self.turns.pop(0)
+        return OpenAIRealtimeTurn(
+            transcript=prompt,
+            response_text="Guten Tag",
+            response_id="resp_rt_123",
+            end_conversation=False,
+        )
+
 
 class FakePrintBackend:
     def __init__(self) -> None:
@@ -94,6 +120,8 @@ class FakePrintBackend:
         self.generic_reminder_calls: list[tuple[str, str | None, bool | None]] = []
         self.automation_calls: list[tuple[str, bool, str]] = []
         self.proactive_calls: list[tuple[str, str, str, int, tuple[tuple[str, str], ...] | None, tuple[str, ...]]] = []
+        self.transcribe_calls: list[tuple[bytes, str | None, str | None]] = []
+        self.transcribe_result = "hey twinr"
 
     def compose_print_job_with_metadata(
         self,
@@ -161,9 +189,18 @@ class FakePrintBackend:
         priority: int,
         conversation=None,
         recent_prompts=(),
+        observation_facts=(),
     ) -> OpenAITextResponse:
         self.proactive_calls.append(
-            (trigger_id, reason, default_prompt, priority, conversation, tuple(recent_prompts))
+            (
+                trigger_id,
+                reason,
+                default_prompt,
+                priority,
+                conversation,
+                tuple(recent_prompts),
+                tuple(observation_facts),
+            )
         )
         return OpenAITextResponse(
             text=f"Proaktiv: {trigger_id}",
@@ -212,6 +249,18 @@ class FakePrintBackend:
             token_usage=None,
         )
 
+    def transcribe(
+        self,
+        audio_bytes: bytes,
+        *,
+        filename: str = "audio.wav",
+        content_type: str = "audio/wav",
+        language: str | None = None,
+        prompt: str | None = None,
+    ) -> str:
+        self.transcribe_calls.append((audio_bytes, language, prompt))
+        return self.transcribe_result
+
 
 class FakeRecorder:
     def __init__(self, recordings: list[bytes | Exception] | None = None) -> None:
@@ -219,26 +268,58 @@ class FakeRecorder:
         self.start_timeouts: list[float | None] = []
         self.speech_start_chunks: list[int | None] = []
         self.ignore_initial_ms: list[int] = []
+        self.pause_grace_values: list[int] = []
         self.recordings = list(recordings or [b"PCMINPUT"])
+
+    def capture_pcm_until_pause_with_options(
+        self,
+        *,
+        pause_ms: int,
+        start_timeout_s: float | None = None,
+        max_record_seconds: float | None = None,
+        speech_start_chunks: int | None = None,
+        ignore_initial_ms: int = 0,
+        pause_grace_ms: int = 0,
+    ):
+        del max_record_seconds
+        self.pause_values.append(pause_ms)
+        self.start_timeouts.append(start_timeout_s)
+        self.speech_start_chunks.append(speech_start_chunks)
+        self.ignore_initial_ms.append(ignore_initial_ms)
+        self.pause_grace_values.append(pause_grace_ms)
+        if not self.recordings:
+            value: bytes | Exception = b"PCMINPUT"
+        else:
+            value = self.recordings.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        if hasattr(value, "pcm_bytes"):
+            return value
+        return SimpleNamespace(
+            pcm_bytes=value,
+            speech_started_after_ms=2100,
+            resumed_after_pause_count=0,
+        )
 
     def record_pcm_until_pause_with_options(
         self,
         *,
         pause_ms: int,
         start_timeout_s: float | None = None,
+        max_record_seconds: float | None = None,
         speech_start_chunks: int | None = None,
         ignore_initial_ms: int = 0,
+        pause_grace_ms: int = 0,
     ) -> bytes:
-        self.pause_values.append(pause_ms)
-        self.start_timeouts.append(start_timeout_s)
-        self.speech_start_chunks.append(speech_start_chunks)
-        self.ignore_initial_ms.append(ignore_initial_ms)
-        if not self.recordings:
-            return b"PCMINPUT"
-        value = self.recordings.pop(0)
-        if isinstance(value, Exception):
-            raise value
-        return value
+        result = self.capture_pcm_until_pause_with_options(
+            pause_ms=pause_ms,
+            start_timeout_s=start_timeout_s,
+            max_record_seconds=max_record_seconds,
+            speech_start_chunks=speech_start_chunks,
+            ignore_initial_ms=ignore_initial_ms,
+            pause_grace_ms=pause_grace_ms,
+        )
+        return result.pcm_bytes
 
 
 class FakePlayer:
@@ -323,6 +404,8 @@ class FakeProactiveMonitor:
 
 
 class RealtimeHardwareLoopTests(unittest.TestCase):
+    _LANGUAGE_CONTRACT = "All user-facing spoken and written replies for this turn must be in German."
+
     def make_loop(
         self,
         *,
@@ -331,13 +414,49 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         camera: FakeCamera | None = None,
         button_monitor=None,
         print_backend: FakePrintBackend | None = None,
+        stt_provider=None,
+        agent_provider=None,
+        tts_provider=None,
         voice_profile_monitor=None,
         proactive_monitor=None,
     ) -> tuple[TwinrRealtimeHardwareLoop, list[str], FakeRealtimeSession, FakePrintBackend, FakeRecorder, FakePlayer, FakePrinter]:
+        temp_dir_handle = tempfile.TemporaryDirectory()
+        temp_root = Path(temp_dir_handle.name)
         config = config or TwinrConfig()
+        config = replace(
+            config,
+            project_root=str(temp_root if config.project_root == "." else Path(config.project_root)),
+            runtime_state_path=self._sandbox_path(
+                config.runtime_state_path,
+                temp_root / "runtime-state.json",
+                default="/tmp/twinr-runtime-state.json",
+            ),
+            reminder_store_path=self._sandbox_path(
+                config.reminder_store_path,
+                temp_root / "state" / "reminders.json",
+                default="state/reminders.json",
+            ),
+            automation_store_path=self._sandbox_path(
+                config.automation_store_path,
+                temp_root / "state" / "automations.json",
+                default="state/automations.json",
+            ),
+            adaptive_timing_store_path=self._sandbox_path(
+                config.adaptive_timing_store_path,
+                temp_root / "state" / "adaptive-timing.json",
+                default="state/adaptive_timing.json",
+            ),
+        )
         lines: list[str] = []
         realtime_session = FakeRealtimeSession()
-        print_backend = print_backend or FakePrintBackend()
+        resolved_print_backend = print_backend
+        if resolved_print_backend is None:
+            for provider in (agent_provider, stt_provider, tts_provider):
+                if provider is not None:
+                    resolved_print_backend = provider
+                    break
+        if resolved_print_backend is None:
+            resolved_print_backend = FakePrintBackend()
         recorder = recorder or FakeRecorder()
         player = FakePlayer()
         printer = FakePrinter()
@@ -345,7 +464,10 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             config=config,
             runtime=TwinrRuntime(config=config),
             realtime_session=realtime_session,
-            print_backend=print_backend,
+            print_backend=resolved_print_backend,
+            stt_provider=stt_provider,
+            agent_provider=agent_provider,
+            tts_provider=tts_provider,
             button_monitor=button_monitor or SimpleNamespace(__enter__=lambda self: self, __exit__=lambda self, exc_type, exc, tb: None),
             recorder=recorder,
             player=player,
@@ -357,7 +479,22 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             sleep=lambda _seconds: None,
             error_reset_seconds=0.0,
         )
-        return loop, lines, realtime_session, print_backend, recorder, player, printer
+        loop._test_temp_dir = temp_dir_handle
+        return loop, lines, realtime_session, resolved_print_backend, recorder, player, printer
+
+    @staticmethod
+    def _sandbox_path(current: str, isolated: Path, *, default: str) -> str:
+        path = Path(current)
+        if current == default or not path.is_absolute():
+            return str(isolated)
+        return current
+
+    def _assert_language_contract_only(self, conversation: tuple[tuple[str, str], ...] | None) -> None:
+        self.assertIsNotNone(conversation)
+        assert conversation is not None
+        self.assertEqual(len(conversation), 1)
+        self.assertEqual(conversation[0][0], "system")
+        self.assertIn(self._LANGUAGE_CONTRACT, conversation[0][1])
 
     def test_green_button_runs_realtime_audio_turn(self) -> None:
         loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
@@ -365,11 +502,13 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop.handle_button_press("green")
 
         self.assertEqual(recorder.pause_values, [1200])
-        self.assertEqual(recorder.start_timeouts, [None])
+        self.assertEqual(recorder.start_timeouts, [8.0])
         self.assertEqual(recorder.speech_start_chunks, [None])
         self.assertEqual(recorder.ignore_initial_ms, [0])
+        self.assertEqual(recorder.pause_grace_values, [900])
         self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
-        self.assertEqual(realtime_session.conversations, [()])
+        self.assertEqual(len(realtime_session.conversations), 1)
+        self._assert_language_contract_only(realtime_session.conversations[0])
         self.assertTrue(realtime_session.entered)
         self.assertTrue(realtime_session.exited)
         self.assertEqual(len(player.tones), 1)
@@ -382,13 +521,77 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("status=waiting", lines)
         self.assertTrue(any(line.startswith("timing_realtime_ms=") for line in lines))
 
+    def test_yellow_button_accepts_split_support_providers(self) -> None:
+        backend = FakePrintBackend()
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, printer = self.make_loop(
+            print_backend=None,
+            stt_provider=backend,
+            agent_provider=backend,
+            tts_provider=backend,
+        )
+        loop.runtime.last_response = "Guten Tag"
+
+        loop.handle_button_press("yellow")
+
+        self.assertEqual(len(backend.calls), 1)
+        self.assertEqual(printer.printed, ["GUTEN TAG"])
+
+    def test_wakeword_with_remaining_text_runs_direct_text_turn(self) -> None:
+        loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
+
+        handled = loop.handle_wakeword_match(
+            WakewordMatch(
+                detected=True,
+                transcript="Hey Twinr wie spaet ist es",
+                matched_phrase="hey twinr",
+                remaining_text="wie spaet ist es",
+                normalized_transcript="hey twinr wie spaet ist es",
+            )
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(realtime_session.text_calls, ["wie spaet ist es"])
+        self.assertEqual(realtime_session.calls, [])
+        self.assertEqual(recorder.pause_values, [])
+        self.assertEqual(len(player.tones), 0)
+        self.assertIn("wakeword_mode=direct_text", lines)
+        self.assertEqual(loop.runtime.last_transcript, "Hallo Twinr")
+
+    def test_wakeword_without_remaining_text_opens_listening_window(self) -> None:
+        loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
+
+        handled = loop.handle_wakeword_match(
+            WakewordMatch(
+                detected=True,
+                transcript="Hey Twinr",
+                matched_phrase="hey twinr",
+                remaining_text="",
+                normalized_transcript="hey twinr",
+            )
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
+        self.assertEqual(realtime_session.text_calls, [])
+        self.assertEqual(recorder.pause_values, [1200])
+        self.assertEqual(recorder.start_timeouts, [loop.config.conversation_follow_up_timeout_s])
+        self.assertEqual(recorder.speech_start_chunks, [loop.config.audio_follow_up_speech_start_chunks])
+        self.assertEqual(recorder.ignore_initial_ms, [loop.config.audio_follow_up_ignore_ms])
+        self.assertEqual(recorder.pause_grace_values, [loop.config.adaptive_timing_pause_grace_ms])
+        self.assertEqual(len(player.tones), 1)
+        self.assertEqual(player.played, [b"PCM", b"PCM"])
+        self.assertIn("wakeword_mode=listen", lines)
+        self.assertIn("wakeword_ack=Ja?", lines)
+
     def test_yellow_button_uses_print_backend(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop()
         loop.runtime.last_response = "Guten Tag"
 
         loop.handle_button_press("yellow")
 
-        self.assertEqual(print_backend.calls, [((), None, "Guten Tag", "button")])
+        self.assertEqual(len(print_backend.calls), 1)
+        self._assert_language_contract_only(print_backend.calls[0][0])
+        self.assertEqual(print_backend.calls[0][1:], (None, "Guten Tag", "button"))
         self.assertEqual(printer.printed, ["GUTEN TAG"])
         self.assertIn("status=printing", lines)
         self.assertEqual(lines[-1], "status=waiting")
@@ -414,14 +617,70 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop.handle_button_press("green")
 
         self.assertEqual(recorder.pause_values, [1200, 1200])
-        self.assertEqual(recorder.start_timeouts, [None, 3.5])
+        self.assertEqual(recorder.start_timeouts, [8.0, 3.5])
         self.assertEqual(recorder.speech_start_chunks, [None, 5])
         self.assertEqual(recorder.ignore_initial_ms, [0, 420])
+        self.assertEqual(recorder.pause_grace_values, [900, 900])
         self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
-        self.assertEqual(realtime_session.conversations[0], ())
+        self._assert_language_contract_only(realtime_session.conversations[0])
         self.assertEqual(len(player.tones), 2)
         self.assertIn("follow_up_timeout=true", lines)
         self.assertEqual(loop.runtime.status.value, "waiting")
+
+    def test_button_listening_timeout_adapts_next_start_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                adaptive_timing_store_path=str(Path(temp_dir) / "adaptive-timing.json"),
+            )
+            recorder = FakeRecorder(
+                recordings=[
+                    RuntimeError("No speech detected before timeout"),
+                    b"PCMINPUT",
+                ]
+            )
+            loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop(
+                config=config,
+                recorder=recorder,
+            )
+
+            loop.handle_button_press("green")
+            loop.handle_button_press("green")
+
+        self.assertEqual(recorder.start_timeouts, [8.0, 8.75])
+        self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
+        self.assertEqual(len(player.tones), 2)
+        self.assertIn("listen_timeout=true", lines)
+
+    def test_resumed_pause_adapts_next_pause_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                adaptive_timing_store_path=str(Path(temp_dir) / "adaptive-timing.json"),
+            )
+            recorder = FakeRecorder(
+                recordings=[
+                    SimpleNamespace(
+                        pcm_bytes=b"FIRST",
+                        speech_started_after_ms=2100,
+                        resumed_after_pause_count=1,
+                    ),
+                    b"SECOND",
+                ]
+            )
+            loop, _lines, realtime_session, _print_backend, recorder, _player, _printer = self.make_loop(
+                config=config,
+                recorder=recorder,
+            )
+
+            loop.handle_button_press("green")
+            loop.handle_button_press("green")
+
+        self.assertEqual(recorder.pause_values, [1200, 1340])
+        self.assertEqual(recorder.pause_grace_values, [900, 990])
+        self.assertEqual(realtime_session.calls, [b"FIRST", b"SECOND"])
 
     def test_follow_up_turn_receives_previous_conversation_history(self) -> None:
         config = TwinrConfig(
@@ -458,12 +717,14 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         loop.handle_button_press("green")
 
-        self.assertEqual(realtime_session.conversations[0], ())
+        self._assert_language_contract_only(realtime_session.conversations[0])
         self.assertIsNotNone(realtime_session.conversations[1])
         self.assertEqual(realtime_session.conversations[1][0][0], "system")
-        self.assertIn("Twinr memory summary", realtime_session.conversations[1][0][1])
+        self.assertIn(self._LANGUAGE_CONTRACT, realtime_session.conversations[1][0][1])
+        self.assertEqual(realtime_session.conversations[1][1][0], "system")
+        self.assertIn("Twinr memory summary", realtime_session.conversations[1][1][1])
         self.assertEqual(
-            realtime_session.conversations[1][1:],
+            realtime_session.conversations[1][2:],
             (
                 ("user", "Erste Frage"),
                 ("assistant", "Erste Antwort"),
@@ -491,6 +752,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop.handle_button_press("green")
 
         self.assertEqual(recorder.pause_values, [1200])
+        self.assertEqual(recorder.pause_grace_values, [900])
         self.assertEqual(len(player.tones), 1)
         self.assertIn("conversation_ended=true", lines)
         self.assertEqual(loop.runtime.status.value, "waiting")
@@ -523,8 +785,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime.user_voice_confidence, 0.63)
         self.assertEqual(loop.runtime.user_voice_checked_at, "2026-03-13T12:15:00+00:00")
         self.assertIsNotNone(realtime_session.conversations[0])
-        self.assertEqual(realtime_session.conversations[0][0][0], "system")
-        self.assertIn("Speaker signal: partial match", realtime_session.conversations[0][0][1])
+        self.assertTrue(
+            any(
+                role == "system" and "Speaker signal: partial match" in content
+                for role, content in realtime_session.conversations[0]
+            )
+        )
         self.assertIn("voice_profile_status=uncertain", lines)
         self.assertIn("voice_profile_confidence=0.63", lines)
 
@@ -535,10 +801,9 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         result = loop._handle_print_tool_call({"text": "Wichtige Info"})
 
-        self.assertEqual(
-            print_backend.calls,
-            [((), None, "Wichtige Info", "tool")],
-        )
+        self.assertEqual(len(print_backend.calls), 1)
+        self._assert_language_contract_only(print_backend.calls[0][0])
+        self.assertEqual(print_backend.calls[0][1:], (None, "Wichtige Info", "tool"))
         self.assertEqual(printer.printed, ["GUTEN TAG"])
         self.assertEqual(result["status"], "printed")
         self.assertEqual(result["text"], "GUTEN TAG")
@@ -583,7 +848,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
             result = loop._handle_schedule_reminder_tool_call(
                 {
-                    "due_at": "2026-03-14T12:00:00+01:00",
+                    "due_at": "2026-03-15T12:00:00+01:00",
                     "summary": "Arzttermin",
                     "details": "Bei Dr. Meyer",
                     "kind": "appointment",
@@ -944,6 +1209,79 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime.memory.ledger[-1].kind, "preference")
         self.assertIn("user_profile_tool_call=true", lines)
 
+    def test_remember_contact_and_lookup_contact_tool_calls_handle_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+
+            first = loop._handle_remember_contact_tool_call(
+                {
+                    "given_name": "Corinna",
+                    "family_name": "Maier",
+                    "phone": "01761234",
+                    "role": "Physiotherapeutin",
+                }
+            )
+            second = loop._handle_remember_contact_tool_call(
+                {
+                    "given_name": "Corinna",
+                    "family_name": "Schmidt",
+                    "phone": "0309988",
+                    "role": "Nachbarin",
+                }
+            )
+            lookup = loop._handle_lookup_contact_tool_call({"name": "Corinna"})
+            resolved = loop._handle_lookup_contact_tool_call({"name": "Corinna", "role": "Physiotherapeutin"})
+
+        self.assertEqual(first["status"], "created")
+        self.assertEqual(second["status"], "created")
+        self.assertEqual(lookup["status"], "needs_clarification")
+        self.assertEqual(len(lookup["options"]), 2)
+        self.assertEqual(resolved["status"], "found")
+        self.assertEqual(resolved["label"], "Corinna Maier")
+        self.assertEqual(resolved["phones"], ["01761234"])
+        self.assertIn("graph_contact_tool_call=true", lines)
+        self.assertIn("graph_contact_lookup=true", lines)
+
+    def test_remember_preference_and_plan_tool_calls_feed_provider_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                openai_web_search_timezone="Europe/Berlin",
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+
+            preference = loop._handle_remember_preference_tool_call(
+                {
+                    "category": "brand",
+                    "value": "Melitta",
+                    "for_product": "coffee",
+                }
+            )
+            plan = loop._handle_remember_plan_tool_call(
+                {
+                    "summary": "go for a walk",
+                    "when": "today",
+                }
+            )
+            loop.runtime.last_transcript = "Wie wird das Wetter heute?"
+            provider_context = loop.runtime.provider_conversation_context()
+            system_contexts = [content for role, content in provider_context if role == "system"]
+
+        self.assertEqual(preference["edge_type"], "user_prefers_brand")
+        self.assertEqual(plan["edge_type"], "user_plans")
+        self.assertTrue(any("All user-facing spoken and written replies for this turn must be in German." in content for content in system_contexts))
+        self.assertTrue(any("Melitta" in content for content in system_contexts))
+        self.assertTrue(any("go for a walk" in content for content in system_contexts))
+        self.assertIn("graph_preference_tool_call=true", lines)
+        self.assertIn("graph_plan_tool_call=true", lines)
+
     def test_update_user_profile_requires_confirmation_for_unknown_voice(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             personality_dir = Path(temp_dir) / "personality"
@@ -1009,6 +1347,115 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime.memory.ledger[-1].kind, "preference")
         self.assertIn("personality_tool_call=true", lines)
 
+    def test_update_simple_setting_tool_call_persists_and_applies_memory_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "TWINR_MEMORY_MAX_TURNS=20\nTWINR_MEMORY_KEEP_RECENT=10\n",
+                encoding="utf-8",
+            )
+            config = TwinrConfig.from_env(env_path)
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+
+            result = loop._handle_update_simple_setting_tool_call(
+                {
+                    "setting": "memory_capacity",
+                    "action": "increase",
+                }
+            )
+
+            env_text = env_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(result["memory_max_turns"], 28)
+        self.assertEqual(result["memory_keep_recent"], 12)
+        self.assertEqual(loop.config.memory_max_turns, 28)
+        self.assertEqual(loop.runtime.memory.max_turns, 28)
+        self.assertIn("TWINR_MEMORY_MAX_TURNS=28", env_text)
+        self.assertIn("TWINR_MEMORY_KEEP_RECENT=12", env_text)
+        self.assertEqual(loop.runtime.memory.ledger[-1].kind, "preference")
+        self.assertIn("simple_setting_tool_call=true", lines)
+
+    def test_update_simple_setting_requires_confirmation_for_unknown_voice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "TWINR_MEMORY_MAX_TURNS=20\nTWINR_MEMORY_KEEP_RECENT=10\n",
+                encoding="utf-8",
+            )
+            config = TwinrConfig.from_env(env_path)
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+            loop.runtime.update_user_voice_assessment(
+                status="unknown_voice",
+                confidence=0.18,
+                checked_at="2026-03-13T21:00:00+00:00",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "confirmed=true"):
+                loop._handle_update_simple_setting_tool_call(
+                    {
+                        "setting": "memory_capacity",
+                        "action": "increase",
+                    }
+                )
+
+            result = loop._handle_update_simple_setting_tool_call(
+                {
+                    "setting": "memory_capacity",
+                    "action": "increase",
+                    "confirmed": True,
+                }
+            )
+
+        self.assertEqual(result["status"], "updated")
+
+    def test_update_simple_setting_can_change_voice_and_speed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "OPENAI_TTS_VOICE=marin",
+                        "OPENAI_REALTIME_VOICE=sage",
+                        "OPENAI_TTS_SPEED=1.00",
+                        "OPENAI_REALTIME_SPEED=1.00",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = TwinrConfig.from_env(env_path)
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+
+            voice_result = loop._handle_update_simple_setting_tool_call(
+                {
+                    "setting": "spoken_voice",
+                    "action": "set",
+                    "value": "männliche Stimme",
+                }
+            )
+            speed_result = loop._handle_update_simple_setting_tool_call(
+                {
+                    "setting": "speech_speed",
+                    "action": "decrease",
+                }
+            )
+
+            env_text = env_path.read_text(encoding="utf-8")
+
+        self.assertEqual(voice_result["status"], "updated")
+        self.assertEqual(voice_result["voice"], "cedar")
+        self.assertEqual(loop.config.openai_tts_voice, "cedar")
+        self.assertEqual(loop.config.openai_realtime_voice, "cedar")
+        self.assertEqual(speed_result["status"], "updated")
+        self.assertEqual(speed_result["speech_speed"], 0.9)
+        self.assertEqual(loop.config.openai_tts_speed, 0.9)
+        self.assertEqual(loop.config.openai_realtime_speed, 0.9)
+        self.assertIn("OPENAI_TTS_VOICE=cedar", env_text)
+        self.assertIn("OPENAI_REALTIME_VOICE=cedar", env_text)
+        self.assertIn("OPENAI_TTS_SPEED=0.90", env_text)
+        self.assertIn("OPENAI_REALTIME_SPEED=0.90", env_text)
+
     def test_voice_profile_tools_can_enroll_status_and_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -1052,7 +1499,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         prompt, images, conversation, allow_web_search = print_backend.vision_calls[0]
         self.assertIn("Image 2 is a stored reference image of the main user.", prompt)
         self.assertEqual(len(images), 2)
-        self.assertEqual(conversation, ())
+        self._assert_language_contract_only(conversation)
         self.assertFalse(allow_web_search)
         self.assertIn("camera_tool_call=true", lines)
         self.assertIn("vision_image_count=2", lines)
@@ -1073,17 +1520,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(
-            print_backend.search_calls,
-            [
-                (
-                    "Wann faehrt der Bus nach Hamburg?",
-                    (),
-                    "Schwarzenbek",
-                    "Friday, 2026-03-13 10:00 (Europe/Berlin)",
-                )
-            ],
-        )
+        self.assertEqual(len(print_backend.search_calls), 1)
+        question, conversation, location_hint, date_context = print_backend.search_calls[0]
+        self.assertEqual(question, "Wann faehrt der Bus nach Hamburg?")
+        self._assert_language_contract_only(conversation)
+        self.assertEqual(location_hint, "Schwarzenbek")
+        self.assertEqual(date_context, "Friday, 2026-03-13 10:00 (Europe/Berlin)")
         self.assertEqual(result["answer"], "Bus 24 faehrt um 07:30 Uhr.")
         self.assertEqual(result["sources"], ["https://example.com/fahrplan"])
         self.assertEqual(len(loop.runtime.memory.search_results), 1)
@@ -1124,10 +1566,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             ),
         )
         self.assertIsInstance(proactive_call[5], tuple)
+        self.assertIsInstance(proactive_call[6], tuple)
         self.assertEqual(print_backend.synthesize_calls, ["Proaktiv: person_returned"])
         self.assertEqual(len(player.tones), 1)
         self.assertEqual(player.played, [b"PCM", b"PCM"])
         self.assertIn("social_trigger=person_returned", lines)
+        self.assertIn("social_prompt_mode=llm", lines)
         self.assertIn("proactive_listen=true", lines)
         self.assertIn("status=listening", lines)
         self.assertIn("social_response_id=resp_social_1", lines)
@@ -1144,6 +1588,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             social_events[-1]["data"]["default_prompt"],
             "Hey Thom, schön dich zu sehen. Wie geht's dir?",
         )
+        self.assertEqual(social_events[-1]["data"]["prompt_mode"], "llm")
 
     def test_social_trigger_opens_hands_free_listening_window_and_times_out(self) -> None:
         recorder = FakeRecorder(
@@ -1181,6 +1626,33 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(player.played, [b"PCM"])
         self.assertIn("proactive_listen_timeout=true", lines)
         self.assertEqual(loop.runtime.status.value, "waiting")
+
+    def test_social_trigger_uses_direct_prompt_for_safety_events(self) -> None:
+        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop()
+
+        spoke = loop.handle_social_trigger(
+            SocialTriggerDecision(
+                trigger_id="possible_fall",
+                prompt="Brauchst du Hilfe?",
+                reason="Person disappeared after a fall-like transition.",
+                observed_at=42.0,
+                priority=SocialTriggerPriority.POSSIBLE_FALL,
+            )
+        )
+
+        self.assertTrue(spoke)
+        self.assertEqual(print_backend.proactive_calls, [])
+        self.assertEqual(print_backend.synthesize_calls, ["Brauchst du Hilfe?"])
+        self.assertIn("social_prompt_mode=direct_safety", lines)
+        social_events = [
+            entry
+            for entry in loop.runtime.ops_events.tail(limit=40)
+            if entry["event"] == "social_trigger_prompted"
+            and entry.get("data", {}).get("trigger") == "possible_fall"
+        ]
+        self.assertTrue(social_events)
+        self.assertEqual(social_events[-1]["data"]["prompt"], "Brauchst du Hilfe?")
+        self.assertEqual(social_events[-1]["data"]["prompt_mode"], "direct_safety")
 
     def test_social_trigger_is_skipped_when_runtime_is_busy(self) -> None:
         loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()

@@ -22,6 +22,29 @@ DEFAULT_BUTTON_PROBE_LINES = (
     25,
     27,
 )
+DEFAULT_WAKEWORD_PHRASES = (
+    "hey twinr",
+    "he twinr",
+    "hey twinna",
+    "hey twina",
+    "hey twinner",
+    "hallo twinr",
+    "hallo twinna",
+    "hallo twina",
+    "hallo twinner",
+    "twinr hallo",
+    "twinr hey",
+    "twinna hallo",
+    "twinna hey",
+    "twina hallo",
+    "twina hey",
+    "twinner hallo",
+    "twinner hey",
+    "twinr",
+    "twinna",
+    "twina",
+    "twinner",
+)
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -73,6 +96,13 @@ def _parse_csv_ints(value: str | None, default: tuple[int, ...]) -> tuple[int, .
     return tuple(int(part.strip()) for part in value.split(",") if part.strip())
 
 
+def _parse_csv_strings(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    if value is None or not value.strip():
+        return default
+    parsed = tuple(part.strip() for part in value.split(",") if part.strip())
+    return parsed or default
+
+
 @dataclass(frozen=True, slots=True)
 class TwinrConfig:
     openai_api_key: str | None = None
@@ -86,10 +116,12 @@ class TwinrConfig:
     openai_stt_model: str = "whisper-1"
     openai_tts_model: str = "gpt-4o-mini-tts"
     openai_tts_voice: str = "marin"
+    openai_tts_speed: float = 1.0
     openai_tts_format: str = "wav"
     openai_tts_instructions: str | None = None
     openai_realtime_model: str = "gpt-4o-realtime-preview"
     openai_realtime_voice: str = "sage"
+    openai_realtime_speed: float = 1.0
     openai_realtime_instructions: str | None = None
     openai_realtime_transcription_model: str = "whisper-1"
     openai_realtime_language: str | None = "de"
@@ -141,6 +173,23 @@ class TwinrConfig:
     proactive_audio_input_device: str | None = None
     proactive_audio_sample_ms: int = 1000
     proactive_audio_distress_enabled: bool = False
+    wakeword_enabled: bool = False
+    wakeword_backend: str = "stt"
+    wakeword_phrases: tuple[str, ...] = DEFAULT_WAKEWORD_PHRASES
+    wakeword_sample_ms: int = 1800
+    wakeword_presence_grace_s: float = 15.0 * 60.0
+    wakeword_motion_grace_s: float = 5.0 * 60.0
+    wakeword_speech_grace_s: float = 90.0
+    wakeword_attempt_cooldown_s: float = 4.0
+    wakeword_min_active_ratio: float = 0.08
+    wakeword_min_active_chunks: int = 2
+    wakeword_openwakeword_models: tuple[str, ...] = ()
+    wakeword_openwakeword_threshold: float = 0.5
+    wakeword_openwakeword_vad_threshold: float = 0.0
+    wakeword_openwakeword_patience_frames: int = 1
+    wakeword_openwakeword_enable_speex: bool = False
+    wakeword_openwakeword_transcribe_on_detect: bool = True
+    wakeword_openwakeword_inference_framework: str = "tflite"
     proactive_person_returned_absence_s: float = 20.0 * 60.0
     proactive_person_returned_recent_motion_s: float = 30.0
     proactive_attention_window_s: float = 6.0
@@ -166,6 +215,21 @@ class TwinrConfig:
     reminder_store_path: str = "state/reminders.json"
     automation_store_path: str = "state/automations.json"
     voice_profile_store_path: str = "state/voice_profile.json"
+    adaptive_timing_enabled: bool = True
+    adaptive_timing_store_path: str = "state/adaptive_timing.json"
+    adaptive_timing_pause_grace_ms: int = 900
+    long_term_memory_enabled: bool = False
+    long_term_memory_backend: str = "chonkydb"
+    long_term_memory_path: str = "state/chonkydb"
+    long_term_memory_background_store_turns: bool = True
+    long_term_memory_write_queue_size: int = 32
+    long_term_memory_recall_limit: int = 3
+    long_term_memory_query_rewrite_enabled: bool = True
+    chonkydb_base_url: str | None = None
+    chonkydb_api_key: str | None = None
+    chonkydb_api_key_header: str = "x-api-key"
+    chonkydb_allow_bearer_auth: bool = False
+    chonkydb_timeout_s: float = 20.0
     restore_runtime_state_on_startup: bool = False
     reminder_poll_interval_s: float = 1.0
     reminder_retry_delay_s: float = 90.0
@@ -177,8 +241,8 @@ class TwinrConfig:
     voice_profile_uncertain_threshold: float = 0.55
     voice_profile_max_samples: int = 6
     speech_pause_ms: int = 1200
-    memory_max_turns: int = 12
-    memory_keep_recent: int = 6
+    memory_max_turns: int = 20
+    memory_keep_recent: int = 10
     gpio_chip: str = "gpiochip0"
     green_button_gpio: int | None = None
     yellow_button_gpio: int | None = None
@@ -253,11 +317,13 @@ class TwinrConfig:
             openai_stt_model=get_value("OPENAI_STT_MODEL", "whisper-1") or "whisper-1",
             openai_tts_model=get_value("OPENAI_TTS_MODEL", "gpt-4o-mini-tts") or "gpt-4o-mini-tts",
             openai_tts_voice=get_value("OPENAI_TTS_VOICE", "marin") or "marin",
+            openai_tts_speed=_parse_float(get_value("OPENAI_TTS_SPEED"), 1.0),
             openai_tts_format=get_value("OPENAI_TTS_FORMAT", "wav") or "wav",
             openai_tts_instructions=get_value("OPENAI_TTS_INSTRUCTIONS"),
             openai_realtime_model=get_value("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
             or "gpt-4o-realtime-preview",
             openai_realtime_voice=get_value("OPENAI_REALTIME_VOICE", "sage") or "sage",
+            openai_realtime_speed=_parse_float(get_value("OPENAI_REALTIME_SPEED"), 1.0),
             openai_realtime_instructions=get_value("OPENAI_REALTIME_INSTRUCTIONS"),
             openai_realtime_transcription_model=(
                 get_value("OPENAI_REALTIME_TRANSCRIPTION_MODEL", "whisper-1") or "whisper-1"
@@ -324,6 +390,62 @@ class TwinrConfig:
                 get_value("TWINR_PROACTIVE_AUDIO_DISTRESS_ENABLED"),
                 False,
             ),
+            wakeword_enabled=_parse_bool(get_value("TWINR_WAKEWORD_ENABLED"), False),
+            wakeword_backend=(get_value("TWINR_WAKEWORD_BACKEND", "stt") or "stt").strip().lower(),
+            wakeword_phrases=_parse_csv_strings(
+                get_value("TWINR_WAKEWORD_PHRASES"),
+                DEFAULT_WAKEWORD_PHRASES,
+            ),
+            wakeword_sample_ms=int(get_value("TWINR_WAKEWORD_SAMPLE_MS", "1800") or "1800"),
+            wakeword_presence_grace_s=_parse_float(
+                get_value("TWINR_WAKEWORD_PRESENCE_GRACE_S"),
+                15.0 * 60.0,
+            ),
+            wakeword_motion_grace_s=_parse_float(
+                get_value("TWINR_WAKEWORD_MOTION_GRACE_S"),
+                5.0 * 60.0,
+            ),
+            wakeword_speech_grace_s=_parse_float(
+                get_value("TWINR_WAKEWORD_SPEECH_GRACE_S"),
+                90.0,
+            ),
+            wakeword_attempt_cooldown_s=_parse_float(
+                get_value("TWINR_WAKEWORD_ATTEMPT_COOLDOWN_S"),
+                4.0,
+            ),
+            wakeword_min_active_ratio=_parse_float(
+                get_value("TWINR_WAKEWORD_MIN_ACTIVE_RATIO"),
+                0.08,
+            ),
+            wakeword_min_active_chunks=int(
+                get_value("TWINR_WAKEWORD_MIN_ACTIVE_CHUNKS", "2") or "2"
+            ),
+            wakeword_openwakeword_models=_parse_csv_strings(
+                get_value("TWINR_WAKEWORD_OPENWAKEWORD_MODELS"),
+                (),
+            ),
+            wakeword_openwakeword_threshold=_parse_float(
+                get_value("TWINR_WAKEWORD_OPENWAKEWORD_THRESHOLD"),
+                0.5,
+            ),
+            wakeword_openwakeword_vad_threshold=_parse_float(
+                get_value("TWINR_WAKEWORD_OPENWAKEWORD_VAD_THRESHOLD"),
+                0.0,
+            ),
+            wakeword_openwakeword_patience_frames=int(
+                get_value("TWINR_WAKEWORD_OPENWAKEWORD_PATIENCE_FRAMES", "1") or "1"
+            ),
+            wakeword_openwakeword_enable_speex=_parse_bool(
+                get_value("TWINR_WAKEWORD_OPENWAKEWORD_ENABLE_SPEEX"),
+                False,
+            ),
+            wakeword_openwakeword_transcribe_on_detect=_parse_bool(
+                get_value("TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT"),
+                True,
+            ),
+            wakeword_openwakeword_inference_framework=(
+                get_value("TWINR_WAKEWORD_OPENWAKEWORD_INFERENCE_FRAMEWORK", "tflite") or "tflite"
+            ).strip().lower(),
             proactive_person_returned_absence_s=_parse_float(
                 get_value("TWINR_PROACTIVE_PERSON_RETURNED_ABSENCE_S"),
                 20.0 * 60.0,
@@ -423,6 +545,47 @@ class TwinrConfig:
                 str(project_root / "state" / "voice_profile.json"),
             )
             or str(project_root / "state" / "voice_profile.json"),
+            adaptive_timing_enabled=_parse_bool(get_value("TWINR_ADAPTIVE_TIMING_ENABLED"), True),
+            adaptive_timing_store_path=get_value(
+                "TWINR_ADAPTIVE_TIMING_STORE_PATH",
+                str(project_root / "state" / "adaptive_timing.json"),
+            )
+            or str(project_root / "state" / "adaptive_timing.json"),
+            adaptive_timing_pause_grace_ms=int(
+                get_value("TWINR_ADAPTIVE_TIMING_PAUSE_GRACE_MS", "900") or "900"
+            ),
+            long_term_memory_enabled=_parse_bool(get_value("TWINR_LONG_TERM_MEMORY_ENABLED"), False),
+            long_term_memory_backend=get_value("TWINR_LONG_TERM_MEMORY_BACKEND", "chonkydb") or "chonkydb",
+            long_term_memory_path=get_value(
+                "TWINR_LONG_TERM_MEMORY_PATH",
+                str(project_root / "state" / "chonkydb"),
+            )
+            or str(project_root / "state" / "chonkydb"),
+            long_term_memory_background_store_turns=_parse_bool(
+                get_value("TWINR_LONG_TERM_MEMORY_BACKGROUND_STORE_TURNS"),
+                True,
+            ),
+            long_term_memory_write_queue_size=int(
+                get_value("TWINR_LONG_TERM_MEMORY_WRITE_QUEUE_SIZE", "32") or "32"
+            ),
+            long_term_memory_recall_limit=int(
+                get_value("TWINR_LONG_TERM_MEMORY_RECALL_LIMIT", "3") or "3"
+            ),
+            long_term_memory_query_rewrite_enabled=_parse_bool(
+                get_value("TWINR_LONG_TERM_MEMORY_QUERY_REWRITE_ENABLED"),
+                True,
+            ),
+            chonkydb_base_url=(
+                get_value("TWINR_CHONKYDB_BASE_URL")
+                or get_value("CCODEX_MEMORY_BASE_URL")
+            ),
+            chonkydb_api_key=(
+                get_value("TWINR_CHONKYDB_API_KEY")
+                or get_value("CCODEX_MEMORY_API_KEY")
+            ),
+            chonkydb_api_key_header=get_value("TWINR_CHONKYDB_API_KEY_HEADER", "x-api-key") or "x-api-key",
+            chonkydb_allow_bearer_auth=_parse_bool(get_value("TWINR_CHONKYDB_ALLOW_BEARER_AUTH"), False),
+            chonkydb_timeout_s=_parse_float(get_value("TWINR_CHONKYDB_TIMEOUT_S"), 20.0),
             restore_runtime_state_on_startup=_parse_bool(
                 get_value("TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP"),
                 False,
@@ -443,8 +606,8 @@ class TwinrConfig:
             ),
             voice_profile_max_samples=int(get_value("TWINR_VOICE_PROFILE_MAX_SAMPLES", "6") or "6"),
             speech_pause_ms=int(get_value("TWINR_SPEECH_PAUSE_MS", "1200") or "1200"),
-            memory_max_turns=int(get_value("TWINR_MEMORY_MAX_TURNS", "12") or "12"),
-            memory_keep_recent=int(get_value("TWINR_MEMORY_KEEP_RECENT", "6") or "6"),
+            memory_max_turns=int(get_value("TWINR_MEMORY_MAX_TURNS", "20") or "20"),
+            memory_keep_recent=int(get_value("TWINR_MEMORY_KEEP_RECENT", "10") or "10"),
             gpio_chip=get_value("TWINR_GPIO_CHIP", "gpiochip0") or "gpiochip0",
             green_button_gpio=_parse_optional_int(get_value("TWINR_GREEN_BUTTON_GPIO")),
             yellow_button_gpio=_parse_optional_int(get_value("TWINR_YELLOW_BUTTON_GPIO")),

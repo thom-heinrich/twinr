@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -16,6 +17,17 @@ from twinr.runner import TwinrHardwareLoop
 from twinr.runtime import TwinrRuntime
 
 
+def _system_messages(conversation: tuple[tuple[str, str], ...] | None) -> tuple[str, ...]:
+    return tuple(content for role, content in (conversation or ()) if role == "system")
+
+
+def _assert_contains_system_message(testcase: unittest.TestCase, conversation, needle: str) -> None:
+    testcase.assertTrue(
+        any(needle in content for content in _system_messages(conversation)),
+        msg=f"Expected a system message containing {needle!r}, got {conversation!r}",
+    )
+
+
 class FakeBackend:
     def __init__(self) -> None:
         self.transcribe_calls: list[tuple[bytes, str, str]] = []
@@ -26,6 +38,7 @@ class FakeBackend:
         self.synthesize_calls: list[str] = []
         self.print_calls: list[tuple[tuple[tuple[str, str], ...] | None, str | None, str | None, str]] = []
         self.reminder_calls: list[object] = []
+        self.proactive_calls: list[tuple[str, str, str, int, tuple[tuple[str, str], ...] | None, tuple[str, ...], tuple[str, ...]]] = []
         self.transcript = "Hello Twinr"
         self.answer = "Hello back."
 
@@ -91,14 +104,70 @@ class FakeBackend:
             used_web_search=False,
         )
 
+    def phrase_proactive_prompt_with_metadata(
+        self,
+        *,
+        trigger_id: str,
+        reason: str,
+        default_prompt: str,
+        priority: int,
+        conversation=None,
+        recent_prompts=(),
+        observation_facts=(),
+    ) -> OpenAITextResponse:
+        self.proactive_calls.append(
+            (
+                trigger_id,
+                reason,
+                default_prompt,
+                priority,
+                conversation,
+                tuple(recent_prompts),
+                tuple(observation_facts),
+            )
+        )
+        return OpenAITextResponse(
+            text=f"Proaktiv: {trigger_id}",
+            response_id="resp_social_1",
+            request_id="req_social_1",
+            model="gpt-5.2",
+            token_usage=None,
+            used_web_search=False,
+        )
+
 
 class FakeRecorder:
-    def __init__(self) -> None:
+    def __init__(self, recordings: list[bytes | Exception] | None = None) -> None:
         self.pause_values: list[int] = []
+        self.start_timeouts: list[float | None] = []
+        self.pause_grace_values: list[int] = []
+        self.recordings = list(recordings or [b"PCMINPUT"])
 
-    def record_until_pause(self, *, pause_ms: int) -> bytes:
+    def capture_pcm_until_pause_with_options(
+        self,
+        *,
+        pause_ms: int,
+        start_timeout_s: float | None = None,
+        max_record_seconds: float | None = None,
+        speech_start_chunks: int | None = None,
+        ignore_initial_ms: int = 0,
+        pause_grace_ms: int = 0,
+    ):
+        del max_record_seconds, speech_start_chunks, ignore_initial_ms
         self.pause_values.append(pause_ms)
-        return b"WAVDATA"
+        self.start_timeouts.append(start_timeout_s)
+        self.pause_grace_values.append(pause_grace_ms)
+        if not self.recordings:
+            value: bytes | Exception = b"PCMINPUT"
+        else:
+            value = self.recordings.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return SimpleNamespace(
+            pcm_bytes=value,
+            speech_started_after_ms=2300,
+            resumed_after_pause_count=0,
+        )
 
 
 class FakePlayer:
@@ -174,21 +243,54 @@ class HardwareLoopTests(unittest.TestCase):
         self,
         *,
         backend=None,
+        stt_provider=None,
+        agent_provider=None,
+        tts_provider=None,
         config: TwinrConfig | None = None,
+        recorder: FakeRecorder | None = None,
         camera=None,
         button_monitor=None,
         voice_profile_monitor=None,
         proactive_monitor=None,
     ) -> tuple[TwinrHardwareLoop, list[str], FakeRecorder, FakePlayer, FakePrinter]:
         lines: list[str] = []
-        recorder = FakeRecorder()
+        recorder = recorder or FakeRecorder()
         player = FakePlayer()
         printer = FakePrinter()
+        temp_dir_handle = tempfile.TemporaryDirectory()
+        temp_root = Path(temp_dir_handle.name)
         config = config or TwinrConfig()
+        config = replace(
+            config,
+            project_root=str(temp_root if config.project_root == "." else Path(config.project_root)),
+            runtime_state_path=self._sandbox_path(
+                config.runtime_state_path,
+                temp_root / "runtime-state.json",
+                default="/tmp/twinr-runtime-state.json",
+            ),
+            reminder_store_path=self._sandbox_path(
+                config.reminder_store_path,
+                temp_root / "state" / "reminders.json",
+                default="state/reminders.json",
+            ),
+            adaptive_timing_store_path=self._sandbox_path(
+                config.adaptive_timing_store_path,
+                temp_root / "state" / "adaptive-timing.json",
+                default="state/adaptive_timing.json",
+            ),
+        )
+        resolved_backend = (
+            backend
+            if backend is not None or any(provider is not None for provider in (stt_provider, agent_provider, tts_provider))
+            else FakeBackend()
+        )
         loop = TwinrHardwareLoop(
             config=config,
             runtime=TwinrRuntime(config=config),
-            backend=backend or FakeBackend(),
+            backend=resolved_backend,
+            stt_provider=stt_provider,
+            agent_provider=agent_provider,
+            tts_provider=tts_provider,
             button_monitor=button_monitor or SimpleNamespace(__enter__=lambda self: self, __exit__=lambda self, exc_type, exc, tb: None),
             recorder=recorder,
             player=player,
@@ -200,7 +302,15 @@ class HardwareLoopTests(unittest.TestCase):
             sleep=lambda _seconds: None,
             error_reset_seconds=0.0,
         )
+        loop._test_temp_dir = temp_dir_handle
         return loop, lines, recorder, player, printer
+
+    @staticmethod
+    def _sandbox_path(current: str, isolated: Path, *, default: str) -> str:
+        path = Path(current)
+        if current == default or not path.is_absolute():
+            return str(isolated)
+        return current
 
     def test_green_button_runs_full_audio_turn(self) -> None:
         backend = FakeBackend()
@@ -209,7 +319,9 @@ class HardwareLoopTests(unittest.TestCase):
         loop.handle_button_press("green")
 
         self.assertEqual(recorder.pause_values, [1200])
-        self.assertEqual(backend.transcribe_calls[0][0], b"WAVDATA")
+        self.assertEqual(recorder.start_timeouts, [8.0])
+        self.assertEqual(recorder.pause_grace_values, [900])
+        self.assertTrue(backend.transcribe_calls[0][0].startswith(b"RIFF"))
         self.assertEqual(backend.transcribe_calls[0][1], "twinr-listen.wav")
         self.assertEqual(backend.respond_calls[0][0], "Hello Twinr")
         self.assertEqual(backend.respond_to_images_calls, [])
@@ -217,10 +329,42 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertEqual(player.played, [b"RIFF"])
         self.assertEqual(loop.runtime.last_response, "Hello back.")
         self.assertIn("status=listening", lines)
+
+    def test_green_button_accepts_split_providers(self) -> None:
+        backend = FakeBackend()
+        loop, lines, _recorder, player, _printer = self.make_loop(
+            backend=None,
+            stt_provider=backend,
+            agent_provider=backend,
+            tts_provider=backend,
+        )
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(len(backend.transcribe_calls), 1)
+        self.assertEqual(len(backend.respond_calls), 1)
+        self.assertEqual(player.played, [b"RIFF"])
         self.assertIn("status=processing", lines)
         self.assertIn("status=answering", lines)
         self.assertIn("status=waiting", lines)
         self.assertIn("timing_playback_ms=streamed", lines)
+
+    def test_green_button_no_speech_timeout_returns_to_waiting(self) -> None:
+        backend = FakeBackend()
+        recorder = FakeRecorder(recordings=[RuntimeError("No speech detected before timeout")])
+        loop, lines, recorder, player, _printer = self.make_loop(
+            backend=backend,
+            config=TwinrConfig(),
+            recorder=recorder,
+        )
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(recorder.pause_values, [1200])
+        self.assertEqual(backend.transcribe_calls, [])
+        self.assertEqual(player.played, [])
+        self.assertIn("listen_timeout=true", lines)
+        self.assertEqual(loop.runtime.status.value, "waiting")
 
     def test_yellow_button_formats_and_prints_last_answer(self) -> None:
         backend = FakeBackend()
@@ -229,10 +373,12 @@ class HardwareLoopTests(unittest.TestCase):
 
         loop.handle_button_press("yellow")
 
-        self.assertEqual(
-            backend.print_calls,
-            [((), None, "Hello back", "button")],
-        )
+        self.assertEqual(len(backend.print_calls), 1)
+        conversation, focus_hint, direct_text, request_source = backend.print_calls[0]
+        self.assertEqual(focus_hint, None)
+        self.assertEqual(direct_text, "Hello back")
+        self.assertEqual(request_source, "button")
+        _assert_contains_system_message(self, conversation, "All user-facing spoken and written replies")
         self.assertEqual(printer.printed, ["HELLO BACK"])
         self.assertIn("status=printing", lines)
         self.assertEqual(lines[-1], "status=waiting")
@@ -297,7 +443,7 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(backend.respond_to_images_calls), 1)
         prompt, images, conversation, allow_web_search = backend.respond_to_images_calls[0]
         self.assertIn("Image 1 is the current live camera frame", prompt)
-        self.assertEqual(conversation, ())
+        _assert_contains_system_message(self, conversation, "All user-facing spoken and written replies")
         self.assertFalse(allow_web_search)
         self.assertEqual(len(images), 1)
         self.assertEqual(images[0].label, "Image 1: live camera frame from the device.")
@@ -350,13 +496,12 @@ class HardwareLoopTests(unittest.TestCase):
 
         loop.handle_button_press("green")
 
-        self.assertEqual(monitor.audio_bytes, b"WAVDATA")
+        self.assertTrue(monitor.audio_bytes.startswith(b"RIFF"))
         self.assertEqual(loop.runtime.user_voice_status, "likely_user")
         self.assertEqual(loop.runtime.user_voice_confidence, 0.81)
         self.assertEqual(loop.runtime.user_voice_checked_at, "2026-03-13T12:00:00+00:00")
         self.assertIsNotNone(backend.respond_calls[0][1])
-        self.assertEqual(backend.respond_calls[0][1][0][0], "system")
-        self.assertIn("Speaker signal: likely match", backend.respond_calls[0][1][0][1])
+        _assert_contains_system_message(self, backend.respond_calls[0][1], "Speaker signal: likely match")
         self.assertIn("voice_profile_status=likely_user", lines)
         self.assertIn("voice_profile_confidence=0.81", lines)
 
@@ -378,12 +523,63 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime.status.value, "waiting")
         self.assertEqual(player.played, [b"RIFF"])
         self.assertEqual(loop.runtime.last_response, None)
+        self.assertEqual(len(backend.proactive_calls), 1)
+        trigger_id, reason, default_prompt, priority, conversation, recent_prompts, observation_facts = backend.proactive_calls[0]
+        self.assertEqual(
+            (trigger_id, reason, default_prompt, priority),
+            (
+                "attention_window",
+                "Person looked toward the device and stayed quiet.",
+                "Kann ich dir bei etwas helfen?",
+                int(SocialTriggerPriority.ATTENTION_WINDOW),
+            ),
+        )
+        _assert_contains_system_message(self, conversation, "All user-facing spoken and written replies")
+        self.assertEqual(recent_prompts, ())
+        self.assertEqual(observation_facts, ())
         self.assertIn("status=answering", lines)
         self.assertIn("social_trigger=attention_window", lines)
-        self.assertIn("social_prompt=Kann ich dir bei etwas helfen?", lines)
-        social_events = [entry for entry in loop.runtime.ops_events.tail(limit=20) if entry["event"] == "social_trigger_prompted"]
+        self.assertIn("social_prompt_mode=llm", lines)
+        self.assertIn("social_prompt=Proaktiv: attention_window", lines)
+        social_events = [
+            entry
+            for entry in loop.runtime.ops_events.tail(limit=20)
+            if entry["event"] == "social_trigger_prompted"
+            and entry.get("data", {}).get("trigger") == "attention_window"
+        ]
         self.assertEqual(len(social_events), 1)
-        self.assertEqual(social_events[0]["data"]["prompt"], "Kann ich dir bei etwas helfen?")
+        self.assertEqual(social_events[0]["data"]["prompt"], "Proaktiv: attention_window")
+        self.assertEqual(social_events[0]["data"]["default_prompt"], "Kann ich dir bei etwas helfen?")
+        self.assertEqual(social_events[0]["data"]["prompt_mode"], "llm")
+
+    def test_social_trigger_uses_direct_prompt_for_safety_events(self) -> None:
+        backend = FakeBackend()
+        loop, lines, _recorder, player, _printer = self.make_loop(backend=backend)
+
+        spoke = loop.handle_social_trigger(
+            SocialTriggerDecision(
+                trigger_id="possible_fall",
+                prompt="Brauchst du Hilfe?",
+                reason="Person disappeared after a fall-like transition.",
+                observed_at=42.0,
+                priority=SocialTriggerPriority.POSSIBLE_FALL,
+            )
+        )
+
+        self.assertTrue(spoke)
+        self.assertEqual(backend.proactive_calls, [])
+        self.assertEqual(player.played, [b"RIFF"])
+        self.assertIn("social_prompt_mode=direct_safety", lines)
+        self.assertIn("social_prompt=Brauchst du Hilfe?", lines)
+        social_events = [
+            entry
+            for entry in loop.runtime.ops_events.tail(limit=20)
+            if entry["event"] == "social_trigger_prompted"
+            and entry.get("data", {}).get("trigger") == "possible_fall"
+        ]
+        self.assertEqual(len(social_events), 1)
+        self.assertEqual(social_events[0]["data"]["prompt"], "Brauchst du Hilfe?")
+        self.assertEqual(social_events[0]["data"]["prompt_mode"], "direct_safety")
 
     def test_social_trigger_is_skipped_when_runtime_is_busy(self) -> None:
         backend = FakeBackend()

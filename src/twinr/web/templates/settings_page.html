@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% from "_form_fields.html" import render_setting_field %}
+
+{% block content %}
+<form method="post" action="{{ form_action }}" class="stack">
+  {% for section in sections %}
+  <section class="panel">
+    <div class="section-header">
+      <div>
+        <h2>{{ section.title }}</h2>
+        <p class="section-description">{{ section.description }}</p>
+      </div>
+    </div>
+    <div class="form-grid">
+      {% for field in section.fields %}
+      {{ render_setting_field(field) }}
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+  <div class="actions">
+    <button type="submit">Save changes</button>
+  </div>
+</form>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Adaptive timing</h2>
+      <p class="section-description">
+        Twinr keeps a bounded learned profile for slow starts and short mid-question pauses. It stays within the fixed baselines above and can be reset at any time.
+      </p>
+    </div>
+    <span class="status-pill {% if adaptive_timing.enabled %}is-ok{% else %}is-muted{% endif %}">
+      {% if adaptive_timing.enabled %}Enabled{% else %}Disabled{% endif %}
+    </span>
+  </div>
+
+  <div class="detail-grid">
+    {% for metric in adaptive_timing.current_metrics %}
+    <article class="detail-card">
+      <div class="detail-label">{{ metric.label }}</div>
+      <div class="detail-body">{{ metric.value }}</div>
+      <div class="field-help">{{ metric.detail }}</div>
+    </article>
+    {% endfor %}
+  </div>
+
+  <div class="panel-subsection panel-subsection-spaced">
+    <h3 class="subsection-title">Observed patterns</h3>
+    <div class="detail-grid">
+      {% for metric in adaptive_timing.counter_metrics %}
+      <article class="detail-card">
+        <div class="detail-label">{{ metric.label }}</div>
+        <div class="detail-body">{{ metric.value }}</div>
+        <div class="field-help">{{ metric.detail }}</div>
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="panel-subsection panel-subsection-spaced">
+    <h3 class="subsection-title">Configured baselines</h3>
+    <div class="detail-grid">
+      {% for metric in adaptive_timing.baseline_metrics %}
+      <article class="detail-card">
+        <div class="detail-label">{{ metric.label }}</div>
+        <div class="detail-body">{{ metric.value }}</div>
+        <div class="field-help">{{ metric.detail }}</div>
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="panel-subsection panel-subsection-spaced">
+    <div class="detail-grid">
+      <article class="detail-card">
+        <div class="detail-label">Store file</div>
+        <div class="detail-body-copy">{{ adaptive_timing.path }}</div>
+        <div class="field-help">Persistent learned timing profile on disk.</div>
+      </article>
+      <article class="detail-card">
+        <div class="detail-label">Last saved</div>
+        <div class="detail-body-copy">{{ adaptive_timing.last_updated_label }}</div>
+        <div class="field-help">Updates whenever Twinr learns from a successful turn or a no-speech timeout.</div>
+      </article>
+    </div>
+    <form method="post" action="/settings" class="actions-start inline-form">
+      <input type="hidden" name="_action" value="reset_adaptive_timing">
+      <button type="submit" class="button-secondary">Reset learned timing</button>
+    </form>
+  </div>
+</section>
+{% endblock %}
