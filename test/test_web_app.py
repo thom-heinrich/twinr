@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from fastapi.testclient import TestClient
 
-from twinr.agent.base_agent import RuntimeSnapshotStore, TwinrConfig
+from twinr.agent.base_agent import AdaptiveTimingStore, RuntimeSnapshotStore, TwinrConfig
 from twinr.automations import AutomationAction, AutomationStore, build_sensor_trigger
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.memory.reminders import ReminderStore
@@ -409,8 +409,10 @@ class WebAppTests(unittest.TestCase):
                 "OPENAI_STT_MODEL": "whisper-1",
                 "OPENAI_TTS_MODEL": "gpt-4o-mini-tts",
                 "OPENAI_TTS_VOICE": "marin",
+                "OPENAI_TTS_SPEED": "0.90",
                 "OPENAI_REALTIME_MODEL": "gpt-4o-realtime-preview",
                 "OPENAI_REALTIME_VOICE": "sage",
+                "OPENAI_REALTIME_SPEED": "1.05",
                 "TWINR_WEB_HOST": "127.0.0.1",
                 "TWINR_WEB_PORT": "1440",
                 "TWINR_SPEECH_PAUSE_MS": "900",
@@ -430,6 +432,8 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 303)
         env_text = env_path.read_text(encoding="utf-8")
         self.assertIn("OPENAI_MODEL=gpt-4o-mini", env_text)
+        self.assertIn("OPENAI_TTS_SPEED=0.90", env_text)
+        self.assertIn("OPENAI_REALTIME_SPEED=1.05", env_text)
         self.assertIn("TWINR_WEB_PORT=1440", env_text)
         self.assertIn("TWINR_PRINTER_LINE_WIDTH=28", env_text)
 
@@ -445,12 +449,50 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Proactive behavior", response.text)
         self.assertIn("Proactive timing", response.text)
         self.assertIn("Proactive sensitivity", response.text)
+        self.assertIn("Wakeword mode", response.text)
+        self.assertIn("Wakeword backend", response.text)
+        self.assertIn("Wakeword phrases", response.text)
+        self.assertIn("openWakeWord models", response.text)
+        self.assertIn("Transcribe after detect", response.text)
+        self.assertIn("Wake presence grace (s)", response.text)
+        self.assertIn("Wake audio ratio", response.text)
+        self.assertIn("Wake active chunks", response.text)
+        self.assertIn("Wake patience frames", response.text)
+        self.assertIn("Wakeword min score", response.text)
         self.assertIn("Buttons and motion sensor", response.text)
         self.assertIn("Display and printer", response.text)
+        self.assertIn("Adaptive timing", response.text)
+        self.assertIn("Observed patterns", response.text)
+        self.assertIn("Configured baselines", response.text)
+        self.assertIn("Reset learned timing", response.text)
         self.assertIn("field-tooltip", response.text)
         self.assertIn("How much image detail Twinr asks OpenAI to inspect.", response.text)
         self.assertIn("Optional speaking instructions sent with text-to-speech requests.", response.text)
+        self.assertIn("TTS speed", response.text)
+        self.assertIn("Realtime speed", response.text)
+        self.assertIn("STT works without a custom model but is slower. openWakeWord runs locally and needs one or more configured wakeword models.", response.text)
         self.assertIn("After this many quiet seconds without motion, the scene is treated as idle / low-motion.", response.text)
+
+    def test_settings_page_renders_current_adaptive_timing_profile(self) -> None:
+        client, env_path = self.make_client()
+        config = TwinrConfig.from_env(env_path)
+        store = AdaptiveTimingStore(config.adaptive_timing_store_path, config=config)
+        store.record_no_speech_timeout(initial_source="button", follow_up=False)
+        store.record_capture(
+            initial_source="button",
+            follow_up=False,
+            speech_started_after_ms=1800,
+            resumed_after_pause_count=1,
+        )
+
+        response = client.get("/settings")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("8.75 s", response.text)
+        self.assertIn("1340 ms", response.text)
+        self.assertIn("990 ms", response.text)
+        self.assertIn("1 ok / 1 timeout", response.text)
+        self.assertIn("Persistent learned timing profile on disk.", response.text)
 
     def test_settings_post_updates_extended_env_values(self) -> None:
         client, env_path = self.make_client()
@@ -497,6 +539,15 @@ class WebAppTests(unittest.TestCase):
                 "TWINR_PROACTIVE_AUDIO_ENABLED": "true",
                 "TWINR_PROACTIVE_AUDIO_DEVICE": "plughw:CARD=CameraB409241,DEV=0",
                 "TWINR_PROACTIVE_AUDIO_SAMPLE_MS": "900",
+                "TWINR_WAKEWORD_ENABLED": "true",
+                "TWINR_WAKEWORD_PHRASES": "hey twinr, hey twinna, twinr",
+                "TWINR_WAKEWORD_SAMPLE_MS": "1700",
+                "TWINR_WAKEWORD_PRESENCE_GRACE_S": "600",
+                "TWINR_WAKEWORD_MOTION_GRACE_S": "180",
+                "TWINR_WAKEWORD_SPEECH_GRACE_S": "75",
+                "TWINR_WAKEWORD_ATTEMPT_COOLDOWN_S": "5.5",
+                "TWINR_WAKEWORD_MIN_ACTIVE_RATIO": "0.06",
+                "TWINR_WAKEWORD_MIN_ACTIVE_CHUNKS": "2",
                 "TWINR_PROACTIVE_ATTENTION_WINDOW_S": "8.5",
                 "TWINR_PROACTIVE_FLOOR_STILLNESS_S": "26.0",
                 "TWINR_PROACTIVE_SHOWING_INTENT_SCORE_THRESHOLD": "0.76",
@@ -546,11 +597,46 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("OPENAI_VISION_DETAIL=high", env_text)
         self.assertIn("TWINR_PROACTIVE_AUDIO_DEVICE=plughw:CARD=CameraB409241,DEV=0", env_text)
         self.assertIn("TWINR_PROACTIVE_LOW_MOTION_AFTER_S=14.0", env_text)
+        self.assertIn("TWINR_WAKEWORD_ENABLED=true", env_text)
+        self.assertIn('TWINR_WAKEWORD_PHRASES="hey twinr, hey twinna, twinr"', env_text)
+        self.assertIn("TWINR_WAKEWORD_SAMPLE_MS=1700", env_text)
+        self.assertIn("TWINR_WAKEWORD_MIN_ACTIVE_RATIO=0.06", env_text)
+        self.assertIn("TWINR_WAKEWORD_MIN_ACTIVE_CHUNKS=2", env_text)
         self.assertIn("TWINR_PROACTIVE_ATTENTION_WINDOW_S=8.5", env_text)
         self.assertIn("TWINR_PROACTIVE_SHOWING_INTENT_SCORE_THRESHOLD=0.76", env_text)
         self.assertIn("TWINR_RUNTIME_STATE_PATH=/tmp/twinr-runtime-state.json", env_text)
         self.assertIn("TWINR_BUTTON_PROBE_LINES=23,22,24", env_text)
         self.assertIn("TWINR_PRINTER_DEVICE_URI=usb://Acme/Printer", env_text)
+
+    def test_settings_post_resets_adaptive_timing_profile(self) -> None:
+        client, env_path = self.make_client()
+        config = TwinrConfig.from_env(env_path)
+        store = AdaptiveTimingStore(config.adaptive_timing_store_path, config=config)
+        store.record_no_speech_timeout(initial_source="button", follow_up=False)
+        store.record_capture(
+            initial_source="button",
+            follow_up=False,
+            speech_started_after_ms=2200,
+            resumed_after_pause_count=1,
+        )
+
+        response = client.post(
+            "/settings",
+            data={"_action": "reset_adaptive_timing"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/settings?saved=1")
+        reset_profile = store.current()
+        default_profile = store.default_profile()
+        self.assertEqual(reset_profile.button_start_timeout_s, default_profile.button_start_timeout_s)
+        self.assertEqual(reset_profile.follow_up_start_timeout_s, default_profile.follow_up_start_timeout_s)
+        self.assertEqual(reset_profile.speech_pause_ms, default_profile.speech_pause_ms)
+        self.assertEqual(reset_profile.pause_grace_ms, default_profile.pause_grace_ms)
+        self.assertEqual(reset_profile.button_success_count, 0)
+        self.assertEqual(reset_profile.button_timeout_count, 0)
+        self.assertEqual(reset_profile.pause_resume_count, 0)
 
     def test_memory_page_renders_live_snapshot(self) -> None:
         client, env_path = self.make_client()
@@ -562,13 +648,13 @@ class WebAppTests(unittest.TestCase):
         )
         reminder_store = ReminderStore(env_path.parent / "state" / "reminders.json")
         reminder_store.schedule(
-            due_at="2026-03-14T09:00",
+            due_at="2026-03-15T09:00",
             kind="medication",
             summary="An die Tabletten erinnern.",
             details="Nach dem Fruehstueck.",
         )
         delivered = reminder_store.schedule(
-            due_at="2026-03-14T12:00",
+            due_at="2026-03-15T12:00",
             kind="appointment",
             summary="An den Arzttermin erinnern.",
             details="Dr. Meyer in Hamburg.",
@@ -680,7 +766,7 @@ class WebAppTests(unittest.TestCase):
             "/memory",
             data={
                 "_action": "add_reminder",
-                "reminder_due_at": "2026-03-14T12:00",
+                "reminder_due_at": "2026-03-15T12:00",
                 "reminder_kind": "appointment",
                 "reminder_summary": "An den Arzttermin erinnern.",
                 "reminder_details": "Unterlagen mitnehmen.",
@@ -699,7 +785,7 @@ class WebAppTests(unittest.TestCase):
         client, env_path = self.make_client()
         reminder_store = ReminderStore(env_path.parent / "state" / "reminders.json")
         reminder = reminder_store.schedule(
-            due_at="2026-03-14T12:00",
+            due_at="2026-03-15T12:00",
             kind="appointment",
             summary="An den Arzttermin erinnern.",
         )
@@ -721,7 +807,7 @@ class WebAppTests(unittest.TestCase):
         client, env_path = self.make_client()
         reminder_store = ReminderStore(env_path.parent / "state" / "reminders.json")
         reminder = reminder_store.schedule(
-            due_at="2026-03-14T12:00",
+            due_at="2026-03-15T12:00",
             kind="appointment",
             summary="An den Arzttermin erinnern.",
         )

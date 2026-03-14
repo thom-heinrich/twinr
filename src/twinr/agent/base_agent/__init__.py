@@ -1,10 +1,30 @@
+from twinr.agent.base_agent.adaptive_timing import (
+    AdaptiveListeningWindow,
+    AdaptiveTimingProfile,
+    AdaptiveTimingStore,
+)
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.contracts import (
+    AgentToolCall,
+    AgentTextProvider,
+    AgentToolResult,
+    CombinedSpeechAgentProvider,
+    CompositeSpeechAgentProvider,
+    ProviderBundle,
+    SpeechToTextProvider,
+    TextToSpeechProvider,
+    ToolCallingAgentProvider,
+    ToolCallingTurnResponse,
+)
 from twinr.memory.context_store import (
     ManagedContextEntry,
     ManagedContextFileStore,
     PersistentMemoryEntry,
     PersistentMemoryMarkdownStore,
     PromptContextStore,
+)
+from twinr.memory.longterm import (
+    LongTermMemoryService,
 )
 from twinr.agent.base_agent.personality import load_personality_instructions, merge_instructions
 from twinr.memory.reminders import ReminderEntry, ReminderStore
@@ -18,16 +38,30 @@ from twinr.agent.base_agent.state_machine import (
 )
 
 __all__ = [
+    "AdaptiveListeningWindow",
+    "AdaptiveTimingProfile",
+    "AdaptiveTimingStore",
+    "AgentToolCall",
+    "AgentTextProvider",
+    "AgentToolResult",
+    "CombinedSpeechAgentProvider",
+    "CompositeSpeechAgentProvider",
     "InvalidTransitionError",
     "ManagedContextEntry",
     "ManagedContextFileStore",
+    "LongTermMemoryService",
     "PersistentMemoryEntry",
+    "ProviderBundle",
     "PersistentMemoryMarkdownStore",
     "PromptContextStore",
     "ReminderEntry",
     "ReminderStore",
     "RuntimeSnapshot",
     "RuntimeSnapshotStore",
+    "SpeechToTextProvider",
+    "TextToSpeechProvider",
+    "ToolCallingAgentProvider",
+    "ToolCallingTurnResponse",
     "TwinrConfig",
     "TwinrEvent",
     "TwinrRuntime",

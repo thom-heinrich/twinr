@@ -8,18 +8,20 @@ from datetime import datetime
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from twinr.agent.tools import build_realtime_tool_schemas
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.language import memory_and_response_contract
+from twinr.agent.base_agent.simple_settings import (
+    adjustable_settings_context,
+)
 from twinr.agent.base_agent.personality import load_personality_instructions, merge_instructions
-from twinr.automations import supported_sensor_trigger_kinds
 from twinr.ops.usage import TokenUsage, extract_model_name, extract_token_usage
 from twinr.providers.openai.backend import _should_send_project_header
 
 _DEFAULT_REALTIME_INSTRUCTIONS = (
-    "Speak in clear, warm, natural standard German. "
-    "Keep responses concise, practical, and easy for a senior user to understand. "
-    "Do not use an English accent. "
+    "Keep user-facing replies clear, warm, natural, concise, practical, and easy for a senior user to understand. "
     "If the user explicitly asks for a printout, use the print_receipt tool with a short focus hint and optional exact text. "
-    "If the user asks for any current, external, or otherwise freshness-sensitive information that benefits from web research, first say one short German sentence that you are checking the web and that this may take a moment, then call the search_live_info tool. "
+    "If the user asks for any current, external, or otherwise freshness-sensitive information that benefits from web research, first say one short sentence in the configured user-facing language that you are checking the web and that this may take a moment, then call the search_live_info tool. "
     "If the user asks to be reminded later, asks you to set a timer, or says things like erinnere mich, remind me, timer, wecker, or alarm, use the schedule_reminder tool. "
     "For schedule_reminder you must resolve relative times like heute, morgen, uebermorgen, this evening, in ten minutes, and next Monday against the local date/time context and pass due_at as an absolute ISO 8601 datetime with timezone offset. "
     "If the user asks for a recurring scheduled action such as every day, every morning, every week, weekdays, daily news, daily weather, or daily printed headlines, use the time automation tools instead of schedule_reminder. "
@@ -29,9 +31,24 @@ _DEFAULT_REALTIME_INSTRUCTIONS = (
     "For printed scheduled output, use delivery printed. For spoken scheduled output, use delivery spoken. "
     "Do not guess a vague time like morning; if the schedule is not concrete enough to run safely, ask a short follow-up question instead of creating the automation. "
     "For sensor automations, only use the supported trigger kinds and require a concrete hold_seconds value for quiet or no-motion requests. "
+    "If the user explicitly asks you to remember or update a contact with a phone number, email, relation, or role, use the remember_contact tool. "
+    "If the user asks for the phone number, email, or contact details of a remembered person, use the lookup_contact tool. "
+    "If the user explicitly asks you to remember a stable personal preference such as a liked brand, favored shop, disliked food, or similar preference, use the remember_preference tool. "
+    "If the user explicitly asks you to remember a future intention or short plan such as wanting to go for a walk today, use the remember_plan tool. "
     "If the user explicitly asks you to remember an important fact for future turns, use the remember_memory tool. "
     "If the user explicitly asks you to change your future speaking style or behavior, use the update_personality tool. "
     "If the user explicitly asks you to remember a stable user-profile fact or preference, use the update_user_profile tool. "
+    "For remember_memory, remember_contact, remember_preference, remember_plan, update_user_profile, and update_personality, all semantic text fields must be canonical English. "
+    "Keep names, phone numbers, email addresses, IDs, codes, and direct quotes verbatim. "
+    "If the user explicitly asks you to change a supported simple device setting such as remembering more or less recent conversation, use the update_simple_setting tool. "
+    "Treat direct complaints like you are too forgetful or please remember more as an explicit request to adjust memory_capacity. "
+    "Map remember more, less forgetful, keep more context, or remember less to memory_capacity. "
+    "If the user asks which voices are available, answer from the supported Twinr voice catalog in the system context instead of saying you do not know. "
+    "Use spoken_voice when the user explicitly asks you to change how your voice sounds, for example calmer, warmer, deeper, brighter, or a different named voice. "
+    "For clear requests such as male voice, female voice, neutral voice, warmer voice, softer voice, deeper voice, or brighter voice, use update_simple_setting with spoken_voice and the closest supported voice value. "
+    "Use speech_speed when the user explicitly asks you to speak slower or faster. "
+    "For these bounded simple settings, do not ask an extra confirmation question unless a system message says the current speaker signal is uncertain or unknown. "
+    "If the request is ambiguous about the direction or exact value, ask one short follow-up question instead of guessing. "
     "If the user explicitly asks you to create or refresh the local voice profile from the current spoken turn, use the enroll_voice_profile tool. "
     "If the user asks whether a local voice profile exists or wants its current status, use the get_voice_profile_status tool. "
     "If the user explicitly asks you to delete the local voice profile, use the reset_voice_profile tool. "
@@ -187,7 +204,7 @@ class OpenAIRealtimeSession:
                         "rate": self.config.openai_realtime_input_sample_rate,
                     },
                     "voice": self.config.openai_realtime_voice,
-                    "speed": 1.0,
+                    "speed": float(self.config.openai_realtime_speed),
                 },
             },
         }
@@ -364,8 +381,10 @@ class OpenAIRealtimeSession:
     def _session_instructions(self) -> str:
         return merge_instructions(
             self._resolve_base_instructions(),
+            memory_and_response_contract(self.config.openai_realtime_language),
             _DEFAULT_REALTIME_INSTRUCTIONS,
             self._reminder_time_context(),
+            adjustable_settings_context(self.config),
             self.config.openai_realtime_instructions,
         ) or _DEFAULT_REALTIME_INSTRUCTIONS
 
@@ -375,644 +394,7 @@ class OpenAIRealtimeSession:
         return load_personality_instructions(self.config)
 
     def _session_tools(self) -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = []
-        if "print_receipt" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "print_receipt",
-                    "description": (
-                        "Print short, user-facing content on the thermal receipt printer "
-                        "when the user explicitly asks for a printout. "
-                        "Use focus_hint to describe what from the recent context should be printed. "
-                        "Optionally pass text when exact printable wording is already known."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "focus_hint": {
-                                "type": "string",
-                                "description": "Short hint describing what from the recent conversation should be printed.",
-                            },
-                            "text": {
-                                "type": "string",
-                                "description": "Optional exact text if the printable wording is already known.",
-                            }
-                        },
-                        "required": [],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "search_live_info" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "search_live_info",
-                    "description": (
-                        "Look up fresh or externally verifiable web information for the user. "
-                        "Use this for broad web research, not only a fixed list of example domains."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "question": {
-                                "type": "string",
-                                "description": "The exact question to research on the web.",
-                            },
-                            "location_hint": {
-                                "type": "string",
-                                "description": "Optional location such as a city or district relevant to the search.",
-                            },
-                            "date_context": {
-                                "type": "string",
-                                "description": "Optional absolute date or time context if the user referred to relative dates.",
-                            },
-                        },
-                        "required": ["question"],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "schedule_reminder" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "schedule_reminder",
-                    "description": (
-                        "Schedule a future reminder or timer when the user asks to be reminded later or to set a timer. "
-                        "Always send due_at as an absolute ISO 8601 local datetime with timezone offset."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "due_at": {
-                                "type": "string",
-                                "description": "Absolute local due time in ISO 8601 format, for example 2026-03-14T12:00:00+01:00.",
-                            },
-                            "summary": {
-                                "type": "string",
-                                "description": "Short summary of what Twinr should remind the user about.",
-                            },
-                            "details": {
-                                "type": "string",
-                                "description": "Optional extra detail to include when the reminder is spoken.",
-                            },
-                            "kind": {
-                                "type": "string",
-                                "description": "Short type such as reminder, timer, appointment, medication, task, or alarm.",
-                            },
-                            "original_request": {
-                                "type": "string",
-                                "description": "Optional short quote or paraphrase of the user's original reminder request.",
-                            },
-                        },
-                        "required": ["due_at", "summary"],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "list_automations" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "list_automations",
-                    "description": (
-                        "List the currently configured time-based and sensor-triggered automations so you can answer questions about them "
-                        "or choose one to update or delete."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "include_disabled": {
-                                "type": "boolean",
-                                "description": "Set true if disabled automations should also be included.",
-                            }
-                        },
-                        "required": [],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "create_time_automation" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "create_time_automation",
-                    "description": (
-                        "Create a time-based automation for one-off or recurring actions such as daily weather, "
-                        "daily news, or printed headlines."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "Short operator-friendly name for the automation.",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Optional short description of what the automation does.",
-                            },
-                            "schedule": {
-                                "type": "string",
-                                "enum": ["once", "daily", "weekly"],
-                                "description": "Time schedule type.",
-                            },
-                            "due_at": {
-                                "type": "string",
-                                "description": "Absolute ISO 8601 local datetime with timezone offset for once schedules.",
-                            },
-                            "time_of_day": {
-                                "type": "string",
-                                "description": "Local time in HH:MM for daily or weekly schedules.",
-                            },
-                            "weekdays": {
-                                "type": "array",
-                                "description": "Weekday numbers for weekly schedules, where Monday is 0 and Sunday is 6.",
-                                "items": {"type": "integer"},
-                            },
-                            "delivery": {
-                                "type": "string",
-                                "enum": ["spoken", "printed"],
-                                "description": "Whether the automation should speak or print when it runs.",
-                            },
-                            "content_mode": {
-                                "type": "string",
-                                "enum": ["llm_prompt", "static_text"],
-                                "description": "Use llm_prompt for generated content or static_text for fixed wording.",
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "The prompt or static text the automation should use.",
-                            },
-                            "allow_web_search": {
-                                "type": "boolean",
-                                "description": "Set true when the automation needs fresh live information from the web.",
-                            },
-                            "enabled": {
-                                "type": "boolean",
-                                "description": "Whether the automation should be active immediately.",
-                            },
-                            "tags": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Optional short tags for operator organization.",
-                            },
-                            "timezone_name": {
-                                "type": "string",
-                                "description": "Optional timezone name. Use the local Twinr timezone unless there is a clear reason not to.",
-                            },
-                            "confirmed": {
-                                "type": "boolean",
-                                "description": "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed.",
-                            },
-                        },
-                        "required": ["name", "schedule", "delivery", "content_mode", "content"],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "create_sensor_automation" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "create_sensor_automation",
-                    "description": (
-                        "Create an automation triggered by PIR motion, camera visibility/object readings, "
-                        "or background microphone/VAD state."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "Short operator-friendly name for the automation.",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Optional short description of what the automation does.",
-                            },
-                            "trigger_kind": {
-                                "type": "string",
-                                "enum": list(supported_sensor_trigger_kinds()),
-                                "description": "Supported sensor trigger type.",
-                            },
-                            "hold_seconds": {
-                                "type": "number",
-                                "description": "Optional required hold duration before firing. Required for quiet/no-motion triggers.",
-                            },
-                            "cooldown_seconds": {
-                                "type": "number",
-                                "description": "Optional cooldown after the automation fired.",
-                            },
-                            "delivery": {
-                                "type": "string",
-                                "enum": ["spoken", "printed"],
-                                "description": "Whether the automation should speak or print when it runs.",
-                            },
-                            "content_mode": {
-                                "type": "string",
-                                "enum": ["llm_prompt", "static_text"],
-                                "description": "Use llm_prompt for generated content or static_text for fixed wording.",
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "The prompt or static text the automation should use.",
-                            },
-                            "allow_web_search": {
-                                "type": "boolean",
-                                "description": "Set true when the automation needs fresh live information from the web.",
-                            },
-                            "enabled": {
-                                "type": "boolean",
-                                "description": "Whether the automation should be active immediately.",
-                            },
-                            "tags": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Optional short tags for operator organization.",
-                            },
-                            "confirmed": {
-                                "type": "boolean",
-                                "description": "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed.",
-                            },
-                        },
-                        "required": ["name", "trigger_kind", "delivery", "content_mode", "content"],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "update_time_automation" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "update_time_automation",
-                    "description": (
-                        "Update an existing time-based automation. Use list_automations first if you need to identify it."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "automation_ref": {
-                                "type": "string",
-                                "description": "Automation id or a clear automation name.",
-                            },
-                            "name": {
-                                "type": "string",
-                                "description": "Optional new automation name.",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Optional new description.",
-                            },
-                            "schedule": {
-                                "type": "string",
-                                "enum": ["once", "daily", "weekly"],
-                                "description": "Optional new time schedule type.",
-                            },
-                            "due_at": {
-                                "type": "string",
-                                "description": "Absolute ISO 8601 local datetime with timezone offset for once schedules.",
-                            },
-                            "time_of_day": {
-                                "type": "string",
-                                "description": "Local time in HH:MM for daily or weekly schedules.",
-                            },
-                            "weekdays": {
-                                "type": "array",
-                                "description": "Weekday numbers for weekly schedules, where Monday is 0 and Sunday is 6.",
-                                "items": {"type": "integer"},
-                            },
-                            "delivery": {
-                                "type": "string",
-                                "enum": ["spoken", "printed"],
-                                "description": "Optional new delivery mode.",
-                            },
-                            "content_mode": {
-                                "type": "string",
-                                "enum": ["llm_prompt", "static_text"],
-                                "description": "Optional new content mode.",
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "Optional new prompt or static text.",
-                            },
-                            "allow_web_search": {
-                                "type": "boolean",
-                                "description": "Optional new live-search flag for llm_prompt content.",
-                            },
-                            "enabled": {
-                                "type": "boolean",
-                                "description": "Optional enabled toggle.",
-                            },
-                            "tags": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Optional full replacement tag list.",
-                            },
-                            "timezone_name": {
-                                "type": "string",
-                                "description": "Optional new timezone name.",
-                            },
-                            "confirmed": {
-                                "type": "boolean",
-                                "description": "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed.",
-                            },
-                        },
-                        "required": ["automation_ref"],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "update_sensor_automation" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "update_sensor_automation",
-                    "description": (
-                        "Update an existing supported sensor-triggered automation. Use list_automations first if you need to identify it."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "automation_ref": {
-                                "type": "string",
-                                "description": "Automation id or a clear automation name.",
-                            },
-                            "name": {
-                                "type": "string",
-                                "description": "Optional new automation name.",
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Optional new description.",
-                            },
-                            "trigger_kind": {
-                                "type": "string",
-                                "enum": list(supported_sensor_trigger_kinds()),
-                                "description": "Optional new supported sensor trigger type.",
-                            },
-                            "hold_seconds": {
-                                "type": "number",
-                                "description": "Optional hold duration before firing.",
-                            },
-                            "cooldown_seconds": {
-                                "type": "number",
-                                "description": "Optional cooldown after the automation fired.",
-                            },
-                            "delivery": {
-                                "type": "string",
-                                "enum": ["spoken", "printed"],
-                                "description": "Optional new delivery mode.",
-                            },
-                            "content_mode": {
-                                "type": "string",
-                                "enum": ["llm_prompt", "static_text"],
-                                "description": "Optional new content mode.",
-                            },
-                            "content": {
-                                "type": "string",
-                                "description": "Optional new prompt or static text.",
-                            },
-                            "allow_web_search": {
-                                "type": "boolean",
-                                "description": "Optional new live-search flag for llm_prompt content.",
-                            },
-                            "enabled": {
-                                "type": "boolean",
-                                "description": "Optional enabled toggle.",
-                            },
-                            "tags": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Optional full replacement tag list.",
-                            },
-                            "confirmed": {
-                                "type": "boolean",
-                                "description": "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed.",
-                            },
-                        },
-                        "required": ["automation_ref"],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "delete_automation" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "delete_automation",
-                    "description": "Delete an existing scheduled automation.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "automation_ref": {
-                                "type": "string",
-                                "description": "Automation id or a clear automation name.",
-                            },
-                            "confirmed": {
-                                "type": "boolean",
-                                "description": "Set true only after the user clearly confirmed the deletion when extra confirmation is needed.",
-                            },
-                        },
-                        "required": ["automation_ref"],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "remember_memory" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "remember_memory",
-                    "description": (
-                        "Store an important memory for future turns when the user explicitly asks you to remember something. "
-                        "Use only for clear remember/save requests, not for ordinary conversation."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "kind": {
-                                "type": "string",
-                                "description": "Short type such as appointment, contact, reminder, preference, fact, or task.",
-                            },
-                            "summary": {
-                                "type": "string",
-                                "description": "Short factual summary of what should be remembered.",
-                            },
-                            "details": {
-                                "type": "string",
-                                "description": "Optional extra detail that helps later recall.",
-                            },
-                            "confirmed": {
-                                "type": "boolean",
-                                "description": "Set true only after the user clearly confirmed the persistent save when extra confirmation is needed.",
-                            },
-                        },
-                        "required": ["summary"],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "update_user_profile" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "update_user_profile",
-                    "description": (
-                        "Update stable user profile or preference context for future turns when the user explicitly asks you to remember it."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "category": {
-                                "type": "string",
-                                "description": "Short category such as preferred_name, location, preference, contact, or routine.",
-                            },
-                            "instruction": {
-                                "type": "string",
-                                "description": "Short, durable instruction or fact to store in the user profile.",
-                            },
-                            "confirmed": {
-                                "type": "boolean",
-                                "description": "Set true only after the user clearly confirmed this persistent profile change when extra confirmation is needed.",
-                            },
-                        },
-                        "required": ["category", "instruction"],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "update_personality" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "update_personality",
-                    "description": (
-                        "Update how Twinr should speak or behave in future turns when the user explicitly asks for a behavior change."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "category": {
-                                "type": "string",
-                                "description": "Short category such as response_style, humor, language, verbosity, or greeting_style.",
-                            },
-                            "instruction": {
-                                "type": "string",
-                                "description": "Short future-behavior instruction to store in Twinr personality context.",
-                            },
-                            "confirmed": {
-                                "type": "boolean",
-                                "description": "Set true only after the user clearly confirmed this persistent behavior change when extra confirmation is needed.",
-                            },
-                        },
-                        "required": ["category", "instruction"],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "enroll_voice_profile" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "enroll_voice_profile",
-                    "description": (
-                        "Create or refresh the local Twinr voice profile from the current spoken turn. "
-                        "Use only when the user explicitly asks Twinr to learn or update their voice profile."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "confirmed": {
-                                "type": "boolean",
-                                "description": "Set true only after the user clearly confirmed a replacement when extra confirmation is needed.",
-                            }
-                        },
-                        "required": [],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "get_voice_profile_status" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "get_voice_profile_status",
-                    "description": "Read the local voice-profile status and current live speaker signal.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "required": [],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "reset_voice_profile" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "reset_voice_profile",
-                    "description": "Delete the local Twinr voice profile when the user explicitly asks to remove it.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "confirmed": {
-                                "type": "boolean",
-                                "description": "Set true only after the user clearly confirmed the reset when extra confirmation is needed.",
-                            }
-                        },
-                        "required": [],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "end_conversation" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "end_conversation",
-                    "description": (
-                        "End the current follow-up listening loop when the user clearly indicates they are done for now, "
-                        "for example by saying thanks, stop, pause, bye, or tschuss."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "reason": {
-                                "type": "string",
-                                "description": "Optional short note describing why the conversation should end.",
-                            }
-                        },
-                        "required": [],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        if "inspect_camera" in self._tool_handlers:
-            tools.append(
-                {
-                    "type": "function",
-                    "name": "inspect_camera",
-                    "description": (
-                        "Inspect the current live camera view when the user asks you to look at them, "
-                        "an object, a document, or something they are showing."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "question": {
-                                "type": "string",
-                                "description": "The exact user request about what should be inspected in the camera view.",
-                            }
-                        },
-                        "required": ["question"],
-                        "additionalProperties": False,
-                    },
-                }
-            )
-        return tools
+        return build_realtime_tool_schemas(self._tool_handlers.keys())
 
     def _reminder_time_context(self) -> str:
         try:

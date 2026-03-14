@@ -7,16 +7,28 @@ from threading import Lock, Thread
 from typing import Callable
 import time
 
+from twinr.agent.base_agent.contracts import (
+    AgentTextProvider,
+    CombinedSpeechAgentProvider,
+    CompositeSpeechAgentProvider,
+    SpeechToTextProvider,
+    TextToSpeechProvider,
+)
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.runtime import TwinrRuntime
-from twinr.hardware.audio import SilenceDetectedRecorder, WaveAudioPlayer
+from twinr.hardware.audio import SilenceDetectedRecorder, WaveAudioPlayer, pcm16_to_wav_bytes
 from twinr.hardware.camera import V4L2StillCamera
 from twinr.hardware.buttons import ButtonAction, configured_button_monitor
 from twinr.hardware.printer import RawReceiptPrinter
 from twinr.hardware.voice_profile import VoiceProfileMonitor
 from twinr.ops import TwinrUsageStore
-from twinr.proactive import SocialTriggerDecision, build_default_proactive_monitor
-from twinr.providers.openai.backend import OpenAIBackend, OpenAIImageInput
+from twinr.proactive import (
+    SocialTriggerDecision,
+    build_default_proactive_monitor,
+    proactive_observation_facts,
+    proactive_prompt_mode,
+)
+from twinr.providers.openai import OpenAIImageInput, OpenAIProviderBundle
 
 _WEB_SEARCH_KEYWORDS = (
     "latest",
@@ -100,7 +112,10 @@ class TwinrHardwareLoop:
         config: TwinrConfig,
         *,
         runtime: TwinrRuntime | None = None,
-        backend: OpenAIBackend | None = None,
+        backend: CombinedSpeechAgentProvider | None = None,
+        stt_provider: SpeechToTextProvider | None = None,
+        agent_provider: AgentTextProvider | None = None,
+        tts_provider: TextToSpeechProvider | None = None,
         button_monitor=None,
         recorder: SilenceDetectedRecorder | None = None,
         player: WaveAudioPlayer | None = None,
@@ -115,7 +130,23 @@ class TwinrHardwareLoop:
     ) -> None:
         self.config = config
         self.runtime = runtime or TwinrRuntime(config=config)
-        self.backend = backend or OpenAIBackend(config=config)
+        openai_bundle: OpenAIProviderBundle | None = None
+        if backend is None and (stt_provider is None or agent_provider is None or tts_provider is None):
+            openai_bundle = OpenAIProviderBundle.from_config(config)
+        self.stt_provider = stt_provider or backend or (openai_bundle.stt if openai_bundle is not None else None)
+        self.agent_provider = agent_provider or backend or (openai_bundle.agent if openai_bundle is not None else None)
+        self.tts_provider = tts_provider or backend or (openai_bundle.tts if openai_bundle is not None else None)
+        if self.stt_provider is None or self.agent_provider is None or self.tts_provider is None:
+            raise ValueError("TwinrHardwareLoop requires STT, agent, and TTS providers")
+        self.backend = backend or (
+            openai_bundle.combined
+            if openai_bundle is not None
+            else CompositeSpeechAgentProvider(
+                stt=self.stt_provider,
+                agent=self.agent_provider,
+                tts=self.tts_provider,
+            )
+        )
         self.button_monitor = button_monitor or configured_button_monitor(config)
         self.recorder = recorder or SilenceDetectedRecorder.from_config(config)
         self.player = player or WaveAudioPlayer.from_config(config)
@@ -192,7 +223,39 @@ class TwinrHardwareLoop:
             )
             return False
 
-        prompt = self.runtime.begin_proactive_prompt(trigger.prompt)
+        phrase_response = None
+        prompt_mode = proactive_prompt_mode(trigger)
+        prompt_text = trigger.prompt
+        if prompt_mode == "llm":
+            try:
+                phrase_response = self.agent_provider.phrase_proactive_prompt_with_metadata(
+                    trigger_id=trigger.trigger_id,
+                    reason=trigger.reason,
+                    default_prompt=trigger.prompt,
+                    priority=int(trigger.priority),
+                    conversation=self.runtime.provider_conversation_context(),
+                    recent_prompts=self._recent_proactive_prompts(trigger_id=trigger.trigger_id),
+                    observation_facts=proactive_observation_facts(trigger),
+                )
+                candidate_prompt = phrase_response.text.strip()
+                if candidate_prompt:
+                    prompt_text = candidate_prompt
+                else:
+                    prompt_mode = "default_fallback"
+                    self.emit("social_prompt_fallback=empty_phrase")
+            except Exception as exc:
+                prompt_mode = "default_fallback"
+                self.emit("social_prompt_fallback=default")
+                self.emit(f"social_prompt_phrase_error={exc}")
+                self._record_event(
+                    "social_trigger_phrase_fallback",
+                    "Twinr fell back to the default proactive prompt after proactive phrasing failed.",
+                    level="warning",
+                    trigger=trigger.trigger_id,
+                    error=str(exc),
+                )
+
+        prompt = self.runtime.begin_proactive_prompt(prompt_text)
         self._emit_status(force=True)
         turn_started = time.monotonic()
         tts_ms, first_audio_ms = self._speak_full_answer(prompt, turn_started=turn_started)
@@ -200,7 +263,23 @@ class TwinrHardwareLoop:
         self._emit_status(force=True)
         self.emit(f"social_trigger={trigger.trigger_id}")
         self.emit(f"social_trigger_priority={int(trigger.priority)}")
+        self.emit(f"social_prompt_mode={prompt_mode}")
         self.emit(f"social_prompt={prompt}")
+        if phrase_response is not None:
+            if phrase_response.response_id:
+                self.emit(f"social_response_id={phrase_response.response_id}")
+            if phrase_response.request_id:
+                self.emit(f"social_request_id={phrase_response.request_id}")
+            self._record_usage(
+                request_kind="proactive_prompt",
+                source="hardware_loop",
+                model=phrase_response.model,
+                response_id=phrase_response.response_id,
+                request_id=phrase_response.request_id,
+                used_web_search=False,
+                token_usage=phrase_response.token_usage,
+                proactive_trigger=trigger.trigger_id,
+            )
         self.emit(f"timing_social_tts_ms={tts_ms}")
         if first_audio_ms is not None:
             self.emit(f"timing_social_first_audio_ms={first_audio_ms}")
@@ -211,23 +290,75 @@ class TwinrHardwareLoop:
             reason=trigger.reason,
             priority=int(trigger.priority),
             prompt=prompt,
+            default_prompt=trigger.prompt,
+            prompt_mode=prompt_mode,
         )
         return True
+
+    def _recent_proactive_prompts(
+        self,
+        *,
+        trigger_id: str,
+        limit: int = 3,
+    ) -> tuple[str, ...]:
+        prompts: list[str] = []
+        for entry in reversed(self.runtime.ops_events.tail(limit=50)):
+            if entry.get("event") != "social_trigger_prompted":
+                continue
+            data = entry.get("data", {})
+            if data.get("trigger") != trigger_id:
+                continue
+            prompt = str(data.get("prompt", "")).strip()
+            if prompt:
+                prompts.append(prompt)
+            if len(prompts) >= limit:
+                break
+        return tuple(prompts)
 
     def _handle_green_turn(self) -> None:
         turn_started = time.monotonic()
         self.runtime.press_green_button()
         self._emit_status(force=True)
 
+        listening_window = self.runtime.listening_window(initial_source="button", follow_up=False)
         capture_started = time.monotonic()
-        with self._audio_lock:
-            audio_bytes = self.recorder.record_until_pause(pause_ms=self.config.speech_pause_ms)
+        try:
+            with self._audio_lock:
+                capture_result = self.recorder.capture_pcm_until_pause_with_options(
+                    pause_ms=listening_window.speech_pause_ms,
+                    start_timeout_s=listening_window.start_timeout_s,
+                    pause_grace_ms=listening_window.pause_grace_ms,
+                )
+        except RuntimeError as exc:
+            if not self._is_no_speech_timeout(exc):
+                raise
+            self.runtime.remember_listen_timeout(initial_source="button", follow_up=False)
+            self.runtime.cancel_listening()
+            self._emit_status(force=True)
+            self.emit("listen_timeout=true")
+            self._record_event(
+                "listen_timeout",
+                "Listening timed out before speech started.",
+                request_source="button",
+            )
+            return
+        self.runtime.remember_listen_capture(
+            initial_source="button",
+            follow_up=False,
+            speech_started_after_ms=capture_result.speech_started_after_ms,
+            resumed_after_pause_count=capture_result.resumed_after_pause_count,
+        )
+        audio_bytes = pcm16_to_wav_bytes(
+            capture_result.pcm_bytes,
+            sample_rate=self.config.audio_sample_rate,
+            channels=self.config.audio_channels,
+        )
         capture_ms = int((time.monotonic() - capture_started) * 1000)
         self._update_voice_assessment_from_wav(audio_bytes)
 
         stt_started = time.monotonic()
         try:
-            transcript = self.backend.transcribe(
+            transcript = self.stt_provider.transcribe(
                 audio_bytes,
                 filename="twinr-listen.wav",
                 content_type="audio/wav",
@@ -270,7 +401,7 @@ class TwinrHardwareLoop:
                     return
                 try:
                     def mark_first_chunk() -> object:
-                        for chunk in self.backend.synthesize_stream(segment):
+                        for chunk in self.tts_provider.synthesize_stream(segment):
                             if first_audio_at[0] is None:
                                 first_audio_at[0] = time.monotonic()
                             yield chunk
@@ -302,7 +433,7 @@ class TwinrHardwareLoop:
                 spoken_segments.put(segment)
 
         try:
-            response = self.backend.respond_streaming(
+            response = self.agent_provider.respond_streaming(
                 transcript,
                 conversation=self.runtime.provider_conversation_context(),
                 allow_web_search=allow_web_search,
@@ -376,7 +507,7 @@ class TwinrHardwareLoop:
         camera_capture_ms = int((time.monotonic() - camera_capture_started) * 1000)
 
         llm_started = time.monotonic()
-        response = self.backend.respond_to_images_with_metadata(
+        response = self.agent_provider.respond_to_images_with_metadata(
             self._build_vision_prompt(transcript, include_reference=len(images) > 1),
             images=images,
             conversation=self.runtime.provider_conversation_context(),
@@ -432,7 +563,7 @@ class TwinrHardwareLoop:
         response_to_print = self.runtime.press_yellow_button()
         self._emit_status(force=True)
 
-        composed = self.backend.compose_print_job_with_metadata(
+        composed = self.agent_provider.compose_print_job_with_metadata(
             conversation=self.runtime.provider_conversation_context(),
             focus_hint=self.runtime.last_transcript,
             direct_text=response_to_print,
@@ -539,7 +670,7 @@ class TwinrHardwareLoop:
         response = None
         spoken_prompt = ""
         try:
-            response = self.backend.phrase_due_reminder_with_metadata(reminder)
+            response = self.agent_provider.phrase_due_reminder_with_metadata(reminder)
             spoken_prompt = self.runtime.begin_reminder_prompt(response.text)
             self._emit_status(force=True)
             tts_ms, first_audio_ms = self._speak_full_answer(spoken_prompt, turn_started=time.monotonic())
@@ -646,7 +777,7 @@ class TwinrHardwareLoop:
         first_audio_at: list[float | None] = [None]
 
         def mark_first_chunk():
-            for chunk in self.backend.synthesize_stream(text):
+            for chunk in self.tts_provider.synthesize_stream(text):
                 if first_audio_at[0] is None:
                     first_audio_at[0] = time.monotonic()
                 yield chunk
@@ -665,6 +796,9 @@ class TwinrHardwareLoop:
         if len(text) >= 140:
             return len(text)
         return None
+
+    def _is_no_speech_timeout(self, exc: Exception) -> bool:
+        return "No speech detected before timeout" in str(exc)
 
     def _is_print_cooldown_active(self) -> bool:
         if self._last_print_request_at is None:

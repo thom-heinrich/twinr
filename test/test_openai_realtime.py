@@ -113,7 +113,8 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             personality_dir="personality",
             openai_realtime_model="gpt-4o-realtime-preview",
             openai_realtime_voice="sage",
-            openai_realtime_instructions="Speak concise German.",
+            openai_realtime_speed=0.85,
+            openai_realtime_instructions="Keep replies concise.",
             openai_realtime_transcription_model="whisper-1",
             openai_realtime_language="de",
             openai_realtime_input_sample_rate=24000,
@@ -157,10 +158,22 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
 
         instructions = connection.session.calls[0]["instructions"]
         self.assertTrue(instructions.startswith("Base context\n\n"))
+        self.assertIn("All user-facing spoken and written replies for this turn must be in German.", instructions)
+        self.assertIn("persistent memory or profile tool payloads must use canonical English", instructions)
         self.assertIn("use the schedule_reminder tool", instructions)
+        self.assertIn("update_simple_setting tool", instructions)
+        self.assertIn("remember_contact tool", instructions)
+        self.assertIn("lookup_contact tool", instructions)
+        self.assertIn("remember_preference tool", instructions)
+        self.assertIn("remember_plan tool", instructions)
+        self.assertIn("If the user asks which voices are available", instructions)
+        self.assertIn("Use spoken_voice when the user explicitly asks you to change how your voice sounds", instructions)
+        self.assertIn("male voice, female voice, neutral voice", instructions)
+        self.assertIn("Use speech_speed when the user explicitly asks you to speak slower or faster", instructions)
         self.assertIn("create_time_automation", instructions)
         self.assertIn("Local date/time context for resolving reminders, timers, and scheduled automations:", instructions)
-        self.assertTrue(instructions.endswith("Speak concise German."))
+        self.assertIn("memory_capacity level", instructions)
+        self.assertTrue(instructions.endswith("Keep replies concise."))
 
     def test_open_loads_latest_hidden_context_from_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -290,8 +303,13 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "update_sensor_automation": lambda _arguments: {"status": "updated"},
                 "delete_automation": lambda _arguments: {"status": "deleted"},
                 "remember_memory": lambda _arguments: {"status": "saved"},
+                "remember_contact": lambda _arguments: {"status": "created"},
+                "lookup_contact": lambda _arguments: {"status": "found"},
+                "remember_preference": lambda _arguments: {"status": "updated"},
+                "remember_plan": lambda _arguments: {"status": "created"},
                 "update_user_profile": lambda _arguments: {"status": "updated"},
                 "update_personality": lambda _arguments: {"status": "updated"},
+                "update_simple_setting": lambda _arguments: {"status": "updated"},
                 "enroll_voice_profile": lambda _arguments: {"status": "enrolled"},
                 "get_voice_profile_status": lambda _arguments: {"status": "ok"},
                 "reset_voice_profile": lambda _arguments: {"status": "reset"},
@@ -317,8 +335,13 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "update_sensor_automation",
                 "delete_automation",
                 "remember_memory",
+                "remember_contact",
+                "lookup_contact",
+                "remember_preference",
+                "remember_plan",
                 "update_user_profile",
                 "update_personality",
+                "update_simple_setting",
                 "enroll_voice_profile",
                 "get_voice_profile_status",
                 "reset_voice_profile",
@@ -338,10 +361,29 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("automation_ref", tools_by_name["update_sensor_automation"]["parameters"]["properties"])
         self.assertIn("summary", tools_by_name["remember_memory"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["remember_memory"]["parameters"]["properties"])
+        self.assertIn("phone", tools_by_name["remember_contact"]["parameters"]["properties"])
+        self.assertIn("role", tools_by_name["remember_contact"]["parameters"]["properties"])
+        self.assertIn("name", tools_by_name["lookup_contact"]["parameters"]["properties"])
+        self.assertIn("value", tools_by_name["remember_preference"]["parameters"]["properties"])
+        self.assertIn("for_product", tools_by_name["remember_preference"]["parameters"]["properties"])
+        self.assertIn("summary", tools_by_name["remember_plan"]["parameters"]["properties"])
+        self.assertIn("when", tools_by_name["remember_plan"]["parameters"]["properties"])
         self.assertIn("instruction", tools_by_name["update_user_profile"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["update_user_profile"]["parameters"]["properties"])
         self.assertIn("instruction", tools_by_name["update_personality"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["update_personality"]["parameters"]["properties"])
+        self.assertIn("setting", tools_by_name["update_simple_setting"]["parameters"]["properties"])
+        self.assertIn("action", tools_by_name["update_simple_setting"]["parameters"]["properties"])
+        self.assertIn("value", tools_by_name["update_simple_setting"]["parameters"]["properties"])
+        self.assertEqual(
+            tools_by_name["update_simple_setting"]["parameters"]["properties"]["value"]["anyOf"],
+            [{"type": "number"}, {"type": "string"}],
+        )
+        self.assertIn(
+            "Descriptive values such as male, female, neutral, warm, soft, deep, bright, or firm are also accepted",
+            tools_by_name["update_simple_setting"]["parameters"]["properties"]["value"]["description"],
+        )
+        self.assertIn("confirmed", tools_by_name["update_simple_setting"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["create_time_automation"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["create_sensor_automation"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["update_time_automation"]["parameters"]["properties"])
@@ -352,6 +394,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("confirmed", tools_by_name["reset_voice_profile"]["parameters"]["properties"])
         self.assertIn("reason", tools_by_name["end_conversation"]["parameters"]["properties"])
         self.assertIn("question", tools_by_name["inspect_camera"]["parameters"]["properties"])
+        self.assertEqual(connection.session.calls[0]["audio"]["output"]["speed"], 0.85)
 
     def test_run_audio_turn_streams_audio_and_collects_text(self) -> None:
         audio_chunks: list[bytes] = []

@@ -157,6 +157,7 @@ class OpenAIBackendTests(unittest.TestCase):
             openai_stt_model="whisper-1",
             openai_tts_model="gpt-4o-mini-tts",
             openai_tts_voice="marin",
+            openai_tts_speed=0.9,
             openai_tts_format="wav",
             openai_tts_instructions="Speak in natural German.",
             openai_web_search_context_size="medium",
@@ -189,6 +190,10 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(request["model"], "gpt-5.2")
         self.assertEqual(request["reasoning"], {"effort": "medium"})
         self.assertFalse(request["store"])
+        self.assertIn(
+            "All user-facing spoken and written replies for this turn must be in German.",
+            request["instructions"],
+        )
         self.assertEqual(request["tools"][0]["type"], "web_search")
         self.assertEqual(request["tools"][0]["search_context_size"], "medium")
         self.assertEqual(request["tools"][0]["user_location"]["country"], "DE")
@@ -209,7 +214,14 @@ class OpenAIBackendTests(unittest.TestCase):
         backend.respond_with_metadata("Hello", instructions="Task context")
 
         request = self.responses.calls[0]
-        self.assertEqual(request["instructions"], "Base context\n\nTask context")
+        self.assertEqual(
+            request["instructions"],
+            (
+                "Base context\n\n"
+                "Task context\n\n"
+                "All user-facing spoken and written replies for this turn must be in German."
+            ),
+        )
 
     def test_respond_loads_latest_hidden_context_from_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -275,6 +287,7 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertIn("REMINDERS:\nScheduled reminders and timers:", request["instructions"])
         self.assertIn("04151 8810", request["instructions"])
         self.assertIn("Muell rausstellen", request["instructions"])
+        self.assertIn("All user-facing spoken and written replies for this turn must be in German.", request["instructions"])
 
     def test_respond_to_images_sends_multiple_input_images(self) -> None:
         response = self.backend.respond_to_images_with_metadata(
@@ -325,6 +338,7 @@ class OpenAIBackendTests(unittest.TestCase):
         request = self.speech.calls[0]
         self.assertEqual(request["model"], "gpt-4o-mini-tts")
         self.assertEqual(request["voice"], "marin")
+        self.assertEqual(request["speed"], 0.9)
         self.assertEqual(request["response_format"], "wav")
         self.assertEqual(request["instructions"], "Speak in natural German.")
 
@@ -347,12 +361,14 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(backend._client.audio.speech.calls[0]["model"], "gpt-4o-mini-tts")
         self.assertEqual(backend._client.audio.speech.calls[1]["model"], "tts-1")
         self.assertEqual(backend._client.audio.speech.calls[1]["voice"], "sage")
+        self.assertEqual(backend._client.audio.speech.calls[1]["speed"], 0.9)
 
     def test_synthesize_stream_yields_audio_chunks(self) -> None:
         chunks = list(self.backend.synthesize_stream("Hello from Twinr"))
 
         self.assertEqual(chunks, [b"AU", b"DIO"])
         self.assertEqual(self.speech.calls[0]["model"], "gpt-4o-mini-tts")
+        self.assertEqual(self.speech.calls[0]["speed"], 0.9)
         self.assertEqual(self.speech.calls[0]["instructions"], "Speak in natural German.")
 
     def test_phrase_due_reminder_builds_short_reminder_request(self) -> None:
@@ -379,6 +395,7 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertIn("Reminder summary: Arzttermin", request["input"][0]["content"][0]["text"])
         self.assertIn("Reminder details: Bei Dr. Meyer", request["input"][0]["content"][0]["text"])
         self.assertIn("speaking a due reminder", request["instructions"])
+        self.assertIn("All user-facing spoken and written replies for this turn must be in German.", request["instructions"])
 
     def test_phrase_proactive_prompt_uses_recent_context_and_repeat_guard(self) -> None:
         response = self.backend.phrase_proactive_prompt_with_metadata(
@@ -388,6 +405,10 @@ class OpenAIBackendTests(unittest.TestCase):
             priority=30,
             conversation=[("user", "Ich suche meinen Ausweis."), ("assistant", "Ich helfe dir gern.")],
             recent_prompts=("Möchtest du mir etwas zeigen?", "Willst du mir das kurz zeigen?"),
+            observation_facts=(
+                "showing_hold: value=1.00, weight=0.55, detail=active_for=2.4s target=1.5s",
+                "looking_toward_device: value=1.00, weight=0.20, detail=looking_toward_device=True",
+            ),
         )
 
         self.assertEqual(response.text, "Backend answer")
@@ -399,6 +420,8 @@ class OpenAIBackendTests(unittest.TestCase):
             "Recent proactive wording to avoid repeating too closely",
             request["input"][-1]["content"][0]["text"],
         )
+        self.assertIn("Observed evidence:", request["input"][-1]["content"][0]["text"])
+        self.assertIn("showing_hold: value=1.00", request["input"][-1]["content"][0]["text"])
         self.assertEqual(request["input"][0]["role"], "user")
         self.assertEqual(request["input"][1]["role"], "assistant")
 
@@ -581,3 +604,4 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(request["reasoning"], {"effort": "low"})
         self.assertNotIn("tools", request)
         self.assertEqual(request["max_output_tokens"], 140)
+        self.assertIn("All user-facing spoken and written replies for this turn must be in German.", request["instructions"])
