@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import re
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.language import language_display_name
+from twinr.text_utils import folded_lookup_text
 
 _MEMORY_CAPACITY_PRESETS: tuple[tuple[int, str, int, int], ...] = (
     (1, "compact", 12, 6),
@@ -49,7 +49,6 @@ _SPOKEN_VOICE_OPTIONS: tuple[dict[str, str], ...] = (
         "tts_voice": "marin",
         "realtime_voice": "marin",
         "selection_hint": "warm, calm, natural, and a little lighter",
-        "aliases": "marin,warm,warmer,calm,soft,natural,female,feminine,weiblich,frau",
     },
     {
         "name": "cedar",
@@ -58,7 +57,6 @@ _SPOKEN_VOICE_OPTIONS: tuple[dict[str, str], ...] = (
         "tts_voice": "cedar",
         "realtime_voice": "cedar",
         "selection_hint": "calm, steady, deeper, and more masculine",
-        "aliases": "cedar,deep,deeper,tiefer,steady,masculine,male,mann,männlich,maennlich",
     },
     {
         "name": "sage",
@@ -67,7 +65,6 @@ _SPOKEN_VOICE_OPTIONS: tuple[dict[str, str], ...] = (
         "tts_voice": "sage",
         "realtime_voice": "sage",
         "selection_hint": "gentle, soft, reassuring, and neutral",
-        "aliases": "sage,gentle,soft,softer,neutral,calm,ruhig,sanft,reassuring",
     },
     {
         "name": "alloy",
@@ -76,7 +73,6 @@ _SPOKEN_VOICE_OPTIONS: tuple[dict[str, str], ...] = (
         "tts_voice": "alloy",
         "realtime_voice": "alloy",
         "selection_hint": "neutral, clear, and balanced",
-        "aliases": "alloy,neutral,balanced,clear,klar",
     },
     {
         "name": "coral",
@@ -85,7 +81,6 @@ _SPOKEN_VOICE_OPTIONS: tuple[dict[str, str], ...] = (
         "tts_voice": "coral",
         "realtime_voice": "coral",
         "selection_hint": "bright, friendly, cheerful, and a little lighter",
-        "aliases": "coral,bright,brighter,cheerful,friendly,light,lighter,freundlich,hell,female,feminine,weiblich",
     },
     {
         "name": "echo",
@@ -94,7 +89,6 @@ _SPOKEN_VOICE_OPTIONS: tuple[dict[str, str], ...] = (
         "tts_voice": "echo",
         "realtime_voice": "echo",
         "selection_hint": "clear, firmer, direct, and a little deeper",
-        "aliases": "echo,firm,firmer,direct,clear,deeper,deep,male,masculine,männlich,maennlich",
     },
 )
 _SPOKEN_VOICE_BY_NAME = {
@@ -147,9 +141,8 @@ def adjustable_settings_context(config: TwinrConfig) -> str:
         f"speech_pause_ms {config.speech_pause_ms}; "
         f"follow_up_timeout_s {config.conversation_follow_up_timeout_s:.1f}. "
         f"{spoken_voice_language_note(config.openai_realtime_language)} "
-        "For calm German speech, Marin, Cedar, and Sage are usually the safest suggestions. "
         "If the user asks which voices are available, answer from this list. "
-        "If the user asks for a masculine, feminine, neutral, warmer, softer, deeper, brighter, or firmer voice, map it to the closest supported spoken_voice."
+        "When the user describes a desired voice, resolve it to one supported voice from this list and only write that supported voice name."
     )
 
 
@@ -363,52 +356,17 @@ def _resolve_spoken_voice_option(requested_voice: str) -> dict[str, str] | None:
     normalized = _normalize_lookup_text(requested_voice)
     if not normalized:
         return None
-    if normalized in _SPOKEN_VOICE_BY_NAME:
-        return _SPOKEN_VOICE_BY_NAME[normalized]
-
-    best_option: dict[str, str] | None = None
-    best_score = 0
     for option in _SPOKEN_VOICE_OPTIONS:
-        score = _voice_alias_score(option, normalized)
-        if score > best_score:
-            best_score = score
-            best_option = option
-    return best_option
-
-
-def _voice_alias_score(option: dict[str, str], normalized_request: str) -> int:
-    aliases = [_normalize_lookup_text(alias) for alias in option["aliases"].split(",") if alias.strip()]
-    score = 0
-    for alias in aliases:
-        if not alias:
-            continue
-        if normalized_request == alias:
-            score += 100
-        elif alias in normalized_request:
-            score += max(18, len(alias))
-    request_tokens = set(token for token in normalized_request.split() if token)
-    alias_tokens = {
-        token
-        for alias in aliases
-        for token in alias.split()
-        if token
-    }
-    score += len(request_tokens & alias_tokens) * 8
-    return score
+        if normalized in {
+            _normalize_lookup_text(option["name"]),
+            _normalize_lookup_text(option["label"]),
+        }:
+            return option
+    return None
 
 
 def _normalize_lookup_text(value: str) -> str:
-    normalized = value.strip().lower()
-    replacements = (
-        ("ä", "ae"),
-        ("ö", "oe"),
-        ("ü", "ue"),
-        ("ß", "ss"),
-    )
-    for source, target in replacements:
-        normalized = normalized.replace(source, target)
-    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
-    return re.sub(r"\s+", " ", normalized).strip()
+    return folded_lookup_text(value)
 
 
 def _update_numeric_setting(

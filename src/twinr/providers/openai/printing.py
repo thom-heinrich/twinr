@@ -52,6 +52,19 @@ class OpenAIPrintMixin:
         direct_text: str | None = None,
         request_source: str = "button",
     ) -> OpenAITextResponse:
+        literal_tool_text = self._literal_tool_print_text(
+            direct_text=direct_text,
+            request_source=request_source,
+        )
+        if literal_tool_text is not None:
+            return OpenAITextResponse(
+                text=literal_tool_text,
+                response_id=None,
+                request_id=None,
+                model=None,
+                token_usage=None,
+                used_web_search=False,
+            )
         prompt = self._build_print_composer_prompt(
             conversation=conversation,
             focus_hint=focus_hint,
@@ -68,12 +81,16 @@ class OpenAIPrintMixin:
             max_output_tokens=180,
         )
         response = self._client.responses.create(**request)
-        candidate_text = self._sanitize_print_text(self._extract_output_text(response))
+        candidate_text, candidate_error = self._try_sanitize_print_text(self._extract_output_text(response))
         fallback_source = self._fallback_print_source(conversation, direct_text)
         final_text = candidate_text
-        if self._should_use_print_fallback(candidate_text, fallback_source):
+        if (not candidate_text and fallback_source) or self._should_use_print_fallback(candidate_text, fallback_source):
             fallback = self.format_for_print_with_metadata(fallback_source)
             final_text = self._sanitize_print_text(fallback.text)
+        elif not final_text:
+            if candidate_error is not None:
+                raise candidate_error
+            raise RuntimeError("Print composer returned empty output")
         return OpenAITextResponse(
             text=final_text,
             response_id=getattr(response, "id", None),
@@ -144,6 +161,12 @@ class OpenAIPrintMixin:
             result = result.rstrip(" .") + "…"
         return result.strip()
 
+    def _try_sanitize_print_text(self, text: str) -> tuple[str, RuntimeError | None]:
+        try:
+            return self._sanitize_print_text(text), None
+        except RuntimeError as exc:
+            return "", exc
+
     def _latest_print_exchange(self, conversation: ConversationLike | None) -> tuple[str | None, str | None]:
         latest_user: str | None = None
         latest_assistant: str | None = None
@@ -167,6 +190,24 @@ class OpenAIPrintMixin:
             return direct_text.strip()
         _latest_user, latest_assistant = self._latest_print_exchange(conversation)
         return (latest_assistant or "").strip()
+
+    def _literal_tool_print_text(
+        self,
+        *,
+        direct_text: str | None,
+        request_source: str,
+    ) -> str | None:
+        if request_source.strip().lower() != "tool":
+            return None
+        clean_direct_text = (direct_text or "").strip()
+        if not clean_direct_text:
+            return None
+        sanitized, error = self._try_sanitize_print_text(clean_direct_text)
+        if sanitized:
+            return sanitized
+        if error is not None:
+            raise error
+        return None
 
     def _should_use_print_fallback(self, candidate_text: str, fallback_source: str) -> bool:
         if not fallback_source:

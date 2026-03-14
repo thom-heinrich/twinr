@@ -215,6 +215,7 @@ class OpenAIToolCallingAgentProviderTests(unittest.TestCase):
         self.assertEqual(response.tool_calls[0].arguments["focus_hint"], "arzttermin")
         self.assertEqual(text_deltas, ["Ich prüfe das."])
         self.assertEqual(request["model"], "gpt-5.2")
+        self.assertTrue(request["store"])
         self.assertEqual(request["tool_choice"], "auto")
         self.assertEqual(
             [tool["type"] for tool in request["tools"]],
@@ -255,6 +256,7 @@ class OpenAIToolCallingAgentProviderTests(unittest.TestCase):
         request = backend._client.responses.stream_requests[0]
         self.assertEqual(response.text, "Ist erledigt.")
         self.assertEqual(request["previous_response_id"], "resp_start_1")
+        self.assertTrue(request["store"])
         self.assertEqual(
             request["input"],
             [{"type": "function_call_output", "call_id": "call_1", "output": '{"status":"printed"}'}],

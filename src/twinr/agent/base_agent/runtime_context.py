@@ -3,6 +3,7 @@ from __future__ import annotations
 from twinr.agent.base_agent.adaptive_timing import AdaptiveListeningWindow, AdaptiveTimingProfile
 from twinr.agent.base_agent.language import memory_and_response_contract
 from twinr.memory import LongTermMemoryService, TwinrPersonalGraphStore
+from twinr.proactive import ProactiveGovernor
 
 
 class TwinrRuntimeContextMixin:
@@ -44,6 +45,7 @@ class TwinrRuntimeContextMixin:
             config,
             graph_store=self.graph_memory,
         )
+        self.proactive_governor = ProactiveGovernor.from_config(config)
         self.adaptive_timing_store = self.adaptive_timing_store.__class__(
             config.adaptive_timing_store_path,
             config=config,
@@ -159,7 +161,7 @@ class TwinrRuntimeContextMixin:
             signal = status.replace("_", " ")
 
         parts = [
-            "Live speaker signal for this turn. Treat it as a local heuristic, not proof of identity.",
+            "Live speaker signal for this turn. Treat it as a local verification signal, not proof of identity.",
             f"Speaker signal: {signal}.",
         ]
         if self.user_voice_confidence is not None:

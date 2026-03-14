@@ -45,6 +45,9 @@ DEFAULT_WAKEWORD_PHRASES = (
     "twina",
     "twinner",
 )
+# Custom openWakeWord models can legitimately need very low operating thresholds.
+# Keep the parser permissive and let deployment tuning decide the actual value.
+MIN_SAFE_OPENWAKEWORD_THRESHOLD = 0.0
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -90,6 +93,15 @@ def _parse_float(value: str | None, default: float) -> float:
     return float(value)
 
 
+def _parse_clamped_float(value: str | None, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    parsed = _parse_float(value, default)
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
 def _parse_csv_ints(value: str | None, default: tuple[int, ...]) -> tuple[int, ...]:
     if value is None or not value.strip():
         return default
@@ -108,6 +120,9 @@ class TwinrConfig:
     openai_api_key: str | None = None
     openai_project_id: str | None = None
     openai_send_project_header: bool | None = None
+    stt_provider: str = "openai"
+    llm_provider: str = "openai"
+    tts_provider: str = "openai"
     project_root: str = "."
     personality_dir: str = "personality"
     user_display_name: str | None = None
@@ -119,6 +134,16 @@ class TwinrConfig:
     openai_tts_speed: float = 1.0
     openai_tts_format: str = "wav"
     openai_tts_instructions: str | None = None
+    deepgram_api_key: str | None = None
+    deepgram_base_url: str = "https://api.deepgram.com/v1"
+    deepgram_stt_model: str = "nova-3"
+    deepgram_stt_language: str | None = "de"
+    deepgram_stt_smart_format: bool = True
+    deepgram_timeout_s: float = 30.0
+    groq_api_key: str | None = None
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    groq_model: str = "llama-3.3-70b-versatile"
+    groq_timeout_s: float = 45.0
     openai_realtime_model: str = "gpt-4o-realtime-preview"
     openai_realtime_voice: str = "sage"
     openai_realtime_speed: float = 1.0
@@ -181,20 +206,27 @@ class TwinrConfig:
     wakeword_motion_grace_s: float = 5.0 * 60.0
     wakeword_speech_grace_s: float = 90.0
     wakeword_attempt_cooldown_s: float = 4.0
+    wakeword_block_proactive_after_attempt_s: float = 20.0
     wakeword_min_active_ratio: float = 0.08
     wakeword_min_active_chunks: int = 2
     wakeword_openwakeword_models: tuple[str, ...] = ()
     wakeword_openwakeword_threshold: float = 0.5
     wakeword_openwakeword_vad_threshold: float = 0.0
     wakeword_openwakeword_patience_frames: int = 1
+    wakeword_openwakeword_activation_samples: int = 3
+    wakeword_openwakeword_deactivation_threshold: float = 0.2
     wakeword_openwakeword_enable_speex: bool = False
-    wakeword_openwakeword_transcribe_on_detect: bool = True
+    wakeword_openwakeword_transcribe_on_detect: bool = False
     wakeword_openwakeword_inference_framework: str = "tflite"
     proactive_person_returned_absence_s: float = 20.0 * 60.0
     proactive_person_returned_recent_motion_s: float = 30.0
     proactive_attention_window_s: float = 6.0
     proactive_slumped_quiet_s: float = 20.0
     proactive_possible_fall_stillness_s: float = 10.0
+    proactive_possible_fall_visibility_loss_hold_s: float = 15.0
+    proactive_possible_fall_visibility_loss_arming_s: float = 6.0
+    proactive_possible_fall_slumped_visibility_loss_arming_s: float = 4.0
+    proactive_possible_fall_once_per_presence_session: bool = True
     proactive_floor_stillness_s: float = 20.0
     proactive_showing_intent_hold_s: float = 1.5
     proactive_positive_contact_hold_s: float = 1.5
@@ -208,6 +240,14 @@ class TwinrConfig:
     proactive_showing_intent_score_threshold: float = 0.84
     proactive_positive_contact_score_threshold: float = 0.84
     proactive_distress_possible_score_threshold: float = 0.85
+    proactive_governor_enabled: bool = True
+    proactive_governor_active_reservation_ttl_s: float = 45.0
+    proactive_governor_global_prompt_cooldown_s: float = 120.0
+    proactive_governor_window_s: float = 20.0 * 60.0
+    proactive_governor_window_prompt_limit: int = 4
+    proactive_governor_presence_session_prompt_limit: int = 2
+    proactive_governor_source_repeat_cooldown_s: float = 10.0 * 60.0
+    proactive_governor_history_limit: int = 128
     web_host: str = "0.0.0.0"
     web_port: int = 1337
     runtime_state_path: str = "/tmp/twinr-runtime-state.json"
@@ -217,7 +257,7 @@ class TwinrConfig:
     voice_profile_store_path: str = "state/voice_profile.json"
     adaptive_timing_enabled: bool = True
     adaptive_timing_store_path: str = "state/adaptive_timing.json"
-    adaptive_timing_pause_grace_ms: int = 900
+    adaptive_timing_pause_grace_ms: int = 450
     long_term_memory_enabled: bool = False
     long_term_memory_backend: str = "chonkydb"
     long_term_memory_path: str = "state/chonkydb"
@@ -225,6 +265,14 @@ class TwinrConfig:
     long_term_memory_write_queue_size: int = 32
     long_term_memory_recall_limit: int = 3
     long_term_memory_query_rewrite_enabled: bool = True
+    long_term_memory_proactive_enabled: bool = False
+    long_term_memory_proactive_poll_interval_s: float = 30.0
+    long_term_memory_proactive_min_confidence: float = 0.72
+    long_term_memory_proactive_repeat_cooldown_s: float = 6.0 * 60.0 * 60.0
+    long_term_memory_proactive_skip_cooldown_s: float = 30.0 * 60.0
+    long_term_memory_proactive_reservation_ttl_s: float = 90.0
+    long_term_memory_proactive_allow_sensitive: bool = False
+    long_term_memory_proactive_history_limit: int = 128
     chonkydb_base_url: str | None = None
     chonkydb_api_key: str | None = None
     chonkydb_api_key_header: str = "x-api-key"
@@ -309,6 +357,9 @@ class TwinrConfig:
             openai_api_key=get_value("OPENAI_API_KEY"),
             openai_project_id=get_value("OPENAI_PROJ_ID"),
             openai_send_project_header=_parse_optional_bool(get_value("OPENAI_SEND_PROJECT_HEADER")),
+            stt_provider=(get_value("TWINR_STT_PROVIDER", "openai") or "openai").strip().lower(),
+            llm_provider=(get_value("TWINR_LLM_PROVIDER", "openai") or "openai").strip().lower(),
+            tts_provider=(get_value("TWINR_TTS_PROVIDER", "openai") or "openai").strip().lower(),
             project_root=str(project_root),
             personality_dir=get_value("TWINR_PERSONALITY_DIR", "personality") or "personality",
             user_display_name=get_value("TWINR_USER_DISPLAY_NAME"),
@@ -320,6 +371,18 @@ class TwinrConfig:
             openai_tts_speed=_parse_float(get_value("OPENAI_TTS_SPEED"), 1.0),
             openai_tts_format=get_value("OPENAI_TTS_FORMAT", "wav") or "wav",
             openai_tts_instructions=get_value("OPENAI_TTS_INSTRUCTIONS"),
+            deepgram_api_key=get_value("DEEPGRAM_API_KEY"),
+            deepgram_base_url=get_value("DEEPGRAM_BASE_URL", "https://api.deepgram.com/v1")
+            or "https://api.deepgram.com/v1",
+            deepgram_stt_model=get_value("DEEPGRAM_STT_MODEL", "nova-3") or "nova-3",
+            deepgram_stt_language=get_value("DEEPGRAM_STT_LANGUAGE", "de") or "de",
+            deepgram_stt_smart_format=_parse_bool(get_value("DEEPGRAM_STT_SMART_FORMAT"), True),
+            deepgram_timeout_s=_parse_float(get_value("DEEPGRAM_TIMEOUT_S"), 30.0),
+            groq_api_key=get_value("GROQ_API_KEY"),
+            groq_base_url=get_value("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+            or "https://api.groq.com/openai/v1",
+            groq_model=get_value("GROQ_MODEL", "llama-3.3-70b-versatile") or "llama-3.3-70b-versatile",
+            groq_timeout_s=_parse_float(get_value("GROQ_TIMEOUT_S"), 45.0),
             openai_realtime_model=get_value("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
             or "gpt-4o-realtime-preview",
             openai_realtime_voice=get_value("OPENAI_REALTIME_VOICE", "sage") or "sage",
@@ -413,6 +476,10 @@ class TwinrConfig:
                 get_value("TWINR_WAKEWORD_ATTEMPT_COOLDOWN_S"),
                 4.0,
             ),
+            wakeword_block_proactive_after_attempt_s=_parse_float(
+                get_value("TWINR_WAKEWORD_BLOCK_PROACTIVE_AFTER_ATTEMPT_S"),
+                20.0,
+            ),
             wakeword_min_active_ratio=_parse_float(
                 get_value("TWINR_WAKEWORD_MIN_ACTIVE_RATIO"),
                 0.08,
@@ -424,9 +491,11 @@ class TwinrConfig:
                 get_value("TWINR_WAKEWORD_OPENWAKEWORD_MODELS"),
                 (),
             ),
-            wakeword_openwakeword_threshold=_parse_float(
+            wakeword_openwakeword_threshold=_parse_clamped_float(
                 get_value("TWINR_WAKEWORD_OPENWAKEWORD_THRESHOLD"),
                 0.5,
+                minimum=MIN_SAFE_OPENWAKEWORD_THRESHOLD,
+                maximum=1.0,
             ),
             wakeword_openwakeword_vad_threshold=_parse_float(
                 get_value("TWINR_WAKEWORD_OPENWAKEWORD_VAD_THRESHOLD"),
@@ -435,13 +504,22 @@ class TwinrConfig:
             wakeword_openwakeword_patience_frames=int(
                 get_value("TWINR_WAKEWORD_OPENWAKEWORD_PATIENCE_FRAMES", "1") or "1"
             ),
+            wakeword_openwakeword_activation_samples=int(
+                get_value("TWINR_WAKEWORD_OPENWAKEWORD_ACTIVATION_SAMPLES", "3") or "3"
+            ),
+            wakeword_openwakeword_deactivation_threshold=_parse_clamped_float(
+                get_value("TWINR_WAKEWORD_OPENWAKEWORD_DEACTIVATION_THRESHOLD"),
+                0.2,
+                minimum=0.0,
+                maximum=1.0,
+            ),
             wakeword_openwakeword_enable_speex=_parse_bool(
                 get_value("TWINR_WAKEWORD_OPENWAKEWORD_ENABLE_SPEEX"),
                 False,
             ),
             wakeword_openwakeword_transcribe_on_detect=_parse_bool(
                 get_value("TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT"),
-                True,
+                False,
             ),
             wakeword_openwakeword_inference_framework=(
                 get_value("TWINR_WAKEWORD_OPENWAKEWORD_INFERENCE_FRAMEWORK", "tflite") or "tflite"
@@ -465,6 +543,22 @@ class TwinrConfig:
             proactive_possible_fall_stillness_s=_parse_float(
                 get_value("TWINR_PROACTIVE_POSSIBLE_FALL_STILLNESS_S"),
                 10.0,
+            ),
+            proactive_possible_fall_visibility_loss_hold_s=_parse_float(
+                get_value("TWINR_PROACTIVE_POSSIBLE_FALL_VISIBILITY_LOSS_HOLD_S"),
+                15.0,
+            ),
+            proactive_possible_fall_visibility_loss_arming_s=_parse_float(
+                get_value("TWINR_PROACTIVE_POSSIBLE_FALL_VISIBILITY_LOSS_ARMING_S"),
+                6.0,
+            ),
+            proactive_possible_fall_slumped_visibility_loss_arming_s=_parse_float(
+                get_value("TWINR_PROACTIVE_POSSIBLE_FALL_SLUMPED_VISIBILITY_LOSS_ARMING_S"),
+                4.0,
+            ),
+            proactive_possible_fall_once_per_presence_session=_parse_bool(
+                get_value("TWINR_PROACTIVE_POSSIBLE_FALL_ONCE_PER_PRESENCE_SESSION"),
+                True,
             ),
             proactive_floor_stillness_s=_parse_float(
                 get_value("TWINR_PROACTIVE_FLOOR_STILLNESS_S"),
@@ -518,6 +612,35 @@ class TwinrConfig:
                 get_value("TWINR_PROACTIVE_DISTRESS_POSSIBLE_SCORE_THRESHOLD"),
                 0.85,
             ),
+            proactive_governor_enabled=_parse_bool(
+                get_value("TWINR_PROACTIVE_GOVERNOR_ENABLED"),
+                True,
+            ),
+            proactive_governor_active_reservation_ttl_s=_parse_float(
+                get_value("TWINR_PROACTIVE_GOVERNOR_ACTIVE_RESERVATION_TTL_S"),
+                45.0,
+            ),
+            proactive_governor_global_prompt_cooldown_s=_parse_float(
+                get_value("TWINR_PROACTIVE_GOVERNOR_GLOBAL_PROMPT_COOLDOWN_S"),
+                120.0,
+            ),
+            proactive_governor_window_s=_parse_float(
+                get_value("TWINR_PROACTIVE_GOVERNOR_WINDOW_S"),
+                20.0 * 60.0,
+            ),
+            proactive_governor_window_prompt_limit=int(
+                get_value("TWINR_PROACTIVE_GOVERNOR_WINDOW_PROMPT_LIMIT", "4") or "4"
+            ),
+            proactive_governor_presence_session_prompt_limit=int(
+                get_value("TWINR_PROACTIVE_GOVERNOR_PRESENCE_SESSION_PROMPT_LIMIT", "2") or "2"
+            ),
+            proactive_governor_source_repeat_cooldown_s=_parse_float(
+                get_value("TWINR_PROACTIVE_GOVERNOR_SOURCE_REPEAT_COOLDOWN_S"),
+                10.0 * 60.0,
+            ),
+            proactive_governor_history_limit=int(
+                get_value("TWINR_PROACTIVE_GOVERNOR_HISTORY_LIMIT", "128") or "128"
+            ),
             web_host=get_value("TWINR_WEB_HOST", "0.0.0.0") or "0.0.0.0",
             web_port=int(get_value("TWINR_WEB_PORT", "1337") or "1337"),
             runtime_state_path=get_value(
@@ -552,7 +675,7 @@ class TwinrConfig:
             )
             or str(project_root / "state" / "adaptive_timing.json"),
             adaptive_timing_pause_grace_ms=int(
-                get_value("TWINR_ADAPTIVE_TIMING_PAUSE_GRACE_MS", "900") or "900"
+                get_value("TWINR_ADAPTIVE_TIMING_PAUSE_GRACE_MS", "450") or "450"
             ),
             long_term_memory_enabled=_parse_bool(get_value("TWINR_LONG_TERM_MEMORY_ENABLED"), False),
             long_term_memory_backend=get_value("TWINR_LONG_TERM_MEMORY_BACKEND", "chonkydb") or "chonkydb",
@@ -574,6 +697,37 @@ class TwinrConfig:
             long_term_memory_query_rewrite_enabled=_parse_bool(
                 get_value("TWINR_LONG_TERM_MEMORY_QUERY_REWRITE_ENABLED"),
                 True,
+            ),
+            long_term_memory_proactive_enabled=_parse_bool(
+                get_value("TWINR_LONG_TERM_MEMORY_PROACTIVE_ENABLED"),
+                False,
+            ),
+            long_term_memory_proactive_poll_interval_s=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_PROACTIVE_POLL_INTERVAL_S"),
+                30.0,
+            ),
+            long_term_memory_proactive_min_confidence=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_PROACTIVE_MIN_CONFIDENCE"),
+                0.72,
+            ),
+            long_term_memory_proactive_repeat_cooldown_s=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_PROACTIVE_REPEAT_COOLDOWN_S"),
+                6.0 * 60.0 * 60.0,
+            ),
+            long_term_memory_proactive_skip_cooldown_s=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_PROACTIVE_SKIP_COOLDOWN_S"),
+                30.0 * 60.0,
+            ),
+            long_term_memory_proactive_reservation_ttl_s=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_PROACTIVE_RESERVATION_TTL_S"),
+                90.0,
+            ),
+            long_term_memory_proactive_allow_sensitive=_parse_bool(
+                get_value("TWINR_LONG_TERM_MEMORY_PROACTIVE_ALLOW_SENSITIVE"),
+                False,
+            ),
+            long_term_memory_proactive_history_limit=int(
+                get_value("TWINR_LONG_TERM_MEMORY_PROACTIVE_HISTORY_LIMIT", "128") or "128"
             ),
             chonkydb_base_url=(
                 get_value("TWINR_CHONKYDB_BASE_URL")

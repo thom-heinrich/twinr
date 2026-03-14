@@ -2,26 +2,25 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 import json
-import re
 import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
 from twinr import TwinrConfig, TwinrRuntime
 from twinr.providers.openai import OpenAIBackend
+from twinr.text_utils import extract_json_object, folded_lookup_text
 
 
-_EXPLICIT_MEMORY_PATTERNS = (
-    re.compile(r"\bich erinnere mich\b", re.IGNORECASE),
-    re.compile(r"\bwenn ich mich richtig erinnere\b", re.IGNORECASE),
-    re.compile(r"\bdu hast gesagt\b", re.IGNORECASE),
-    re.compile(r"\bdu meintest\b", re.IGNORECASE),
-    re.compile(r"\bi remember\b", re.IGNORECASE),
-    re.compile(r"\bif i remember correctly\b", re.IGNORECASE),
-    re.compile(r"\byou told me\b", re.IGNORECASE),
-    re.compile(r"\byou said earlier\b", re.IGNORECASE),
+_EXPLICIT_MEMORY_PHRASES = (
+    "ich erinnere mich",
+    "wenn ich mich richtig erinnere",
+    "du hast gesagt",
+    "du meintest",
+    "i remember",
+    "if i remember correctly",
+    "you told me",
+    "you said earlier",
 )
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,15 +437,15 @@ def _judge_case(
 
 
 def contains_explicit_memory_announcement(text: str) -> bool:
-    normalized = str(text or "").strip()
-    return any(pattern.search(normalized) is not None for pattern in _EXPLICIT_MEMORY_PATTERNS)
+    normalized = f" {folded_lookup_text(text)} "
+    return any(f" {phrase} " in normalized for phrase in _EXPLICIT_MEMORY_PHRASES)
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
-    match = _JSON_OBJECT_RE.search(text)
-    if match is None:
-        raise ValueError(f"Judge response did not contain JSON: {text!r}")
-    return json.loads(match.group(0))
+    try:
+        return extract_json_object(text)
+    except ValueError as exc:
+        raise ValueError(f"Judge response did not contain JSON: {text!r}") from exc
 
 
 def _summarize(case_results: tuple[SubtextEvalCaseResult, ...]) -> SubtextEvalSummary:

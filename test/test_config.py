@@ -17,6 +17,9 @@ class TwinrConfigTests(unittest.TestCase):
                     [
                         "OPENAI_REASONING_EFFORT=medium",
                         "OPENAI_SEND_PROJECT_HEADER=false",
+                        "TWINR_STT_PROVIDER=deepgram",
+                        "TWINR_LLM_PROVIDER=groq",
+                        "TWINR_TTS_PROVIDER=openai",
                         "TWINR_USER_DISPLAY_NAME=Thom",
                         "OPENAI_STT_MODEL=whisper-1",
                         "OPENAI_TTS_MODEL=gpt-4o-mini-tts",
@@ -24,6 +27,16 @@ class TwinrConfigTests(unittest.TestCase):
                         "OPENAI_TTS_SPEED=0.90",
                         "OPENAI_TTS_FORMAT=wav",
                         "OPENAI_TTS_INSTRUCTIONS=Speak in natural German.",
+                        "DEEPGRAM_API_KEY=deepgram-key",
+                        "DEEPGRAM_BASE_URL=https://api.deepgram.example/v1",
+                        "DEEPGRAM_STT_MODEL=nova-3",
+                        "DEEPGRAM_STT_LANGUAGE=de",
+                        "DEEPGRAM_STT_SMART_FORMAT=false",
+                        "DEEPGRAM_TIMEOUT_S=22.0",
+                        "GROQ_API_KEY=groq-key",
+                        "GROQ_BASE_URL=https://api.groq.example/openai/v1",
+                        "GROQ_MODEL=llama-3.3-70b-versatile",
+                        "GROQ_TIMEOUT_S=33.0",
                         "OPENAI_REALTIME_MODEL=gpt-4o-realtime-preview",
                         "OPENAI_REALTIME_VOICE=sage",
                         "OPENAI_REALTIME_SPEED=1.05",
@@ -86,12 +99,15 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_WAKEWORD_MOTION_GRACE_S=180",
                         "TWINR_WAKEWORD_SPEECH_GRACE_S=75",
                         "TWINR_WAKEWORD_ATTEMPT_COOLDOWN_S=5.5",
+                        "TWINR_WAKEWORD_BLOCK_PROACTIVE_AFTER_ATTEMPT_S=14",
                         "TWINR_WAKEWORD_MIN_ACTIVE_RATIO=0.06",
                         "TWINR_WAKEWORD_MIN_ACTIVE_CHUNKS=2",
                         "TWINR_WAKEWORD_OPENWAKEWORD_MODELS=/twinr/models/wakewords/twinr.tflite, /twinr/models/wakewords/twinna.tflite",
                         "TWINR_WAKEWORD_OPENWAKEWORD_THRESHOLD=0.57",
                         "TWINR_WAKEWORD_OPENWAKEWORD_VAD_THRESHOLD=0.18",
                         "TWINR_WAKEWORD_OPENWAKEWORD_PATIENCE_FRAMES=3",
+                        "TWINR_WAKEWORD_OPENWAKEWORD_ACTIVATION_SAMPLES=4",
+                        "TWINR_WAKEWORD_OPENWAKEWORD_DEACTIVATION_THRESHOLD=0.12",
                         "TWINR_WAKEWORD_OPENWAKEWORD_ENABLE_SPEEX=true",
                         "TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT=false",
                         "TWINR_WAKEWORD_OPENWAKEWORD_INFERENCE_FRAMEWORK=onnx",
@@ -100,6 +116,10 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_PROACTIVE_ATTENTION_WINDOW_S=7.5",
                         "TWINR_PROACTIVE_SLUMPED_QUIET_S=24",
                         "TWINR_PROACTIVE_POSSIBLE_FALL_STILLNESS_S=12",
+                        "TWINR_PROACTIVE_POSSIBLE_FALL_VISIBILITY_LOSS_HOLD_S=18",
+                        "TWINR_PROACTIVE_POSSIBLE_FALL_VISIBILITY_LOSS_ARMING_S=6.5",
+                        "TWINR_PROACTIVE_POSSIBLE_FALL_SLUMPED_VISIBILITY_LOSS_ARMING_S=4.5",
+                        "TWINR_PROACTIVE_POSSIBLE_FALL_ONCE_PER_PRESENCE_SESSION=false",
                         "TWINR_PROACTIVE_FLOOR_STILLNESS_S=28",
                         "TWINR_PROACTIVE_SHOWING_INTENT_HOLD_S=2.2",
                         "TWINR_PROACTIVE_POSITIVE_CONTACT_HOLD_S=2.4",
@@ -113,6 +133,14 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_PROACTIVE_SHOWING_INTENT_SCORE_THRESHOLD=0.81",
                         "TWINR_PROACTIVE_POSITIVE_CONTACT_SCORE_THRESHOLD=0.79",
                         "TWINR_PROACTIVE_DISTRESS_POSSIBLE_SCORE_THRESHOLD=0.83",
+                        "TWINR_PROACTIVE_GOVERNOR_ENABLED=false",
+                        "TWINR_PROACTIVE_GOVERNOR_ACTIVE_RESERVATION_TTL_S=33",
+                        "TWINR_PROACTIVE_GOVERNOR_GLOBAL_PROMPT_COOLDOWN_S=180",
+                        "TWINR_PROACTIVE_GOVERNOR_WINDOW_S=2400",
+                        "TWINR_PROACTIVE_GOVERNOR_WINDOW_PROMPT_LIMIT=5",
+                        "TWINR_PROACTIVE_GOVERNOR_PRESENCE_SESSION_PROMPT_LIMIT=3",
+                        "TWINR_PROACTIVE_GOVERNOR_SOURCE_REPEAT_COOLDOWN_S=420",
+                        "TWINR_PROACTIVE_GOVERNOR_HISTORY_LIMIT=96",
                         "TWINR_WEB_HOST=0.0.0.0",
                         "TWINR_RUNTIME_STATE_PATH=/tmp/twinr-state-test.json",
                         "TWINR_MEMORY_MARKDOWN_PATH=/tmp/twinr-memory-test.md",
@@ -128,6 +156,14 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LONG_TERM_MEMORY_BACKGROUND_STORE_TURNS=false",
                         "TWINR_LONG_TERM_MEMORY_WRITE_QUEUE_SIZE=48",
                         "TWINR_LONG_TERM_MEMORY_RECALL_LIMIT=5",
+                        "TWINR_LONG_TERM_MEMORY_PROACTIVE_ENABLED=true",
+                        "TWINR_LONG_TERM_MEMORY_PROACTIVE_POLL_INTERVAL_S=18.0",
+                        "TWINR_LONG_TERM_MEMORY_PROACTIVE_MIN_CONFIDENCE=0.81",
+                        "TWINR_LONG_TERM_MEMORY_PROACTIVE_REPEAT_COOLDOWN_S=28800",
+                        "TWINR_LONG_TERM_MEMORY_PROACTIVE_SKIP_COOLDOWN_S=900",
+                        "TWINR_LONG_TERM_MEMORY_PROACTIVE_RESERVATION_TTL_S=75",
+                        "TWINR_LONG_TERM_MEMORY_PROACTIVE_ALLOW_SENSITIVE=true",
+                        "TWINR_LONG_TERM_MEMORY_PROACTIVE_HISTORY_LIMIT=64",
                         "TWINR_CHONKYDB_BASE_URL=https://memory.example.com:2149",
                         "TWINR_CHONKYDB_API_KEY=secret-key",
                         "TWINR_CHONKYDB_API_KEY_HEADER=x-api-key",
@@ -182,6 +218,9 @@ class TwinrConfigTests(unittest.TestCase):
 
         self.assertEqual(config.openai_reasoning_effort, "medium")
         self.assertFalse(config.openai_send_project_header)
+        self.assertEqual(config.stt_provider, "deepgram")
+        self.assertEqual(config.llm_provider, "groq")
+        self.assertEqual(config.tts_provider, "openai")
         self.assertEqual(config.user_display_name, "Thom")
         self.assertEqual(config.openai_stt_model, "whisper-1")
         self.assertEqual(config.openai_tts_model, "gpt-4o-mini-tts")
@@ -189,6 +228,16 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.openai_tts_speed, 0.9)
         self.assertEqual(config.openai_tts_format, "wav")
         self.assertEqual(config.openai_tts_instructions, "Speak in natural German.")
+        self.assertEqual(config.deepgram_api_key, "deepgram-key")
+        self.assertEqual(config.deepgram_base_url, "https://api.deepgram.example/v1")
+        self.assertEqual(config.deepgram_stt_model, "nova-3")
+        self.assertEqual(config.deepgram_stt_language, "de")
+        self.assertFalse(config.deepgram_stt_smart_format)
+        self.assertEqual(config.deepgram_timeout_s, 22.0)
+        self.assertEqual(config.groq_api_key, "groq-key")
+        self.assertEqual(config.groq_base_url, "https://api.groq.example/openai/v1")
+        self.assertEqual(config.groq_model, "llama-3.3-70b-versatile")
+        self.assertEqual(config.groq_timeout_s, 33.0)
         self.assertEqual(config.openai_realtime_model, "gpt-4o-realtime-preview")
         self.assertEqual(config.openai_realtime_voice, "sage")
         self.assertEqual(config.openai_realtime_speed, 1.05)
@@ -251,6 +300,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.wakeword_motion_grace_s, 180.0)
         self.assertEqual(config.wakeword_speech_grace_s, 75.0)
         self.assertEqual(config.wakeword_attempt_cooldown_s, 5.5)
+        self.assertEqual(config.wakeword_block_proactive_after_attempt_s, 14.0)
         self.assertEqual(config.wakeword_min_active_ratio, 0.06)
         self.assertEqual(config.wakeword_min_active_chunks, 2)
         self.assertEqual(
@@ -260,6 +310,8 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.wakeword_openwakeword_threshold, 0.57)
         self.assertEqual(config.wakeword_openwakeword_vad_threshold, 0.18)
         self.assertEqual(config.wakeword_openwakeword_patience_frames, 3)
+        self.assertEqual(config.wakeword_openwakeword_activation_samples, 4)
+        self.assertEqual(config.wakeword_openwakeword_deactivation_threshold, 0.12)
         self.assertTrue(config.wakeword_openwakeword_enable_speex)
         self.assertFalse(config.wakeword_openwakeword_transcribe_on_detect)
         self.assertEqual(config.wakeword_openwakeword_inference_framework, "onnx")
@@ -268,6 +320,10 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_attention_window_s, 7.5)
         self.assertEqual(config.proactive_slumped_quiet_s, 24.0)
         self.assertEqual(config.proactive_possible_fall_stillness_s, 12.0)
+        self.assertEqual(config.proactive_possible_fall_visibility_loss_hold_s, 18.0)
+        self.assertEqual(config.proactive_possible_fall_visibility_loss_arming_s, 6.5)
+        self.assertEqual(config.proactive_possible_fall_slumped_visibility_loss_arming_s, 4.5)
+        self.assertFalse(config.proactive_possible_fall_once_per_presence_session)
         self.assertEqual(config.proactive_floor_stillness_s, 28.0)
         self.assertEqual(config.proactive_showing_intent_hold_s, 2.2)
         self.assertEqual(config.proactive_positive_contact_hold_s, 2.4)
@@ -281,6 +337,14 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_showing_intent_score_threshold, 0.81)
         self.assertEqual(config.proactive_positive_contact_score_threshold, 0.79)
         self.assertEqual(config.proactive_distress_possible_score_threshold, 0.83)
+        self.assertFalse(config.proactive_governor_enabled)
+        self.assertEqual(config.proactive_governor_active_reservation_ttl_s, 33.0)
+        self.assertEqual(config.proactive_governor_global_prompt_cooldown_s, 180.0)
+        self.assertEqual(config.proactive_governor_window_s, 2400.0)
+        self.assertEqual(config.proactive_governor_window_prompt_limit, 5)
+        self.assertEqual(config.proactive_governor_presence_session_prompt_limit, 3)
+        self.assertEqual(config.proactive_governor_source_repeat_cooldown_s, 420.0)
+        self.assertEqual(config.proactive_governor_history_limit, 96)
         self.assertEqual(config.web_host, "0.0.0.0")
         self.assertEqual(config.runtime_state_path, "/tmp/twinr-state-test.json")
         self.assertEqual(config.memory_markdown_path, "/tmp/twinr-memory-test.md")
@@ -296,6 +360,14 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertFalse(config.long_term_memory_background_store_turns)
         self.assertEqual(config.long_term_memory_write_queue_size, 48)
         self.assertEqual(config.long_term_memory_recall_limit, 5)
+        self.assertTrue(config.long_term_memory_proactive_enabled)
+        self.assertEqual(config.long_term_memory_proactive_poll_interval_s, 18.0)
+        self.assertEqual(config.long_term_memory_proactive_min_confidence, 0.81)
+        self.assertEqual(config.long_term_memory_proactive_repeat_cooldown_s, 28800.0)
+        self.assertEqual(config.long_term_memory_proactive_skip_cooldown_s, 900.0)
+        self.assertEqual(config.long_term_memory_proactive_reservation_ttl_s, 75.0)
+        self.assertTrue(config.long_term_memory_proactive_allow_sensitive)
+        self.assertEqual(config.long_term_memory_proactive_history_limit, 64)
         self.assertEqual(config.chonkydb_base_url, "https://memory.example.com:2149")
         self.assertEqual(config.chonkydb_api_key, "secret-key")
         self.assertEqual(config.chonkydb_api_key_header, "x-api-key")
@@ -351,13 +423,51 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_max_turns, 20)
         self.assertEqual(config.memory_keep_recent, 10)
         self.assertTrue(config.adaptive_timing_enabled)
-        self.assertEqual(config.adaptive_timing_pause_grace_ms, 900)
+        self.assertEqual(config.adaptive_timing_pause_grace_ms, 450)
         self.assertFalse(config.long_term_memory_enabled)
         self.assertEqual(config.long_term_memory_backend, "chonkydb")
         self.assertEqual(config.long_term_memory_path, "state/chonkydb")
         self.assertTrue(config.long_term_memory_background_store_turns)
         self.assertEqual(config.long_term_memory_write_queue_size, 32)
         self.assertEqual(config.long_term_memory_recall_limit, 3)
+        self.assertFalse(config.long_term_memory_proactive_enabled)
+        self.assertEqual(config.long_term_memory_proactive_poll_interval_s, 30.0)
+        self.assertEqual(config.long_term_memory_proactive_min_confidence, 0.72)
+        self.assertEqual(config.long_term_memory_proactive_repeat_cooldown_s, 21600.0)
+        self.assertEqual(config.long_term_memory_proactive_skip_cooldown_s, 1800.0)
+        self.assertEqual(config.long_term_memory_proactive_reservation_ttl_s, 90.0)
+        self.assertFalse(config.long_term_memory_proactive_allow_sensitive)
+        self.assertEqual(config.long_term_memory_proactive_history_limit, 128)
+        self.assertEqual(config.proactive_possible_fall_visibility_loss_hold_s, 15.0)
+        self.assertEqual(config.proactive_possible_fall_visibility_loss_arming_s, 6.0)
+        self.assertEqual(config.proactive_possible_fall_slumped_visibility_loss_arming_s, 4.0)
+        self.assertTrue(config.proactive_possible_fall_once_per_presence_session)
+        self.assertTrue(config.proactive_governor_enabled)
+        self.assertEqual(config.proactive_governor_active_reservation_ttl_s, 45.0)
+        self.assertEqual(config.proactive_governor_global_prompt_cooldown_s, 120.0)
+        self.assertEqual(config.proactive_governor_window_s, 1200.0)
+        self.assertEqual(config.proactive_governor_window_prompt_limit, 4)
+        self.assertEqual(config.proactive_governor_presence_session_prompt_limit, 2)
+        self.assertEqual(config.proactive_governor_source_repeat_cooldown_s, 600.0)
+        self.assertEqual(config.proactive_governor_history_limit, 128)
+
+    def test_wakeword_openwakeword_threshold_allows_deployment_tuned_low_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_WAKEWORD_ENABLED=true",
+                        "TWINR_WAKEWORD_BACKEND=openwakeword",
+                        "TWINR_WAKEWORD_OPENWAKEWORD_THRESHOLD=0.001",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.wakeword_openwakeword_threshold, 0.001)
 
     def test_from_env_defaults_long_term_memory_path_to_project_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -27,7 +27,8 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                     "Print short, user-facing content on the thermal receipt printer "
                     "when the user explicitly asks for a printout. "
                     "Use focus_hint to describe what from the recent context should be printed. "
-                    "Optionally pass text when exact printable wording is already known."
+                    "When the user asks for exact wording, quoted text, or a literal string to print, "
+                    "you must pass that exact printable wording in text."
                 ),
                 "parameters": {
                     "type": "object",
@@ -38,7 +39,10 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                         },
                         "text": {
                             "type": "string",
-                            "description": "Optional exact text if the printable wording is already known.",
+                            "description": (
+                                "Exact printable wording. Required when the user asked to print exact text, "
+                                "quoted text, or a literal string."
+                            ),
                         },
                     },
                     "required": [],
@@ -498,6 +502,61 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 },
             }
         )
+    if "get_memory_conflicts" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "get_memory_conflicts",
+                "description": (
+                    "Inspect open long-term memory conflicts when the user asks what Twinr is unsure about, "
+                    "or when you need the current conflict option IDs before resolving one."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query_text": {
+                            "type": "string",
+                            "description": (
+                                "Optional short query describing the current topic, such as Corinna, physiotherapist, "
+                                "phone number, spouse, or coffee brand."
+                            ),
+                        },
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "resolve_memory_conflict" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "resolve_memory_conflict",
+                "description": (
+                    "Resolve one open long-term memory conflict after the user clearly identified which stored option is correct. "
+                    "Use the slot_key and selected_memory_id from conflict context or from get_memory_conflicts."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "slot_key": {
+                            "type": "string",
+                            "description": "The conflict slot key to resolve, for example contact:person:corinna_maier:phone.",
+                        },
+                        "selected_memory_id": {
+                            "type": "string",
+                            "description": "The chosen memory_id from the conflict options that should become active.",
+                        },
+                        "confirmed": {
+                            "type": "boolean",
+                            "description": "Set true only after the user clearly confirmed the persistent memory correction when extra confirmation is needed.",
+                        },
+                    },
+                    "required": ["slot_key", "selected_memory_id"],
+                    "additionalProperties": False,
+                },
+            }
+        )
     if "remember_preference" in available:
         tools.append(
             {
@@ -630,7 +689,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "description": (
                     "Adjust one of Twinr's small bounded runtime settings after an explicit user request. "
                     "Use memory_capacity when the user wants Twinr to remember more or less recent conversation. "
-                    "Use spoken_voice when the user wants a different voice. "
+                    "Use spoken_voice when the user wants a different voice and resolve descriptive requests to a supported Twinr voice name before calling the tool. "
                     "Use speech_speed when the user wants Twinr to speak slower or faster."
                 ),
                 "parameters": {
@@ -642,7 +701,6 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                             "description": (
                                 "Supported setting. memory_capacity changes how much recent conversation Twinr keeps. "
                                 f"spoken_voice changes the spoken voice and must be set to one of: {', '.join(supported_spoken_voices())}. "
-                                "It may also use a short descriptive style request such as male, female, neutral, warm, soft, deep, bright, or firm; Twinr will map that to the closest supported voice. "
                                 "speech_speed changes the overall speaking speed for both normal TTS and realtime speech. "
                                 "speech_pause_ms changes how long Twinr waits for a short pause before stopping recording. "
                                 "follow_up_timeout_s changes how long the hands-free follow-up listening window stays open."
@@ -658,8 +716,8 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                             "description": (
                                 "Optional concrete value for action=set. "
                                 "For memory_capacity use levels 1 to 4. "
-                                f"For spoken_voice use one of: {spoken_voice_options_context()}. "
-                                "Descriptive values such as male, female, neutral, warm, soft, deep, bright, or firm are also accepted and will be mapped to the closest supported voice. "
+                                f"For spoken_voice pass one supported voice name from this catalog: {spoken_voice_options_context()}. "
+                                "Do not pass a free-form description. "
                                 "For speech_speed use a factor between 0.75 and 1.15. "
                                 "For speech_pause_ms use milliseconds. "
                                 "For follow_up_timeout_s use seconds."
@@ -775,6 +833,55 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
             }
         )
     return tools
+
+
+def build_compact_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
+    return [_compact_tool_schema(schema) for schema in build_agent_tool_schemas(tool_names)]
+
+
+def _compact_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {
+        "type": schema.get("type", "function"),
+        "name": schema.get("name"),
+    }
+    short_description = _compact_description(schema.get("description"))
+    if short_description:
+        compact["description"] = short_description
+    parameters = schema.get("parameters")
+    if isinstance(parameters, dict):
+        compact["parameters"] = _compact_schema_node(parameters)
+    return compact
+
+
+def _compact_schema_node(node: Any) -> Any:
+    if isinstance(node, dict):
+        compact: dict[str, Any] = {}
+        for key, value in node.items():
+            if key == "description":
+                continue
+            if key in {"type", "required", "additionalProperties", "enum"}:
+                compact[key] = value
+            elif key == "properties" and isinstance(value, dict):
+                compact["properties"] = {
+                    str(property_name): _compact_schema_node(property_schema)
+                    for property_name, property_schema in value.items()
+                }
+            elif key == "items":
+                compact[key] = _compact_schema_node(value)
+        return compact
+    if isinstance(node, list):
+        return [_compact_schema_node(item) for item in node]
+    return node
+
+
+def _compact_description(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    first_sentence = text.split(". ", 1)[0].strip()
+    if len(first_sentence) <= 72:
+        return first_sentence
+    return first_sentence[:69].rstrip() + "..."
 
 
 def build_realtime_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:

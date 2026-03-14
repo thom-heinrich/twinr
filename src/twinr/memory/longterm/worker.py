@@ -1,23 +1,27 @@
 from __future__ import annotations
 
+from typing import Callable, Generic, TypeVar
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
-from typing import Callable
 import time
 
-from twinr.memory.longterm.models import LongTermConversationTurn, LongTermEnqueueResult
+from twinr.memory.longterm.models import LongTermConversationTurn, LongTermEnqueueResult, LongTermMultimodalEvidence
 
 
-class AsyncLongTermMemoryWriter:
+TLongTermItem = TypeVar("TLongTermItem")
+
+
+class _AsyncLongTermWriter(Generic[TLongTermItem]):
     def __init__(
         self,
         *,
-        write_callback: Callable[[LongTermConversationTurn], None],
+        write_callback: Callable[[TLongTermItem], None],
         max_queue_size: int = 32,
         poll_interval_s: float = 0.1,
+        worker_name: str = "twinr-longterm-memory",
     ) -> None:
         self._write_callback = write_callback
-        self._queue: Queue[LongTermConversationTurn] = Queue(maxsize=max_queue_size)
+        self._queue: Queue[TLongTermItem] = Queue(maxsize=max_queue_size)
         self._poll_interval_s = max(poll_interval_s, 0.01)
         self._stop_event = Event()
         self._drain_lock = Lock()
@@ -25,7 +29,7 @@ class AsyncLongTermMemoryWriter:
         self._dropped_count = 0
         self._worker = Thread(
             target=self._run,
-            name="twinr-longterm-memory",
+            name=worker_name,
             daemon=True,
         )
         self._worker.start()
@@ -39,7 +43,7 @@ class AsyncLongTermMemoryWriter:
         with self._drain_lock:
             return self._queue.qsize() + self._inflight
 
-    def enqueue(self, item: LongTermConversationTurn) -> LongTermEnqueueResult:
+    def enqueue(self, item: TLongTermItem) -> LongTermEnqueueResult:
         try:
             self._queue.put_nowait(item)
             return LongTermEnqueueResult(
@@ -86,3 +90,35 @@ class AsyncLongTermMemoryWriter:
                 with self._drain_lock:
                     self._inflight = max(0, self._inflight - 1)
                 self._queue.task_done()
+
+
+class AsyncLongTermMemoryWriter(_AsyncLongTermWriter[LongTermConversationTurn]):
+    def __init__(
+        self,
+        *,
+        write_callback: Callable[[LongTermConversationTurn], None],
+        max_queue_size: int = 32,
+        poll_interval_s: float = 0.1,
+    ) -> None:
+        super().__init__(
+            write_callback=write_callback,
+            max_queue_size=max_queue_size,
+            poll_interval_s=poll_interval_s,
+            worker_name="twinr-longterm-memory",
+        )
+
+
+class AsyncLongTermMultimodalWriter(_AsyncLongTermWriter[LongTermMultimodalEvidence]):
+    def __init__(
+        self,
+        *,
+        write_callback: Callable[[LongTermMultimodalEvidence], None],
+        max_queue_size: int = 32,
+        poll_interval_s: float = 0.1,
+    ) -> None:
+        super().__init__(
+            write_callback=write_callback,
+            max_queue_size=max_queue_size,
+            poll_interval_s=poll_interval_s,
+            worker_name="twinr-longterm-multimodal",
+        )

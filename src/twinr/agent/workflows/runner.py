@@ -13,93 +13,37 @@ from twinr.agent.base_agent.contracts import (
     CompositeSpeechAgentProvider,
     SpeechToTextProvider,
     TextToSpeechProvider,
+    ToolCallingAgentProvider,
 )
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.runtime import TwinrRuntime
+from twinr.agent.tools import (
+    RealtimeToolExecutor,
+    ToolCallingStreamingLoop,
+    build_agent_tool_schemas,
+    build_compact_agent_tool_schemas,
+    build_compact_tool_agent_instructions,
+    build_tool_agent_instructions,
+    bind_realtime_tool_handlers,
+    realtime_tool_names,
+)
 from twinr.hardware.audio import SilenceDetectedRecorder, WaveAudioPlayer, pcm16_to_wav_bytes
 from twinr.hardware.camera import V4L2StillCamera
 from twinr.hardware.buttons import ButtonAction, configured_button_monitor
 from twinr.hardware.printer import RawReceiptPrinter
 from twinr.hardware.voice_profile import VoiceProfileMonitor
 from twinr.ops import TwinrUsageStore
+from twinr.agent.workflows.working_feedback import WorkingFeedbackKind, start_working_feedback_loop
 from twinr.proactive import (
+    ProactiveGovernorCandidate,
+    ProactiveGovernorReservation,
     SocialTriggerDecision,
     build_default_proactive_monitor,
+    is_safety_trigger,
     proactive_observation_facts,
     proactive_prompt_mode,
 )
-from twinr.providers.openai import OpenAIImageInput, OpenAIProviderBundle
-
-_WEB_SEARCH_KEYWORDS = (
-    "latest",
-    "current",
-    "today",
-    "tonight",
-    "tomorrow",
-    "yesterday",
-    "news",
-    "weather",
-    "forecast",
-    "temperature",
-    "price",
-    "prices",
-    "stock",
-    "stocks",
-    "score",
-    "scores",
-    "schedule",
-    "schedules",
-    "standings",
-    "traffic",
-    "version",
-    "release",
-    "update",
-    "updates",
-    "recent",
-    "recently",
-    "breaking",
-    "ceo",
-    "president",
-    "election",
-    "exchange rate",
-    "market",
-)
-
-_CAMERA_TRIGGER_PHRASES = (
-    "schau mich an",
-    "schau mich mal an",
-    "guck mich an",
-    "guck mich mal an",
-    "sieh mich an",
-    "sieh mich mal an",
-    "schau dir mal an was ich zeige",
-    "schau dir an was ich zeige",
-    "guck dir mal an was ich zeige",
-    "sieh dir mal an was ich zeige",
-    "schau dir das mal an",
-    "guck dir das mal an",
-    "sieh dir das mal an",
-    "was zeige ich",
-    "was halte ich",
-    "was habe ich hier",
-    "was ist das hier",
-    "erkennst du das",
-    "kannst du das sehen",
-    "kannst du mich sehen",
-    "siehst du das",
-    "siehst du mich",
-    "wie sehe ich aus",
-    "wie seh ich aus",
-    "wie sehe ich heute aus",
-    "wie seh ich heute aus",
-    "look at me",
-    "look at this",
-    "can you see me",
-    "can you see this",
-    "what am i showing you",
-    "how do i look",
-    "how do i look today",
-)
+from twinr.providers.openai import OpenAIBackend, OpenAIImageInput, OpenAIProviderBundle
 
 
 def _default_emit(line: str) -> None:
@@ -116,6 +60,8 @@ class TwinrHardwareLoop:
         stt_provider: SpeechToTextProvider | None = None,
         agent_provider: AgentTextProvider | None = None,
         tts_provider: TextToSpeechProvider | None = None,
+        tool_agent_provider: ToolCallingAgentProvider | None = None,
+        tool_turn_loop: ToolCallingStreamingLoop | None = None,
         button_monitor=None,
         recorder: SilenceDetectedRecorder | None = None,
         player: WaveAudioPlayer | None = None,
@@ -131,7 +77,9 @@ class TwinrHardwareLoop:
         self.config = config
         self.runtime = runtime or TwinrRuntime(config=config)
         openai_bundle: OpenAIProviderBundle | None = None
-        if backend is None and (stt_provider is None or agent_provider is None or tts_provider is None):
+        if isinstance(backend, OpenAIBackend):
+            openai_bundle = OpenAIProviderBundle.from_backend(backend)
+        elif backend is None and (stt_provider is None or agent_provider is None or tts_provider is None):
             openai_bundle = OpenAIProviderBundle.from_config(config)
         self.stt_provider = stt_provider or backend or (openai_bundle.stt if openai_bundle is not None else None)
         self.agent_provider = agent_provider or backend or (openai_bundle.agent if openai_bundle is not None else None)
@@ -147,6 +95,8 @@ class TwinrHardwareLoop:
                 tts=self.tts_provider,
             )
         )
+        self.print_backend = self.backend
+        self.tool_agent_provider = tool_agent_provider or (openai_bundle.tool_agent if openai_bundle is not None else None)
         self.button_monitor = button_monitor or configured_button_monitor(config)
         self.recorder = recorder or SilenceDetectedRecorder.from_config(config)
         self.player = player or WaveAudioPlayer.from_config(config)
@@ -156,12 +106,32 @@ class TwinrHardwareLoop:
         self.voice_profile_monitor = voice_profile_monitor or VoiceProfileMonitor.from_config(config)
         self._camera_lock = Lock()
         self._audio_lock = Lock()
+        self._current_turn_audio_pcm: bytes | None = None
+        self._current_turn_audio_sample_rate: int = self.config.audio_sample_rate
         self.emit = emit or _default_emit
         self.sleep = sleep
         self.error_reset_seconds = error_reset_seconds
         self._last_status: str | None = None
         self._last_print_request_at: float | None = None
         self._next_reminder_check_at: float = 0.0
+        self._next_long_term_memory_proactive_check_at: float = 0.0
+        self._working_feedback_stop: Callable[[], None] | None = None
+        self._working_feedback_generation: int = 0
+        self.tool_executor = RealtimeToolExecutor(self)
+        if self.tool_agent_provider is None:
+            self.tool_turn_loop = tool_turn_loop
+        else:
+            tool_schemas = (
+                build_compact_agent_tool_schemas(realtime_tool_names())
+                if (self.config.llm_provider or "").strip().lower() == "groq"
+                else build_agent_tool_schemas(realtime_tool_names())
+            )
+            self.tool_turn_loop = tool_turn_loop or ToolCallingStreamingLoop(
+                provider=self.tool_agent_provider,
+                tool_handlers=bind_realtime_tool_handlers(self.tool_executor),
+                tool_schemas=tool_schemas,
+                stream_final_only=((self.config.llm_provider or "").strip().lower() == "groq"),
+            )
         self.proactive_monitor = proactive_monitor or build_default_proactive_monitor(
             config=config,
             runtime=self.runtime,
@@ -185,7 +155,9 @@ class TwinrHardwareLoop:
                     return 0
                 event = monitor.poll(timeout=poll_timeout)
                 if event is None:
-                    self._maybe_deliver_due_reminder()
+                    if self._maybe_deliver_due_reminder():
+                        continue
+                    self._maybe_run_long_term_memory_proactive()
                     continue
                 if event.action != ButtonAction.PRESSED:
                     continue
@@ -223,77 +195,102 @@ class TwinrHardwareLoop:
             )
             return False
 
+        governor_reservation = self._reserve_governed_prompt(
+            ProactiveGovernorCandidate(
+                source_kind="social",
+                source_id=trigger.trigger_id,
+                summary=trigger.prompt,
+                priority=int(trigger.priority),
+                presence_session_id=self._current_presence_session_id(),
+                safety_exempt=is_safety_trigger(trigger.trigger_id),
+                counts_toward_presence_budget=not is_safety_trigger(trigger.trigger_id),
+            )
+        )
+        if governor_reservation is None:
+            return False
+
         phrase_response = None
         prompt_mode = proactive_prompt_mode(trigger)
         prompt_text = trigger.prompt
-        if prompt_mode == "llm":
-            try:
-                phrase_response = self.agent_provider.phrase_proactive_prompt_with_metadata(
-                    trigger_id=trigger.trigger_id,
-                    reason=trigger.reason,
-                    default_prompt=trigger.prompt,
-                    priority=int(trigger.priority),
-                    conversation=self.runtime.provider_conversation_context(),
-                    recent_prompts=self._recent_proactive_prompts(trigger_id=trigger.trigger_id),
-                    observation_facts=proactive_observation_facts(trigger),
-                )
-                candidate_prompt = phrase_response.text.strip()
-                if candidate_prompt:
-                    prompt_text = candidate_prompt
-                else:
+        try:
+            if prompt_mode == "llm":
+                try:
+                    phrase_response = self.agent_provider.phrase_proactive_prompt_with_metadata(
+                        trigger_id=trigger.trigger_id,
+                        reason=trigger.reason,
+                        default_prompt=trigger.prompt,
+                        priority=int(trigger.priority),
+                        conversation=self.runtime.provider_conversation_context(),
+                        recent_prompts=self._recent_proactive_prompts(trigger_id=trigger.trigger_id),
+                        observation_facts=proactive_observation_facts(trigger),
+                    )
+                    candidate_prompt = phrase_response.text.strip()
+                    if candidate_prompt:
+                        prompt_text = candidate_prompt
+                    else:
+                        prompt_mode = "default_fallback"
+                        self.emit("social_prompt_fallback=empty_phrase")
+                except Exception as exc:
                     prompt_mode = "default_fallback"
-                    self.emit("social_prompt_fallback=empty_phrase")
-            except Exception as exc:
-                prompt_mode = "default_fallback"
-                self.emit("social_prompt_fallback=default")
-                self.emit(f"social_prompt_phrase_error={exc}")
-                self._record_event(
-                    "social_trigger_phrase_fallback",
-                    "Twinr fell back to the default proactive prompt after proactive phrasing failed.",
-                    level="warning",
-                    trigger=trigger.trigger_id,
-                    error=str(exc),
-                )
+                    self.emit("social_prompt_fallback=default")
+                    self.emit(f"social_prompt_phrase_error={exc}")
+                    self._record_event(
+                        "social_trigger_phrase_fallback",
+                        "Twinr fell back to the default proactive prompt after proactive phrasing failed.",
+                        level="warning",
+                        trigger=trigger.trigger_id,
+                        error=str(exc),
+                    )
 
-        prompt = self.runtime.begin_proactive_prompt(prompt_text)
-        self._emit_status(force=True)
-        turn_started = time.monotonic()
-        tts_ms, first_audio_ms = self._speak_full_answer(prompt, turn_started=turn_started)
-        self.runtime.finish_speaking()
-        self._emit_status(force=True)
-        self.emit(f"social_trigger={trigger.trigger_id}")
-        self.emit(f"social_trigger_priority={int(trigger.priority)}")
-        self.emit(f"social_prompt_mode={prompt_mode}")
-        self.emit(f"social_prompt={prompt}")
-        if phrase_response is not None:
-            if phrase_response.response_id:
-                self.emit(f"social_response_id={phrase_response.response_id}")
-            if phrase_response.request_id:
-                self.emit(f"social_request_id={phrase_response.request_id}")
-            self._record_usage(
-                request_kind="proactive_prompt",
-                source="hardware_loop",
-                model=phrase_response.model,
-                response_id=phrase_response.response_id,
-                request_id=phrase_response.request_id,
-                used_web_search=False,
-                token_usage=phrase_response.token_usage,
-                proactive_trigger=trigger.trigger_id,
+            prompt = self.runtime.begin_proactive_prompt(prompt_text)
+            self._emit_status(force=True)
+            turn_started = time.monotonic()
+            tts_ms, first_audio_ms = self._speak_full_answer(prompt, turn_started=turn_started)
+            self.runtime.finish_speaking()
+            self._emit_status(force=True)
+            self.runtime.proactive_governor.mark_delivered(governor_reservation)
+            self.emit(f"social_trigger={trigger.trigger_id}")
+            self.emit(f"social_trigger_priority={int(trigger.priority)}")
+            self.emit(f"social_prompt_mode={prompt_mode}")
+            self.emit(f"social_prompt={prompt}")
+            if phrase_response is not None:
+                if phrase_response.response_id:
+                    self.emit(f"social_response_id={phrase_response.response_id}")
+                if phrase_response.request_id:
+                    self.emit(f"social_request_id={phrase_response.request_id}")
+                self._record_usage(
+                    request_kind="proactive_prompt",
+                    source="hardware_loop",
+                    model=phrase_response.model,
+                    response_id=phrase_response.response_id,
+                    request_id=phrase_response.request_id,
+                    used_web_search=False,
+                    token_usage=phrase_response.token_usage,
+                    proactive_trigger=trigger.trigger_id,
+                )
+            self.emit(f"timing_social_tts_ms={tts_ms}")
+            if first_audio_ms is not None:
+                self.emit(f"timing_social_first_audio_ms={first_audio_ms}")
+            self._record_event(
+                "social_trigger_prompted",
+                "Twinr spoke a proactive social prompt.",
+                trigger=trigger.trigger_id,
+                reason=trigger.reason,
+                priority=int(trigger.priority),
+                prompt=prompt,
+                default_prompt=trigger.prompt,
+                prompt_mode=prompt_mode,
             )
-        self.emit(f"timing_social_tts_ms={tts_ms}")
-        if first_audio_ms is not None:
-            self.emit(f"timing_social_first_audio_ms={first_audio_ms}")
-        self._record_event(
-            "social_trigger_prompted",
-            "Twinr spoke a proactive social prompt.",
-            trigger=trigger.trigger_id,
-            reason=trigger.reason,
-            priority=int(trigger.priority),
-            prompt=prompt,
-            default_prompt=trigger.prompt,
-            prompt_mode=prompt_mode,
-        )
-        return True
+            return True
+        except Exception as exc:
+            if self.runtime.status.value == "answering":
+                self.runtime.finish_speaking()
+                self._emit_status(force=True)
+            self.runtime.proactive_governor.mark_skipped(
+                governor_reservation,
+                reason=f"delivery_failed: {exc}",
+            )
+            raise
 
     def _recent_proactive_prompts(
         self,
@@ -303,7 +300,7 @@ class TwinrHardwareLoop:
     ) -> tuple[str, ...]:
         prompts: list[str] = []
         for entry in reversed(self.runtime.ops_events.tail(limit=50)):
-            if entry.get("event") != "social_trigger_prompted":
+            if entry.get("event") not in {"social_trigger_prompted", "longterm_proactive_prompted"}:
                 continue
             data = entry.get("data", {})
             if data.get("trigger") != trigger_id:
@@ -314,6 +311,41 @@ class TwinrHardwareLoop:
             if len(prompts) >= limit:
                 break
         return tuple(prompts)
+
+    def _current_presence_session_id(self) -> int | None:
+        monitor = getattr(self, "proactive_monitor", None)
+        coordinator = None if monitor is None else getattr(monitor, "coordinator", None)
+        snapshot = None if coordinator is None else getattr(coordinator, "latest_presence_snapshot", None)
+        if snapshot is None or not getattr(snapshot, "armed", False):
+            return None
+        return getattr(snapshot, "session_id", None)
+
+    def _reserve_governed_prompt(
+        self,
+        candidate: ProactiveGovernorCandidate,
+    ) -> ProactiveGovernorReservation | None:
+        decision = self.runtime.proactive_governor.try_reserve(candidate)
+        if decision.allowed:
+            return decision.reservation
+        emit_prefix = {
+            "social": "social_trigger",
+            "longterm": "longterm_proactive",
+            "reminder": "reminder",
+            "automation": "automation",
+        }.get(candidate.source_kind, candidate.source_kind)
+        self.emit(f"{emit_prefix}_skipped={decision.reason}")
+        self._record_event(
+            "proactive_governor_blocked",
+            "Proactive delivery was blocked by the shared governor policy.",
+            source_kind=candidate.source_kind,
+            source_id=candidate.source_id,
+            summary=candidate.summary,
+            reason=decision.reason,
+            channel=candidate.channel,
+            priority=int(candidate.priority),
+            presence_session_id=candidate.presence_session_id,
+        )
+        return None
 
     def _handle_green_turn(self) -> None:
         turn_started = time.monotonic()
@@ -355,205 +387,180 @@ class TwinrHardwareLoop:
         )
         capture_ms = int((time.monotonic() - capture_started) * 1000)
         self._update_voice_assessment_from_wav(audio_bytes)
-
-        stt_started = time.monotonic()
-        try:
-            transcript = self.stt_provider.transcribe(
-                audio_bytes,
-                filename="twinr-listen.wav",
-                content_type="audio/wav",
-            ).strip()
-        except Exception as exc:
-            self._record_event("stt_failed", "Speech-to-text failed.", level="error", error=str(exc))
-            raise
-        stt_ms = int((time.monotonic() - stt_started) * 1000)
-        if not transcript:
-            self._record_event("stt_failed", "Speech-to-text returned an empty transcript.", level="error")
-            raise RuntimeError("Speech-to-text returned an empty transcript")
-
-        self.emit(f"transcript={transcript}")
-        self.runtime.submit_transcript(transcript)
-        self._emit_status(force=True)
-
-        allow_web_search = self._should_use_web_search(transcript)
-        if self._should_use_camera(transcript):
-            self._handle_green_vision_turn(
-                transcript,
-                turn_started=turn_started,
-                capture_ms=capture_ms,
-                stt_ms=stt_ms,
-                allow_web_search=allow_web_search,
-            )
-            return
-
-        llm_started = time.monotonic()
-        spoken_segments: Queue[str | None] = Queue()
-        tts_error: list[Exception] = []
-        first_audio_at: list[float | None] = [None]
-        answer_started = False
-        pending_segment = ""
-        worker_started = False
-
-        def tts_worker() -> None:
-            while True:
-                segment = spoken_segments.get()
-                if segment is None:
-                    return
-                try:
-                    def mark_first_chunk() -> object:
-                        for chunk in self.tts_provider.synthesize_stream(segment):
-                            if first_audio_at[0] is None:
-                                first_audio_at[0] = time.monotonic()
-                            yield chunk
-
-                    self.player.play_wav_chunks(mark_first_chunk())
-                except Exception as exc:
-                    tts_error.append(exc)
-                    return
-
-        worker = Thread(target=tts_worker, daemon=True)
-        worker.start()
-        worker_started = True
-
-        def queue_ready_segments(delta: str) -> None:
-            nonlocal answer_started, pending_segment
-            pending_segment += delta
-            while True:
-                boundary = self._segment_boundary(pending_segment)
-                if boundary is None:
-                    return
-                segment = pending_segment[:boundary].strip()
-                pending_segment = pending_segment[boundary:].lstrip()
-                if not segment:
-                    continue
-                if not answer_started:
-                    self.runtime.begin_answering()
-                    self._emit_status(force=True)
-                    answer_started = True
-                spoken_segments.put(segment)
+        self._current_turn_audio_pcm = capture_result.pcm_bytes
+        self._current_turn_audio_sample_rate = self.config.audio_sample_rate
 
         try:
-            response = self.agent_provider.respond_streaming(
-                transcript,
-                conversation=self.runtime.provider_conversation_context(),
-                allow_web_search=allow_web_search,
-                on_text_delta=queue_ready_segments,
-            )
-            llm_ms = int((time.monotonic() - llm_started) * 1000)
-            if response.used_web_search:
-                self.runtime.remember_search_result(
-                    question=transcript,
-                    answer=response.text,
-                )
-            answer = self.runtime.finalize_agent_turn(response.text)
-            if pending_segment.strip():
-                if not answer_started:
-                    self.runtime.begin_answering()
-                    self._emit_status(force=True)
-                    answer_started = True
-                spoken_segments.put(pending_segment.strip())
-        finally:
-            if worker_started:
-                spoken_segments.put(None)
-        tts_started = time.monotonic()
-        if worker_started:
-            worker.join()
-        tts_ms = int((time.monotonic() - tts_started) * 1000)
-        if tts_error:
-            raise tts_error[0]
-        if not answer_started:
-            self.runtime.begin_answering()
+            stt_started = time.monotonic()
+            try:
+                transcript = self.stt_provider.transcribe(
+                    audio_bytes,
+                    filename="twinr-listen.wav",
+                    content_type="audio/wav",
+                ).strip()
+            except Exception as exc:
+                self._record_event("stt_failed", "Speech-to-text failed.", level="error", error=str(exc))
+                raise
+            stt_ms = int((time.monotonic() - stt_started) * 1000)
+            if not transcript:
+                self._record_event("stt_failed", "Speech-to-text returned an empty transcript.", level="error")
+                raise RuntimeError("Speech-to-text returned an empty transcript")
+
+            self.emit(f"transcript={transcript}")
+            self.runtime.submit_transcript(transcript)
             self._emit_status(force=True)
-        self.emit(f"response={answer}")
-        if response.response_id:
-            self.emit(f"openai_response_id={response.response_id}")
-        if response.request_id:
-            self.emit(f"openai_request_id={response.request_id}")
-        self.emit(f"openai_allow_web_search={str(allow_web_search).lower()}")
-        self.emit(f"openai_used_web_search={str(response.used_web_search).lower()}")
-        self._record_usage(
-            request_kind="conversation",
-            source="hardware_loop",
-            model=response.model,
-            response_id=response.response_id,
-            request_id=response.request_id,
-            used_web_search=response.used_web_search,
-            token_usage=response.token_usage,
-            transcript=transcript,
-        )
-        self.runtime.finish_speaking()
-        self._emit_status(force=True)
-        self.emit(f"timing_capture_ms={capture_ms}")
-        self.emit(f"timing_stt_ms={stt_ms}")
-        self.emit(f"timing_llm_ms={llm_ms}")
-        self.emit(f"timing_tts_ms={tts_ms}")
-        self.emit("timing_playback_ms=streamed")
-        if first_audio_at[0] is not None:
-            self.emit(f"timing_first_audio_ms={int((first_audio_at[0] - turn_started) * 1000)}")
-        self.emit(f"timing_total_ms={int((time.monotonic() - turn_started) * 1000)}")
 
-    def _handle_green_vision_turn(
-        self,
-        transcript: str,
-        *,
-        turn_started: float,
-        capture_ms: int,
-        stt_ms: int,
-        allow_web_search: bool,
-    ) -> None:
-        self.emit("camera_used=true")
-        camera_capture_started = time.monotonic()
-        images = self._build_vision_images()
-        camera_capture_ms = int((time.monotonic() - camera_capture_started) * 1000)
+            llm_started = time.monotonic()
+            spoken_segments: Queue[str | None] = Queue()
+            tts_error: list[Exception] = []
+            first_audio_at: list[float | None] = [None]
+            answer_started = False
+            pending_segment = ""
+            worker_started = False
 
-        llm_started = time.monotonic()
-        response = self.agent_provider.respond_to_images_with_metadata(
-            self._build_vision_prompt(transcript, include_reference=len(images) > 1),
-            images=images,
-            conversation=self.runtime.provider_conversation_context(),
-            allow_web_search=allow_web_search,
-        )
-        llm_ms = int((time.monotonic() - llm_started) * 1000)
-        if response.used_web_search:
-            self.runtime.remember_search_result(
-                question=transcript,
-                answer=response.text,
+            def tts_worker() -> None:
+                while True:
+                    segment = spoken_segments.get()
+                    if segment is None:
+                        return
+                    try:
+                        def mark_first_chunk() -> object:
+                            for chunk in self.tts_provider.synthesize_stream(segment):
+                                if first_audio_at[0] is None:
+                                    first_audio_at[0] = time.monotonic()
+                                yield chunk
+
+                        self.player.play_wav_chunks(mark_first_chunk())
+                    except Exception as exc:
+                        tts_error.append(exc)
+                        return
+
+            worker = Thread(target=tts_worker, daemon=True)
+            worker.start()
+            worker_started = True
+
+            def queue_ready_segments(delta: str) -> None:
+                nonlocal answer_started, pending_segment
+                pending_segment += delta
+                while True:
+                    boundary = self._segment_boundary(pending_segment)
+                    if boundary is None:
+                        return
+                    segment = pending_segment[:boundary].strip()
+                    pending_segment = pending_segment[boundary:].lstrip()
+                    if not segment:
+                        continue
+                    if not answer_started:
+                        self.runtime.begin_answering()
+                        self._emit_status(force=True)
+                        answer_started = True
+                    spoken_segments.put(segment)
+
+            try:
+                tool_response = None
+                if self.tool_turn_loop is not None:
+                    tool_response = self.tool_turn_loop.run(
+                        transcript,
+                        conversation=self.runtime.provider_conversation_context(),
+                        instructions=(
+                            build_compact_tool_agent_instructions(
+                                self.config,
+                                extra_instructions=self.config.openai_realtime_instructions,
+                            )
+                            if (self.config.llm_provider or "").strip().lower() == "groq"
+                            else build_tool_agent_instructions(
+                                self.config,
+                                extra_instructions=self.config.openai_realtime_instructions,
+                            )
+                        ),
+                        allow_web_search=False,
+                        on_text_delta=queue_ready_segments,
+                    )
+                    llm_ms = int((time.monotonic() - llm_started) * 1000)
+                    if not tool_response.text.strip():
+                        raise RuntimeError("Tool-calling turn completed without text output")
+                    if self.runtime.status.value == "printing":
+                        self.runtime.resume_answering_after_print()
+                        self._emit_status(force=True)
+                        answer_started = True
+                    answer = self.runtime.finalize_agent_turn(tool_response.text)
+                    if pending_segment.strip():
+                        if not answer_started:
+                            self.runtime.begin_answering()
+                            self._emit_status(force=True)
+                            answer_started = True
+                        spoken_segments.put(pending_segment.strip())
+                    response = tool_response
+                else:
+                    allow_web_search = self._resolve_web_search_mode()
+                    direct_response = self.agent_provider.respond_streaming(
+                        transcript,
+                        conversation=self.runtime.provider_conversation_context(),
+                        allow_web_search=allow_web_search,
+                        on_text_delta=queue_ready_segments,
+                    )
+                    llm_ms = int((time.monotonic() - llm_started) * 1000)
+                    if direct_response.used_web_search:
+                        self.runtime.remember_search_result(
+                            question=transcript,
+                            answer=direct_response.text,
+                        )
+                    answer = self.runtime.finalize_agent_turn(direct_response.text)
+                    if pending_segment.strip():
+                        if not answer_started:
+                            self.runtime.begin_answering()
+                            self._emit_status(force=True)
+                            answer_started = True
+                        spoken_segments.put(pending_segment.strip())
+                    response = direct_response
+            finally:
+                if worker_started:
+                    spoken_segments.put(None)
+            tts_started = time.monotonic()
+            if worker_started:
+                worker.join()
+            tts_ms = int((time.monotonic() - tts_started) * 1000)
+            if tts_error:
+                raise tts_error[0]
+            if not answer_started:
+                self.runtime.begin_answering()
+                self._emit_status(force=True)
+            self.emit(f"response={answer}")
+            if response.response_id:
+                self.emit(f"agent_response_id={response.response_id}")
+            if response.request_id:
+                self.emit(f"agent_request_id={response.request_id}")
+            if self.tool_turn_loop is not None:
+                self.emit(f"agent_tool_rounds={response.rounds}")
+                self.emit(f"agent_tool_calls={len(response.tool_calls)}")
+                self.emit(f"agent_used_web_search={str(response.used_web_search).lower()}")
+            else:
+                self.emit(f"openai_allow_web_search={str(allow_web_search).lower()}")
+                self.emit(f"openai_used_web_search={str(response.used_web_search).lower()}")
+            self._record_usage(
+                request_kind="conversation",
+                source="hardware_loop",
+                model=response.model,
+                response_id=response.response_id,
+                request_id=response.request_id,
+                used_web_search=response.used_web_search,
+                token_usage=response.token_usage,
+                transcript=transcript,
+                tool_rounds=getattr(response, "rounds", None),
+                tool_calls=len(getattr(response, "tool_calls", ())),
             )
-
-        answer = self.runtime.complete_agent_turn(response.text)
-        self._emit_status(force=True)
-        self.emit(f"vision_image_count={len(images)}")
-        self.emit(f"response={answer}")
-        if response.response_id:
-            self.emit(f"openai_response_id={response.response_id}")
-        if response.request_id:
-            self.emit(f"openai_request_id={response.request_id}")
-        self.emit(f"openai_allow_web_search={str(allow_web_search).lower()}")
-        self.emit(f"openai_used_web_search={str(response.used_web_search).lower()}")
-        self._record_usage(
-            request_kind="vision",
-            source="hardware_loop",
-            model=response.model,
-            response_id=response.response_id,
-            request_id=response.request_id,
-            used_web_search=response.used_web_search,
-            token_usage=response.token_usage,
-            transcript=transcript,
-            vision_image_count=len(images),
-        )
-
-        tts_ms, first_audio_ms = self._speak_full_answer(answer, turn_started=turn_started)
-        self.runtime.finish_speaking()
-        self._emit_status(force=True)
-        self.emit(f"timing_capture_ms={capture_ms}")
-        self.emit(f"timing_stt_ms={stt_ms}")
-        self.emit(f"timing_camera_capture_ms={camera_capture_ms}")
-        self.emit(f"timing_llm_ms={llm_ms}")
-        self.emit(f"timing_tts_ms={tts_ms}")
-        self.emit("timing_playback_ms=streamed")
-        if first_audio_ms is not None:
-            self.emit(f"timing_first_audio_ms={first_audio_ms}")
-        self.emit(f"timing_total_ms={int((time.monotonic() - turn_started) * 1000)}")
+            self.runtime.finish_speaking()
+            self._emit_status(force=True)
+            self.emit(f"timing_capture_ms={capture_ms}")
+            self.emit(f"timing_stt_ms={stt_ms}")
+            self.emit(f"timing_llm_ms={llm_ms}")
+            self.emit(f"timing_tts_ms={tts_ms}")
+            self.emit("timing_playback_ms=streamed")
+            if first_audio_at[0] is not None:
+                self.emit(f"timing_first_audio_ms={int((first_audio_at[0] - turn_started) * 1000)}")
+            self.emit(f"timing_total_ms={int((time.monotonic() - turn_started) * 1000)}")
+        finally:
+            self._current_turn_audio_pcm = None
 
     def _handle_print_turn(self) -> None:
         if self._is_print_cooldown_active():
@@ -591,6 +598,17 @@ class TwinrHardwareLoop:
             queue=self.config.printer_queue,
             job=print_job,
         )
+        self.runtime.long_term_memory.enqueue_multimodal_evidence(
+            event_name="print_completed",
+            modality="printer",
+            source="hardware_print",
+            message="Printed Twinr output was delivered from the hardware loop.",
+            data={
+                "request_source": "button",
+                "queue": self.config.printer_queue,
+                "job": print_job or "",
+            },
+        )
 
         self.runtime.finish_printing()
         self._emit_status(force=True)
@@ -610,6 +628,57 @@ class TwinrHardwareLoop:
         if force or status != self._last_status:
             self.emit(f"status={status}")
             self._last_status = status
+
+    def _reload_live_config_from_env(self, env_path: Path) -> None:
+        updated_config = TwinrConfig.from_env(env_path)
+        self.config = updated_config
+        self.runtime.apply_live_config(updated_config)
+        self._current_turn_audio_sample_rate = updated_config.audio_sample_rate
+        seen: set[int] = set()
+        for provider in (
+            self.stt_provider,
+            self.agent_provider,
+            self.tts_provider,
+            self.print_backend,
+            self.tool_agent_provider,
+        ):
+            if provider is None:
+                continue
+            provider_id = id(provider)
+            if provider_id in seen:
+                continue
+            seen.add(provider_id)
+            provider.config = updated_config
+
+    def _start_working_feedback_loop(self, kind: WorkingFeedbackKind) -> Callable[[], None]:
+        previous_stop = self._working_feedback_stop
+        if callable(previous_stop):
+            previous_stop()
+        generation = self._working_feedback_generation + 1
+        stop = start_working_feedback_loop(
+            self.player,
+            kind=kind,
+            sample_rate=self.config.audio_sample_rate,
+            emit=self.emit,
+        )
+        self._working_feedback_generation = generation
+        self._working_feedback_stop = stop
+
+        def stop_current() -> None:
+            if self._working_feedback_generation != generation:
+                return
+            active_stop = self._working_feedback_stop
+            self._working_feedback_stop = None
+            if callable(active_stop):
+                active_stop()
+
+        return stop_current
+
+    def _stop_working_feedback(self) -> None:
+        active_stop = self._working_feedback_stop
+        self._working_feedback_stop = None
+        if callable(active_stop):
+            active_stop()
 
     def _update_voice_assessment_from_wav(self, audio_bytes: bytes) -> None:
         try:
@@ -661,12 +730,157 @@ class TwinrHardwareLoop:
         self._next_reminder_check_at = now_monotonic + self.config.reminder_poll_interval_s
         if self.runtime.status.value != "waiting":
             return False
+        preview_entries = self.runtime.peek_due_reminders(limit=1)
+        if not preview_entries:
+            return False
+        governor_reservation = self._reserve_governed_prompt(
+            ProactiveGovernorCandidate(
+                source_kind="reminder",
+                source_id=preview_entries[0].reminder_id,
+                summary=preview_entries[0].summary,
+                priority=80,
+                presence_session_id=self._current_presence_session_id(),
+                safety_exempt=False,
+                counts_toward_presence_budget=False,
+            )
+        )
+        if governor_reservation is None:
+            return False
         due_entries = self.runtime.reserve_due_reminders(limit=1)
         if not due_entries:
+            self.runtime.proactive_governor.cancel(governor_reservation)
             return False
-        return self._deliver_due_reminder(due_entries[0])
+        if due_entries[0].reminder_id != preview_entries[0].reminder_id:
+            self.runtime.proactive_governor.cancel(governor_reservation)
+            return False
+        return self._deliver_due_reminder(due_entries[0], governor_reservation=governor_reservation)
 
-    def _deliver_due_reminder(self, reminder) -> bool:
+    def _maybe_run_long_term_memory_proactive(self) -> bool:
+        now_monotonic = time.monotonic()
+        if now_monotonic < self._next_long_term_memory_proactive_check_at:
+            return False
+        self._next_long_term_memory_proactive_check_at = (
+            now_monotonic + self.config.long_term_memory_proactive_poll_interval_s
+        )
+        if self.runtime.status.value != "waiting":
+            return False
+        preview = self.runtime.preview_long_term_proactive_candidate()
+        if preview is None:
+            return False
+        governor_reservation = self._reserve_governed_prompt(
+            ProactiveGovernorCandidate(
+                source_kind="longterm",
+                source_id=preview.candidate_id,
+                summary=preview.summary,
+                priority=max(1, min(99, int(preview.confidence * 100))),
+                presence_session_id=self._current_presence_session_id(),
+                safety_exempt=False,
+                counts_toward_presence_budget=True,
+            )
+        )
+        if governor_reservation is None:
+            return False
+        reservation = self.runtime.reserve_specific_long_term_proactive_candidate(preview)
+        if reservation is None or reservation.candidate.candidate_id != preview.candidate_id:
+            self.runtime.proactive_governor.cancel(governor_reservation)
+            return False
+        candidate = reservation.candidate
+        response = None
+        prompt_mode = "default"
+        prompt_text = candidate.summary
+        trigger_id = f"longterm:{candidate.candidate_id}"
+        try:
+            try:
+                response = self.agent_provider.phrase_proactive_prompt_with_metadata(
+                    trigger_id=trigger_id,
+                    reason=candidate.rationale,
+                    default_prompt=candidate.summary,
+                    priority=max(1, min(99, int(candidate.confidence * 100))),
+                    conversation=self.runtime.provider_conversation_context(),
+                    recent_prompts=self._recent_proactive_prompts(trigger_id=trigger_id),
+                    observation_facts=(
+                        f"candidate_kind={candidate.kind}",
+                        f"sensitivity={candidate.sensitivity}",
+                    ),
+                )
+                candidate_prompt = response.text.strip()
+                if candidate_prompt:
+                    prompt_text = candidate_prompt
+                    prompt_mode = "llm"
+                else:
+                    prompt_mode = "default_fallback"
+            except Exception as exc:
+                prompt_mode = "default_fallback"
+                self.emit("longterm_proactive_phrase_fallback=default")
+                self.emit(f"longterm_proactive_phrase_error={exc}")
+                self._record_event(
+                    "longterm_proactive_phrase_fallback",
+                    "Twinr fell back to the default long-term proactive prompt after phrasing failed.",
+                    level="warning",
+                    candidate_id=candidate.candidate_id,
+                    error=str(exc),
+                )
+
+            prompt = self.runtime.begin_proactive_prompt(prompt_text)
+            self._emit_status(force=True)
+            tts_ms, first_audio_ms = self._speak_full_answer(prompt, turn_started=time.monotonic())
+            self.runtime.finish_speaking()
+            self._emit_status(force=True)
+            self.runtime.mark_long_term_proactive_candidate_delivered(
+                reservation,
+                prompt_text=prompt,
+            )
+            self.runtime.proactive_governor.mark_delivered(governor_reservation)
+            self.emit(f"longterm_proactive_candidate={candidate.candidate_id}")
+            self.emit(f"longterm_proactive_kind={candidate.kind}")
+            self.emit(f"longterm_proactive_prompt_mode={prompt_mode}")
+            self.emit(f"longterm_proactive_prompt={prompt}")
+            self.emit(f"timing_longterm_proactive_tts_ms={tts_ms}")
+            if first_audio_ms is not None:
+                self.emit(f"timing_longterm_proactive_first_audio_ms={first_audio_ms}")
+            if response is not None:
+                self._record_usage(
+                    request_kind="longterm_proactive_prompt",
+                    source="hardware_loop",
+                    model=response.model,
+                    response_id=response.response_id,
+                    request_id=response.request_id,
+                    used_web_search=False,
+                    token_usage=response.token_usage,
+                    proactive_trigger=trigger_id,
+                )
+            self._record_event(
+                "longterm_proactive_prompted",
+                "Twinr spoke a proactive prompt derived from long-term memory.",
+                trigger=trigger_id,
+                candidate_id=candidate.candidate_id,
+                candidate_kind=candidate.kind,
+                prompt=prompt,
+                prompt_mode=prompt_mode,
+                rationale=candidate.rationale,
+            )
+            return True
+        except Exception as exc:
+            if self.runtime.status.value == "answering":
+                self.runtime.finish_speaking()
+                self._emit_status(force=True)
+            self.runtime.mark_long_term_proactive_candidate_skipped(
+                reservation,
+                reason=f"delivery_failed: {exc}",
+            )
+            self.runtime.proactive_governor.mark_skipped(
+                governor_reservation,
+                reason=f"delivery_failed: {exc}",
+            )
+            self.emit(f"longterm_proactive_error={exc}")
+            return False
+
+    def _deliver_due_reminder(
+        self,
+        reminder,
+        *,
+        governor_reservation: ProactiveGovernorReservation,
+    ) -> bool:
         response = None
         spoken_prompt = ""
         try:
@@ -677,6 +891,7 @@ class TwinrHardwareLoop:
             self.runtime.finish_speaking()
             self._emit_status(force=True)
             delivered = self.runtime.mark_reminder_delivered(reminder.reminder_id)
+            self.runtime.proactive_governor.mark_delivered(governor_reservation)
             self.emit("reminder_delivered=true")
             self.emit(f"reminder_due_at={delivered.due_at.isoformat()}")
             self.emit(f"reminder_text={spoken_prompt}")
@@ -704,21 +919,20 @@ class TwinrHardwareLoop:
                 self.runtime.finish_speaking()
                 self._emit_status(force=True)
             self.runtime.mark_reminder_failed(reminder.reminder_id, error=str(exc))
+            self.runtime.proactive_governor.mark_skipped(
+                governor_reservation,
+                reason=f"delivery_failed: {exc}",
+            )
             self.emit(f"reminder_error={exc}")
             return False
 
-    def _should_use_web_search(self, transcript: str) -> bool:
+    def _resolve_web_search_mode(self) -> bool | None:
         mode = self.config.conversation_web_search.strip().lower()
         if mode == "always":
             return True
         if mode == "never":
             return False
-        normalized = transcript.lower()
-        return any(keyword in normalized for keyword in _WEB_SEARCH_KEYWORDS)
-
-    def _should_use_camera(self, transcript: str) -> bool:
-        normalized = " ".join(transcript.lower().split())
-        return any(phrase in normalized for phrase in _CAMERA_TRIGGER_PHRASES)
+        return None
 
     def _build_vision_images(self) -> list[OpenAIImageInput]:
         with self._camera_lock:
@@ -726,6 +940,17 @@ class TwinrHardwareLoop:
         self.emit(f"camera_device={capture.source_device}")
         self.emit(f"camera_input_format={capture.input_format or 'default'}")
         self.emit(f"camera_capture_bytes={len(capture.data)}")
+        self.runtime.long_term_memory.enqueue_multimodal_evidence(
+            event_name="camera_capture",
+            modality="camera",
+            source="camera_tool",
+            message="Live camera frame captured for device interaction.",
+            data={
+                "purpose": "vision_inspection",
+                "source_device": capture.source_device,
+                "input_format": capture.input_format or "default",
+            },
+        )
 
         images = [
             OpenAIImageInput(

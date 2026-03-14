@@ -5,19 +5,27 @@ from typing import Any
 from twinr.agent.tools.support import require_current_turn_audio, require_sensitive_voice_confirmation
 
 
+def _current_turn_audio_sample_rate(owner: Any) -> int:
+    sample_rate = getattr(owner, "_current_turn_audio_sample_rate", None)
+    if isinstance(sample_rate, int) and sample_rate > 0:
+        return sample_rate
+    return int(owner.config.openai_realtime_input_sample_rate)
+
+
 def handle_enroll_voice_profile(owner: Any, arguments: dict[str, object]) -> dict[str, object]:
     summary = owner.voice_profile_monitor.summary()
     if summary.enrolled:
         require_sensitive_voice_confirmation(owner, arguments, action_label="replace the saved voice profile")
     audio_pcm = require_current_turn_audio(owner)
+    sample_rate = _current_turn_audio_sample_rate(owner)
     template = owner.voice_profile_monitor.enroll_pcm16(
         audio_pcm,
-        sample_rate=owner.config.openai_realtime_input_sample_rate,
+        sample_rate=sample_rate,
         channels=owner.config.audio_channels,
     )
     assessment = owner.voice_profile_monitor.assess_pcm16(
         audio_pcm,
-        sample_rate=owner.config.openai_realtime_input_sample_rate,
+        sample_rate=sample_rate,
         channels=owner.config.audio_channels,
     )
     if assessment.should_persist:

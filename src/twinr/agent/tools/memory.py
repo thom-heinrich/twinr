@@ -5,6 +5,31 @@ from typing import Any
 from twinr.agent.tools.support import require_sensitive_voice_confirmation
 
 
+def _serialize_conflict_queue(queue: tuple[object, ...]) -> list[dict[str, object]]:
+    serialized: list[dict[str, object]] = []
+    for item in queue:
+        options = [
+            {
+                "memory_id": option.memory_id,
+                "summary": option.summary,
+                "details": option.details,
+                "status": option.status,
+                "value_key": option.value_key,
+            }
+            for option in item.options
+        ]
+        serialized.append(
+            {
+                "slot_key": item.slot_key,
+                "question": item.question,
+                "reason": item.reason,
+                "candidate_memory_id": item.candidate_memory_id,
+                "options": options,
+            }
+        )
+    return serialized
+
+
 def handle_remember_memory(owner: Any, arguments: dict[str, object]) -> dict[str, object]:
     require_sensitive_voice_confirmation(owner, arguments, action_label="save durable memory")
     kind = str(arguments.get("kind", "")).strip() or "memory"
@@ -109,6 +134,72 @@ def handle_lookup_contact(owner: Any, arguments: dict[str, object]) -> dict[str,
         "role": result.match.role,
         "phones": list(result.match.phones),
         "emails": list(result.match.emails),
+    }
+
+
+def handle_get_memory_conflicts(owner: Any, arguments: dict[str, object]) -> dict[str, object]:
+    query_text = str(arguments.get("query_text", "")).strip() or None
+    queue = owner.runtime.select_long_term_memory_conflicts(query_text=query_text)
+    owner.emit("memory_conflict_tool_call=true")
+    owner._record_event(
+        "memory_conflicts_inspected",
+        "Open long-term memory conflicts were inspected for clarification.",
+        conflict_count=len(queue),
+        query=query_text or "",
+    )
+    payload = _serialize_conflict_queue(queue)
+    if not payload:
+        return {
+            "status": "no_conflicts",
+            "conflict_count": 0,
+            "conflicts": [],
+        }
+    return {
+        "status": "ok",
+        "conflict_count": len(payload),
+        "conflicts": payload,
+    }
+
+
+def handle_resolve_memory_conflict(owner: Any, arguments: dict[str, object]) -> dict[str, object]:
+    require_sensitive_voice_confirmation(owner, arguments, action_label="change saved long-term memory")
+    slot_key = str(arguments.get("slot_key", "")).strip()
+    selected_memory_id = str(arguments.get("selected_memory_id", "")).strip()
+    if not slot_key or not selected_memory_id:
+        raise RuntimeError("resolve_memory_conflict requires `slot_key` and `selected_memory_id`")
+    result = owner.runtime.resolve_long_term_memory_conflict(
+        slot_key=slot_key,
+        selected_memory_id=selected_memory_id,
+    )
+    updated = {item.memory_id: item for item in result.updated_objects}
+    selected = updated.get(selected_memory_id)
+    superseded_memory_ids = sorted(
+        item.memory_id
+        for item in result.updated_objects
+        if item.memory_id != selected_memory_id and item.status == "superseded"
+    )
+    invalid_memory_ids = sorted(
+        item.memory_id
+        for item in result.updated_objects
+        if item.memory_id != selected_memory_id and item.status == "invalid"
+    )
+    owner.emit("memory_conflict_tool_call=true")
+    owner.emit(f"memory_conflict_resolved={slot_key}")
+    owner._record_event(
+        "memory_conflict_resolved",
+        "A long-term memory conflict was resolved from spoken clarification.",
+        slot_key=slot_key,
+        selected_memory_id=selected_memory_id,
+        remaining_conflicts=len(result.remaining_conflicts),
+    )
+    return {
+        "status": "resolved",
+        "slot_key": slot_key,
+        "selected_memory_id": selected_memory_id,
+        "selected_summary": selected.summary if selected is not None else None,
+        "superseded_memory_ids": superseded_memory_ids,
+        "invalid_memory_ids": invalid_memory_ids,
+        "remaining_conflict_count": len(result.remaining_conflicts),
     }
 
 

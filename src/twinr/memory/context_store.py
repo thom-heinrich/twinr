@@ -3,15 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-import re
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.text_utils import collapse_whitespace, slugify_identifier
 
 _MANAGED_START = "<!-- TWINR_MANAGED_CONTEXT_START -->"
 _MANAGED_END = "<!-- TWINR_MANAGED_CONTEXT_END -->"
-_MEMORY_ENTRY_HEADING_RE = re.compile(r"^###\s+(?P<entry_id>[A-Z0-9_-]+)\s*$")
-_MEMORY_FIELD_RE = re.compile(r"^-\s+(?P<key>[a-z_]+):\s*(?P<value>.*)\s*$")
-_MANAGED_ENTRY_RE = re.compile(r"^-\s+(?P<key>[a-z0-9_]+):\s*(?P<value>.+?)\s*$", re.IGNORECASE)
 
 
 def _utcnow() -> datetime:
@@ -19,7 +16,7 @@ def _utcnow() -> datetime:
 
 
 def _normalize_text(value: str, *, limit: int) -> str:
-    text = " ".join(str(value or "").split()).strip()
+    text = collapse_whitespace(value)
     if not text:
         return ""
     if len(text) <= limit:
@@ -28,8 +25,41 @@ def _normalize_text(value: str, *, limit: int) -> str:
 
 
 def _slugify(value: str, *, fallback: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
-    return normalized or fallback
+    return slugify_identifier(value, fallback=fallback)
+
+
+def _parse_markdown_heading(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped.startswith("### "):
+        return None
+    entry_id = stripped[4:].strip()
+    if not entry_id:
+        return None
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+    if any(char not in allowed for char in entry_id):
+        return None
+    return entry_id
+
+
+def _parse_markdown_field(line: str, *, allow_uppercase_key: bool = False) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped.startswith("- "):
+        return None
+    key, separator, value = stripped[2:].partition(":")
+    if separator != ":":
+        return None
+    normalized_key = key.strip()
+    if not normalized_key:
+        return None
+    valid_chars = set("abcdefghijklmnopqrstuvwxyz0123456789_")
+    lowered = normalized_key.lower()
+    if allow_uppercase_key:
+        if any(char not in valid_chars for char in lowered):
+            return None
+        return lowered, value.strip()
+    if any(char not in valid_chars for char in normalized_key):
+        return None
+    return normalized_key, value.strip()
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -106,14 +136,14 @@ class ManagedContextFileStore:
         managed_block, suffix = remainder.split(_MANAGED_END, 1)
         entries: list[ManagedContextEntry] = []
         for raw_line in managed_block.splitlines():
-            line = raw_line.strip()
-            match = _MANAGED_ENTRY_RE.match(line)
-            if match is None:
+            parsed = _parse_markdown_field(raw_line, allow_uppercase_key=True)
+            if parsed is None:
                 continue
+            key, value = parsed
             entries.append(
                 ManagedContextEntry(
-                    key=_slugify(match.group("key"), fallback="update"),
-                    instruction=match.group("value").strip(),
+                    key=_slugify(key, fallback="update"),
+                    instruction=value,
                 )
             )
         return prefix.rstrip(), tuple(entries), suffix.lstrip("\n")
@@ -160,21 +190,21 @@ class PersistentMemoryMarkdownStore:
         entries: list[PersistentMemoryEntry] = []
         current: dict[str, str] | None = None
         for raw_line in self.path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            heading = _MEMORY_ENTRY_HEADING_RE.match(line)
+            heading = _parse_markdown_heading(raw_line)
             if heading is not None:
                 if current is not None:
                     entry = self._entry_from_mapping(current)
                     if entry is not None:
                         entries.append(entry)
-                current = {"entry_id": heading.group("entry_id")}
+                current = {"entry_id": heading}
                 continue
             if current is None:
                 continue
-            field_match = _MEMORY_FIELD_RE.match(line)
-            if field_match is None:
+            parsed = _parse_markdown_field(raw_line)
+            if parsed is None:
                 continue
-            current[field_match.group("key")] = field_match.group("value").strip()
+            key, value = parsed
+            current[key] = value
         if current is not None:
             entry = self._entry_from_mapping(current)
             if entry is not None:

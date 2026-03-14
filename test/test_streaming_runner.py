@@ -243,6 +243,94 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertTrue(any(call["request_kind"] == "print" for call in usage_store.calls))
         self.assertTrue(any(call["request_kind"] == "conversation" for call in usage_store.calls))
 
+    def test_groq_config_uses_compact_tool_schemas_and_instructions(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                groq_api_key="groq-key",
+                llm_provider="groq",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tool_agent = FakeToolAgentProvider(config)
+            support_provider = FakePrintBackend(config)
+
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=tool_agent,
+                print_backend=support_provider,
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=support_provider,
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+
+            loop._run_single_text_turn(
+                transcript="Bitte druck das aus",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        schema_properties = tool_agent.start_calls[0]["tool_schemas"][0]["parameters"]["properties"]
+        schemas_by_name = {
+            schema["name"]: schema
+            for schema in tool_agent.start_calls[0]["tool_schemas"]
+        }
+        self.assertLess(len(tool_agent.start_calls[0]["tool_schemas"][0]["description"]), 80)
+        self.assertTrue(all("description" not in value for value in schema_properties.values()))
+        self.assertEqual(set(schema_properties), {"focus_hint", "text"})
+        self.assertIn("question", schemas_by_name["search_live_info"]["parameters"]["properties"])
+        self.assertIn("Available Twinr spoken voices", tool_agent.start_calls[0]["instructions"])
+        self.assertNotIn("Current bounded simple settings", tool_agent.start_calls[0]["instructions"])
+
+    def test_groq_config_streams_final_text_only(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                groq_api_key="groq-key",
+                llm_provider="groq",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tool_agent = FakeToolAgentProvider(config)
+            support_provider = FakePrintBackend(config)
+            tts_provider = FakeTextToSpeechProvider(config)
+
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=tool_agent,
+                print_backend=support_provider,
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=support_provider,
+                tts_provider=tts_provider,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+
+            loop._run_single_text_turn(
+                transcript="Bitte druck das aus",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        self.assertEqual(tts_provider.calls, ["Ist erledigt."])
+        self.assertEqual(runtime.last_response, "Ist erledigt.")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,100 +1,148 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-import re
+from datetime import datetime
+from typing import TYPE_CHECKING, Mapping, Protocol
 from zoneinfo import ZoneInfo
 
+from twinr.agent.base_agent.config import TwinrConfig
+from twinr.llm_json import request_structured_json_object
+from twinr.memory.chonkydb.schema import TWINR_GRAPH_ALLOWED_EDGE_TYPES
 from twinr.memory.longterm.models import (
     LongTermGraphEdgeCandidateV1,
     LongTermMemoryObjectV1,
     LongTermSourceRefV1,
     LongTermTurnExtractionV1,
 )
+from twinr.text_utils import collapse_whitespace, slugify_identifier, truncate_text
+
+if TYPE_CHECKING:
+    from twinr.providers.openai import OpenAIBackend
 
 
-_RELATION_TO_EDGE = {
-    "wife": ("social_family_of", "wife"),
-    "husband": ("social_family_of", "husband"),
-    "daughter": ("social_family_of", "daughter"),
-    "son": ("social_family_of", "son"),
-    "mother": ("social_family_of", "mother"),
-    "father": ("social_family_of", "father"),
-    "sister": ("social_family_of", "sister"),
-    "brother": ("social_family_of", "brother"),
-    "friend": ("social_friend_of", "friend"),
-    "neighbor": ("general_related_to", "neighbor"),
-    "neighbour": ("general_related_to", "neighbor"),
-    "physiotherapist": ("social_supports_user_as", "physiotherapist"),
-    "caregiver": ("social_supports_user_as", "caregiver"),
-    "doctor": ("social_supports_user_as", "doctor"),
+_MEMORY_KIND_PREFIX = {
+    "relationship_fact": "fact",
+    "contact_method_fact": "fact",
+    "preference_fact": "fact",
+    "plan_fact": "plan",
+    "situational_observation": "observation",
+    "medical_event": "event",
+    "event_fact": "event",
 }
 
-_RELATION_PATTERN = re.compile(
-    r"\b(?:my|My)\s+(?P<relation>wife|husband|daughter|son|mother|father|sister|brother|friend|neighbor|neighbour|physiotherapist|caregiver|doctor)\s+(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b"
+_EXTRACTION_OBJECT_KINDS = (
+    "relationship_fact",
+    "contact_method_fact",
+    "preference_fact",
+    "plan_fact",
+    "situational_observation",
+    "medical_event",
+    "event_fact",
 )
-_AT_PLACE_PATTERN = re.compile(
-    r"\b(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+is\s+at\s+(?P<place>[^.,;]+?)(?:\s+and\s+is\s+getting\s+(?P<treatment>[^.,;]+))?(?:[.,;]|$)"
-)
-_GETTING_PATTERN = re.compile(
-    r"\b(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+is\s+getting\s+(?P<treatment>[^.,;]+?)(?:[.,;]|$)"
-)
-_DAY_WORDS = {
-    "monday",
-    "tuesday",
-    "wednesday",
-    "thursday",
-    "friday",
-    "saturday",
-    "sunday",
-}
-_WEATHER_WORDS = {
-    "warm",
-    "hot",
-    "cold",
-    "cool",
-    "sunny",
-    "rainy",
-    "windy",
-    "mild",
-    "cloudy",
-    "bright",
-}
-_MEDICAL_TERMS = {"doctor", "clinic", "treatment", "laser", "hospital", "appointment", "surgery"}
 
 
 def _normalize_text(value: str | None, *, limit: int | None = None) -> str:
-    text = " ".join(str(value or "").split()).strip()
-    if limit is None or len(text) <= limit:
-        return text
-    return text[: max(limit - 1, 0)].rstrip() + "…"
-
-
-def _slugify(value: str, *, fallback: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", _normalize_text(value).lower()).strip("_")
-    return slug or fallback
-
-
-def _extract_date(text: str, *, occurred_at: datetime, timezone_name: str) -> str | None:
-    lower = text.lower()
-    now = occurred_at.astimezone(ZoneInfo(timezone_name))
-    if "today" in lower:
-        return now.date().isoformat()
-    if "tomorrow" in lower:
-        return (now.date() + timedelta(days=1)).isoformat()
-    match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
-    if match is not None:
-        return match.group(1)
-    return None
+    return truncate_text(value, limit=limit)
 
 
 def _quoted(value: str) -> str:
     return '"' + value.replace('"', '\\"') + '"'
 
 
+class LongTermStructuredTurnProgram(Protocol):
+    def extract_turn(
+        self,
+        *,
+        transcript: str,
+        response: str,
+        occurred_at: datetime,
+        turn_id: str,
+        timezone_name: str,
+    ) -> Mapping[str, object]:
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIStructuredTurnProgram:
+    backend: "OpenAIBackend"
+
+    def extract_turn(
+        self,
+        *,
+        transcript: str,
+        response: str,
+        occurred_at: datetime,
+        turn_id: str,
+        timezone_name: str,
+    ) -> Mapping[str, object]:
+        from twinr.providers.openai.structured import request_structured_json_object
+
+        return request_structured_json_object(
+            self.backend,
+            prompt="\n".join(
+                (
+                    "Compile long-term memory candidates from one assistant turn.",
+                    "Internal memory must stay in canonical English.",
+                    "Split one turn into multiple atomic memories when needed.",
+                    "Only extract facts that are explicit or directly stated.",
+                    "Do not infer hidden medical diagnoses, feelings, or unstated background facts.",
+                    "Keep names, dates, places, phone numbers, and relation labels precise.",
+                    f"Turn id: {turn_id}",
+                    f"Occurred at: {occurred_at.astimezone(ZoneInfo(timezone_name)).isoformat()}",
+                    f"Timezone: {timezone_name}",
+                    f"User transcript: {_quoted(transcript)}",
+                    f"Assistant response: {_quoted(response)}",
+                )
+            ),
+            instructions="\n".join(
+                (
+                    "Return one strict JSON object only.",
+                    "Use canonical English in summaries, details, slot keys, value keys, and attributes.",
+                    "Use graph refs like person:janina, place:eye_doctor, phone:+491761234, day:2026-03-14.",
+                    "If a person relation is explicit, emit both a relationship memory object and a graph edge.",
+                    "If an event has a specific day, set valid_from and valid_to to that date and emit a temporal_occurs_on edge to day:<date>.",
+                    "If no durable candidate is justified, return empty arrays.",
+                )
+            ),
+            schema_name="twinr_long_term_turn_extraction_v1",
+            schema=_turn_extraction_schema(),
+            model=self.backend.config.default_model,
+            reasoning_effort="low",
+            max_output_tokens=1200,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class LongTermTurnExtractor:
     timezone_name: str = "Europe/Berlin"
+    program: LongTermStructuredTurnProgram | None = None
+
+    @classmethod
+    def from_config(
+        cls,
+        config: TwinrConfig,
+        *,
+        program: LongTermStructuredTurnProgram | None = None,
+    ) -> "LongTermTurnExtractor":
+        if program is not None:
+            return cls(
+                timezone_name=config.local_timezone_name,
+                program=program,
+            )
+        extractor_program: LongTermStructuredTurnProgram | None = None
+        if config.openai_api_key:
+            from twinr.providers.openai import OpenAIBackend
+
+            extractor_program = OpenAIStructuredTurnProgram(
+                backend=OpenAIBackend(
+                    config,
+                    base_instructions="",
+                )
+            )
+        return cls(
+            timezone_name=config.local_timezone_name,
+            program=extractor_program,
+        )
 
     def extract_conversation_turn(
         self,
@@ -117,8 +165,32 @@ class LongTermTurnExtractor:
             speaker="user",
             modality="voice",
         )
+        episode_attributes: dict[str, object] = {
+            "raw_transcript": clean_transcript,
+            "raw_response": clean_response,
+            "structured_extraction_status": "disabled" if self.program is None else "ready",
+        }
+        candidate_objects: tuple[LongTermMemoryObjectV1, ...] = ()
+        graph_edges: tuple[LongTermGraphEdgeCandidateV1, ...] = ()
+        if self.program is not None:
+            try:
+                payload = self.program.extract_turn(
+                    transcript=clean_transcript,
+                    response=clean_response,
+                    occurred_at=occurred,
+                    turn_id=resolved_turn_id,
+                    timezone_name=self.timezone_name,
+                )
+                candidate_objects = self._candidate_objects_from_payload(
+                    payload=payload,
+                    source_ref=source_ref,
+                )
+                graph_edges = self._graph_edges_from_payload(payload)
+            except Exception as exc:
+                episode_attributes["structured_extraction_status"] = "failed"
+                episode_attributes["structured_extraction_error"] = _normalize_text(str(exc), limit=220)
         episode = LongTermMemoryObjectV1(
-            memory_id=f"episode:{_slugify(resolved_turn_id, fallback='turn')}",
+            memory_id=f"episode:{slugify_identifier(resolved_turn_id, fallback='turn')}",
             kind="episode",
             summary="Conversation turn recorded for long-term memory.",
             details=f"User said: {_quoted(clean_transcript)} Assistant answered: {_quoted(clean_response)}",
@@ -127,238 +199,194 @@ class LongTermTurnExtractor:
             confidence=1.0,
             sensitivity="normal",
             slot_key=f"episode:{resolved_turn_id}",
-            value_key=_slugify(clean_transcript, fallback="episode"),
-            valid_from=_extract_date(clean_transcript, occurred_at=occurred, timezone_name=self.timezone_name),
-            valid_to=_extract_date(clean_transcript, occurred_at=occurred, timezone_name=self.timezone_name),
-            attributes={
-                "raw_transcript": clean_transcript,
-                "raw_response": clean_response,
-            },
+            value_key=slugify_identifier(clean_transcript, fallback="episode"),
+            valid_from=None,
+            valid_to=None,
+            attributes=episode_attributes,
         )
-
-        candidates: list[LongTermMemoryObjectV1] = []
-        graph_edges: list[LongTermGraphEdgeCandidateV1] = []
-        known_people: dict[str, str] = {}
-
-        for match in _RELATION_PATTERN.finditer(clean_transcript):
-            relation = _normalize_text(match.group("relation")).lower()
-            name = _normalize_text(match.group("name"), limit=100)
-            person_ref = f"person:{_slugify(name, fallback='person')}"
-            known_people[name] = person_ref
-            edge_type, relation_label = _RELATION_TO_EDGE.get(relation, ("general_related_to", relation))
-            memory_id = f"fact:{_slugify(f'{name}_{relation_label}', fallback='relationship')}"
-            candidates.append(
-                LongTermMemoryObjectV1(
-                    memory_id=memory_id,
-                    kind="relationship_fact",
-                    summary=f"{name} is the user's {relation_label}.",
-                    details=f"Derived from a user statement in {_quoted(clean_transcript)}.",
-                    source=source_ref,
-                    status="candidate",
-                    confidence=0.98,
-                    sensitivity="private",
-                    slot_key=f"relationship:user:main:{relation_label}",
-                    value_key=person_ref,
-                    attributes={
-                        "person_ref": person_ref,
-                        "person_name": name,
-                        "relation": relation_label,
-                    },
-                )
-            )
-            graph_edges.append(
-                LongTermGraphEdgeCandidateV1(
-                    source_ref="user:main",
-                    edge_type=edge_type,
-                    target_ref=person_ref,
-                    confidence=0.98,
-                    confirmed_by_user=True,
-                    attributes={
-                        "relation": relation_label,
-                        "origin_memory_id": memory_id,
-                    },
-                )
-            )
-
-        for observation in self._extract_environment_observations(
-            transcript=clean_transcript,
-            occurred_at=occurred,
-            source_ref=source_ref,
-        ):
-            candidates.append(observation)
-
-        for event in self._extract_person_events(
-            transcript=clean_transcript,
-            occurred_at=occurred,
-            source_ref=source_ref,
-            known_people=known_people,
-        ):
-            candidates.extend(event["objects"])
-            graph_edges.extend(event["edges"])
-
         return LongTermTurnExtractionV1(
             turn_id=resolved_turn_id,
             occurred_at=occurred,
             episode=episode,
-            candidate_objects=tuple(candidates),
-            graph_edges=tuple(graph_edges),
+            candidate_objects=candidate_objects,
+            graph_edges=graph_edges,
         )
 
-    def _extract_environment_observations(
+    def _candidate_objects_from_payload(
         self,
         *,
-        transcript: str,
-        occurred_at: datetime,
+        payload: Mapping[str, object],
         source_ref: LongTermSourceRefV1,
-    ) -> list[LongTermMemoryObjectV1]:
-        lower_tokens = {token.strip(".,;:!?").lower() for token in transcript.split()}
-        observations: list[LongTermMemoryObjectV1] = []
-        date_key = _extract_date(transcript, occurred_at=occurred_at, timezone_name=self.timezone_name)
-        day_words = sorted(word for word in _DAY_WORDS if word in lower_tokens)
-        for day_word in day_words:
-            slug_input = f"{day_word}_{date_key or 'day'}"
-            observations.append(
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        objects_payload = payload.get("objects")
+        if not isinstance(objects_payload, list):
+            return ()
+        candidates: list[LongTermMemoryObjectV1] = []
+        for index, raw_item in enumerate(objects_payload):
+            if not isinstance(raw_item, Mapping):
+                continue
+            kind = _normalize_text(str(raw_item.get("kind", "")), limit=64)
+            summary = _normalize_text(str(raw_item.get("summary", "")), limit=220)
+            slot_key = _normalize_text(str(raw_item.get("slot_key", "")), limit=220)
+            value_key = _normalize_text(str(raw_item.get("value_key", "")), limit=220)
+            if kind not in _EXTRACTION_OBJECT_KINDS or not summary or not slot_key or not value_key:
+                continue
+            attributes = self._normalize_attributes(raw_item.get("attributes"))
+            confidence = raw_item.get("confidence", 0.5)
+            sensitivity = _normalize_text(str(raw_item.get("sensitivity", "normal")), limit=32) or "normal"
+            prefix = _MEMORY_KIND_PREFIX.get(kind, "memory")
+            stable_basis = f"{slot_key}:{value_key}"
+            memory_id = f"{prefix}:{slugify_identifier(stable_basis, fallback=f'item_{index + 1}')}"
+            candidates.append(
                 LongTermMemoryObjectV1(
-                    memory_id=f"observation:{_slugify(slug_input, fallback='day')}",
-                    kind="situational_observation",
-                    summary=f"The user described the day as {day_word}.",
-                    details=f"Observed in {_quoted(transcript)}.",
+                    memory_id=memory_id,
+                    kind=kind,
+                    summary=summary,
+                    details=_normalize_text(raw_item.get("details"), limit=320) or None,
                     source=source_ref,
-                    confidence=0.72,
-                    sensitivity="low",
-                    slot_key=f"observation:day_name:{date_key or 'unknown'}",
-                    value_key=day_word,
-                    valid_from=date_key,
-                    valid_to=date_key,
-                    attributes={"topic": "day_name"},
+                    status="candidate",
+                    confidence=float(confidence) if isinstance(confidence, (int, float)) else 0.5,
+                    sensitivity=sensitivity if sensitivity else "normal",
+                    slot_key=slot_key,
+                    value_key=value_key,
+                    valid_from=self._optional_text(raw_item.get("valid_from")),
+                    valid_to=self._optional_text(raw_item.get("valid_to")),
+                    attributes=attributes or None,
                 )
             )
-        weather_words = sorted(word for word in _WEATHER_WORDS if word in lower_tokens)
-        for weather_word in weather_words:
-            slug_input = f"{weather_word}_{date_key or 'weather'}"
-            observations.append(
-                LongTermMemoryObjectV1(
-                    memory_id=f"observation:{_slugify(slug_input, fallback='weather')}",
-                    kind="situational_observation",
-                    summary=f"The user described the day as {weather_word}.",
-                    details=f"Observed in {_quoted(transcript)}.",
-                    source=source_ref,
-                    confidence=0.7,
-                    sensitivity="low",
-                    slot_key=f"observation:weather:{date_key or 'unknown'}",
-                    value_key=weather_word,
-                    valid_from=date_key,
-                    valid_to=date_key,
-                    attributes={"topic": "weather"},
-                )
-            )
-        return observations
+        return tuple(candidates)
 
-    def _extract_person_events(
+    def _graph_edges_from_payload(
         self,
-        *,
-        transcript: str,
-        occurred_at: datetime,
-        source_ref: LongTermSourceRefV1,
-        known_people: dict[str, str],
-    ) -> list[dict[str, tuple[LongTermMemoryObjectV1, ...] | tuple[LongTermGraphEdgeCandidateV1, ...]]]:
-        person_events: dict[str, dict[str, str]] = {}
-        for match in _AT_PLACE_PATTERN.finditer(transcript):
-            name = _normalize_text(match.group("name"), limit=100)
-            place = _normalize_text(match.group("place"), limit=120)
-            treatment = _normalize_text(match.group("treatment"), limit=120)
-            event = person_events.setdefault(name, {})
-            if place:
-                event["place"] = place
-            if treatment:
-                event["treatment"] = treatment
-        for match in _GETTING_PATTERN.finditer(transcript):
-            name = _normalize_text(match.group("name"), limit=100)
-            treatment = _normalize_text(match.group("treatment"), limit=120)
-            if not treatment:
+        payload: Mapping[str, object],
+    ) -> tuple[LongTermGraphEdgeCandidateV1, ...]:
+        edges_payload = payload.get("graph_edges")
+        if not isinstance(edges_payload, list):
+            return ()
+        edges: list[LongTermGraphEdgeCandidateV1] = []
+        for raw_edge in edges_payload:
+            if not isinstance(raw_edge, Mapping):
                 continue
-            event = person_events.setdefault(name, {})
-            event.setdefault("treatment", treatment)
-
-        results: list[dict[str, tuple[LongTermMemoryObjectV1, ...] | tuple[LongTermGraphEdgeCandidateV1, ...]]] = []
-        date_key = _extract_date(transcript, occurred_at=occurred_at, timezone_name=self.timezone_name)
-        for name, details in person_events.items():
-            person_ref = known_people.get(name, f"person:{_slugify(name, fallback='person')}")
-            treatment = details.get("treatment")
-            place = details.get("place")
-            if not treatment and not place:
+            edge_type = _normalize_text(str(raw_edge.get("edge_type", "")), limit=80)
+            if edge_type not in TWINR_GRAPH_ALLOWED_EDGE_TYPES:
                 continue
-            event_slug = _slugify(
-                f"{name}_{treatment or place or 'event'}_{date_key or occurred_at.date().isoformat()}",
-                fallback="event",
-            )
-            event_ref = f"event:{event_slug}"
-            summary = self._event_summary(name=name, place=place, treatment=treatment, date_key=date_key)
-            kind = "medical_event" if self._looks_medical(place=place, treatment=treatment) else "event_fact"
-            memory = LongTermMemoryObjectV1(
-                memory_id=f"fact:{event_slug}",
-                kind=kind,
-                summary=summary,
-                details=f"Derived from a user statement in {_quoted(transcript)}.",
-                source=source_ref,
-                confidence=0.9,
-                sensitivity="medical" if kind == "medical_event" else "private",
-                slot_key=f"event:{person_ref}:{_slugify(treatment or place or 'event', fallback='event')}:{date_key or 'open'}",
-                value_key=event_ref,
-                valid_from=date_key,
-                valid_to=date_key,
-                attributes={
-                    "person_ref": person_ref,
-                    "person_name": name,
-                    "place": place,
-                    "treatment": treatment,
-                    "event_ref": event_ref,
-                },
-            )
-            edges = [
+            source_ref = _normalize_text(str(raw_edge.get("source_ref", "")), limit=160)
+            target_ref = _normalize_text(str(raw_edge.get("target_ref", "")), limit=160)
+            if not source_ref or not target_ref:
+                continue
+            confidence = raw_edge.get("confidence", 0.5)
+            edges.append(
                 LongTermGraphEdgeCandidateV1(
-                    source_ref=event_ref,
-                    edge_type="general_related_to",
-                    target_ref=person_ref,
-                    confidence=0.9,
-                    attributes={"origin_memory_id": memory.memory_id},
-                    valid_from=date_key,
-                    valid_to=date_key,
+                    source_ref=source_ref,
+                    edge_type=edge_type,
+                    target_ref=target_ref,
+                    confidence=float(confidence) if isinstance(confidence, (int, float)) else 0.5,
+                    confirmed_by_user=bool(raw_edge.get("confirmed_by_user", True)),
+                    valid_from=self._optional_text(raw_edge.get("valid_from")),
+                    valid_to=self._optional_text(raw_edge.get("valid_to")),
+                    attributes=self._normalize_attributes(raw_edge.get("attributes")) or None,
                 )
-            ]
-            if date_key:
-                edges.append(
-                    LongTermGraphEdgeCandidateV1(
-                        source_ref=event_ref,
-                        edge_type="temporal_occurs_on",
-                        target_ref=f"day:{date_key}",
-                        confidence=0.95,
-                        attributes={"origin_memory_id": memory.memory_id},
-                        valid_from=date_key,
-                        valid_to=date_key,
-                    )
-                )
-            results.append({"objects": (memory,), "edges": tuple(edges)})
-        return results
+            )
+        return tuple(edges)
 
-    def _event_summary(
-        self,
-        *,
-        name: str,
-        place: str | None,
-        treatment: str | None,
-        date_key: str | None,
-    ) -> str:
-        date_suffix = f" on {date_key}" if date_key else ""
-        if place and treatment:
-            return f"{name} has {treatment} at {place}{date_suffix}."
-        if treatment:
-            return f"{name} is receiving {treatment}{date_suffix}."
-        return f"{name} is at {place}{date_suffix}."
+    def _normalize_attributes(self, value: object) -> dict[str, str]:
+        if not isinstance(value, Mapping):
+            return {}
+        normalized: dict[str, str] = {}
+        for key, raw in value.items():
+            clean_key = collapse_whitespace(str(key))
+            clean_value = self._optional_text(raw)
+            if clean_key and clean_value:
+                normalized[clean_key] = clean_value
+        return normalized
 
-    def _looks_medical(self, *, place: str | None, treatment: str | None) -> bool:
-        haystack = f"{place or ''} {treatment or ''}".lower()
-        return any(term in haystack for term in _MEDICAL_TERMS)
+    def _optional_text(self, value: object) -> str | None:
+        if value is None:
+            return None
+        clean_value = _normalize_text(str(value), limit=160)
+        return clean_value or None
 
 
-__all__ = ["LongTermTurnExtractor"]
+def _turn_extraction_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "objects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": list(_EXTRACTION_OBJECT_KINDS),
+                        },
+                        "summary": {"type": "string"},
+                        "details": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "sensitivity": {
+                            "type": "string",
+                            "enum": ["low", "normal", "private", "medical", "sensitive"],
+                        },
+                        "slot_key": {"type": "string"},
+                        "value_key": {"type": "string"},
+                        "valid_from": {"type": "string"},
+                        "valid_to": {"type": "string"},
+                        "attributes": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                        },
+                    },
+                    "required": [
+                        "kind",
+                        "summary",
+                        "confidence",
+                        "sensitivity",
+                        "slot_key",
+                        "value_key",
+                        "attributes",
+                    ],
+                },
+            },
+            "graph_edges": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "source_ref": {"type": "string"},
+                        "edge_type": {
+                            "type": "string",
+                            "enum": sorted(TWINR_GRAPH_ALLOWED_EDGE_TYPES),
+                        },
+                        "target_ref": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "confirmed_by_user": {"type": "boolean"},
+                        "valid_from": {"type": "string"},
+                        "valid_to": {"type": "string"},
+                        "attributes": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                        },
+                    },
+                    "required": [
+                        "source_ref",
+                        "edge_type",
+                        "target_ref",
+                        "confidence",
+                        "confirmed_by_user",
+                        "attributes",
+                    ],
+                },
+            },
+        },
+        "required": ["objects", "graph_edges"],
+    }
+
+
+__all__ = [
+    "LongTermStructuredTurnProgram",
+    "LongTermTurnExtractor",
+    "OpenAIStructuredTurnProgram",
+]

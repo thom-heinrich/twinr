@@ -30,7 +30,15 @@ class TwinrRuntimeFlowMixin:
         return status
 
     def press_green_button(self) -> TwinrStatus:
-        return self.begin_listening(request_source="button", button="green")
+        status = self.begin_listening(request_source="button", button="green")
+        self.long_term_memory.enqueue_multimodal_evidence(
+            event_name="button_interaction",
+            modality="button",
+            source="runtime_button",
+            message="Green button started a conversation turn.",
+            data={"button": "green", "action": "start_listening"},
+        )
+        return status
 
     def submit_transcript(self, transcript: str) -> TwinrStatus:
         self.last_transcript = transcript.strip()
@@ -148,6 +156,13 @@ class TwinrRuntimeFlowMixin:
                 "status": self.status.value,
                 "response_preview": compact_text(self.last_response),
             },
+        )
+        self.long_term_memory.enqueue_multimodal_evidence(
+            event_name="button_interaction",
+            modality="button",
+            source="runtime_button",
+            message="Yellow button requested a printed answer.",
+            data={"button": "yellow", "action": "print_request"},
         )
         return self.last_response
 

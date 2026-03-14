@@ -1,32 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 from pathlib import Path
-import re
 from typing import Mapping
-from zoneinfo import ZoneInfo
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.client import chonkydb_data_path
-from twinr.memory.query_normalization import tokenize_retrieval_text
+from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.chonkydb.schema import (
     TwinrGraphDocumentV1,
     TwinrGraphEdgeV1,
     TwinrGraphNodeV1,
 )
-
-_DATE_RE = re.compile(r"(?P<date>\d{4}-\d{2}-\d{2})")
-_CONTACT_QUERY_TOKENS = frozenset({"nummer", "telefon", "anrufen", "kontakt", "email", "mail"})
-_SHOPPING_QUERY_TOKENS = frozenset({"kaufen", "kauf", "laden", "geschaeft", "geschäft", "shop", "wo", "bekomme"})
-_PLAN_CONTEXT_TOKENS = frozenset({"wetter", "plan", "vorhaben", "machen", "wollte", "will", "noch", "heute", "today"})
-_TODAY_QUERY_TOKENS = frozenset({"heute", "today"})
-_TOMORROW_QUERY_TOKENS = frozenset({"morgen", "tomorrow"})
+from twinr.temporal import parse_local_date_text
+from twinr.text_utils import collapse_whitespace, retrieval_terms, slugify_identifier
 
 
 def _normalize_text(value: str, *, limit: int) -> str:
-    text = " ".join(str(value or "").split()).strip()
+    text = collapse_whitespace(value)
     if not text:
         return ""
     if len(text) <= limit:
@@ -35,12 +28,11 @@ def _normalize_text(value: str, *, limit: int) -> str:
 
 
 def _slugify(value: str, *, fallback: str) -> str:
-    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
-    return normalized or fallback
+    return slugify_identifier(value, fallback=fallback)
 
 
 def _tokenize(value: str) -> tuple[str, ...]:
-    return tokenize_retrieval_text(value)
+    return retrieval_terms(value)
 
 
 def _canonical_phone(value: str) -> str:
@@ -52,26 +44,9 @@ def _canonical_email(value: str) -> str:
     return str(value or "").strip().lower()
 
 
-def _now_in_timezone(timezone_name: str) -> datetime:
-    return datetime.now(ZoneInfo(timezone_name))
-
-
 def _infer_day_key(when_text: str | None, *, timezone_name: str) -> str | None:
-    text = (when_text or "").strip().lower()
-    if not text:
-        return None
-    now = _now_in_timezone(timezone_name)
-    if text in {"today", "heute"}:
-        return now.date().isoformat()
-    if text in {"tomorrow", "morgen"}:
-        return (now.date() + timedelta(days=1)).isoformat()
-    match = _DATE_RE.search(text)
-    if match is not None:
-        return match.group("date")
-    try:
-        return datetime.fromisoformat(text).date().isoformat()
-    except ValueError:
-        return None
+    resolved = parse_local_date_text(when_text, timezone_name=timezone_name)
+    return resolved.isoformat() if resolved is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,18 +474,17 @@ class TwinrPersonalGraphStore:
 
     def build_prompt_context(self, query_text: str | None) -> str | None:
         document = self.load_document()
-        query_tokens = set(_tokenize(query_text or ""))
         contacts = self._rank_contact_prompt_items(
             self._prompt_contacts(document, limit=128),
-            query_tokens=query_tokens,
+            query_text=query_text,
         )
         preferences = self._rank_preference_prompt_items(
             self._prompt_preferences(document, limit=128),
-            query_tokens=query_tokens,
+            query_text=query_text,
         )
         plans = self._rank_plan_prompt_items(
             self._prompt_plans(document, limit=128),
-            query_tokens=query_tokens,
+            query_text=query_text,
         )
         if not contacts and not preferences and not plans:
             return None
@@ -531,25 +505,24 @@ class TwinrPersonalGraphStore:
 
     def build_subtext_payload(self, query_text: str | None) -> dict[str, object] | None:
         clean_query = _normalize_text(query_text or "", limit=220)
-        query_tokens = set(_tokenize(clean_query))
-        if not query_tokens:
+        if not clean_query:
             return None
         document = self.load_document()
         preference_items = self._rank_preference_prompt_items(
             self._prompt_preferences(document, limit=128),
-            query_tokens=query_tokens,
+            query_text=clean_query,
             limit=3,
             fallback_limit=0,
         )
         plan_items = self._rank_plan_prompt_items(
             self._prompt_plans(document, limit=128),
-            query_tokens=query_tokens,
+            query_text=clean_query,
             limit=3,
             fallback_limit=0,
         )
         contact_items = self._rank_contact_prompt_items(
             self._prompt_contacts(document, limit=128),
-            query_tokens=query_tokens,
+            query_text=clean_query,
             limit=3,
             fallback_limit=0,
         )
@@ -569,22 +542,13 @@ class TwinrPersonalGraphStore:
         self,
         items: list[dict[str, object]],
         *,
-        query_tokens: set[str],
+        query_text: str | None,
         limit: int = 8,
         fallback_limit: int = 3,
     ) -> list[dict[str, object]]:
         return self._rank_prompt_items(
             items,
-            query_tokens=query_tokens,
-            weighted_fields=(
-                ("name", 4),
-                ("aliases", 3),
-                ("role", 3),
-                ("relation", 3),
-                ("phones", 1),
-                ("emails", 1),
-                ("notes", 2),
-            ),
+            query_text=query_text,
             limit=limit,
             fallback_limit=fallback_limit,
         )
@@ -593,21 +557,13 @@ class TwinrPersonalGraphStore:
         self,
         items: list[dict[str, object]],
         *,
-        query_tokens: set[str],
+        query_text: str | None,
         limit: int = 8,
         fallback_limit: int = 3,
     ) -> list[dict[str, object]]:
         return self._rank_prompt_items(
             items,
-            query_tokens=query_tokens,
-            weighted_fields=(
-                ("type", 2),
-                ("value", 4),
-                ("category", 2),
-                ("for_product", 4),
-                ("details", 2),
-                ("carries_brands", 3),
-            ),
+            query_text=query_text,
             limit=limit,
             fallback_limit=fallback_limit,
         )
@@ -616,20 +572,13 @@ class TwinrPersonalGraphStore:
         self,
         items: list[dict[str, object]],
         *,
-        query_tokens: set[str],
+        query_text: str | None,
         limit: int = 8,
         fallback_limit: int = 3,
     ) -> list[dict[str, object]]:
         return self._rank_prompt_items(
             items,
-            query_tokens=query_tokens,
-            weighted_fields=(
-                ("summary", 4),
-                ("when", 3),
-                ("date", 3),
-                ("details", 2),
-                ("related_people", 3),
-            ),
+            query_text=query_text,
             limit=limit,
             fallback_limit=fallback_limit,
         )
@@ -638,32 +587,43 @@ class TwinrPersonalGraphStore:
         self,
         items: list[dict[str, object]],
         *,
-        query_tokens: set[str],
-        weighted_fields: tuple[tuple[str, int], ...],
+        query_text: str | None,
         limit: int,
         fallback_limit: int,
     ) -> list[dict[str, object]]:
         if not items:
             return []
-        if not query_tokens:
+        clean_query = _normalize_text(query_text or "", limit=220)
+        if not clean_query:
             return items[:limit]
-        scored: list[tuple[int, int, dict[str, object]]] = []
-        for index, item in enumerate(items):
-            score = 0
-            for field_name, weight in weighted_fields:
-                value = item.get(field_name)
-                tokens = self._prompt_item_tokens(value)
-                overlap = len(query_tokens & tokens)
-                if overlap > 0:
-                    score += overlap * weight
-            if score > 0:
-                scored.append((score, index, item))
-        if not scored:
+        selector = FullTextSelector(
+            tuple(
+                FullTextDocument(
+                    doc_id=str(index),
+                    category="prompt_item",
+                    content=self._prompt_item_search_text(item),
+                )
+                for index, item in enumerate(items)
+            )
+        )
+        selected_ids = selector.search(
+            clean_query,
+            limit=limit,
+            category="prompt_item",
+            allow_fallback=fallback_limit > 0,
+        )
+        if not selected_ids:
             if fallback_limit <= 0:
                 return []
             return items[:fallback_limit]
-        scored.sort(key=lambda row: (-row[0], row[1]))
-        return [item for _score, _index, item in scored[:limit]]
+        selected: list[dict[str, object]] = []
+        for item_id in selected_ids:
+            if not item_id.isdigit():
+                continue
+            index = int(item_id)
+            if 0 <= index < len(items):
+                selected.append(items[index])
+        return selected
 
     def _subtext_preferences(self, items: list[dict[str, object]]) -> list[dict[str, str]]:
         cues: list[dict[str, str]] = []
@@ -738,13 +698,23 @@ class TwinrPersonalGraphStore:
             cues.append(cue)
         return cues
 
-    def _prompt_item_tokens(self, value: object) -> set[str]:
+    def _prompt_item_search_text(self, value: object) -> str:
+        return _normalize_text(" ".join(self._prompt_item_strings(value)), limit=480)
+
+    def _prompt_item_strings(self, value: object) -> list[str]:
+        if isinstance(value, str):
+            return [value]
         if isinstance(value, (list, tuple)):
-            tokens: set[str] = set()
+            parts: list[str] = []
             for item in value:
-                tokens.update(_tokenize(str(item)))
-            return tokens
-        return set(_tokenize(str(value or "")))
+                parts.extend(self._prompt_item_strings(item))
+            return parts
+        if isinstance(value, dict):
+            parts: list[str] = []
+            for item in value.values():
+                parts.extend(self._prompt_item_strings(item))
+            return parts
+        return []
 
     def _prompt_contacts(self, document: TwinrGraphDocumentV1, *, limit: int = 12) -> list[dict[str, object]]:
         contacts: list[dict[str, object]] = []
@@ -847,137 +817,6 @@ class TwinrPersonalGraphStore:
             plans.append(((day_key or "9999-99-99", plan.label.lower()), item))
         plans.sort(key=lambda item: item[0])
         return [item for _sort_key, item in plans[:limit]]
-
-    def _collect_temporal_multihop_hints(
-        self,
-        *,
-        document: TwinrGraphDocumentV1,
-        query_text: str,
-        query_tokens: set[str],
-        today_key: str,
-    ) -> tuple[list[tuple[int, str]], set[str]]:
-        relevant_day_keys = self._query_day_keys(query_text, query_tokens=query_tokens, today_key=today_key)
-        tomorrow_key = (_now_in_timezone(self.timezone_name).date() + timedelta(days=1)).isoformat()
-        query_mentions_contact = bool(query_tokens & _CONTACT_QUERY_TOKENS)
-        scored: list[tuple[int, str]] = []
-        preferred_contact_ids: set[str] = set()
-
-        for edge in self._outgoing_edges(document, self.user_node_id, edge_types={"user_plans"}):
-            plan = self._node_by_id(document, edge.target_node_id)
-            if plan is None:
-                continue
-            when_text = str((edge.attributes or {}).get("when_text", "") or "")
-            day_key = str((edge.attributes or {}).get("day_key", "") or "")
-            plan_tokens = set(_tokenize(plan.label))
-            if when_text:
-                plan_tokens.update(_tokenize(when_text))
-            score = len(query_tokens & plan_tokens)
-            if relevant_day_keys and day_key in relevant_day_keys:
-                score += 4
-            if query_tokens & {"termin", "treffen", "plan", "kalender", "physiotherapie", "arzt"} and (
-                day_key in relevant_day_keys or score > 0
-            ):
-                score += 1
-            if score <= 0:
-                continue
-            people = self._related_people_for_plan(document, plan.node_id)
-            if not people:
-                continue
-            for person in people:
-                option = self._contact_option(document, person)
-                preferred_contact_ids.add(person.node_id)
-                person_tokens = set(_tokenize(option.label))
-                if option.role:
-                    person_tokens.update(_tokenize(option.role))
-                person_score = score + max(1, len(query_tokens & person_tokens))
-                if query_mentions_contact and (option.phones or option.emails):
-                    person_score += 2
-                time_phrase = self._time_phrase(day_key=day_key, when_text=when_text, today_key=today_key, tomorrow_key=tomorrow_key)
-                if query_mentions_contact:
-                    line = f"Passender Kontakt zum Plan {time_phrase}: {option.label}"
-                    if option.detail:
-                        line += f" ({option.detail})"
-                else:
-                    line = f"Plan {time_phrase}: {plan.label} mit {option.label}"
-                    if option.role:
-                        line += f" ({option.role})"
-                scored.append((person_score, line))
-        return scored, preferred_contact_ids
-
-    def _collect_store_multihop_hints(
-        self,
-        *,
-        document: TwinrGraphDocumentV1,
-        query_tokens: set[str],
-    ) -> list[tuple[int, str]]:
-        if not query_tokens & _SHOPPING_QUERY_TOKENS:
-            return []
-        preferred_brand_edges = {
-            edge.target_node_id: edge
-            for edge in self._outgoing_edges(document, self.user_node_id, edge_types={"user_prefers_brand"})
-        }
-        scored: list[tuple[int, str]] = []
-        for edge in self._outgoing_edges(document, self.user_node_id, edge_types={"user_usually_buys_at"}):
-            store = self._node_by_id(document, edge.target_node_id)
-            if store is None or store.node_type != "place":
-                continue
-            product = _normalize_text(str((edge.attributes or {}).get("for_product", "")), limit=60)
-            carry_labels: list[str] = []
-            for carry_edge in self._outgoing_edges(document, store.node_id, edge_types={"general_carries_brand"}):
-                if carry_edge.target_node_id not in preferred_brand_edges:
-                    continue
-                brand = self._node_by_id(document, carry_edge.target_node_id)
-                if brand is not None:
-                    carry_labels.append(brand.label)
-            near_user = self._node_is_near_user(document, store.node_id)
-            score = 2
-            if product and set(_tokenize(product)) & query_tokens:
-                score += 2
-            if carry_labels:
-                score += 3
-            if near_user:
-                score += 2
-            if score <= 2:
-                continue
-            line = f"Persoenlicher Einkaufshinweis: {store.label}"
-            if carry_labels:
-                line += f" fuehrt wahrscheinlich {', '.join(sorted(set(carry_labels)))}"
-                if product:
-                    line += f" fuer {product}"
-            elif product:
-                line += f" ist ein passender Ort fuer {product}"
-            if near_user:
-                line += " und ist in der Naehe."
-            else:
-                line += "."
-            scored.append((score, line))
-        return scored
-
-    def _collect_contact_hints(
-        self,
-        *,
-        document: TwinrGraphDocumentV1,
-        query_tokens: set[str],
-        preferred_person_node_ids: set[str],
-    ) -> list[tuple[int, str]]:
-        scored: list[tuple[int, str]] = []
-        for option in self._contact_options(document, self._all_contact_nodes(document)):
-            if preferred_person_node_ids and option.person_node_id not in preferred_person_node_ids:
-                continue
-            relevance_tokens = set(_tokenize(option.label))
-            if option.detail:
-                relevance_tokens.update(_tokenize(option.detail))
-            overlap = len(query_tokens & relevance_tokens)
-            if overlap <= 0:
-                continue
-            score = overlap + 1
-            if preferred_person_node_ids:
-                score += 2
-            line = f"Bekannter Kontakt: {option.label}"
-            if option.detail:
-                line += f" ({option.detail})"
-            scored.append((score, line))
-        return scored
 
     def _empty_document(self) -> TwinrGraphDocumentV1:
         user = TwinrGraphNodeV1(node_id=self.user_node_id, node_type="user", label=self.user_label)
@@ -1181,27 +1020,6 @@ class TwinrPersonalGraphStore:
         if len(labels) == 2:
             return f"I know two contacts named {name}: {labels[0]} or {labels[1]}?"
         return f"I know multiple contacts named {name}: {', '.join(labels[:-1])}, or {labels[-1]}?"
-
-    def _query_day_keys(self, query_text: str, *, query_tokens: set[str], today_key: str) -> set[str]:
-        day_keys: set[str] = set()
-        if query_tokens & _TODAY_QUERY_TOKENS:
-            day_keys.add(today_key)
-        if query_tokens & _TOMORROW_QUERY_TOKENS:
-            day_keys.add((_now_in_timezone(self.timezone_name).date() + timedelta(days=1)).isoformat())
-        for match in _DATE_RE.finditer(query_text):
-            day_keys.add(match.group("date"))
-        return day_keys
-
-    def _time_phrase(self, *, day_key: str, when_text: str, today_key: str, tomorrow_key: str) -> str:
-        if day_key == today_key:
-            return "heute"
-        if day_key == tomorrow_key:
-            return "morgen"
-        if when_text:
-            return when_text
-        if day_key:
-            return day_key
-        return "zeitlich passend"
 
     def _node_by_id(self, document: TwinrGraphDocumentV1, node_id: str) -> TwinrGraphNodeV1 | None:
         for node in document.nodes:

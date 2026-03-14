@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import re
 from typing import Mapping
 
 from twinr.memory.chonkydb.models import JsonDict
+from twinr.text_utils import is_valid_identifier_namespace, is_valid_namespaced_identifier
 
 TWINR_GRAPH_SCHEMA_NAME = "twinr_graph"
 TWINR_GRAPH_SCHEMA_VERSION = 1
@@ -48,10 +48,6 @@ TWINR_GRAPH_ALLOWED_EDGE_TYPES = frozenset(
 TWINR_GRAPH_EDGE_STATUSES = frozenset(("active", "uncertain", "superseded", "invalid"))
 TWINR_GRAPH_NODE_STATUSES = frozenset(("active", "inactive", "merged", "invalid"))
 
-_NODE_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-_NODE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*:[a-z0-9][a-z0-9._:-]*$")
-
-
 def graph_edge_namespace(edge_type: str) -> str:
     prefix, _, _rest = edge_type.partition("_")
     return prefix
@@ -66,14 +62,14 @@ def _drop_none(payload: JsonDict) -> JsonDict:
 
 
 def _validate_node_id(node_id: str, *, field_name: str) -> None:
-    if not _NODE_ID_RE.fullmatch(node_id):
+    if not is_valid_namespaced_identifier(node_id):
         raise ValueError(
             f"{field_name} must look like '<type>:<stable-id>' using lowercase letters, digits, '.', '_', '-', or ':'."
         )
 
 
 def _validate_node_type(node_type: str) -> None:
-    if not _NODE_TYPE_RE.fullmatch(node_type):
+    if not is_valid_identifier_namespace(node_type):
         raise ValueError("node_type must use lowercase letters, digits, and underscores only.")
 
 

@@ -38,6 +38,12 @@ class TwinrRealtimeToolDelegatesMixin:
     def _handle_lookup_contact_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_lookup_contact(arguments)
 
+    def _handle_get_memory_conflicts_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_get_memory_conflicts(arguments)
+
+    def _handle_resolve_memory_conflict_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_resolve_memory_conflict(arguments)
+
     def _handle_remember_preference_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_remember_preference(arguments)
 

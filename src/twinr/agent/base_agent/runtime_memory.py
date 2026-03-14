@@ -191,3 +191,60 @@ class TwinrRuntimeMemoryMixin:
             data={"label": compact_text(result.label), "edge_type": result.edge_type or ""},
         )
         return result
+
+    def select_long_term_memory_conflicts(
+        self,
+        *,
+        query_text: str | None = None,
+        limit: int | None = None,
+    ):
+        return self.long_term_memory.select_conflict_queue(
+            query_text=query_text,
+            limit=limit,
+        )
+
+    def resolve_long_term_memory_conflict(
+        self,
+        *,
+        slot_key: str,
+        selected_memory_id: str,
+    ):
+        return self.long_term_memory.resolve_conflict(
+            slot_key=slot_key,
+            selected_memory_id=selected_memory_id,
+        )
+
+    def reserve_long_term_proactive_candidate(self, *, now=None):
+        return self.long_term_memory.reserve_proactive_candidate(now=now)
+
+    def preview_long_term_proactive_candidate(self, *, now=None):
+        return self.long_term_memory.preview_proactive_candidate(now=now)
+
+    def reserve_specific_long_term_proactive_candidate(self, candidate, *, now=None):
+        return self.long_term_memory.reserve_specific_proactive_candidate(candidate, now=now)
+
+    def mark_long_term_proactive_candidate_delivered(
+        self,
+        reservation,
+        *,
+        delivered_at=None,
+        prompt_text: str | None = None,
+    ):
+        return self.long_term_memory.mark_proactive_candidate_delivered(
+            reservation,
+            delivered_at=delivered_at,
+            prompt_text=prompt_text,
+        )
+
+    def mark_long_term_proactive_candidate_skipped(
+        self,
+        reservation,
+        *,
+        reason: str,
+        skipped_at=None,
+    ):
+        return self.long_term_memory.mark_proactive_candidate_skipped(
+            reservation,
+            reason=reason,
+            skipped_at=skipped_at,
+        )

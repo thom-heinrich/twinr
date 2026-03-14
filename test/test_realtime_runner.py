@@ -1,5 +1,6 @@
 from array import array
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 import math
@@ -7,12 +8,19 @@ import sys
 import tempfile
 import time
 import unittest
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.automations import AutomationAction
 from twinr.config import TwinrConfig
 from twinr.hardware import VoiceAssessment
+from twinr.memory.longterm.models import (
+    LongTermConsolidationResultV1,
+    LongTermMemoryConflictV1,
+    LongTermMemoryObjectV1,
+    LongTermSourceRefV1,
+)
 from twinr.memory.reminders import now_in_timezone
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority, WakewordMatch
 from twinr.providers.openai import OpenAITextResponse
@@ -35,6 +43,15 @@ def _voice_sample_pcm_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0
         )
         frames.append(max(-32767, min(32767, int(sample * 32767))))
     return frames.tobytes()
+
+
+def _longterm_source(event_id: str) -> LongTermSourceRefV1:
+    return LongTermSourceRefV1(
+        source_type="conversation_turn",
+        event_ids=(event_id,),
+        speaker="user",
+        modality="voice",
+    )
 
 
 class FakeRealtimeSession:
@@ -115,6 +132,7 @@ class FakePrintBackend:
         self.search_calls: list[tuple[str, tuple[tuple[str, str], ...] | None, str | None, str | None]] = []
         self.vision_calls: list[tuple[str, list[object], tuple[tuple[str, str], ...] | None, bool | None]] = []
         self.search_sleep_s = 0.0
+        self.synthesize_sleep_s = 0.0
         self.synthesize_calls: list[str] = []
         self.reminder_calls: list[object] = []
         self.generic_reminder_calls: list[tuple[str, str | None, bool | None]] = []
@@ -169,7 +187,16 @@ class FakePrintBackend:
 
     def synthesize_stream(self, text: str):
         self.synthesize_calls.append(text)
+        if self.synthesize_sleep_s > 0:
+            time.sleep(self.synthesize_sleep_s)
         yield b"PCM"
+
+    def synthesize(self, text: str, *, voice=None, response_format=None, instructions=None) -> bytes:
+        del voice, response_format, instructions
+        self.synthesize_calls.append(text)
+        if self.synthesize_sleep_s > 0:
+            time.sleep(self.synthesize_sleep_s)
+        return b"WAVPCM"
 
     def phrase_due_reminder_with_metadata(self, reminder):
         self.reminder_calls.append(reminder)
@@ -345,6 +372,9 @@ class FakePlayer:
     def play_wav_chunks(self, chunks) -> None:
         self.played.append(b"".join(chunks))
 
+    def play_wav_bytes(self, audio_bytes: bytes) -> None:
+        self.played.append(audio_bytes)
+
 
 class FakePrinter:
     def __init__(self) -> None:
@@ -423,6 +453,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         temp_dir_handle = tempfile.TemporaryDirectory()
         temp_root = Path(temp_dir_handle.name)
         config = config or TwinrConfig()
+        original_project_root = Path(config.project_root).resolve()
+        sandbox_project_default = config.project_root == "."
         config = replace(
             config,
             project_root=str(temp_root if config.project_root == "." else Path(config.project_root)),
@@ -430,21 +462,43 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 config.runtime_state_path,
                 temp_root / "runtime-state.json",
                 default="/tmp/twinr-runtime-state.json",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
             ),
             reminder_store_path=self._sandbox_path(
                 config.reminder_store_path,
                 temp_root / "state" / "reminders.json",
                 default="state/reminders.json",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
+            ),
+            memory_markdown_path=self._sandbox_path(
+                config.memory_markdown_path,
+                temp_root / "state" / "MEMORY.md",
+                default="state/MEMORY.md",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
             ),
             automation_store_path=self._sandbox_path(
                 config.automation_store_path,
                 temp_root / "state" / "automations.json",
                 default="state/automations.json",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
             ),
             adaptive_timing_store_path=self._sandbox_path(
                 config.adaptive_timing_store_path,
                 temp_root / "state" / "adaptive-timing.json",
                 default="state/adaptive_timing.json",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
+            ),
+            long_term_memory_path=self._sandbox_path(
+                config.long_term_memory_path,
+                temp_root / "state" / "chonkydb",
+                default="state/chonkydb",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
             ),
         )
         lines: list[str] = []
@@ -483,9 +537,18 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         return loop, lines, realtime_session, resolved_print_backend, recorder, player, printer
 
     @staticmethod
-    def _sandbox_path(current: str, isolated: Path, *, default: str) -> str:
+    def _sandbox_path(
+        current: str,
+        isolated: Path,
+        *,
+        default: str,
+        project_root: Path,
+        sandbox_project_default: bool,
+    ) -> str:
         path = Path(current)
-        if current == default or not path.is_absolute():
+        default_path = Path(default)
+        project_default = project_root / default_path if not default_path.is_absolute() else default_path
+        if current == default or not path.is_absolute() or (sandbox_project_default and path == project_default):
             return str(isolated)
         return current
 
@@ -505,7 +568,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(recorder.start_timeouts, [8.0])
         self.assertEqual(recorder.speech_start_chunks, [None])
         self.assertEqual(recorder.ignore_initial_ms, [0])
-        self.assertEqual(recorder.pause_grace_values, [900])
+        self.assertEqual(recorder.pause_grace_values, [450])
         self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
         self.assertEqual(len(realtime_session.conversations), 1)
         self._assert_language_contract_only(realtime_session.conversations[0])
@@ -520,6 +583,60 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("status=answering", lines)
         self.assertIn("status=waiting", lines)
         self.assertTrue(any(line.startswith("timing_realtime_ms=") for line in lines))
+
+    def test_green_button_uses_processing_and_answering_feedback(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        feedback_kinds: list[str] = []
+
+        def fake_start(kind: str):
+            feedback_kinds.append(kind)
+            return lambda: None
+
+        loop._start_working_feedback_loop = fake_start  # type: ignore[method-assign]
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(feedback_kinds[:2], ["processing", "answering"])
+
+    def test_green_button_falls_back_to_tts_when_realtime_returns_text_only(self) -> None:
+        class TextOnlyRealtimeSession(FakeRealtimeSession):
+            def run_audio_turn(
+                self,
+                audio_pcm: bytes,
+                *,
+                conversation=None,
+                on_audio_chunk=None,
+                on_output_text_delta=None,
+            ) -> OpenAIRealtimeTurn:
+                self.calls.append(audio_pcm)
+                self.conversations.append(conversation)
+                if on_output_text_delta is not None:
+                    on_output_text_delta("Guten ")
+                    on_output_text_delta("Tag")
+                if self.turns:
+                    return self.turns.pop(0)
+                return OpenAIRealtimeTurn(
+                    transcript="Hallo Twinr",
+                    response_text="Guten Tag",
+                    response_id="resp_rt_text_only",
+                    end_conversation=False,
+                )
+
+        backend = FakePrintBackend()
+        backend.synthesize_sleep_s = 0.12
+        loop, lines, realtime_session, _print_backend, _recorder, player, _printer = self.make_loop(
+            print_backend=backend,
+        )
+        loop.realtime_session = TextOnlyRealtimeSession()
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(realtime_session.calls, [])
+        self.assertEqual(loop.realtime_session.calls, [b"PCMINPUT"])
+        self.assertEqual(backend.synthesize_calls, ["Guten Tag"])
+        self.assertEqual(player.played, [b"PCM"])
+        self.assertIn("realtime_audio_fallback=true", lines)
+        self.assertTrue(any(line.startswith("timing_tts_fallback_ms=") for line in lines))
 
     def test_yellow_button_accepts_split_support_providers(self) -> None:
         backend = FakePrintBackend()
@@ -583,6 +700,19 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("wakeword_mode=listen", lines)
         self.assertIn("wakeword_ack=Ja?", lines)
 
+    def test_wakeword_ack_uses_cached_audio_when_prefetched(self) -> None:
+        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
+            config=TwinrConfig(wakeword_enabled=True)
+        )
+
+        loop._prime_wakeword_ack_cache()
+        loop._acknowledge_wakeword()
+
+        self.assertEqual(print_backend.synthesize_calls, ["Ja?"])
+        self.assertEqual(player.played, [b"WAVPCM"])
+        self.assertIn("wakeword_ack=Ja?", lines)
+        self.assertIn("wakeword_ack_cached=true", lines)
+
     def test_yellow_button_uses_print_backend(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop()
         loop.runtime.last_response = "Guten Tag"
@@ -595,6 +725,21 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(printer.printed, ["GUTEN TAG"])
         self.assertIn("status=printing", lines)
         self.assertEqual(lines[-1], "status=waiting")
+
+    def test_yellow_button_uses_printing_feedback(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        loop.runtime.last_response = "Guten Tag"
+        feedback_kinds: list[str] = []
+
+        def fake_start(kind: str):
+            feedback_kinds.append(kind)
+            return lambda: None
+
+        loop._start_working_feedback_loop = fake_start  # type: ignore[method-assign]
+
+        loop.handle_button_press("yellow")
+
+        self.assertEqual(feedback_kinds, ["printing"])
 
     def test_follow_up_turn_beeps_again_and_stops_on_timeout(self) -> None:
         config = TwinrConfig(
@@ -620,7 +765,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(recorder.start_timeouts, [8.0, 3.5])
         self.assertEqual(recorder.speech_start_chunks, [None, 5])
         self.assertEqual(recorder.ignore_initial_ms, [0, 420])
-        self.assertEqual(recorder.pause_grace_values, [900, 900])
+        self.assertEqual(recorder.pause_grace_values, [450, 450])
         self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
         self._assert_language_contract_only(realtime_session.conversations[0])
         self.assertEqual(len(player.tones), 2)
@@ -678,8 +823,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             loop.handle_button_press("green")
             loop.handle_button_press("green")
 
-        self.assertEqual(recorder.pause_values, [1200, 1340])
-        self.assertEqual(recorder.pause_grace_values, [900, 990])
+        self.assertEqual(recorder.pause_values, [1200, 1270])
+        self.assertEqual(recorder.pause_grace_values, [450, 490])
         self.assertEqual(realtime_session.calls, [b"FIRST", b"SECOND"])
 
     def test_follow_up_turn_receives_previous_conversation_history(self) -> None:
@@ -752,7 +897,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop.handle_button_press("green")
 
         self.assertEqual(recorder.pause_values, [1200])
-        self.assertEqual(recorder.pause_grace_values, [900])
+        self.assertEqual(recorder.pause_grace_values, [450])
         self.assertEqual(len(player.tones), 1)
         self.assertIn("conversation_ended=true", lines)
         self.assertEqual(loop.runtime.status.value, "waiting")
@@ -986,6 +1131,93 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIsNotNone(stored.last_triggered_at)
         self.assertIn("automation_executed=true", lines)
 
+    def test_due_spoken_automation_is_governor_blocked_after_recent_social_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                automation_poll_interval_s=0.0,
+                proactive_governor_global_prompt_cooldown_s=300.0,
+                proactive_governor_source_repeat_cooldown_s=0.0,
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            entry = loop.runtime.create_time_automation(
+                name="Daily weather",
+                schedule="daily",
+                time_of_day=now_in_timezone(config.local_timezone_name).strftime("%H:%M"),
+                actions=(
+                    AutomationAction(
+                        kind="llm_prompt",
+                        text="Give the morning weather report.",
+                        payload={"delivery": "spoken", "allow_web_search": True},
+                        enabled=True,
+                    ),
+                ),
+                source="test",
+            )
+
+            spoke = loop.handle_social_trigger(
+                SocialTriggerDecision(
+                    trigger_id="attention_window",
+                    prompt="Soll ich dir helfen?",
+                    reason="User seems attentive and quiet.",
+                    observed_at=12.0,
+                    priority=SocialTriggerPriority.ATTENTION_WINDOW,
+                    score=0.92,
+                    threshold=0.86,
+                    evidence=(),
+                )
+            )
+            executed = loop._maybe_run_due_automation()
+            stored = loop.runtime.automation_store.get(entry.automation_id)
+
+        self.assertTrue(spoke)
+        self.assertFalse(executed)
+        self.assertEqual(len(print_backend.automation_calls), 0)
+        self.assertIn("automation_skipped=governor_global_prompt_cooldown_active", lines)
+        assert stored is not None
+        self.assertIsNone(stored.last_triggered_at)
+
+    def test_idle_loop_spoken_automation_uses_processing_and_answering_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                automation_poll_interval_s=0.0,
+            )
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+                config=config
+            )
+            loop.runtime.create_time_automation(
+                name="Daily weather",
+                schedule="daily",
+                time_of_day=now_in_timezone(config.local_timezone_name).strftime("%H:%M"),
+                actions=(
+                    AutomationAction(
+                        kind="llm_prompt",
+                        text="Give the morning weather report.",
+                        payload={"delivery": "spoken", "allow_web_search": True},
+                        enabled=True,
+                    ),
+                ),
+                source="test",
+            )
+            loop.print_backend.synthesize_sleep_s = 0.12
+            feedback_kinds: list[str] = []
+
+            def fake_start(kind: str):
+                feedback_kinds.append(kind)
+                return lambda: None
+
+            loop._start_working_feedback_loop = fake_start  # type: ignore[method-assign]
+
+            executed = loop._maybe_run_due_automation()
+
+        self.assertTrue(executed)
+        self.assertEqual(feedback_kinds[:2], ["processing", "answering"])
+
     def test_idle_loop_executes_due_printed_automation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -1019,6 +1251,44 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         assert stored is not None
         self.assertIsNotNone(stored.last_triggered_at)
         self.assertIn("automation_print_job=request id is Test-2 (1 file(s))", lines)
+
+    def test_idle_loop_printed_automation_uses_processing_and_printing_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                automation_poll_interval_s=0.0,
+            )
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+                config=config
+            )
+            loop.runtime.create_time_automation(
+                name="Daily headlines",
+                schedule="daily",
+                time_of_day=now_in_timezone(config.local_timezone_name).strftime("%H:%M"),
+                actions=(
+                    AutomationAction(
+                        kind="llm_prompt",
+                        text="Print the main headlines of the day.",
+                        payload={"delivery": "printed", "allow_web_search": True},
+                        enabled=True,
+                    ),
+                ),
+                source="test",
+            )
+            feedback_kinds: list[str] = []
+
+            def fake_start(kind: str):
+                feedback_kinds.append(kind)
+                return lambda: None
+
+            loop._start_working_feedback_loop = fake_start  # type: ignore[method-assign]
+
+            executed = loop._maybe_run_due_automation()
+
+        self.assertTrue(executed)
+        self.assertEqual(feedback_kinds[:2], ["processing", "printing"])
 
     def test_idle_loop_executes_sensor_automation_from_camera_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1145,6 +1415,125 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("reminder_delivered=true", lines)
         self.assertTrue(stored_entries[0].delivered)
 
+    def test_social_trigger_is_governor_blocked_after_recent_reminder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                reminder_store_path=str(Path(temp_dir) / "state" / "reminders.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                reminder_poll_interval_s=0.0,
+                proactive_governor_global_prompt_cooldown_s=300.0,
+                proactive_governor_source_repeat_cooldown_s=0.0,
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            loop.runtime.schedule_reminder(
+                due_at=now_in_timezone(config.local_timezone_name).isoformat(),
+                summary="Medikament nehmen",
+                kind="medication",
+                source="test",
+            )
+
+            delivered = loop._maybe_deliver_due_reminder()
+            spoke = loop.handle_social_trigger(
+                SocialTriggerDecision(
+                    trigger_id="attention_window",
+                    prompt="Soll ich dir helfen?",
+                    reason="User seems attentive and quiet.",
+                    observed_at=12.0,
+                    priority=SocialTriggerPriority.ATTENTION_WINDOW,
+                    score=0.92,
+                    threshold=0.86,
+                    evidence=(),
+                )
+            )
+
+        self.assertTrue(delivered)
+        self.assertFalse(spoke)
+        self.assertEqual(len(print_backend.reminder_calls), 1)
+        self.assertEqual(player.played, [b"PCM"])
+        self.assertIn("social_trigger_skipped=governor_global_prompt_cooldown_active", lines)
+
+    def test_idle_loop_reminder_uses_processing_and_answering_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                reminder_store_path=str(Path(temp_dir) / "state" / "reminders.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                reminder_poll_interval_s=0.0,
+            )
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+                config=config
+            )
+            loop.runtime.schedule_reminder(
+                due_at=now_in_timezone(config.local_timezone_name).isoformat(),
+                summary="Medikament nehmen",
+                kind="medication",
+                source="test",
+            )
+            loop.print_backend.synthesize_sleep_s = 0.12
+            feedback_kinds: list[str] = []
+
+            def fake_start(kind: str):
+                feedback_kinds.append(kind)
+                return lambda: None
+
+            loop._start_working_feedback_loop = fake_start  # type: ignore[method-assign]
+
+            delivered = loop._maybe_deliver_due_reminder()
+
+        self.assertTrue(delivered)
+        self.assertEqual(feedback_kinds[:2], ["processing", "answering"])
+
+    def test_idle_loop_delivers_longterm_proactive_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                long_term_memory_proactive_enabled=True,
+                long_term_memory_proactive_poll_interval_s=0.0,
+                long_term_memory_proactive_min_confidence=0.7,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            loop.runtime.long_term_memory.object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:thread",
+                    occurred_at=datetime(2026, 3, 14, 12, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                    episodic_objects=(),
+                    durable_objects=(
+                        LongTermMemoryObjectV1(
+                            memory_id="thread:walk_weather",
+                            kind="thread_summary",
+                            summary="Ongoing thread about the user's plan to walk if the weather is nice.",
+                            details="Reflected from multiple related turns.",
+                            source=_longterm_source("turn:thread"),
+                            status="active",
+                            confidence=0.82,
+                            sensitivity="normal",
+                            slot_key="thread:user:main:walk_weather",
+                            value_key="walk_weather",
+                            attributes={"support_count": 4},
+                        ),
+                    ),
+                    deferred_objects=(),
+                    conflicts=(),
+                    graph_edges=(),
+                )
+            )
+
+            delivered = loop._maybe_run_long_term_memory_proactive()
+            history = loop.runtime.long_term_memory.proactive_policy.state_store.load_entries()
+
+        self.assertTrue(delivered)
+        self.assertEqual(len(print_backend.proactive_calls), 1)
+        self.assertEqual(print_backend.proactive_calls[0][0], "longterm:candidate:thread_walk_weather:followup")
+        self.assertEqual(player.played, [b"PCM"])
+        self.assertIn("longterm_proactive_candidate=candidate:thread_walk_weather:followup", lines)
+        self.assertIn("longterm_proactive_prompt_mode=llm", lines)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].delivery_count, 1)
+
     def test_idle_loop_delivers_due_reminder_with_generic_backend_fallback(self) -> None:
         class LegacyReminderBackend(FakePrintBackend):
             phrase_due_reminder_with_metadata = None
@@ -1246,6 +1635,149 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(resolved["phones"], ["01761234"])
         self.assertIn("graph_contact_tool_call=true", lines)
         self.assertIn("graph_contact_lookup=true", lines)
+
+    def test_memory_conflict_tool_calls_list_and_resolve_open_conflicts(self) -> None:
+        existing = LongTermMemoryObjectV1(
+            memory_id="fact:corinna_phone_old",
+            kind="contact_method_fact",
+            summary="Corinna Maier can be reached at +491761234.",
+            details="Use the mobile number ending in 1234.",
+            source=_longterm_source("turn:1"),
+            status="active",
+            confidence=0.95,
+            slot_key="contact:person:corinna_maier:phone",
+            value_key="+491761234",
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        candidate = LongTermMemoryObjectV1(
+            memory_id="fact:corinna_phone_new",
+            kind="contact_method_fact",
+            summary="Corinna Maier can be reached at +4940998877.",
+            details="Use the office number ending in 8877.",
+            source=_longterm_source("turn:2"),
+            status="uncertain",
+            confidence=0.92,
+            slot_key="contact:person:corinna_maier:phone",
+            value_key="+4940998877",
+            attributes={"person_ref": "person:corinna_maier"},
+        )
+        conflict = LongTermMemoryConflictV1(
+            slot_key="contact:person:corinna_maier:phone",
+            candidate_memory_id="fact:corinna_phone_new",
+            existing_memory_ids=("fact:corinna_phone_old",),
+            question="Which phone number should I use for Corinna Maier?",
+            reason="Conflicting phone numbers exist.",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+            loop.runtime.long_term_memory.object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:2",
+                    occurred_at=datetime(2026, 3, 14, 12, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                    episodic_objects=(),
+                    durable_objects=(existing,),
+                    deferred_objects=(candidate,),
+                    conflicts=(conflict,),
+                    graph_edges=(),
+                )
+            )
+
+            listed = loop._handle_get_memory_conflicts_tool_call({"query_text": "Corinna phone number"})
+            resolved = loop._handle_resolve_memory_conflict_tool_call(
+                {
+                    "slot_key": "contact:person:corinna_maier:phone",
+                    "selected_memory_id": "fact:corinna_phone_new",
+                }
+            )
+            objects = {
+                item.memory_id: item
+                for item in loop.runtime.long_term_memory.object_store.load_objects()
+            }
+            conflicts = loop.runtime.long_term_memory.object_store.load_conflicts()
+
+        self.assertEqual(listed["status"], "ok")
+        self.assertEqual(listed["conflict_count"], 1)
+        self.assertEqual(listed["conflicts"][0]["slot_key"], "contact:person:corinna_maier:phone")
+        self.assertEqual(len(listed["conflicts"][0]["options"]), 2)
+        self.assertEqual(resolved["status"], "resolved")
+        self.assertEqual(resolved["selected_memory_id"], "fact:corinna_phone_new")
+        self.assertEqual(resolved["superseded_memory_ids"], ["fact:corinna_phone_old"])
+        self.assertEqual(objects["fact:corinna_phone_new"].status, "active")
+        self.assertEqual(objects["fact:corinna_phone_old"].status, "superseded")
+        self.assertEqual(conflicts, ())
+        self.assertIn("memory_conflict_tool_call=true", lines)
+        self.assertIn("memory_conflict_resolved=contact:person:corinna_maier:phone", lines)
+
+    def test_resolve_memory_conflict_requires_confirmation_when_speaker_signal_is_uncertain(self) -> None:
+        existing = LongTermMemoryObjectV1(
+            memory_id="fact:corinna_phone_old",
+            kind="contact_method_fact",
+            summary="Corinna Maier can be reached at +491761234.",
+            source=_longterm_source("turn:1"),
+            status="active",
+            confidence=0.95,
+            slot_key="contact:person:corinna_maier:phone",
+            value_key="+491761234",
+        )
+        candidate = LongTermMemoryObjectV1(
+            memory_id="fact:corinna_phone_new",
+            kind="contact_method_fact",
+            summary="Corinna Maier can be reached at +4940998877.",
+            source=_longterm_source("turn:2"),
+            status="uncertain",
+            confidence=0.92,
+            slot_key="contact:person:corinna_maier:phone",
+            value_key="+4940998877",
+        )
+        conflict = LongTermMemoryConflictV1(
+            slot_key="contact:person:corinna_maier:phone",
+            candidate_memory_id="fact:corinna_phone_new",
+            existing_memory_ids=("fact:corinna_phone_old",),
+            question="Which phone number should I use for Corinna Maier?",
+            reason="Conflicting phone numbers exist.",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+            loop.runtime.long_term_memory.object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:2",
+                    occurred_at=datetime(2026, 3, 14, 12, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                    episodic_objects=(),
+                    durable_objects=(existing,),
+                    deferred_objects=(candidate,),
+                    conflicts=(conflict,),
+                    graph_edges=(),
+                )
+            )
+            loop.runtime.user_voice_status = "unknown_voice"
+
+            with self.assertRaisesRegex(RuntimeError, "Please ask for clear confirmation"):
+                loop._handle_resolve_memory_conflict_tool_call(
+                    {
+                        "slot_key": "contact:person:corinna_maier:phone",
+                        "selected_memory_id": "fact:corinna_phone_new",
+                    }
+                )
+
+            resolved = loop._handle_resolve_memory_conflict_tool_call(
+                {
+                    "slot_key": "contact:person:corinna_maier:phone",
+                    "selected_memory_id": "fact:corinna_phone_new",
+                    "confirmed": True,
+                }
+            )
+
+        self.assertEqual(resolved["status"], "resolved")
 
     def test_remember_preference_and_plan_tool_calls_feed_provider_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1431,7 +1963,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 {
                     "setting": "spoken_voice",
                     "action": "set",
-                    "value": "männliche Stimme",
+                    "value": "cedar",
                 }
             )
             speed_result = loop._handle_update_simple_setting_tool_call(
@@ -1509,7 +2041,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             search_feedback_delay_ms=0,
             search_feedback_pause_ms=0,
         )
-        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+        loop, lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop(config=config)
         print_backend.search_sleep_s = 0.02
 
         result = loop._handle_search_tool_call(
@@ -1534,7 +2066,6 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("Verified web lookup", loop.runtime.memory.turns[0].content)
         self.assertIn("search_tool_call=true", lines)
         self.assertTrue(any(line.startswith("search_source_1=") for line in lines))
-        self.assertGreaterEqual(len(player.tones), 1)
 
     def test_social_trigger_speaks_proactive_prompt(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop()
@@ -1589,6 +2120,37 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             "Hey Thom, schön dich zu sehen. Wie geht's dir?",
         )
         self.assertEqual(social_events[-1]["data"]["prompt_mode"], "llm")
+
+    def test_social_trigger_uses_processing_and_answering_feedback(self) -> None:
+        recorder = FakeRecorder(
+            recordings=[
+                RuntimeError("No speech detected before timeout"),
+            ]
+        )
+        loop, _lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop(
+            recorder=recorder
+        )
+        print_backend.synthesize_sleep_s = 0.12
+        feedback_kinds: list[str] = []
+
+        def fake_start(kind: str):
+            feedback_kinds.append(kind)
+            return lambda: None
+
+        loop._start_working_feedback_loop = fake_start  # type: ignore[method-assign]
+
+        spoke = loop.handle_social_trigger(
+            SocialTriggerDecision(
+                trigger_id="person_returned",
+                prompt="Hey Thom, schön dich zu sehen. Wie geht's dir?",
+                reason="Person returned after a long absence.",
+                observed_at=42.0,
+                priority=SocialTriggerPriority.PERSON_RETURNED,
+            )
+        )
+
+        self.assertTrue(spoke)
+        self.assertEqual(feedback_kinds[:2], ["processing", "answering"])
 
     def test_social_trigger_opens_hands_free_listening_window_and_times_out(self) -> None:
         recorder = FakeRecorder(

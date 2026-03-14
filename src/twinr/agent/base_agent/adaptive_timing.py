@@ -82,9 +82,9 @@ class AdaptiveTimingBounds:
             follow_up_start_timeout_min_s=follow_up_min,
             follow_up_start_timeout_max_s=max(follow_up_min + 4.0, 8.0),
             speech_pause_min_ms=speech_pause_min,
-            speech_pause_max_ms=max(speech_pause_min + 1200, 2600),
+            speech_pause_max_ms=speech_pause_min + 400,
             pause_grace_min_ms=pause_grace_min,
-            pause_grace_max_ms=max(pause_grace_min + 600, 1500),
+            pause_grace_max_ms=pause_grace_min + 200,
         )
 
 
@@ -268,8 +268,8 @@ class AdaptiveTimingStore:
         resumed_after_pause_count: int,
     ) -> AdaptiveTimingProfile:
         if resumed_after_pause_count > 0:
-            pause_step = min(240, 140 * resumed_after_pause_count)
-            grace_step = min(180, 90 * resumed_after_pause_count)
+            pause_step = min(140, 70 * resumed_after_pause_count)
+            grace_step = min(80, 40 * resumed_after_pause_count)
             return replace(
                 profile,
                 speech_pause_ms=_clamp_int(
@@ -287,17 +287,17 @@ class AdaptiveTimingStore:
             )
 
         clean_pause_streak = profile.clean_pause_streak + 1
-        if clean_pause_streak < 3:
+        if clean_pause_streak < 2:
             return replace(profile, clean_pause_streak=clean_pause_streak)
         return replace(
             profile,
             speech_pause_ms=_clamp_int(
-                profile.speech_pause_ms - 40,
+                profile.speech_pause_ms - 60,
                 lower=self.bounds.speech_pause_min_ms,
                 upper=self.bounds.speech_pause_max_ms,
             ),
             pause_grace_ms=_clamp_int(
-                profile.pause_grace_ms - 20,
+                profile.pause_grace_ms - 40,
                 lower=self.bounds.pause_grace_min_ms,
                 upper=self.bounds.pause_grace_max_ms,
             ),

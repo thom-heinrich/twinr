@@ -164,11 +164,13 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("update_simple_setting tool", instructions)
         self.assertIn("remember_contact tool", instructions)
         self.assertIn("lookup_contact tool", instructions)
+        self.assertIn("get_memory_conflicts tool", instructions)
+        self.assertIn("resolve_memory_conflict tool", instructions)
         self.assertIn("remember_preference tool", instructions)
         self.assertIn("remember_plan tool", instructions)
         self.assertIn("If the user asks which voices are available", instructions)
         self.assertIn("Use spoken_voice when the user explicitly asks you to change how your voice sounds", instructions)
-        self.assertIn("male voice, female voice, neutral voice", instructions)
+        self.assertIn("Resolve descriptive voice requests to the best supported Twinr voice", instructions)
         self.assertIn("Use speech_speed when the user explicitly asks you to speak slower or faster", instructions)
         self.assertIn("create_time_automation", instructions)
         self.assertIn("Local date/time context for resolving reminders, timers, and scheduled automations:", instructions)
@@ -305,6 +307,8 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "remember_memory": lambda _arguments: {"status": "saved"},
                 "remember_contact": lambda _arguments: {"status": "created"},
                 "lookup_contact": lambda _arguments: {"status": "found"},
+                "get_memory_conflicts": lambda _arguments: {"status": "ok", "conflicts": []},
+                "resolve_memory_conflict": lambda _arguments: {"status": "resolved"},
                 "remember_preference": lambda _arguments: {"status": "updated"},
                 "remember_plan": lambda _arguments: {"status": "created"},
                 "update_user_profile": lambda _arguments: {"status": "updated"},
@@ -337,6 +341,8 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "remember_memory",
                 "remember_contact",
                 "lookup_contact",
+                "get_memory_conflicts",
+                "resolve_memory_conflict",
                 "remember_preference",
                 "remember_plan",
                 "update_user_profile",
@@ -351,6 +357,11 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         )
         tools_by_name = {tool["name"]: tool for tool in connection.session.calls[0]["tools"]}
         self.assertIn("focus_hint", tools_by_name["print_receipt"]["parameters"]["properties"])
+        self.assertIn("exact wording", tools_by_name["print_receipt"]["description"])
+        self.assertIn(
+            "Required when the user asked to print exact text",
+            tools_by_name["print_receipt"]["parameters"]["properties"]["text"]["description"],
+        )
         self.assertIn("question", tools_by_name["search_live_info"]["parameters"]["properties"])
         self.assertIn("due_at", tools_by_name["schedule_reminder"]["parameters"]["properties"])
         self.assertIn("summary", tools_by_name["schedule_reminder"]["parameters"]["properties"])
@@ -364,6 +375,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("phone", tools_by_name["remember_contact"]["parameters"]["properties"])
         self.assertIn("role", tools_by_name["remember_contact"]["parameters"]["properties"])
         self.assertIn("name", tools_by_name["lookup_contact"]["parameters"]["properties"])
+        self.assertIn("query_text", tools_by_name["get_memory_conflicts"]["parameters"]["properties"])
+        self.assertIn("slot_key", tools_by_name["resolve_memory_conflict"]["parameters"]["properties"])
+        self.assertIn("selected_memory_id", tools_by_name["resolve_memory_conflict"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["resolve_memory_conflict"]["parameters"]["properties"])
         self.assertIn("value", tools_by_name["remember_preference"]["parameters"]["properties"])
         self.assertIn("for_product", tools_by_name["remember_preference"]["parameters"]["properties"])
         self.assertIn("summary", tools_by_name["remember_plan"]["parameters"]["properties"])
@@ -380,7 +395,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
             [{"type": "number"}, {"type": "string"}],
         )
         self.assertIn(
-            "Descriptive values such as male, female, neutral, warm, soft, deep, bright, or firm are also accepted",
+            "Do not pass a free-form description",
             tools_by_name["update_simple_setting"]["parameters"]["properties"]["value"]["description"],
         )
         self.assertIn("confirmed", tools_by_name["update_simple_setting"]["parameters"]["properties"])
@@ -395,6 +410,13 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("reason", tools_by_name["end_conversation"]["parameters"]["properties"])
         self.assertIn("question", tools_by_name["inspect_camera"]["parameters"]["properties"])
         self.assertEqual(connection.session.calls[0]["audio"]["output"]["speed"], 0.85)
+
+    def test_session_instructions_require_literal_tool_text_for_exact_print_requests(self) -> None:
+        session, _connection, _manager = self.make_session()
+
+        instructions = session._session_instructions()
+
+        self.assertIn("must pass that literal wording in the tool field text", instructions)
 
     def test_run_audio_turn_streams_audio_and_collects_text(self) -> None:
         audio_chunks: list[bytes] = []
