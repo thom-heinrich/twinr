@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Lock
+from types import SimpleNamespace
 
 from twinr.hardware.audio import AmbientAudioLevelSample, AmbientAudioSampler
 from twinr.hardware.camera import V4L2StillCamera
@@ -22,6 +23,9 @@ class ProactiveVisionSnapshot:
 class ProactiveAudioSnapshot:
     observation: SocialAudioObservation
     sample: AmbientAudioLevelSample | None = None
+    pcm_bytes: bytes | None = None
+    sample_rate: int | None = None
+    channels: int | None = None
 
 
 class NullAudioObservationProvider:
@@ -51,13 +55,28 @@ class AmbientAudioObservationProvider:
 
     def observe(self) -> ProactiveAudioSnapshot:
         with self.audio_lock:
-            sample = self.sampler.sample_levels(duration_ms=self.sample_ms)
-        speech_detected = (
-            sample.active_chunk_count > 0 and sample.active_ratio >= self.speech_min_active_ratio
-        )
+            if hasattr(self.sampler, "sample_window"):
+                capture = self.sampler.sample_window(duration_ms=self.sample_ms)
+            else:
+                sample = self.sampler.sample_levels(duration_ms=self.sample_ms)
+                capture = SimpleNamespace(
+                    sample=sample,
+                    pcm_bytes=None,
+                    sample_rate=None,
+                    channels=None,
+                )
+        sample = capture.sample
+        speech_threshold = getattr(self.sampler, "speech_threshold", 700)
+        speech_peak_threshold = max(1800, int(speech_threshold * 2.5))
+        speech_detected = False
+        if sample.active_chunk_count > 0 and sample.active_ratio >= self.speech_min_active_ratio:
+            speech_detected = True
+        elif sample.active_chunk_count >= 2 and sample.peak_rms >= speech_peak_threshold:
+            # Short utterances near the device can be brief enough to miss the
+            # active-ratio gate while still being clear speech in practice.
+            speech_detected = True
         distress_detected: bool | None = None
         if self.distress_enabled:
-            speech_threshold = getattr(self.sampler, "speech_threshold", 700)
             peak_threshold = self.distress_peak_threshold or max(1800, int(speech_threshold * 2.5))
             distress_detected = (
                 speech_detected
@@ -70,6 +89,9 @@ class AmbientAudioObservationProvider:
                 distress_detected=distress_detected,
             ),
             sample=sample,
+            pcm_bytes=capture.pcm_bytes,
+            sample_rate=capture.sample_rate,
+            channels=capture.channels,
         )
 
 
