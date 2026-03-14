@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -17,6 +18,7 @@ from twinr.proactive import (
     SocialBodyPose,
     SocialTriggerEngine,
     SocialVisionObservation,
+    WakewordPhraseSpotter,
     build_default_proactive_monitor,
     parse_vision_observation_text,
 )
@@ -187,6 +189,27 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertIsNotNone(snapshot.sample)
         self.assertEqual(snapshot.sample.peak_rms, 2200)
 
+    def test_ambient_audio_observer_treats_short_loud_speech_like_window_as_speech(self) -> None:
+        observer = AmbientAudioObservationProvider(
+            sampler=FakeAudioSampler(
+                AmbientAudioLevelSample(
+                    duration_ms=2600,
+                    chunk_count=26,
+                    active_chunk_count=3,
+                    average_rms=462,
+                    peak_rms=5336,
+                    active_ratio=3 / 26,
+                )
+            ),
+            sample_ms=2600,
+            distress_enabled=False,
+        )
+
+        snapshot = observer.observe()
+
+        self.assertTrue(snapshot.observation.speech_detected)
+        self.assertFalse(snapshot.observation.distress_detected)
+
     def test_coordinator_triggers_person_returned_after_absence(self) -> None:
         config = TwinrConfig(
             proactive_enabled=True,
@@ -221,6 +244,38 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(handled, ["person_returned"])
         self.assertIsNotNone(result.decision)
         self.assertEqual(result.decision.trigger_id, "person_returned")
+
+    def test_openwakeword_backend_bypasses_coarse_audio_gate(self) -> None:
+        config = TwinrConfig(
+            wakeword_enabled=True,
+            wakeword_backend="openwakeword",
+            wakeword_openwakeword_models=("hey_twinna.onnx",),
+        )
+        runtime = TwinrRuntime(config=config)
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(user_name="Thom"),
+            trigger_handler=lambda _decision: False,
+            vision_observer=FakeVisionObserver([]),
+            emit=lambda _line: None,
+        )
+        audio_snapshot = ProactiveAudioSnapshot(
+            observation=SocialAudioObservation(speech_detected=False),
+            sample=AmbientAudioLevelSample(
+                duration_ms=2600,
+                chunk_count=26,
+                active_chunk_count=0,
+                average_rms=133,
+                peak_rms=241,
+                active_ratio=0.0,
+            ),
+            pcm_bytes=b"\x00\x01" * 128,
+            sample_rate=16000,
+            channels=1,
+        )
+
+        self.assertTrue(coordinator._wakeword_audio_candidate(audio_snapshot))
 
     def test_coordinator_pauses_completely_when_idle_predicate_is_false(self) -> None:
         config = TwinrConfig(
@@ -425,7 +480,7 @@ class ProactiveMonitorTests(unittest.TestCase):
                 trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
                 vision_observer=FakeVisionObserver(
                     [
-                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT),
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
                     ]
                 ),
                 pir_monitor=pir_monitor,
@@ -471,6 +526,33 @@ class ProactiveMonitorTests(unittest.TestCase):
         )
 
         self.assertIsNone(monitor)
+
+    def test_build_default_monitor_falls_back_to_stt_when_openwakeword_models_are_missing(self) -> None:
+        config = TwinrConfig(
+            wakeword_enabled=True,
+            wakeword_backend="openwakeword",
+            pir_motion_gpio=26,
+        )
+        runtime = TwinrRuntime(config=config)
+
+        with patch("twinr.proactive.service.configured_pir_monitor", return_value=FakePirMonitor()):
+            monitor = build_default_proactive_monitor(
+                config=config,
+                runtime=runtime,
+                backend=FakeBackend("person_visible=no"),
+                camera=FakeCamera(),
+                camera_lock=None,
+                audio_lock=None,
+                trigger_handler=lambda _decision: True,
+                emit=lambda _line: None,
+            )
+
+        self.assertIsNotNone(monitor)
+        self.assertIsInstance(monitor.coordinator.wakeword_spotter, WakewordPhraseSpotter)
+        events = runtime.ops_events.tail(limit=10)
+        warning = next(entry for entry in events if entry.get("event") == "wakeword_backend_warning")
+        self.assertEqual(warning["data"]["reason"], "openwakeword_models_missing")
+        self.assertEqual(warning["data"]["fallback_backend"], "stt")
 
     def test_coordinator_emits_sensor_facts_and_events_for_automations(self) -> None:
         config = TwinrConfig(

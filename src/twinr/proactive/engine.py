@@ -399,6 +399,8 @@ class SocialTriggerEngine:
         )
 
     def _candidate_possible_fall(self, now: float) -> SocialTriggerEvaluation:
+        low_motion_since = self._possible_fall_post_transition_since(now, self._low_motion_since)
+        quiet_since = self._possible_fall_post_transition_since(now, self._quiet_since)
         evidence = (
             TriggerScoreEvidence(
                 key="fall_transition_signal",
@@ -414,15 +416,15 @@ class SocialTriggerEngine:
             ),
             TriggerScoreEvidence(
                 key="low_motion_hold",
-                value=hold_progress(now, self._low_motion_since, self.thresholds.possible_fall_stillness_s),
+                value=hold_progress(now, low_motion_since, self.thresholds.possible_fall_stillness_s),
                 weight=0.28,
-                detail=self._hold_detail(self._low_motion_since, now, self.thresholds.possible_fall_stillness_s),
+                detail=self._hold_detail(low_motion_since, now, self.thresholds.possible_fall_stillness_s),
             ),
             TriggerScoreEvidence(
                 key="quiet_hold",
-                value=hold_progress(now, self._quiet_since, self.thresholds.possible_fall_stillness_s),
+                value=hold_progress(now, quiet_since, self.thresholds.possible_fall_stillness_s),
                 weight=0.15,
-                detail=self._hold_detail(self._quiet_since, now, self.thresholds.possible_fall_stillness_s),
+                detail=self._hold_detail(quiet_since, now, self.thresholds.possible_fall_stillness_s),
             ),
         )
         blocked_reason = "cooldown_active" if self._cooldown_active("possible_fall", now) else None
@@ -708,10 +710,41 @@ class SocialTriggerEngine:
         if visible_duration is None or visible_duration < self._fall_visibility_loss_arming_s():
             return False
         if self._current_pose == SocialBodyPose.SLUMPED and self._last_slumped_at is not None:
-            return (now - self._last_slumped_at) <= self.thresholds.fall_transition_window_s
-        if self._current_pose == SocialBodyPose.UPRIGHT and self._last_non_floor_pose_at is not None:
-            return (now - self._last_non_floor_pose_at) <= self.thresholds.fall_transition_window_s
+            return (
+                (now - self._last_slumped_at) <= self.thresholds.fall_transition_window_s
+                and self._slumped_hold_before_visibility_loss(now) >= self._fall_slumped_visibility_loss_arming_s()
+            )
+        if self._current_pose == SocialBodyPose.UNKNOWN and self._last_slumped_at is not None:
+            return (
+                (now - self._last_slumped_at) <= self.thresholds.fall_transition_window_s
+                and self._slumped_hold_before_visibility_loss(now) >= self._fall_slumped_visibility_loss_arming_s()
+            )
         return False
+
+    def _possible_fall_transition_anchor(self) -> float | None:
+        anchors = [
+            anchor
+            for anchor in (
+                self._possible_fall_candidate_at,
+                self._possible_fall_loss_candidate_at,
+            )
+            if anchor is not None
+        ]
+        if not anchors:
+            return None
+        return max(anchors)
+
+    def _possible_fall_post_transition_since(
+        self,
+        now: float,
+        signal_since: float | None,
+    ) -> float | None:
+        transition_anchor = self._possible_fall_transition_anchor()
+        if transition_anchor is None or signal_since is None:
+            return None
+        if signal_since > now:
+            return now
+        return max(signal_since, transition_anchor)
 
     def _possible_fall_transition_signal(self) -> float:
         if self._possible_fall_candidate_at is not None:
@@ -751,6 +784,14 @@ class SocialTriggerEngine:
 
     def _fall_visibility_loss_arming_s(self) -> float:
         return 2.0
+
+    def _fall_slumped_visibility_loss_arming_s(self) -> float:
+        return 2.0
+
+    def _slumped_hold_before_visibility_loss(self, now: float) -> float:
+        if self._slumped_since is None:
+            return 0.0
+        return max(0.0, now - self._slumped_since)
 
     def _seconds(self, value: float | None) -> str:
         if value is None:
