@@ -75,6 +75,26 @@ The active voice agent now exposes a dedicated automation toolset for:
 - updating sensor-triggered automations
 - deleting automations
 
+Twinr also exposes a bounded self-settings tool for a few operator-safe runtime changes. Today that includes:
+
+- recent-memory capacity
+- speaking pause detection
+- follow-up listening window
+- spoken voice
+- spoken speed
+
+Voice and speed changes are persisted back into `.env`, applied live to the running backend configuration, and kept within a narrow range so the device stays calm and understandable.
+
+Twinr keeps a small curated spoken-voice catalog for this path instead of exposing every possible provider voice. That lets the live voice agent answer questions like “Which voices do you have?” and map descriptive requests such as “use a male voice” or “sound warmer” onto a bounded `spoken_voice` setting without opening up the whole provider surface.
+
+Twinr also keeps a small bounded adaptive timing profile in `state/adaptive_timing.json`. This profile learns slowly from real button turns:
+
+- no-speech timeouts widen the next start-of-speech window
+- resumed speech during a pause grace window increases pause tolerance
+- repeated clean, fast starts slowly tighten the timing again
+
+The adaptive layer is intentionally conservative. It never removes the hard timing bounds, and it stays anchored to the configured base values so the device remains predictable.
+
 Time-based automations can either:
 
 - speak static text
@@ -109,6 +129,23 @@ Twinr can optionally be extended with a ChonkyDB-based long-term memory layer. T
 
 This long-term layer is intended for persistent user preferences, recalled facts, and historical conversations.
 
+Twinr now includes a small external client baseline under `src/twinr/memory/chonkydb/`. The current basics cover instance/auth inspection, record listing, single-record fetches, full-document fetches, unified retrieval queries, single/bulk record submissions, a versioned `twinr_graph` schema v1 with namespaced typed edges for structured relationships, and a first local personal-graph layer for contacts, preferences, plans, and contact clarification.
+
+The runtime orchestration for this path now lives separately under `src/twinr/memory/longterm/`. That layer builds a small structured long-term provider context before each turn and can persist episodic conversation memories in the background after a turn finishes, so recall can improve without blocking the response path.
+
+The canonical Twinr env names for that path are:
+
+- `TWINR_LONG_TERM_MEMORY_ENABLED`
+- `TWINR_LONG_TERM_MEMORY_BACKEND`
+- `TWINR_LONG_TERM_MEMORY_PATH`
+- `TWINR_CHONKYDB_BASE_URL`
+- `TWINR_CHONKYDB_API_KEY`
+- `TWINR_CHONKYDB_API_KEY_HEADER`
+- `TWINR_CHONKYDB_ALLOW_BEARER_AUTH`
+- `TWINR_CHONKYDB_TIMEOUT_S`
+
+For migration convenience, the config also accepts legacy `CCODEX_MEMORY_BASE_URL` and `CCODEX_MEMORY_API_KEY` as fallbacks, but Twinr docs and code should refer to the backend as `chonkydb`.
+
 ## Web interface
 
 Twinr exposes a web interface on port `1337` for local configuration.
@@ -142,6 +179,7 @@ The current implementation uses a server-rendered local dashboard with these sec
 The `Memory` page reads a live runtime snapshot from the active Twinr process, so operators can inspect the current on-device conversation memory without attaching to the running loop.
 The `Memory` page also exposes the durable `state/MEMORY.md` store, so operators can inspect and add explicit long-lived remembered items without touching the rolling runtime snapshot.
 The same `Memory` page now exposes scheduled reminders from `state/reminders.json`, including pending and delivered reminders plus simple operator controls to add, complete, or delete reminder entries.
+The `Settings` page now also shows the live bounded adaptive listening profile from `state/adaptive_timing.json`, including the learned start-of-speech and pause windows plus a manual reset action.
 The `Automations` page reads `state/automations.json`, groups stored rules by automation family, and exposes explicit create/edit/delete controls for scheduled and sensor-triggered rules. Integration modules now register their own reserved family blocks through an integration-side registry, so later mail/calendar/integration automations can land in their own UI sections without rewriting the core page.
 The `Personality` and `User` pages now separate the hand-written base text from Twinr-managed updates, so tool-written behavior/profile changes stay visible and editable without clobbering the base files.
 The `Devices` page shows the current local hardware view for printer, camera, audio, PIR, and buttons, plus the newest self-test evidence Twinr can confirm. Signals that the current path cannot expose, such as paper status on the raw USB printer path, are shown as unknown instead of guessed.
@@ -189,6 +227,8 @@ The live speaker signal is injected into the LLM context as a short redacted sys
 - `src/twinr/display/` — Waveshare display wrapper and image rendering helpers
 - `src/twinr/providers/` — provider implementations such as OpenAI
 - `src/twinr/memory/` — on-device memory, durable memory stores, and reminders
+- `src/twinr/memory/chonkydb/` — external ChonkyDB client basics plus versioned Twinr graph schema for future long-term memory integration
+- `src/twinr/memory/longterm/` — long-term retrieval and non-blocking persistence orchestration
 - `src/twinr/automations/` — canonical automation definitions, evaluation, and persistent CRUD store
 - `src/twinr/hardware/` — audio, button, PIR, camera, and printer adapters
 - `state/voice_profile.json` — local speaker-template store for the optional voice-confidence layer
@@ -413,6 +453,14 @@ TWINR_PROACTIVE_AUDIO_ENABLED=true
 TWINR_PROACTIVE_AUDIO_DEVICE=plughw:CARD=CameraB409241,DEV=0
 TWINR_PROACTIVE_AUDIO_SAMPLE_MS=1000
 TWINR_PROACTIVE_AUDIO_DISTRESS_ENABLED=false
+TWINR_WAKEWORD_ENABLED=true
+TWINR_WAKEWORD_BACKEND=stt
+TWINR_WAKEWORD_PHRASES="hey twinr, hey twinna, twinr"
+TWINR_WAKEWORD_SAMPLE_MS=1700
+TWINR_WAKEWORD_PRESENCE_GRACE_S=900
+TWINR_WAKEWORD_MOTION_GRACE_S=300
+TWINR_WAKEWORD_SPEECH_GRACE_S=90
+TWINR_WAKEWORD_ATTEMPT_COOLDOWN_S=4.0
 ```
 
 When the OpenAI secret is already project-scoped (`sk-proj-...`), keep `OPENAI_SEND_PROJECT_HEADER=false`. That avoids a redundant project header that can block STT/TTS while `gpt-5.2` still works.
@@ -432,6 +480,8 @@ PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --proactive-au
 The vision path requires `ffmpeg` on the device because Twinr captures still images from V4L2 and then sends one or more images to the OpenAI Responses API in a single request.
 The live hardware loop can also trigger the camera automatically for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
 With `TWINR_PROACTIVE_ENABLED=true`, the hardware and realtime loops also start the proactive monitor and let it issue bounded conversation starters while Twinr is idle.
+With `TWINR_WAKEWORD_ENABLED=true`, the same idle monitor keeps a presence-gated wakeword session armed after recent PIR motion or visible presence. If ambient speech starts with one of the configured aliases, Twinr either answers the rest of the spoken request directly or opens the normal hands-free listening window.
+For lower latency, set `TWINR_WAKEWORD_BACKEND=openwakeword` and point `TWINR_WAKEWORD_OPENWAKEWORD_MODELS` at one or more local `.tflite` or `.onnx` wakeword models. `openWakeWord` runs fully on-device, but it still needs a real model for the chosen phrase; for `Twinr/Twinna/Twinner` that normally means a custom-trained model. Until such a model is configured, Twinr can stay on the slower STT backend.
 
 Run the live hardware loop with:
 
@@ -453,6 +503,15 @@ The Realtime loop keeps the same button UX but uses OpenAI Realtime for direct a
 With `TWINR_CONVERSATION_FOLLOW_UP_ENABLED=true`, Twinr emits a short beep before listening, answers, then automatically beeps and listens again for a short follow-up window so a short back-and-forth conversation works without pressing the button every turn.
 The Realtime loop can now also inspect the camera view for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
 If the user says things like `Erinnere mich morgen um 12 Uhr an den Arzttermin`, the realtime agent resolves the time into an absolute due time, stores the reminder in `state/reminders.json`, and later speaks a fresh reminder generated from the stored reminder facts.
+
+For the migration path away from OpenAI Realtime, Twinr now also exposes a provider-neutral streaming loop:
+
+```bash
+source .venv/bin/activate
+twinr --env-file /twinr/.env --run-streaming-loop
+```
+
+The streaming loop keeps the same green/yellow button semantics and background reminder/automation behavior, but runs the spoken turn as `STT -> text/tool agent -> TTS`. Today it is wired through the OpenAI Responses API adapter, so the existing Twinr tool surface still works while the provider stack is being decoupled.
 
 Latency notes:
 

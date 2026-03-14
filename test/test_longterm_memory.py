@@ -189,6 +189,30 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertEqual(personality_entry.key, "response_style")
         self.assertIn("response_style: Keep answers calm and short.", personality_text)
 
+    def test_service_can_analyze_turn_into_consolidated_memory_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config)
+
+            result = service.analyze_conversation_turn(
+                transcript=(
+                    "Today is a beautiful Sunday, it is really warm. "
+                    "My wife Janina is at the eye doctor and is getting eye laser treatment."
+                ),
+                response="I hope Janina's appointment goes smoothly.",
+            )
+
+        durable_summaries = [item.summary for item in result.durable_objects]
+        self.assertIn("Janina is the user's wife.", durable_summaries)
+        self.assertTrue(any("eye laser treatment" in summary for summary in durable_summaries))
+        self.assertFalse(result.clarification_needed)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,7 @@ class LongTermMemoryService:
     ) -> "LongTermMemoryService":
         store = prompt_context_store or PromptContextStore.from_config(config)
         graph = graph_store or TwinrPersonalGraphStore.from_config(config)
+        truth_maintainer = LongTermTruthMaintainer()
         writer: AsyncLongTermMemoryWriter | None = None
         if config.long_term_memory_enabled and config.long_term_memory_background_store_turns:
             writer = AsyncLongTermMemoryWriter(
@@ -64,8 +65,8 @@ class LongTermMemoryService:
             subtext_builder=LongTermSubtextBuilder(config=config, graph_store=graph),
             query_rewriter=LongTermQueryRewriter.from_config(config),
             extractor=LongTermTurnExtractor(timezone_name=config.local_timezone_name),
-            truth_maintainer=LongTermTruthMaintainer(),
-            consolidator=LongTermMemoryConsolidator(truth_maintainer=LongTermTruthMaintainer()),
+            truth_maintainer=truth_maintainer,
+            consolidator=LongTermMemoryConsolidator(truth_maintainer=truth_maintainer),
             writer=writer,
         )
 

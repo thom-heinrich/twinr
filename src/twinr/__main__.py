@@ -90,9 +90,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the GPIO -> mic -> OpenAI Realtime -> speaker/printer loop",
     )
     parser.add_argument(
+        "--run-streaming-loop",
+        action="store_true",
+        help="Run the GPIO -> STT -> tool-calling LLM -> TTS -> speaker/printer loop",
+    )
+    parser.add_argument(
         "--loop-duration",
         type=float,
-        help="Optional max runtime in seconds for --run-hardware-loop",
+        help="Optional max runtime in seconds for the loop commands",
     )
     parser.add_argument(
         "--run-web",
@@ -145,6 +150,7 @@ def main() -> int:
             args.proactive_observe_once,
             args.run_hardware_loop,
             args.run_realtime_loop,
+            args.run_streaming_loop,
         ]
     )
     uses_camera = bool(args.vision_camera_capture or args.camera_capture_output or args.proactive_observe_once)
@@ -202,6 +208,26 @@ def main() -> int:
                 print_backend=backend,
             )
             with loop_instance_lock(config, "realtime-loop"):
+                return loop.run(duration_s=args.loop_duration)
+
+        if args.run_streaming_loop:
+            from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
+            from twinr.ops import loop_instance_lock
+            from twinr.providers.openai import OpenAIProviderBundle
+
+            if backend is None:
+                raise RuntimeError("Streaming loop requires configured providers")
+            provider_bundle = OpenAIProviderBundle.from_backend(backend)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                print_backend=provider_bundle.combined,
+                stt_provider=provider_bundle.stt,
+                agent_provider=provider_bundle.agent,
+                tts_provider=provider_bundle.tts,
+                tool_agent_provider=provider_bundle.tool_agent,
+            )
+            with loop_instance_lock(config, "streaming-loop"):
                 return loop.run(duration_s=args.loop_duration)
 
         if args.run_hardware_loop and backend is not None:
