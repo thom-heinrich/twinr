@@ -584,11 +584,11 @@ def _settings_sections(config: TwinrConfig, env_values: dict[str, str]) -> tuple
                 ),
                 _select_field(
                     "TWINR_PROACTIVE_AUDIO_DISTRESS_ENABLED",
-                    "Distress heuristic",
+                    "Distress detector",
                     env_values,
                     _BOOL_OPTIONS,
                     "true" if config.proactive_audio_distress_enabled else "false",
-                    tooltip_text="Experimental ambient audio heuristic for stronger distress-like sounds.",
+                    tooltip_text="Experimental ambient audio detector for stronger distress-like sounds.",
                 ),
                 _select_field(
                     "TWINR_WAKEWORD_ENABLED",

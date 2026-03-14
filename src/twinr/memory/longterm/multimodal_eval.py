@@ -146,24 +146,26 @@ def run_multimodal_longterm_eval(
             config,
             prompt_context_store=prompt_context_store,
         )
-        seed_stats = _seed_multimodal_store(service)
-        cases = _build_multimodal_eval_cases()
-        service.query_rewriter = _StaticQueryRewriter(
-            {case.query_text: case.canonical_query_text for case in cases}
-        )
-        case_results = tuple(_run_case(service, case) for case in cases)
-        summary = _summarize(case_results)
-        object_store_path = str(service.object_store.objects_path)
-        memory_path = str(Path(config.memory_markdown_path))
-        service.shutdown()
-        return MultimodalEvalResult(
-            seed_stats=seed_stats,
-            summary=summary,
-            cases=case_results,
-            temp_root=str(root),
-            object_store_path=object_store_path,
-            memory_path=memory_path,
-        )
+        try:
+            seed_stats = _seed_multimodal_store(service)
+            cases = _build_multimodal_eval_cases()
+            service.query_rewriter = _StaticQueryRewriter(
+                {case.query_text: case.canonical_query_text for case in cases}
+            )
+            case_results = tuple(_run_case(service, case) for case in cases)
+            summary = _summarize(case_results)
+            object_store_path = str(service.object_store.objects_path)
+            memory_path = str(Path(config.memory_markdown_path))
+            return MultimodalEvalResult(
+                seed_stats=seed_stats,
+                summary=summary,
+                cases=case_results,
+                temp_root=str(root),
+                object_store_path=object_store_path,
+                memory_path=memory_path,
+            )
+        finally:
+            service.shutdown(timeout_s=30.0)
 
 
 def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeedStats:

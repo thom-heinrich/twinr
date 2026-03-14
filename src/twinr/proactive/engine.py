@@ -82,6 +82,9 @@ class SocialTriggerThresholds:
     attention_window_s: float = 6.0
     slumped_quiet_s: float = 20.0
     possible_fall_stillness_s: float = 10.0
+    possible_fall_visibility_loss_hold_s: float = 15.0
+    possible_fall_visibility_loss_arming_s: float = 6.0
+    possible_fall_slumped_visibility_loss_arming_s: float = 4.0
     floor_stillness_s: float = 20.0
     showing_intent_hold_s: float = 1.5
     positive_contact_hold_s: float = 1.5
@@ -104,6 +107,9 @@ class SocialTriggerThresholds:
             attention_window_s=config.proactive_attention_window_s,
             slumped_quiet_s=config.proactive_slumped_quiet_s,
             possible_fall_stillness_s=config.proactive_possible_fall_stillness_s,
+            possible_fall_visibility_loss_hold_s=config.proactive_possible_fall_visibility_loss_hold_s,
+            possible_fall_visibility_loss_arming_s=config.proactive_possible_fall_visibility_loss_arming_s,
+            possible_fall_slumped_visibility_loss_arming_s=config.proactive_possible_fall_slumped_visibility_loss_arming_s,
             floor_stillness_s=config.proactive_floor_stillness_s,
             showing_intent_hold_s=config.proactive_showing_intent_hold_s,
             positive_contact_hold_s=config.proactive_positive_contact_hold_s,
@@ -427,7 +433,11 @@ class SocialTriggerEngine:
                 detail=self._hold_detail(quiet_since, now, self.thresholds.possible_fall_stillness_s),
             ),
         )
-        blocked_reason = "cooldown_active" if self._cooldown_active("possible_fall", now) else None
+        blocked_reason = None
+        if self._cooldown_active("possible_fall", now):
+            blocked_reason = "cooldown_active"
+        elif self._possible_fall_loss_candidate_at is not None and not self._possible_fall_visibility_loss_hold_complete(now):
+            blocked_reason = "visibility_loss_hold_incomplete"
         return self._evaluate_candidate(
             trigger_id="possible_fall",
             observed_at=now,
@@ -759,7 +769,11 @@ class SocialTriggerEngine:
 
     def _possible_fall_low_or_missing_hold(self, now: float) -> float:
         floor_hold = hold_progress(now, self._floor_since, self.thresholds.possible_fall_stillness_s)
-        missing_hold = hold_progress(now, self._possible_fall_loss_candidate_at, self.thresholds.possible_fall_stillness_s)
+        missing_hold = hold_progress(
+            now,
+            self._possible_fall_loss_candidate_at,
+            self.thresholds.possible_fall_visibility_loss_hold_s,
+        )
         return max(floor_hold, missing_hold)
 
     def _possible_fall_low_or_missing_detail(self, now: float) -> str:
@@ -767,9 +781,21 @@ class SocialTriggerEngine:
         missing_detail = self._hold_detail(
             self._possible_fall_loss_candidate_at,
             now,
-            self.thresholds.possible_fall_stillness_s,
+            self.thresholds.possible_fall_visibility_loss_hold_s,
         )
         return f"floor={floor_detail}; missing={missing_detail}"
+
+    def _possible_fall_visibility_loss_hold_complete(self, now: float) -> bool:
+        if self._possible_fall_loss_candidate_at is None:
+            return True
+        return (
+            hold_progress(
+                now,
+                self._possible_fall_loss_candidate_at,
+                self.thresholds.possible_fall_visibility_loss_hold_s,
+            )
+            >= 1.0
+        )
 
     def _possible_fall_transition_detail(self, now: float) -> str:
         if self._possible_fall_candidate_at is not None:
@@ -783,10 +809,10 @@ class SocialTriggerEngine:
         return "no recent fall-like transition"
 
     def _fall_visibility_loss_arming_s(self) -> float:
-        return 2.0
+        return max(0.0, self.thresholds.possible_fall_visibility_loss_arming_s)
 
     def _fall_slumped_visibility_loss_arming_s(self) -> float:
-        return 2.0
+        return max(0.0, self.thresholds.possible_fall_slumped_visibility_loss_arming_s)
 
     def _slumped_hold_before_visibility_loss(self, now: float) -> float:
         if self._slumped_since is None:

@@ -16,8 +16,10 @@ from twinr.proactive import (
     SocialTriggerEngine,
     SocialVisionObservation,
     WakewordMatch,
+    WakewordOpenWakeWordFrameSpotter,
     WakewordOpenWakeWordSpotter,
     WakewordPhraseSpotter,
+    normalize_detector_label,
 )
 from twinr.runtime import TwinrRuntime
 
@@ -152,6 +154,27 @@ class WakewordTests(unittest.TestCase):
         self.assertEqual(second.reason, "recent_person_visible")
         self.assertFalse(third.armed)
         self.assertEqual(third.reason, "idle")
+
+    def test_presence_session_id_stays_stable_until_idle_and_then_rotates(self) -> None:
+        controller = PresenceSessionController(
+            presence_grace_s=600.0,
+            motion_grace_s=120.0,
+            speech_grace_s=45.0,
+        )
+
+        first = controller.observe(now=0.0, person_visible=True, motion_active=True, speech_detected=False)
+        second = controller.observe(now=300.0, person_visible=None, motion_active=False, speech_detected=False)
+        third = controller.observe(now=901.0, person_visible=None, motion_active=False, speech_detected=False)
+        fourth = controller.observe(now=902.0, person_visible=True, motion_active=True, speech_detected=False)
+
+        self.assertTrue(first.armed)
+        self.assertEqual(first.session_id, 1)
+        self.assertTrue(second.armed)
+        self.assertEqual(second.session_id, 1)
+        self.assertFalse(third.armed)
+        self.assertIsNone(third.session_id)
+        self.assertTrue(fourth.armed)
+        self.assertEqual(fourth.session_id, 2)
 
     def test_wakeword_phrase_spotter_matches_prefix_and_remaining_text(self) -> None:
         backend = FakeBackend("Hallo Twinner bist du da")
@@ -311,6 +334,97 @@ class WakewordTests(unittest.TestCase):
         self.assertEqual(model.predict_calls[0][1], {})
         self.assertEqual(model.predict_calls[0][2], {})
 
+    def test_openwakeword_frame_spotter_detects_streaming_hit_without_transcription(self) -> None:
+        model = FakeOpenWakeWordModel(
+            [
+                {"twinr_multivoice_v2": 0.0},
+                {"twinr_multivoice_v2": 0.86},
+            ],
+            model_names=("twinr_multivoice_v2",),
+        )
+        spotter = WakewordOpenWakeWordFrameSpotter(
+            wakeword_models=("twinr_multivoice_v2",),
+            phrases=("twinr", "twinna"),
+            threshold=0.5,
+            patience_frames=1,
+            model_factory=lambda **_kwargs: model,
+        )
+
+        first = spotter.process_pcm_frame(b"\x01\x02" * 1280)
+        second = spotter.process_pcm_frame(b"\x01\x02" * 1280)
+
+        self.assertIsNone(first)
+        self.assertIsNotNone(second)
+        self.assertTrue(second.detected)
+        self.assertEqual(second.matched_phrase, "twinr")
+        self.assertEqual(second.detector_label, "twinr_multivoice_v2")
+        self.assertAlmostEqual(second.score or 0.0, 0.86)
+        self.assertEqual(len(model.predict_calls), 2)
+        self.assertEqual(model.predict_calls[0][1], {})
+        self.assertEqual(model.predict_calls[0][2], {})
+
+    def test_openwakeword_frame_spotter_requires_smoothed_activation(self) -> None:
+        model = FakeOpenWakeWordModel(
+            [
+                {"hey_twinna": 0.92},
+                {"hey_twinna": 0.0},
+                {"hey_twinna": 0.88},
+            ],
+            model_names=("hey_twinna",),
+        )
+        spotter = WakewordOpenWakeWordFrameSpotter(
+            wakeword_models=("hey_twinna",),
+            phrases=("hey twinna", "twinna"),
+            threshold=0.7,
+            activation_samples=3,
+            patience_frames=1,
+            model_factory=lambda **_kwargs: model,
+        )
+
+        first = spotter.process_pcm_frame(b"\x01\x02" * 1280)
+        second = spotter.process_pcm_frame(b"\x01\x02" * 1280)
+        third = spotter.process_pcm_frame(b"\x01\x02" * 1280)
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertIsNone(third)
+
+    def test_openwakeword_frame_spotter_latches_until_average_deactivates(self) -> None:
+        model = FakeOpenWakeWordModel(
+            [
+                {"hey_twinna": 0.8},
+                {"hey_twinna": 0.82},
+                {"hey_twinna": 0.84},
+                {"hey_twinna": 0.83},
+                {"hey_twinna": 0.02},
+                {"hey_twinna": 0.01},
+                {"hey_twinna": 0.0},
+                {"hey_twinna": 0.9},
+                {"hey_twinna": 0.92},
+                {"hey_twinna": 0.94},
+            ],
+            model_names=("hey_twinna",),
+        )
+        spotter = WakewordOpenWakeWordFrameSpotter(
+            wakeword_models=("hey_twinna",),
+            phrases=("hey twinna", "twinna"),
+            threshold=0.5,
+            activation_samples=3,
+            deactivation_threshold=0.2,
+            patience_frames=1,
+            model_factory=lambda **_kwargs: model,
+        )
+
+        detections = [
+            spotter.process_pcm_frame(b"\x01\x02" * 1280)
+            for _ in range(10)
+        ]
+
+        fired = [item for item in detections if item is not None]
+        self.assertEqual(len(fired), 2)
+        self.assertEqual(fired[0].matched_phrase, "hey twinna")
+        self.assertEqual(fired[1].matched_phrase, "hey twinna")
+
     def test_openwakeword_spotter_uses_peak_clip_score(self) -> None:
         model = FakeClipOpenWakeWordModel(
             [
@@ -428,6 +542,9 @@ class WakewordTests(unittest.TestCase):
         self.assertEqual(match.transcript, "irgendwas anderes")
         self.assertEqual(match.normalized_transcript, "irgendwas anderes")
         self.assertEqual(len(backend.calls), 1)
+
+    def test_normalize_detector_label_strips_decorative_words(self) -> None:
+        self.assertEqual(normalize_detector_label("twinr_multivoice_v2"), "twinr")
 
     def test_coordinator_routes_detected_wakeword_to_handler(self) -> None:
         config = TwinrConfig(

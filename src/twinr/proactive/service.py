@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Event, Lock, Thread
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.runtime import TwinrRuntime
 from twinr.hardware import GpioPirMonitor, V4L2StillCamera, configured_pir_monitor
-from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioSampler
+from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioSampler, pcm16_to_wav_bytes
+from twinr.ops.paths import resolve_ops_paths_for_config
 from twinr.proactive.engine import SocialAudioObservation, SocialObservation, SocialTriggerDecision, SocialTriggerEngine, SocialVisionObservation
+from twinr.proactive.openwakeword_stream import OpenWakeWordStreamingMonitor, WakewordStreamDetection
 from twinr.proactive.openwakeword_spotter import WakewordOpenWakeWordSpotter
 from twinr.proactive.observers import AmbientAudioObservationProvider, NullAudioObservationProvider, OpenAIVisionObservationProvider
 from twinr.proactive.presence import PresenceSessionController, PresenceSessionSnapshot
 from twinr.proactive.wakeword import WakewordMatch, WakewordPhraseSpotter
 from twinr.providers.openai.backend import OpenAIBackend
+
+if TYPE_CHECKING:
+    from twinr.agent.base_agent.runtime import TwinrRuntime
+
+_WAKEWORD_SUPPRESSION_EXEMPT_TRIGGERS = frozenset(
+    {"possible_fall", "floor_stillness", "distress_possible"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +47,7 @@ class ProactiveCoordinator:
         audio_observer=None,
         presence_session: PresenceSessionController | None = None,
         wakeword_spotter: WakewordPhraseSpotter | None = None,
+        wakeword_stream: OpenWakeWordStreamingMonitor | None = None,
         wakeword_handler: Callable[[WakewordMatch], bool] | None = None,
         idle_predicate: Callable[[], bool] | None = None,
         observation_handler: Callable[[dict[str, Any], tuple[str, ...]], None] | None = None,
@@ -53,6 +63,7 @@ class ProactiveCoordinator:
         self.audio_observer = audio_observer or NullAudioObservationProvider()
         self.presence_session = presence_session
         self.wakeword_spotter = wakeword_spotter
+        self.wakeword_stream = wakeword_stream
         self.wakeword_handler = wakeword_handler
         self.idle_predicate = idle_predicate
         self.observation_handler = observation_handler
@@ -68,6 +79,8 @@ class ProactiveCoordinator:
         self._quiet_since: float | None = None
         self._last_presence_key: tuple[bool, str | None] | None = None
         self._last_wakeword_attempt_at: float | None = None
+        self._last_possible_fall_prompted_session_id: int | None = None
+        self.latest_presence_snapshot: PresenceSessionSnapshot | None = None
 
     def tick(self) -> ProactiveTickResult:
         now = self.clock()
@@ -108,10 +121,29 @@ class ProactiveCoordinator:
                     person_visible=False,
                 )
             if decision is not None:
+                suppressed_age_s = self._recent_wakeword_attempt_age_s(now, decision)
+                if suppressed_age_s is not None:
+                    self._record_trigger_skipped_recent_wakeword_attempt(
+                        decision,
+                        wakeword_attempt_age_s=suppressed_age_s,
+                    )
+                    return ProactiveTickResult(inspected=False, person_visible=False)
+                blocked_reason = self._presence_session_block_reason(
+                    decision,
+                    presence_snapshot=presence_snapshot,
+                )
+                if blocked_reason is not None:
+                    self._record_trigger_skipped_presence_session(
+                        decision,
+                        presence_snapshot=presence_snapshot,
+                        reason=blocked_reason,
+                    )
+                    return ProactiveTickResult(inspected=False, person_visible=False)
                 return self._handle_decision(
                     decision,
                     observation=observation,
                     inspected=False,
+                    presence_snapshot=presence_snapshot,
                 )
             return ProactiveTickResult(inspected=False, person_visible=False)
 
@@ -166,10 +198,35 @@ class ProactiveCoordinator:
                 person_visible=snapshot.observation.person_visible,
             )
         if decision is not None:
+            suppressed_age_s = self._recent_wakeword_attempt_age_s(now, decision)
+            if suppressed_age_s is not None:
+                self._record_trigger_skipped_recent_wakeword_attempt(
+                    decision,
+                    wakeword_attempt_age_s=suppressed_age_s,
+                )
+                return ProactiveTickResult(
+                    inspected=True,
+                    person_visible=snapshot.observation.person_visible,
+                )
+            blocked_reason = self._presence_session_block_reason(
+                decision,
+                presence_snapshot=presence_snapshot,
+            )
+            if blocked_reason is not None:
+                self._record_trigger_skipped_presence_session(
+                    decision,
+                    presence_snapshot=presence_snapshot,
+                    reason=blocked_reason,
+                )
+                return ProactiveTickResult(
+                    inspected=True,
+                    person_visible=snapshot.observation.person_visible,
+                )
             return self._handle_decision(
                 decision,
                 observation=observation,
                 inspected=True,
+                presence_snapshot=presence_snapshot,
             )
         return ProactiveTickResult(
             inspected=True,
@@ -201,15 +258,35 @@ class ProactiveCoordinator:
         speech_detected: bool,
     ) -> PresenceSessionSnapshot:
         if self.presence_session is None:
-            return PresenceSessionSnapshot(armed=False, reason="disabled", person_visible=bool(person_visible))
+            snapshot = PresenceSessionSnapshot(
+                armed=False,
+                reason="disabled",
+                person_visible=bool(person_visible),
+            )
+            self.latest_presence_snapshot = snapshot
+            return snapshot
         snapshot = self.presence_session.observe(
             now=now,
             person_visible=person_visible,
             motion_active=motion_active,
             speech_detected=speech_detected,
         )
+        self.latest_presence_snapshot = snapshot
         self._record_presence_if_changed(snapshot)
+        if self.wakeword_stream is not None:
+            self.wakeword_stream.update_presence(snapshot)
         return snapshot
+
+    def poll_wakeword_stream(self) -> WakewordMatch | None:
+        if self.wakeword_stream is None or self.wakeword_handler is None:
+            return None
+        error = self.wakeword_stream.poll_error()
+        if error:
+            raise RuntimeError(f"openWakeWord stream failed: {error}")
+        detection = self.wakeword_stream.poll_detection()
+        if detection is None:
+            return None
+        return self._handle_stream_detection(detection)
 
     def _maybe_detect_wakeword(
         self,
@@ -218,6 +295,8 @@ class ProactiveCoordinator:
         audio_snapshot,
         presence_snapshot: PresenceSessionSnapshot,
     ) -> WakewordMatch | None:
+        if self.wakeword_stream is not None:
+            return None
         if self.wakeword_spotter is None or self.wakeword_handler is None:
             return None
         if not presence_snapshot.armed:
@@ -245,6 +324,54 @@ class ProactiveCoordinator:
             return match
         return None
 
+    def _handle_stream_detection(self, detection: WakewordStreamDetection) -> WakewordMatch | None:
+        self._last_wakeword_attempt_at = self.clock()
+        self._record_wakeword_attempt(detection.match, presence_snapshot=detection.presence_snapshot)
+        if detection.match.detected and detection.capture_window is not None:
+            self._persist_wakeword_capture(detection.match, capture_window=detection.capture_window)
+        if not detection.match.detected:
+            return None
+        handled = self.wakeword_handler(detection.match)
+        if handled:
+            self.emit("wakeword_detected=true")
+            return detection.match
+        return None
+
+    def _persist_wakeword_capture(
+        self,
+        match: WakewordMatch,
+        *,
+        capture_window: AmbientAudioCaptureWindow,
+    ) -> None:
+        if not capture_window.pcm_bytes:
+            return
+        captures_dir = resolve_ops_paths_for_config(self.config).artifacts_root / "ops" / "wakeword_captures"
+        captures_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        score_value = 0.0 if match.score is None else max(0.0, float(match.score))
+        score_token = f"{score_value:.4f}".replace(".", "_")
+        phrase_token = (match.matched_phrase or match.detector_label or "unknown").strip().replace(" ", "_")
+        safe_phrase = "".join(char for char in phrase_token if char.isalnum() or char in {"_", "-"}) or "unknown"
+        path = captures_dir / f"{timestamp}__score-{score_token}__{safe_phrase}.wav"
+        wav_bytes = pcm16_to_wav_bytes(
+            capture_window.pcm_bytes,
+            sample_rate=capture_window.sample_rate,
+            channels=capture_window.channels,
+        )
+        path.write_bytes(wav_bytes)
+        self.runtime.ops_events.append(
+            event="wakeword_capture_saved",
+            message="Saved the local audio window that triggered a wakeword detection.",
+            data={
+                "path": str(path),
+                "matched_phrase": match.matched_phrase,
+                "detector_label": match.detector_label,
+                "score": match.score,
+                "duration_ms": capture_window.sample.duration_ms,
+                "peak_rms": capture_window.sample.peak_rms,
+            },
+        )
+
     def _wakeword_audio_candidate(self, audio_snapshot) -> bool:
         sample = getattr(audio_snapshot, "sample", None)
         if sample is None:
@@ -255,12 +382,13 @@ class ProactiveCoordinator:
             return False
         if getattr(audio_snapshot, "channels", None) is None:
             return False
-        # Let openWakeWord inspect every presence-gated audio window locally.
-        # The lightweight model is a better filter here than the coarse RMS gate,
-        # and transcript confirmation still prevents weak false positives from
-        # turning into an actual wake event.
         if self.config.wakeword_backend == "openwakeword":
-            return True
+            if sample.active_chunk_count >= max(1, self.config.wakeword_min_active_chunks):
+                return True
+            if audio_snapshot.observation.speech_detected is True:
+                return True
+            peak_threshold = max(1400, int(self.config.audio_speech_threshold * 2))
+            return sample.peak_rms >= peak_threshold
         if sample.active_chunk_count < max(1, self.config.wakeword_min_active_chunks):
             return False
         if sample.active_ratio >= self.config.wakeword_min_active_ratio:
@@ -274,16 +402,41 @@ class ProactiveCoordinator:
         *,
         observation: SocialObservation,
         inspected: bool,
+        presence_snapshot: PresenceSessionSnapshot,
     ) -> ProactiveTickResult:
         self._record_trigger_detected(decision, observation=observation)
         handled = self.trigger_handler(decision)
+        presence_session_id = getattr(presence_snapshot, "session_id", None)
         if handled:
             self.emit(f"proactive_trigger={decision.trigger_id}")
+            if (
+                decision.trigger_id == "possible_fall"
+                and self.config.proactive_possible_fall_once_per_presence_session
+                and presence_snapshot.armed
+                and presence_session_id is not None
+            ):
+                self._last_possible_fall_prompted_session_id = presence_session_id
         return ProactiveTickResult(
             decision=decision if handled else None,
             inspected=inspected,
             person_visible=observation.vision.person_visible,
         )
+
+    def _recent_wakeword_attempt_age_s(
+        self,
+        now: float,
+        decision: SocialTriggerDecision,
+    ) -> float | None:
+        if decision.trigger_id in _WAKEWORD_SUPPRESSION_EXEMPT_TRIGGERS:
+            return None
+        if self._last_wakeword_attempt_at is None:
+            return None
+        age_s = now - self._last_wakeword_attempt_at
+        if age_s < 0:
+            return None
+        if age_s > self.config.wakeword_block_proactive_after_attempt_s:
+            return None
+        return age_s
 
     def _update_motion(self, now: float) -> bool:
         if self.pir_monitor is None:
@@ -331,6 +484,7 @@ class ProactiveCoordinator:
         audio_snapshot=None,
         presence_snapshot: PresenceSessionSnapshot | None = None,
     ) -> None:
+        presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
         observation_key = (
             inspected,
             observation.pir_motion_detected,
@@ -344,6 +498,7 @@ class ProactiveCoordinator:
             observation.audio.distress_detected,
             None if presence_snapshot is None else presence_snapshot.armed,
             None if presence_snapshot is None else presence_snapshot.reason,
+            presence_session_id,
         )
         if observation_key == self._last_observation_key:
             return
@@ -368,6 +523,7 @@ class ProactiveCoordinator:
                 {
                     "wakeword_armed": presence_snapshot.armed,
                     "wakeword_presence_reason": presence_snapshot.reason,
+                    "wakeword_presence_session_id": presence_session_id,
                 }
             )
         if vision_snapshot is not None:
@@ -407,7 +563,8 @@ class ProactiveCoordinator:
         )
 
     def _record_presence_if_changed(self, snapshot: PresenceSessionSnapshot) -> None:
-        key = (snapshot.armed, snapshot.reason)
+        session_id = getattr(snapshot, "session_id", None)
+        key = (snapshot.armed, snapshot.reason, session_id)
         if key == self._last_presence_key:
             return
         self._last_presence_key = key
@@ -417,6 +574,7 @@ class ProactiveCoordinator:
             data={
                 "armed": snapshot.armed,
                 "reason": snapshot.reason,
+                "session_id": session_id,
                 "person_visible": snapshot.person_visible,
                 "last_person_seen_age_s": snapshot.last_person_seen_age_s,
                 "last_motion_age_s": snapshot.last_motion_age_s,
@@ -472,6 +630,66 @@ class ProactiveCoordinator:
                 "speech_detected": observation.audio.speech_detected,
                 "distress_detected": observation.audio.distress_detected,
                 "low_motion": observation.low_motion,
+            },
+        )
+
+    def _record_trigger_skipped_recent_wakeword_attempt(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        wakeword_attempt_age_s: float,
+    ) -> None:
+        self.emit("social_trigger_skipped=recent_wakeword_attempt")
+        self.runtime.ops_events.append(
+            event="social_trigger_skipped",
+            message="Social trigger prompt was skipped because a wakeword attempt was seen recently.",
+            data={
+                "trigger": decision.trigger_id,
+                "reason": "recent_wakeword_attempt",
+                "wakeword_attempt_age_s": round(wakeword_attempt_age_s, 3),
+                "priority": int(decision.priority),
+                "score": decision.score,
+                "threshold": decision.threshold,
+            },
+        )
+
+    def _presence_session_block_reason(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        presence_snapshot: PresenceSessionSnapshot,
+    ) -> str | None:
+        session_id = getattr(presence_snapshot, "session_id", None)
+        if decision.trigger_id != "possible_fall":
+            return None
+        if not self.config.proactive_possible_fall_once_per_presence_session:
+            return None
+        if not presence_snapshot.armed or session_id is None:
+            return None
+        if self._last_possible_fall_prompted_session_id != session_id:
+            return None
+        return "already_prompted_this_presence_session"
+
+    def _record_trigger_skipped_presence_session(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        presence_snapshot: PresenceSessionSnapshot,
+        reason: str,
+    ) -> None:
+        session_id = getattr(presence_snapshot, "session_id", None)
+        self.emit(f"social_trigger_skipped={reason}")
+        self.runtime.ops_events.append(
+            event="social_trigger_skipped",
+            message="Social trigger prompt was skipped because it already fired in the current presence session.",
+            data={
+                "trigger": decision.trigger_id,
+                "reason": reason,
+                "presence_session_id": session_id,
+                "presence_reason": presence_snapshot.reason,
+                "priority": int(decision.priority),
+                "score": decision.score,
+                "threshold": decision.threshold,
             },
         )
 
@@ -567,10 +785,12 @@ class ProactiveMonitorService:
         coordinator: ProactiveCoordinator,
         *,
         poll_interval_s: float,
+        wakeword_stream: OpenWakeWordStreamingMonitor | None = None,
         emit: Callable[[str], None] | None = None,
     ) -> None:
         self.coordinator = coordinator
         self.poll_interval_s = max(0.2, poll_interval_s)
+        self.wakeword_stream = wakeword_stream
         self.emit = emit or (lambda _line: None)
         self._stop_event = Event()
         self._thread: Thread | None = None
@@ -584,7 +804,10 @@ class ProactiveMonitorService:
         self.coordinator.runtime.ops_events.append(
             event="proactive_monitor_started",
             message="Proactive monitor started.",
-            data={"poll_interval_s": self.poll_interval_s},
+            data={
+                "poll_interval_s": self.poll_interval_s,
+                "wakeword_streaming": self.wakeword_stream is not None,
+            },
         )
         self.emit("proactive_monitor=started")
         return self
@@ -596,6 +819,8 @@ class ProactiveMonitorService:
         self._stop_event.set()
         thread.join()
         self._thread = None
+        if self.wakeword_stream is not None:
+            self.wakeword_stream.close()
         if self.coordinator.pir_monitor is not None:
             self.coordinator.pir_monitor.close()
         self.coordinator.runtime.ops_events.append(
@@ -608,24 +833,46 @@ class ProactiveMonitorService:
     def __enter__(self) -> "ProactiveMonitorService":
         if self.coordinator.pir_monitor is not None:
             self.coordinator.pir_monitor.open()
+        if self.wakeword_stream is not None:
+            self.wakeword_stream.open()
         return self.open()
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
     def _run(self) -> None:
+        next_tick_at = 0.0
         while not self._stop_event.is_set():
+            did_work = False
             try:
-                self.coordinator.tick()
+                while self.coordinator.poll_wakeword_stream() is not None:
+                    did_work = True
             except Exception as exc:
                 self.emit(f"proactive_error={exc}")
                 self.coordinator.runtime.ops_events.append(
                     event="proactive_error",
                     level="error",
-                    message="Proactive monitor tick failed.",
+                    message="Proactive wakeword stream handling failed.",
                     data={"error": str(exc)},
                 )
-            if self._stop_event.wait(self.poll_interval_s):
+            now = time.monotonic()
+            if now >= next_tick_at:
+                try:
+                    self.coordinator.tick()
+                    did_work = True
+                except Exception as exc:
+                    self.emit(f"proactive_error={exc}")
+                    self.coordinator.runtime.ops_events.append(
+                        event="proactive_error",
+                        level="error",
+                        message="Proactive monitor tick failed.",
+                        data={"error": str(exc)},
+                    )
+                next_tick_at = time.monotonic() + self.poll_interval_s
+            wait_s = max(0.02, min(0.05, max(0.0, next_tick_at - time.monotonic())))
+            if did_work:
+                wait_s = 0.02
+            if self._stop_event.wait(wait_s):
                 return
 
 
@@ -651,30 +898,48 @@ def build_default_proactive_monitor(
         return None
 
     engine = SocialTriggerEngine.from_config(config)
-    audio_observer = NullAudioObservationProvider()
-    if config.proactive_audio_enabled or config.wakeword_enabled:
-        audio_observer = AmbientAudioObservationProvider(
-            sampler=AmbientAudioSampler.from_config(config),
-            audio_lock=audio_lock,
-            sample_ms=max(
-                config.proactive_audio_sample_ms,
-                config.wakeword_sample_ms if config.wakeword_enabled else config.proactive_audio_sample_ms,
-            ),
-            distress_enabled=config.proactive_audio_distress_enabled,
-        )
+    use_openwakeword_stream = (
+        config.wakeword_enabled
+        and (config.wakeword_backend or "stt").strip().lower() == "openwakeword"
+    )
     presence_session = None
     wakeword_spotter = None
+    wakeword_stream = None
     if config.wakeword_enabled:
         presence_session = PresenceSessionController(
             presence_grace_s=config.wakeword_presence_grace_s,
             motion_grace_s=config.wakeword_motion_grace_s,
             speech_grace_s=config.wakeword_speech_grace_s,
         )
-        wakeword_spotter = _build_wakeword_spotter(
-            config=config,
-            runtime=runtime,
-            backend=backend,
-            emit=emit,
+        if use_openwakeword_stream:
+            wakeword_stream = _build_openwakeword_stream(
+                config=config,
+                runtime=runtime,
+                emit=emit,
+            )
+            if wakeword_stream is None:
+                wakeword_spotter = _build_wakeword_spotter(
+                    config=config,
+                    runtime=runtime,
+                    backend=backend,
+                    emit=emit,
+                    selected_backend="stt",
+                )
+        else:
+            wakeword_spotter = _build_wakeword_spotter(
+                config=config,
+                runtime=runtime,
+                backend=backend,
+                emit=emit,
+            )
+    audio_observer = NullAudioObservationProvider()
+    if config.proactive_audio_enabled or config.wakeword_enabled:
+        sampler = wakeword_stream if wakeword_stream is not None else AmbientAudioSampler.from_config(config)
+        audio_observer = AmbientAudioObservationProvider(
+            sampler=sampler,
+            audio_lock=None if wakeword_stream is not None else audio_lock,
+            sample_ms=config.proactive_audio_sample_ms,
+            distress_enabled=config.proactive_audio_distress_enabled,
         )
     coordinator = ProactiveCoordinator(
         config=config,
@@ -689,6 +954,7 @@ def build_default_proactive_monitor(
         audio_observer=audio_observer,
         presence_session=presence_session,
         wakeword_spotter=wakeword_spotter,
+        wakeword_stream=wakeword_stream,
         wakeword_handler=wakeword_handler,
         pir_monitor=configured_pir_monitor(config),
         idle_predicate=idle_predicate,
@@ -698,8 +964,70 @@ def build_default_proactive_monitor(
     return ProactiveMonitorService(
         coordinator,
         poll_interval_s=config.proactive_poll_interval_s,
+        wakeword_stream=wakeword_stream,
         emit=emit,
     )
+
+
+def _build_openwakeword_stream(
+    *,
+    config: TwinrConfig,
+    runtime: TwinrRuntime,
+    emit: Callable[[str], None] | None,
+) -> OpenWakeWordStreamingMonitor | None:
+    models = tuple(model for model in config.wakeword_openwakeword_models if str(model).strip())
+    if config.audio_sample_rate != 16000 or config.audio_channels != 1:
+        _record_wakeword_backend_warning(
+            runtime=runtime,
+            emit=emit,
+            reason="openwakeword_requires_16khz_mono",
+            detail=(
+                "openWakeWord needs 16 kHz mono audio. Configure "
+                "TWINR_AUDIO_SAMPLE_RATE=16000 and TWINR_AUDIO_CHANNELS=1."
+            ),
+        )
+        return None
+    if not models:
+        _record_wakeword_backend_warning(
+            runtime=runtime,
+            emit=emit,
+            reason="openwakeword_models_missing",
+            detail=(
+                "openWakeWord backend selected, but no models were configured. "
+                "Set TWINR_WAKEWORD_OPENWAKEWORD_MODELS to model names or file paths."
+            ),
+        )
+        return None
+    try:
+        from twinr.proactive.openwakeword_spotter import WakewordOpenWakeWordFrameSpotter
+
+        return OpenWakeWordStreamingMonitor(
+            device=(config.proactive_audio_input_device or config.audio_input_device).strip(),
+            sample_rate=config.audio_sample_rate,
+            channels=config.audio_channels,
+            spotter=WakewordOpenWakeWordFrameSpotter(
+                wakeword_models=models,
+                phrases=config.wakeword_phrases,
+                threshold=config.wakeword_openwakeword_threshold,
+                vad_threshold=config.wakeword_openwakeword_vad_threshold,
+                patience_frames=config.wakeword_openwakeword_patience_frames,
+                activation_samples=config.wakeword_openwakeword_activation_samples,
+                deactivation_threshold=config.wakeword_openwakeword_deactivation_threshold,
+                enable_speex_noise_suppression=config.wakeword_openwakeword_enable_speex,
+                inference_framework=config.wakeword_openwakeword_inference_framework,
+            ),
+            attempt_cooldown_s=config.wakeword_attempt_cooldown_s,
+            speech_threshold=config.audio_speech_threshold,
+            emit=emit,
+        )
+    except Exception as exc:
+        _record_wakeword_backend_warning(
+            runtime=runtime,
+            emit=emit,
+            reason="openwakeword_init_failed",
+            detail=f"openWakeWord streaming initialization failed: {exc}",
+        )
+        return None
 
 
 def _build_wakeword_spotter(
@@ -708,8 +1036,13 @@ def _build_wakeword_spotter(
     runtime: TwinrRuntime,
     backend: OpenAIBackend,
     emit: Callable[[str], None] | None,
+    selected_backend: str | None = None,
 ):
-    selected_backend = (config.wakeword_backend or "stt").strip().lower() or "stt"
+    selected_backend = (
+        selected_backend
+        if selected_backend is not None
+        else (config.wakeword_backend or "stt").strip().lower() or "stt"
+    )
     if selected_backend == "openwakeword":
         models = tuple(model for model in config.wakeword_openwakeword_models if str(model).strip())
         if config.audio_sample_rate != 16000 or config.audio_channels != 1:
@@ -740,6 +1073,8 @@ def _build_wakeword_spotter(
                     threshold=config.wakeword_openwakeword_threshold,
                     vad_threshold=config.wakeword_openwakeword_vad_threshold,
                     patience_frames=config.wakeword_openwakeword_patience_frames,
+                    activation_samples=config.wakeword_openwakeword_activation_samples,
+                    deactivation_threshold=config.wakeword_openwakeword_deactivation_threshold,
                     enable_speex_noise_suppression=config.wakeword_openwakeword_enable_speex,
                     inference_framework=config.wakeword_openwakeword_inference_framework,
                     backend=backend,

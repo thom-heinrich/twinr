@@ -513,6 +513,25 @@ twinr --env-file /twinr/.env --run-streaming-loop
 
 The streaming loop keeps the same green/yellow button semantics and background reminder/automation behavior, but runs the spoken turn as `STT -> text/tool agent -> TTS`. Today it is wired through the OpenAI Responses API adapter, so the existing Twinr tool surface still works while the provider stack is being decoupled.
 
+The streaming loop now also supports a mixed provider stack through `.env`:
+
+- `TWINR_STT_PROVIDER=openai|deepgram`
+- `TWINR_LLM_PROVIDER=openai|groq`
+- `TWINR_TTS_PROVIDER=openai`
+
+For the cheaper migration target, set:
+
+```bash
+TWINR_STT_PROVIDER=deepgram
+TWINR_LLM_PROVIDER=groq
+TWINR_TTS_PROVIDER=openai
+DEEPGRAM_API_KEY=...
+GROQ_API_KEY=...
+OPENAI_API_KEY=...
+```
+
+`OpenAI` remains the support backend for search, print composition, reminder phrasing, proactive phrasing, camera inspection, and spoken TTS while `Deepgram` handles STT and `Groq` handles the main text/tool loop.
+
 Latency notes:
 
 - `TWINR_SPEECH_PAUSE_MS` controls how quickly Twinr stops listening after you stop speaking.

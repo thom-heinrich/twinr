@@ -109,7 +109,6 @@ apt-get install -y python3-pil python3-spidev python3-gpiozero python3-lgpio pyt
 "$PYTHON_BIN" <<'PY'
 from pathlib import Path
 import os
-import re
 import urllib.request
 
 vendor_dir = Path(os.environ["VENDOR_DIR"]) / "waveshare_epd"
@@ -121,14 +120,22 @@ driver_url = "https://raw.githubusercontent.com/waveshareteam/e-Paper/master/Ras
 epdconfig = urllib.request.urlopen(epdconfig_url, timeout=20).read().decode("utf-8", "ignore")
 driver = urllib.request.urlopen(driver_url, timeout=20).read().decode("utf-8", "ignore")
 
-replacements = {
-    r"RST_PIN\s*=\s*\d+": f"RST_PIN  = {os.environ['RESET_GPIO']}",
-    r"DC_PIN\s*=\s*\d+": f"DC_PIN   = {os.environ['DC_GPIO']}",
-    r"CS_PIN\s*=\s*\d+": f"CS_PIN   = {os.environ['CS_GPIO']}",
-    r"BUSY_PIN\s*=\s*\d+": f"BUSY_PIN = {os.environ['BUSY_GPIO']}",
+pin_replacements = {
+    "RST_PIN": f"RST_PIN  = {os.environ['RESET_GPIO']}",
+    "DC_PIN": f"DC_PIN   = {os.environ['DC_GPIO']}",
+    "CS_PIN": f"CS_PIN   = {os.environ['CS_GPIO']}",
+    "BUSY_PIN": f"BUSY_PIN = {os.environ['BUSY_GPIO']}",
 }
-for pattern, replacement in replacements.items():
-    epdconfig = re.sub(pattern, replacement, epdconfig)
+patched_lines = []
+for line in epdconfig.splitlines():
+    stripped = line.strip()
+    left, separator, _right = stripped.partition("=")
+    key = left.strip()
+    if separator and key in pin_replacements:
+        patched_lines.append(pin_replacements[key])
+        continue
+    patched_lines.append(line)
+epdconfig = "\n".join(patched_lines) + "\n"
 
 epdconfig = epdconfig.replace(
     "self.SPI.open(0, 0)",
@@ -145,11 +152,27 @@ touch "${ENV_FILE}"
 upsert_env() {
   local key="$1"
   local value="$2"
-  if grep -qE "^${key}=" "${ENV_FILE}"; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "${ENV_FILE}"
-  else
-    printf '%s=%s\n' "${key}" "${value}" >>"${ENV_FILE}"
-  fi
+  KEY="$key" VALUE="$value" "$PYTHON_BIN" <<'PY'
+from pathlib import Path
+import os
+
+env_file = Path(os.environ["ENV_FILE"])
+key = os.environ["KEY"]
+value = os.environ["VALUE"]
+lines = env_file.read_text(encoding="utf-8").splitlines() if env_file.exists() else []
+updated = False
+new_lines = []
+for line in lines:
+    current_key, separator, _rest = line.partition("=")
+    if separator and current_key == key:
+        new_lines.append(f"{key}={value}")
+        updated = True
+    else:
+        new_lines.append(line)
+if not updated:
+    new_lines.append(f"{key}={value}")
+env_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+PY
 }
 
 upsert_env "TWINR_DISPLAY_DRIVER" "waveshare_4in2_v2"

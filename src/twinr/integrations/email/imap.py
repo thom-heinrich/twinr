@@ -7,13 +7,11 @@ from email.header import decode_header, make_header
 from email.parser import BytesParser
 from email.utils import parseaddr, parsedate_to_datetime
 import imaplib
-import re
 from typing import Callable
 
 from twinr.integrations.email.adapter import MailboxReader
 from twinr.integrations.email.models import EmailMessageSummary, normalize_email
-
-_WHITESPACE_RE = re.compile(r"\s+")
+from twinr.text_utils import collapse_whitespace
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +91,7 @@ class IMAPMailboxReader(MailboxReader):
         return self._normalize_preview(payload.decode(charset, errors="replace"))
 
     def _normalize_preview(self, value: str) -> str:
-        return _WHITESPACE_RE.sub(" ", value).strip()[:160]
+        return collapse_whitespace(value)[:160]
 
     def _decode_header_value(self, value: str) -> str:
         if not value:
