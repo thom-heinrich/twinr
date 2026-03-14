@@ -8,6 +8,7 @@ class PresenceSessionSnapshot:
     armed: bool
     reason: str | None = None
     person_visible: bool = False
+    session_id: int | None = None
     last_person_seen_age_s: float | None = None
     last_motion_age_s: float | None = None
     last_speech_age_s: float | None = None
@@ -27,6 +28,8 @@ class PresenceSessionController:
         self._last_person_seen_at: float | None = None
         self._last_motion_at: float | None = None
         self._last_speech_at: float | None = None
+        self._armed: bool = False
+        self._current_session_id: int = 0
 
     def observe(
         self,
@@ -48,7 +51,7 @@ class PresenceSessionController:
         speech_age = _age(now, self._last_speech_at)
 
         if person_visible is True:
-            return PresenceSessionSnapshot(
+            return self._build_snapshot(
                 armed=True,
                 reason="person_visible",
                 person_visible=True,
@@ -57,7 +60,7 @@ class PresenceSessionController:
                 last_speech_age_s=speech_age,
             )
         if person_age is not None and person_age <= self.presence_grace_s:
-            return PresenceSessionSnapshot(
+            return self._build_snapshot(
                 armed=True,
                 reason="recent_person_visible",
                 person_visible=False,
@@ -66,7 +69,7 @@ class PresenceSessionController:
                 last_speech_age_s=speech_age,
             )
         if motion_active:
-            return PresenceSessionSnapshot(
+            return self._build_snapshot(
                 armed=True,
                 reason="pir_motion",
                 person_visible=False,
@@ -75,7 +78,7 @@ class PresenceSessionController:
                 last_speech_age_s=speech_age,
             )
         if motion_age is not None and motion_age <= self.motion_grace_s:
-            return PresenceSessionSnapshot(
+            return self._build_snapshot(
                 armed=True,
                 reason="recent_pir_motion",
                 person_visible=False,
@@ -88,7 +91,7 @@ class PresenceSessionController:
             or (motion_age is not None and motion_age <= self.motion_grace_s)
         )
         if speech_detected and recently_present:
-            return PresenceSessionSnapshot(
+            return self._build_snapshot(
                 armed=True,
                 reason="speech_while_recently_present",
                 person_visible=False,
@@ -97,7 +100,7 @@ class PresenceSessionController:
                 last_speech_age_s=speech_age,
             )
         if speech_age is not None and speech_age <= self.speech_grace_s and recently_present:
-            return PresenceSessionSnapshot(
+            return self._build_snapshot(
                 armed=True,
                 reason="recent_speech_while_present",
                 person_visible=False,
@@ -105,13 +108,36 @@ class PresenceSessionController:
                 last_motion_age_s=motion_age,
                 last_speech_age_s=speech_age,
             )
-        return PresenceSessionSnapshot(
+        return self._build_snapshot(
             armed=False,
             reason="idle",
             person_visible=False,
             last_person_seen_age_s=person_age,
             last_motion_age_s=motion_age,
             last_speech_age_s=speech_age,
+        )
+
+    def _build_snapshot(
+        self,
+        *,
+        armed: bool,
+        reason: str | None,
+        person_visible: bool,
+        last_person_seen_age_s: float | None,
+        last_motion_age_s: float | None,
+        last_speech_age_s: float | None,
+    ) -> PresenceSessionSnapshot:
+        if armed and not self._armed:
+            self._current_session_id += 1
+        self._armed = armed
+        return PresenceSessionSnapshot(
+            armed=armed,
+            reason=reason,
+            person_visible=person_visible,
+            session_id=self._current_session_id if armed else None,
+            last_person_seen_age_s=last_person_seen_age_s,
+            last_motion_age_s=last_motion_age_s,
+            last_speech_age_s=last_speech_age_s,
         )
 
 

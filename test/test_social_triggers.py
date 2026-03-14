@@ -156,7 +156,12 @@ class SocialTriggerEngineTests(unittest.TestCase):
         self.assertGreaterEqual(decision.score, decision.threshold)
 
     def test_possible_fall_triggers_when_slumped_person_drops_out_of_view_and_stays_still(self) -> None:
-        engine = SocialTriggerEngine()
+        config = TwinrConfig(
+            proactive_possible_fall_visibility_loss_arming_s=2.0,
+            proactive_possible_fall_slumped_visibility_loss_arming_s=2.0,
+            proactive_possible_fall_visibility_loss_hold_s=10.0,
+        )
+        engine = SocialTriggerEngine.from_config(config)
         self.observe(engine, 0.0, pir=True, person_visible=True, pose=SocialBodyPose.SLUMPED, low_motion=False, speech=False)
         self.observe(engine, 2.5, person_visible=True, pose=SocialBodyPose.SLUMPED, low_motion=True, speech=False)
         self.observe(engine, 3.0, person_visible=False, pose=SocialBodyPose.UNKNOWN, low_motion=True, speech=False)
@@ -245,6 +250,57 @@ class SocialTriggerEngineTests(unittest.TestCase):
         self.assertIsNone(decision)
         possible_fall = self.possible_fall_evaluation(engine)
         self.assertLess(possible_fall.score, possible_fall.threshold)
+
+    def test_possible_fall_visibility_loss_path_requires_longer_missing_hold_than_floor_path(self) -> None:
+        config = TwinrConfig(
+            proactive_possible_fall_stillness_s=4.0,
+            proactive_possible_fall_visibility_loss_hold_s=8.0,
+            proactive_possible_fall_visibility_loss_arming_s=2.0,
+            proactive_possible_fall_slumped_visibility_loss_arming_s=2.0,
+            proactive_possible_fall_score_threshold=0.65,
+        )
+        engine = SocialTriggerEngine.from_config(config)
+
+        self.observe(engine, 0.0, person_visible=True, pose=SocialBodyPose.SLUMPED, low_motion=False, speech=False)
+        self.observe(engine, 4.0, person_visible=True, pose=SocialBodyPose.SLUMPED, low_motion=True, speech=False)
+        self.observe(engine, 5.0, person_visible=False, pose=SocialBodyPose.UNKNOWN, low_motion=True, speech=False)
+        decision = self.observe(
+            engine,
+            8.4,
+            person_visible=False,
+            pose=SocialBodyPose.UNKNOWN,
+            low_motion=True,
+            speech=False,
+        )
+
+        self.assertIsNone(decision)
+        possible_fall = self.possible_fall_evaluation(engine)
+        self.assertEqual(possible_fall.blocked_reason, "visibility_loss_hold_incomplete")
+
+    def test_possible_fall_visibility_loss_path_can_still_trigger_after_longer_missing_hold(self) -> None:
+        config = TwinrConfig(
+            proactive_possible_fall_stillness_s=4.0,
+            proactive_possible_fall_visibility_loss_hold_s=8.0,
+            proactive_possible_fall_visibility_loss_arming_s=2.0,
+            proactive_possible_fall_slumped_visibility_loss_arming_s=2.0,
+            proactive_possible_fall_score_threshold=0.65,
+        )
+        engine = SocialTriggerEngine.from_config(config)
+
+        self.observe(engine, 0.0, person_visible=True, pose=SocialBodyPose.SLUMPED, low_motion=False, speech=False)
+        self.observe(engine, 4.0, person_visible=True, pose=SocialBodyPose.SLUMPED, low_motion=True, speech=False)
+        self.observe(engine, 5.0, person_visible=False, pose=SocialBodyPose.UNKNOWN, low_motion=True, speech=False)
+        decision = self.observe(
+            engine,
+            13.6,
+            person_visible=False,
+            pose=SocialBodyPose.UNKNOWN,
+            low_motion=True,
+            speech=False,
+        )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.trigger_id, "possible_fall")
 
     def test_showing_intent_needs_object_near_camera(self) -> None:
         engine = SocialTriggerEngine()

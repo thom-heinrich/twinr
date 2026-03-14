@@ -253,7 +253,7 @@ def _collect_proactive_audio_status(
         facts=(
             DeviceFact("Configured device", device_label),
             DeviceFact("Sample window", f"{config.proactive_audio_sample_ms} ms"),
-            DeviceFact("Distress heuristic", "enabled" if config.proactive_audio_distress_enabled else "disabled"),
+            DeviceFact("Distress detector", "enabled" if config.proactive_audio_distress_enabled else "disabled"),
             DeviceFact("Last self-test", _self_test_label(latest_self_tests, "proactive_mic")),
         ),
     )

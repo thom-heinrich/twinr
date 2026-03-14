@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from difflib import SequenceMatcher
-import re
 
 from twinr.hardware.audio import AmbientAudioCaptureWindow, pcm16_to_wav_bytes
 from twinr.providers.openai.backend import OpenAIBackend
+from twinr.text_utils import folded_lookup_text
 
 
 DEFAULT_WAKEWORD_PHRASES: tuple[str, ...] = (
@@ -32,28 +31,6 @@ DEFAULT_WAKEWORD_PHRASES: tuple[str, ...] = (
     "twinner",
 )
 
-_NON_ALNUM_RE = re.compile(r"[^0-9a-zA-ZäöüÄÖÜß]+")
-_LEADING_WAKEWORD_FILLERS = frozenset(
-    {
-        "ja",
-        "na",
-        "hm",
-        "hmm",
-        "äh",
-        "eh",
-        "oh",
-        "ah",
-        "also",
-        "hallo",
-        "hey",
-        "he",
-        "hi",
-        "bitte",
-        "mal",
-        "du",
-    }
-)
-_MAX_LEADING_WAKEWORD_FILLERS = 2
 _PROMPT_CONTAMINATION_MARKERS = (
     "if a name sounds close",
     "use that spelling exactly",
@@ -61,7 +38,18 @@ _PROMPT_CONTAMINATION_MARKERS = (
     "wake word variants",
     "return only what was actually spoken",
 )
-_MODEL_VERSION_SUFFIX_RE = re.compile(r"(?:[\s_-]v?\d+(?:[._-]\d+)*)+$")
+_DECORATIVE_MODEL_WORDS = frozenset(
+    {
+        "custom",
+        "family",
+        "model",
+        "models",
+        "multispeaker",
+        "multivoice",
+        "openwakeword",
+        "wakeword",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,24 +158,6 @@ def match_wakeword_transcript(
                     detector_label=detector_label,
                     score=score,
                 )
-    for phrase in normalized_phrases:
-        phrase_words = phrase.split()
-        if len(phrase) < 5:
-            continue
-        for start_index, normalized_prefix in _candidate_segments(normalized_words, len(phrase_words)):
-            if SequenceMatcher(None, normalized_prefix, phrase).ratio() >= min_prefix_ratio:
-                remaining_text = " ".join(original_words[start_index + len(phrase_words) :]).strip(" ,.!?:;")
-                return WakewordMatch(
-                    detected=True,
-                    transcript=cleaned_transcript,
-                    matched_phrase=phrase,
-                    remaining_text=remaining_text,
-                    normalized_transcript=normalized_transcript,
-                    backend=backend,
-                    detector_label=detector_label,
-                    score=score,
-                )
-
     return WakewordMatch(
         detected=False,
         transcript=cleaned_transcript,
@@ -202,7 +172,6 @@ def phrase_from_detector_label(
     label: str | None,
     *,
     phrases: tuple[str, ...] | list[str],
-    min_ratio: float = 0.82,
 ) -> str | None:
     normalized_label = normalize_detector_label(label)
     if not normalized_label:
@@ -210,24 +179,21 @@ def phrase_from_detector_label(
     normalized_phrases = tuple(_normalize_text(phrase) for phrase in phrases if _normalize_text(phrase))
     if normalized_label in normalized_phrases:
         return normalized_label
-    best_phrase = ""
-    best_score = 0.0
-    for phrase in normalized_phrases:
-        score = SequenceMatcher(None, normalized_label, phrase).ratio()
-        if score > best_score:
-            best_score = score
-            best_phrase = phrase
-    if best_phrase and best_score >= min_ratio:
-        return best_phrase
-    return normalized_label
+    return None
 
 
 def normalize_detector_label(label: str | None) -> str:
     raw_label = (label or "").strip()
     if not raw_label:
         return ""
-    without_version = _MODEL_VERSION_SUFFIX_RE.sub("", raw_label)
-    return _normalize_text(without_version.replace("_", " ").replace("-", " "))
+    normalized = _normalize_text(raw_label.replace("_", " ").replace("-", " "))
+    if not normalized:
+        return ""
+    words = normalized.split()
+    while words and _looks_like_version_token(words[-1]):
+        words.pop()
+    filtered_words = [word for word in words if word not in _DECORATIVE_MODEL_WORDS]
+    return " ".join(filtered_words) or normalized
 
 
 def _candidate_segments(
@@ -236,24 +202,41 @@ def _candidate_segments(
 ) -> list[tuple[int, str]]:
     if len(normalized_words) < phrase_word_count:
         return []
-    last_start = len(normalized_words) - phrase_word_count
     segments: list[tuple[int, str]] = []
-    for start_index in range(0, min(_MAX_LEADING_WAKEWORD_FILLERS, last_start) + 1):
-        if start_index > 0:
-            leading_words = normalized_words[:start_index]
-            if any(word not in _LEADING_WAKEWORD_FILLERS for word in leading_words):
-                continue
+    max_start = len(normalized_words) - phrase_word_count
+    for start_index in range(max_start + 1):
         segment = " ".join(normalized_words[start_index : start_index + phrase_word_count])
         segments.append((start_index, segment))
     return segments
 
 
 def _normalize_text(text: str) -> str:
-    lowered = (text or "").strip().lower()
-    if not lowered:
-        return ""
-    compact = _NON_ALNUM_RE.sub(" ", lowered)
-    return " ".join(compact.split())
+    return folded_lookup_text(text)
+
+
+def _looks_like_version_token(value: str) -> bool:
+    token = value.strip().lower()
+    if not token:
+        return False
+    if token.startswith("v"):
+        token = token[1:]
+    separators = {".", "_", "-"}
+    parts: list[str] = []
+    current: list[str] = []
+    for char in token:
+        if char.isdigit():
+            current.append(char)
+            continue
+        if char in separators:
+            if not current:
+                return False
+            parts.append("".join(current))
+            current = []
+            continue
+        return False
+    if current:
+        parts.append("".join(current))
+    return bool(parts)
 
 
 def _looks_like_prompt_contamination(text: str) -> bool:

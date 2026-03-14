@@ -12,12 +12,16 @@ from twinr.hardware.audio import AmbientAudioLevelSample
 from twinr.proactive import (
     AmbientAudioObservationProvider,
     OpenAIVisionObservationProvider,
+    PresenceSessionController,
     ProactiveAudioSnapshot,
     ProactiveCoordinator,
+    PresenceSessionSnapshot,
     SocialAudioObservation,
     SocialBodyPose,
     SocialTriggerEngine,
     SocialVisionObservation,
+    WakewordMatch,
+    WakewordStreamDetection,
     WakewordPhraseSpotter,
     build_default_proactive_monitor,
     parse_vision_observation_text,
@@ -112,6 +116,35 @@ class FakeAudioObserver:
     def observe(self):
         self.calls += 1
         return self.snapshot
+
+
+class FakeWakewordStream:
+    def __init__(self, detections=None) -> None:
+        self.detections = list(detections or [])
+        self.errors: list[str] = []
+        self.presence_snapshots: list[PresenceSessionSnapshot] = []
+        self.opened = False
+        self.closed = False
+
+    def open(self):
+        self.opened = True
+        return self
+
+    def close(self):
+        self.closed = True
+
+    def update_presence(self, snapshot: PresenceSessionSnapshot) -> None:
+        self.presence_snapshots.append(snapshot)
+
+    def poll_detection(self):
+        if not self.detections:
+            return None
+        return self.detections.pop(0)
+
+    def poll_error(self):
+        if not self.errors:
+            return None
+        return self.errors.pop(0)
 
 
 class MutableClock:
@@ -245,7 +278,90 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertIsNotNone(result.decision)
         self.assertEqual(result.decision.trigger_id, "person_returned")
 
-    def test_openwakeword_backend_bypasses_coarse_audio_gate(self) -> None:
+    def test_coordinator_updates_wakeword_stream_presence(self) -> None:
+        config = TwinrConfig(
+            wakeword_enabled=True,
+            proactive_capture_interval_s=1.0,
+            proactive_motion_window_s=20.0,
+        )
+        runtime = TwinrRuntime(config=config)
+        wakeword_stream = FakeWakewordStream()
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(),
+            trigger_handler=lambda _decision: True,
+            vision_observer=FakeVisionObserver(
+                [SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT)]
+            ),
+            pir_monitor=FakePirMonitor(events=[True], level=True),
+            audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+            presence_session=PresenceSessionController(
+                presence_grace_s=600.0,
+                motion_grace_s=120.0,
+                speech_grace_s=45.0,
+            ),
+            wakeword_stream=wakeword_stream,
+            emit=lambda _line: None,
+            clock=MutableClock(0.0),
+        )
+
+        coordinator.tick()
+
+        self.assertTrue(wakeword_stream.presence_snapshots)
+        self.assertTrue(wakeword_stream.presence_snapshots[-1].armed)
+        self.assertEqual(wakeword_stream.presence_snapshots[-1].reason, "person_visible")
+
+    def test_coordinator_handles_streaming_wakeword_detection(self) -> None:
+        config = TwinrConfig(
+            wakeword_enabled=True,
+            proactive_capture_interval_s=1.0,
+            proactive_motion_window_s=20.0,
+        )
+        runtime = TwinrRuntime(config=config)
+        handled: list[str | None] = []
+        detection = WakewordStreamDetection(
+            match=WakewordMatch(
+                detected=True,
+                transcript="",
+                matched_phrase="twinna",
+                backend="openwakeword",
+                detector_label="twinr_multivoice_v2",
+                score=0.82,
+            ),
+            presence_snapshot=PresenceSessionSnapshot(
+                armed=True,
+                reason="person_visible",
+                person_visible=True,
+                session_id=1,
+            ),
+        )
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(),
+            trigger_handler=lambda _decision: True,
+            vision_observer=FakeVisionObserver(
+                [SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT)]
+            ),
+            pir_monitor=FakePirMonitor(level=False),
+            audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+            wakeword_stream=FakeWakewordStream([detection]),
+            wakeword_handler=lambda match: handled.append(match.matched_phrase) or True,
+            emit=lambda _line: None,
+            clock=MutableClock(0.0),
+        )
+
+        match = coordinator.poll_wakeword_stream()
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match.matched_phrase, "twinna")
+        self.assertEqual(handled, ["twinna"])
+        attempted = [entry for entry in runtime.ops_events.tail(limit=10) if entry.get("event") == "wakeword_attempted"]
+        self.assertTrue(attempted)
+        self.assertEqual(attempted[-1]["data"]["matched_phrase"], "twinna")
+
+    def test_openwakeword_backend_requires_speech_like_audio_window(self) -> None:
         config = TwinrConfig(
             wakeword_enabled=True,
             wakeword_backend="openwakeword",
@@ -260,7 +376,7 @@ class ProactiveMonitorTests(unittest.TestCase):
             vision_observer=FakeVisionObserver([]),
             emit=lambda _line: None,
         )
-        audio_snapshot = ProactiveAudioSnapshot(
+        quiet_snapshot = ProactiveAudioSnapshot(
             observation=SocialAudioObservation(speech_detected=False),
             sample=AmbientAudioLevelSample(
                 duration_ms=2600,
@@ -274,8 +390,23 @@ class ProactiveMonitorTests(unittest.TestCase):
             sample_rate=16000,
             channels=1,
         )
+        speechy_snapshot = ProactiveAudioSnapshot(
+            observation=SocialAudioObservation(speech_detected=True),
+            sample=AmbientAudioLevelSample(
+                duration_ms=2600,
+                chunk_count=26,
+                active_chunk_count=3,
+                average_rms=478,
+                peak_rms=3556,
+                active_ratio=3 / 26,
+            ),
+            pcm_bytes=b"\x00\x01" * 128,
+            sample_rate=16000,
+            channels=1,
+        )
 
-        self.assertTrue(coordinator._wakeword_audio_candidate(audio_snapshot))
+        self.assertFalse(coordinator._wakeword_audio_candidate(quiet_snapshot))
+        self.assertTrue(coordinator._wakeword_audio_candidate(speechy_snapshot))
 
     def test_coordinator_pauses_completely_when_idle_predicate_is_false(self) -> None:
         config = TwinrConfig(
@@ -422,7 +553,7 @@ class ProactiveMonitorTests(unittest.TestCase):
             coordinator = ProactiveCoordinator(
                 config=config,
                 runtime=runtime,
-                engine=SocialTriggerEngine(user_name="Thom"),
+                engine=SocialTriggerEngine.from_config(config),
                 trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
                 vision_observer=FakeVisionObserver(
                     [
@@ -458,6 +589,60 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(observation_events[-1]["data"]["person_visible"], False)
         self.assertEqual(observation_events[-1]["data"]["inspected"], False)
 
+    def test_coordinator_suppresses_attention_window_after_recent_wakeword_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=1.0,
+                proactive_motion_window_s=20.0,
+                proactive_attention_window_s=1.0,
+                proactive_attention_window_score_threshold=0.86,
+                wakeword_block_proactive_after_attempt_s=15.0,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(0.0)
+            emitted: list[str] = []
+            handled: list[str] = []
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine.from_config(config),
+                trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            looking_toward_device=True,
+                            body_pose=SocialBodyPose.UPRIGHT,
+                        ),
+                        SocialVisionObservation(
+                            person_visible=True,
+                            looking_toward_device=True,
+                            body_pose=SocialBodyPose.UPRIGHT,
+                        ),
+                    ]
+                ),
+                pir_monitor=FakePirMonitor(events=[True], level=True),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                emit=emitted.append,
+                clock=clock,
+            )
+
+            coordinator.tick()
+            coordinator._last_wakeword_attempt_at = 1.4
+            clock.now = 2.5
+            result = coordinator.tick()
+
+            events = runtime.ops_events.tail(limit=20)
+
+        self.assertIsNone(result.decision)
+        self.assertEqual(handled, [])
+        self.assertIn("social_trigger_skipped=recent_wakeword_attempt", emitted)
+        skip_events = [entry for entry in events if entry.get("event") == "social_trigger_skipped"]
+        self.assertEqual(skip_events[-1]["data"]["trigger"], "attention_window")
+        self.assertEqual(skip_events[-1]["data"]["reason"], "recent_wakeword_attempt")
+
     def test_coordinator_dispatches_absence_path_trigger_when_inspection_is_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -467,6 +652,9 @@ class ProactiveMonitorTests(unittest.TestCase):
                 proactive_motion_window_s=5.0,
                 proactive_low_motion_after_s=1.0,
                 proactive_possible_fall_stillness_s=4.0,
+                proactive_possible_fall_visibility_loss_hold_s=4.0,
+                proactive_possible_fall_visibility_loss_arming_s=2.0,
+                proactive_possible_fall_slumped_visibility_loss_arming_s=2.0,
                 proactive_possible_fall_score_threshold=0.65,
             )
             runtime = TwinrRuntime(config=config)
@@ -476,7 +664,7 @@ class ProactiveMonitorTests(unittest.TestCase):
             coordinator = ProactiveCoordinator(
                 config=config,
                 runtime=runtime,
-                engine=SocialTriggerEngine(),
+                engine=SocialTriggerEngine.from_config(config),
                 trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
                 vision_observer=FakeVisionObserver(
                     [
@@ -509,6 +697,84 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(trigger_events[-1]["data"]["trigger"], "possible_fall")
         observation_events = [entry for entry in events if entry.get("event") == "proactive_observation"]
         self.assertEqual(observation_events[-1]["data"]["inspected"], False)
+
+    def test_coordinator_suppresses_second_possible_fall_prompt_within_same_presence_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=0.1,
+                proactive_motion_window_s=20.0,
+                proactive_low_motion_after_s=1.0,
+                proactive_possible_fall_stillness_s=4.0,
+                proactive_possible_fall_visibility_loss_hold_s=4.0,
+                proactive_possible_fall_visibility_loss_arming_s=2.0,
+                proactive_possible_fall_slumped_visibility_loss_arming_s=2.0,
+                proactive_possible_fall_score_threshold=0.65,
+                wakeword_presence_grace_s=600.0,
+                wakeword_motion_grace_s=120.0,
+                wakeword_speech_grace_s=45.0,
+                proactive_possible_fall_once_per_presence_session=True,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(0.0)
+            pir_monitor = FakePirMonitor(events=[True], level=False)
+            handled: list[str] = []
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine.from_config(config),
+                trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
+                        SocialVisionObservation(person_visible=False, body_pose=SocialBodyPose.UNKNOWN),
+                        SocialVisionObservation(person_visible=False, body_pose=SocialBodyPose.UNKNOWN),
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
+                        SocialVisionObservation(person_visible=False, body_pose=SocialBodyPose.UNKNOWN),
+                        SocialVisionObservation(person_visible=False, body_pose=SocialBodyPose.UNKNOWN),
+                    ]
+                ),
+                presence_session=PresenceSessionController(
+                    presence_grace_s=config.wakeword_presence_grace_s,
+                    motion_grace_s=config.wakeword_motion_grace_s,
+                    speech_grace_s=config.wakeword_speech_grace_s,
+                ),
+                pir_monitor=pir_monitor,
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            coordinator.tick()
+            clock.now = 2.5
+            coordinator.tick()
+            clock.now = 3.0
+            coordinator.tick()
+            clock.now = 7.3
+            first = coordinator.tick()
+            self.assertIsNotNone(first.decision)
+            self.assertEqual(first.decision.trigger_id, "possible_fall")
+
+            clock.now = 70.0
+            pir_monitor.events = [True]
+            coordinator.tick()
+            clock.now = 72.5
+            coordinator.tick()
+            clock.now = 76.9
+            second = coordinator.tick()
+
+            events = runtime.ops_events.tail(limit=40)
+
+        self.assertIsNone(second.decision)
+        self.assertEqual(handled, ["possible_fall"])
+        skip_events = [entry for entry in events if entry.get("event") == "social_trigger_skipped"]
+        self.assertEqual(skip_events[-1]["data"]["trigger"], "possible_fall")
+        self.assertEqual(
+            skip_events[-1]["data"]["reason"],
+            "already_prompted_this_presence_session",
+        )
 
     def test_build_default_monitor_requires_pir(self) -> None:
         config = TwinrConfig(proactive_enabled=True)

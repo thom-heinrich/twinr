@@ -183,53 +183,59 @@ def run_synthetic_longterm_eval(
             graph_store=graph_store,
             prompt_context_store=prompt_context_store,
         )
+        try:
+            contacts = _seed_contacts(graph_store)
+            preferences = _seed_preferences(graph_store)
+            plans = _seed_plans(graph_store, contacts)
+            episodes = _seed_episodes(service)
+            flushed = service.flush(timeout_s=30.0)
+            if not flushed:
+                pending_episodic = 0 if service.writer is None else service.writer.pending_count()
+                pending_multimodal = 0 if service.multimodal_writer is None else service.multimodal_writer.pending_count()
+                raise RuntimeError(
+                    "Synthetic long-term memory eval failed to flush background writes. "
+                    f"pending_episodic={pending_episodic} pending_multimodal={pending_multimodal}"
+                )
 
-        contacts = _seed_contacts(graph_store)
-        preferences = _seed_preferences(graph_store)
-        plans = _seed_plans(graph_store, contacts)
-        episodes = _seed_episodes(service)
-        flushed = service.flush(timeout_s=5.0)
-        if not flushed:
-            raise RuntimeError("Synthetic long-term memory eval failed to flush episodic writes.")
+            seed_stats = LongTermEvalSeedStats(
+                contacts=len(contacts),
+                preferences=150,
+                plans=len(plans),
+                episodic_turns=len(episodes),
+            )
+            if seed_stats.total_memories != 500:
+                raise AssertionError(f"Expected exactly 500 synthetic memories, got {seed_stats.total_memories}.")
 
-        seed_stats = LongTermEvalSeedStats(
-            contacts=len(contacts),
-            preferences=150,
-            plans=len(plans),
-            episodic_turns=len(episodes),
-        )
-        if seed_stats.total_memories != 500:
-            raise AssertionError(f"Expected exactly 500 synthetic memories, got {seed_stats.total_memories}.")
+            cases = _build_eval_cases(
+                contacts=contacts,
+                preferences=preferences,
+                plans=plans,
+                episodes=episodes,
+            )
+            if len(cases) != 50:
+                raise AssertionError(f"Expected exactly 50 eval cases, got {len(cases)}.")
+            service.query_rewriter = _StaticQueryRewriter(
+                {
+                    case.query_text: case.canonical_query_text
+                    for case in cases
+                    if case.canonical_query_text
+                }
+            )
 
-        cases = _build_eval_cases(
-            contacts=contacts,
-            preferences=preferences,
-            plans=plans,
-            episodes=episodes,
-        )
-        if len(cases) != 50:
-            raise AssertionError(f"Expected exactly 50 eval cases, got {len(cases)}.")
-        service.query_rewriter = _StaticQueryRewriter(
-            {
-                case.query_text: case.canonical_query_text
-                for case in cases
-                if case.canonical_query_text
-            }
-        )
-
-        case_results = tuple(_run_eval_case(service=service, graph_store=graph_store, case=case) for case in cases)
-        summary = _summarize_results(case_results)
-        memory_path = str(Path(config.memory_markdown_path))
-        graph_path = str(Path(config.long_term_memory_path) / "twinr_graph_v1.json")
-        service.shutdown()
-        return LongTermEvalResult(
-            seed_stats=seed_stats,
-            summary=summary,
-            cases=case_results,
-            temp_root=str(root),
-            memory_path=memory_path,
-            graph_path=graph_path,
-        )
+            case_results = tuple(_run_eval_case(service=service, graph_store=graph_store, case=case) for case in cases)
+            summary = _summarize_results(case_results)
+            memory_path = str(Path(config.memory_markdown_path))
+            graph_path = str(Path(config.long_term_memory_path) / "twinr_graph_v1.json")
+            return LongTermEvalResult(
+                seed_stats=seed_stats,
+                summary=summary,
+                cases=case_results,
+                temp_root=str(root),
+                memory_path=memory_path,
+                graph_path=graph_path,
+            )
+        finally:
+            service.shutdown(timeout_s=30.0)
 
 
 def _seed_contacts(graph_store: TwinrPersonalGraphStore) -> list[_ContactSeed]:

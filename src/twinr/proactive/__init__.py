@@ -9,6 +9,13 @@ from twinr.proactive.engine import (
     SocialTriggerThresholds,
     SocialVisionObservation,
 )
+from twinr.proactive.governor import (
+    ProactiveGovernor,
+    ProactiveGovernorCandidate,
+    ProactiveGovernorDecision,
+    ProactiveGovernorHistoryEntry,
+    ProactiveGovernorReservation,
+)
 from twinr.proactive.observers import (
     AmbientAudioObservationProvider,
     NullAudioObservationProvider,
@@ -17,7 +24,12 @@ from twinr.proactive.observers import (
     ProactiveVisionSnapshot,
     parse_vision_observation_text,
 )
-from twinr.proactive.openwakeword_spotter import OpenWakeWordPrediction, WakewordOpenWakeWordSpotter
+from twinr.proactive.openwakeword_spotter import (
+    OpenWakeWordPrediction,
+    WakewordOpenWakeWordFrameSpotter,
+    WakewordOpenWakeWordSpotter,
+)
+from twinr.proactive.openwakeword_stream import OpenWakeWordStreamingMonitor, WakewordStreamDetection
 from twinr.proactive.presence import PresenceSessionController, PresenceSessionSnapshot
 from twinr.proactive.scoring import (
     TriggerScoreEvidence,
@@ -51,7 +63,13 @@ __all__ = [
     "AmbientAudioObservationProvider",
     "NullAudioObservationProvider",
     "OpenWakeWordPrediction",
+    "OpenWakeWordStreamingMonitor",
     "OpenAIVisionObservationProvider",
+    "ProactiveGovernor",
+    "ProactiveGovernorCandidate",
+    "ProactiveGovernorDecision",
+    "ProactiveGovernorHistoryEntry",
+    "ProactiveGovernorReservation",
     "ProactiveAudioSnapshot",
     "ProactiveCoordinator",
     "ProactiveMonitorService",
@@ -69,8 +87,10 @@ __all__ = [
     "SocialVisionObservation",
     "TriggerScoreEvidence",
     "WakewordMatch",
+    "WakewordOpenWakeWordFrameSpotter",
     "WakewordOpenWakeWordSpotter",
     "WakewordPhraseSpotter",
+    "WakewordStreamDetection",
     "WeightedTriggerScore",
     "bool_score",
     "build_default_proactive_monitor",
