@@ -44,11 +44,8 @@ class MemoryState:
 
 
 class OnDeviceMemory:
-    def __init__(self, max_turns: int = 12, keep_recent: int = 6) -> None:
-        if max_turns < 3:
-            raise ValueError("max_turns must be at least 3")
-        if keep_recent < 1 or keep_recent >= max_turns:
-            raise ValueError("keep_recent must be between 1 and max_turns - 1")
+    def __init__(self, max_turns: int = 20, keep_recent: int = 10) -> None:
+        self._validate_limits(max_turns=max_turns, keep_recent=keep_recent)
         self.max_turns = max_turns
         self.keep_recent = keep_recent
         self._raw_tail: list[ConversationTurn] = []
@@ -84,6 +81,17 @@ class OnDeviceMemory:
             last_search_summary=self._state.last_search_summary,
             open_loops=tuple(self._state.open_loops),
         )
+
+    def reconfigure(self, *, max_turns: int, keep_recent: int) -> None:
+        self._validate_limits(max_turns=max_turns, keep_recent=keep_recent)
+        self.max_turns = max_turns
+        self.keep_recent = keep_recent
+        if len(self._raw_tail) > self.max_turns:
+            self._compact()
+        self._trim_raw_tail()
+        self._trim_ledger()
+        self._trim_search_results()
+        self._rebuild_state()
 
     def restore(self, turns: tuple[ConversationTurn, ...]) -> None:
         self._raw_tail = []
@@ -259,7 +267,7 @@ class OnDeviceMemory:
             self._ledger = self._ledger[-max_entries:]
 
     def _trim_search_results(self) -> None:
-        max_entries = max(2, min(6, self.keep_recent))
+        max_entries = max(4, min(10, self.keep_recent))
         if len(self._search_results) > max_entries:
             self._search_results = self._search_results[-max_entries:]
 
@@ -341,14 +349,14 @@ class OnDeviceMemory:
             summary_lines.append(f"Last user goal: {self._state.last_user_goal}")
         if self._state.open_loops:
             summary_lines.append("Open loops: " + " | ".join(self._state.open_loops[:2]))
-        for entry in self._search_results[-2:]:
+        for entry in self._search_results[-self._summary_search_limit() :]:
             summary_lines.append(
                 "Verified web lookup: "
                 f"{self._short_text(entry.question, limit=120)} -> {self._short_text(entry.answer, limit=220)}"
             )
         ledger_lines = [
             self._format_ledger_summary_line(item)
-            for item in self._ledger[-3:]
+            for item in self._ledger[-self._summary_ledger_limit() :]
             if item.kind != "search_result"
         ]
         summary_lines.extend(line for line in ledger_lines if line)
@@ -420,6 +428,18 @@ class OnDeviceMemory:
 
     def _ledger_key(self, kind: str, content: str) -> tuple[str, str]:
         return kind.strip().lower(), " ".join(content.strip().lower().split())
+
+    def _summary_search_limit(self) -> int:
+        return max(2, min(4, (self.keep_recent // 3) + 1))
+
+    def _summary_ledger_limit(self) -> int:
+        return max(3, min(6, (self.keep_recent // 2) + 1))
+
+    def _validate_limits(self, *, max_turns: int, keep_recent: int) -> None:
+        if max_turns < 3:
+            raise ValueError("max_turns must be at least 3")
+        if keep_recent < 1 or keep_recent >= max_turns:
+            raise ValueError("keep_recent must be between 1 and max_turns - 1")
 
     def _short_text(self, text: str, *, limit: int) -> str:
         normalized = " ".join(str(text or "").split()).strip()
