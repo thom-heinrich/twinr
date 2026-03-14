@@ -40,6 +40,36 @@ class AmbientAudioLevelSample:
     active_ratio: float
 
 
+@dataclass(frozen=True, slots=True)
+class AmbientAudioCaptureWindow:
+    sample: AmbientAudioLevelSample
+    pcm_bytes: bytes
+    sample_rate: int
+    channels: int
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechCaptureResult:
+    pcm_bytes: bytes
+    speech_started_after_ms: int
+    resumed_after_pause_count: int
+
+
+def pcm16_to_wav_bytes(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(_SAMPLE_WIDTH_BYTES)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_bytes)
+    return buffer.getvalue()
+
+
 class SilenceDetectedRecorder:
     def __init__(
         self,
@@ -84,7 +114,7 @@ class SilenceDetectedRecorder:
     def record_pcm_until_pause(self, *, pause_ms: int) -> bytes:
         return self.record_pcm_until_pause_with_options(pause_ms=pause_ms)
 
-    def record_pcm_until_pause_with_options(
+    def capture_pcm_until_pause_with_options(
         self,
         *,
         pause_ms: int,
@@ -92,7 +122,8 @@ class SilenceDetectedRecorder:
         max_record_seconds: float | None = None,
         speech_start_chunks: int | None = None,
         ignore_initial_ms: int = 0,
-    ) -> bytes:
+        pause_grace_ms: int = 0,
+    ) -> SpeechCaptureResult:
         command = [
             "arecord",
             "-D",
@@ -117,12 +148,18 @@ class SilenceDetectedRecorder:
         heard_speech = False
         consecutive_speech_chunks = 0
         last_non_silent_at: float | None = None
+        pause_candidate_deadline_at: float | None = None
         started_at = time.monotonic()
         effective_start_timeout_s = self.start_timeout_s if start_timeout_s is None else start_timeout_s
         effective_max_record_seconds = (
             self.max_record_seconds if max_record_seconds is None else max_record_seconds
         )
-        effective_speech_start_chunks = self.speech_start_chunks if speech_start_chunks is None else max(1, speech_start_chunks)
+        effective_speech_start_chunks = (
+            self.speech_start_chunks if speech_start_chunks is None else max(1, speech_start_chunks)
+        )
+        effective_pause_grace_ms = max(0, int(pause_grace_ms))
+        speech_started_after_ms = 0
+        resumed_after_pause_count = 0
         chunk_bytes = max(
             _SAMPLE_WIDTH_BYTES * self.channels,
             int((self.sample_rate * self.channels * _SAMPLE_WIDTH_BYTES * self.chunk_ms) / 1000),
@@ -142,6 +179,8 @@ class SilenceDetectedRecorder:
 
                 ready, _write_ready, _error_ready = select.select([process.stdout], [], [], 0.25)
                 if not ready:
+                    if heard_speech and pause_candidate_deadline_at is not None and time.monotonic() >= pause_candidate_deadline_at:
+                        break
                     continue
 
                 chunk = os.read(process.stdout.fileno(), chunk_bytes)
@@ -166,6 +205,8 @@ class SilenceDetectedRecorder:
                         if consecutive_speech_chunks >= effective_speech_start_chunks:
                             heard_speech = True
                             last_non_silent_at = now
+                            pause_candidate_deadline_at = None
+                            speech_started_after_ms = int((now - started_at) * 1000)
                             for buffered_chunk in preroll:
                                 captured.extend(buffered_chunk)
                     else:
@@ -174,25 +215,62 @@ class SilenceDetectedRecorder:
 
                 captured.extend(chunk)
                 if rms >= self.speech_threshold:
+                    if pause_candidate_deadline_at is not None:
+                        resumed_after_pause_count += 1
+                    pause_candidate_deadline_at = None
                     last_non_silent_at = now
                     continue
-                if last_non_silent_at is not None and (now - last_non_silent_at) * 1000 >= pause_ms:
+                if last_non_silent_at is None:
+                    continue
+                silence_ms = int((now - last_non_silent_at) * 1000)
+                if silence_ms < pause_ms:
+                    continue
+                if effective_pause_grace_ms <= 0:
+                    break
+                if pause_candidate_deadline_at is None:
+                    pause_candidate_deadline_at = last_non_silent_at + (
+                        pause_ms + effective_pause_grace_ms
+                    ) / 1000.0
+                    continue
+                if now >= pause_candidate_deadline_at:
                     break
         finally:
             self._stop_process(process)
 
         if not heard_speech or not captured:
             raise RuntimeError("Speech capture ended without usable audio")
-        return bytes(captured)
+        return SpeechCaptureResult(
+            pcm_bytes=bytes(captured),
+            speech_started_after_ms=max(0, speech_started_after_ms),
+            resumed_after_pause_count=max(0, resumed_after_pause_count),
+        )
+
+    def record_pcm_until_pause_with_options(
+        self,
+        *,
+        pause_ms: int,
+        start_timeout_s: float | None = None,
+        max_record_seconds: float | None = None,
+        speech_start_chunks: int | None = None,
+        ignore_initial_ms: int = 0,
+        pause_grace_ms: int = 0,
+    ) -> bytes:
+        result = self.capture_pcm_until_pause_with_options(
+            pause_ms=pause_ms,
+            start_timeout_s=start_timeout_s,
+            max_record_seconds=max_record_seconds,
+            speech_start_chunks=speech_start_chunks,
+            ignore_initial_ms=ignore_initial_ms,
+            pause_grace_ms=pause_grace_ms,
+        )
+        return result.pcm_bytes
 
     def _pcm_to_wav(self, pcm_bytes: bytes) -> bytes:
-        buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as wav_file:
-            wav_file.setnchannels(self.channels)
-            wav_file.setsampwidth(_SAMPLE_WIDTH_BYTES)
-            wav_file.setframerate(self.sample_rate)
-            wav_file.writeframes(pcm_bytes)
-        return buffer.getvalue()
+        return pcm16_to_wav_bytes(
+            pcm_bytes,
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+        )
 
     def _raise_process_error(self, process: subprocess.Popen[bytes]) -> None:
         stderr = b""
@@ -242,6 +320,9 @@ class AmbientAudioSampler:
         )
 
     def sample_levels(self, *, duration_ms: int | None = None) -> AmbientAudioLevelSample:
+        return self.sample_window(duration_ms=duration_ms).sample
+
+    def sample_window(self, *, duration_ms: int | None = None) -> AmbientAudioCaptureWindow:
         effective_duration_ms = max(self.chunk_ms, duration_ms or self.default_duration_ms)
         chunk_bytes = max(
             _SAMPLE_WIDTH_BYTES * self.channels,
@@ -268,6 +349,7 @@ class AmbientAudioSampler:
             stderr=subprocess.PIPE,
         )
         rms_values: list[int] = []
+        pcm_fragments: list[bytes] = []
 
         try:
             while len(rms_values) < target_chunk_count:
@@ -286,6 +368,7 @@ class AmbientAudioSampler:
                 if not chunk:
                     continue
                 rms_values.append(_pcm16_rms(chunk))
+                pcm_fragments.append(chunk)
         finally:
             self._stop_process(process)
 
@@ -295,13 +378,19 @@ class AmbientAudioSampler:
         active_chunk_count = sum(1 for rms in rms_values if rms >= self.speech_threshold)
         average_rms = int(sum(rms_values) / len(rms_values))
         peak_rms = max(rms_values)
-        return AmbientAudioLevelSample(
+        sample = AmbientAudioLevelSample(
             duration_ms=effective_duration_ms,
             chunk_count=len(rms_values),
             active_chunk_count=active_chunk_count,
             average_rms=average_rms,
             peak_rms=peak_rms,
             active_ratio=active_chunk_count / max(1, len(rms_values)),
+        )
+        return AmbientAudioCaptureWindow(
+            sample=sample,
+            pcm_bytes=b"".join(pcm_fragments),
+            sample_rate=self.sample_rate,
+            channels=self.channels,
         )
 
     def _raise_process_error(self, process: subprocess.Popen[bytes]) -> None:

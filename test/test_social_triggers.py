@@ -15,6 +15,9 @@ from twinr.config import TwinrConfig
 
 
 class SocialTriggerEngineTests(unittest.TestCase):
+    def possible_fall_evaluation(self, engine: SocialTriggerEngine):
+        return next(item for item in engine.last_evaluations if item.trigger_id == "possible_fall")
+
     def observe(
         self,
         engine: SocialTriggerEngine,
@@ -83,6 +86,22 @@ class SocialTriggerEngineTests(unittest.TestCase):
         self.assertEqual(decision.trigger_id, "attention_window")
         self.assertGreaterEqual(decision.score, decision.threshold)
         self.assertTrue(any(item.key == "looking_hold" for item in decision.evidence))
+
+    def test_attention_window_does_not_trigger_when_speech_interrupts_quiet_hold(self) -> None:
+        engine = SocialTriggerEngine()
+        self.observe(engine, 10.0, person_visible=True, looking=True, pose=SocialBodyPose.UPRIGHT, speech=False)
+        decision = self.observe(
+            engine,
+            16.2,
+            person_visible=True,
+            looking=True,
+            pose=SocialBodyPose.UPRIGHT,
+            speech=True,
+        )
+
+        self.assertIsNone(decision)
+        evaluation = next(item for item in engine.last_evaluations if item.trigger_id == "attention_window")
+        self.assertLess(evaluation.score, evaluation.threshold)
 
     def test_slumped_quiet_requires_slumped_low_motion_and_quiet(self) -> None:
         engine = SocialTriggerEngine(user_name="Thom")
@@ -155,7 +174,26 @@ class SocialTriggerEngineTests(unittest.TestCase):
         self.assertTrue(any(item.key == "fall_transition_signal" for item in decision.evidence))
         self.assertGreaterEqual(decision.score, decision.threshold)
 
-    def test_possible_fall_triggers_when_upright_person_drops_out_of_view_and_stays_still(self) -> None:
+    def test_possible_fall_does_not_trigger_when_person_briefly_looks_slumped_before_sitting_out_of_view(self) -> None:
+        engine = SocialTriggerEngine()
+        self.observe(engine, 0.0, person_visible=True, pose=SocialBodyPose.UPRIGHT, low_motion=False, speech=False)
+        self.observe(engine, 6.5, person_visible=True, pose=SocialBodyPose.UPRIGHT, low_motion=True, speech=False)
+        self.observe(engine, 7.0, person_visible=True, pose=SocialBodyPose.SLUMPED, low_motion=True, speech=False)
+        self.observe(engine, 8.0, person_visible=False, pose=SocialBodyPose.UNKNOWN, low_motion=True, speech=False)
+        decision = self.observe(
+            engine,
+            11.5,
+            person_visible=False,
+            pose=SocialBodyPose.UNKNOWN,
+            low_motion=True,
+            speech=False,
+        )
+
+        self.assertIsNone(decision)
+        possible_fall = self.possible_fall_evaluation(engine)
+        self.assertLess(possible_fall.score, possible_fall.threshold)
+
+    def test_possible_fall_does_not_trigger_when_upright_person_just_leaves_frame(self) -> None:
         engine = SocialTriggerEngine()
         self.observe(engine, 0.0, person_visible=True, pose=SocialBodyPose.UPRIGHT, low_motion=False, speech=False)
         self.observe(engine, 2.5, person_visible=True, pose=SocialBodyPose.UPRIGHT, low_motion=True, speech=False)
@@ -169,10 +207,26 @@ class SocialTriggerEngineTests(unittest.TestCase):
             speech=False,
         )
 
-        self.assertIsNotNone(decision)
-        self.assertEqual(decision.trigger_id, "possible_fall")
-        self.assertTrue(any(item.key == "low_or_missing_hold" for item in decision.evidence))
-        self.assertGreaterEqual(decision.score, decision.threshold)
+        self.assertIsNone(decision)
+        possible_fall = self.possible_fall_evaluation(engine)
+        self.assertLess(possible_fall.score, possible_fall.threshold)
+
+    def test_possible_fall_does_not_borrow_quiet_or_stillness_from_before_visibility_loss(self) -> None:
+        engine = SocialTriggerEngine()
+        self.observe(engine, 0.0, person_visible=True, pose=SocialBodyPose.UPRIGHT, low_motion=True, speech=False)
+        self.observe(engine, 30.0, person_visible=True, pose=SocialBodyPose.UPRIGHT, low_motion=True, speech=False)
+        decision = self.observe(
+            engine,
+            30.5,
+            person_visible=False,
+            pose=SocialBodyPose.UNKNOWN,
+            low_motion=True,
+            speech=False,
+        )
+
+        self.assertIsNone(decision)
+        possible_fall = self.possible_fall_evaluation(engine)
+        self.assertLess(possible_fall.score, possible_fall.threshold)
 
     def test_possible_fall_does_not_trigger_immediately_on_visibility_loss(self) -> None:
         engine = SocialTriggerEngine()
@@ -189,9 +243,8 @@ class SocialTriggerEngineTests(unittest.TestCase):
         )
 
         self.assertIsNone(decision)
-        self.assertIsNotNone(engine.best_evaluation)
-        self.assertEqual(engine.best_evaluation.trigger_id, "possible_fall")
-        self.assertLess(engine.best_evaluation.score, engine.best_evaluation.threshold)
+        possible_fall = self.possible_fall_evaluation(engine)
+        self.assertLess(possible_fall.score, possible_fall.threshold)
 
     def test_showing_intent_needs_object_near_camera(self) -> None:
         engine = SocialTriggerEngine()
