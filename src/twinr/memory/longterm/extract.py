@@ -31,7 +31,7 @@ _RELATION_TO_EDGE = {
 }
 
 _RELATION_PATTERN = re.compile(
-    r"\bmy\s+(?P<relation>wife|husband|daughter|son|mother|father|sister|brother|friend|neighbor|neighbour|physiotherapist|caregiver|doctor)\s+(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b"
+    r"\b(?:my|My)\s+(?P<relation>wife|husband|daughter|son|mother|father|sister|brother|friend|neighbor|neighbour|physiotherapist|caregiver|doctor)\s+(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b"
 )
 _AT_PLACE_PATTERN = re.compile(
     r"\b(?P<name>[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+is\s+at\s+(?P<place>[^.,;]+?)(?:\s+and\s+is\s+getting\s+(?P<treatment>[^.,;]+))?(?:[.,;]|$)"
@@ -216,9 +216,10 @@ class LongTermTurnExtractor:
         date_key = _extract_date(transcript, occurred_at=occurred_at, timezone_name=self.timezone_name)
         day_words = sorted(word for word in _DAY_WORDS if word in lower_tokens)
         for day_word in day_words:
+            slug_input = f"{day_word}_{date_key or 'day'}"
             observations.append(
                 LongTermMemoryObjectV1(
-                    memory_id=f"observation:{_slugify(f'{day_word}_{date_key or 'day'}', fallback='day')}",
+                    memory_id=f"observation:{_slugify(slug_input, fallback='day')}",
                     kind="situational_observation",
                     summary=f"The user described the day as {day_word}.",
                     details=f"Observed in {_quoted(transcript)}.",
@@ -234,9 +235,10 @@ class LongTermTurnExtractor:
             )
         weather_words = sorted(word for word in _WEATHER_WORDS if word in lower_tokens)
         for weather_word in weather_words:
+            slug_input = f"{weather_word}_{date_key or 'weather'}"
             observations.append(
                 LongTermMemoryObjectV1(
-                    memory_id=f"observation:{_slugify(f'{weather_word}_{date_key or 'weather'}', fallback='weather')}",
+                    memory_id=f"observation:{_slugify(slug_input, fallback='weather')}",
                     kind="situational_observation",
                     summary=f"The user described the day as {weather_word}.",
                     details=f"Observed in {_quoted(transcript)}.",

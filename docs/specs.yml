@@ -125,12 +125,14 @@ providers:
       - OpenRouter
     default_openai_model: gpt-4o-mini-tts
     default_openai_voice: marin
+    default_speed: 1.0
     default_style: clear_natural_standard_german
   realtime_voice:
     role: low_latency_direct_audio_conversation
     provider: OpenAI
     default_openai_model: gpt-4o-realtime-preview
     default_openai_voice: sage
+    default_speed: 1.0
     input_audio_format: pcm16_24khz_mono
     output_audio_format: pcm16_24khz_mono
     web_search_capable: true
@@ -175,11 +177,13 @@ memory:
       - search_tool_results_persist_as_typed_entries
       - compacted_context_stays_replayable
       - runtime_snapshot_restores_structured_memory
+      - listening_timing_adapts_slowly_within_bounds
     persistence:
       runtime_snapshot_path: state/runtime-state.json
       durable_memory_markdown_path: state/MEMORY.md
       reminder_store_path: state/reminders.json
       automation_store_path: state/automations.json
+      adaptive_timing_store_path: state/adaptive_timing.json
       automation_poll_interval_s: 5.0
       durable_memory_write_rule: explicit_user_request_only
       reminder_write_rule: explicit_user_request_only_via_tool
@@ -189,6 +193,7 @@ memory:
     operator_surfaces:
       - memory_page_lists_pending_and_delivered_reminders
       - memory_page_can_add_complete_and_delete_reminders
+      - settings_page_shows_adaptive_timing_profile_and_reset
   print_memory:
     purpose:
       - store_last_response
@@ -207,6 +212,50 @@ memory:
       - durable_user_preferences
       - persistent_facts
       - long_horizon_recall
+    runtime_orchestration:
+      package: src/twinr/memory/longterm
+      behavior:
+        - build_small_provider_context_before_turns
+        - persist_episodic_turns_in_background
+        - keep_internal_semantic_memory_in_canonical_english
+    current_client_basics:
+      - instance_overview
+      - auth_overview
+      - record_listing
+      - single_record_fetch
+      - full_document_fetch
+      - unified_retrieval
+      - single_record_submission
+      - bulk_record_submission
+      - graph_edges
+      - graph_neighbors
+      - graph_path
+      - graph_patterns
+      - versioned_twinr_graph_schema_v1
+      - long_term_service_orchestration
+      - bounded_async_write_queue
+      - recent_episodic_context_rendering
+    graph_schema:
+      name: twinr_graph
+      version: 1
+      edge_namespaces:
+        - social
+        - general
+        - temporal
+        - spatial
+        - user
+    config_env:
+      - TWINR_LONG_TERM_MEMORY_ENABLED
+      - TWINR_LONG_TERM_MEMORY_BACKEND
+      - TWINR_LONG_TERM_MEMORY_PATH
+      - TWINR_LONG_TERM_MEMORY_BACKGROUND_STORE_TURNS
+      - TWINR_LONG_TERM_MEMORY_WRITE_QUEUE_SIZE
+      - TWINR_LONG_TERM_MEMORY_RECALL_LIMIT
+      - TWINR_CHONKYDB_BASE_URL
+      - TWINR_CHONKYDB_API_KEY
+      - TWINR_CHONKYDB_API_KEY_HEADER
+      - TWINR_CHONKYDB_ALLOW_BEARER_AUTH
+      - TWINR_CHONKYDB_TIMEOUT_S
 
 web_interface:
   port: 1337
@@ -288,6 +337,8 @@ repository_layout:
   src/twinr/providers: Python package for provider adapters
   src/twinr/providers/openai: OpenAI provider implementation
   src/twinr/memory: Python package for on-device memory, durable memory, and reminders
+  src/twinr/memory/chonkydb: External ChonkyDB client basics and versioned Twinr graph schema for future long-term memory use
+  src/twinr/memory/longterm: Long-term memory orchestration for retrieval and non-blocking episodic persistence
   src/twinr/memory/on_device: Rolling local conversation memory
   src/twinr/automations: Python package for local automation triggers, actions, evaluation, and CRUD storage
   src/twinr/hardware: Python package for hardware adapters
@@ -318,10 +369,54 @@ automation_tools:
     - printed_static_actions
     - llm_prompt_actions
     - optional_web_search_during_due_execution
+
+simple_runtime_settings:
+  realtime_voice_tool: update_simple_setting
+  supported_settings:
+    - memory_capacity
+    - spoken_voice
+    - speech_speed
+    - speech_pause_ms
+    - follow_up_timeout_s
+  bounded_voice_options:
+    - marin
+    - cedar
+    - sage
+    - alloy
+    - coral
+    - echo
+  descriptive_voice_mapping:
+    enabled: true
+    example_requests:
+      - male_voice
+      - female_voice
+      - neutral_voice
+      - warmer_voice
+      - softer_voice
+      - deeper_voice
+  speech_speed_range:
+    minimum: 0.75
+    maximum: 1.15
   operator_examples:
     - every_day_at_noon_tell_me_the_news_about_topic_x
     - every_morning_give_me_the_weather
     - every_day_at_08_00_print_the_headlines
+
+adaptive_timing:
+  enabled_by_default: true
+  learning_signals:
+    - no_speech_timeout
+    - speech_started_after_ms
+    - resumed_after_pause_count
+  parameters:
+    - button_start_timeout_s
+    - follow_up_start_timeout_s
+    - speech_pause_ms
+    - pause_grace_ms
+  rules:
+    - widen_faster_than_it_shrinks
+    - keep_hard_bounds
+    - stay_anchored_to_configured_base_values
 
 mvp:
   includes:

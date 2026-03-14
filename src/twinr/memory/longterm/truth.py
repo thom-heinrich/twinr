@@ -50,7 +50,14 @@ class LongTermTruthMaintainer:
     ) -> LongTermMemoryObjectV1:
         conflicts = self.detect_conflicts(existing_objects=existing_objects, candidate=candidate)
         if conflicts:
-            return candidate.with_updates(status="uncertain", conflicts_with=tuple(item.candidate_memory_id for item in conflicts))
+            return candidate.with_updates(
+                status="uncertain",
+                conflicts_with=tuple(
+                    memory_id
+                    for conflict in conflicts
+                    for memory_id in conflict.existing_memory_ids
+                ),
+            )
         if candidate.status == "candidate":
             return candidate.with_updates(status="active")
         return candidate
