@@ -564,9 +564,10 @@ def _enrich_store_multihop(graph_store: TwinrPersonalGraphStore, *, store_label:
         edges,
         TwinrGraphEdgeV1(
             source_node_id=store_node_id,
-            edge_type="general_carries_brand",
+            edge_type="general_related_to",
             target_node_id=brand_node_id,
             confirmed_by_user=True,
+            attributes={"relation": "carries"},
         ),
     )
     edges = graph_store._upsert_edge(

@@ -1,6 +1,12 @@
 from twinr.memory.longterm.consolidator import LongTermMemoryConsolidator
 from twinr.memory.longterm.conflicts import LongTermConflictResolver
 from twinr.memory.longterm.extract import LongTermTurnExtractor
+from twinr.memory.longterm.midterm import (
+    LongTermStructuredReflectionProgram,
+    OpenAIStructuredReflectionProgram,
+    structured_reflection_program_from_config,
+)
+from twinr.memory.longterm.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.multimodal import LongTermMultimodalExtractor
 from twinr.memory.longterm.models import (
     LongTermConsolidationResultV1,
@@ -16,6 +22,7 @@ from twinr.memory.longterm.models import (
     LongTermMemoryObjectV1,
     LongTermMemoryReviewItemV1,
     LongTermMemoryReviewResultV1,
+    LongTermMidtermPacketV1,
     LongTermMultimodalEvidence,
     LongTermProactiveCandidateV1,
     LongTermProactivePlanV1,
@@ -25,6 +32,10 @@ from twinr.memory.longterm.models import (
     LongTermTurnExtractionV1,
 )
 from twinr.memory.longterm.planner import LongTermProactivePlanner
+from twinr.memory.longterm.propositions import (
+    LongTermTurnPropositionBundleV1,
+    LongTermTurnPropositionCompiler,
+)
 from twinr.memory.longterm.proactive import (
     LongTermProactiveHistoryEntryV1,
     LongTermProactivePolicy,
@@ -34,6 +45,7 @@ from twinr.memory.longterm.proactive import (
 from twinr.memory.longterm.reflect import LongTermMemoryReflector
 from twinr.memory.longterm.retriever import LongTermRetriever
 from twinr.memory.longterm.retention import LongTermRetentionPolicy
+from twinr.memory.longterm.sensor_memory import LongTermSensorMemoryCompiler
 from twinr.memory.longterm.service import LongTermMemoryService
 from twinr.memory.longterm.store import LongTermStructuredStore
 from twinr.memory.longterm.subtext import LongTermSubtextBuilder
@@ -62,6 +74,8 @@ __all__ = [
     "LongTermMemoryMutationResultV1",
     "LongTermMemoryReviewItemV1",
     "LongTermMemoryReviewResultV1",
+    "LongTermMidtermPacketV1",
+    "LongTermMidtermStore",
     "LongTermMultimodalEvidence",
     "LongTermMultimodalExtractor",
     "MultimodalEvalCase",
@@ -76,19 +90,25 @@ __all__ = [
     "LongTermProactivePlanner",
     "LongTermProactiveReservationV1",
     "LongTermProactiveStateStore",
+    "LongTermTurnPropositionBundleV1",
+    "LongTermTurnPropositionCompiler",
     "LongTermMemoryReflector",
     "LongTermRetriever",
     "LongTermRetentionPolicy",
+    "LongTermSensorMemoryCompiler",
     "LongTermRetentionResultV1",
     "LongTermReflectionResultV1",
     "LongTermMemoryService",
     "LongTermStructuredStore",
     "LongTermSourceRefV1",
     "LongTermSubtextBuilder",
+    "LongTermStructuredReflectionProgram",
     "LongTermTruthMaintainer",
     "LongTermTurnExtractionV1",
     "LongTermTurnExtractor",
+    "OpenAIStructuredReflectionProgram",
     "AsyncLongTermMultimodalWriter",
+    "structured_reflection_program_from_config",
     "run_multimodal_longterm_eval",
     "run_synthetic_longterm_eval",
 ]

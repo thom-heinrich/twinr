@@ -17,6 +17,7 @@ from twinr.memory.longterm import (
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,
+    LongTermMidtermStore,
     LongTermRetriever,
     LongTermSourceRefV1,
     LongTermStructuredStore,
@@ -47,20 +48,31 @@ def _source(event_id: str) -> LongTermSourceRefV1:
 
 
 class LongTermRetrieverTests(unittest.TestCase):
-    def _make_retriever(self, temp_dir: str) -> tuple[LongTermRetriever, LongTermStructuredStore, PromptContextStore, TwinrPersonalGraphStore]:
+    def _make_retriever(
+        self,
+        temp_dir: str,
+    ) -> tuple[
+        LongTermRetriever,
+        LongTermStructuredStore,
+        PromptContextStore,
+        TwinrPersonalGraphStore,
+        LongTermMidtermStore,
+    ]:
         config = _config(temp_dir)
         prompt_context_store = PromptContextStore.from_config(config)
         graph_store = TwinrPersonalGraphStore.from_config(config)
         object_store = LongTermStructuredStore.from_config(config)
+        midterm_store = LongTermMidtermStore.from_config(config)
         retriever = LongTermRetriever(
             config=config,
             prompt_context_store=prompt_context_store,
             graph_store=graph_store,
             object_store=object_store,
+            midterm_store=midterm_store,
             conflict_resolver=LongTermConflictResolver(),
             subtext_builder=LongTermSubtextBuilder(config=config, graph_store=graph_store),
         )
-        return retriever, object_store, prompt_context_store, graph_store
+        return retriever, object_store, prompt_context_store, graph_store, midterm_store
 
     def test_build_context_assembles_structured_memory_packet(self) -> None:
         existing = LongTermMemoryObjectV1(
@@ -95,7 +107,7 @@ class LongTermRetrieverTests(unittest.TestCase):
             reason="Conflicting phone numbers exist.",
         )
         with tempfile.TemporaryDirectory() as temp_dir:
-            retriever, object_store, prompt_context_store, graph_store = self._make_retriever(temp_dir)
+            retriever, object_store, prompt_context_store, graph_store, midterm_store = self._make_retriever(temp_dir)
             graph_store.remember_contact(
                 given_name="Corinna",
                 family_name="Maier",
@@ -118,6 +130,19 @@ class LongTermRetrieverTests(unittest.TestCase):
                     graph_edges=(),
                 )
             )
+            midterm_store.save_packets(
+                packets=(
+                    midterm_store.packet_type(
+                        packet_id="midterm:corinna_today",
+                        kind="recent_contact_bundle",
+                        summary="Corinna Maier is a recent practical contact and current phone questions may require disambiguation.",
+                        details="Useful when the user asks for Corinna's number or whether to call her.",
+                        source_memory_ids=("fact:corinna_phone_old", "fact:corinna_phone_new"),
+                        query_hints=("corinna", "phone", "number"),
+                        sensitivity="normal",
+                    ),
+                )
+            )
 
             context = retriever.build_context(
                 query=LongTermQueryProfile.from_text(
@@ -128,10 +153,12 @@ class LongTermRetrieverTests(unittest.TestCase):
             )
 
         self.assertIsNotNone(context.episodic_context)
+        self.assertIsNotNone(context.midterm_context)
         self.assertIsNotNone(context.durable_context)
         self.assertIsNotNone(context.graph_context)
         self.assertIsNotNone(context.conflict_context)
         self.assertIn("Corinna called earlier today", context.episodic_context or "")
+        self.assertIn("recent_contact_bundle", context.midterm_context or "")
         self.assertIn("+15555551234", context.durable_context or "")
         self.assertIn("Corinna Maier", context.graph_context or "")
         self.assertIn("contact:person:corinna_maier:phone", context.conflict_context or "")
@@ -165,7 +192,7 @@ class LongTermRetrieverTests(unittest.TestCase):
             reason="Conflicting phone numbers exist.",
         )
         with tempfile.TemporaryDirectory() as temp_dir:
-            retriever, object_store, _prompt_context_store, _graph_store = self._make_retriever(temp_dir)
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
             object_store.apply_consolidation(
                 LongTermConsolidationResultV1(
                     turn_id="turn:2",

@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
+from twinr.memory.longterm.models import LongTermGraphEdgeCandidateV1
 
 
 def _memory_payload(context: str) -> dict[str, object]:
@@ -118,6 +119,44 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
             subtext_payload = store.build_subtext_payload("Wie spät ist es in Tokio?")
 
         self.assertIsNone(subtext_payload)
+
+    def test_apply_candidate_edges_persists_graph_refs_as_nodes_and_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            store = TwinrPersonalGraphStore.from_config(config)
+            store.apply_candidate_edges(
+                (
+                    LongTermGraphEdgeCandidateV1(
+                        source_ref="user:main",
+                        edge_type="social_related_to_user",
+                        target_ref="person:janina",
+                        confidence=0.95,
+                        confirmed_by_user=True,
+                        attributes={"relation": "wife"},
+                    ),
+                    LongTermGraphEdgeCandidateV1(
+                        source_ref="person:janina",
+                        edge_type="spatial_located_in",
+                        target_ref="place:eye_doctor",
+                        confidence=0.88,
+                        confirmed_by_user=True,
+                    ),
+                )
+            )
+            document = store.load_document()
+
+        node_ids = {node.node_id for node in document.nodes}
+        edge_types = {edge.edge_type for edge in document.edges}
+
+        self.assertIn("user:main", node_ids)
+        self.assertIn("person:janina", node_ids)
+        self.assertIn("place:eye_doctor", node_ids)
+        self.assertIn("social_related_to_user", edge_types)
+        self.assertIn("spatial_located_in", edge_types)
 
 
 if __name__ == "__main__":

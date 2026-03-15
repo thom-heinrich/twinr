@@ -128,6 +128,8 @@ class TwinrConfig:
     user_display_name: str | None = None
     default_model: str = "gpt-5.2"
     openai_reasoning_effort: str = "medium"
+    openai_prompt_cache_enabled: bool = True
+    openai_prompt_cache_retention: str | None = None
     openai_stt_model: str = "whisper-1"
     openai_tts_model: str = "gpt-4o-mini-tts"
     openai_tts_voice: str = "marin"
@@ -139,6 +141,11 @@ class TwinrConfig:
     deepgram_stt_model: str = "nova-3"
     deepgram_stt_language: str | None = "de"
     deepgram_stt_smart_format: bool = True
+    deepgram_streaming_interim_results: bool = True
+    deepgram_streaming_endpointing_ms: int = 400
+    deepgram_streaming_utterance_end_ms: int = 1000
+    deepgram_streaming_stop_on_utterance_end: bool = True
+    deepgram_streaming_finalize_timeout_s: float = 4.0
     deepgram_timeout_s: float = 30.0
     groq_api_key: str | None = None
     groq_base_url: str = "https://api.groq.com/openai/v1"
@@ -151,22 +158,43 @@ class TwinrConfig:
     openai_realtime_transcription_model: str = "whisper-1"
     openai_realtime_language: str | None = "de"
     openai_realtime_input_sample_rate: int = 24000
+    turn_controller_enabled: bool = True
+    turn_controller_context_turns: int = 4
+    turn_controller_instructions_file: str = "TURN_CONTROLLER.md"
+    turn_controller_fast_endpoint_enabled: bool = True
+    turn_controller_fast_endpoint_min_chars: int = 10
+    turn_controller_fast_endpoint_min_confidence: float = 0.9
+    streaming_early_transcript_enabled: bool = True
+    streaming_early_transcript_min_chars: int = 10
     conversation_follow_up_enabled: bool = False
     conversation_follow_up_timeout_s: float = 4.0
     audio_beep_frequency_hz: int = 1046
     audio_beep_duration_ms: int = 180
     audio_beep_volume: float = 0.8
     audio_beep_settle_ms: int = 120
+    processing_feedback_delay_ms: int = 0
     search_feedback_tones_enabled: bool = True
     search_feedback_delay_ms: int = 1200
     search_feedback_pause_ms: int = 900
     search_feedback_volume: float = 0.14
+    audio_dynamic_pause_enabled: bool = True
+    audio_dynamic_pause_short_utterance_max_ms: int = 1000
+    audio_dynamic_pause_long_utterance_min_ms: int = 5000
+    audio_dynamic_pause_short_pause_bonus_ms: int = 120
+    audio_dynamic_pause_short_pause_grace_bonus_ms: int = 0
+    audio_dynamic_pause_medium_pause_penalty_ms: int = 120
+    audio_dynamic_pause_medium_pause_grace_penalty_ms: int = 250
+    audio_dynamic_pause_long_pause_penalty_ms: int = 320
+    audio_dynamic_pause_long_pause_grace_penalty_ms: int = 220
+    audio_pause_resume_chunks: int = 2
     audio_speech_start_chunks: int = 1
     audio_follow_up_speech_start_chunks: int = 4
     audio_follow_up_ignore_ms: int = 300
     openai_enable_web_search: bool = False
     openai_search_model: str = "gpt-5.2-chat-latest"
     openai_web_search_context_size: str = "medium"
+    openai_search_max_output_tokens: int = 160
+    openai_search_retry_max_output_tokens: int = 240
     openai_web_search_country: str | None = None
     openai_web_search_region: str | None = None
     openai_web_search_city: str | None = None
@@ -181,6 +209,10 @@ class TwinrConfig:
     audio_speech_threshold: int = 700
     audio_start_timeout_s: float = 8.0
     audio_max_record_seconds: float = 20.0
+    streaming_tts_clause_min_chars: int = 28
+    streaming_tts_soft_segment_chars: int = 72
+    streaming_tts_hard_segment_chars: int = 120
+    openai_tts_stream_chunk_size: int = 2048
     camera_device: str = "/dev/video0"
     camera_width: int = 640
     camera_height: int = 480
@@ -198,6 +230,11 @@ class TwinrConfig:
     proactive_audio_input_device: str | None = None
     proactive_audio_sample_ms: int = 1000
     proactive_audio_distress_enabled: bool = False
+    proactive_vision_review_enabled: bool = False
+    proactive_vision_review_buffer_frames: int = 8
+    proactive_vision_review_max_frames: int = 4
+    proactive_vision_review_max_age_s: float = 12.0
+    proactive_vision_review_min_spacing_s: float = 1.2
     wakeword_enabled: bool = False
     wakeword_backend: str = "stt"
     wakeword_phrases: tuple[str, ...] = DEFAULT_WAKEWORD_PHRASES
@@ -265,6 +302,17 @@ class TwinrConfig:
     long_term_memory_write_queue_size: int = 32
     long_term_memory_recall_limit: int = 3
     long_term_memory_query_rewrite_enabled: bool = True
+    long_term_memory_turn_extractor_model: str | None = None
+    long_term_memory_turn_extractor_max_output_tokens: int = 2200
+    long_term_memory_midterm_enabled: bool = True
+    long_term_memory_midterm_limit: int = 4
+    long_term_memory_reflection_window_size: int = 18
+    long_term_memory_reflection_compiler_enabled: bool = True
+    long_term_memory_reflection_compiler_model: str | None = None
+    long_term_memory_reflection_compiler_max_output_tokens: int = 900
+    long_term_memory_subtext_compiler_enabled: bool = True
+    long_term_memory_subtext_compiler_model: str | None = None
+    long_term_memory_subtext_compiler_max_output_tokens: int = 520
     long_term_memory_proactive_enabled: bool = False
     long_term_memory_proactive_poll_interval_s: float = 30.0
     long_term_memory_proactive_min_confidence: float = 0.72
@@ -273,6 +321,11 @@ class TwinrConfig:
     long_term_memory_proactive_reservation_ttl_s: float = 90.0
     long_term_memory_proactive_allow_sensitive: bool = False
     long_term_memory_proactive_history_limit: int = 128
+    long_term_memory_sensor_memory_enabled: bool = False
+    long_term_memory_sensor_baseline_days: int = 21
+    long_term_memory_sensor_min_days_observed: int = 6
+    long_term_memory_sensor_min_routine_ratio: float = 0.55
+    long_term_memory_sensor_deviation_min_delta: float = 0.45
     chonkydb_base_url: str | None = None
     chonkydb_api_key: str | None = None
     chonkydb_api_key_header: str = "x-api-key"
@@ -365,6 +418,8 @@ class TwinrConfig:
             user_display_name=get_value("TWINR_USER_DISPLAY_NAME"),
             default_model=get_value("OPENAI_MODEL", "gpt-5.2") or "gpt-5.2",
             openai_reasoning_effort=get_value("OPENAI_REASONING_EFFORT", "medium") or "medium",
+            openai_prompt_cache_enabled=_parse_bool(get_value("OPENAI_PROMPT_CACHE_ENABLED"), True),
+            openai_prompt_cache_retention=get_value("OPENAI_PROMPT_CACHE_RETENTION"),
             openai_stt_model=get_value("OPENAI_STT_MODEL", "whisper-1") or "whisper-1",
             openai_tts_model=get_value("OPENAI_TTS_MODEL", "gpt-4o-mini-tts") or "gpt-4o-mini-tts",
             openai_tts_voice=get_value("OPENAI_TTS_VOICE", "marin") or "marin",
@@ -377,6 +432,24 @@ class TwinrConfig:
             deepgram_stt_model=get_value("DEEPGRAM_STT_MODEL", "nova-3") or "nova-3",
             deepgram_stt_language=get_value("DEEPGRAM_STT_LANGUAGE", "de") or "de",
             deepgram_stt_smart_format=_parse_bool(get_value("DEEPGRAM_STT_SMART_FORMAT"), True),
+            deepgram_streaming_interim_results=_parse_bool(
+                get_value("DEEPGRAM_STREAMING_INTERIM_RESULTS"),
+                True,
+            ),
+            deepgram_streaming_endpointing_ms=int(
+                get_value("DEEPGRAM_STREAMING_ENDPOINTING_MS", "400") or "400"
+            ),
+            deepgram_streaming_utterance_end_ms=int(
+                get_value("DEEPGRAM_STREAMING_UTTERANCE_END_MS", "1000") or "1000"
+            ),
+            deepgram_streaming_stop_on_utterance_end=_parse_bool(
+                get_value("DEEPGRAM_STREAMING_STOP_ON_UTTERANCE_END"),
+                True,
+            ),
+            deepgram_streaming_finalize_timeout_s=_parse_float(
+                get_value("DEEPGRAM_STREAMING_FINALIZE_TIMEOUT_S"),
+                4.0,
+            ),
             deepgram_timeout_s=_parse_float(get_value("DEEPGRAM_TIMEOUT_S"), 30.0),
             groq_api_key=get_value("GROQ_API_KEY"),
             groq_base_url=get_value("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
@@ -395,6 +468,37 @@ class TwinrConfig:
             openai_realtime_input_sample_rate=int(
                 get_value("OPENAI_REALTIME_INPUT_SAMPLE_RATE", "24000") or "24000"
             ),
+            turn_controller_enabled=_parse_bool(
+                get_value("TWINR_TURN_CONTROLLER_ENABLED"),
+                True,
+            ),
+            turn_controller_context_turns=int(
+                get_value("TWINR_TURN_CONTROLLER_CONTEXT_TURNS", "4") or "4"
+            ),
+            turn_controller_instructions_file=(
+                get_value("TWINR_TURN_CONTROLLER_INSTRUCTIONS_FILE", "TURN_CONTROLLER.md")
+                or "TURN_CONTROLLER.md"
+            ),
+            turn_controller_fast_endpoint_enabled=_parse_bool(
+                get_value("TWINR_TURN_CONTROLLER_FAST_ENDPOINT_ENABLED"),
+                True,
+            ),
+            turn_controller_fast_endpoint_min_chars=int(
+                get_value("TWINR_TURN_CONTROLLER_FAST_ENDPOINT_MIN_CHARS", "10") or "10"
+            ),
+            turn_controller_fast_endpoint_min_confidence=_parse_clamped_float(
+                get_value("TWINR_TURN_CONTROLLER_FAST_ENDPOINT_MIN_CONFIDENCE"),
+                0.9,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            streaming_early_transcript_enabled=_parse_bool(
+                get_value("TWINR_STREAMING_EARLY_TRANSCRIPT_ENABLED"),
+                True,
+            ),
+            streaming_early_transcript_min_chars=int(
+                get_value("TWINR_STREAMING_EARLY_TRANSCRIPT_MIN_CHARS", "10") or "10"
+            ),
             conversation_follow_up_enabled=_parse_bool(
                 get_value("TWINR_CONVERSATION_FOLLOW_UP_ENABLED"),
                 False,
@@ -407,10 +511,44 @@ class TwinrConfig:
             audio_beep_duration_ms=int(get_value("TWINR_AUDIO_BEEP_DURATION_MS", "180") or "180"),
             audio_beep_volume=_parse_float(get_value("TWINR_AUDIO_BEEP_VOLUME"), 0.8),
             audio_beep_settle_ms=int(get_value("TWINR_AUDIO_BEEP_SETTLE_MS", "120") or "120"),
+            processing_feedback_delay_ms=int(
+                get_value("TWINR_PROCESSING_FEEDBACK_DELAY_MS", "0") or "0"
+            ),
             search_feedback_tones_enabled=_parse_bool(get_value("TWINR_SEARCH_FEEDBACK_TONES_ENABLED"), True),
             search_feedback_delay_ms=int(get_value("TWINR_SEARCH_FEEDBACK_DELAY_MS", "1200") or "1200"),
             search_feedback_pause_ms=int(get_value("TWINR_SEARCH_FEEDBACK_PAUSE_MS", "900") or "900"),
             search_feedback_volume=_parse_float(get_value("TWINR_SEARCH_FEEDBACK_VOLUME"), 0.14),
+            audio_dynamic_pause_enabled=_parse_bool(
+                get_value("TWINR_AUDIO_DYNAMIC_PAUSE_ENABLED"),
+                True,
+            ),
+            audio_dynamic_pause_short_utterance_max_ms=int(
+                get_value("TWINR_AUDIO_DYNAMIC_PAUSE_SHORT_UTTERANCE_MAX_MS", "1000") or "1000"
+            ),
+            audio_dynamic_pause_long_utterance_min_ms=int(
+                get_value("TWINR_AUDIO_DYNAMIC_PAUSE_LONG_UTTERANCE_MIN_MS", "5000") or "5000"
+            ),
+            audio_dynamic_pause_short_pause_bonus_ms=int(
+                get_value("TWINR_AUDIO_DYNAMIC_PAUSE_SHORT_PAUSE_BONUS_MS", "120") or "120"
+            ),
+            audio_dynamic_pause_short_pause_grace_bonus_ms=int(
+                get_value("TWINR_AUDIO_DYNAMIC_PAUSE_SHORT_PAUSE_GRACE_BONUS_MS", "0") or "0"
+            ),
+            audio_dynamic_pause_medium_pause_penalty_ms=int(
+                get_value("TWINR_AUDIO_DYNAMIC_PAUSE_MEDIUM_PAUSE_PENALTY_MS", "120") or "120"
+            ),
+            audio_dynamic_pause_medium_pause_grace_penalty_ms=int(
+                get_value("TWINR_AUDIO_DYNAMIC_PAUSE_MEDIUM_PAUSE_GRACE_PENALTY_MS", "250") or "250"
+            ),
+            audio_dynamic_pause_long_pause_penalty_ms=int(
+                get_value("TWINR_AUDIO_DYNAMIC_PAUSE_LONG_PAUSE_PENALTY_MS", "320") or "320"
+            ),
+            audio_dynamic_pause_long_pause_grace_penalty_ms=int(
+                get_value("TWINR_AUDIO_DYNAMIC_PAUSE_LONG_PAUSE_GRACE_PENALTY_MS", "220") or "220"
+            ),
+            audio_pause_resume_chunks=int(
+                get_value("TWINR_AUDIO_PAUSE_RESUME_CHUNKS", "2") or "2"
+            ),
             audio_speech_start_chunks=int(get_value("TWINR_AUDIO_SPEECH_START_CHUNKS", "1") or "1"),
             audio_follow_up_speech_start_chunks=int(
                 get_value("TWINR_AUDIO_FOLLOW_UP_SPEECH_START_CHUNKS", "4") or "4"
@@ -419,6 +557,12 @@ class TwinrConfig:
             openai_enable_web_search=_parse_bool(get_value("TWINR_OPENAI_ENABLE_WEB_SEARCH"), False),
             openai_search_model=get_value("OPENAI_SEARCH_MODEL", "gpt-5.2-chat-latest") or "gpt-5.2-chat-latest",
             openai_web_search_context_size=get_value("TWINR_OPENAI_WEB_SEARCH_CONTEXT_SIZE", "medium") or "medium",
+            openai_search_max_output_tokens=int(
+                get_value("TWINR_OPENAI_SEARCH_MAX_OUTPUT_TOKENS", "160") or "160"
+            ),
+            openai_search_retry_max_output_tokens=int(
+                get_value("TWINR_OPENAI_SEARCH_RETRY_MAX_OUTPUT_TOKENS", "240") or "240"
+            ),
             openai_web_search_country=get_value("TWINR_OPENAI_WEB_SEARCH_COUNTRY"),
             openai_web_search_region=get_value("TWINR_OPENAI_WEB_SEARCH_REGION"),
             openai_web_search_city=get_value("TWINR_OPENAI_WEB_SEARCH_CITY"),
@@ -433,6 +577,18 @@ class TwinrConfig:
             audio_speech_threshold=int(get_value("TWINR_AUDIO_SPEECH_THRESHOLD", "700") or "700"),
             audio_start_timeout_s=_parse_float(get_value("TWINR_AUDIO_START_TIMEOUT_S"), 8.0),
             audio_max_record_seconds=_parse_float(get_value("TWINR_AUDIO_MAX_RECORD_SECONDS"), 20.0),
+            streaming_tts_clause_min_chars=int(
+                get_value("TWINR_STREAMING_TTS_CLAUSE_MIN_CHARS", "28") or "28"
+            ),
+            streaming_tts_soft_segment_chars=int(
+                get_value("TWINR_STREAMING_TTS_SOFT_SEGMENT_CHARS", "72") or "72"
+            ),
+            streaming_tts_hard_segment_chars=int(
+                get_value("TWINR_STREAMING_TTS_HARD_SEGMENT_CHARS", "120") or "120"
+            ),
+            openai_tts_stream_chunk_size=int(
+                get_value("OPENAI_TTS_STREAM_CHUNK_SIZE", "2048") or "2048"
+            ),
             camera_device=get_value("TWINR_CAMERA_DEVICE", "/dev/video0") or "/dev/video0",
             camera_width=int(get_value("TWINR_CAMERA_WIDTH", "640") or "640"),
             camera_height=int(get_value("TWINR_CAMERA_HEIGHT", "480") or "480"),
@@ -452,6 +608,24 @@ class TwinrConfig:
             proactive_audio_distress_enabled=_parse_bool(
                 get_value("TWINR_PROACTIVE_AUDIO_DISTRESS_ENABLED"),
                 False,
+            ),
+            proactive_vision_review_enabled=_parse_bool(
+                get_value("TWINR_PROACTIVE_VISION_REVIEW_ENABLED"),
+                False,
+            ),
+            proactive_vision_review_buffer_frames=int(
+                get_value("TWINR_PROACTIVE_VISION_REVIEW_BUFFER_FRAMES", "8") or "8"
+            ),
+            proactive_vision_review_max_frames=int(
+                get_value("TWINR_PROACTIVE_VISION_REVIEW_MAX_FRAMES", "4") or "4"
+            ),
+            proactive_vision_review_max_age_s=_parse_float(
+                get_value("TWINR_PROACTIVE_VISION_REVIEW_MAX_AGE_S"),
+                12.0,
+            ),
+            proactive_vision_review_min_spacing_s=_parse_float(
+                get_value("TWINR_PROACTIVE_VISION_REVIEW_MIN_SPACING_S"),
+                1.2,
             ),
             wakeword_enabled=_parse_bool(get_value("TWINR_WAKEWORD_ENABLED"), False),
             wakeword_backend=(get_value("TWINR_WAKEWORD_BACKEND", "stt") or "stt").strip().lower(),
@@ -698,6 +872,42 @@ class TwinrConfig:
                 get_value("TWINR_LONG_TERM_MEMORY_QUERY_REWRITE_ENABLED"),
                 True,
             ),
+            long_term_memory_turn_extractor_model=(
+                get_value("TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MODEL") or None
+            ),
+            long_term_memory_turn_extractor_max_output_tokens=int(
+                get_value("TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MAX_OUTPUT_TOKENS", "2200") or "2200"
+            ),
+            long_term_memory_midterm_enabled=_parse_bool(
+                get_value("TWINR_LONG_TERM_MEMORY_MIDTERM_ENABLED"),
+                True,
+            ),
+            long_term_memory_midterm_limit=int(
+                get_value("TWINR_LONG_TERM_MEMORY_MIDTERM_LIMIT", "4") or "4"
+            ),
+            long_term_memory_reflection_window_size=int(
+                get_value("TWINR_LONG_TERM_MEMORY_REFLECTION_WINDOW_SIZE", "18") or "18"
+            ),
+            long_term_memory_reflection_compiler_enabled=_parse_bool(
+                get_value("TWINR_LONG_TERM_MEMORY_REFLECTION_COMPILER_ENABLED"),
+                True,
+            ),
+            long_term_memory_reflection_compiler_model=(
+                get_value("TWINR_LONG_TERM_MEMORY_REFLECTION_COMPILER_MODEL") or None
+            ),
+            long_term_memory_reflection_compiler_max_output_tokens=int(
+                get_value("TWINR_LONG_TERM_MEMORY_REFLECTION_COMPILER_MAX_OUTPUT_TOKENS", "900") or "900"
+            ),
+            long_term_memory_subtext_compiler_enabled=_parse_bool(
+                get_value("TWINR_LONG_TERM_MEMORY_SUBTEXT_COMPILER_ENABLED"),
+                True,
+            ),
+            long_term_memory_subtext_compiler_model=(
+                get_value("TWINR_LONG_TERM_MEMORY_SUBTEXT_COMPILER_MODEL") or None
+            ),
+            long_term_memory_subtext_compiler_max_output_tokens=int(
+                get_value("TWINR_LONG_TERM_MEMORY_SUBTEXT_COMPILER_MAX_OUTPUT_TOKENS", "520") or "520"
+            ),
             long_term_memory_proactive_enabled=_parse_bool(
                 get_value("TWINR_LONG_TERM_MEMORY_PROACTIVE_ENABLED"),
                 False,
@@ -728,6 +938,24 @@ class TwinrConfig:
             ),
             long_term_memory_proactive_history_limit=int(
                 get_value("TWINR_LONG_TERM_MEMORY_PROACTIVE_HISTORY_LIMIT", "128") or "128"
+            ),
+            long_term_memory_sensor_memory_enabled=_parse_bool(
+                get_value("TWINR_LONG_TERM_MEMORY_SENSOR_MEMORY_ENABLED"),
+                False,
+            ),
+            long_term_memory_sensor_baseline_days=int(
+                get_value("TWINR_LONG_TERM_MEMORY_SENSOR_BASELINE_DAYS", "21") or "21"
+            ),
+            long_term_memory_sensor_min_days_observed=int(
+                get_value("TWINR_LONG_TERM_MEMORY_SENSOR_MIN_DAYS_OBSERVED", "6") or "6"
+            ),
+            long_term_memory_sensor_min_routine_ratio=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_SENSOR_MIN_ROUTINE_RATIO"),
+                0.55,
+            ),
+            long_term_memory_sensor_deviation_min_delta=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_SENSOR_DEVIATION_MIN_DELTA"),
+                0.45,
             ),
             chonkydb_base_url=(
                 get_value("TWINR_CHONKYDB_BASE_URL")

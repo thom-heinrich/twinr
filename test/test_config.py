@@ -17,6 +17,8 @@ class TwinrConfigTests(unittest.TestCase):
                     [
                         "OPENAI_REASONING_EFFORT=medium",
                         "OPENAI_SEND_PROJECT_HEADER=false",
+                        "OPENAI_PROMPT_CACHE_ENABLED=true",
+                        "OPENAI_PROMPT_CACHE_RETENTION=24h",
                         "TWINR_STT_PROVIDER=deepgram",
                         "TWINR_LLM_PROVIDER=groq",
                         "TWINR_TTS_PROVIDER=openai",
@@ -32,6 +34,11 @@ class TwinrConfigTests(unittest.TestCase):
                         "DEEPGRAM_STT_MODEL=nova-3",
                         "DEEPGRAM_STT_LANGUAGE=de",
                         "DEEPGRAM_STT_SMART_FORMAT=false",
+                        "DEEPGRAM_STREAMING_INTERIM_RESULTS=false",
+                        "DEEPGRAM_STREAMING_ENDPOINTING_MS=550",
+                        "DEEPGRAM_STREAMING_UTTERANCE_END_MS=1200",
+                        "DEEPGRAM_STREAMING_STOP_ON_UTTERANCE_END=false",
+                        "DEEPGRAM_STREAMING_FINALIZE_TIMEOUT_S=6.5",
                         "DEEPGRAM_TIMEOUT_S=22.0",
                         "GROQ_API_KEY=groq-key",
                         "GROQ_BASE_URL=https://api.groq.example/openai/v1",
@@ -44,22 +51,43 @@ class TwinrConfigTests(unittest.TestCase):
                         "OPENAI_REALTIME_TRANSCRIPTION_MODEL=whisper-1",
                         "OPENAI_REALTIME_LANGUAGE=de",
                         "OPENAI_REALTIME_INPUT_SAMPLE_RATE=24000",
+                        "TWINR_TURN_CONTROLLER_ENABLED=false",
+                        "TWINR_TURN_CONTROLLER_CONTEXT_TURNS=6",
+                        "TWINR_TURN_CONTROLLER_INSTRUCTIONS_FILE=custom-turn-controller.md",
+                        "TWINR_TURN_CONTROLLER_FAST_ENDPOINT_ENABLED=false",
+                        "TWINR_TURN_CONTROLLER_FAST_ENDPOINT_MIN_CHARS=14",
+                        "TWINR_TURN_CONTROLLER_FAST_ENDPOINT_MIN_CONFIDENCE=0.82",
+                        "TWINR_STREAMING_EARLY_TRANSCRIPT_ENABLED=false",
+                        "TWINR_STREAMING_EARLY_TRANSCRIPT_MIN_CHARS=18",
                         "TWINR_CONVERSATION_FOLLOW_UP_ENABLED=true",
                         "TWINR_CONVERSATION_FOLLOW_UP_TIMEOUT_S=3.5",
                         "TWINR_AUDIO_BEEP_FREQUENCY_HZ=1175",
                         "TWINR_AUDIO_BEEP_DURATION_MS=220",
                         "TWINR_AUDIO_BEEP_VOLUME=0.9",
                         "TWINR_AUDIO_BEEP_SETTLE_MS=150",
+                        "TWINR_PROCESSING_FEEDBACK_DELAY_MS=25",
                         "TWINR_SEARCH_FEEDBACK_TONES_ENABLED=false",
                         "TWINR_SEARCH_FEEDBACK_DELAY_MS=1100",
                         "TWINR_SEARCH_FEEDBACK_PAUSE_MS=650",
                         "TWINR_SEARCH_FEEDBACK_VOLUME=0.22",
+                        "TWINR_AUDIO_DYNAMIC_PAUSE_ENABLED=false",
+                        "TWINR_AUDIO_DYNAMIC_PAUSE_SHORT_UTTERANCE_MAX_MS=900",
+                        "TWINR_AUDIO_DYNAMIC_PAUSE_LONG_UTTERANCE_MIN_MS=4200",
+                        "TWINR_AUDIO_DYNAMIC_PAUSE_SHORT_PAUSE_BONUS_MS=150",
+                        "TWINR_AUDIO_DYNAMIC_PAUSE_SHORT_PAUSE_GRACE_BONUS_MS=40",
+                        "TWINR_AUDIO_DYNAMIC_PAUSE_MEDIUM_PAUSE_PENALTY_MS=90",
+                        "TWINR_AUDIO_DYNAMIC_PAUSE_MEDIUM_PAUSE_GRACE_PENALTY_MS=180",
+                        "TWINR_AUDIO_DYNAMIC_PAUSE_LONG_PAUSE_PENALTY_MS=280",
+                        "TWINR_AUDIO_DYNAMIC_PAUSE_LONG_PAUSE_GRACE_PENALTY_MS=180",
+                        "TWINR_AUDIO_PAUSE_RESUME_CHUNKS=3",
                         "TWINR_AUDIO_SPEECH_START_CHUNKS=3",
                         "TWINR_AUDIO_FOLLOW_UP_SPEECH_START_CHUNKS=5",
                         "TWINR_AUDIO_FOLLOW_UP_IGNORE_MS=420",
                         "TWINR_OPENAI_ENABLE_WEB_SEARCH=true",
                         "OPENAI_SEARCH_MODEL=gpt-5.2",
                         "TWINR_OPENAI_WEB_SEARCH_CONTEXT_SIZE=high",
+                        "TWINR_OPENAI_SEARCH_MAX_OUTPUT_TOKENS=180",
+                        "TWINR_OPENAI_SEARCH_RETRY_MAX_OUTPUT_TOKENS=260",
                         "TWINR_OPENAI_WEB_SEARCH_COUNTRY=DE",
                         "TWINR_OPENAI_WEB_SEARCH_REGION=Berlin",
                         "TWINR_OPENAI_WEB_SEARCH_CITY=Berlin",
@@ -74,6 +102,10 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_AUDIO_SPEECH_THRESHOLD=950",
                         "TWINR_AUDIO_START_TIMEOUT_S=6.5",
                         "TWINR_AUDIO_MAX_RECORD_SECONDS=18.0",
+                        "TWINR_STREAMING_TTS_CLAUSE_MIN_CHARS=32",
+                        "TWINR_STREAMING_TTS_SOFT_SEGMENT_CHARS=84",
+                        "TWINR_STREAMING_TTS_HARD_SEGMENT_CHARS=132",
+                        "OPENAI_TTS_STREAM_CHUNK_SIZE=1024",
                         "TWINR_CAMERA_DEVICE=/dev/video2",
                         "TWINR_CAMERA_WIDTH=800",
                         "TWINR_CAMERA_HEIGHT=600",
@@ -91,6 +123,11 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_PROACTIVE_AUDIO_DEVICE=plughw:CARD=CameraB409241,DEV=0",
                         "TWINR_PROACTIVE_AUDIO_SAMPLE_MS=900",
                         "TWINR_PROACTIVE_AUDIO_DISTRESS_ENABLED=true",
+                        "TWINR_PROACTIVE_VISION_REVIEW_ENABLED=true",
+                        "TWINR_PROACTIVE_VISION_REVIEW_BUFFER_FRAMES=9",
+                        "TWINR_PROACTIVE_VISION_REVIEW_MAX_FRAMES=5",
+                        "TWINR_PROACTIVE_VISION_REVIEW_MAX_AGE_S=15.5",
+                        "TWINR_PROACTIVE_VISION_REVIEW_MIN_SPACING_S=1.7",
                         "TWINR_WAKEWORD_ENABLED=true",
                         "TWINR_WAKEWORD_BACKEND=openwakeword",
                         "TWINR_WAKEWORD_PHRASES=hey twinr, hey twinna, twinr, twinner",
@@ -156,6 +193,17 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LONG_TERM_MEMORY_BACKGROUND_STORE_TURNS=false",
                         "TWINR_LONG_TERM_MEMORY_WRITE_QUEUE_SIZE=48",
                         "TWINR_LONG_TERM_MEMORY_RECALL_LIMIT=5",
+                        "TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MODEL=gpt-5.2-mini",
+                        "TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MAX_OUTPUT_TOKENS=2600",
+                        "TWINR_LONG_TERM_MEMORY_MIDTERM_ENABLED=false",
+                        "TWINR_LONG_TERM_MEMORY_MIDTERM_LIMIT=6",
+                        "TWINR_LONG_TERM_MEMORY_REFLECTION_WINDOW_SIZE=24",
+                        "TWINR_LONG_TERM_MEMORY_REFLECTION_COMPILER_ENABLED=false",
+                        "TWINR_LONG_TERM_MEMORY_REFLECTION_COMPILER_MODEL=gpt-5.2-nano",
+                        "TWINR_LONG_TERM_MEMORY_REFLECTION_COMPILER_MAX_OUTPUT_TOKENS=640",
+                        "TWINR_LONG_TERM_MEMORY_SUBTEXT_COMPILER_ENABLED=false",
+                        "TWINR_LONG_TERM_MEMORY_SUBTEXT_COMPILER_MODEL=gpt-5.2-mini",
+                        "TWINR_LONG_TERM_MEMORY_SUBTEXT_COMPILER_MAX_OUTPUT_TOKENS=196",
                         "TWINR_LONG_TERM_MEMORY_PROACTIVE_ENABLED=true",
                         "TWINR_LONG_TERM_MEMORY_PROACTIVE_POLL_INTERVAL_S=18.0",
                         "TWINR_LONG_TERM_MEMORY_PROACTIVE_MIN_CONFIDENCE=0.81",
@@ -164,6 +212,11 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LONG_TERM_MEMORY_PROACTIVE_RESERVATION_TTL_S=75",
                         "TWINR_LONG_TERM_MEMORY_PROACTIVE_ALLOW_SENSITIVE=true",
                         "TWINR_LONG_TERM_MEMORY_PROACTIVE_HISTORY_LIMIT=64",
+                        "TWINR_LONG_TERM_MEMORY_SENSOR_MEMORY_ENABLED=true",
+                        "TWINR_LONG_TERM_MEMORY_SENSOR_BASELINE_DAYS=28",
+                        "TWINR_LONG_TERM_MEMORY_SENSOR_MIN_DAYS_OBSERVED=7",
+                        "TWINR_LONG_TERM_MEMORY_SENSOR_MIN_ROUTINE_RATIO=0.66",
+                        "TWINR_LONG_TERM_MEMORY_SENSOR_DEVIATION_MIN_DELTA=0.52",
                         "TWINR_CHONKYDB_BASE_URL=https://memory.example.com:2149",
                         "TWINR_CHONKYDB_API_KEY=secret-key",
                         "TWINR_CHONKYDB_API_KEY_HEADER=x-api-key",
@@ -218,6 +271,8 @@ class TwinrConfigTests(unittest.TestCase):
 
         self.assertEqual(config.openai_reasoning_effort, "medium")
         self.assertFalse(config.openai_send_project_header)
+        self.assertTrue(config.openai_prompt_cache_enabled)
+        self.assertEqual(config.openai_prompt_cache_retention, "24h")
         self.assertEqual(config.stt_provider, "deepgram")
         self.assertEqual(config.llm_provider, "groq")
         self.assertEqual(config.tts_provider, "openai")
@@ -233,6 +288,11 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.deepgram_stt_model, "nova-3")
         self.assertEqual(config.deepgram_stt_language, "de")
         self.assertFalse(config.deepgram_stt_smart_format)
+        self.assertFalse(config.deepgram_streaming_interim_results)
+        self.assertEqual(config.deepgram_streaming_endpointing_ms, 550)
+        self.assertEqual(config.deepgram_streaming_utterance_end_ms, 1200)
+        self.assertFalse(config.deepgram_streaming_stop_on_utterance_end)
+        self.assertEqual(config.deepgram_streaming_finalize_timeout_s, 6.5)
         self.assertEqual(config.deepgram_timeout_s, 22.0)
         self.assertEqual(config.groq_api_key, "groq-key")
         self.assertEqual(config.groq_base_url, "https://api.groq.example/openai/v1")
@@ -245,22 +305,43 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.openai_realtime_transcription_model, "whisper-1")
         self.assertEqual(config.openai_realtime_language, "de")
         self.assertEqual(config.openai_realtime_input_sample_rate, 24000)
+        self.assertFalse(config.turn_controller_enabled)
+        self.assertEqual(config.turn_controller_context_turns, 6)
+        self.assertEqual(config.turn_controller_instructions_file, "custom-turn-controller.md")
+        self.assertFalse(config.turn_controller_fast_endpoint_enabled)
+        self.assertEqual(config.turn_controller_fast_endpoint_min_chars, 14)
+        self.assertEqual(config.turn_controller_fast_endpoint_min_confidence, 0.82)
+        self.assertFalse(config.streaming_early_transcript_enabled)
+        self.assertEqual(config.streaming_early_transcript_min_chars, 18)
         self.assertTrue(config.conversation_follow_up_enabled)
         self.assertEqual(config.conversation_follow_up_timeout_s, 3.5)
         self.assertEqual(config.audio_beep_frequency_hz, 1175)
         self.assertEqual(config.audio_beep_duration_ms, 220)
         self.assertEqual(config.audio_beep_volume, 0.9)
         self.assertEqual(config.audio_beep_settle_ms, 150)
+        self.assertEqual(config.processing_feedback_delay_ms, 25)
         self.assertFalse(config.search_feedback_tones_enabled)
         self.assertEqual(config.search_feedback_delay_ms, 1100)
         self.assertEqual(config.search_feedback_pause_ms, 650)
         self.assertEqual(config.search_feedback_volume, 0.22)
+        self.assertFalse(config.audio_dynamic_pause_enabled)
+        self.assertEqual(config.audio_dynamic_pause_short_utterance_max_ms, 900)
+        self.assertEqual(config.audio_dynamic_pause_long_utterance_min_ms, 4200)
+        self.assertEqual(config.audio_dynamic_pause_short_pause_bonus_ms, 150)
+        self.assertEqual(config.audio_dynamic_pause_short_pause_grace_bonus_ms, 40)
+        self.assertEqual(config.audio_dynamic_pause_medium_pause_penalty_ms, 90)
+        self.assertEqual(config.audio_dynamic_pause_medium_pause_grace_penalty_ms, 180)
+        self.assertEqual(config.audio_dynamic_pause_long_pause_penalty_ms, 280)
+        self.assertEqual(config.audio_dynamic_pause_long_pause_grace_penalty_ms, 180)
+        self.assertEqual(config.audio_pause_resume_chunks, 3)
         self.assertEqual(config.audio_speech_start_chunks, 3)
         self.assertEqual(config.audio_follow_up_speech_start_chunks, 5)
         self.assertEqual(config.audio_follow_up_ignore_ms, 420)
         self.assertTrue(config.openai_enable_web_search)
         self.assertEqual(config.openai_search_model, "gpt-5.2")
         self.assertEqual(config.openai_web_search_context_size, "high")
+        self.assertEqual(config.openai_search_max_output_tokens, 180)
+        self.assertEqual(config.openai_search_retry_max_output_tokens, 260)
         self.assertEqual(config.openai_web_search_country, "DE")
         self.assertEqual(config.openai_web_search_region, "Berlin")
         self.assertEqual(config.openai_web_search_city, "Berlin")
@@ -275,6 +356,10 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.audio_speech_threshold, 950)
         self.assertEqual(config.audio_start_timeout_s, 6.5)
         self.assertEqual(config.audio_max_record_seconds, 18.0)
+        self.assertEqual(config.streaming_tts_clause_min_chars, 32)
+        self.assertEqual(config.streaming_tts_soft_segment_chars, 84)
+        self.assertEqual(config.streaming_tts_hard_segment_chars, 132)
+        self.assertEqual(config.openai_tts_stream_chunk_size, 1024)
         self.assertEqual(config.camera_device, "/dev/video2")
         self.assertEqual(config.camera_width, 800)
         self.assertEqual(config.camera_height, 600)
@@ -292,6 +377,11 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_audio_input_device, "plughw:CARD=CameraB409241,DEV=0")
         self.assertEqual(config.proactive_audio_sample_ms, 900)
         self.assertTrue(config.proactive_audio_distress_enabled)
+        self.assertTrue(config.proactive_vision_review_enabled)
+        self.assertEqual(config.proactive_vision_review_buffer_frames, 9)
+        self.assertEqual(config.proactive_vision_review_max_frames, 5)
+        self.assertEqual(config.proactive_vision_review_max_age_s, 15.5)
+        self.assertEqual(config.proactive_vision_review_min_spacing_s, 1.7)
         self.assertTrue(config.wakeword_enabled)
         self.assertEqual(config.wakeword_backend, "openwakeword")
         self.assertEqual(config.wakeword_phrases, ("hey twinr", "hey twinna", "twinr", "twinner"))
@@ -360,6 +450,17 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertFalse(config.long_term_memory_background_store_turns)
         self.assertEqual(config.long_term_memory_write_queue_size, 48)
         self.assertEqual(config.long_term_memory_recall_limit, 5)
+        self.assertEqual(config.long_term_memory_turn_extractor_model, "gpt-5.2-mini")
+        self.assertEqual(config.long_term_memory_turn_extractor_max_output_tokens, 2600)
+        self.assertFalse(config.long_term_memory_midterm_enabled)
+        self.assertEqual(config.long_term_memory_midterm_limit, 6)
+        self.assertEqual(config.long_term_memory_reflection_window_size, 24)
+        self.assertFalse(config.long_term_memory_reflection_compiler_enabled)
+        self.assertEqual(config.long_term_memory_reflection_compiler_model, "gpt-5.2-nano")
+        self.assertEqual(config.long_term_memory_reflection_compiler_max_output_tokens, 640)
+        self.assertFalse(config.long_term_memory_subtext_compiler_enabled)
+        self.assertEqual(config.long_term_memory_subtext_compiler_model, "gpt-5.2-mini")
+        self.assertEqual(config.long_term_memory_subtext_compiler_max_output_tokens, 196)
         self.assertTrue(config.long_term_memory_proactive_enabled)
         self.assertEqual(config.long_term_memory_proactive_poll_interval_s, 18.0)
         self.assertEqual(config.long_term_memory_proactive_min_confidence, 0.81)
@@ -368,6 +469,11 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_proactive_reservation_ttl_s, 75.0)
         self.assertTrue(config.long_term_memory_proactive_allow_sensitive)
         self.assertEqual(config.long_term_memory_proactive_history_limit, 64)
+        self.assertTrue(config.long_term_memory_sensor_memory_enabled)
+        self.assertEqual(config.long_term_memory_sensor_baseline_days, 28)
+        self.assertEqual(config.long_term_memory_sensor_min_days_observed, 7)
+        self.assertEqual(config.long_term_memory_sensor_min_routine_ratio, 0.66)
+        self.assertEqual(config.long_term_memory_sensor_deviation_min_delta, 0.52)
         self.assertEqual(config.chonkydb_base_url, "https://memory.example.com:2149")
         self.assertEqual(config.chonkydb_api_key, "secret-key")
         self.assertEqual(config.chonkydb_api_key_header, "x-api-key")
@@ -424,12 +530,42 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.memory_keep_recent, 10)
         self.assertTrue(config.adaptive_timing_enabled)
         self.assertEqual(config.adaptive_timing_pause_grace_ms, 450)
+        self.assertEqual(config.processing_feedback_delay_ms, 0)
+        self.assertTrue(config.turn_controller_enabled)
+        self.assertEqual(config.turn_controller_context_turns, 4)
+        self.assertEqual(config.turn_controller_instructions_file, "TURN_CONTROLLER.md")
+        self.assertTrue(config.turn_controller_fast_endpoint_enabled)
+        self.assertEqual(config.turn_controller_fast_endpoint_min_chars, 10)
+        self.assertEqual(config.turn_controller_fast_endpoint_min_confidence, 0.9)
+        self.assertTrue(config.streaming_early_transcript_enabled)
+        self.assertEqual(config.streaming_early_transcript_min_chars, 10)
+        self.assertTrue(config.audio_dynamic_pause_enabled)
+        self.assertEqual(config.audio_dynamic_pause_short_utterance_max_ms, 1000)
+        self.assertEqual(config.audio_dynamic_pause_long_utterance_min_ms, 5000)
+        self.assertEqual(config.audio_dynamic_pause_short_pause_bonus_ms, 120)
+        self.assertEqual(config.audio_dynamic_pause_short_pause_grace_bonus_ms, 0)
+        self.assertEqual(config.audio_dynamic_pause_medium_pause_penalty_ms, 120)
+        self.assertEqual(config.audio_dynamic_pause_medium_pause_grace_penalty_ms, 250)
+        self.assertEqual(config.audio_dynamic_pause_long_pause_penalty_ms, 320)
+        self.assertEqual(config.audio_dynamic_pause_long_pause_grace_penalty_ms, 220)
+        self.assertEqual(config.audio_pause_resume_chunks, 2)
         self.assertFalse(config.long_term_memory_enabled)
         self.assertEqual(config.long_term_memory_backend, "chonkydb")
         self.assertEqual(config.long_term_memory_path, "state/chonkydb")
         self.assertTrue(config.long_term_memory_background_store_turns)
         self.assertEqual(config.long_term_memory_write_queue_size, 32)
         self.assertEqual(config.long_term_memory_recall_limit, 3)
+        self.assertIsNone(config.long_term_memory_turn_extractor_model)
+        self.assertEqual(config.long_term_memory_turn_extractor_max_output_tokens, 2200)
+        self.assertTrue(config.long_term_memory_midterm_enabled)
+        self.assertEqual(config.long_term_memory_midterm_limit, 4)
+        self.assertEqual(config.long_term_memory_reflection_window_size, 18)
+        self.assertTrue(config.long_term_memory_reflection_compiler_enabled)
+        self.assertIsNone(config.long_term_memory_reflection_compiler_model)
+        self.assertEqual(config.long_term_memory_reflection_compiler_max_output_tokens, 900)
+        self.assertTrue(config.long_term_memory_subtext_compiler_enabled)
+        self.assertIsNone(config.long_term_memory_subtext_compiler_model)
+        self.assertEqual(config.long_term_memory_subtext_compiler_max_output_tokens, 520)
         self.assertFalse(config.long_term_memory_proactive_enabled)
         self.assertEqual(config.long_term_memory_proactive_poll_interval_s, 30.0)
         self.assertEqual(config.long_term_memory_proactive_min_confidence, 0.72)
@@ -438,6 +574,11 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_proactive_reservation_ttl_s, 90.0)
         self.assertFalse(config.long_term_memory_proactive_allow_sensitive)
         self.assertEqual(config.long_term_memory_proactive_history_limit, 128)
+        self.assertFalse(config.long_term_memory_sensor_memory_enabled)
+        self.assertEqual(config.long_term_memory_sensor_baseline_days, 21)
+        self.assertEqual(config.long_term_memory_sensor_min_days_observed, 6)
+        self.assertEqual(config.long_term_memory_sensor_min_routine_ratio, 0.55)
+        self.assertEqual(config.long_term_memory_sensor_deviation_min_delta, 0.45)
         self.assertEqual(config.proactive_possible_fall_visibility_loss_hold_s, 15.0)
         self.assertEqual(config.proactive_possible_fall_visibility_loss_arming_s, 6.0)
         self.assertEqual(config.proactive_possible_fall_slumped_visibility_loss_arming_s, 4.0)

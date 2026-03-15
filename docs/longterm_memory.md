@@ -24,7 +24,9 @@ This layer keeps long-term memory responsibilities separated from:
 - `retriever.py`
   - hybrid retrieval and bounded context assembly for silent personalization, explicit recall, and conflict prompts
 - `extract.py`
-  - cautious turn-to-memory decomposition into episode, fact, event, observation, and graph-edge candidates
+  - cautious turn-to-memory decomposition that first extracts atomic propositions and then compiles them into episode, fact, event, observation, and graph-edge candidates
+- `propositions.py`
+  - structured proposition contract plus deterministic proposition-to-memory compilation for the live turn extractor
 - `multimodal.py`
   - cautious device-event decomposition for PIR, camera, button, and printer signals into low-confidence multimodal memory candidates
 - `truth.py`
@@ -33,8 +35,12 @@ This layer keeps long-term memory responsibilities separated from:
   - promotion of extracted candidates into episodic vs durable memory plus conflict-aware graph emission
 - `store.py`
   - local structured persistence for durable objects and unresolved conflicts, plus review/delete/invalidate mutation helpers
+- `midterm_store.py`
+  - separate near-term continuity store for compiled mid-term packets that sit between rolling dialogue and durable facts
 - `reflect.py`
-  - bounded reflection over stored objects for support-count promotion and compact thread summaries
+  - bounded reflection over stored objects for support-count promotion, compact thread summaries, and compiled mid-term packets
+- `midterm.py`
+  - structured reflection program contract for compiling recent memory windows into bounded mid-term packets
 - `planner.py`
   - bounded proactive candidate generation from durable and reflected long-term memory
 - `proactive.py`
@@ -44,7 +50,7 @@ This layer keeps long-term memory responsibilities separated from:
 - `retention.py`
   - bounded retention policy for expiring time-bound memory and pruning low-value ephemeral objects
 - `subtext.py`
-  - builds silent personalization cues that should shape replies without explicit memory announcements
+  - builds silent personalization context and, when enabled, compiles relevant memory into a bounded structured subtext program for the current turn
 - `subtext_eval.py`
   - bounded live reply eval for subtle personalization quality
 - `multimodal_eval.py`
@@ -58,16 +64,21 @@ When enabled, Twinr uses the long-term service in two directions:
 
 1. Before a provider call, it builds a structured long-term context package:
    - silent personalization subtext
+   - mid-term continuity packets
    - recent episodic memories
    - graph-based personalization context
    - conflict clarification context when relevant
 2. After a normal conversation turn finishes, it can queue an episodic memory write in the background.
+   - the live extractor now uses a two-stage path:
+     - structured proposition extraction
+     - deterministic compilation into versioned long-term objects and graph edges
 3. During live operation, it can also queue multimodal evidence from:
    - PIR/camera sensor observations
    - green/yellow button usage
    - completed print deliveries
    - live camera captures
-4. When enabled, the background loops can reserve one bounded long-term proactive candidate at a time, apply cooldown/sensitivity policy, and speak it through the existing proactive prompt path.
+4. When enabled, it can compile bounded sensor-memory routine and deviation objects from repeated multimodal pattern evidence.
+5. When enabled, the background loops can reserve one bounded long-term proactive candidate at a time, apply cooldown/sensitivity policy, and speak it through the existing proactive prompt path.
 
 The service keeps semantic memory text in canonical English. Names, phone numbers, email addresses, IDs, and verbatim quoted text stay unchanged.
 
@@ -77,6 +88,8 @@ For non-English user queries, the retrieval path can build a short canonical Eng
 
 - recent episodic long-term memories:
   - `state/MEMORY.md`
+- compiled mid-term packets:
+  - `TWINR_LONG_TERM_MEMORY_PATH/twinr_memory_midterm_v1.json`
 - local graph-backed long-term structures:
   - `TWINR_LONG_TERM_MEMORY_PATH/twinr_graph_v1.json`
 
@@ -91,6 +104,17 @@ The normal live runtime still does not push every turn into the shared external 
 - `TWINR_LONG_TERM_MEMORY_WRITE_QUEUE_SIZE`
 - `TWINR_LONG_TERM_MEMORY_RECALL_LIMIT`
 - `TWINR_LONG_TERM_MEMORY_QUERY_REWRITE_ENABLED`
+- `TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MODEL`
+- `TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MAX_OUTPUT_TOKENS`
+- `TWINR_LONG_TERM_MEMORY_MIDTERM_ENABLED`
+- `TWINR_LONG_TERM_MEMORY_MIDTERM_LIMIT`
+- `TWINR_LONG_TERM_MEMORY_REFLECTION_WINDOW_SIZE`
+- `TWINR_LONG_TERM_MEMORY_REFLECTION_COMPILER_ENABLED`
+- `TWINR_LONG_TERM_MEMORY_REFLECTION_COMPILER_MODEL`
+- `TWINR_LONG_TERM_MEMORY_REFLECTION_COMPILER_MAX_OUTPUT_TOKENS`
+- `TWINR_LONG_TERM_MEMORY_SUBTEXT_COMPILER_ENABLED`
+- `TWINR_LONG_TERM_MEMORY_SUBTEXT_COMPILER_MODEL`
+- `TWINR_LONG_TERM_MEMORY_SUBTEXT_COMPILER_MAX_OUTPUT_TOKENS`
 - `TWINR_LONG_TERM_MEMORY_PROACTIVE_ENABLED`
 - `TWINR_LONG_TERM_MEMORY_PROACTIVE_POLL_INTERVAL_S`
 - `TWINR_LONG_TERM_MEMORY_PROACTIVE_MIN_CONFIDENCE`
@@ -99,6 +123,11 @@ The normal live runtime still does not push every turn into the shared external 
 - `TWINR_LONG_TERM_MEMORY_PROACTIVE_RESERVATION_TTL_S`
 - `TWINR_LONG_TERM_MEMORY_PROACTIVE_ALLOW_SENSITIVE`
 - `TWINR_LONG_TERM_MEMORY_PROACTIVE_HISTORY_LIMIT`
+- `TWINR_LONG_TERM_MEMORY_SENSOR_MEMORY_ENABLED`
+- `TWINR_LONG_TERM_MEMORY_SENSOR_BASELINE_DAYS`
+- `TWINR_LONG_TERM_MEMORY_SENSOR_MIN_DAYS_OBSERVED`
+- `TWINR_LONG_TERM_MEMORY_SENSOR_MIN_ROUTINE_RATIO`
+- `TWINR_LONG_TERM_MEMORY_SENSOR_DEVIATION_MIN_DELTA`
 - `TWINR_CHONKYDB_BASE_URL`
 - `TWINR_CHONKYDB_API_KEY`
 - `TWINR_CHONKYDB_API_KEY_HEADER`
@@ -146,6 +175,8 @@ Twinr also carries a bounded live response eval for the silent personalization l
 This eval uses real generated replies and checks whether hidden personal context is woven into answers naturally instead of being announced explicitly.
 It runs with isolated per-case base instructions so unrelated repo personality or user files do not pollute the measurement.
 
+When `TWINR_LONG_TERM_MEMORY_SUBTEXT_COMPILER_ENABLED=true`, the response path first compiles relevant graph and episodic memory into a bounded structured subtext program, then injects that compiled program as the silent personalization system message for the turn.
+
 Current case families:
 
 - preference-based personalization
@@ -160,11 +191,15 @@ Repro:
 PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.subtext_eval
 ```
 
-Current validated run on 2026-03-14:
+Current validated run on 2026-03-15:
 
 - 8/8 passed
 - 0 explicit memory-announcement violations
-- average naturalness score: 4.75/5
+- average naturalness score: 4.875/5
+
+Current status:
+
+- situational continuity, social-role familiarity, episodic continuity, preference shaping, and irrelevant-query controls are all green on Pi validation
 
 ## Multimodal goldset eval
 
@@ -201,6 +236,8 @@ The long-term service now keeps a local structured store alongside the markdown 
 
 - structured memory objects:
   - `TWINR_LONG_TERM_MEMORY_PATH/twinr_memory_objects_v1.json`
+- compiled mid-term packets:
+  - `TWINR_LONG_TERM_MEMORY_PATH/twinr_memory_midterm_v1.json`
 - unresolved conflicts:
   - `TWINR_LONG_TERM_MEMORY_PATH/twinr_memory_conflicts_v1.json`
 
@@ -210,7 +247,7 @@ The async background path can now:
 2. extract structured memory candidates from the same turn
 3. consolidate them against existing structured memory
 4. persist durable objects and unresolved conflicts for later retrieval
-5. run a bounded reflection pass to strengthen repeated evidence and emit `thread_summary` objects
+5. run a bounded reflection pass to strengthen repeated evidence, emit `summary` objects with `summary_type=thread`, and compile a small mid-term packet layer for near-term continuity
 6. expose a bounded proactive planner over structured memory for reminders and gentle follow-ups
 7. apply bounded retention so old episodes/observations do not accumulate without bound and past events become `expired`
 
@@ -235,6 +272,14 @@ The realtime voice tool path now exposes this explicitly through:
 This keeps spoken clarification generic across contacts, preferences, routines, and other slot-based long-term facts instead of hard-coding one-off disambiguation cases.
 
 Multimodal evidence uses the same consolidation/reflection/retention path as conversation turns, but starts from lower-confidence pattern candidates. This lets repeated PIR, camera, button, and printer signals strengthen into durable memory without over-trusting one isolated device event.
+
+On top of those raw multimodal patterns, Twinr can now also compile a bounded sensor-memory layer with:
+
+- presence routines by daypart and weekday/weekend class
+- interaction routines such as conversation start, print, camera use, and camera-showing
+- same-day low-presence deviation summaries that still require live confirmation before any spoken use
+
+The proactive planner can now turn that layer into bounded routine-aware candidates such as `routine_check_in`, `routine_camera_offer`, and `routine_print_offer`, but only when current live sensor facts confirm the moment is actually suitable.
 
 Live long-term proactive prompts now sit behind a separate reservation/policy layer instead of letting the planner speak directly. That layer is responsible for:
 

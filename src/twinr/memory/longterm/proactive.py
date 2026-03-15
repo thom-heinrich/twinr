@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.client import chonkydb_data_path
+from twinr.memory.longterm.ontology import normalize_memory_sensitivity
 from twinr.memory.longterm.models import LONGTERM_MEMORY_SENSITIVITY, LongTermProactiveCandidateV1, LongTermProactivePlanV1
 
 
@@ -68,6 +69,7 @@ class LongTermProactiveHistoryEntryV1:
     skip_count: int = 0
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(self.sensitivity))
         if not _normalize_text(self.candidate_id):
             raise ValueError("candidate_id is required.")
         if not _normalize_text(self.kind):
@@ -107,7 +109,7 @@ class LongTermProactiveHistoryEntryV1:
             candidate_id=str(payload.get("candidate_id", "")),
             kind=str(payload.get("kind", "")),
             summary=str(payload.get("summary", "")),
-            sensitivity=str(payload.get("sensitivity", "normal")),
+            sensitivity=normalize_memory_sensitivity(str(payload.get("sensitivity", "normal"))),
             source_memory_ids=tuple(
                 str(item) for item in payload.get("source_memory_ids", []) if isinstance(item, str)
             ),
@@ -290,7 +292,7 @@ class LongTermProactiveStateStore:
 class LongTermProactivePolicy:
     config: TwinrConfig
     state_store: LongTermProactiveStateStore
-    blocked_sensitivities: frozenset[str] = frozenset({"private", "medical", "sensitive"})
+    blocked_sensitivities: frozenset[str] = frozenset({"private", "sensitive", "critical"})
 
     def reserve_candidate(
         self,

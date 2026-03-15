@@ -52,8 +52,8 @@ class LongTermMemoryConsolidatorTests(unittest.TestCase):
         self.assertIn("Janina is the user's wife.", durable_summaries)
         self.assertTrue(any("eye laser treatment" in summary for summary in durable_summaries))
         self.assertIn("episode", episodic_kinds)
-        self.assertIn("situational_observation", episodic_kinds)
-        self.assertIn("social_family_of", edge_types)
+        self.assertIn("observation", episodic_kinds)
+        self.assertIn("social_related_to_user", edge_types)
         self.assertIn("temporal_occurs_on", edge_types)
 
     def test_consolidator_keeps_conflicting_candidate_deferred_and_blocks_its_graph_edge(self) -> None:

@@ -24,14 +24,19 @@ class LongTermRetentionPolicyTests(unittest.TestCase):
     def test_retention_expires_past_time_bound_event(self) -> None:
         policy = LongTermRetentionPolicy()
         item = LongTermMemoryObjectV1(
-            memory_id="fact:appointment",
-            kind="medical_event",
+            memory_id="event:appointment",
+            kind="event",
             summary="Janina has eye laser treatment on 2026-03-14.",
             source=_source(),
             status="active",
             confidence=0.9,
             valid_from="2026-03-14",
             valid_to="2026-03-14",
+            sensitivity="sensitive",
+            attributes={
+                "memory_domain": "appointment",
+                "event_domain": "appointment",
+            },
         )
 
         result = policy.apply(

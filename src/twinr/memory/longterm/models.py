@@ -4,6 +4,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Mapping
 
+from twinr.memory.longterm.ontology import (
+    LONGTERM_MEMORY_SENSITIVITIES,
+    normalize_memory_kind,
+    normalize_memory_sensitivity,
+)
+
 
 LONGTERM_MEMORY_OBJECT_SCHEMA = "twinr_memory_object"
 LONGTERM_MEMORY_OBJECT_VERSION = 1
@@ -15,6 +21,8 @@ LONGTERM_CONSOLIDATION_SCHEMA = "twinr_memory_consolidation"
 LONGTERM_CONSOLIDATION_VERSION = 1
 LONGTERM_REFLECTION_SCHEMA = "twinr_memory_reflection"
 LONGTERM_REFLECTION_VERSION = 1
+LONGTERM_MIDTERM_PACKET_SCHEMA = "twinr_memory_midterm_packet"
+LONGTERM_MIDTERM_PACKET_VERSION = 1
 LONGTERM_PROACTIVE_PLAN_SCHEMA = "twinr_memory_proactive_plan"
 LONGTERM_PROACTIVE_PLAN_VERSION = 1
 LONGTERM_RETENTION_SCHEMA = "twinr_memory_retention"
@@ -41,7 +49,7 @@ LONGTERM_MEMORY_STATUSES = frozenset(
         "expired",
     }
 )
-LONGTERM_MEMORY_SENSITIVITY = frozenset({"low", "normal", "private", "medical", "sensitive"})
+LONGTERM_MEMORY_SENSITIVITY = LONGTERM_MEMORY_SENSITIVITIES
 
 
 def _utcnow() -> datetime:
@@ -110,6 +118,7 @@ class LongTermMultimodalEvidence:
 @dataclass(frozen=True, slots=True)
 class LongTermMemoryContext:
     subtext_context: str | None = None
+    midterm_context: str | None = None
     durable_context: str | None = None
     episodic_context: str | None = None
     graph_context: str | None = None
@@ -119,6 +128,8 @@ class LongTermMemoryContext:
         messages: list[str] = []
         if self.subtext_context:
             messages.append(self.subtext_context)
+        if self.midterm_context:
+            messages.append(self.midterm_context)
         if self.durable_context:
             messages.append(self.durable_context)
         if self.episodic_context:
@@ -227,6 +238,7 @@ class LongTermMemoryObjectV1:
     version: int = LONGTERM_MEMORY_OBJECT_VERSION
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(self.sensitivity))
         if not _normalize_text(self.memory_id):
             raise ValueError("memory_id is required.")
         if not _normalize_text(self.kind):
@@ -279,9 +291,13 @@ class LongTermMemoryObjectV1:
         if not isinstance(source_payload, Mapping):
             raise ValueError("source payload is required.")
         attributes = payload.get("attributes")
+        normalized_kind, normalized_attributes = normalize_memory_kind(
+            str(payload.get("kind", "")),
+            dict(attributes) if isinstance(attributes, Mapping) else None,
+        )
         return cls(
             memory_id=str(payload.get("memory_id", "")),
-            kind=str(payload.get("kind", "")),
+            kind=normalized_kind,
             summary=str(payload.get("summary", "")),
             source=LongTermSourceRefV1.from_payload(source_payload),
             details=str(payload["details"]) if payload.get("details") is not None else None,
@@ -289,14 +305,14 @@ class LongTermMemoryObjectV1:
             confidence=float(payload.get("confidence", 0.5)),
             canonical_language=str(payload.get("canonical_language", "en")),
             confirmed_by_user=bool(payload.get("confirmed_by_user", False)),
-            sensitivity=str(payload.get("sensitivity", "normal")),
+            sensitivity=normalize_memory_sensitivity(str(payload.get("sensitivity", "normal"))),
             slot_key=str(payload["slot_key"]) if payload.get("slot_key") is not None else None,
             value_key=str(payload["value_key"]) if payload.get("value_key") is not None else None,
             valid_from=str(payload["valid_from"]) if payload.get("valid_from") is not None else None,
             valid_to=str(payload["valid_to"]) if payload.get("valid_to") is not None else None,
             created_at=datetime.fromisoformat(str(payload["created_at"])) if payload.get("created_at") else _utcnow(),
             updated_at=datetime.fromisoformat(str(payload["updated_at"])) if payload.get("updated_at") else _utcnow(),
-            attributes=dict(attributes) if isinstance(attributes, Mapping) else None,
+            attributes=normalized_attributes or None,
             conflicts_with=_tuple_str(
                 payload.get("conflicts_with")
                 if isinstance(payload.get("conflicts_with"), (list, tuple))
@@ -321,6 +337,16 @@ class LongTermMemoryObjectV1:
         if "updated_at" in payload and isinstance(payload["updated_at"], datetime):
             payload["updated_at"] = payload["updated_at"].isoformat()
         return LongTermMemoryObjectV1.from_payload(payload)
+
+    def canonicalized(self) -> "LongTermMemoryObjectV1":
+        normalized_kind, normalized_attributes = normalize_memory_kind(self.kind, self.attributes)
+        current_attributes = dict(self.attributes or {})
+        if normalized_kind == self.kind and normalized_attributes == current_attributes:
+            return self
+        return self.with_updates(
+            kind=normalized_kind,
+            attributes=normalized_attributes,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +435,7 @@ class LongTermConsolidationResultV1:
 class LongTermReflectionResultV1:
     reflected_objects: tuple[LongTermMemoryObjectV1, ...]
     created_summaries: tuple[LongTermMemoryObjectV1, ...]
+    midterm_packets: tuple["LongTermMidtermPacketV1", ...] = ()
     schema: str = LONGTERM_REFLECTION_SCHEMA
     version: int = LONGTERM_REFLECTION_VERSION
 
@@ -417,6 +444,76 @@ class LongTermReflectionResultV1:
             raise ValueError(f"schema must be {LONGTERM_REFLECTION_SCHEMA!r}.")
         if self.version != LONGTERM_REFLECTION_VERSION:
             raise ValueError(f"version must be {LONGTERM_REFLECTION_VERSION}.")
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermMidtermPacketV1:
+    packet_id: str
+    kind: str
+    summary: str
+    details: str | None = None
+    source_memory_ids: tuple[str, ...] = ()
+    query_hints: tuple[str, ...] = ()
+    canonical_language: str = "en"
+    sensitivity: str = "normal"
+    valid_from: str | None = None
+    valid_to: str | None = None
+    updated_at: datetime = field(default_factory=_utcnow)
+    attributes: Mapping[str, object] | None = None
+    schema: str = LONGTERM_MIDTERM_PACKET_SCHEMA
+    version: int = LONGTERM_MIDTERM_PACKET_VERSION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(self.sensitivity))
+        if not _normalize_text(self.packet_id):
+            raise ValueError("packet_id is required.")
+        if not _normalize_text(self.kind):
+            raise ValueError("kind is required.")
+        if not _normalize_text(self.summary):
+            raise ValueError("summary is required.")
+        if (self.canonical_language or "en").strip().lower() != "en":
+            raise ValueError("midterm packets must use canonical English.")
+        if self.schema != LONGTERM_MIDTERM_PACKET_SCHEMA:
+            raise ValueError(f"schema must be {LONGTERM_MIDTERM_PACKET_SCHEMA!r}.")
+        if self.version != LONGTERM_MIDTERM_PACKET_VERSION:
+            raise ValueError(f"version must be {LONGTERM_MIDTERM_PACKET_VERSION}.")
+
+    def to_payload(self) -> dict[str, object]:
+        return _drop_none(
+            {
+                "schema": self.schema,
+                "version": self.version,
+                "packet_id": self.packet_id,
+                "kind": self.kind,
+                "summary": self.summary,
+                "details": self.details,
+                "source_memory_ids": list(self.source_memory_ids) if self.source_memory_ids else None,
+                "query_hints": list(self.query_hints) if self.query_hints else None,
+                "canonical_language": self.canonical_language,
+                "sensitivity": self.sensitivity,
+                "valid_from": self.valid_from,
+                "valid_to": self.valid_to,
+                "updated_at": self.updated_at.isoformat(),
+                "attributes": _mapping_dict(self.attributes),
+            }
+        )
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "LongTermMidtermPacketV1":
+        return cls(
+            packet_id=str(payload.get("packet_id", "")),
+            kind=str(payload.get("kind", "")),
+            summary=str(payload.get("summary", "")),
+            details=str(payload["details"]) if payload.get("details") is not None else None,
+            source_memory_ids=_tuple_str(payload.get("source_memory_ids")),
+            query_hints=_tuple_str(payload.get("query_hints")),
+            canonical_language=str(payload.get("canonical_language", "en") or "en"),
+            sensitivity=str(payload.get("sensitivity", "normal") or "normal"),
+            valid_from=str(payload["valid_from"]) if payload.get("valid_from") is not None else None,
+            valid_to=str(payload["valid_to"]) if payload.get("valid_to") is not None else None,
+            updated_at=datetime.fromisoformat(str(payload["updated_at"])) if payload.get("updated_at") else _utcnow(),
+            attributes=_mapping_dict(payload.get("attributes")) if isinstance(payload.get("attributes"), Mapping) else None,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,6 +528,7 @@ class LongTermProactiveCandidateV1:
     sensitivity: str = "normal"
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(self.sensitivity))
         if not _normalize_text(self.candidate_id):
             raise ValueError("candidate_id is required.")
         if not _normalize_text(self.kind):
@@ -590,6 +688,7 @@ class LongTermMemoryReviewItemV1:
     value_key: str | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(self.sensitivity))
         if not _normalize_text(self.memory_id):
             raise ValueError("memory_id is required.")
         if not _normalize_text(self.kind):

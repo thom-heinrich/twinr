@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from twinr.memory.longterm.ontology import is_durable_kind, is_episodic_kind
 from twinr.memory.longterm.models import (
     LongTermConsolidationResultV1,
     LongTermGraphEdgeCandidateV1,
@@ -10,21 +11,6 @@ from twinr.memory.longterm.models import (
     LongTermTurnExtractionV1,
 )
 from twinr.memory.longterm.truth import LongTermTruthMaintainer
-
-
-_DURABLE_KINDS = frozenset(
-    {
-        "relationship_fact",
-        "contact_method_fact",
-        "preference_fact",
-        "plan_fact",
-        "medical_event",
-        "event_fact",
-        "presence_pattern_fact",
-        "interaction_pattern_fact",
-    }
-)
-_EPISODIC_ONLY_KINDS = frozenset({"episode", "situational_observation"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,24 +31,25 @@ class LongTermMemoryConsolidator:
         accepted_memory_ids: set[str] = set()
 
         for candidate in extraction.candidate_objects:
-            if candidate.kind in _EPISODIC_ONLY_KINDS:
-                episodic_objects.append(candidate.with_updates(status="active"))
+            normalized_candidate = candidate.canonicalized()
+            if is_episodic_kind(normalized_candidate.kind):
+                episodic_objects.append(normalized_candidate.with_updates(status="active"))
                 accepted_memory_ids.add(candidate.memory_id)
                 continue
-            if candidate.kind not in _DURABLE_KINDS:
-                deferred_objects.append(candidate)
+            if not is_durable_kind(normalized_candidate.kind):
+                deferred_objects.append(normalized_candidate)
                 continue
-            if candidate.confidence < self.promotion_confidence_threshold and not candidate.confirmed_by_user:
-                deferred_objects.append(candidate.with_updates(status="candidate"))
+            if normalized_candidate.confidence < self.promotion_confidence_threshold and not normalized_candidate.confirmed_by_user:
+                deferred_objects.append(normalized_candidate.with_updates(status="candidate"))
                 continue
             candidate_conflicts = self.truth_maintainer.detect_conflicts(
                 existing_objects=existing_objects,
-                candidate=candidate,
+                candidate=normalized_candidate,
             )
             if candidate_conflicts:
                 conflicts.extend(candidate_conflicts)
                 deferred_objects.append(
-                    candidate.with_updates(
+                    normalized_candidate.with_updates(
                         status="uncertain",
                         conflicts_with=tuple(
                             memory_id
@@ -73,7 +60,7 @@ class LongTermMemoryConsolidator:
                 )
                 continue
             activated = self.truth_maintainer.activate_candidate(
-                candidate=candidate,
+                candidate=normalized_candidate,
                 existing_objects=existing_objects,
             )
             durable_objects.append(activated)

@@ -15,9 +15,11 @@ from twinr.memory.longterm import (
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,
+    LongTermMemoryReflector,
     LongTermMemoryService,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.worker import AsyncLongTermMemoryWriter
 from twinr.memory.query_normalization import LongTermQueryProfile
 
 
@@ -28,6 +30,50 @@ class _StaticQueryRewriter:
     def profile(self, query_text: str | None) -> LongTermQueryProfile:
         canonical = self._mapping.get(str(query_text or ""))
         return LongTermQueryProfile.from_text(query_text, canonical_english_text=canonical)
+
+
+class _StubReflectionProgram:
+    def compile_reflection(
+        self,
+        *,
+        objects: tuple[LongTermMemoryObjectV1, ...],
+        timezone_name: str,
+        packet_limit: int,
+    ):
+        del timezone_name
+        del packet_limit
+        if any("eye laser treatment" in item.summary.lower() for item in objects):
+            return {
+                "midterm_packets": [
+                    {
+                        "packet_id": "midterm:janina_today",
+                        "kind": "recent_life_bundle",
+                        "summary": "Janina has eye laser treatment today.",
+                        "details": "This is near-term context for follow-up questions about Janina.",
+                        "source_memory_ids": [item.memory_id for item in objects if "eye laser treatment" in item.summary.lower()],
+                        "query_hints": ["janina", "today", "eye laser treatment"],
+                        "sensitivity": "sensitive",
+                        "valid_from": "2026-03-15",
+                        "valid_to": "2026-03-15",
+                        "attributes": {"scope": "recent_window"},
+                    }
+                ]
+            }
+        return {"midterm_packets": []}
+
+
+class _FailingReflectionProgram:
+    def compile_reflection(
+        self,
+        *,
+        objects: tuple[LongTermMemoryObjectV1, ...],
+        timezone_name: str,
+        packet_limit: int,
+    ):
+        del objects
+        del timezone_name
+        del packet_limit
+        raise RuntimeError("reflection compiler failed")
 
 
 class LongTermMemoryServiceTests(unittest.TestCase):
@@ -65,6 +111,80 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIn('Conversation about "Wie wird das Wetter heute?"', entries[0].summary)
         self.assertIn('Twinr answered: "Heute ist es sonnig und mild."', entries[0].details or "")
         self.assertTrue(any(item.kind == "episode" for item in stored_objects))
+
+    def test_background_worker_persists_extracted_graph_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.enqueue_conversation_turn(
+                transcript=(
+                    "Today is a beautiful Sunday, it is really warm. "
+                    "My wife Janina is at the eye doctor and is getting eye laser treatment."
+                ),
+                response="I hope Janina's appointment goes smoothly.",
+            )
+            drained = service.flush(timeout_s=2.0)
+            graph = service.graph_store.load_document()
+            service.shutdown()
+
+        edge_types = {edge.edge_type for edge in graph.edges}
+        node_ids = {node.node_id for node in graph.nodes}
+
+        self.assertTrue(drained)
+        self.assertIn("social_related_to_user", edge_types)
+        self.assertIn("temporal_occurs_on", edge_types)
+        self.assertIn("user:main", node_ids)
+        self.assertIn("person:janina", node_ids)
+
+    def test_service_flush_fails_when_background_reflection_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_write_queue_size=4,
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            if service.writer is not None:
+                service.writer.shutdown(timeout_s=1.0)
+            service.writer = AsyncLongTermMemoryWriter(
+                write_callback=lambda item: LongTermMemoryService._persist_longterm_turn(
+                    store=service.prompt_context_store,
+                    graph_store=service.graph_store,
+                    object_store=service.object_store,
+                    midterm_store=service.midterm_store,
+                    extractor=service.extractor,
+                    consolidator=service.consolidator,
+                    reflector=LongTermMemoryReflector(program=_FailingReflectionProgram()),
+                    sensor_memory=service.sensor_memory,
+                    retention_policy=service.retention_policy,
+                    item=item,
+                ),
+                max_queue_size=4,
+                poll_interval_s=0.01,
+            )
+            try:
+                result = service.enqueue_conversation_turn(
+                    transcript="Bitte merk dir etwas zu Janina.",
+                    response="Ich habe den Kontext aufgenommen.",
+                )
+                drained = service.flush(timeout_s=1.0)
+                error_message = None if service.writer is None else service.writer.last_error_message
+            finally:
+                service.shutdown(timeout_s=1.0)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.accepted)
+        self.assertFalse(drained)
+        self.assertEqual(error_message, "RuntimeError: reflection compiler failed")
 
     def test_provider_context_combines_recent_episodes_and_graph_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -316,6 +436,45 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIn("same_day_reminder", candidate_kinds)
         self.assertIn("gentle_follow_up", candidate_kinds)
 
+    def test_service_reflection_can_persist_midterm_packets_and_expose_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_midterm_enabled=True,
+                long_term_memory_midterm_limit=3,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.reflector = LongTermMemoryReflector(
+                program=_StubReflectionProgram(),
+                midterm_packet_limit=3,
+                reflection_window_size=12,
+                timezone_name=config.local_timezone_name,
+            )
+            service.object_store.apply_consolidation(
+                service.consolidator.consolidate(
+                    extraction=service.extractor.extract_conversation_turn(
+                        transcript="My wife Janina is getting eye laser treatment today.",
+                        response="I hope Janina's appointment goes smoothly.",
+                        occurred_at=datetime(2026, 3, 15, 10, 0, tzinfo=timezone.utc),
+                    ),
+                    existing_objects=service.object_store.load_objects(),
+                )
+            )
+            reflection = service.run_reflection()
+            context = service.build_provider_context("How is Janina today?")
+            stored_packets = service.midterm_store.load_packets()
+            service.shutdown()
+
+        self.assertEqual(len(reflection.midterm_packets), 1)
+        self.assertEqual(len(stored_packets), 1)
+        self.assertIsNotNone(context.midterm_context)
+        self.assertIn("twinr_long_term_midterm_context_v1", context.midterm_context or "")
+        self.assertIn("Janina has eye laser treatment today.", context.midterm_context or "")
+
     def test_service_can_run_retention_and_remove_old_ephemeral_memory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -336,7 +495,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
             )
             objects = service.object_store.load_objects()
             old_episode = next(item for item in objects if item.kind == "episode")
-            old_observation = next(item for item in objects if item.kind == "situational_observation")
+            old_observation = next(item for item in objects if item.kind == "observation")
             service.object_store.apply_consolidation(
                 service.consolidator.consolidate(
                     extraction=service.extractor.extract_conversation_turn(
@@ -369,7 +528,14 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         kept_ids = {item.memory_id for item in kept}
         self.assertNotIn(old_episode.memory_id, kept_ids)
         self.assertNotIn(old_observation.memory_id, kept_ids)
-        self.assertTrue(any(item.kind == "medical_event" and item.status == "expired" for item in kept))
+        self.assertTrue(
+            any(
+                item.kind == "event"
+                and item.status == "expired"
+                and (item.attributes or {}).get("event_domain") == "appointment"
+                for item in kept
+            )
+        )
 
     def test_service_can_review_memory_without_surface_noise(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -478,9 +644,17 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                     )
                 )
             )
-            current_objects = {item.kind: item for item in service.object_store.load_objects() if item.kind != "episode"}
-            relationship = current_objects["relationship_fact"]
-            event = current_objects["medical_event"]
+            current_objects = tuple(item for item in service.object_store.load_objects() if item.kind != "episode")
+            relationship = next(
+                item
+                for item in current_objects
+                if item.kind == "fact" and (item.attributes or {}).get("fact_type") == "relationship"
+            )
+            event = next(
+                item
+                for item in current_objects
+                if item.kind == "event" and (item.attributes or {}).get("event_domain") == "appointment"
+            )
 
             invalidation = service.invalidate_memory(memory_id=event.memory_id, reason="This appointment was canceled.")
             deletion = service.delete_memory(memory_id=relationship.memory_id)
