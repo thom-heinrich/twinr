@@ -39,12 +39,30 @@ def _slugify(value: Any, *, fallback: str) -> str:
 
 
 def _normalize_event_name(value: Any) -> str | None:
-    # AUDIT-FIX(#10): Normalize event identifiers to a stable slug so case, whitespace, and punctuation
-    # differences do not silently prevent if/then triggers from matching.
+    # AUDIT-FIX(#10): Normalize event identifiers to a stable canonical form while preserving
+    # semantic separators like dots that are part of Twinr event ids (for example
+    # `camera.person_visible`). Collapsing everything into underscores breaks sensor-trigger
+    # round-trips and tool-based updates.
     text = _normalize_text(value, limit=120)
     if not text:
         return None
-    normalized = _slugify(text, fallback="")
+    parts: list[str] = []
+    for character in text.lower():
+        if character.isalnum():
+            parts.append(character)
+            continue
+        if character in {".", "_"}:
+            if parts and parts[-1] != character:
+                parts.append(character)
+            continue
+        if parts and parts[-1] != "_":
+            parts.append("_")
+    normalized = "".join(parts).strip("._")
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    while ".." in normalized:
+        normalized = normalized.replace("..", ".")
+    normalized = normalized.replace("._", ".").replace("_.", ".")
     return normalized or None
 
 
