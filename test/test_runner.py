@@ -503,6 +503,7 @@ class FakeTurnToolAgentProvider:
                     call_id="call_turn_1",
                     arguments={
                         "decision": "end_turn",
+                        "label": "complete",
                         "confidence": 0.94,
                         "reason": "complete_request",
                         "transcript": "ich bin immernoch am programmieren, nur damit du es weisst",
@@ -1058,7 +1059,8 @@ class HardwareLoopTests(unittest.TestCase):
         question, conversation, location_hint, date_context = backend.search_calls[0]
         self.assertEqual(question, "What is the weather today in Berlin?")
         self.assertEqual(location_hint, "Berlin")
-        self.assertEqual(date_context, "2026-03-14")
+        self.assertIn(now_in_timezone("Europe/Berlin").date().isoformat(), date_context)
+        self.assertIn("Europe/Berlin", date_context)
         _assert_contains_system_message(self, conversation, "All user-facing spoken and written replies")
         self.assertIn("search_tool_call=true", lines)
         self.assertEqual(len(loop.runtime.memory.search_results), 1)

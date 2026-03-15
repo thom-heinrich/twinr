@@ -58,6 +58,7 @@ _DEFAULT_REALTIME_INSTRUCTIONS = (
     "If the user explicitly asks you to delete the local voice profile, use the reset_voice_profile tool. "
     "When a system message says the current speaker signal is uncertain or unknown, ask for explicit confirmation before persistent or security-sensitive tool actions and set confirmed=true only after the user clearly confirms. "
     "If the user asks you to look at them, an object, a document, or something they are showing to the camera, call the inspect_camera tool. "
+    "Do not use goodbye-style phrases or imply that the conversation is ending unless you also call the end_conversation tool. "
     "If the user clearly wants to stop or pause the conversation for now, call the end_conversation tool and include a short goodbye in spoken_reply so the turn can finish immediately."
 )
 

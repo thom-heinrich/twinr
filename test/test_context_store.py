@@ -7,6 +7,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
+from twinr.memory.longterm.remote_state import LongTermRemoteUnavailableError
 
 
 class _FakeRemoteState:
@@ -22,6 +23,14 @@ class _FakeRemoteState:
 
     def save_snapshot(self, *, snapshot_kind: str, payload):
         self.snapshots[snapshot_kind] = dict(payload)
+
+
+class _FailingRemoteState(_FakeRemoteState):
+    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+        del local_path
+        raise LongTermRemoteUnavailableError(
+            f"Failed to read remote long-term snapshot {snapshot_kind!r}: status=503"
+        )
 
 
 class ContextStoreTests(unittest.TestCase):
@@ -142,6 +151,70 @@ class ContextStoreTests(unittest.TestCase):
         self.assertIn("Base user facts.", rendered or "")
         self.assertIn("pets: Thom has two dogs.", rendered or "")
         self.assertIn("user_context", remote_state.snapshots)
+
+    def test_managed_context_store_ensure_remote_snapshot_seeds_empty_remote_document(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "USER.md"
+            path.write_text("Base user facts.\n", encoding="utf-8")
+            remote_state = _FakeRemoteState()
+            store = ManagedContextFileStore(
+                path,
+                section_title="Twinr managed user updates",
+                remote_state=remote_state,
+                remote_snapshot_kind="user_context",
+            )
+
+            created = store.ensure_remote_snapshot()
+
+        self.assertTrue(created)
+        self.assertEqual(
+            remote_state.snapshots["user_context"],
+            {"schema": "twinr_managed_context", "version": 1, "entries": []},
+        )
+
+    def test_memory_store_ensure_remote_snapshot_seeds_empty_prompt_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "MEMORY.md"
+            remote_state = _FakeRemoteState()
+            store = PersistentMemoryMarkdownStore(path, remote_state=remote_state)
+
+            created = store.ensure_remote_snapshot()
+
+        self.assertTrue(created)
+        self.assertEqual(
+            remote_state.snapshots["prompt_memory"],
+            {"schema": "twinr_prompt_memory", "version": 1, "entries": []},
+        )
+
+    def test_managed_context_store_remote_primary_raises_when_remote_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "PERSONALITY.md"
+            path.write_text(
+                "\n".join(
+                    [
+                        "Base personality text.",
+                        "",
+                        "<!-- TWINR_MANAGED_CONTEXT_START -->",
+                        "## Twinr managed personality updates",
+                        "_This section is managed by Twinr. Keep entries short and stable._",
+                        "- response_style: Keep answers calm.",
+                        "<!-- TWINR_MANAGED_CONTEXT_END -->",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            store = ManagedContextFileStore(
+                path,
+                section_title="Twinr managed personality updates",
+                remote_state=_FailingRemoteState(),
+                remote_snapshot_kind="personality_context",
+            )
+
+            with self.assertRaises(LongTermRemoteUnavailableError):
+                store.load_entries()
+            with self.assertRaises(LongTermRemoteUnavailableError):
+                store.render_context()
 
 
 if __name__ == "__main__":

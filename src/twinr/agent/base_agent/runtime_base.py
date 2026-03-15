@@ -80,6 +80,7 @@ class TwinrRuntimeBase:
                 self.config,
                 graph_store=self.graph_memory,
             )
+            self.long_term_memory.ensure_remote_ready()
             self.reminder_store = ReminderStore(
                 self.config.reminder_store_path,
                 timezone_name=self.config.local_timezone_name,

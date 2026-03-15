@@ -122,13 +122,12 @@ class ManagedContextFileStore:
                 parsed = self._entries_from_payload(payload)
                 if parsed:
                     return parsed
-            local_entries = self._split_document()[1]
+            local_entries = self._load_local_entries()
             if local_entries and self.remote_state.config.long_term_memory_migration_enabled:
                 self._save_remote_entries(local_entries)
                 return local_entries
             return ()
-        _prefix, managed_entries, _suffix = self._split_document()
-        return managed_entries
+        return self._load_local_entries()
 
     def upsert(self, *, category: str, instruction: str) -> ManagedContextEntry:
         key = _slugify(category, fallback="update")
@@ -175,6 +174,19 @@ class ManagedContextFileStore:
         rendered = "\n\n".join(part for part in parts if part).strip()
         return rendered or None
 
+    def ensure_remote_snapshot(self) -> bool:
+        if self.remote_state is None or not self.remote_state.enabled or self.remote_snapshot_kind is None:
+            return False
+        payload = self.remote_state.load_snapshot(snapshot_kind=self.remote_snapshot_kind)
+        if isinstance(payload, dict):
+            if self._is_managed_context_payload(payload):
+                return False
+            raise ValueError(
+                f"Remote managed-context snapshot {self.remote_snapshot_kind!r} exists but has an invalid schema."
+            )
+        self._save_remote_entries(self._load_local_entries())
+        return True
+
     def _split_document(self) -> tuple[str, tuple[ManagedContextEntry, ...], str]:
         if not self.path.exists():
             return "", (), ""
@@ -202,6 +214,10 @@ class ManagedContextFileStore:
         prefix, _existing_entries, suffix = self._split_document()
         self._write_document(prefix=prefix, entries=entries, suffix=suffix)
 
+    def _load_local_entries(self) -> tuple[ManagedContextEntry, ...]:
+        _prefix, managed_entries, _suffix = self._split_document()
+        return managed_entries
+
     def _entries_from_payload(self, payload: dict[str, object]) -> tuple[ManagedContextEntry, ...]:
         if payload.get("schema") != _MANAGED_CONTEXT_SCHEMA:
             return ()
@@ -226,6 +242,13 @@ class ManagedContextFileStore:
                 )
             )
         return tuple(entries)
+
+    def _is_managed_context_payload(self, payload: Mapping[str, object]) -> bool:
+        if payload.get("schema") != _MANAGED_CONTEXT_SCHEMA:
+            return False
+        if payload.get("version") != _MANAGED_CONTEXT_VERSION:
+            return False
+        return isinstance(payload.get("entries"), list)
 
     def _save_remote_entries(self, entries: tuple[ManagedContextEntry, ...]) -> None:
         assert self.remote_state is not None
@@ -308,6 +331,19 @@ class PersistentMemoryMarkdownStore:
                     return local_entries
             return ()
         return self._load_local_entries()
+
+    def ensure_remote_snapshot(self) -> bool:
+        if self.remote_state is None or not self.remote_state.enabled:
+            return False
+        payload = self.remote_state.load_snapshot(snapshot_kind=self.remote_snapshot_kind)
+        if isinstance(payload, dict):
+            if self._is_prompt_memory_payload(payload):
+                return False
+            raise ValueError(
+                f"Remote prompt-memory snapshot {self.remote_snapshot_kind!r} exists but has an invalid schema."
+            )
+        self._save_remote_entries(self._load_local_entries())
+        return True
 
     def _load_local_entries(self) -> tuple[PersistentMemoryEntry, ...]:
         if not self.path.exists():
@@ -454,6 +490,13 @@ class PersistentMemoryMarkdownStore:
                 entries.append(entry)
         return tuple(entries)
 
+    def _is_prompt_memory_payload(self, payload: Mapping[str, object]) -> bool:
+        if payload.get("schema") != _PROMPT_MEMORY_SCHEMA:
+            return False
+        if payload.get("version") != _PROMPT_MEMORY_VERSION:
+            return False
+        return isinstance(payload.get("entries"), list)
+
     def _save_remote_entries(self, entries: tuple[PersistentMemoryEntry, ...]) -> None:
         assert self.remote_state is not None
         payload = {
@@ -514,3 +557,13 @@ class PromptContextStore:
                 remote_snapshot_kind="personality_context",
             ),
         )
+
+    def ensure_remote_snapshots(self) -> tuple[str, ...]:
+        ensured: list[str] = []
+        if self.memory_store.ensure_remote_snapshot():
+            ensured.append(self.memory_store.remote_snapshot_kind)
+        if self.user_store.ensure_remote_snapshot():
+            ensured.append(self.user_store.remote_snapshot_kind or "user_context")
+        if self.personality_store.ensure_remote_snapshot():
+            ensured.append(self.personality_store.remote_snapshot_kind or "personality_context")
+        return tuple(ensured)

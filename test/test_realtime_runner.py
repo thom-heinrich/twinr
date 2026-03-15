@@ -21,6 +21,7 @@ from twinr.agent.base_agent.contracts import (
 )
 from twinr.config import TwinrConfig
 from twinr.hardware import VoiceAssessment
+from twinr.hardware.buttons import ButtonAction, ButtonEvent
 from twinr.memory.longterm.models import (
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
@@ -34,6 +35,8 @@ from twinr.providers.openai import OpenAITextResponse
 from twinr.providers.openai.realtime import OpenAIRealtimeTurn
 from twinr.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.runtime import TwinrRuntime
+from twinr.agent.base_agent.conversation_closure import ConversationClosureDecision
+from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample
 
 
 def _voice_sample_pcm_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0.35, duration_s: float = 1.8) -> bytes:
@@ -476,6 +479,7 @@ class FakeTurnToolAgentProvider:
         )
         arguments = {
             "decision": "end_turn",
+            "label": "complete",
             "confidence": 0.94,
             "reason": "complete_request",
             "transcript": "ich bin immernoch am programmieren, nur damit du es weisst",
@@ -487,7 +491,7 @@ class FakeTurnToolAgentProvider:
                     name="submit_turn_decision",
                     call_id="turn-decision-1",
                     arguments=arguments,
-                    raw_arguments='{"decision":"end_turn","confidence":0.94,"reason":"complete_request","transcript":"ich bin immernoch am programmieren, nur damit du es weisst"}',
+                    raw_arguments='{"decision":"end_turn","label":"complete","confidence":0.94,"reason":"complete_request","transcript":"ich bin immernoch am programmieren, nur damit du es weisst"}',
                 ),
             ),
             response_id="resp_turn_1",
@@ -509,16 +513,77 @@ class FakePlayer:
     ) -> None:
         self.tones.append((frequency_hz, duration_ms, volume, sample_rate))
 
-    def play_pcm16_chunks(self, chunks, *, sample_rate: int, channels: int = 1) -> None:
-        self.played.append(b"".join(chunks))
+    def play_pcm16_chunks(self, chunks, *, sample_rate: int, channels: int = 1, should_stop=None) -> None:
+        rendered = bytearray()
+        for chunk in chunks:
+            if should_stop is not None and should_stop():
+                break
+            rendered.extend(chunk)
+        self.played.append(bytes(rendered))
         self.sample_rate = sample_rate
         self.channels = channels
 
-    def play_wav_chunks(self, chunks) -> None:
-        self.played.append(b"".join(chunks))
+    def play_wav_chunks(self, chunks, *, should_stop=None) -> None:
+        rendered = bytearray()
+        for chunk in chunks:
+            if should_stop is not None and should_stop():
+                break
+            rendered.extend(chunk)
+        self.played.append(bytes(rendered))
 
     def play_wav_bytes(self, audio_bytes: bytes) -> None:
         self.played.append(audio_bytes)
+
+
+class FakeAmbientAudioSampler:
+    def __init__(self, windows: list[AmbientAudioCaptureWindow]) -> None:
+        self.windows = list(windows)
+        self.calls = 0
+
+    def sample_window(self, *, duration_ms: int | None = None) -> AmbientAudioCaptureWindow:
+        del duration_ms
+        self.calls += 1
+        if self.windows:
+            return self.windows.pop(0)
+        return AmbientAudioCaptureWindow(
+            sample=AmbientAudioLevelSample(
+                duration_ms=420,
+                chunk_count=4,
+                active_chunk_count=0,
+                average_rms=120,
+                peak_rms=180,
+                active_ratio=0.0,
+            ),
+            pcm_bytes=b"\x00\x00" * 3200,
+            sample_rate=16000,
+            channels=1,
+        )
+
+
+class FakeConversationClosureEvaluator:
+    def __init__(self, decision: ConversationClosureDecision) -> None:
+        self.decision = decision
+        self.calls: list[dict[str, object]] = []
+
+    def evaluate(
+        self,
+        *,
+        user_transcript: str,
+        assistant_response: str,
+        request_source: str,
+        proactive_trigger: str | None = None,
+        conversation=None,
+    ) -> ConversationClosureDecision:
+        self.calls.append(
+            {
+                "user_transcript": user_transcript,
+                "assistant_response": assistant_response,
+                "request_source": request_source,
+                "proactive_trigger": proactive_trigger,
+                "conversation": conversation,
+            }
+        )
+        return self.decision
 
 
 class FakePrinter:
@@ -565,6 +630,36 @@ class FakeIdleButtonMonitor:
         return None
 
 
+class FakeScheduledButtonMonitor(FakeIdleButtonMonitor):
+    def __init__(self, *, event_after_s: float, name: str = "yellow") -> None:
+        super().__init__()
+        self._event_after_s = event_after_s
+        self._name = name
+        self._started_at: float | None = None
+        self._emitted = False
+
+    def __enter__(self):
+        self._started_at = time.monotonic()
+        return super().__enter__()
+
+    def poll(self, timeout=None):
+        self.poll_calls += 1
+        if timeout:
+            time.sleep(min(timeout, 0.001))
+        if self._emitted or self._started_at is None:
+            return None
+        if time.monotonic() - self._started_at < self._event_after_s:
+            return None
+        self._emitted = True
+        return ButtonEvent(
+            name=self._name,
+            line_offset=22 if self._name == "yellow" else 23,
+            action=ButtonAction.PRESSED,
+            raw_edge="falling",
+            timestamp_ns=time.monotonic_ns(),
+        )
+
+
 class FakeProactiveMonitor:
     def __init__(self) -> None:
         self.entered = False
@@ -594,6 +689,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         tts_provider=None,
         turn_stt_provider=None,
         turn_tool_agent_provider=None,
+        ambient_audio_sampler=None,
+        conversation_closure_evaluator=None,
         voice_profile_monitor=None,
         proactive_monitor=None,
     ) -> tuple[TwinrRealtimeHardwareLoop, list[str], FakeRealtimeSession, FakePrintBackend, FakeRecorder, FakePlayer, FakePrinter]:
@@ -677,6 +774,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             printer=printer,
             camera=camera or FakeCamera(),
             voice_profile_monitor=voice_profile_monitor,
+            ambient_audio_sampler=ambient_audio_sampler,
+            conversation_closure_evaluator=conversation_closure_evaluator,
             proactive_monitor=proactive_monitor,
             emit=lines.append,
             sleep=lambda _seconds: None,
@@ -758,6 +857,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(turn_tool_agent_provider.start_calls), 1)
         self.assertIn("turn_controller_candidate=speech_final", lines)
         self.assertIn("turn_controller_decision=end_turn", lines)
+        self.assertIn("turn_controller_label=complete", lines)
+        self.assertIn("turn_controller_selected_label=complete", lines)
         self.assertIn("stt_partial=ich bin immernoch", lines)
         self.assertIn("timing_stt_ms=", "\n".join(lines))
         self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
@@ -788,6 +889,160 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(realtime_session.calls, [b"PCM-APCM-B"])
         self.assertEqual(loop.runtime.last_transcript, "")
         self.assertIn("transcript=Hallo Twinr", lines)
+
+    def test_backchannel_turn_adds_short_reply_guidance(self) -> None:
+        config = TwinrConfig(
+            turn_controller_enabled=True,
+            turn_controller_fast_endpoint_enabled=False,
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+        )
+
+        class BackchannelStreamingSession(FakeTurnStreamingSpeechSession):
+            def send_pcm(self, pcm_bytes: bytes) -> None:
+                self.sent.append(pcm_bytes)
+                if len(self.sent) == 2 and self._on_endpoint is not None:
+                    self._on_endpoint(
+                        StreamingSpeechEndpointEvent(
+                            transcript="ja",
+                            event_type="speech_final",
+                            speech_final=True,
+                        )
+                    )
+
+            def snapshot(self) -> StreamingTranscriptionResult:
+                return StreamingTranscriptionResult(
+                    transcript="ja",
+                    request_id="turn-stt-1",
+                    saw_interim=True,
+                    saw_speech_final=True,
+                    saw_utterance_end=False,
+                )
+
+            def finalize(self) -> StreamingTranscriptionResult:
+                self.finalize_calls += 1
+                return self.snapshot()
+
+        class BackchannelStreamingProvider(FakeTurnStreamingSpeechToTextProvider):
+            def __init__(self, config: TwinrConfig) -> None:
+                super().__init__(config)
+                self.session = BackchannelStreamingSession()
+
+            def transcribe(self, audio_bytes: bytes, **kwargs) -> str:
+                del audio_bytes, kwargs
+                return "ja"
+
+            def transcribe_path(self, path, **kwargs) -> str:
+                del path, kwargs
+                return "ja"
+
+        class BackchannelTurnToolProvider(FakeTurnToolAgentProvider):
+            def start_turn_streaming(self, *args, **kwargs) -> ToolCallingTurnResponse:
+                kwargs.pop("timeout_seconds", None)
+                kwargs.pop("timeout", None)
+                response = super().start_turn_streaming(*args, **kwargs)
+                arguments = {
+                    "decision": "end_turn",
+                    "label": "backchannel",
+                    "confidence": 0.88,
+                    "reason": "short_answer",
+                    "transcript": "ja",
+                }
+                return ToolCallingTurnResponse(
+                    text="",
+                    tool_calls=(
+                        AgentToolCall(
+                            name="submit_turn_decision",
+                            call_id="turn-decision-1",
+                            arguments=arguments,
+                            raw_arguments='{"decision":"end_turn","label":"backchannel","confidence":0.88,"reason":"short_answer","transcript":"ja"}',
+                        ),
+                    ),
+                    response_id=response.response_id,
+                )
+
+        turn_stt_provider = BackchannelStreamingProvider(config)
+        turn_tool_agent_provider = BackchannelTurnToolProvider(config)
+        loop, lines, realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=config,
+            turn_stt_provider=turn_stt_provider,
+            turn_tool_agent_provider=turn_tool_agent_provider,
+        )
+
+        loop.handle_button_press("green")
+
+        self.assertIn("turn_controller_selected_label=backchannel", lines)
+        conversation = realtime_session.conversations[0]
+        assert conversation is not None
+        self.assertTrue(any("short backchannel" in message for role, message in conversation if role == "system"))
+
+    def test_user_interrupt_stops_answer_and_opens_follow_up_turn(self) -> None:
+        config = TwinrConfig(
+            turn_controller_interrupt_enabled=True,
+            turn_controller_interrupt_window_ms=120,
+            turn_controller_interrupt_poll_ms=10,
+            turn_controller_interrupt_min_active_ratio=0.1,
+            turn_controller_interrupt_min_transcript_chars=4,
+            turn_controller_interrupt_consecutive_windows=2,
+            conversation_follow_up_timeout_s=3.5,
+        )
+
+        class InterruptibleRealtimeSession(FakeRealtimeSession):
+            def run_audio_turn(
+                self,
+                audio_pcm: bytes,
+                *,
+                conversation=None,
+                on_audio_chunk=None,
+                on_output_text_delta=None,
+            ) -> OpenAIRealtimeTurn:
+                self.calls.append(audio_pcm)
+                self.conversations.append(conversation)
+                if on_output_text_delta is not None:
+                    on_output_text_delta("Ich ")
+                if on_audio_chunk is not None:
+                    on_audio_chunk(b"PCM1")
+                    time.sleep(0.03)
+                    on_audio_chunk(b"PCM2")
+                time.sleep(0.05)
+                return OpenAIRealtimeTurn(
+                    transcript="Hallo Twinr",
+                    response_text="Ich bin noch nicht fertig",
+                    response_id="resp_rt_interrupt",
+                    end_conversation=False,
+                )
+
+        backend = FakePrintBackend()
+        backend.transcribe_result = "warte mal"
+        speech_window = AmbientAudioCaptureWindow(
+            sample=AmbientAudioLevelSample(
+                duration_ms=120,
+                chunk_count=2,
+                active_chunk_count=2,
+                average_rms=1800,
+                peak_rms=2200,
+                active_ratio=1.0,
+            ),
+            pcm_bytes=_voice_sample_pcm_bytes(duration_s=0.15),
+            sample_rate=24000,
+            channels=1,
+        )
+        sampler = FakeAmbientAudioSampler([speech_window, speech_window])
+        loop, lines, realtime_session, _print_backend, recorder, _player, _printer = self.make_loop(
+            config=config,
+            print_backend=backend,
+            ambient_audio_sampler=sampler,
+        )
+        loop.realtime_session = InterruptibleRealtimeSession()
+
+        loop.handle_button_press("green")
+
+        self.assertIn("user_interrupt_detected=true", lines)
+        self.assertIn("assistant_interrupted=true", lines)
+        self.assertIn("interrupt_transcript=warte mal", lines)
+        self.assertEqual(len(loop.realtime_session.calls), 2)
+        self.assertEqual(recorder.start_timeouts, [8.0, 3.5])
 
     def test_green_button_uses_processing_and_answering_feedback(self) -> None:
         loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
@@ -1107,6 +1362,76 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertGreaterEqual(len(player.tones), 1)
         self.assertIn("conversation_ended=true", lines)
         self.assertEqual(loop.runtime.status.value, "waiting")
+
+    def test_proactive_turn_does_not_chain_second_follow_up_by_default(self) -> None:
+        config = TwinrConfig(
+            conversation_follow_up_enabled=True,
+            conversation_follow_up_after_proactive_enabled=False,
+            conversation_follow_up_timeout_s=3.5,
+        )
+        loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop(
+            config=config,
+            recorder=FakeRecorder(recordings=[b"PROACTIVE"]),
+        )
+        realtime_session.turns = [
+            OpenAIRealtimeTurn(
+                transcript="Alles ist okay, bis bald.",
+                response_text="Gut, danke fuer die Rueckmeldung. Bis spaeter.",
+                response_id="resp_proactive",
+                end_conversation=False,
+            )
+        ]
+
+        loop._run_proactive_follow_up(
+            SocialTriggerDecision(
+                trigger_id="slumped_quiet",
+                prompt="Ist alles in Ordnung?",
+                reason="concern check",
+                observed_at=0.0,
+                priority=SocialTriggerPriority.SLUMPED_QUIET,
+            )
+        )
+
+        self.assertEqual(len(recorder.pause_values), 1)
+        self.assertEqual(realtime_session.calls, [b"PROACTIVE"])
+        self.assertNotIn("follow_up_timeout=true", lines)
+        self.assertEqual(loop.runtime.status.value, "waiting")
+
+    def test_explicit_goodbye_vetoes_follow_up_listening(self) -> None:
+        config = TwinrConfig(
+            conversation_follow_up_enabled=True,
+            conversation_closure_guard_enabled=True,
+            conversation_closure_min_confidence=0.6,
+            conversation_follow_up_timeout_s=3.5,
+        )
+        closure_evaluator = FakeConversationClosureEvaluator(
+            ConversationClosureDecision(
+                close_now=True,
+                confidence=0.92,
+                reason="explicit_goodbye",
+            )
+        )
+        loop, lines, realtime_session, _print_backend, recorder, _player, _printer = self.make_loop(
+            config=config,
+            recorder=FakeRecorder(recordings=[b"TURN1", b"TURN2"]),
+            conversation_closure_evaluator=closure_evaluator,
+        )
+        realtime_session.turns = [
+            OpenAIRealtimeTurn(
+                transcript="Danke, bis bald.",
+                response_text="Gern. Bis bald.",
+                response_id="resp_goodbye",
+                end_conversation=False,
+            ),
+        ]
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(len(recorder.pause_values), 1)
+        self.assertEqual(realtime_session.calls, [b"TURN1"])
+        self.assertIn("conversation_closure_close_now=true", lines)
+        self.assertIn("conversation_follow_up_vetoed=closure", lines)
+        self.assertEqual(closure_evaluator.calls[0]["request_source"], "button")
 
     def test_green_button_updates_runtime_voice_assessment(self) -> None:
         class FakeVoiceProfileMonitor:
@@ -2619,6 +2944,28 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertTrue(button_monitor.exited)
         self.assertTrue(proactive_monitor.entered)
         self.assertTrue(proactive_monitor.exited)
+
+    def test_run_handles_button_press_while_housekeeping_blocks(self) -> None:
+        button_monitor = FakeScheduledButtonMonitor(event_after_s=0.02, name="yellow")
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, printer = self.make_loop(
+            button_monitor=button_monitor,
+        )
+        loop.runtime.last_response = "Bitte druck das."
+
+        def slow_housekeeping() -> bool:
+            time.sleep(0.2)
+            return False
+
+        loop._maybe_deliver_due_reminder = slow_housekeeping
+        loop._maybe_run_due_automation = lambda: False
+        loop._maybe_run_sensor_automation = lambda: False
+        loop._maybe_run_long_term_memory_proactive = lambda: False
+
+        result = loop.run(duration_s=0.12, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(printer.printed), 1)
+        self.assertIn("button=yellow", lines)
 
 
 if __name__ == "__main__":

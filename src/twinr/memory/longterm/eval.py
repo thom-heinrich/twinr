@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from tempfile import TemporaryDirectory
+import shutil
+from tempfile import TemporaryDirectory, mkdtemp
 from typing import Literal
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -19,6 +20,10 @@ from twinr.memory.longterm.service import LongTermMemoryService
 
 
 EvalKind = Literal["provider_context", "contact_lookup"]
+
+_EXACT_MEMORY_TARGET = 500
+_EXACT_CASE_TARGET = 50
+_EPISODIC_TARGET_INDICES = (5, 15, 25, 35, 45, 55, 65, 75, 85, 95)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +52,7 @@ class LongTermEvalCaseResult:
     present_forbidden: tuple[str, ...]
     observed_lookup_status: str | None = None
     observed_option_count: int | None = None
+    error_message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,32 +146,33 @@ class _StaticQueryRewriter:
 
 def run_synthetic_longterm_eval(
     *,
-    memory_target: int = 500,
-    case_target: int = 50,
+    memory_target: int = _EXACT_MEMORY_TARGET,
+    case_target: int = _EXACT_CASE_TARGET,
     project_root: str | Path | None = None,
 ) -> LongTermEvalResult:
-    if memory_target < 500:
-        raise ValueError("memory_target must be at least 500 for the current synthetic eval.")
-    if case_target < 50:
-        raise ValueError("case_target must be at least 50 for the current synthetic eval.")
+    _validate_eval_targets(memory_target=memory_target, case_target=case_target)  # AUDIT-FIX(#2): Fail fast on unsupported target sizes instead of failing later via hard-coded assertions.
+    project_root_path = _resolve_project_root(project_root)  # AUDIT-FIX(#6): Normalize and create the optional root directory before any filesystem writes.
 
-    with TemporaryDirectory(dir=str(project_root) if project_root is not None else None) as temp_dir:
+    with TemporaryDirectory(dir=str(project_root_path) if project_root_path is not None else None) as temp_dir:
         root = Path(temp_dir)
+        state_dir = root / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)  # AUDIT-FIX(#3): Pre-create file-backed storage parents instead of relying on store implementations to do it implicitly.
+        personality_dir = root / "personality"
+        personality_dir.mkdir(parents=True, exist_ok=True)  # AUDIT-FIX(#3): Ensure managed context stores always have a valid parent directory.
+
         config = TwinrConfig(
             project_root=str(root),
             personality_dir="personality",
-            memory_markdown_path=str(root / "state" / "MEMORY.md"),
+            memory_markdown_path=str(state_dir / "MEMORY.md"),
             long_term_memory_enabled=True,
             long_term_memory_background_store_turns=True,
             long_term_memory_write_queue_size=128,
             long_term_memory_recall_limit=8,
-            long_term_memory_path=str(root / "state" / "chonkydb"),
+            long_term_memory_path=str(state_dir / "chonkydb"),
             user_display_name="Erika",
             openai_realtime_language="de",
             openai_web_search_timezone="Europe/Berlin",
         )
-        personality_dir = root / "personality"
-        personality_dir.mkdir(parents=True, exist_ok=True)
         prompt_context_store = PromptContextStore(
             memory_store=PersistentMemoryMarkdownStore(config.memory_markdown_path, max_entries=1024),
             user_store=ManagedContextFileStore(
@@ -178,16 +185,30 @@ def run_synthetic_longterm_eval(
             ),
         )
         graph_store = TwinrPersonalGraphStore.from_config(config)
-        service = LongTermMemoryService.from_config(
-            config,
-            graph_store=graph_store,
-            prompt_context_store=prompt_context_store,
-        )
+        service: LongTermMemoryService | None = None
+        primary_exception: BaseException | None = None
+        stage = "initialization"
+
         try:
+            stage = "contact seeding"
             contacts = _seed_contacts(graph_store)
-            preferences = _seed_preferences(graph_store)
+
+            stage = "preference seeding"
+            preferences, preference_memory_count = _seed_preferences(graph_store)
+
+            stage = "plan seeding"
             plans = _seed_plans(graph_store, contacts)
+
+            service = LongTermMemoryService.from_config(  # AUDIT-FIX(#9): Start the background-writing service only after direct graph mutations are complete to reduce overlap with private load/modify/save helpers.
+                config,
+                graph_store=graph_store,
+                prompt_context_store=prompt_context_store,
+            )
+
+            stage = "episodic seeding"
             episodes = _seed_episodes(service)
+
+            stage = "background writer flush"
             flushed = service.flush(timeout_s=30.0)
             if not flushed:
                 pending_episodic = 0 if service.writer is None else service.writer.pending_count()
@@ -199,21 +220,25 @@ def run_synthetic_longterm_eval(
 
             seed_stats = LongTermEvalSeedStats(
                 contacts=len(contacts),
-                preferences=150,
+                preferences=preference_memory_count,  # AUDIT-FIX(#2): Derive preference memory counts from the actual seeding logic instead of a brittle magic number.
                 plans=len(plans),
                 episodic_turns=len(episodes),
             )
-            if seed_stats.total_memories != 500:
-                raise AssertionError(f"Expected exactly 500 synthetic memories, got {seed_stats.total_memories}.")
+            if seed_stats.total_memories != memory_target:
+                raise AssertionError(
+                    f"Expected exactly {memory_target} synthetic memories, got {seed_stats.total_memories}."
+                )
 
+            stage = "case construction"
             cases = _build_eval_cases(
                 contacts=contacts,
                 preferences=preferences,
                 plans=plans,
                 episodes=episodes,
             )
-            if len(cases) != 50:
-                raise AssertionError(f"Expected exactly 50 eval cases, got {len(cases)}.")
+            if len(cases) != case_target:
+                raise AssertionError(f"Expected exactly {case_target} eval cases, got {len(cases)}.")
+
             service.query_rewriter = _StaticQueryRewriter(
                 {
                     case.query_text: case.canonical_query_text
@@ -222,20 +247,85 @@ def run_synthetic_longterm_eval(
                 }
             )
 
-            case_results = tuple(_run_eval_case(service=service, graph_store=graph_store, case=case) for case in cases)
-            summary = _summarize_results(case_results)
-            memory_path = str(Path(config.memory_markdown_path))
-            graph_path = str(Path(config.long_term_memory_path) / "twinr_graph_v1.json")
-            return LongTermEvalResult(
-                seed_stats=seed_stats,
-                summary=summary,
-                cases=case_results,
-                temp_root=str(root),
-                memory_path=memory_path,
-                graph_path=graph_path,
+            stage = "case execution"
+            case_results = tuple(  # AUDIT-FIX(#5): Isolate each case so a single provider/store error fails one case instead of aborting the whole run.
+                _run_eval_case_safely(service=service, graph_store=graph_store, case=case)
+                for case in cases
             )
+            summary = _summarize_results(case_results)
+        except BaseException as exc:
+            primary_exception = exc
+            exc.add_note(f"Synthetic long-term eval failed during {stage}.")  # AUDIT-FIX(#4): Preserve the original exception and annotate it with stage context.
+            raise
         finally:
-            service.shutdown(timeout_s=30.0)
+            if service is not None:
+                try:
+                    service.shutdown(timeout_s=30.0)
+                except Exception as shutdown_exc:
+                    if primary_exception is None:
+                        raise RuntimeError("Synthetic long-term memory eval failed during service shutdown.") from shutdown_exc
+                    primary_exception.add_note(
+                        f"Service shutdown also failed: {type(shutdown_exc).__name__}: {shutdown_exc}"
+                    )  # AUDIT-FIX(#4): Do not mask the primary failure with a secondary shutdown error.
+
+        stage = "artifact materialization"
+        try:
+            artifact_root, memory_path, graph_path = _materialize_workspace(  # AUDIT-FIX(#1): Copy the finished workspace to a durable directory before TemporaryDirectory cleanup.
+                root=root,
+                project_root=project_root_path,
+            )
+        except BaseException as exc:
+            exc.add_note(f"Synthetic long-term eval failed during {stage}.")
+            raise
+        return LongTermEvalResult(
+            seed_stats=seed_stats,
+            summary=summary,
+            cases=case_results,
+            temp_root=str(artifact_root),
+            memory_path=str(memory_path),
+            graph_path=str(graph_path),
+        )
+
+
+def _validate_eval_targets(*, memory_target: int, case_target: int) -> None:
+    if memory_target != _EXACT_MEMORY_TARGET:
+        raise ValueError(
+            f"memory_target must be exactly {_EXACT_MEMORY_TARGET} for the current synthetic eval, got {memory_target}."
+        )
+    if case_target != _EXACT_CASE_TARGET:
+        raise ValueError(
+            f"case_target must be exactly {_EXACT_CASE_TARGET} for the current synthetic eval, got {case_target}."
+        )
+
+
+def _resolve_project_root(project_root: str | Path | None) -> Path | None:
+    if project_root is None:
+        return None
+    root = Path(project_root).expanduser()
+    for candidate in (root, *root.parents):
+        if candidate.exists() and candidate.is_symlink():
+            raise ValueError("project_root must not be or reside under a symlinked directory.")
+    if root.exists() and not root.is_dir():
+        raise ValueError(f"project_root must be a directory path, got {root!s}.")
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve(strict=True)
+
+
+def _materialize_workspace(*, root: Path, project_root: Path | None) -> tuple[Path, Path, Path]:
+    artifact_root = Path(
+        mkdtemp(
+            prefix="twinr-synthetic-longterm-eval-",
+            dir=str(project_root) if project_root is not None else None,
+        )
+    )
+    shutil.copytree(root, artifact_root, dirs_exist_ok=True)
+    memory_path = artifact_root / "state" / "MEMORY.md"
+    graph_path = artifact_root / "state" / "chonkydb" / "twinr_graph_v1.json"
+    if not memory_path.is_file():
+        raise FileNotFoundError(f"Expected synthetic memory artifact at {memory_path!s}.")
+    if not graph_path.is_file():
+        raise FileNotFoundError(f"Expected synthetic graph artifact at {graph_path!s}.")
+    return artifact_root, memory_path, graph_path
 
 
 def _seed_contacts(graph_store: TwinrPersonalGraphStore) -> list[_ContactSeed]:
@@ -322,8 +412,9 @@ def _seed_contacts(graph_store: TwinrPersonalGraphStore) -> list[_ContactSeed]:
     return contacts
 
 
-def _seed_preferences(graph_store: TwinrPersonalGraphStore) -> list[_PreferenceSeed]:
+def _seed_preferences(graph_store: TwinrPersonalGraphStore) -> tuple[list[_PreferenceSeed], int]:
     preferences: list[_PreferenceSeed] = []
+    memory_count = 0
     for index in range(50):
         product = f"product {index:03d}"
         brand = f"brand {index:03d}"
@@ -335,6 +426,7 @@ def _seed_preferences(graph_store: TwinrPersonalGraphStore) -> list[_PreferenceS
             sentiment="prefer",
             details=f"preferred option for {product}",
         )
+        memory_count += 1
         graph_store.remember_preference(
             category="store",
             value=store,
@@ -342,6 +434,7 @@ def _seed_preferences(graph_store: TwinrPersonalGraphStore) -> list[_PreferenceS
             sentiment="prefer",
             details=f"usually visited for {product}",
         )
+        memory_count += 1
         _enrich_store_multihop(graph_store, store_label=store, brand_label=brand)
         preferences.append(_PreferenceSeed(product=product, brand=brand, store=store))
 
@@ -352,19 +445,30 @@ def _seed_preferences(graph_store: TwinrPersonalGraphStore) -> list[_PreferenceS
             sentiment="like" if index % 2 == 0 else "dislike",
             details="evening preference",
         )
-    return preferences + [
-        _PreferenceSeed(
-            product=f"tea blend {index:03d}",
-            brand="",
-            store="",
-        )
-        for index in range(50)
-    ]
+        memory_count += 1
+    return (
+        preferences
+        + [
+            _PreferenceSeed(
+                product=f"tea blend {index:03d}",
+                brand="",
+                store="",
+            )
+            for index in range(50)
+        ],
+        memory_count,
+    )
 
 
 def _seed_plans(graph_store: TwinrPersonalGraphStore, contacts: list[_ContactSeed]) -> list[_PlanSeed]:
     plans: list[_PlanSeed] = []
-    linked_contacts = [contact for contact in contacts if contact.role in {"physiotherapist", "doctor", "gardener", "friend"}]
+    linked_contacts = [
+        contact for contact in contacts if contact.role in {"physiotherapist", "doctor", "gardener", "friend"}
+    ]
+    if len(linked_contacts) < 30:
+        raise ValueError(
+            f"Expected at least 30 linked contacts for synthetic plan seeding, got {len(linked_contacts)}."
+        )  # AUDIT-FIX(#7): Validate fixture cardinality before indexed access so dataset drift fails with an actionable error.
     when_values = ("today", "tomorrow", "2026-03-20", "2026-03-21", "2026-03-22")
     for index in range(100):
         when_text = when_values[index % len(when_values)]
@@ -376,9 +480,12 @@ def _seed_plans(graph_store: TwinrPersonalGraphStore, contacts: list[_ContactSee
                 when_text=when_text,
                 details=f"linked with {contact.label}",
             )
+            plan_node_id = getattr(plan_result, "node_id", None)
+            if not plan_node_id:
+                raise RuntimeError(f"Synthetic plan seeding did not return a node_id for {summary!r}.")  # AUDIT-FIX(#7): Fail explicitly when the store contract changes instead of dereferencing None.
             _link_plan_to_contact(
                 graph_store,
-                plan_node_id=plan_result.node_id,
+                plan_node_id=plan_node_id,
                 contact_label=contact.label,
             )
             plans.append(_PlanSeed(summary=summary, when_text=when_text, contact_label=contact.label))
@@ -416,6 +523,8 @@ def _build_eval_cases(
     cases: list[LongTermEvalCase] = []
 
     exact_contacts = [contact for contact in contacts if not contact.ambiguous][:10]
+    if len(exact_contacts) < 10:
+        raise ValueError(f"Expected at least 10 exact contacts, got {len(exact_contacts)}.")  # AUDIT-FIX(#7): Guard indexed synthetic selections with explicit size checks.
     for index, contact in enumerate(exact_contacts, start=1):
         cases.append(
             LongTermEvalCase(
@@ -432,6 +541,8 @@ def _build_eval_cases(
         )
 
     ambiguous_contacts = contacts[:30:3][:10]
+    if len(ambiguous_contacts) < 10:
+        raise ValueError(f"Expected at least 10 ambiguous contacts, got {len(ambiguous_contacts)}.")  # AUDIT-FIX(#7): Prevent silent fixture drift from degenerating into fewer-than-expected eval cases.
     for index, contact in enumerate(ambiguous_contacts, start=1):
         cases.append(
             LongTermEvalCase(
@@ -445,6 +556,8 @@ def _build_eval_cases(
         )
 
     shopping_preferences = preferences[:10]
+    if len(shopping_preferences) < 10:
+        raise ValueError(f"Expected at least 10 shopping preferences, got {len(shopping_preferences)}.")  # AUDIT-FIX(#7): Keep the case set deterministic even if the seed corpus changes.
     for index, preference in enumerate(shopping_preferences, start=1):
         cases.append(
             LongTermEvalCase(
@@ -458,6 +571,8 @@ def _build_eval_cases(
         )
 
     linked_plans = [plan for plan in plans if plan.contact_label][:10]
+    if len(linked_plans) < 10:
+        raise ValueError(f"Expected at least 10 linked plans, got {len(linked_plans)}.")  # AUDIT-FIX(#7): Turn latent IndexError-style failures into a clear fixture contract violation.
     for index, plan in enumerate(linked_plans, start=1):
         cases.append(
             LongTermEvalCase(
@@ -470,7 +585,11 @@ def _build_eval_cases(
             )
         )
 
-    episodic_targets = [episodes[index] for index in (5, 15, 25, 35, 45, 55, 65, 75, 85, 95)]
+    if len(episodes) <= max(_EPISODIC_TARGET_INDICES):
+        raise ValueError(
+            f"Expected at least {max(_EPISODIC_TARGET_INDICES) + 1} episodes, got {len(episodes)}."
+        )  # AUDIT-FIX(#7): Protect fixed-index episodic sampling against corpus shrinkage.
+    episodic_targets = [episodes[index] for index in _EPISODIC_TARGET_INDICES]
     for index, episode in enumerate(episodic_targets, start=1):
         cases.append(
             LongTermEvalCase(
@@ -486,6 +605,42 @@ def _build_eval_cases(
     return cases
 
 
+def _run_eval_case_safely(
+    *,
+    service: LongTermMemoryService,
+    graph_store: TwinrPersonalGraphStore,
+    case: LongTermEvalCase,
+) -> LongTermEvalCaseResult:
+    try:
+        return _run_eval_case(service=service, graph_store=graph_store, case=case)
+    except Exception as exc:
+        return LongTermEvalCaseResult(
+            case_id=case.case_id,
+            category=case.category,
+            kind=case.kind,
+            passed=False,
+            matched_contains=(),
+            missing_contains=case.expected_contains,
+            present_forbidden=(),
+            error_message=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _coerce_tuple(value: object) -> tuple[object, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, tuple):
+        return value
+    if isinstance(value, list):
+        return tuple(value)
+    if isinstance(value, str):
+        return (value,)
+    try:
+        return tuple(value)  # type: ignore[arg-type]
+    except TypeError:
+        return (value,)
+
+
 def _run_eval_case(
     *,
     service: LongTermMemoryService,
@@ -498,14 +653,22 @@ def _run_eval_case(
             family_name=case.lookup_family_name,
             role=case.lookup_role,
         )
-        context_blob = " ".join(
-            [result.match.label, *result.match.phones] if result.match is not None else []
-        )
+        match = getattr(result, "match", None)
+        label = str(getattr(match, "label", "")) if match is not None else ""
+        phones = tuple(
+            str(phone) for phone in _coerce_tuple(getattr(match, "phones", ()))
+        ) if match is not None else ()
+        context_blob = " ".join(part for part in (label, *phones) if part)
         matched_contains = tuple(text for text in case.expected_contains if text and text in context_blob)
         missing_contains = tuple(text for text in case.expected_contains if text and text not in context_blob)
-        observed_option_count = len(result.options)
+        options = _coerce_tuple(getattr(result, "options", ()))  # AUDIT-FIX(#8): Tolerate None/non-list option payloads from the contact lookup contract.
+        observed_option_count = len(options)
+        observed_lookup_status_raw = getattr(result, "status", None)
+        observed_lookup_status = (
+            str(observed_lookup_status_raw) if observed_lookup_status_raw is not None else None
+        )
         passed = (
-            result.status == case.expected_lookup_status
+            observed_lookup_status == case.expected_lookup_status
             and (case.expected_option_count is None or observed_option_count == case.expected_option_count)
             and not missing_contains
         )
@@ -517,12 +680,16 @@ def _run_eval_case(
             matched_contains=matched_contains,
             missing_contains=missing_contains,
             present_forbidden=(),
-            observed_lookup_status=result.status,
+            observed_lookup_status=observed_lookup_status,
             observed_option_count=observed_option_count,
         )
 
     context = service.build_provider_context(case.query_text)
-    context_blob = "\n".join(context.system_messages())
+    system_messages_method = getattr(context, "system_messages", None)
+    system_messages = system_messages_method() if callable(system_messages_method) else ()
+    context_blob = "\n".join(  # AUDIT-FIX(#8): Accept provider-context implementations that yield None or non-string message elements.
+        str(message) for message in _coerce_tuple(system_messages)
+    )
     matched_contains = tuple(text for text in case.expected_contains if text and text in context_blob)
     missing_contains = tuple(text for text in case.expected_contains if text and text not in context_blob)
     present_forbidden = tuple(text for text in case.expected_absent if text and text in context_blob)
@@ -612,6 +779,9 @@ def _link_plan_to_contact(
 
 def _result_to_payload(result: LongTermEvalResult) -> dict[str, object]:
     return {
+        "temp_root": result.temp_root,  # AUDIT-FIX(#10): Expose persisted artifact locations in the CLI payload so callers can inspect the generated files.
+        "memory_path": result.memory_path,
+        "graph_path": result.graph_path,
         "seed_stats": {
             "contacts": result.seed_stats.contacts,
             "preferences": result.seed_stats.preferences,
@@ -623,8 +793,8 @@ def _result_to_payload(result: LongTermEvalResult) -> dict[str, object]:
             "total_cases": result.summary.total_cases,
             "passed_cases": result.summary.passed_cases,
             "accuracy": result.summary.accuracy,
-            "category_case_counts": result.summary.category_case_counts,
-            "category_pass_counts": result.summary.category_pass_counts,
+            "category_case_counts": dict(result.summary.category_case_counts),
+            "category_pass_counts": dict(result.summary.category_pass_counts),
             "category_accuracy": result.summary.category_accuracy(),
         },
         "cases": [
@@ -638,6 +808,7 @@ def _result_to_payload(result: LongTermEvalResult) -> dict[str, object]:
                 "present_forbidden": list(case.present_forbidden),
                 "observed_lookup_status": case.observed_lookup_status,
                 "observed_option_count": case.observed_option_count,
+                "error_message": case.error_message,
             }
             for case in result.cases
         ],
@@ -645,11 +816,24 @@ def _result_to_payload(result: LongTermEvalResult) -> dict[str, object]:
 
 
 def main() -> int:
-    payload = _result_to_payload(run_synthetic_longterm_eval())
     try:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        payload = _result_to_payload(run_synthetic_longterm_eval())
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))  # AUDIT-FIX(#11): Emit deterministic JSON to make CI snapshots and diffs stable.
     except BrokenPipeError:
         return 0
+    except Exception as exc:
+        error_payload = {
+            "error": {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "notes": list(getattr(exc, "__notes__", ())),
+            }
+        }
+        try:
+            print(json.dumps(error_payload, ensure_ascii=False, indent=2, sort_keys=True))  # AUDIT-FIX(#11): Return machine-readable error details instead of a raw traceback when the CLI fails.
+        except BrokenPipeError:
+            return 0
+        return 1
     return 0
 
 

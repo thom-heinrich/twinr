@@ -475,14 +475,16 @@ class ProactiveCoordinator:
                     "error": str(exc),
                 },
             )
-            return decision, None
+            self._record_trigger_skipped_vision_review_unavailable(decision)
+            return None, None
         if review is None:
             self.runtime.ops_events.append(
                 event="proactive_vision_review_unavailable",
                 message="Buffered proactive vision review was enabled but no usable result was available.",
                 data={"trigger": decision.trigger_id},
             )
-            return decision, None
+            self._record_trigger_skipped_vision_review_unavailable(decision)
+            return None, None
         self._record_vision_review(decision, review=review)
         if not review.approved:
             self._record_trigger_skipped_vision_review(decision, review=review)
@@ -762,6 +764,23 @@ class ProactiveCoordinator:
                 "vision_review_response_id": review.response_id,
                 "vision_review_request_id": review.request_id,
                 "vision_review_model": review.model,
+            },
+        )
+
+    def _record_trigger_skipped_vision_review_unavailable(
+        self,
+        decision: SocialTriggerDecision,
+    ) -> None:
+        self.emit("social_trigger_skipped=vision_review_unavailable")
+        self.runtime.ops_events.append(
+            event="social_trigger_skipped",
+            message="Social trigger prompt was skipped because buffered frame review was unavailable.",
+            data={
+                "trigger": decision.trigger_id,
+                "reason": "vision_review_unavailable",
+                "priority": int(decision.priority),
+                "score": decision.score,
+                "threshold": decision.threshold,
             },
         )
 

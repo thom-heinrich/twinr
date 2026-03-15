@@ -8,6 +8,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.memory.longterm.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.personality import (
     load_personality_instructions,
@@ -30,6 +31,14 @@ class _FakeRemoteState:
 
     def save_snapshot(self, *, snapshot_kind: str, payload):
         self.snapshots[snapshot_kind] = dict(payload)
+
+
+class _FailingRemoteState(_FakeRemoteState):
+    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+        del local_path
+        raise LongTermRemoteUnavailableError(
+            f"Failed to read remote long-term snapshot {snapshot_kind!r}: status=503"
+        )
 
 
 class PersonalityTests(unittest.TestCase):
@@ -229,6 +238,57 @@ class PersonalityTests(unittest.TestCase):
         self.assertIn("Eye doctor on Tuesday at 10:30.", instructions)
         self.assertIn("Base user profile", instructions)
         self.assertIn("pets: Thom has two dogs.", instructions)
+
+    def test_load_personality_instructions_fails_closed_when_remote_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            personality_dir = Path(tmpdir) / "personality"
+            personality_dir.mkdir()
+            state_dir = Path(tmpdir) / "state"
+            state_dir.mkdir()
+            (personality_dir / "SYSTEM.md").write_text("System context", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text(
+                "\n".join(
+                    [
+                        "Style context",
+                        "",
+                        "<!-- TWINR_MANAGED_CONTEXT_START -->",
+                        "## Twinr managed personality updates",
+                        "_This section is managed by Twinr. Keep entries short and stable._",
+                        "- response_style: Keep answers calm.",
+                        "<!-- TWINR_MANAGED_CONTEXT_END -->",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (personality_dir / "USER.md").write_text(
+                "\n".join(
+                    [
+                        "Base user profile",
+                        "",
+                        "<!-- TWINR_MANAGED_CONTEXT_START -->",
+                        "## Twinr managed user updates",
+                        "_This section is managed by Twinr. Keep entries short and stable._",
+                        "- pets: Thom has two dogs.",
+                        "<!-- TWINR_MANAGED_CONTEXT_END -->",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig(
+                project_root=tmpdir,
+                personality_dir="personality",
+                memory_markdown_path=str(state_dir / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+            )
+            failing_remote = _FailingRemoteState()
+            with patch("twinr.agent.base_agent.personality.LongTermRemoteStateStore.from_config", return_value=failing_remote):
+                with self.assertRaises(LongTermRemoteUnavailableError):
+                    load_personality_instructions(config)
 
 
 if __name__ == "__main__":

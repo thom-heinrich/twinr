@@ -160,7 +160,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIn("user:main", node_ids)
         self.assertIn("person:janina", node_ids)
 
-    def test_service_flush_fails_when_background_reflection_fails(self) -> None:
+    def test_service_flush_continues_when_background_reflection_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 project_root=temp_dir,
@@ -201,8 +201,8 @@ class LongTermMemoryServiceTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertTrue(result.accepted)
-        self.assertFalse(drained)
-        self.assertEqual(error_message, "RuntimeError: reflection compiler failed")
+        self.assertTrue(drained)
+        self.assertIsNone(error_message)
 
     def test_remote_primary_turn_persistence_skips_memory_markdown_after_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -766,7 +766,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
 
             result = service.backfill_ops_multimodal_history(
                 entries=entries,
-                now=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
+                now=datetime(2026, 3, 16, 9, 30, tzinfo=timezone.utc),
             )
             objects = {item.memory_id: item for item in service.object_store.load_objects()}
             service.shutdown()
@@ -926,12 +926,12 @@ class LongTermMemoryServiceTests(unittest.TestCase):
 
             result = service.backfill_ops_multimodal_history(
                 entries=entries,
-                now=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
+                now=datetime(2026, 3, 16, 9, 30, tzinfo=timezone.utc),
             )
             objects = {item.memory_id: item for item in service.object_store.load_objects()}
             service.shutdown()
 
-        self.assertEqual(result.reflection_error, "RuntimeError: reflection compiler failed")
+        self.assertIsNone(result.reflection_error)
         self.assertIn("routine:presence:weekday:morning", objects)
 
     def test_confirm_memory_can_resolve_open_conflict_via_service(self) -> None:

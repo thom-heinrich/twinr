@@ -22,6 +22,7 @@ from twinr.memory.longterm.models import (
     LongTermMemoryObjectV1,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.longterm.store import LongTermStructuredStore, _write_json_atomic
 from twinr.memory.longterm.truth import LongTermTruthMaintainer
 
@@ -29,7 +30,10 @@ from twinr.memory.longterm.truth import LongTermTruthMaintainer
 class _FakeRemoteState:
     def __init__(self) -> None:
         self.enabled = True
-        self.config = SimpleNamespace(long_term_memory_migration_enabled=False)
+        self.config = SimpleNamespace(
+            long_term_memory_migration_enabled=False,
+            long_term_memory_remote_shard_max_content_chars=1000,
+        )
         self.snapshots: dict[str, dict[str, object]] = {}
 
     def load_snapshot(self, *, snapshot_kind: str, local_path=None):
@@ -39,6 +43,13 @@ class _FakeRemoteState:
 
     def save_snapshot(self, *, snapshot_kind: str, payload):
         self.snapshots[snapshot_kind] = dict(payload)
+
+
+class _FailingRemoteState(_FakeRemoteState):
+    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+        del snapshot_kind
+        del local_path
+        raise LongTermRemoteUnavailableError("remote unavailable")
 
 
 def _config(root: str) -> TwinrConfig:
@@ -170,7 +181,78 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertFalse(store.objects_path.exists())
         self.assertEqual(len(loaded), 1)
-        self.assertIn("objects", remote_state.snapshots)
+        self.assertEqual(
+            remote_state.snapshots["objects"],
+            {"schema": "twinr_memory_object_store_manifest", "version": 1, "shards": ["objects__part_0000"]},
+        )
+        self.assertEqual(
+            remote_state.snapshots["objects__part_0000"]["schema"],
+            "twinr_memory_object_store_shard",
+        )
+
+    def test_ensure_remote_snapshots_seeds_empty_remote_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+
+            ensured = store.ensure_remote_snapshots()
+
+        self.assertEqual(set(ensured), {"objects", "conflicts", "archive"})
+        self.assertEqual(
+            remote_state.snapshots["conflicts"],
+            {"schema": "twinr_memory_conflict_store", "version": 1, "conflicts": []},
+        )
+        self.assertEqual(
+            remote_state.snapshots["archive"],
+            {"schema": "twinr_memory_archive_store_manifest", "version": 1, "shards": ["archive__part_0000"]},
+        )
+        self.assertEqual(
+            remote_state.snapshots["archive__part_0000"],
+            {"schema": "twinr_memory_archive_store_shard", "version": 1, "objects": []},
+        )
+        self.assertEqual(
+            remote_state.snapshots["objects"],
+            {"schema": "twinr_memory_object_store_manifest", "version": 1, "shards": ["objects__part_0000"]},
+        )
+        self.assertEqual(
+            remote_state.snapshots["objects__part_0000"],
+            {"schema": "twinr_memory_object_store_shard", "version": 1, "objects": []},
+        )
+
+    def test_remote_primary_store_shards_large_object_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            objects = tuple(
+                LongTermMemoryObjectV1(
+                    memory_id=f"fact:{index}",
+                    kind="fact",
+                    summary=f"Fact number {index} " + ("x" * 400),
+                    source=_source(),
+                    status="active",
+                    confidence=0.9,
+                )
+                for index in range(4)
+            )
+
+            store.write_snapshot(objects=objects)
+            loaded = store.load_objects()
+
+        self.assertGreater(len(remote_state.snapshots["objects"]["shards"]), 1)
+
+    def test_remote_primary_store_does_not_fallback_to_local_objects_when_remote_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_path = Path(temp_dir) / "state" / "chonkydb"
+            base_path.mkdir(parents=True, exist_ok=True)
+            objects_path = base_path / "twinr_memory_objects_v1.json"
+            objects_path.write_text(
+                json.dumps({"schema": "twinr_memory_object_store", "version": 1, "objects": [{"memory_id": "fact:local"}]}),
+                encoding="utf-8",
+            )
+            store = LongTermStructuredStore(base_path=base_path, remote_state=_FailingRemoteState())
+
+            with self.assertRaises(LongTermRemoteUnavailableError):
+                store.load_objects()
 
     def test_select_relevant_objects_prefers_query_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

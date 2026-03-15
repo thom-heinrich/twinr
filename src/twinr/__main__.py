@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from threading import Lock
 
 from twinr.agent.base_agent import TwinrConfig, TwinrRuntime
@@ -126,15 +127,46 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _assert_pi_runtime_root(env_file: str | Path, *, command_name: str) -> None:
+    env_path = Path(env_file).resolve()
+    pi_root = Path("/twinr").resolve()
+    if pi_root not in env_path.parents and env_path != pi_root / ".env":
+        return
+    cwd = Path.cwd().resolve()
+    if cwd != pi_root:
+        raise RuntimeError(
+            f"{command_name} with /twinr runtime state must be launched from /twinr, not {cwd}"
+        )
+    import twinr as twinr_package
+
+    package_file = getattr(twinr_package, "__file__", None)
+    package_root = Path(package_file).resolve().parent.parent if package_file else None
+    expected_source_root = pi_root / "src"
+    if package_root != expected_source_root:
+        raise RuntimeError(
+            f"{command_name} with /twinr runtime state must import from {expected_source_root}, not {package_root}"
+        )
+
+
 def main() -> int:
     args = build_parser().parse_args()
     config = TwinrConfig.from_env(Path(args.env_file))
     runtime = TwinrRuntime(config=config)
+    env_path = Path(args.env_file).resolve()
 
     print(f"status={runtime.status.value}")
     print(f"web_port={config.web_port}")
     print(f"model={config.default_model}")
     print(f"openai_reasoning_effort={config.openai_reasoning_effort}")
+    print(f"runtime_cwd={Path.cwd().resolve()}")
+    print(f"runtime_source_root={Path(sys.path[0] or '.').resolve()}")
+    try:
+        import twinr as twinr_package
+
+        print(f"runtime_package_root={Path(getattr(twinr_package, '__file__', '.')).resolve().parent.parent}")
+    except Exception:
+        print("runtime_package_root=unknown")
+    print(f"runtime_env_file={env_path}")
 
     if args.demo_transcript:
         runtime.press_green_button()
@@ -180,6 +212,7 @@ def main() -> int:
             camera = V4L2StillCamera.from_config(config)
 
         if args.run_web:
+            _assert_pi_runtime_root(args.env_file, command_name="run-web")
             from twinr.web import create_app
 
             try:
@@ -194,6 +227,7 @@ def main() -> int:
             return 0
 
         if args.run_orchestrator_server:
+            _assert_pi_runtime_root(args.env_file, command_name="run-orchestrator-server")
             from twinr.orchestrator import create_app
 
             try:
@@ -216,6 +250,7 @@ def main() -> int:
             return 0
 
         if args.run_display_loop:
+            _assert_pi_runtime_root(args.env_file, command_name="run-display-loop")
             from twinr.display import TwinrStatusDisplayLoop
             from twinr.ops import loop_instance_lock
 
@@ -224,6 +259,7 @@ def main() -> int:
                 return loop.run(duration_s=args.loop_duration)
 
         if args.run_realtime_loop:
+            _assert_pi_runtime_root(args.env_file, command_name="run-realtime-loop")
             from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
             from twinr.ops import loop_instance_lock
 
@@ -236,6 +272,7 @@ def main() -> int:
                 return loop.run(duration_s=args.loop_duration)
 
         if args.run_streaming_loop:
+            _assert_pi_runtime_root(args.env_file, command_name="run-streaming-loop")
             from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
             from twinr.ops import loop_instance_lock
             from twinr.providers import build_streaming_provider_bundle
@@ -256,6 +293,7 @@ def main() -> int:
                 return loop.run(duration_s=args.loop_duration)
 
         if args.orchestrator_probe_turn:
+            _assert_pi_runtime_root(args.env_file, command_name="orchestrator-probe-turn")
             from twinr.agent.tools import bind_realtime_tool_handlers
             from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
             from twinr.orchestrator import OrchestratorTurnRequest, OrchestratorWebSocketClient
@@ -302,6 +340,7 @@ def main() -> int:
             return 0
 
         if args.run_hardware_loop and backend is not None:
+            _assert_pi_runtime_root(args.env_file, command_name="run-hardware-loop")
             from twinr.agent.workflows.runner import TwinrHardwareLoop
             from twinr.ops import loop_instance_lock
 

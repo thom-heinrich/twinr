@@ -25,6 +25,29 @@ def _fake_lock(_config, _name: str):
 
 
 class MainCliTests(unittest.TestCase):
+    def test_assert_pi_runtime_root_rejects_non_pi_cwd_for_pi_env(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        twinr_package = importlib.import_module("twinr")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_cwd = Path(temp_dir)
+            with patch("pathlib.Path.cwd", return_value=fake_cwd):
+                with patch.object(twinr_package, "__file__", "/twinr/src/twinr/__init__.py"):
+                    with self.assertRaisesRegex(RuntimeError, "must be launched from /twinr"):
+                        main_mod._assert_pi_runtime_root("/twinr/.env", command_name="run-streaming-loop")
+
+        sys.modules.pop("twinr.__main__", None)
+
+    def test_assert_pi_runtime_root_accepts_twinr_cwd_and_source_root(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        twinr_package = importlib.import_module("twinr")
+        try:
+            with patch("pathlib.Path.cwd", return_value=Path("/twinr")):
+                with patch.object(twinr_package, "__file__", "/twinr/src/twinr/__init__.py"):
+                    main_mod._assert_pi_runtime_root("/twinr/.env", command_name="run-streaming-loop")
+        finally:
+            sys.modules.pop("twinr.__main__", None)
+
     def test_run_display_loop_does_not_require_workflow_imports(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

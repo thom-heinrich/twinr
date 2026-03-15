@@ -51,11 +51,12 @@ class FakeTurnToolAgentProvider:
                     call_id="call_turn_1",
                     arguments={
                         "decision": "end_turn",
+                        "label": "complete",
                         "confidence": 0.91,
                         "reason": "complete_request",
                         "transcript": "ich bin noch am programmieren",
                     },
-                    raw_arguments='{"decision":"end_turn","confidence":0.91,"reason":"complete_request","transcript":"ich bin noch am programmieren"}',
+                    raw_arguments='{"decision":"end_turn","label":"complete","confidence":0.91,"reason":"complete_request","transcript":"ich bin noch am programmieren"}',
                 ),
             ),
         )
@@ -81,6 +82,7 @@ class TurnControllerTests(unittest.TestCase):
         )
 
         self.assertEqual(decision.decision, "end_turn")
+        self.assertEqual(decision.label, "complete")
         self.assertAlmostEqual(decision.confidence, 0.91)
         self.assertEqual(decision.reason, "complete_request")
         self.assertEqual(decision.transcript, "ich bin noch am programmieren")
@@ -118,6 +120,7 @@ class TurnControllerTests(unittest.TestCase):
         self.assertTrue(controller.should_stop_capture())
         self.assertEqual(controller.latest_transcript(), "ich bin noch am programmieren")
         self.assertIn("turn_controller_decision=end_turn", lines)
+        self.assertIn("turn_controller_label=complete", lines)
 
     def test_streaming_turn_controller_fast_path_stops_on_speech_final(self) -> None:
         config = TwinrConfig(
@@ -149,6 +152,7 @@ class TurnControllerTests(unittest.TestCase):
         self.assertEqual(controller.latest_transcript(), "ich bin fertig")
         self.assertEqual(provider.calls, [])
         self.assertIn("turn_controller_reason=speech_final_fast_path", lines)
+        self.assertIn("turn_controller_label=complete", lines)
 
     def test_streaming_turn_controller_fast_path_stops_on_stable_utterance_end(self) -> None:
         config = TwinrConfig(
@@ -181,6 +185,35 @@ class TurnControllerTests(unittest.TestCase):
         self.assertEqual(controller.latest_transcript(), "ich bin fertig")
         self.assertEqual(provider.calls, [])
         self.assertIn("turn_controller_reason=utterance_end_fast_path", lines)
+        self.assertIn("turn_controller_label=complete", lines)
+
+    def test_text_fallback_can_parse_backchannel_label(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+        )
+
+        class BackchannelProvider(FakeTurnToolAgentProvider):
+            def start_turn_streaming(self, *args, **kwargs) -> ToolCallingTurnResponse:
+                del args, kwargs
+                return ToolCallingTurnResponse(
+                    text='{"decision":"end_turn","label":"backchannel","confidence":0.82,"reason":"short_answer","transcript":"ja"}'
+                )
+
+        evaluator = ToolCallingTurnDecisionEvaluator(config=config, provider=BackchannelProvider(config))
+
+        decision = evaluator.evaluate(
+            candidate=TurnEvaluationCandidate(
+                transcript="ja",
+                event_type="speech_final",
+                speech_final=True,
+            ),
+            conversation=(("assistant", "Moechtest du, dass ich es drucke?"),),
+        )
+
+        self.assertEqual(decision.decision, "end_turn")
+        self.assertEqual(decision.label, "backchannel")
 
 
 if __name__ == "__main__":

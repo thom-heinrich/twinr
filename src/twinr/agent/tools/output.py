@@ -458,6 +458,11 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
         "status": "ok",
         "answer": answer,
         "sources": sources,
+        "used_web_search": used_web_search,
+        "response_id": response_id or None,
+        "request_id": request_id or None,
+        "model": getattr(result, "model", None),
+        "token_usage": getattr(result, "token_usage", None),
     }
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from queue import Queue
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Callable
 import time
 
@@ -13,6 +13,7 @@ from twinr.agent.base_agent.contracts import (
     CombinedSpeechAgentProvider,
     CompositeSpeechAgentProvider,
     SpeechToTextProvider,
+    StreamingSpeechEndpointEvent,
     StreamingSpeechToTextProvider,
     TextToSpeechProvider,
     ToolCallingAgentProvider,
@@ -22,9 +23,19 @@ from twinr.agent.base_agent.turn_controller import (
     ToolCallingTurnDecisionEvaluator,
     _normalize_turn_text,
 )
+from twinr.agent.base_agent.conversation_closure import (
+    ConversationClosureDecision,
+    ToolCallingConversationClosureEvaluator,
+)
 from twinr.agent.base_agent.runtime import TwinrRuntime
 from twinr.agent.tools import RealtimeToolExecutor, bind_realtime_tool_handlers
-from twinr.hardware.audio import SilenceDetectedRecorder, SpeechCaptureResult, WaveAudioPlayer
+from twinr.hardware.audio import (
+    AmbientAudioSampler,
+    SilenceDetectedRecorder,
+    SpeechCaptureResult,
+    WaveAudioPlayer,
+    pcm16_to_wav_bytes,
+)
 from twinr.hardware.buttons import ButtonAction, configured_button_monitor
 from twinr.hardware.camera import V4L2StillCamera
 from twinr.hardware.printer import RawReceiptPrinter
@@ -56,6 +67,7 @@ class TwinrRealtimeHardwareLoop(
         tts_provider: TextToSpeechProvider | None = None,
         turn_stt_provider: StreamingSpeechToTextProvider | None = None,
         turn_tool_agent_provider: ToolCallingAgentProvider | None = None,
+        conversation_closure_evaluator: ToolCallingConversationClosureEvaluator | None = None,
         button_monitor=None,
         recorder: SilenceDetectedRecorder | None = None,
         player: WaveAudioPlayer | None = None,
@@ -63,6 +75,7 @@ class TwinrRealtimeHardwareLoop(
         camera: V4L2StillCamera | None = None,
         usage_store: TwinrUsageStore | None = None,
         voice_profile_monitor: VoiceProfileMonitor | None = None,
+        ambient_audio_sampler: AmbientAudioSampler | None = None,
         proactive_monitor=None,
         emit: Callable[[str], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -104,6 +117,7 @@ class TwinrRealtimeHardwareLoop(
         self.camera = camera or V4L2StillCamera.from_config(config)
         self.usage_store = usage_store or TwinrUsageStore.from_config(config)
         self.voice_profile_monitor = voice_profile_monitor or VoiceProfileMonitor.from_config(config)
+        self._ambient_audio_sampler = ambient_audio_sampler
         self._camera_lock = Lock()
         self._audio_lock = Lock()
         self._conversation_session_lock = Lock()  # AUDIT-FIX(#1): Serialize session entry across button, wakeword, and proactive threads.
@@ -111,7 +125,7 @@ class TwinrRealtimeHardwareLoop(
         self._current_turn_audio_sample_rate: int = self.config.openai_realtime_input_sample_rate
         self.tool_executor = RealtimeToolExecutor(self)
         provider_bundle = None
-        if self.config.turn_controller_enabled and (
+        if (self.config.turn_controller_enabled or self.config.conversation_closure_guard_enabled) and (
             turn_stt_provider is None or turn_tool_agent_provider is None
         ):
             try:
@@ -133,6 +147,17 @@ class TwinrRealtimeHardwareLoop(
             )
             if self.turn_tool_agent_provider is not None and self.config.turn_controller_enabled
             else None
+        )
+        self.conversation_closure_evaluator = (
+            conversation_closure_evaluator
+            or (
+                ToolCallingConversationClosureEvaluator(
+                    config=config,
+                    provider=self.turn_tool_agent_provider,
+                )
+                if self.turn_tool_agent_provider is not None and self.config.conversation_closure_guard_enabled
+                else None
+            )
         )
         self.realtime_session = realtime_session or OpenAIRealtimeSession(
             config=config,
@@ -205,33 +230,62 @@ class TwinrRealtimeHardwareLoop(
             monitor = stack.enter_context(self.button_monitor)
             if self.proactive_monitor is not None:
                 stack.enter_context(self.proactive_monitor)
-            while True:
-                try:  # AUDIT-FIX(#4): Keep the hardware loop alive when idle-housekeeping or polling raises.
-                    if duration_s is not None and time.monotonic() - started_at >= duration_s:
-                        return 0
-                    event = monitor.poll(timeout=safe_poll_timeout)
-                    if event is None:
-                        if self._maybe_deliver_due_reminder():
+            housekeeping_stop, housekeeping_thread = self._start_idle_housekeeping_worker(
+                poll_timeout=safe_poll_timeout
+            )
+            try:
+                while True:
+                    try:  # AUDIT-FIX(#4): Keep the hardware loop alive when button polling or button handling raises.
+                        if duration_s is not None and time.monotonic() - started_at >= duration_s:
+                            return 0
+                        event = monitor.poll(timeout=safe_poll_timeout)
+                        if event is None:
                             continue
-                        if self._maybe_run_due_automation():
+                        if event.action != ButtonAction.PRESSED:
                             continue
-                        if self._maybe_run_sensor_automation():
-                            continue
-                        if self._maybe_run_long_term_memory_proactive():
-                            continue
-                        continue
-                    if event.action != ButtonAction.PRESSED:
-                        continue
-                    self.emit(f"button={event.name}")
-                    self._record_event(
-                        "button_pressed",
-                        f"Physical button `{event.name}` was pressed.",
-                        button=event.name,
-                        line_offset=event.line_offset,
-                    )
-                    self.handle_button_press(event.name)
-                except Exception as exc:
+                        self.emit(f"button={event.name}")
+                        self._record_event(
+                            "button_pressed",
+                            f"Physical button `{event.name}` was pressed.",
+                            button=event.name,
+                            line_offset=event.line_offset,
+                        )
+                        self.handle_button_press(event.name)
+                    except Exception as exc:
+                        self._handle_error(exc)
+            finally:
+                housekeeping_stop.set()
+                housekeeping_thread.join(timeout=max(0.5, safe_poll_timeout + 0.25))
+
+    def _run_idle_housekeeping_cycle(self) -> bool:
+        if self._maybe_deliver_due_reminder():
+            return True
+        if self._maybe_run_due_automation():
+            return True
+        if self._maybe_run_sensor_automation():
+            return True
+        if self._maybe_run_long_term_memory_proactive():
+            return True
+        return False
+
+    def _start_idle_housekeeping_worker(self, *, poll_timeout: float) -> tuple[Event, Thread]:
+        stop_event = Event()
+        idle_sleep_s = max(0.02, min(0.25, poll_timeout or 0.25))
+
+        def worker() -> None:
+            while not stop_event.is_set():
+                try:
+                    did_work = self._run_idle_housekeeping_cycle()
+                except Exception as exc:  # AUDIT-FIX(#10): Contain housekeeping-thread faults so hardware button monitoring stays alive.
                     self._handle_error(exc)
+                    did_work = False
+                if did_work:
+                    continue
+                stop_event.wait(idle_sleep_s)
+
+        thread = Thread(target=worker, daemon=True, name="twinr-realtime-housekeeping")
+        thread.start()
+        return stop_event, thread
 
     def handle_button_press(self, button_name: str) -> None:
         try:
@@ -302,6 +356,59 @@ class TwinrRealtimeHardwareLoop(
         except Exception as exc:
             self._handle_error(exc)
 
+    def _follow_up_allowed_for_source(self, *, initial_source: str) -> bool:
+        if not self.config.conversation_follow_up_enabled:
+            return False
+        if initial_source == "proactive":
+            return bool(self.config.conversation_follow_up_after_proactive_enabled)
+        return True
+
+    def _follow_up_vetoed_by_closure(
+        self,
+        *,
+        user_transcript: str,
+        assistant_response: str,
+        request_source: str,
+        proactive_trigger: str | None,
+    ) -> bool:
+        evaluator = self.conversation_closure_evaluator
+        if evaluator is None or not self.config.conversation_closure_guard_enabled:
+            return False
+        if not self._follow_up_allowed_for_source(initial_source=request_source):
+            return False
+        try:
+            decision = evaluator.evaluate(
+                user_transcript=user_transcript,
+                assistant_response=assistant_response,
+                request_source=request_source,
+                proactive_trigger=proactive_trigger,
+                conversation=self.runtime.conversation_context(),
+            )
+        except Exception as exc:
+            self.emit(f"conversation_closure_fallback={type(exc).__name__}")
+            return False
+        self._emit_closure_decision(decision)
+        if not decision.close_now:
+            return False
+        min_confidence = max(0.0, min(1.0, float(self.config.conversation_closure_min_confidence)))
+        if decision.confidence < min_confidence:
+            self.emit("conversation_closure_below_threshold=true")
+            return False
+        self._record_event(
+            "conversation_closure_detected",
+            "Twinr suppressed automatic follow-up listening because the exchange clearly ended for now.",
+            request_source=request_source,
+            proactive_trigger=proactive_trigger,
+            confidence=decision.confidence,
+            reason=decision.reason,
+        )
+        return True
+
+    def _emit_closure_decision(self, decision: ConversationClosureDecision) -> None:
+        self.emit(f"conversation_closure_close_now={str(decision.close_now).lower()}")
+        self.emit(f"conversation_closure_confidence={decision.confidence:.3f}")
+        self.emit(f"conversation_closure_reason={decision.reason}")
+
     def _run_conversation_session(
         self,
         *,
@@ -329,7 +436,7 @@ class TwinrRealtimeHardwareLoop(
                     listen_source=initial_source,
                     proactive_trigger=proactive_trigger,
                 ):
-                    if self.config.conversation_follow_up_enabled:
+                    if self._follow_up_allowed_for_source(initial_source=initial_source):
                         follow_up = True
                     else:
                         return True
@@ -358,7 +465,7 @@ class TwinrRealtimeHardwareLoop(
                     timeout_message=self._listening_timeout_message(initial_source=initial_source, follow_up=follow_up),
                     play_initial_beep=True if follow_up else play_initial_beep,
                 ):
-                    if self.config.conversation_follow_up_enabled:
+                    if self._follow_up_allowed_for_source(initial_source=initial_source):
                         follow_up = True
                         continue
                 return True
@@ -392,6 +499,34 @@ class TwinrRealtimeHardwareLoop(
             emit=self.emit,
         )
 
+    def _turn_guidance_messages(self, turn_label: str | None) -> tuple[tuple[str, str], ...]:
+        normalized = str(turn_label or "").strip().lower()
+        if normalized != "backchannel":
+            return ()
+        return (
+            (
+                "system",
+                "The current user turn is a short backchannel or direct answer to the latest assistant prompt. "
+                "If you answer, keep it very short, direct, and do not restate the whole context.",
+            ),
+        )
+
+    def _conversation_context_for_turn_label(self, turn_label: str | None) -> tuple[tuple[str, str], ...]:
+        return self.runtime.provider_conversation_context() + self._turn_guidance_messages(turn_label)
+
+    def _interrupt_stt_provider(self) -> SpeechToTextProvider | None:
+        provider = self.turn_stt_provider or self.stt_provider
+        if provider is None or not callable(getattr(provider, "transcribe", None)):
+            return None
+        return provider
+
+    def _ambient_sampler(self) -> AmbientAudioSampler:
+        sampler = self._ambient_audio_sampler
+        if sampler is None:
+            sampler = AmbientAudioSampler.from_config(self.config)
+            self._ambient_audio_sampler = sampler
+        return sampler
+
     def _best_effort_streaming_transcript_hint(
         self,
         *,
@@ -408,6 +543,9 @@ class TwinrRealtimeHardwareLoop(
     def _on_streaming_stt_interim(self, text: str) -> None:
         del text
 
+    def _on_streaming_stt_endpoint(self, event: StreamingSpeechEndpointEvent) -> None:
+        del event
+
     def _capture_and_transcribe_with_turn_controller(
         self,
         *,
@@ -415,7 +553,7 @@ class TwinrRealtimeHardwareLoop(
         listening_window: AdaptiveListeningWindow,
         speech_start_chunks: int | None,
         ignore_initial_ms: int,
-    ) -> tuple[SpeechCaptureResult, str, int, int]:
+    ) -> tuple[SpeechCaptureResult, str, int, int, str | None]:
         partial_cache = [""]
         streamed_pcm = bytearray()
         controller = self._build_streaming_turn_controller()
@@ -423,6 +561,12 @@ class TwinrRealtimeHardwareLoop(
         capture_result: SpeechCaptureResult | None = None
         capture_ms = 0
         streaming_send_error: list[Exception] = []
+
+        def current_turn_label() -> str | None:
+            if controller is None:
+                return None
+            decision = controller.last_decision()
+            return decision.label if decision is not None else None
 
         def send_chunk(chunk: bytes) -> None:
             streamed_pcm.extend(chunk)
@@ -444,13 +588,18 @@ class TwinrRealtimeHardwareLoop(
                 controller.on_interim(cleaned)
             self.emit(f"stt_partial={cleaned}")
 
+        def on_endpoint(event: StreamingSpeechEndpointEvent) -> None:
+            if controller is not None:
+                controller.on_endpoint(event)
+            self._on_streaming_stt_endpoint(event)
+
         try:
             session = stt_provider.start_streaming_session(
                 sample_rate=self._recorder_sample_rate(),
                 channels=self.config.audio_channels,
                 language=self.config.deepgram_stt_language,
                 on_interim=on_interim,
-                on_endpoint=(controller.on_endpoint if controller is not None else None),
+                on_endpoint=on_endpoint,
             )
         except Exception:
             if controller is not None:
@@ -500,7 +649,7 @@ class TwinrRealtimeHardwareLoop(
                 self.emit(f"stt_streaming_speech_final={str(early_result.saw_speech_final).lower()}")
                 self.emit(f"stt_streaming_utterance_end={str(early_result.saw_utterance_end).lower()}")
                 self.emit("stt_streaming_early=true")
-                return capture_result, early_result.transcript.strip(), capture_ms, 0
+                return capture_result, early_result.transcript.strip(), capture_ms, 0, current_turn_label()
 
             stt_started = time.monotonic()
             try:
@@ -512,7 +661,7 @@ class TwinrRealtimeHardwareLoop(
                 )
                 if capture_result is not None:
                     self.emit(f"turn_controller_finalize_recovered={type(exc).__name__}")  # AUDIT-FIX(#2): Preserve the original capture and continue with realtime audio even when seed STT finalization fails.
-                    return capture_result, transcript_hint, capture_ms, -1
+                    return capture_result, transcript_hint, capture_ms, -1, current_turn_label()
                 raise
             stt_ms = int((time.monotonic() - stt_started) * 1000)
             if result.request_id:
@@ -526,7 +675,7 @@ class TwinrRealtimeHardwareLoop(
                     partial_text=partial_cache[0],
                     controller=controller,
                 )
-            return capture_result, transcript, capture_ms, stt_ms
+            return capture_result, transcript, capture_ms, stt_ms, current_turn_label()
         finally:
             try:
                 session.close()
@@ -621,9 +770,10 @@ class TwinrRealtimeHardwareLoop(
             with self._audio_lock:
                 transcript_seed = ""
                 stt_ms = -1
+                turn_label = None
                 if isinstance(self.turn_stt_provider, StreamingSpeechToTextProvider):
                     try:
-                        capture_result, transcript_seed, capture_ms, stt_ms = (
+                        capture_result, transcript_seed, capture_ms, stt_ms, turn_label = (
                             self._capture_and_transcribe_with_turn_controller(
                                 stt_provider=self.turn_stt_provider,
                                 listening_window=listening_window,
@@ -678,9 +828,13 @@ class TwinrRealtimeHardwareLoop(
         realtime_started = time.monotonic()
         self._current_turn_audio_pcm = audio_pcm
         self._current_turn_audio_sample_rate = self._recorder_sample_rate()
+        if turn_label:
+            self.emit(f"turn_controller_selected_label={turn_label}")
         try:
             return self._complete_realtime_turn(
                 transcript_seed=transcript_seed.strip() or "[voice input]",
+                turn_label=turn_label,
+                initial_source=initial_source,
                 listen_source=listen_source,
                 proactive_trigger=proactive_trigger,
                 turn_started=turn_started,
@@ -688,7 +842,7 @@ class TwinrRealtimeHardwareLoop(
                 stt_ms=stt_ms,
                 turn_runner=lambda on_audio_chunk, on_output_text_delta: self.realtime_session.run_audio_turn(
                     audio_pcm,
-                    conversation=self.runtime.provider_conversation_context(),
+                    conversation=self._conversation_context_for_turn_label(turn_label),
                     on_audio_chunk=on_audio_chunk,
                     on_output_text_delta=on_output_text_delta,
                 ),
@@ -713,6 +867,8 @@ class TwinrRealtimeHardwareLoop(
         realtime_started = time.monotonic()
         return self._complete_realtime_turn(
             transcript_seed=transcript,
+            turn_label=None,
+            initial_source=listen_source,
             listen_source=listen_source,
             proactive_trigger=proactive_trigger,
             turn_started=turn_started,
@@ -720,17 +876,126 @@ class TwinrRealtimeHardwareLoop(
             stt_ms=-1,
             turn_runner=lambda on_audio_chunk, on_output_text_delta: self.realtime_session.run_text_turn(
                 transcript,
-                conversation=self.runtime.provider_conversation_context(),
+                conversation=self._conversation_context_for_turn_label(None),
                 on_audio_chunk=on_audio_chunk,
                 on_output_text_delta=on_output_text_delta,
             ),
             realtime_started=realtime_started,
         )
 
+    def _run_interrupt_follow_up_turn(self) -> bool:
+        listening_window = self.runtime.listening_window(
+            initial_source="button",
+            follow_up=True,
+        )
+        return self._run_single_audio_turn(
+            initial_source="button",
+            follow_up=True,
+            listening_window=listening_window,
+            listen_source="interrupt",
+            proactive_trigger=None,
+            speech_start_chunks=self.config.audio_follow_up_speech_start_chunks,
+            ignore_initial_ms=0,
+            timeout_emit_key="interrupt_follow_up_timeout",
+            timeout_message="Interrupt follow-up listening window expired.",
+            play_initial_beep=False,
+        )
+
+    def _start_answer_interrupt_watcher(
+        self,
+        *,
+        interrupt_event: Event,
+        stop_event: Event,
+        transcript_holder: list[str],
+        answer_started: Callable[[], bool],
+        on_interrupt: Callable[[], None] | None = None,
+    ) -> Thread | None:
+        if not self.config.turn_controller_interrupt_enabled:
+            return None
+        stt_provider = self._interrupt_stt_provider()
+        if stt_provider is None:
+            return None
+        try:
+            sampler = self._ambient_sampler()
+        except Exception as exc:
+            self.emit(f"interrupt_sampler_failed={type(exc).__name__}")
+            return None
+
+        min_active_ratio = max(0.0, float(self.config.turn_controller_interrupt_min_active_ratio))
+        min_transcript_chars = max(1, int(self.config.turn_controller_interrupt_min_transcript_chars))
+        required_windows = max(1, int(self.config.turn_controller_interrupt_consecutive_windows))
+        window_ms = max(120, int(self.config.turn_controller_interrupt_window_ms))
+        poll_s = max(0.02, int(self.config.turn_controller_interrupt_poll_ms) / 1000.0)
+
+        def worker() -> None:
+            consecutive_confirmed = 0
+            saw_candidate = False
+            while not stop_event.is_set() and not interrupt_event.is_set():
+                if not answer_started():
+                    if stop_event.wait(0.02):
+                        return
+                    continue
+                try:
+                    window = sampler.sample_window(duration_ms=window_ms)
+                except Exception as exc:
+                    self.emit(f"interrupt_sampler_failed={type(exc).__name__}")
+                    return
+                sample = window.sample
+                speech_like = sample.active_chunk_count > 0 and sample.active_ratio >= min_active_ratio
+                if not speech_like:
+                    if saw_candidate:
+                        self.emit("false_interrupt_recovered=true")
+                    consecutive_confirmed = 0
+                    saw_candidate = False
+                    if stop_event.wait(poll_s):
+                        return
+                    continue
+                saw_candidate = True
+                transcript = ""
+                try:
+                    wav_bytes = pcm16_to_wav_bytes(
+                        window.pcm_bytes,
+                        sample_rate=window.sample_rate,
+                        channels=window.channels,
+                    )
+                    transcript = stt_provider.transcribe(
+                        wav_bytes,
+                        filename="interrupt.wav",
+                        content_type="audio/wav",
+                        language=self.config.deepgram_stt_language,
+                    ).strip()
+                except Exception as exc:
+                    self.emit(f"interrupt_transcribe_failed={type(exc).__name__}")
+                if len(_normalize_turn_text(transcript).replace(" ", "")) < min_transcript_chars:
+                    if stop_event.wait(poll_s):
+                        return
+                    continue
+                consecutive_confirmed += 1
+                self.emit(f"interrupt_candidate_transcript={transcript}")
+                self.emit(f"interrupt_candidate_windows={consecutive_confirmed}")
+                if consecutive_confirmed >= required_windows:
+                    transcript_holder[0] = transcript
+                    interrupt_event.set()
+                    if callable(on_interrupt):
+                        try:
+                            on_interrupt()
+                        except Exception:
+                            pass
+                    self.emit("user_interrupt_detected=true")
+                    return
+                if stop_event.wait(poll_s):
+                    return
+
+        thread = Thread(target=worker, daemon=True, name="twinr-answer-interrupt")
+        thread.start()
+        return thread
+
     def _complete_realtime_turn(
         self,
         *,
         transcript_seed: str,
+        turn_label: str | None,
+        initial_source: str,
         listen_source: str,
         proactive_trigger: str | None,
         turn_started: float,
@@ -749,12 +1014,16 @@ class TwinrRealtimeHardwareLoop(
         first_audio_at: list[float | None] = [None]
         first_audio_ms_override: int | None = None
         answer_started = False
+        interrupt_event = Event()
+        interrupt_stop_event = Event()
+        interrupt_transcript_holder = [""]
+        interrupt_thread: Thread | None = None
         playback_started = False
         turn = None
         turn_error: Exception | None = None
 
         def begin_answering() -> None:
-            nonlocal answer_started, stop_answering_feedback
+            nonlocal answer_started, stop_answering_feedback, interrupt_thread
             if answer_started:
                 return
             stop_processing_feedback()
@@ -762,6 +1031,14 @@ class TwinrRealtimeHardwareLoop(
             self._emit_status(force=True)
             stop_answering_feedback = self._start_working_feedback_loop("answering")
             answer_started = True
+            if interrupt_thread is None:
+                interrupt_thread = self._start_answer_interrupt_watcher(
+                    interrupt_event=interrupt_event,
+                    stop_event=interrupt_stop_event,
+                    transcript_holder=interrupt_transcript_holder,
+                    answer_started=lambda: answer_started,
+                    on_interrupt=lambda: audio_chunks.put(None),
+                )
 
         def playback_generator():
             while True:
@@ -776,6 +1053,7 @@ class TwinrRealtimeHardwareLoop(
                     playback_generator(),
                     sample_rate=self.config.openai_realtime_input_sample_rate,
                     channels=self.config.audio_channels,
+                    should_stop=interrupt_event.is_set,
                 )
             except Exception as exc:
                 playback_error.append(exc)
@@ -792,6 +1070,8 @@ class TwinrRealtimeHardwareLoop(
 
         def on_audio_chunk(chunk: bytes) -> None:
             begin_answering()
+            if interrupt_event.is_set():
+                return
             if first_audio_at[0] is None:
                 stop_answering_feedback()
                 first_audio_at[0] = time.monotonic()
@@ -799,6 +1079,8 @@ class TwinrRealtimeHardwareLoop(
             audio_chunks.put(chunk)
 
         def on_output_text_delta(_delta: str) -> None:
+            if interrupt_event.is_set():
+                return
             begin_answering()
 
         try:
@@ -808,8 +1090,13 @@ class TwinrRealtimeHardwareLoop(
             turn_error = exc
         finally:
             stop_processing_feedback()
+            interrupt_stop_event.set()
             if playback_started:
                 audio_chunks.put(None)
+        if interrupt_thread is not None:
+            interrupt_thread.join(timeout=1.0)
+            if interrupt_thread.is_alive():
+                self.emit("interrupt_watcher_join_timeout=true")
         if worker is not None:
             playback_join_timeout_s = max(
                 0.1,
@@ -840,6 +1127,7 @@ class TwinrRealtimeHardwareLoop(
                 fallback_tts_ms, fallback_first_audio_ms = self._play_streaming_tts_with_feedback(
                     response_text,
                     turn_started=turn_started,
+                    should_stop=interrupt_event.is_set,
                 )
                 self.emit(f"timing_tts_fallback_ms={fallback_tts_ms}")
                 if fallback_first_audio_ms is not None:
@@ -873,8 +1161,27 @@ class TwinrRealtimeHardwareLoop(
         finally:
             self.runtime.finish_speaking()  # AUDIT-FIX(#6): Always leave the runtime in a non-speaking state even if post-processing or usage accounting fails.
             self._emit_status(force=True)
+        force_close = turn.end_conversation or self._follow_up_vetoed_by_closure(
+            user_transcript=final_transcript,
+            assistant_response=answer,
+            request_source=initial_source,
+            proactive_trigger=proactive_trigger,
+        )
         if turn.end_conversation:
             self.emit("conversation_ended=true")
+        elif force_close:
+            self.emit("conversation_follow_up_vetoed=closure")
+        if interrupt_event.is_set():
+            self.emit("assistant_interrupted=true")
+            if interrupt_transcript_holder[0].strip():
+                self.emit(f"interrupt_transcript={interrupt_transcript_holder[0].strip()}")
+            self._record_event(
+                "user_interrupt_detected",
+                "Twinr stopped the current spoken answer after detecting a user interruption.",
+                transcript_preview=interrupt_transcript_holder[0].strip() or None,
+                request_source=listen_source,
+                turn_label=turn_label,
+            )
         self.emit(f"timing_capture_ms={capture_ms}")
         if stt_ms >= 0:
             self.emit(f"timing_stt_ms={stt_ms}")
@@ -885,7 +1192,9 @@ class TwinrRealtimeHardwareLoop(
         elif first_audio_at[0] is not None:
             self.emit(f"timing_first_audio_ms={int((first_audio_at[0] - turn_started) * 1000)}")
         self.emit(f"timing_total_ms={int((time.monotonic() - turn_started) * 1000)}")
-        return not turn.end_conversation
+        if interrupt_event.is_set() and not force_close:
+            return self._run_interrupt_follow_up_turn()
+        return not force_close
 
     def _acknowledge_wakeword(self) -> None:
         prompt = self.runtime.begin_wakeword_prompt("Ja?")

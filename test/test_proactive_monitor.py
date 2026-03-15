@@ -740,6 +740,63 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(skip_events[-1]["data"]["trigger"], "attention_window")
         self.assertEqual(skip_events[-1]["data"]["reason"], "vision_review_rejected")
 
+    def test_coordinator_skips_attention_window_when_buffered_review_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=1.0,
+                proactive_motion_window_s=20.0,
+                proactive_attention_window_s=1.0,
+                proactive_attention_window_score_threshold=0.86,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(0.0)
+            emitted: list[str] = []
+            handled: list[str] = []
+            reviewer = FakeVisionReviewer(None)
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine.from_config(config),
+                trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            looking_toward_device=True,
+                            body_pose=SocialBodyPose.UPRIGHT,
+                        ),
+                        SocialVisionObservation(
+                            person_visible=True,
+                            looking_toward_device=True,
+                            body_pose=SocialBodyPose.UPRIGHT,
+                        ),
+                    ]
+                ),
+                pir_monitor=FakePirMonitor(events=[True], level=True),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                vision_reviewer=reviewer,
+                emit=emitted.append,
+                clock=clock,
+            )
+
+            coordinator.tick()
+            clock.now = 2.5
+            result = coordinator.tick()
+
+            events = runtime.ops_events.tail(limit=20)
+
+        self.assertIsNone(result.decision)
+        self.assertEqual(handled, [])
+        self.assertEqual(len(reviewer.calls), 1)
+        self.assertIn("social_trigger_skipped=vision_review_unavailable", emitted)
+        unavailable_events = [entry for entry in events if entry.get("event") == "proactive_vision_review_unavailable"]
+        self.assertEqual(unavailable_events[-1]["data"]["trigger"], "attention_window")
+        skip_events = [entry for entry in events if entry.get("event") == "social_trigger_skipped"]
+        self.assertEqual(skip_events[-1]["data"]["trigger"], "attention_window")
+        self.assertEqual(skip_events[-1]["data"]["reason"], "vision_review_unavailable")
+
     def test_coordinator_reviews_absence_path_trigger_before_prompting(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(

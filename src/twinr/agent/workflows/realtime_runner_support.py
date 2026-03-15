@@ -10,6 +10,7 @@ from threading import Event, RLock, Thread, current_thread
 from typing import Callable
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.conversation_closure import ToolCallingConversationClosureEvaluator
 from twinr.agent.base_agent.turn_controller import ToolCallingTurnDecisionEvaluator
 from twinr.agent.workflows.working_feedback import WorkingFeedbackKind, start_working_feedback_loop
 from twinr.providers.openai import OpenAIImageInput
@@ -196,6 +197,15 @@ class TwinrRealtimeSupportMixin:
             provider=turn_tool_agent_provider,
         )
 
+    def _build_conversation_closure_evaluator(self, config: TwinrConfig) -> ToolCallingConversationClosureEvaluator | None:
+        turn_tool_agent_provider = getattr(self, "turn_tool_agent_provider", None)
+        if turn_tool_agent_provider is None or not config.conversation_closure_guard_enabled:
+            return None
+        return ToolCallingConversationClosureEvaluator(
+            config=config,
+            provider=turn_tool_agent_provider,
+        )
+
     def _handle_error(self, exc: Exception) -> None:
         safe_error = self._safe_error_text(exc)  # AUDIT-FIX(#4): Never emit unsanitized exception text.
         try:
@@ -227,6 +237,7 @@ class TwinrRealtimeSupportMixin:
         with config_lock:
             previous_config = getattr(self, "config", None)
             previous_evaluator = getattr(self, "turn_decision_evaluator", None)
+            previous_closure_evaluator = getattr(self, "conversation_closure_evaluator", None)
             try:
                 updated_config = TwinrConfig.from_env(env_path)
                 self.runtime.apply_live_config(updated_config)
@@ -236,6 +247,8 @@ class TwinrRealtimeSupportMixin:
                 self._apply_config_to_targets(updated_config)
                 if hasattr(self, "turn_decision_evaluator"):
                     self.turn_decision_evaluator = self._build_turn_decision_evaluator(updated_config)
+                if hasattr(self, "conversation_closure_evaluator"):
+                    self.conversation_closure_evaluator = self._build_conversation_closure_evaluator(updated_config)
             except Exception as exc:
                 if previous_config is not None:
                     try:
@@ -246,6 +259,8 @@ class TwinrRealtimeSupportMixin:
                         self._apply_config_to_targets(previous_config)
                         if hasattr(self, "turn_decision_evaluator"):
                             self.turn_decision_evaluator = previous_evaluator
+                        if hasattr(self, "conversation_closure_evaluator"):
+                            self.conversation_closure_evaluator = previous_closure_evaluator
                     except Exception as rollback_exc:
                         _default_emit(f"config_reload_rollback_error={self._safe_error_text(rollback_exc)}")
                 self._try_emit(f"config_reload_error={self._safe_error_text(exc)}")
@@ -451,7 +466,13 @@ class TwinrRealtimeSupportMixin:
 
         return stop
 
-    def _play_streaming_tts_with_feedback(self, text: str, *, turn_started: float) -> tuple[int, int | None]:
+    def _play_streaming_tts_with_feedback(
+        self,
+        text: str,
+        *,
+        turn_started: float,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> tuple[int, int | None]:
         config = self.config  # AUDIT-FIX(#3): Keep timing and queue limits consistent for this TTS turn.
         tts_started = time.monotonic()
         first_audio_at: list[float | None] = [None]
@@ -517,6 +538,8 @@ class TwinrRealtimeSupportMixin:
         first_chunk_deadline = tts_started + first_chunk_timeout_seconds
         try:
             while first_chunk is None:
+                if should_stop is not None and should_stop():
+                    return int((time.monotonic() - tts_started) * 1000), None
                 timeout_remaining = first_chunk_deadline - time.monotonic()
                 if timeout_remaining <= 0:
                     raise TimeoutError("TTS stream timed out before first audio chunk")
@@ -541,6 +564,8 @@ class TwinrRealtimeSupportMixin:
                     first_audio_at[0] = time.monotonic()
                 yield first_chunk
                 while True:
+                    if should_stop is not None and should_stop():
+                        return
                     try:
                         item = chunk_queue.get(timeout=chunk_timeout_seconds)
                     except Empty:
@@ -552,7 +577,7 @@ class TwinrRealtimeSupportMixin:
                     yield item
 
             with self._get_lock("_audio_lock"):
-                self.player.play_wav_chunks(playback_chunks())
+                self.player.play_wav_chunks(playback_chunks(), should_stop=should_stop)
         finally:
             producer_stop.set()  # AUDIT-FIX(#6): Let the worker thread exit if the consumer aborts early.
             stop_answering_feedback()

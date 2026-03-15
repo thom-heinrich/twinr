@@ -14,6 +14,19 @@ SUPERVISOR_FAST_ACK_PHRASES = (
     "Einen Augenblick bitte.",
 )
 
+FIRST_WORD_AGENT_INSTRUCTIONS = (
+    "You are Twinr's instant first-word lane. "
+    "Return one very short spoken line that can start immediately while the slower final lane continues in parallel. "
+    "Choose mode direct only for simple low-risk conversational turns that you can answer safely from the user's wording and the tiny recent context alone. "
+    "Choose mode filler for everything that may need lookup, verification, tools, memory, scheduling, printing, camera inspection, settings changes, or deeper reasoning. "
+    "A filler must sound warm, specific to the topic, and clearly provisional. "
+    "It may say that you are checking, thinking, or getting the detail now, but it must not imply the result is already known. "
+    "A direct answer must stay short and calm. "
+    "Never claim an unverified live fact, saved change, completed action, or exact lookup result. "
+    "Keep spoken_text to one short sentence whenever possible. "
+    "Do not mention internal workers, tools, prompts, or hidden context."
+)
+
 DEFAULT_TOOL_AGENT_INSTRUCTIONS = (
     "Keep user-facing replies clear, warm, natural, concise, practical, and easy for a senior user to understand. "
     "If the user explicitly asks for a printout, use the print_receipt tool. "
@@ -102,9 +115,10 @@ SUPERVISOR_DECISION_AGENT_INSTRUCTIONS = (
     "Optimize for the first helpful spoken words while preserving correct tool behavior. "
     "Choose direct only when no lookup, persistence, scheduling, printing, camera inspection, automation change, settings change, or slower specialist work is needed. "
     "Choose handoff for fresh web information, any persistent save or update, exact lookup, printing, camera inspection, reminders, timers, scheduling, automation changes, settings changes, or a slower specialist pass. "
-    "When you choose handoff, set spoken_ack to one short spoken acknowledgement in the configured user-facing language that can be said immediately. "
-    f"Prefer one exact phrase from this approved fast-ack list when it fits naturally: {', '.join(SUPERVISOR_FAST_ACK_PHRASES)}. "
-    "That acknowledgement must describe progress only, for example that Twinr is checking or handling it now, and must not imply the task is already finished. "
+    "When you choose handoff, set spoken_ack to a natural user-facing filler reply in the configured language that can be spoken immediately while the slower specialist work runs in parallel. "
+    "That filler may be one or two short sentences, should sound warm and specific to the user's request, should buy a little time without sounding canned, and must describe progress only. "
+    "For web search or other slower verification work, the filler should usually be two short sentences that acknowledge the topic and say Twinr is checking now. "
+    "It must not imply the task is already finished or verified. "
     "When you choose direct, put the full user-facing answer into spoken_reply and leave spoken_ack empty. "
     "Do not wait for the specialist result before that acknowledgement. "
     "Never claim that something was saved, updated, scheduled, printed, looked up, or verified unless the specialist result has already returned. "
@@ -191,6 +205,21 @@ def build_supervisor_decision_instructions(
             extra_instructions,
         )
         or SUPERVISOR_DECISION_AGENT_INSTRUCTIONS
+    )
+
+
+def build_first_word_instructions(
+    config: TwinrConfig,
+    *,
+    extra_instructions: str | None = None,
+) -> str:
+    return (
+        merge_instructions(
+            FIRST_WORD_AGENT_INSTRUCTIONS,
+            tool_agent_time_context(config),
+            extra_instructions,
+        )
+        or FIRST_WORD_AGENT_INSTRUCTIONS
     )
 
 
