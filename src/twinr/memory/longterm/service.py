@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 import json
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.memory.longterm.backfill import (
+    LongTermOpsBackfillRunResult,
+    LongTermOpsEventBackfiller,
+)
 from twinr.memory.context_store import ManagedContextEntry, PersistentMemoryEntry, PromptContextStore
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 from twinr.memory.query_normalization import LongTermQueryRewriter
@@ -34,6 +38,7 @@ from twinr.memory.longterm.proactive import LongTermProactivePolicy, LongTermPro
 from twinr.memory.longterm.reflect import LongTermMemoryReflector
 from twinr.memory.longterm.retriever import LongTermRetriever
 from twinr.memory.longterm.retention import LongTermRetentionPolicy
+from twinr.memory.longterm.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.longterm.sensor_memory import LongTermSensorMemoryCompiler
 from twinr.memory.longterm.store import LongTermStructuredStore
 from twinr.memory.longterm.subtext import LongTermSubtextBuilder, LongTermSubtextCompiler
@@ -66,6 +71,7 @@ class LongTermMemoryService:
     conflict_resolver: LongTermConflictResolver
     reflector: LongTermMemoryReflector
     sensor_memory: LongTermSensorMemoryCompiler
+    ops_backfiller: LongTermOpsEventBackfiller
     planner: LongTermProactivePlanner
     proactive_policy: LongTermProactivePolicy
     retention_policy: LongTermRetentionPolicy
@@ -92,13 +98,18 @@ class LongTermMemoryService:
         conflict_resolver = LongTermConflictResolver()
         reflector = LongTermMemoryReflector.from_config(config)
         sensor_memory = LongTermSensorMemoryCompiler.from_config(config)
+        ops_backfiller = LongTermOpsEventBackfiller()
         planner = LongTermProactivePlanner(timezone_name=config.local_timezone_name)
         proactive_state_store = LongTermProactiveStateStore.from_config(config)
         proactive_policy = LongTermProactivePolicy(
             config=config,
             state_store=proactive_state_store,
         )
-        retention_policy = LongTermRetentionPolicy(timezone_name=config.local_timezone_name)
+        retention_policy = LongTermRetentionPolicy(
+            timezone_name=config.local_timezone_name,
+            mode=config.long_term_memory_retention_mode,
+            archive_enabled=config.long_term_memory_archive_enabled,
+        )
         subtext_builder = LongTermSubtextBuilder(
             config=config,
             graph_store=graph,
@@ -118,6 +129,7 @@ class LongTermMemoryService:
         if config.long_term_memory_enabled and config.long_term_memory_background_store_turns:
             writer = AsyncLongTermMemoryWriter(
                 write_callback=lambda item: cls._persist_longterm_turn(
+                    config=config,
                     store=store,
                     graph_store=graph,
                     object_store=object_store,
@@ -159,6 +171,7 @@ class LongTermMemoryService:
             conflict_resolver=conflict_resolver,
             reflector=reflector,
             sensor_memory=sensor_memory,
+            ops_backfiller=ops_backfiller,
             planner=planner,
             proactive_policy=proactive_policy,
             retention_policy=retention_policy,
@@ -167,45 +180,51 @@ class LongTermMemoryService:
         )
 
     def build_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
-        query = self.query_rewriter.profile(query_text)
-        return self.retriever.build_context(
-            query=query,
-            original_query_text=query_text,
-        )
+        try:
+            query = self.query_rewriter.profile(query_text)
+            return self.retriever.build_context(
+                query=query,
+                original_query_text=query_text,
+            )
+        except LongTermRemoteUnavailableError:
+            return LongTermMemoryContext()
 
     def build_tool_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
-        query = self.query_rewriter.profile(query_text)
-        context = self.retriever.build_context(
-            query=query,
-            original_query_text=query_text,
-        )
-        conflict_queue = self.select_conflict_queue(query_text=query.retrieval_text)
-        conflicting_memory_ids = {
-            option.memory_id
-            for item in conflict_queue
-            for option in item.options
-        }
-        durable_objects = self.object_store.select_relevant_objects(
-            query_text=query.retrieval_text,
-            limit=max(1, self.config.long_term_memory_recall_limit),
-        )
-        filtered_durable_objects = tuple(
-            item
-            for item in durable_objects
-            if not kind_matches(item.kind, "fact", item.attributes, attr_key="fact_type", attr_value="contact_method")
-            and item.memory_id not in conflicting_memory_ids
-        )
-        return LongTermMemoryContext(
-            subtext_context=context.subtext_context,
-            midterm_context=context.midterm_context,
-            durable_context=self.retriever._render_durable_context(filtered_durable_objects),
-            episodic_context=context.episodic_context,
-            graph_context=self.graph_store.build_prompt_context(
-                query.retrieval_text,
-                include_contact_methods=False,
-            ),
-            conflict_context=None,
-        )
+        try:
+            query = self.query_rewriter.profile(query_text)
+            context = self.retriever.build_context(
+                query=query,
+                original_query_text=query_text,
+            )
+            conflict_queue = self.select_conflict_queue(query_text=query.retrieval_text)
+            conflicting_memory_ids = {
+                option.memory_id
+                for item in conflict_queue
+                for option in item.options
+            }
+            durable_objects = self.object_store.select_relevant_objects(
+                query_text=query.retrieval_text,
+                limit=max(1, self.config.long_term_memory_recall_limit),
+            )
+            filtered_durable_objects = tuple(
+                item
+                for item in durable_objects
+                if not kind_matches(item.kind, "fact", item.attributes, attr_key="fact_type", attr_value="contact_method")
+                and item.memory_id not in conflicting_memory_ids
+            )
+            return LongTermMemoryContext(
+                subtext_context=context.subtext_context,
+                midterm_context=context.midterm_context,
+                durable_context=self.retriever._render_durable_context(filtered_durable_objects),
+                episodic_context=context.episodic_context,
+                graph_context=self.graph_store.build_prompt_context(
+                    query.retrieval_text,
+                    include_contact_methods=False,
+                ),
+                conflict_context=None,
+            )
+        except LongTermRemoteUnavailableError:
+            return LongTermMemoryContext()
 
     def enqueue_conversation_turn(
         self,
@@ -288,7 +307,10 @@ class LongTermMemoryService:
         )
 
     def run_reflection(self) -> LongTermReflectionResultV1:
-        result = self.reflector.reflect(objects=self.object_store.load_objects())
+        try:
+            result = self.reflector.reflect(objects=self.object_store.load_objects())
+        except LongTermRemoteUnavailableError:
+            return LongTermReflectionResultV1(reflected_objects=(), created_summaries=(), midterm_packets=())
         self.object_store.apply_reflection(result)
         self.midterm_store.apply_reflection(result)
         sensor_memory_result = self.run_sensor_memory()
@@ -301,20 +323,104 @@ class LongTermMemoryService:
         return result
 
     def run_sensor_memory(self, *, now: datetime | None = None) -> LongTermReflectionResultV1:
-        result = self.sensor_memory.compile(objects=self.object_store.load_objects(), now=now)
+        try:
+            result = self.sensor_memory.compile(objects=self.object_store.load_objects(), now=now)
+        except LongTermRemoteUnavailableError:
+            return LongTermReflectionResultV1(reflected_objects=(), created_summaries=(), midterm_packets=())
         if result.created_summaries or result.reflected_objects:
             self.object_store.apply_reflection(result)
         return result
+
+    def backfill_ops_multimodal_history(
+        self,
+        *,
+        entries: Iterable[Mapping[str, object]] | None = None,
+        now: datetime | None = None,
+    ) -> LongTermOpsBackfillRunResult:
+        if entries is None:
+            from twinr.ops.events import TwinrOpsEventStore
+
+        raw_entries = (
+            tuple(entries)
+            if entries is not None
+            else self.ops_backfiller.load_entries(TwinrOpsEventStore.from_config(self.config).path)
+        )
+        build = self.ops_backfiller.build_evidence(raw_entries)
+        objects_by_id = {item.memory_id: item for item in self.object_store.load_objects()}
+        conflicts_by_slot = {item.slot_key: item for item in self.object_store.load_conflicts()}
+        seen_turn_ids = {
+            event_id
+            for item in objects_by_id.values()
+            for event_id in item.source.event_ids
+        }
+        applied_evidence = 0
+        skipped_existing = 0
+        for evidence in build.evidence:
+            extraction = self.multimodal_extractor.extract_evidence(evidence)
+            if extraction.turn_id in seen_turn_ids:
+                skipped_existing += 1
+                continue
+            result = self.consolidator.consolidate(
+                extraction=extraction,
+                existing_objects=tuple(objects_by_id.values()),
+            )
+            for item in (*result.episodic_objects, *result.durable_objects, *result.deferred_objects):
+                objects_by_id[item.memory_id] = self.object_store._merge_object(
+                    existing=objects_by_id.get(item.memory_id),
+                    incoming=item,
+                    increment_support=True,
+                )
+            for conflict in result.conflicts:
+                conflicts_by_slot[conflict.slot_key] = conflict
+            seen_turn_ids.add(extraction.turn_id)
+            applied_evidence += 1
+
+        reflected_objects = 0
+        created_summaries = 0
+        reflection_error: str | None = None
+        if applied_evidence:
+            self.object_store.write_snapshot(
+                objects=tuple(objects_by_id.values()),
+                conflicts=tuple(conflicts_by_slot.values()),
+            )
+            try:
+                reflection = self.reflector.reflect(objects=self.object_store.load_objects())
+            except Exception as exc:
+                reflection_error = f"{type(exc).__name__}: {exc}"
+            else:
+                self.object_store.apply_reflection(reflection)
+                self.midterm_store.apply_reflection(reflection)
+                reflected_objects += len(reflection.reflected_objects)
+                created_summaries += len(reflection.created_summaries)
+        sensor_result = self.run_sensor_memory(now=now)
+        reflected_objects += len(sensor_result.reflected_objects)
+        created_summaries += len(sensor_result.created_summaries)
+        self.object_store.apply_retention(self.retention_policy.apply(objects=self.object_store.load_objects()))
+        return LongTermOpsBackfillRunResult(
+            scanned_events=build.scanned_events,
+            generated_evidence=build.generated_evidence,
+            applied_evidence=applied_evidence,
+            skipped_existing=skipped_existing,
+            sensor_observations=build.sensor_observations,
+            button_interactions=build.button_interactions,
+            print_completions=build.print_completions,
+            reflected_objects=reflected_objects,
+            created_summaries=created_summaries,
+            reflection_error=reflection_error,
+        )
 
     def plan_proactive_candidates(
         self,
         *,
         live_facts: Mapping[str, object] | None = None,
     ) -> LongTermProactivePlanV1:
-        return self.planner.plan(
-            objects=self.object_store.load_objects(),
-            live_facts=live_facts,
-        )
+        try:
+            return self.planner.plan(
+                objects=self.object_store.load_objects(),
+                live_facts=live_facts,
+            )
+        except LongTermRemoteUnavailableError:
+            return LongTermProactivePlanV1(candidates=())
 
     def reserve_proactive_candidate(
         self,
@@ -369,9 +475,17 @@ class LongTermMemoryService:
         )
 
     def run_retention(self) -> LongTermRetentionResultV1:
-        result = self.retention_policy.apply(objects=self.object_store.load_objects())
-        self.object_store.apply_retention(result)
-        return result
+        try:
+            result = self.retention_policy.apply(objects=self.object_store.load_objects())
+            self.object_store.apply_retention(result)
+            return result
+        except LongTermRemoteUnavailableError:
+            return LongTermRetentionResultV1(
+                kept_objects=(),
+                expired_objects=(),
+                pruned_memory_ids=(),
+                archived_objects=(),
+            )
 
     def select_conflict_queue(
         self,
@@ -379,11 +493,14 @@ class LongTermMemoryService:
         *,
         limit: int | None = None,
     ) -> tuple[LongTermConflictQueueItemV1, ...]:
-        query = self.query_rewriter.profile(query_text)
-        return self.retriever.select_conflict_queue(
-            query=query,
-            limit=limit,
-        )
+        try:
+            query = self.query_rewriter.profile(query_text)
+            return self.retriever.select_conflict_queue(
+                query=query,
+                limit=limit,
+            )
+        except LongTermRemoteUnavailableError:
+            return ()
 
     def resolve_conflict(
         self,
@@ -508,6 +625,7 @@ class LongTermMemoryService:
     @staticmethod
     def _persist_longterm_turn(
         *,
+        config: TwinrConfig,
         store: PromptContextStore,
         graph_store: TwinrPersonalGraphStore,
         object_store: LongTermStructuredStore,
@@ -519,22 +637,52 @@ class LongTermMemoryService:
         retention_policy: LongTermRetentionPolicy,
         item: LongTermConversationTurn,
     ) -> PersistentMemoryEntry:
-        extraction = extractor.extract_conversation_turn(
-            transcript=item.transcript,
-            response=item.response,
-            occurred_at=item.created_at,
-        )
-        result = consolidator.consolidate(
-            extraction=extraction,
-            existing_objects=object_store.load_objects(),
-        )
-        object_store.apply_consolidation(result)
-        graph_store.apply_candidate_edges(result.graph_edges)
-        reflection = reflector.reflect(objects=object_store.load_objects())
-        object_store.apply_reflection(reflection)
-        midterm_store.apply_reflection(reflection)
-        object_store.apply_reflection(sensor_memory.compile(objects=object_store.load_objects(), now=item.created_at))
-        object_store.apply_retention(retention_policy.apply(objects=object_store.load_objects()))
+        try:
+            existing_objects = tuple(object_store.load_objects())
+            existing_conflicts = tuple(object_store.load_conflicts())
+            existing_archived = tuple(object_store.load_archived_objects())
+            extraction = extractor.extract_conversation_turn(
+                transcript=item.transcript,
+                response=item.response,
+                occurred_at=item.created_at,
+            )
+            result = consolidator.consolidate(
+                extraction=extraction,
+                existing_objects=existing_objects,
+            )
+            current_objects, current_conflicts = LongTermMemoryService._merge_consolidation_state(
+                object_store=object_store,
+                existing_objects=existing_objects,
+                existing_conflicts=existing_conflicts,
+                result=result,
+            )
+            graph_store.apply_candidate_edges(result.graph_edges)
+            reflection = reflector.reflect(objects=current_objects)
+            current_objects = LongTermMemoryService._merge_reflection_objects(
+                object_store=object_store,
+                current_objects=current_objects,
+                reflection=reflection,
+            )
+            midterm_store.apply_reflection(reflection)
+            sensor_reflection = sensor_memory.compile(objects=current_objects, now=item.created_at)
+            current_objects = LongTermMemoryService._merge_reflection_objects(
+                object_store=object_store,
+                current_objects=current_objects,
+                reflection=sensor_reflection,
+            )
+            retention = retention_policy.apply(objects=current_objects)
+            archived = {item.memory_id: item for item in existing_archived}
+            for archived_item in retention.archived_objects:
+                archived[archived_item.memory_id] = archived_item
+            object_store.write_snapshot(
+                objects=retention.kept_objects,
+                conflicts=current_conflicts,
+                archived_objects=tuple(sorted(archived.values(), key=lambda row: row.memory_id)),
+            )
+            if config.long_term_memory_mode == "remote_primary":
+                return None
+        except LongTermRemoteUnavailableError:
+            pass
         return LongTermMemoryService._persist_episodic_turn(store=store, item=item)
 
     @staticmethod
@@ -549,24 +697,67 @@ class LongTermMemoryService:
         retention_policy: LongTermRetentionPolicy,
         item: LongTermMultimodalEvidence,
     ) -> None:
-        extraction = multimodal_extractor.extract_evidence(item)
-        result = consolidator.consolidate(
-            extraction=extraction,
-            existing_objects=object_store.load_objects(),
-        )
-        object_store.apply_consolidation(result)
-        reflection = reflector.reflect(objects=object_store.load_objects())
-        object_store.apply_reflection(reflection)
-        midterm_store.apply_reflection(reflection)
-        object_store.apply_reflection(sensor_memory.compile(objects=object_store.load_objects(), now=item.created_at))
-        object_store.apply_retention(retention_policy.apply(objects=object_store.load_objects()))
+        try:
+            extraction = multimodal_extractor.extract_evidence(item)
+            result = consolidator.consolidate(
+                extraction=extraction,
+                existing_objects=object_store.load_objects(),
+            )
+            object_store.apply_consolidation(result)
+            reflection = reflector.reflect(objects=object_store.load_objects())
+            object_store.apply_reflection(reflection)
+            midterm_store.apply_reflection(reflection)
+            object_store.apply_reflection(sensor_memory.compile(objects=object_store.load_objects(), now=item.created_at))
+            object_store.apply_retention(retention_policy.apply(objects=object_store.load_objects()))
+        except LongTermRemoteUnavailableError:
+            return None
 
     @staticmethod
     def _persist_episodic_turn(*, store: PromptContextStore, item: LongTermConversationTurn) -> PersistentMemoryEntry:
         quoted_transcript = json.dumps(item.transcript, ensure_ascii=False)
         quoted_response = json.dumps(item.response, ensure_ascii=False)
-        return store.memory_store.remember(
+        local_memory_store = type(store.memory_store)(store.memory_store.path)
+        return local_memory_store.remember(
             kind="episodic_turn",
             summary=f"Conversation about {quoted_transcript}",
             details=f"User said: {quoted_transcript} Twinr answered: {quoted_response}",
         )
+
+    @staticmethod
+    def _merge_consolidation_state(
+        *,
+        object_store: LongTermStructuredStore,
+        existing_objects: tuple,
+        existing_conflicts: tuple,
+        result: LongTermConsolidationResultV1,
+    ) -> tuple[tuple, tuple]:
+        merged_objects = {item.memory_id: item for item in existing_objects}
+        for item in (*result.episodic_objects, *result.durable_objects, *result.deferred_objects):
+            merged_objects[item.memory_id] = object_store._merge_object(
+                existing=merged_objects.get(item.memory_id),
+                incoming=item,
+                increment_support=True,
+            )
+        merged_conflicts = {item.slot_key: item for item in existing_conflicts}
+        for conflict in result.conflicts:
+            merged_conflicts[conflict.slot_key] = conflict
+        return (
+            tuple(sorted(merged_objects.values(), key=lambda row: row.memory_id)),
+            tuple(sorted(merged_conflicts.values(), key=lambda row: (row.slot_key, row.candidate_memory_id))),
+        )
+
+    @staticmethod
+    def _merge_reflection_objects(
+        *,
+        object_store: LongTermStructuredStore,
+        current_objects: tuple,
+        reflection: LongTermReflectionResultV1,
+    ) -> tuple:
+        merged = {item.memory_id: item for item in current_objects}
+        for item in (*reflection.reflected_objects, *reflection.created_summaries):
+            merged[item.memory_id] = object_store._merge_object(
+                existing=merged.get(item.memory_id),
+                incoming=item,
+                increment_support=False,
+            )
+        return tuple(sorted(merged.values(), key=lambda row: row.memory_id))

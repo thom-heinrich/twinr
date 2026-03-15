@@ -12,19 +12,180 @@ from pathlib import Path
 from typing import Callable
 import select
 import subprocess
+import tempfile
 import time
 import wave
 
 from twinr.agent.base_agent.config import TwinrConfig
 
 _SAMPLE_WIDTH_BYTES = 2
+# AUDIT-FIX(#3): Bound blocking device I/O so broken ALSA devices cannot wedge the process forever.
+_SELECT_TIMEOUT_S = 0.25
+_AMBIENT_CAPTURE_EXTRA_TIMEOUT_S = 2.0
+_STREAM_IO_STALL_TIMEOUT_S = 5.0
+_PLAYBACK_FINALIZE_TIMEOUT_S = 10.0
+_PLAYBACK_FILE_TIMEOUT_S = 120.0
+_PROCESS_STOP_TIMEOUT_S = 1.0
+
+
+def _normalize_audio_device(device: str | None) -> str:
+    # AUDIT-FIX(#7): Normalize blank/None device names to a safe default instead of passing invalid values to ALSA.
+    normalized = str(device or "default").strip()
+    return normalized or "default"
+
+
+def _ensure_int(name: str, value: object, *, minimum: int) -> int:
+    # AUDIT-FIX(#7): Fail fast with clear config errors for invalid numeric parameters.
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer >= {minimum}") from exc
+    if normalized < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return normalized
+
+
+def _ensure_float(name: str, value: object, *, minimum: float) -> float:
+    # AUDIT-FIX(#7): Fail fast with clear config errors for invalid timeout parameters.
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a float >= {minimum}") from exc
+    if normalized < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return normalized
+
+
+def _bytes_per_frame(channels: int) -> int:
+    return _SAMPLE_WIDTH_BYTES * _ensure_int("channels", channels, minimum=1)
+
+
+def _chunk_byte_count(*, sample_rate: int, channels: int, chunk_ms: int) -> int:
+    normalized_channels = _ensure_int("channels", channels, minimum=1)
+    frame_bytes = _bytes_per_frame(normalized_channels)
+    normalized_sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
+    normalized_chunk_ms = _ensure_int("chunk_ms", chunk_ms, minimum=1)
+    return max(
+        frame_bytes,
+        int(
+            (
+                normalized_sample_rate
+                * normalized_channels
+                * _SAMPLE_WIDTH_BYTES
+                * normalized_chunk_ms
+            )
+            / 1000
+        ),
+    )
+
+
+def _trim_incomplete_bytes(payload: bytes, *, alignment: int) -> bytes:
+    if alignment <= 1 or not payload:
+        return payload
+    usable_length = len(payload) - (len(payload) % alignment)
+    if usable_length <= 0:
+        return b""
+    return payload[:usable_length]
+
+
+def _compute_read_stall_timeout(chunk_ms: int) -> float:
+    normalized_chunk_ms = _ensure_int("chunk_ms", chunk_ms, minimum=1)
+    return max(2.0, (normalized_chunk_ms / 1000.0) * 4.0)
+
+
+def _spawn_audio_process(
+    command: list[str],
+    *,
+    stdin: int | None = None,
+    stdout: int | None = None,
+    stderr: int | None = None,
+    purpose: str,
+) -> subprocess.Popen[bytes]:
+    # AUDIT-FIX(#5): Convert raw OS-level spawn failures into actionable audio-specific runtime errors.
+    try:
+        return subprocess.Popen(
+            command,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            close_fds=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{purpose} failed because '{command[0]}' is not installed") from exc
+    except OSError as exc:
+        raise RuntimeError(f"{purpose} failed to start: {exc}") from exc
+
+
+def _close_pipe(pipe: object | None) -> None:
+    try:
+        if pipe is not None and hasattr(pipe, "close"):
+            pipe.close()  # type: ignore[call-arg]
+    except OSError:
+        return
+
+
+def _read_process_stderr(process: subprocess.Popen[bytes]) -> bytes:
+    if process.stderr is None:
+        return b""
+    try:
+        return process.stderr.read().strip()
+    except OSError:
+        return b""
+
+
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    # AUDIT-FIX(#6): Make shutdown idempotent and non-masking so cleanup never hides the real failure.
+    try:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=_PROCESS_STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=_PROCESS_STOP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    pass
+    finally:
+        _close_pipe(process.stdin)
+        _close_pipe(process.stdout)
+        _close_pipe(process.stderr)
+
+
+def _wait_for_readable(stream: object, *, timeout_s: float, purpose: str) -> bool:
+    try:
+        readable, _write_ready, _error_ready = select.select([stream], [], [], timeout_s)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"{purpose} failed while waiting for input data") from exc
+    return bool(readable)
+
+
+def _wait_for_writable(fd: int, *, timeout_s: float, purpose: str) -> bool:
+    try:
+        _read_ready, write_ready, _error_ready = select.select([], [fd], [], timeout_s)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"{purpose} failed while waiting for output device") from exc
+    return bool(write_ready)
+
+
+def _process_failure_message(process: subprocess.Popen[bytes], *, default_action: str) -> str:
+    stderr = _read_process_stderr(process)
+    if stderr:
+        return stderr.decode("utf-8", errors="ignore")
+    if process.returncode == 0:
+        return f"{default_action} ended unexpectedly"
+    return f"exit code {process.returncode}"
 
 
 def _pcm16_rms(samples: bytes) -> int:
     if not samples:
         return 0
+    # AUDIT-FIX(#9): Defensively trim partial samples so malformed buffers never crash RMS calculation.
+    aligned_samples = _trim_incomplete_bytes(samples, alignment=_SAMPLE_WIDTH_BYTES)
+    if not aligned_samples:
+        return 0
     pcm_samples = array("h")
-    pcm_samples.frombytes(samples)
+    pcm_samples.frombytes(aligned_samples)
     if sys.byteorder != "little":
         pcm_samples.byteswap()
     mean_square = sum(sample * sample for sample in pcm_samples) / len(pcm_samples)
@@ -112,12 +273,19 @@ def pcm16_to_wav_bytes(
     sample_rate: int,
     channels: int,
 ) -> bytes:
+    normalized_sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
+    normalized_channels = _ensure_int("channels", channels, minimum=1)
+    # AUDIT-FIX(#9): Drop incomplete trailing frames so emitted WAV data stays frame-aligned.
+    aligned_pcm_bytes = _trim_incomplete_bytes(
+        pcm_bytes,
+        alignment=_SAMPLE_WIDTH_BYTES * normalized_channels,
+    )
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav_file:
-        wav_file.setnchannels(channels)
+        wav_file.setnchannels(normalized_channels)
         wav_file.setsampwidth(_SAMPLE_WIDTH_BYTES)
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(pcm_bytes)
+        wav_file.setframerate(normalized_sample_rate)
+        wav_file.writeframes(aligned_pcm_bytes)
     return buffer.getvalue()
 
 
@@ -145,34 +313,35 @@ class SilenceDetectedRecorder:
         dynamic_pause_long_pause_grace_penalty_ms: int = 220,
         pause_resume_chunks: int = 2,
     ) -> None:
-        self.device = device
-        self.sample_rate = sample_rate
-        self.channels = channels
-        self.chunk_ms = chunk_ms
-        self.preroll_ms = preroll_ms
-        self.speech_threshold = speech_threshold
-        self.speech_start_chunks = max(1, speech_start_chunks)
-        self.start_timeout_s = start_timeout_s
-        self.max_record_seconds = max_record_seconds
-        self.dynamic_pause_enabled = dynamic_pause_enabled
-        self.dynamic_pause_short_utterance_max_ms = max(0, dynamic_pause_short_utterance_max_ms)
-        self.dynamic_pause_long_utterance_min_ms = max(0, dynamic_pause_long_utterance_min_ms)
-        self.dynamic_pause_short_pause_bonus_ms = max(0, dynamic_pause_short_pause_bonus_ms)
+        # AUDIT-FIX(#7): Validate recorder config at construction time so bad .env values fail early and clearly.
+        self.device = _normalize_audio_device(device)
+        self.sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
+        self.channels = _ensure_int("channels", channels, minimum=1)
+        self.chunk_ms = _ensure_int("chunk_ms", chunk_ms, minimum=1)
+        self.preroll_ms = _ensure_int("preroll_ms", preroll_ms, minimum=0)
+        self.speech_threshold = _ensure_int("speech_threshold", speech_threshold, minimum=0)
+        self.speech_start_chunks = _ensure_int("speech_start_chunks", speech_start_chunks, minimum=1)
+        self.start_timeout_s = _ensure_float("start_timeout_s", start_timeout_s, minimum=0.0)
+        self.max_record_seconds = _ensure_float("max_record_seconds", max_record_seconds, minimum=0.1)
+        self.dynamic_pause_enabled = bool(dynamic_pause_enabled)
+        self.dynamic_pause_short_utterance_max_ms = max(0, int(dynamic_pause_short_utterance_max_ms))
+        self.dynamic_pause_long_utterance_min_ms = max(0, int(dynamic_pause_long_utterance_min_ms))
+        self.dynamic_pause_short_pause_bonus_ms = max(0, int(dynamic_pause_short_pause_bonus_ms))
         self.dynamic_pause_short_pause_grace_bonus_ms = max(
             0,
-            dynamic_pause_short_pause_grace_bonus_ms,
+            int(dynamic_pause_short_pause_grace_bonus_ms),
         )
-        self.dynamic_pause_medium_pause_penalty_ms = max(0, dynamic_pause_medium_pause_penalty_ms)
+        self.dynamic_pause_medium_pause_penalty_ms = max(0, int(dynamic_pause_medium_pause_penalty_ms))
         self.dynamic_pause_medium_pause_grace_penalty_ms = max(
             0,
-            dynamic_pause_medium_pause_grace_penalty_ms,
+            int(dynamic_pause_medium_pause_grace_penalty_ms),
         )
-        self.dynamic_pause_long_pause_penalty_ms = max(0, dynamic_pause_long_pause_penalty_ms)
+        self.dynamic_pause_long_pause_penalty_ms = max(0, int(dynamic_pause_long_pause_penalty_ms))
         self.dynamic_pause_long_pause_grace_penalty_ms = max(
             0,
-            dynamic_pause_long_pause_grace_penalty_ms,
+            int(dynamic_pause_long_pause_grace_penalty_ms),
         )
-        self.pause_resume_chunks = max(1, pause_resume_chunks)
+        self.pause_resume_chunks = _ensure_int("pause_resume_chunks", pause_resume_chunks, minimum=1)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "SilenceDetectedRecorder":
@@ -216,6 +385,24 @@ class SilenceDetectedRecorder:
         on_chunk: Callable[[bytes], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> SpeechCaptureResult:
+        normalized_pause_ms = max(0, int(pause_ms))
+        normalized_ignore_initial_ms = max(0, int(ignore_initial_ms))
+        normalized_pause_grace_ms = max(0, int(pause_grace_ms))
+        effective_start_timeout_s = (
+            self.start_timeout_s
+            if start_timeout_s is None
+            else _ensure_float("start_timeout_s", start_timeout_s, minimum=0.0)
+        )
+        effective_max_record_seconds = (
+            self.max_record_seconds
+            if max_record_seconds is None
+            else _ensure_float("max_record_seconds", max_record_seconds, minimum=0.1)
+        )
+        effective_speech_start_chunks = (
+            self.speech_start_chunks
+            if speech_start_chunks is None
+            else _ensure_int("speech_start_chunks", speech_start_chunks, minimum=1)
+        )
         command = [
             "arecord",
             "-D",
@@ -230,13 +417,16 @@ class SilenceDetectedRecorder:
             "-r",
             str(self.sample_rate),
         ]
-        process = subprocess.Popen(
+        process = _spawn_audio_process(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            purpose="Audio capture",
         )
         captured = bytearray()
-        preroll: deque[bytes] = deque(maxlen=max(1, self.preroll_ms // max(1, self.chunk_ms)))
+        # AUDIT-FIX(#8): Use ceil for preroll so we never under-buffer and clip the user's first syllable.
+        preroll_chunk_count = max(1, math.ceil(self.preroll_ms / self.chunk_ms))
+        preroll: deque[bytes] = deque(maxlen=preroll_chunk_count)
         heard_speech = False
         consecutive_speech_chunks = 0
         consecutive_resume_chunks = 0
@@ -244,48 +434,58 @@ class SilenceDetectedRecorder:
         last_non_silent_at: float | None = None
         pause_candidate_deadline_at: float | None = None
         started_at = time.monotonic()
-        effective_start_timeout_s = self.start_timeout_s if start_timeout_s is None else start_timeout_s
-        effective_max_record_seconds = (
-            self.max_record_seconds if max_record_seconds is None else max_record_seconds
-        )
-        effective_speech_start_chunks = (
-            self.speech_start_chunks if speech_start_chunks is None else max(1, speech_start_chunks)
-        )
-        effective_pause_grace_ms = max(0, int(pause_grace_ms))
+        last_chunk_at = started_at
         speech_started_after_ms = 0
         resumed_after_pause_count = 0
-        chunk_bytes = max(
-            _SAMPLE_WIDTH_BYTES * self.channels,
-            int((self.sample_rate * self.channels * _SAMPLE_WIDTH_BYTES * self.chunk_ms) / 1000),
+        chunk_bytes = _chunk_byte_count(
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            chunk_ms=self.chunk_ms,
         )
+        read_stall_timeout_s = _compute_read_stall_timeout(self.chunk_ms)
 
         try:
             while True:
                 now = time.monotonic()
+                # AUDIT-FIX(#11): Honor cancellation before and after speech start so TALK-button releases can abort promptly.
+                stop_requested = should_stop is not None and should_stop()
+                if stop_requested:
+                    if heard_speech:
+                        break
+                    raise RuntimeError("Audio capture stopped before speech started")
                 if not heard_speech and now - started_at >= effective_start_timeout_s:
                     raise RuntimeError("No speech detected before timeout")
-                if heard_speech and now - started_at >= effective_max_record_seconds:
-                    break
-                if heard_speech and should_stop is not None and should_stop():
+                # AUDIT-FIX(#2): Enforce max recording length from speech start, not from when the microphone opened.
+                if (
+                    heard_speech
+                    and speech_started_at is not None
+                    and now - speech_started_at >= effective_max_record_seconds
+                ):
                     break
                 if process.poll() is not None:
                     self._raise_process_error(process)
                 if process.stdout is None:
                     raise RuntimeError("arecord did not expose stdout")
 
-                ready, _write_ready, _error_ready = select.select([process.stdout], [], [], 0.25)
-                if not ready:
+                is_ready = _wait_for_readable(
+                    process.stdout,
+                    timeout_s=_SELECT_TIMEOUT_S,
+                    purpose="Audio capture",
+                )
+                if not is_ready:
+                    if time.monotonic() - last_chunk_at >= read_stall_timeout_s:
+                        raise RuntimeError("Audio capture stalled while waiting for microphone data")
                     if heard_speech and pause_candidate_deadline_at is not None and time.monotonic() >= pause_candidate_deadline_at:
-                        break
-                    if heard_speech and should_stop is not None and should_stop():
                         break
                     continue
 
                 chunk = os.read(process.stdout.fileno(), chunk_bytes)
                 if not chunk:
+                    if time.monotonic() - last_chunk_at >= read_stall_timeout_s:
+                        raise RuntimeError("Audio capture stalled while reading microphone data")
                     continue
-                if len(chunk) % _SAMPLE_WIDTH_BYTES:
-                    chunk = chunk[: -(len(chunk) % _SAMPLE_WIDTH_BYTES)]
+                last_chunk_at = time.monotonic()
+                chunk = _trim_incomplete_bytes(chunk, alignment=_SAMPLE_WIDTH_BYTES)
                 if not chunk:
                     continue
 
@@ -293,7 +493,7 @@ class SilenceDetectedRecorder:
                 now = time.monotonic()
 
                 if not heard_speech:
-                    if ignore_initial_ms > 0 and (now - started_at) * 1000 < ignore_initial_ms:
+                    if normalized_ignore_initial_ms > 0 and (now - started_at) * 1000 < normalized_ignore_initial_ms:
                         preroll.clear()
                         consecutive_speech_chunks = 0
                         continue
@@ -319,11 +519,9 @@ class SilenceDetectedRecorder:
                     on_chunk(chunk)
                 if rms >= self.speech_threshold:
                     if pause_candidate_deadline_at is not None:
-                        confirmed_resume, consecutive_resume_chunks = (
-                            resolve_pause_resume_confirmation(
-                                consecutive_resume_chunks=consecutive_resume_chunks,
-                                required_resume_chunks=self.pause_resume_chunks,
-                            )
+                        confirmed_resume, consecutive_resume_chunks = resolve_pause_resume_confirmation(
+                            consecutive_resume_chunks=consecutive_resume_chunks,
+                            required_resume_chunks=self.pause_resume_chunks,
                         )
                         if not confirmed_resume:
                             continue
@@ -332,6 +530,7 @@ class SilenceDetectedRecorder:
                     pause_candidate_deadline_at = None
                     last_non_silent_at = now
                     continue
+
                 consecutive_resume_chunks = 0
                 if last_non_silent_at is None:
                     continue
@@ -339,8 +538,8 @@ class SilenceDetectedRecorder:
                 if speech_started_at is not None:
                     speech_window_ms = int((last_non_silent_at - speech_started_at) * 1000)
                 effective_pause_ms, effective_pause_grace_ms = resolve_dynamic_pause_thresholds(
-                    base_pause_ms=pause_ms,
-                    base_pause_grace_ms=pause_grace_ms,
+                    base_pause_ms=normalized_pause_ms,
+                    base_pause_grace_ms=normalized_pause_grace_ms,
                     speech_window_ms=speech_window_ms,
                     enabled=self.dynamic_pause_enabled,
                     short_utterance_max_ms=self.dynamic_pause_short_utterance_max_ms,
@@ -406,20 +605,11 @@ class SilenceDetectedRecorder:
         )
 
     def _raise_process_error(self, process: subprocess.Popen[bytes]) -> None:
-        stderr = b""
-        if process.stderr is not None:
-            stderr = process.stderr.read().strip()
-        message = stderr.decode("utf-8", errors="ignore") if stderr else f"exit code {process.returncode}"
+        message = _process_failure_message(process, default_action="Audio capture")
         raise RuntimeError(f"Audio capture failed: {message}")
 
     def _stop_process(self, process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=1.0)
+        _stop_process(process)
 
 
 class AmbientAudioSampler:
@@ -433,16 +623,18 @@ class AmbientAudioSampler:
         speech_threshold: int = 700,
         default_duration_ms: int = 1000,
     ) -> None:
-        self.device = device
-        self.sample_rate = sample_rate
-        self.channels = channels
-        self.chunk_ms = max(20, chunk_ms)
-        self.speech_threshold = speech_threshold
-        self.default_duration_ms = max(self.chunk_ms, default_duration_ms)
+        # AUDIT-FIX(#7): Validate ambient sampler config up front to avoid opaque ALSA and math failures at runtime.
+        self.device = _normalize_audio_device(device)
+        self.sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
+        self.channels = _ensure_int("channels", channels, minimum=1)
+        self.chunk_ms = max(20, _ensure_int("chunk_ms", chunk_ms, minimum=1))
+        self.speech_threshold = _ensure_int("speech_threshold", speech_threshold, minimum=0)
+        self.default_duration_ms = max(self.chunk_ms, _ensure_int("default_duration_ms", default_duration_ms, minimum=1))
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "AmbientAudioSampler":
-        device = (config.proactive_audio_input_device or config.audio_input_device).strip()
+        # AUDIT-FIX(#7): Normalize config-provided device names before accessing ALSA.
+        device = _normalize_audio_device(config.proactive_audio_input_device or config.audio_input_device)
         return cls(
             device=device,
             sample_rate=config.audio_sample_rate,
@@ -456,10 +648,18 @@ class AmbientAudioSampler:
         return self.sample_window(duration_ms=duration_ms).sample
 
     def sample_window(self, *, duration_ms: int | None = None) -> AmbientAudioCaptureWindow:
-        effective_duration_ms = max(self.chunk_ms, duration_ms or self.default_duration_ms)
-        chunk_bytes = max(
-            _SAMPLE_WIDTH_BYTES * self.channels,
-            int((self.sample_rate * self.channels * _SAMPLE_WIDTH_BYTES * self.chunk_ms) / 1000),
+        if duration_ms is None:
+            normalized_duration_ms = self.default_duration_ms
+        else:
+            requested_duration_ms = _ensure_int("duration_ms", duration_ms, minimum=0)
+            normalized_duration_ms = (
+                self.default_duration_ms if requested_duration_ms == 0 else requested_duration_ms
+            )
+        effective_duration_ms = max(self.chunk_ms, normalized_duration_ms)
+        chunk_bytes = _chunk_byte_count(
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            chunk_ms=self.chunk_ms,
         )
         target_chunk_count = max(1, math.ceil(effective_duration_ms / self.chunk_ms))
         command = [
@@ -476,28 +676,45 @@ class AmbientAudioSampler:
             "-r",
             str(self.sample_rate),
         ]
-        process = subprocess.Popen(
+        process = _spawn_audio_process(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            purpose="Ambient audio capture",
         )
         rms_values: list[int] = []
         pcm_fragments: list[bytes] = []
+        started_at = time.monotonic()
+        last_chunk_at = started_at
+        capture_deadline_at = started_at + (effective_duration_ms / 1000.0) + _AMBIENT_CAPTURE_EXTRA_TIMEOUT_S
+        read_stall_timeout_s = _compute_read_stall_timeout(self.chunk_ms)
 
         try:
             while len(rms_values) < target_chunk_count:
+                now = time.monotonic()
+                # AUDIT-FIX(#3): Add absolute and stall timeouts so ambient sampling cannot hang forever on dead audio input.
+                if now >= capture_deadline_at:
+                    raise RuntimeError("Ambient audio capture timed out before collecting enough samples")
                 if process.poll() is not None:
                     self._raise_process_error(process)
                 if process.stdout is None:
                     raise RuntimeError("arecord did not expose stdout")
-                ready, _write_ready, _error_ready = select.select([process.stdout], [], [], 0.25)
-                if not ready:
+                is_ready = _wait_for_readable(
+                    process.stdout,
+                    timeout_s=_SELECT_TIMEOUT_S,
+                    purpose="Ambient audio capture",
+                )
+                if not is_ready:
+                    if time.monotonic() - last_chunk_at >= read_stall_timeout_s:
+                        raise RuntimeError("Ambient audio capture stalled while waiting for microphone data")
                     continue
                 chunk = os.read(process.stdout.fileno(), chunk_bytes)
                 if not chunk:
+                    if time.monotonic() - last_chunk_at >= read_stall_timeout_s:
+                        raise RuntimeError("Ambient audio capture stalled while reading microphone data")
                     continue
-                if len(chunk) % _SAMPLE_WIDTH_BYTES:
-                    chunk = chunk[: -(len(chunk) % _SAMPLE_WIDTH_BYTES)]
+                last_chunk_at = time.monotonic()
+                chunk = _trim_incomplete_bytes(chunk, alignment=_SAMPLE_WIDTH_BYTES)
                 if not chunk:
                     continue
                 rms_values.append(_pcm16_rms(chunk))
@@ -511,8 +728,10 @@ class AmbientAudioSampler:
         active_chunk_count = sum(1 for rms in rms_values if rms >= self.speech_threshold)
         average_rms = int(sum(rms_values) / len(rms_values))
         peak_rms = max(rms_values)
+        # AUDIT-FIX(#10): Report the actual sampled duration instead of the requested nominal duration.
+        actual_duration_ms = len(rms_values) * self.chunk_ms
         sample = AmbientAudioLevelSample(
-            duration_ms=effective_duration_ms,
+            duration_ms=actual_duration_ms,
             chunk_count=len(rms_values),
             active_chunk_count=active_chunk_count,
             average_rms=average_rms,
@@ -527,33 +746,27 @@ class AmbientAudioSampler:
         )
 
     def _raise_process_error(self, process: subprocess.Popen[bytes]) -> None:
-        stderr = b""
-        if process.stderr is not None:
-            stderr = process.stderr.read().strip()
-        message = stderr.decode("utf-8", errors="ignore") if stderr else f"exit code {process.returncode}"
+        message = _process_failure_message(process, default_action="Ambient audio capture")
         raise RuntimeError(f"Ambient audio capture failed: {message}")
 
     def _stop_process(self, process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=1.0)
+        _stop_process(process)
 
 
 class WaveAudioPlayer:
     def __init__(self, *, device: str = "default") -> None:
-        self.device = device
+        # AUDIT-FIX(#7): Normalize playback device names early so blank config values still resolve safely.
+        self.device = _normalize_audio_device(device)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "WaveAudioPlayer":
         return cls(device=config.audio_output_device)
 
     def play_wav_bytes(self, audio_bytes: bytes) -> None:
-        temp_path = Path("/tmp/twinr-playback.wav")
-        temp_path.write_bytes(audio_bytes)
+        # AUDIT-FIX(#1): Use a unique secure temp file instead of a fixed /tmp path to prevent symlink attacks and concurrent clobbering.
+        with tempfile.NamedTemporaryFile(prefix="twinr-playback-", suffix=".wav", delete=False) as temp_file:
+            temp_file.write(audio_bytes)
+            temp_path = Path(temp_file.name)
         try:
             self.play_file(temp_path)
         finally:
@@ -606,7 +819,7 @@ class WaveAudioPlayer:
 
     def play_wav_chunks(self, chunks: Iterable[bytes]) -> None:
         self._play_stream(
-            ["aplay", "-q", "-D", self.device, "-"],
+            ["aplay", "-q", "-D", self.device, "-t", "wav", "-"],
             chunks,
         )
 
@@ -617,6 +830,8 @@ class WaveAudioPlayer:
         sample_rate: int,
         channels: int = 1,
     ) -> None:
+        normalized_sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
+        normalized_channels = _ensure_int("channels", channels, minimum=1)
         self._play_stream(
             [
                 "aplay",
@@ -628,56 +843,92 @@ class WaveAudioPlayer:
                 "-f",
                 "S16_LE",
                 "-c",
-                str(channels),
+                str(normalized_channels),
                 "-r",
-                str(sample_rate),
+                str(normalized_sample_rate),
                 "-",
             ],
             chunks,
         )
 
     def _play_stream(self, command: list[str], chunks: Iterable[bytes]) -> None:
-        process = subprocess.Popen(
+        process = _spawn_audio_process(
             command,
             stdin=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            purpose="Audio playback",
         )
         try:
             if process.stdin is None:
                 raise RuntimeError("aplay did not expose stdin")
+            stdin_fd = process.stdin.fileno()
+            os.set_blocking(stdin_fd, False)
+            # AUDIT-FIX(#4): Write to aplay with backpressure-aware, timeout-bounded non-blocking I/O.
             for chunk in chunks:
-                if process.poll() is not None:
-                    self._raise_stream_error(process)
-                process.stdin.write(chunk)
-                process.stdin.flush()
-            process.stdin.close()
-            process.wait()
+                if not chunk:
+                    continue
+                view = memoryview(chunk)
+                while view:
+                    if process.poll() is not None:
+                        self._raise_stream_error(process)
+                    if not _wait_for_writable(
+                        stdin_fd,
+                        timeout_s=_STREAM_IO_STALL_TIMEOUT_S,
+                        purpose="Audio playback",
+                    ):
+                        raise RuntimeError("Audio playback timed out while waiting for output device")
+                    try:
+                        written = os.write(stdin_fd, view)
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        self._raise_stream_error(process)
+                    except OSError as exc:
+                        raise RuntimeError(f"Audio playback failed while streaming: {exc}") from exc
+                    if written <= 0:
+                        self._raise_stream_error(process)
+                    view = view[written:]
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                self._raise_stream_error(process)
+            except OSError as exc:
+                raise RuntimeError(f"Audio playback failed while closing stream: {exc}") from exc
+            process.wait(timeout=_PLAYBACK_FINALIZE_TIMEOUT_S)
             if process.returncode != 0:
                 self._raise_stream_error(process)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Audio playback timed out while waiting for aplay to finish") from exc
         finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=1.0)
+            self._stop_process(process)
 
     def play_file(self, path: str | Path) -> None:
-        result = subprocess.run(
-            ["aplay", "-q", "-D", self.device, str(path)],
-            capture_output=True,
-            check=False,
-        )
+        path_obj = Path(path)
+        if not path_obj.is_file():
+            raise RuntimeError(f"Audio playback file not found: {path_obj}")
+        try:
+            # AUDIT-FIX(#4): Bound file playback runtime so a broken output device cannot block the process forever.
+            result = subprocess.run(
+                ["aplay", "-q", "-D", self.device, str(path_obj)],
+                capture_output=True,
+                check=False,
+                timeout=_PLAYBACK_FILE_TIMEOUT_S,
+            )
+        except FileNotFoundError as exc:
+            # AUDIT-FIX(#5): Surface missing playback binaries as explicit runtime errors.
+            raise RuntimeError("Audio playback failed because 'aplay' is not installed") from exc
+        except OSError as exc:
+            # AUDIT-FIX(#5): Surface playback start failures with actionable context.
+            raise RuntimeError(f"Audio playback failed to start: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            # AUDIT-FIX(#4): Convert subprocess timeout into a clear playback error.
+            raise RuntimeError("Audio playback timed out") from exc
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="ignore").strip()
             raise RuntimeError(f"Audio playback failed: {stderr or result.returncode}")
 
     def _raise_stream_error(self, process: subprocess.Popen[bytes]) -> None:
-        stderr = b""
-        if process.stderr is not None:
-            stderr = process.stderr.read().strip()
-        message = stderr.decode("utf-8", errors="ignore") if stderr else f"exit code {process.returncode}"
+        message = _process_failure_message(process, default_action="Audio playback")
         raise RuntimeError(f"Audio playback failed: {message}")
 
     def _render_tone_pcm(
@@ -688,14 +939,36 @@ class WaveAudioPlayer:
         volume: float,
         sample_rate: int,
     ) -> bytes:
-        amplitude = max(0.0, min(volume, 1.0)) * 32767.0 * 0.6
-        frame_count = max(1, int(sample_rate * (duration_ms / 1000.0)))
+        # AUDIT-FIX(#7): Validate tone parameters so invalid caller input cannot cause divide-by-zero or nonsense playback.
+        normalized_frequency_hz = _ensure_int("frequency_hz", frequency_hz, minimum=0)
+        normalized_duration_ms = _ensure_int("duration_ms", duration_ms, minimum=0)
+        normalized_sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
+        amplitude = max(0.0, min(float(volume), 1.0)) * 32767.0 * 0.6
+        if normalized_duration_ms == 0 or amplitude == 0.0:
+            return b""
+        frame_count = int(normalized_sample_rate * (normalized_duration_ms / 1000.0))
+        if frame_count <= 0:
+            return b""
         pcm = bytearray()
         for frame_index in range(frame_count):
-            sample = int(amplitude * math.sin(2.0 * math.pi * frequency_hz * frame_index / sample_rate))
+            sample = int(
+                amplitude
+                * math.sin(
+                    2.0 * math.pi * normalized_frequency_hz * frame_index / normalized_sample_rate
+                )
+            )
             pcm.extend(sample.to_bytes(2, byteorder="little", signed=True))
         return bytes(pcm)
 
     def _render_silence_pcm(self, *, duration_ms: int, sample_rate: int) -> bytes:
-        frame_count = max(1, int(sample_rate * (duration_ms / 1000.0)))
+        normalized_duration_ms = _ensure_int("duration_ms", duration_ms, minimum=0)
+        normalized_sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
+        if normalized_duration_ms == 0:
+            return b""
+        frame_count = int(normalized_sample_rate * (normalized_duration_ms / 1000.0))
+        if frame_count <= 0:
+            return b""
         return b"\x00\x00" * frame_count
+
+    def _stop_process(self, process: subprocess.Popen[bytes]) -> None:
+        _stop_process(process)
