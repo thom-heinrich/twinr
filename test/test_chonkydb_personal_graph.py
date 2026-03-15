@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -11,6 +12,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.config import TwinrConfig
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
 from twinr.memory.longterm.models import LongTermGraphEdgeCandidateV1
+
+
+class _FakeRemoteState:
+    def __init__(self) -> None:
+        self.enabled = True
+        self.config = SimpleNamespace(long_term_memory_migration_enabled=False)
+        self.snapshots: dict[str, dict[str, object]] = {}
+
+    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+        del local_path
+        payload = self.snapshots.get(snapshot_kind)
+        return dict(payload) if isinstance(payload, dict) else None
+
+    def save_snapshot(self, *, snapshot_kind: str, payload):
+        self.snapshots[snapshot_kind] = dict(payload)
 
 
 def _memory_payload(context: str) -> dict[str, object]:
@@ -157,6 +173,22 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
         self.assertIn("place:eye_doctor", node_ids)
         self.assertIn("social_related_to_user", edge_types)
         self.assertIn("spatial_located_in", edge_types)
+
+    def test_remote_primary_graph_store_keeps_snapshot_off_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+            store.remember_plan(summary="go for a walk", when_text="today")
+            document = store.load_document()
+
+        self.assertFalse(store.path.exists())
+        self.assertTrue(document.edges)
+        self.assertIn("graph", remote_state.snapshots)
 
 
 if __name__ == "__main__":

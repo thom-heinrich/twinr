@@ -6,7 +6,6 @@ import json
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 from twinr.memory.context_store import PersistentMemoryEntry, PromptContextStore
-from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.conflicts import LongTermConflictResolver
 from twinr.memory.longterm.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.models import LongTermConflictQueueItemV1, LongTermMemoryContext
@@ -86,42 +85,43 @@ class LongTermRetriever:
         fallback_limit: int = 2,
         require_query_match: bool = False,
     ) -> list[PersistentMemoryEntry]:
-        entries = [
-            entry
-            for entry in self.prompt_context_store.memory_store.load_entries()
-            if entry.kind == "episodic_turn"
-        ]
-        if not entries:
-            return []
         limit = max(1, self.config.long_term_memory_recall_limit)
         query_profile = query if isinstance(query, LongTermQueryProfile) else LongTermQueryProfile.from_text(query)
-        clean_query = collapse_whitespace(query_profile.retrieval_text)
-        if clean_query:
-            selector = FullTextSelector(
-                tuple(
-                    FullTextDocument(
-                        doc_id=entry.entry_id,
-                        category="episodic",
-                        content=collapse_whitespace(" ".join(part for part in (entry.summary, entry.details or "") if part)),
-                    )
-                    for entry in entries
-                )
-            )
-            selected_ids = selector.search(
-                clean_query,
-                limit=limit,
-                category="episodic",
-                allow_fallback=not require_query_match and fallback_limit > 0,
-            )
-            by_id = {entry.entry_id: entry for entry in entries}
-            selected = [by_id[entry_id] for entry_id in selected_ids if entry_id in by_id]
-            if not selected and not require_query_match and fallback_limit > 0:
-                selected = list(entries[: min(limit, fallback_limit)])
-        else:
-            if require_query_match:
-                return []
-            selected = list(entries[:limit])
-        return selected
+        selected = self.object_store.select_relevant_episodic_objects(
+            query_text=collapse_whitespace(query_profile.retrieval_text),
+            limit=limit,
+            fallback_limit=fallback_limit,
+            require_query_match=require_query_match,
+        )
+        return [self._episodic_entry_from_object(item) for item in selected]
+
+    def _episodic_entry_from_object(self, item: object) -> PersistentMemoryEntry:
+        raw_summary = str(getattr(item, "summary", "") or "")
+        raw_details = str(getattr(item, "details", "") or "") or None
+        attributes = getattr(item, "attributes", None)
+        transcript = None
+        response = None
+        if isinstance(attributes, dict):
+            transcript = collapse_whitespace(str(attributes.get("raw_transcript", "") or "")) or None
+            response = collapse_whitespace(str(attributes.get("raw_response", "") or "")) or None
+        summary = raw_summary
+        details = raw_details
+        if transcript:
+            transcript_json = json.dumps(transcript, ensure_ascii=False)
+            summary = f"Conversation about {transcript_json}"
+            if response:
+                response_json = json.dumps(response, ensure_ascii=False)
+                details = f"User said: {transcript_json} Twinr answered: {response_json}"
+            else:
+                details = f"User said: {transcript_json}"
+        return PersistentMemoryEntry(
+            entry_id=str(getattr(item, "memory_id", "")),
+            kind="episodic_turn",
+            summary=summary,
+            details=details,
+            created_at=getattr(item, "created_at"),
+            updated_at=getattr(item, "updated_at"),
+        )
 
     def _render_episodic_context(self, entries: list[PersistentMemoryEntry]) -> str | None:
         if not entries:

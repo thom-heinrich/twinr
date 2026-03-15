@@ -40,6 +40,7 @@ class OpenAIResponseMixin:
             allow_web_search=allow_web_search,
             model=self.config.default_model,
             reasoning_effort=self.config.openai_reasoning_effort,
+            prompt_cache_scope="response",
         )
         response = self._client.responses.create(**request)
         return OpenAITextResponse(
@@ -88,6 +89,7 @@ class OpenAIResponseMixin:
             model=self.config.default_model,
             reasoning_effort=self.config.openai_reasoning_effort,
             extra_user_content=self._build_image_content(images),
+            prompt_cache_scope="vision_response",
         )
         response = self._client.responses.create(**request)
         return OpenAITextResponse(
@@ -115,6 +117,7 @@ class OpenAIResponseMixin:
             allow_web_search=allow_web_search,
             model=self.config.default_model,
             reasoning_effort=self.config.openai_reasoning_effort,
+            prompt_cache_scope="response_stream",
         )
         with self._client.responses.stream(**request) as stream:
             for event in stream:

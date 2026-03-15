@@ -165,7 +165,20 @@ class ChonkyDBClient:
 
     def store_record(self, request: ChonkyDBRecordRequest | Mapping[str, object]) -> JsonDict:
         body = request.to_payload() if isinstance(request, ChonkyDBRecordRequest) else dict(request)
-        return self._request_json("POST", "/v1/external/records", body=body)
+        operation = str(body.pop("operation", "store_payload") or "store_payload").strip() or "store_payload"
+        execution_mode = str(body.pop("execution_mode", "sync") or "sync").strip() or "sync"
+        client_request_id = body.pop("client_request_id", None)
+        timeout_seconds = body.pop("timeout_seconds", None)
+        bulk_body = {
+            "operation": operation,
+            "execution_mode": execution_mode,
+            "items": [dict(body)],
+        }
+        if client_request_id is not None:
+            bulk_body["client_request_id"] = client_request_id
+        if timeout_seconds is not None:
+            bulk_body["timeout_seconds"] = timeout_seconds
+        return self._request_json("POST", "/v1/external/records/bulk", body=bulk_body)
 
     def store_records_bulk(self, request: ChonkyDBBulkRecordRequest | Mapping[str, object]) -> JsonDict:
         body = request.to_payload() if isinstance(request, ChonkyDBBulkRecordRequest) else dict(request)

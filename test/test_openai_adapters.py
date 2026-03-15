@@ -8,7 +8,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
 from twinr.agent.base_agent.contracts import AgentToolResult
-from twinr.providers.openai import OpenAIProviderBundle, OpenAIToolCallingAgentProvider, OpenAITextResponse
+from twinr.providers.openai import (
+    OpenAIProviderBundle,
+    OpenAISupervisorDecisionProvider,
+    OpenAIToolCallingAgentProvider,
+    OpenAITextResponse,
+)
 
 
 class FakeAdapterBackend:
@@ -86,8 +91,16 @@ class FakeResponseStream:
 
 class FakeResponsesClient:
     def __init__(self) -> None:
+        self.create_requests: list[dict[str, object]] = []
+        self.create_results: list[object] = []
         self.stream_requests: list[dict[str, object]] = []
         self.stream_results: list[tuple[list[object], object]] = []
+
+    def create(self, **request):
+        self.create_requests.append(request)
+        if not self.create_results:
+            raise AssertionError("No fake create result configured")
+        return self.create_results.pop(0)
 
     def stream(self, **request):
         self.stream_requests.append(request)
@@ -105,6 +118,9 @@ class FakeToolBackend:
     def _resolve_base_instructions(self) -> str:
         return "Base instructions"
 
+    def _resolve_tool_loop_base_instructions(self) -> str:
+        return "Tool-loop base instructions"
+
     def _build_response_request(
         self,
         prompt: str,
@@ -116,8 +132,9 @@ class FakeToolBackend:
         reasoning_effort: str,
         max_output_tokens=None,
         extra_user_content=None,
+        prompt_cache_scope=None,
     ) -> dict[str, object]:
-        del max_output_tokens, extra_user_content
+        del extra_user_content
         request: dict[str, object] = {
             "model": model,
             "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
@@ -128,13 +145,21 @@ class FakeToolBackend:
             request["conversation"] = conversation
         if instructions is not None:
             request["instructions"] = instructions
+        if max_output_tokens is not None:
+            request["max_output_tokens"] = max_output_tokens
         if allow_web_search:
             request["tools"] = [{"type": "web_search"}]
             request["tool_choice"] = "auto"
+        if prompt_cache_scope:
+            request["prompt_cache_key"] = f"twinr:{prompt_cache_scope}:{model}:de"
         return request
 
     def _build_tools(self, use_web_search: bool):
         return [{"type": "web_search"}] if use_web_search else []
+
+    def _apply_prompt_cache(self, request: dict[str, object], *, scope: str | None, model: str) -> None:
+        if scope:
+            request["prompt_cache_key"] = f"twinr:{scope}:{model}:de"
 
     def _extract_output_text(self, response) -> str:
         return str(getattr(response, "output_text", "")).strip()
@@ -215,8 +240,10 @@ class OpenAIToolCallingAgentProviderTests(unittest.TestCase):
         self.assertEqual(response.tool_calls[0].arguments["focus_hint"], "arzttermin")
         self.assertEqual(text_deltas, ["Ich prüfe das."])
         self.assertEqual(request["model"], "gpt-5.2")
+        self.assertIn("Tool-loop base instructions", request["instructions"])
         self.assertTrue(request["store"])
         self.assertEqual(request["tool_choice"], "auto")
+        self.assertEqual(request["prompt_cache_key"], "twinr:tool_loop_start:gpt-5.2:de")
         self.assertEqual(
             [tool["type"] for tool in request["tools"]],
             ["web_search", "function"],
@@ -256,9 +283,156 @@ class OpenAIToolCallingAgentProviderTests(unittest.TestCase):
         request = backend._client.responses.stream_requests[0]
         self.assertEqual(response.text, "Ist erledigt.")
         self.assertEqual(request["previous_response_id"], "resp_start_1")
+        self.assertIn("Tool-loop base instructions", request["instructions"])
         self.assertTrue(request["store"])
+        self.assertEqual(request["prompt_cache_key"], "twinr:tool_loop_continue:gpt-5.2:de")
         self.assertEqual(
             request["input"],
             [{"type": "function_call_output", "call_id": "call_1", "output": '{"status":"printed"}'}],
         )
         self.assertEqual(request["tools"], [{"type": "function", "name": "print_receipt"}])
+
+    def test_provider_overrides_model_and_base_instructions_for_fast_model(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.stream_results.append(
+            (
+                [],
+                SimpleNamespace(
+                    id="resp_override_1",
+                    _request_id="req_override_1",
+                    model="gpt-4o-mini",
+                    output_text="Kurzantwort.",
+                    output=[],
+                    usage=None,
+                ),
+            )
+        )
+        provider = OpenAIToolCallingAgentProvider(
+            backend,
+            model_override="gpt-4o-mini",
+            reasoning_effort_override="low",
+            base_instructions_override="Supervisor role instructions",
+        )
+
+        response = provider.start_turn_streaming("Hallo")
+
+        request = backend._client.responses.stream_requests[0]
+        self.assertEqual(response.text, "Kurzantwort.")
+        self.assertEqual(request["model"], "gpt-4o-mini")
+        self.assertNotIn("reasoning", request)
+        self.assertIn("Supervisor role instructions", request["instructions"])
+
+    def test_provider_can_replace_default_tool_loop_base_instructions(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.stream_results.append(
+            (
+                [],
+                SimpleNamespace(
+                    id="resp_override_2",
+                    _request_id="req_override_2",
+                    model="gpt-4o-mini",
+                    output_text="Kurzantwort.",
+                    output=[],
+                    usage=None,
+                ),
+            )
+        )
+        provider = OpenAIToolCallingAgentProvider(
+            backend,
+            model_override="gpt-4o-mini",
+            reasoning_effort_override="low",
+            base_instructions_override="Supervisor-only base instructions",
+            replace_base_instructions=True,
+        )
+
+        provider.start_turn_streaming("Hallo", instructions="Runtime extra")
+
+        request = backend._client.responses.stream_requests[0]
+        self.assertIn("Supervisor-only base instructions", request["instructions"])
+        self.assertIn("Runtime extra", request["instructions"])
+        self.assertNotIn("Tool-loop base instructions", request["instructions"])
+
+    def test_provider_strips_top_level_combinators_from_function_parameters(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.stream_results.append(
+            (
+                [],
+                SimpleNamespace(
+                    id="resp_tools_1",
+                    _request_id="req_tools_1",
+                    model="gpt-5.2",
+                    output_text="Alles klar.",
+                    output=[],
+                    usage=None,
+                ),
+            )
+        )
+        provider = OpenAIToolCallingAgentProvider(backend)
+
+        provider.start_turn_streaming(
+            "Bitte druck das aus",
+            tool_schemas=[
+                {
+                    "type": "function",
+                    "name": "print_receipt",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "anyOf": [{"required": ["text"]}],
+                        "allOf": [{"properties": {"text": {"minLength": 1}}}],
+                    },
+                }
+            ],
+        )
+
+        request = backend._client.responses.stream_requests[0]
+        parameters = request["tools"][0]["parameters"]
+        self.assertNotIn("anyOf", parameters)
+        self.assertNotIn("allOf", parameters)
+
+
+class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config = TwinrConfig(openai_api_key="test-key", default_model="gpt-5.2")
+
+    def test_decide_uses_structured_json_schema_and_replaces_base_instructions(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.create_results.append(
+            SimpleNamespace(
+                id="resp_decide_1",
+                _request_id="req_decide_1",
+                model="gpt-4o-mini",
+                output_text=(
+                    '{"action":"handoff","spoken_ack":"Ich schaue kurz nach.","spoken_reply":null,'
+                    '"kind":"search","goal":"weather tomorrow","allow_web_search":true}'
+                ),
+                output=[],
+                usage=None,
+            )
+        )
+        provider = OpenAISupervisorDecisionProvider(
+            backend,
+            model_override="gpt-4o-mini",
+            reasoning_effort_override="low",
+            base_instructions_override="Supervisor decision base instructions",
+            replace_base_instructions=True,
+        )
+
+        decision = provider.decide(
+            "Wie wird das Wetter morgen?",
+            conversation=(("user", "Voriger Turn"),),
+            instructions="Runtime extra",
+        )
+
+        request = backend._client.responses.create_requests[0]
+        self.assertEqual(decision.action, "handoff")
+        self.assertEqual(decision.spoken_ack, "Ich schaue kurz nach.")
+        self.assertEqual(decision.kind, "search")
+        self.assertTrue(decision.allow_web_search)
+        self.assertEqual(request["model"], "gpt-4o-mini")
+        self.assertIn("Supervisor decision base instructions", request["instructions"])
+        self.assertIn("Runtime extra", request["instructions"])
+        self.assertNotIn("Tool-loop base instructions", request["instructions"])
+        self.assertEqual(request["prompt_cache_key"], "twinr:supervisor_decision:gpt-4o-mini:de")
+        self.assertEqual(request["max_output_tokens"], 80)
+        self.assertEqual(request["text"]["format"]["type"], "json_schema")

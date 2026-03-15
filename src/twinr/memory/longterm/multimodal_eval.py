@@ -500,6 +500,7 @@ def _build_multimodal_eval_cases() -> tuple[MultimodalEvalCase, ...]:
 
 def _persist_turn(service: LongTermMemoryService, item: LongTermConversationTurn) -> None:
     LongTermMemoryService._persist_longterm_turn(
+        config=service.config,
         store=service.prompt_context_store,
         graph_store=service.graph_store,
         object_store=service.object_store,

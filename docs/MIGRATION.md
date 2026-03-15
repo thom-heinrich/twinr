@@ -4,6 +4,8 @@
 
 Replace the current OpenAI Realtime voice path with a cheaper provider mix **without losing Twinr's existing tool capabilities**.
 
+For the latency-first production plan that prioritizes first spoken word, reliable tool calls, German quality, and Pi stability, see `docs/LATENCY_PLAN.md`.
+
 The migration target is:
 
 - local VAD

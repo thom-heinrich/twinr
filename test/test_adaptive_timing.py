@@ -69,8 +69,8 @@ class AdaptiveTimingStoreTests(unittest.TestCase):
                 resumed_after_pause_count=2,
             )
 
-        self.assertEqual(updated.speech_pause_ms, 1340)
-        self.assertEqual(updated.pause_grace_ms, 530)
+        self.assertEqual(updated.speech_pause_ms, 1260)
+        self.assertEqual(updated.pause_grace_ms, 490)
         self.assertEqual(updated.pause_resume_count, 2)
 
     def test_clean_ends_slowly_trim_pause_values(self) -> None:
@@ -103,8 +103,8 @@ class AdaptiveTimingStoreTests(unittest.TestCase):
                 resumed_after_pause_count=0,
             )
 
-        self.assertEqual(updated.speech_pause_ms, 1280)
-        self.assertEqual(updated.pause_grace_ms, 490)
+        self.assertEqual(updated.speech_pause_ms, 1200)
+        self.assertEqual(updated.pause_grace_ms, 450)
         self.assertEqual(updated.clean_pause_streak, 0)
 
     def test_defaults_stay_bounded_for_snappy_turn_end(self) -> None:

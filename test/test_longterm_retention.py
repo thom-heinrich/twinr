@@ -1,93 +1,89 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from twinr.config import TwinrConfig
 from twinr.memory.longterm.models import LongTermMemoryObjectV1, LongTermSourceRefV1
 from twinr.memory.longterm.retention import LongTermRetentionPolicy
-
-
-def _source() -> LongTermSourceRefV1:
-    return LongTermSourceRefV1(
-        source_type="conversation_turn",
-        event_ids=("turn:test",),
-        speaker="user",
-        modality="voice",
-    )
+from twinr.memory.longterm.store import LongTermStructuredStore
 
 
 class LongTermRetentionPolicyTests(unittest.TestCase):
-    def test_retention_expires_past_time_bound_event(self) -> None:
-        policy = LongTermRetentionPolicy()
-        item = LongTermMemoryObjectV1(
-            memory_id="event:appointment",
-            kind="event",
-            summary="Janina has eye laser treatment on 2026-03-14.",
-            source=_source(),
-            status="active",
-            confidence=0.9,
-            valid_from="2026-03-14",
-            valid_to="2026-03-14",
-            sensitivity="sensitive",
-            attributes={
-                "memory_domain": "appointment",
-                "event_domain": "appointment",
-            },
-        )
+    def _source(self) -> LongTermSourceRefV1:
+        return LongTermSourceRefV1(source_type="conversation_turn", event_ids=("turn:test",), speaker="user", modality="voice")
 
-        result = policy.apply(
-            objects=(item,),
-            now=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
-        )
-
-        self.assertEqual(len(result.expired_objects), 1)
-        self.assertEqual(result.expired_objects[0].status, "expired")
-
-    def test_retention_prunes_old_episode_and_old_observation(self) -> None:
-        policy = LongTermRetentionPolicy(ephemeral_episode_days=14, ephemeral_observation_days=2)
-        old_episode = LongTermMemoryObjectV1(
-            memory_id="episode:old",
+    def test_retention_archives_old_episodes_and_prunes_old_observations(self) -> None:
+        now = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
+        episode = LongTermMemoryObjectV1(
+            memory_id="episode:1",
             kind="episode",
-            summary="Conversation turn recorded for long-term memory.",
-            source=_source(),
+            summary="Episode summary",
+            source=self._source(),
+            updated_at=now - timedelta(days=10),
+            created_at=now - timedelta(days=10),
+        )
+        observation = LongTermMemoryObjectV1(
+            memory_id="observation:1",
+            kind="observation",
+            summary="It is warm today.",
+            source=self._source(),
+            attributes={"observation_type": "weather"},
+            updated_at=now - timedelta(days=4),
+            created_at=now - timedelta(days=4),
+        )
+        expiring = LongTermMemoryObjectV1(
+            memory_id="event:1",
+            kind="event",
+            summary="Appointment is today.",
+            source=self._source(),
+            valid_to="2026-03-14",
             status="active",
-            confidence=1.0,
-            created_at=datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc),
-            updated_at=datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc),
-        )
-        old_observation = LongTermMemoryObjectV1(
-            memory_id="observation:old",
-            kind="situational_observation",
-            summary="The user described the day as warm.",
-            source=_source(),
-            status="active",
-            confidence=0.7,
-            created_at=datetime(2026, 3, 10, 10, 0, tzinfo=timezone.utc),
-            updated_at=datetime(2026, 3, 10, 10, 0, tzinfo=timezone.utc),
-        )
-        durable = LongTermMemoryObjectV1(
-            memory_id="fact:janina_wife",
-            kind="relationship_fact",
-            summary="Janina is the user's wife.",
-            source=_source(),
-            status="active",
-            confidence=0.98,
+            updated_at=now - timedelta(days=1),
+            created_at=now - timedelta(days=1),
         )
 
-        result = policy.apply(
-            objects=(old_episode, old_observation, durable),
-            now=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
+        result = LongTermRetentionPolicy(timezone_name="UTC", archive_enabled=True).apply(
+            objects=(episode, observation, expiring),
+            now=now,
         )
 
-        self.assertIn("episode:old", result.pruned_memory_ids)
-        self.assertIn("observation:old", result.pruned_memory_ids)
-        kept_ids = {item.memory_id for item in result.kept_objects}
-        self.assertIn("fact:janina_wife", kept_ids)
+        self.assertEqual({item.memory_id for item in result.archived_objects}, {"episode:1"})
+        self.assertEqual(result.pruned_memory_ids, ("observation:1",))
+        self.assertEqual({item.memory_id for item in result.expired_objects}, {"event:1"})
 
+    def test_store_retention_writes_archive_snapshot(self) -> None:
+        now = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+            )
+            store = LongTermStructuredStore.from_config(config)
+            episode = LongTermMemoryObjectV1(
+                memory_id="episode:1",
+                kind="episode",
+                summary="Episode summary",
+                source=self._source(),
+                updated_at=now - timedelta(days=10),
+                created_at=now - timedelta(days=10),
+            )
+            store.write_snapshot(objects=(episode,))
 
-if __name__ == "__main__":
-    unittest.main()
+            result = LongTermRetentionPolicy(timezone_name="UTC", archive_enabled=True).apply(
+                objects=store.load_objects(),
+                now=now,
+            )
+            store.apply_retention(result)
+
+            active_ids = {item.memory_id for item in store.load_objects()}
+            archived_ids = {item.memory_id for item in store.load_archived_objects()}
+
+        self.assertEqual(active_ids, set())
+        self.assertEqual(archived_ids, {"episode:1"})

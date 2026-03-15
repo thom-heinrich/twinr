@@ -15,6 +15,8 @@ from twinr.agent.base_agent.contracts import (
     ProviderBundle,
     SearchResponse,
     SpeechToTextProvider,
+    SupervisorDecision,
+    SupervisorDecisionProvider,
     TextResponse,
     TextToSpeechProvider,
     ToolCallingAgentProvider,
@@ -250,6 +252,10 @@ class OpenAITextToSpeechProvider:
 @dataclass
 class OpenAIToolCallingAgentProvider:
     backend: OpenAIBackend
+    model_override: str | None = None
+    reasoning_effort_override: str | None = None
+    base_instructions_override: str | None = None
+    replace_base_instructions: bool = False
 
     @property
     def config(self) -> TwinrConfig:
@@ -258,6 +264,30 @@ class OpenAIToolCallingAgentProvider:
     @config.setter
     def config(self, value: TwinrConfig) -> None:
         self.backend.config = value
+
+    def _resolved_model(self) -> str:
+        override = (self.model_override or "").strip()
+        if override:
+            return override
+        return self.config.default_model
+
+    def _resolved_reasoning_effort(self) -> str:
+        override = (self.reasoning_effort_override or "").strip()
+        if override:
+            return override
+        return self.config.openai_reasoning_effort
+
+    def _merged_base_instructions(self, instructions: str | None) -> str | None:
+        if self.replace_base_instructions:
+            return merge_instructions(
+                self.base_instructions_override or self.backend._resolve_tool_loop_base_instructions(),
+                instructions,
+            )
+        return merge_instructions(
+            self.backend._resolve_tool_loop_base_instructions(),
+            self.base_instructions_override,
+            instructions,
+        )
 
     def start_turn_streaming(
         self,
@@ -269,13 +299,21 @@ class OpenAIToolCallingAgentProvider:
         allow_web_search: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
     ) -> ToolCallingTurnResponse:
+        model = self._resolved_model()
         request = self.backend._build_response_request(
             prompt,
             conversation=conversation,
-            instructions=merge_instructions(self.backend._resolve_base_instructions(), instructions),
+            instructions=self._merged_base_instructions(instructions),
             allow_web_search=allow_web_search,
-            model=self.config.default_model,
-            reasoning_effort=self.config.openai_reasoning_effort,
+            model=model,
+            reasoning_effort=self._resolved_reasoning_effort(),
+            prompt_cache_scope="tool_loop_start",
+        )
+        _apply_reasoning_effort_request(
+            self.backend,
+            request,
+            model=model,
+            reasoning_effort=self._resolved_reasoning_effort(),
         )
         request["store"] = True
         self._merge_tool_schemas(request, tool_schemas)
@@ -293,8 +331,9 @@ class OpenAIToolCallingAgentProvider:
     ) -> ToolCallingTurnResponse:
         if not continuation_token.strip():
             raise RuntimeError("continue_turn_streaming requires a continuation_token")
+        model = self._resolved_model()
         request: dict[str, Any] = {
-            "model": self.config.default_model,
+            "model": model,
             "previous_response_id": continuation_token,
             "input": [
                 {
@@ -304,11 +343,16 @@ class OpenAIToolCallingAgentProvider:
                 }
                 for result in tool_results
             ],
-            "reasoning": {"effort": self.config.openai_reasoning_effort},
             "store": True,
         }
+        _apply_reasoning_effort_request(
+            self.backend,
+            request,
+            model=model,
+            reasoning_effort=self._resolved_reasoning_effort(),
+        )
         merged_instructions = merge_instructions(
-            merge_instructions(self.backend._resolve_base_instructions(), instructions),
+            self._merged_base_instructions(instructions),
             user_response_language_instruction(self.config.openai_realtime_language),
         )
         if merged_instructions:
@@ -318,6 +362,11 @@ class OpenAIToolCallingAgentProvider:
         if web_search_tools:
             request["tools"] = list(web_search_tools)
         self._merge_tool_schemas(request, tool_schemas)
+        self.backend._apply_prompt_cache(
+            request,
+            scope="tool_loop_continue",
+            model=model,
+        )
         return self._run_streaming_request(request, on_text_delta=on_text_delta)
 
     def _merge_tool_schemas(
@@ -330,7 +379,7 @@ class OpenAIToolCallingAgentProvider:
                 request["tool_choice"] = "auto"
             return
         tools = list(request.get("tools") or [])
-        tools.extend(tool_schemas)
+        tools.extend(_normalize_openai_function_schema(schema) for schema in tool_schemas)
         request["tools"] = tools
         request["tool_choice"] = "auto"
 
@@ -340,18 +389,14 @@ class OpenAIToolCallingAgentProvider:
         *,
         on_text_delta: Callable[[str], None] | None = None,
     ) -> ToolCallingTurnResponse:
-        streamed_text = ""
-        with self.backend._client.responses.stream(**request) as stream:
-            for event in stream:
-                if getattr(event, "type", None) != "response.output_text.delta":
-                    continue
-                delta = str(getattr(event, "delta", ""))
-                if not delta:
-                    continue
-                streamed_text += delta
-                if on_text_delta is not None:
-                    on_text_delta(delta)
-            response = stream.get_final_response()
+        try:
+            streamed_text, response = self._consume_stream(request, on_text_delta=on_text_delta)
+        except Exception as exc:
+            if not _is_reasoning_unsupported_error(exc) or "reasoning" not in request:
+                raise
+            retry_request = dict(request)
+            retry_request.pop("reasoning", None)
+            streamed_text, response = self._consume_stream(retry_request, on_text_delta=on_text_delta)
 
         text = streamed_text.strip() or self.backend._extract_output_text(response)
         if text and not streamed_text.strip() and on_text_delta is not None:
@@ -367,6 +412,26 @@ class OpenAIToolCallingAgentProvider:
             used_web_search=self.backend._used_web_search(response),
             continuation_token=response_id,
         )
+
+    def _consume_stream(
+        self,
+        request: dict[str, Any],
+        *,
+        on_text_delta: Callable[[str], None] | None = None,
+    ) -> tuple[str, Any]:
+        streamed_text = ""
+        with self.backend._client.responses.stream(**request) as stream:
+            for event in stream:
+                if getattr(event, "type", None) != "response.output_text.delta":
+                    continue
+                delta = str(getattr(event, "delta", ""))
+                if not delta:
+                    continue
+                streamed_text += delta
+                if on_text_delta is not None:
+                    on_text_delta(delta)
+            response = stream.get_final_response()
+        return streamed_text, response
 
     def _extract_tool_calls(self, response: Any) -> tuple[AgentToolCall, ...]:
         output_items = getattr(response, "output", None) or []
@@ -394,6 +459,205 @@ class OpenAIToolCallingAgentProvider:
                 )
             )
         return tuple(function_calls)
+
+
+_SUPERVISOR_DECISION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["direct", "handoff", "end_conversation"],
+            "description": "direct for a short immediate answer, handoff for specialist work, end_conversation to stop for now.",
+        },
+        "spoken_ack": {
+            "type": ["string", "null"],
+            "description": "Short immediate acknowledgement only for handoff. Must stay null for direct replies.",
+        },
+        "spoken_reply": {
+            "type": ["string", "null"],
+            "description": "Full short user-facing answer for direct or end_conversation. Must stay null for handoff.",
+        },
+        "kind": {
+            "type": ["string", "null"],
+            "enum": ["general", "search", "memory", "automation", None],
+            "description": "Short handoff category. Null unless action is handoff.",
+        },
+        "goal": {
+            "type": ["string", "null"],
+            "description": "Short specialist goal. Null unless action is handoff.",
+        },
+        "allow_web_search": {
+            "type": ["boolean", "null"],
+            "description": "True only when the specialist may use live web search.",
+        },
+    },
+    "required": [
+        "action",
+        "spoken_ack",
+        "spoken_reply",
+        "kind",
+        "goal",
+        "allow_web_search",
+    ],
+    "additionalProperties": False,
+}
+
+
+@dataclass
+class OpenAISupervisorDecisionProvider:
+    backend: OpenAIBackend
+    model_override: str | None = None
+    reasoning_effort_override: str | None = None
+    base_instructions_override: str | None = None
+    replace_base_instructions: bool = False
+
+    @property
+    def config(self) -> TwinrConfig:
+        return self.backend.config
+
+    @config.setter
+    def config(self, value: TwinrConfig) -> None:
+        self.backend.config = value
+
+    def _resolved_model(self) -> str:
+        override = (self.model_override or "").strip()
+        if override:
+            return override
+        return self.config.default_model
+
+    def _resolved_reasoning_effort(self) -> str:
+        override = (self.reasoning_effort_override or "").strip()
+        if override:
+            return override
+        return self.config.openai_reasoning_effort
+
+    def _merged_base_instructions(self, instructions: str | None) -> str | None:
+        if self.replace_base_instructions:
+            return merge_instructions(
+                self.base_instructions_override or self.backend._resolve_tool_loop_base_instructions(),
+                instructions,
+            )
+        return merge_instructions(
+            self.backend._resolve_tool_loop_base_instructions(),
+            self.base_instructions_override,
+            instructions,
+        )
+
+    def decide(
+        self,
+        prompt: str,
+        *,
+        conversation: ConversationLike | None = None,
+        instructions: str | None = None,
+    ) -> SupervisorDecision:
+        model = self._resolved_model()
+        request = self.backend._build_response_request(
+            prompt,
+            conversation=conversation,
+            instructions=self._merged_base_instructions(instructions),
+            allow_web_search=False,
+            model=model,
+            reasoning_effort=self._resolved_reasoning_effort(),
+            max_output_tokens=max(32, int(self.config.streaming_supervisor_max_output_tokens)),
+            prompt_cache_scope="supervisor_decision",
+        )
+        request["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": "twinr_supervisor_decision",
+                "schema": _SUPERVISOR_DECISION_SCHEMA,
+                "strict": True,
+            }
+        }
+        response = self.backend._client.responses.create(**request)
+        payload = json.loads(self.backend._extract_output_text(response) or "{}")
+        return SupervisorDecision(
+            action=str(payload.get("action", "handoff") or "handoff"),
+            spoken_ack=_optional_text(payload.get("spoken_ack")),
+            spoken_reply=_optional_text(payload.get("spoken_reply")),
+            kind=_optional_text(payload.get("kind")),
+            goal=_optional_text(payload.get("goal")),
+            allow_web_search=_optional_bool(payload.get("allow_web_search")),
+            response_id=getattr(response, "id", None),
+            request_id=getattr(response, "_request_id", None),
+            model=extract_model_name(response, model),
+            token_usage=extract_token_usage(response),
+        )
+
+
+def _is_reasoning_unsupported_error(exc: Exception) -> bool:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        message = str(body.get("error", {}).get("message", "")).lower()
+        param = str(body.get("error", {}).get("param", "")).lower()
+        if "reasoning.effort" in param or "reasoning.effort" in message:
+            return True
+    message = str(exc).lower()
+    return "reasoning.effort" in message and "not supported" in message
+
+
+def _apply_reasoning_effort_request(
+    backend: Any,
+    request: dict[str, Any],
+    *,
+    model: str,
+    reasoning_effort: str | None,
+) -> None:
+    helper = getattr(backend, "_apply_reasoning_effort", None)
+    if callable(helper):
+        helper(
+            request,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        return
+    normalized_effort = (reasoning_effort or "").strip().lower()
+    if not normalized_effort:
+        request.pop("reasoning", None)
+        return
+    if not _model_supports_reasoning_effort(model):
+        request.pop("reasoning", None)
+        return
+    request["reasoning"] = {"effort": normalized_effort}
+
+
+def _model_supports_reasoning_effort(model: str) -> bool:
+    normalized = (model or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _normalize_openai_function_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    copied = json.loads(json.dumps(schema))
+    if copied.get("type") != "function":
+        return copied
+    parameters = copied.get("parameters")
+    if not isinstance(parameters, dict):
+        return copied
+    for key in ("anyOf", "oneOf", "allOf", "not", "enum"):
+        parameters.pop(key, None)
+    return copied
 
 
 @dataclass

@@ -9,6 +9,17 @@ from twinr.config import TwinrConfig
 
 
 class TwinrConfigTests(unittest.TestCase):
+    def test_frontier_streaming_defaults_favor_fast_search_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.openai_search_model, "gpt-4o-mini")
+        self.assertEqual(config.streaming_specialist_model, "gpt-4o-mini")
+        self.assertEqual(config.streaming_specialist_reasoning_effort, "low")
+
     def test_reads_openai_button_and_printer_settings_from_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -59,6 +70,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_TURN_CONTROLLER_FAST_ENDPOINT_MIN_CONFIDENCE=0.82",
                         "TWINR_STREAMING_EARLY_TRANSCRIPT_ENABLED=false",
                         "TWINR_STREAMING_EARLY_TRANSCRIPT_MIN_CHARS=18",
+                        "TWINR_STREAMING_EARLY_TRANSCRIPT_WAIT_MS=420",
                         "TWINR_CONVERSATION_FOLLOW_UP_ENABLED=true",
                         "TWINR_CONVERSATION_FOLLOW_UP_TIMEOUT_S=3.5",
                         "TWINR_AUDIO_BEEP_FREQUENCY_HZ=1175",
@@ -189,10 +201,15 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ADAPTIVE_TIMING_PAUSE_GRACE_MS=1050",
                         "TWINR_LONG_TERM_MEMORY_ENABLED=true",
                         "TWINR_LONG_TERM_MEMORY_BACKEND=chonkydb",
+                        "TWINR_LONG_TERM_MEMORY_MODE=remote_primary",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_REQUIRED=true",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_NAMESPACE=pi-main",
                         "TWINR_LONG_TERM_MEMORY_PATH=/tmp/twinr-chonkydb",
                         "TWINR_LONG_TERM_MEMORY_BACKGROUND_STORE_TURNS=false",
                         "TWINR_LONG_TERM_MEMORY_WRITE_QUEUE_SIZE=48",
                         "TWINR_LONG_TERM_MEMORY_RECALL_LIMIT=5",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_READ_TIMEOUT_S=5.5",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S=11.5",
                         "TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MODEL=gpt-5.2-mini",
                         "TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MAX_OUTPUT_TOKENS=2600",
                         "TWINR_LONG_TERM_MEMORY_MIDTERM_ENABLED=false",
@@ -217,6 +234,12 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LONG_TERM_MEMORY_SENSOR_MIN_DAYS_OBSERVED=7",
                         "TWINR_LONG_TERM_MEMORY_SENSOR_MIN_ROUTINE_RATIO=0.66",
                         "TWINR_LONG_TERM_MEMORY_SENSOR_DEVIATION_MIN_DELTA=0.52",
+                        "TWINR_LONG_TERM_MEMORY_RETENTION_ENABLED=true",
+                        "TWINR_LONG_TERM_MEMORY_RETENTION_MODE=conservative",
+                        "TWINR_LONG_TERM_MEMORY_RETENTION_RUN_INTERVAL_S=420",
+                        "TWINR_LONG_TERM_MEMORY_ARCHIVE_ENABLED=true",
+                        "TWINR_LONG_TERM_MEMORY_MIGRATION_ENABLED=false",
+                        "TWINR_LONG_TERM_MEMORY_MIGRATION_BATCH_SIZE=32",
                         "TWINR_CHONKYDB_BASE_URL=https://memory.example.com:2149",
                         "TWINR_CHONKYDB_API_KEY=secret-key",
                         "TWINR_CHONKYDB_API_KEY_HEADER=x-api-key",
@@ -313,6 +336,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.turn_controller_fast_endpoint_min_confidence, 0.82)
         self.assertFalse(config.streaming_early_transcript_enabled)
         self.assertEqual(config.streaming_early_transcript_min_chars, 18)
+        self.assertEqual(config.streaming_early_transcript_wait_ms, 420)
         self.assertTrue(config.conversation_follow_up_enabled)
         self.assertEqual(config.conversation_follow_up_timeout_s, 3.5)
         self.assertEqual(config.audio_beep_frequency_hz, 1175)
@@ -446,10 +470,15 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.adaptive_timing_pause_grace_ms, 1050)
         self.assertTrue(config.long_term_memory_enabled)
         self.assertEqual(config.long_term_memory_backend, "chonkydb")
+        self.assertEqual(config.long_term_memory_mode, "remote_primary")
+        self.assertTrue(config.long_term_memory_remote_required)
+        self.assertEqual(config.long_term_memory_remote_namespace, "pi-main")
         self.assertEqual(config.long_term_memory_path, "/tmp/twinr-chonkydb")
         self.assertFalse(config.long_term_memory_background_store_turns)
         self.assertEqual(config.long_term_memory_write_queue_size, 48)
         self.assertEqual(config.long_term_memory_recall_limit, 5)
+        self.assertEqual(config.long_term_memory_remote_read_timeout_s, 5.5)
+        self.assertEqual(config.long_term_memory_remote_write_timeout_s, 11.5)
         self.assertEqual(config.long_term_memory_turn_extractor_model, "gpt-5.2-mini")
         self.assertEqual(config.long_term_memory_turn_extractor_max_output_tokens, 2600)
         self.assertFalse(config.long_term_memory_midterm_enabled)
@@ -474,6 +503,12 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_sensor_min_days_observed, 7)
         self.assertEqual(config.long_term_memory_sensor_min_routine_ratio, 0.66)
         self.assertEqual(config.long_term_memory_sensor_deviation_min_delta, 0.52)
+        self.assertTrue(config.long_term_memory_retention_enabled)
+        self.assertEqual(config.long_term_memory_retention_mode, "conservative")
+        self.assertEqual(config.long_term_memory_retention_run_interval_s, 420.0)
+        self.assertTrue(config.long_term_memory_archive_enabled)
+        self.assertFalse(config.long_term_memory_migration_enabled)
+        self.assertEqual(config.long_term_memory_migration_batch_size, 32)
         self.assertEqual(config.chonkydb_base_url, "https://memory.example.com:2149")
         self.assertEqual(config.chonkydb_api_key, "secret-key")
         self.assertEqual(config.chonkydb_api_key_header, "x-api-key")
@@ -539,6 +574,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.turn_controller_fast_endpoint_min_confidence, 0.9)
         self.assertTrue(config.streaming_early_transcript_enabled)
         self.assertEqual(config.streaming_early_transcript_min_chars, 10)
+        self.assertEqual(config.streaming_early_transcript_wait_ms, 250)
         self.assertTrue(config.audio_dynamic_pause_enabled)
         self.assertEqual(config.audio_dynamic_pause_short_utterance_max_ms, 1000)
         self.assertEqual(config.audio_dynamic_pause_long_utterance_min_ms, 5000)
@@ -551,10 +587,15 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.audio_pause_resume_chunks, 2)
         self.assertFalse(config.long_term_memory_enabled)
         self.assertEqual(config.long_term_memory_backend, "chonkydb")
+        self.assertEqual(config.long_term_memory_mode, "local_first")
+        self.assertFalse(config.long_term_memory_remote_required)
+        self.assertIsNone(config.long_term_memory_remote_namespace)
         self.assertEqual(config.long_term_memory_path, "state/chonkydb")
         self.assertTrue(config.long_term_memory_background_store_turns)
         self.assertEqual(config.long_term_memory_write_queue_size, 32)
         self.assertEqual(config.long_term_memory_recall_limit, 3)
+        self.assertEqual(config.long_term_memory_remote_read_timeout_s, 8.0)
+        self.assertEqual(config.long_term_memory_remote_write_timeout_s, 15.0)
         self.assertIsNone(config.long_term_memory_turn_extractor_model)
         self.assertEqual(config.long_term_memory_turn_extractor_max_output_tokens, 2200)
         self.assertTrue(config.long_term_memory_midterm_enabled)
@@ -579,6 +620,12 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_sensor_min_days_observed, 6)
         self.assertEqual(config.long_term_memory_sensor_min_routine_ratio, 0.55)
         self.assertEqual(config.long_term_memory_sensor_deviation_min_delta, 0.45)
+        self.assertTrue(config.long_term_memory_retention_enabled)
+        self.assertEqual(config.long_term_memory_retention_mode, "conservative")
+        self.assertEqual(config.long_term_memory_retention_run_interval_s, 300.0)
+        self.assertTrue(config.long_term_memory_archive_enabled)
+        self.assertTrue(config.long_term_memory_migration_enabled)
+        self.assertEqual(config.long_term_memory_migration_batch_size, 64)
         self.assertEqual(config.proactive_possible_fall_visibility_loss_hold_s, 15.0)
         self.assertEqual(config.proactive_possible_fall_visibility_loss_arming_s, 6.0)
         self.assertEqual(config.proactive_possible_fall_slumped_visibility_loss_arming_s, 4.0)
@@ -636,3 +683,50 @@ class TwinrConfigTests(unittest.TestCase):
 
         self.assertEqual(config.chonkydb_base_url, "https://legacy-memory.example.com:2149")
         self.assertEqual(config.chonkydb_api_key, "legacy-secret")
+
+    def test_streaming_dual_lane_env_settings_are_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_STREAMING_DUAL_LANE_ENABLED=false",
+                        "TWINR_STREAMING_SUPERVISOR_MODEL=gpt-4o-mini",
+                        "TWINR_STREAMING_SUPERVISOR_REASONING_EFFORT=low",
+                        "TWINR_STREAMING_SPECIALIST_MODEL=gpt-5.2-chat-latest",
+                        "TWINR_STREAMING_SPECIALIST_REASONING_EFFORT=medium",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertFalse(config.streaming_dual_lane_enabled)
+        self.assertEqual(config.streaming_supervisor_model, "gpt-4o-mini")
+        self.assertEqual(config.streaming_supervisor_reasoning_effort, "low")
+        self.assertEqual(config.streaming_specialist_model, "gpt-5.2-chat-latest")
+        self.assertEqual(config.streaming_specialist_reasoning_effort, "medium")
+
+    def test_reads_orchestrator_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "OPENAI_API_KEY=test-key",
+                        "TWINR_ORCHESTRATOR_HOST=127.0.0.1",
+                        "TWINR_ORCHESTRATOR_PORT=9876",
+                        "TWINR_ORCHESTRATOR_WS_URL=ws://10.0.0.5:9876/ws/orchestrator",
+                        "TWINR_ORCHESTRATOR_SHARED_SECRET=secret-token",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.orchestrator_host, "127.0.0.1")
+        self.assertEqual(config.orchestrator_port, 9876)
+        self.assertEqual(config.orchestrator_ws_url, "ws://10.0.0.5:9876/ws/orchestrator")
+        self.assertEqual(config.orchestrator_shared_secret, "secret-token")

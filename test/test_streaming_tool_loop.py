@@ -103,6 +103,26 @@ class ToolCallingStreamingLoopTests(unittest.TestCase):
             ["Ich prüfe das. ", "Der Bus fährt um 07:30 Uhr."],
         )
 
+    def test_handler_can_opt_in_to_full_tool_call_object(self) -> None:
+        provider = FakeToolCallingProvider()
+        seen_call_ids: list[str] = []
+
+        def handler(tool_call: AgentToolCall):
+            seen_call_ids.append(tool_call.call_id)
+            return {"status": "ok", "answer": "Bus 24 fährt um 07:30 Uhr."}
+
+        setattr(handler, "_twinr_accepts_tool_call", True)
+
+        loop = ToolCallingStreamingLoop(
+            provider,
+            tool_handlers={"search_live_info": handler},
+            tool_schemas=[{"type": "function", "name": "search_live_info"}],
+        )
+
+        loop.run("Wann fährt der Bus?")
+
+        self.assertEqual(seen_call_ids, ["call_search_1"])
+
 
 if __name__ == "__main__":
     unittest.main()

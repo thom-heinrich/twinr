@@ -3,12 +3,25 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import sys
 import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent.contracts import AgentToolCall, ToolCallingTurnResponse
+from twinr.agent.base_agent.contracts import (
+    AgentToolCall,
+    StreamingTranscriptionResult,
+    ToolCallingTurnResponse,
+)
+from twinr.agent.tools.dual_lane_loop import DualLaneToolLoop
 from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
 from twinr.config import TwinrConfig
+from twinr.memory.longterm.models import (
+    LongTermConsolidationResultV1,
+    LongTermMemoryConflictV1,
+    LongTermMemoryObjectV1,
+    LongTermSourceRefV1,
+)
 from twinr.providers.openai import OpenAITextResponse
 from twinr.runtime import TwinrRuntime
 
@@ -140,10 +153,78 @@ class FakeSpeechToTextProvider:
         return "Hallo Twinr"
 
 
+class FakeStreamingSpeechSession:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.closed = False
+        self.finalize_calls = 0
+
+    def send_pcm(self, pcm_bytes: bytes) -> None:
+        self.sent.append(pcm_bytes)
+
+    def snapshot(self) -> StreamingTranscriptionResult:
+        return StreamingTranscriptionResult(
+            transcript="Streaming Hallo Twinr",
+            request_id="dg-stream-1",
+            saw_interim=True,
+            saw_speech_final=True,
+            saw_utterance_end=False,
+        )
+
+    def finalize(self) -> StreamingTranscriptionResult:
+        self.finalize_calls += 1
+        return StreamingTranscriptionResult(
+            transcript="Streaming Hallo Twinr",
+            request_id="dg-stream-1",
+            saw_interim=True,
+            saw_speech_final=True,
+            saw_utterance_end=False,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeStreamingSpeechToTextProvider(FakeSpeechToTextProvider):
+    def __init__(self, config: TwinrConfig) -> None:
+        super().__init__(config)
+        self.session = FakeStreamingSpeechSession()
+        self.start_calls: list[dict[str, object]] = []
+        self.interim_callback = None
+
+    def transcribe(self, audio_bytes: bytes, **kwargs) -> str:
+        raise AssertionError("streaming STT path should not fall back to file transcription")
+
+    def start_streaming_session(
+        self,
+        *,
+        sample_rate: int,
+        channels: int,
+        language: str | None = None,
+        prompt: str | None = None,
+        on_interim=None,
+        on_endpoint=None,
+    ):
+        del prompt, on_endpoint
+        self.start_calls.append(
+            {
+                "sample_rate": sample_rate,
+                "channels": channels,
+                "language": language,
+            }
+        )
+        self.interim_callback = on_interim
+        if on_interim is not None:
+            on_interim("Stream partiell")
+        return self.session
+
+
 class FakeTextToSpeechProvider:
     def __init__(self, config: TwinrConfig) -> None:
         self.config = config
         self.calls: list[str] = []
+        self.stream_calls: list[str] = []
+        self.stream_chunk_sizes: list[int] = []
 
     def synthesize(self, text: str, **kwargs) -> bytes:
         del kwargs
@@ -151,8 +232,9 @@ class FakeTextToSpeechProvider:
         return b"RIFF"
 
     def synthesize_stream(self, text: str, **kwargs):
-        del kwargs
+        self.stream_chunk_sizes.append(int(kwargs.get("chunk_size", 4096)))
         self.calls.append(text)
+        self.stream_calls.append(text)
         yield b"RI"
         yield b"FF"
 
@@ -160,9 +242,13 @@ class FakeTextToSpeechProvider:
 class FakePlayer:
     def __init__(self) -> None:
         self.played: list[bytes] = []
+        self.played_wav_bytes: list[bytes] = []
 
     def play_wav_chunks(self, chunks) -> None:
         self.played.append(b"".join(chunks))
+
+    def play_wav_bytes(self, audio_bytes: bytes) -> None:
+        self.played_wav_bytes.append(audio_bytes)
 
     def play_tone(self, **kwargs) -> None:
         del kwargs
@@ -192,6 +278,37 @@ class FakeUsageStore:
 
     def append(self, **kwargs) -> None:
         self.calls.append(kwargs)
+
+
+class FakeRecorder:
+    def capture_pcm_until_pause_with_options(self, **kwargs):
+        on_chunk = kwargs.get("on_chunk")
+        if on_chunk is not None:
+            on_chunk(b"PCM-A")
+            on_chunk(b"PCM-B")
+        return SimpleNamespace(
+            pcm_bytes=b"PCM-AB",
+            speech_started_after_ms=120,
+            resumed_after_pause_count=1,
+        )
+
+
+class CapturingDualLaneLoop(DualLaneToolLoop):
+    def __init__(self) -> None:
+        self.run_calls: list[dict[str, object]] = []
+
+    def run(self, prompt: str, **kwargs):
+        self.run_calls.append({"prompt": prompt, **kwargs})
+        return SimpleNamespace(
+            text="Ich schaue kurz nach.\nMorgen wird es sonnig.",
+            response_id="resp_dual_lane",
+            request_id="req_dual_lane",
+            rounds=1,
+            tool_calls=(),
+            used_web_search=False,
+            model="gpt-4o-mini",
+            token_usage=None,
+        )
 
 
 class StreamingRunnerTests(unittest.TestCase):
@@ -242,6 +359,241 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(tool_agent.start_calls[0]["allow_web_search"], False)
         self.assertTrue(any(call["request_kind"] == "print" for call in usage_store.calls))
         self.assertTrue(any(call["request_kind"] == "conversation" for call in usage_store.calls))
+
+    def test_audio_turn_uses_streaming_stt_session_when_available(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tool_agent = FakeToolAgentProvider(config)
+            support_provider = FakePrintBackend(config)
+            tts_provider = FakeTextToSpeechProvider(config)
+            player = FakePlayer()
+            printer = FakePrinter()
+            usage_store = FakeUsageStore()
+            stt_provider = FakeStreamingSpeechToTextProvider(config)
+            lines: list[str] = []
+
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=tool_agent,
+                print_backend=support_provider,
+                stt_provider=stt_provider,
+                agent_provider=support_provider,
+                tts_provider=tts_provider,
+                recorder=FakeRecorder(),
+                player=player,
+                printer=printer,
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=usage_store,
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+                emit=lines.append,
+            )
+
+            keep_listening = loop._run_single_audio_turn(
+                initial_source="button",
+                follow_up=False,
+                listening_window=runtime.listening_window(initial_source="button", follow_up=False),
+                listen_source="button",
+                proactive_trigger=None,
+                speech_start_chunks=None,
+                ignore_initial_ms=0,
+                timeout_emit_key="listen_timeout",
+                timeout_message="Listening timed out before speech started.",
+                play_initial_beep=False,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertEqual(stt_provider.start_calls[0]["sample_rate"], config.audio_sample_rate)
+        self.assertEqual(stt_provider.start_calls[0]["channels"], config.audio_channels)
+        self.assertEqual(stt_provider.start_calls[0]["language"], config.deepgram_stt_language)
+        self.assertEqual(stt_provider.session.sent, [b"PCM-A", b"PCM-B"])
+        self.assertEqual(stt_provider.session.finalize_calls, 0)
+        self.assertTrue(stt_provider.session.closed)
+        self.assertIn("transcript=Streaming Hallo Twinr", lines)
+        self.assertIn("stt_streaming_early=true", lines)
+
+    def test_segment_boundary_prefers_clause_and_soft_wrap(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                streaming_tts_clause_min_chars=20,
+                streaming_tts_soft_segment_chars=40,
+                streaming_tts_hard_segment_chars=60,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=TwinrRuntime(config=config),
+                tool_agent_provider=FakeToolAgentProvider(config),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                recorder=FakeRecorder(),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+
+            clause_boundary = loop._segment_boundary("Das Wetter morgen ist wechselhaft, aber am Nachmittag trockener")
+            soft_wrap_boundary = loop._segment_boundary(
+                "Das Wetter morgen bleibt insgesamt wechselhaft und am Nachmittag wieder trockener"
+            )
+
+        self.assertEqual(clause_boundary, len("Das Wetter morgen ist wechselhaft,"))
+        self.assertIsNotNone(soft_wrap_boundary)
+        self.assertLess(soft_wrap_boundary, len("Das Wetter morgen bleibt insgesamt wechselhaft und am Nachmittag wieder trockener"))
+
+    def test_streaming_tts_uses_configured_chunk_size(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                openai_tts_stream_chunk_size=1536,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tool_agent = FakeToolAgentProvider(config)
+            tts_provider = FakeTextToSpeechProvider(config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=tool_agent,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=tts_provider,
+                recorder=FakeRecorder(),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+
+            loop._run_single_text_turn(
+                transcript="Bitte druck das aus",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        self.assertIn(1536, tts_provider.stream_chunk_sizes)
+
+    def test_cached_fast_ack_phrase_uses_prefetched_wav_audio(self) -> None:
+        class AckOnlyLoop:
+            def run(self, *args, **kwargs):
+                on_text_delta = kwargs.get("on_text_delta")
+                if on_text_delta is not None:
+                    on_text_delta("Ich schaue kurz nach.")
+                return SimpleNamespace(
+                    text="Ich schaue kurz nach.",
+                    response_id="resp_ack",
+                    request_id="req_ack",
+                    rounds=1,
+                    tool_calls=(),
+                    used_web_search=False,
+                    model="gpt-4o-mini",
+                    token_usage=None,
+                )
+
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tts_provider = FakeTextToSpeechProvider(config)
+            player = FakePlayer()
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=AckOnlyLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=tts_provider,
+                player=player,
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            loop._fast_ack_wav_cache["Ich schaue kurz nach."] = b"CACHED-ACK"
+
+            loop._run_single_text_turn(
+                transcript="Wie wird das Wetter morgen?",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        self.assertIn(b"CACHED-ACK", player.played_wav_bytes)
+        self.assertNotIn("Ich schaue kurz nach.", tts_provider.stream_calls)
+
+    def test_dual_lane_streaming_runner_passes_slim_supervisor_context(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                streaming_supervisor_context_turns=2,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            runtime.memory.remember("user", "Alter Turn eins")
+            runtime.memory.remember("assistant", "Alter Turn zwei")
+            runtime.memory.remember("user", "Letzte Frage")
+            runtime.memory.remember("assistant", "Letzte Antwort")
+            dual_lane = CapturingDualLaneLoop()
+
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+
+            loop._run_single_text_turn(
+                transcript="Wie wird das Wetter morgen?",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        call = dual_lane.run_calls[0]
+        supervisor_context = call["supervisor_conversation"]
+        specialist_context = call["conversation"]
+        self.assertEqual(
+            [(role, content) for role, content in supervisor_context if role != "system"],
+            [("user", "Letzte Frage"), ("assistant", "Letzte Antwort")],
+        )
+        self.assertGreater(len(specialist_context), len(supervisor_context))
 
     def test_groq_config_uses_compact_tool_schemas_and_instructions(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -330,6 +682,157 @@ class StreamingRunnerTests(unittest.TestCase):
 
         self.assertEqual(tts_provider.calls, ["Ist erledigt."])
         self.assertEqual(runtime.last_response, "Ist erledigt.")
+
+    def test_text_turn_uses_processing_feedback_before_answering(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tool_agent = FakeToolAgentProvider(config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=tool_agent,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            feedback_kinds: list[str] = []
+
+            def fake_start(kind: str):
+                feedback_kinds.append(kind)
+                return lambda: None
+
+            loop._start_working_feedback_loop = fake_start  # type: ignore[method-assign]
+
+            loop._run_single_text_turn(
+                transcript="Bitte druck das aus",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        self.assertEqual(feedback_kinds[0], "processing")
+
+    def test_tool_provider_context_hides_exact_contact_methods_and_conflicts(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            runtime.remember_contact(given_name="Anna", family_name="Schulz", phone="555-0100")
+            runtime.long_term_memory.object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:2",
+                    occurred_at=datetime(2026, 3, 14, 12, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                    episodic_objects=(),
+                    durable_objects=(
+                        LongTermMemoryObjectV1(
+                            memory_id="fact:corinna_phone_old",
+                            kind="contact_method_fact",
+                            summary="Corinna Maier can be reached at +15555551234.",
+                            source=LongTermSourceRefV1(
+                                source_type="conversation_turn",
+                                event_ids=("turn:1",),
+                                speaker="user",
+                                modality="voice",
+                            ),
+                            status="active",
+                            confidence=0.95,
+                            slot_key="contact:person:corinna_maier:phone",
+                            value_key="+15555551234",
+                        ),
+                    ),
+                    deferred_objects=(
+                        LongTermMemoryObjectV1(
+                            memory_id="fact:corinna_phone_new",
+                            kind="contact_method_fact",
+                            summary="Corinna Maier can be reached at +15555558877.",
+                            source=LongTermSourceRefV1(
+                                source_type="conversation_turn",
+                                event_ids=("turn:2",),
+                                speaker="user",
+                                modality="voice",
+                            ),
+                            status="uncertain",
+                            confidence=0.92,
+                            slot_key="contact:person:corinna_maier:phone",
+                            value_key="+15555558877",
+                        ),
+                    ),
+                    conflicts=(
+                        LongTermMemoryConflictV1(
+                            slot_key="contact:person:corinna_maier:phone",
+                            candidate_memory_id="fact:corinna_phone_new",
+                            existing_memory_ids=("fact:corinna_phone_old",),
+                            question="Which phone number should I use for Corinna Maier?",
+                            reason="Conflicting phone numbers exist.",
+                        ),
+                    ),
+                    graph_edges=(),
+                )
+            )
+            runtime.last_transcript = "Wie ist die Telefonnummer von Anna Schulz?"
+            provider_contact_context = runtime.provider_conversation_context()
+            tool_contact_context = runtime.tool_provider_conversation_context()
+            supervisor_contact_context = runtime.supervisor_provider_conversation_context()
+            runtime.last_transcript = "Gibt es bei Corinna Maier offene Erinnerungskonflikte?"
+            provider_conflict_context = runtime.provider_conversation_context()
+            tool_conflict_context = runtime.tool_provider_conversation_context()
+            supervisor_conflict_context = runtime.supervisor_provider_conversation_context()
+
+        provider_contact_system = "\n".join(content for role, content in provider_contact_context if role == "system")
+        tool_contact_system = "\n".join(content for role, content in tool_contact_context if role == "system")
+        supervisor_contact_system = "\n".join(content for role, content in supervisor_contact_context if role == "system")
+        provider_conflict_system = "\n".join(content for role, content in provider_conflict_context if role == "system")
+        tool_conflict_system = "\n".join(content for role, content in tool_conflict_context if role == "system")
+        supervisor_conflict_system = "\n".join(content for role, content in supervisor_conflict_context if role == "system")
+        self.assertIn("555-0100", provider_contact_system)
+        self.assertIn("Structured unresolved long-term memory conflicts", provider_conflict_system)
+        self.assertIn("+15555558877", provider_conflict_system)
+        self.assertNotIn("555-0100", tool_contact_system)
+        self.assertNotIn("Structured unresolved long-term memory conflicts", tool_conflict_system)
+        self.assertNotIn("+15555558877", tool_conflict_system)
+        self.assertNotIn("555-0100", supervisor_contact_system)
+        self.assertNotIn("Structured unresolved long-term memory conflicts", supervisor_conflict_system)
+        self.assertNotIn("+15555558877", supervisor_conflict_system)
+
+    def test_supervisor_context_uses_recent_raw_tail_only(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(
+                TwinrConfig(
+                    openai_api_key="test-key",
+                    project_root=temp_dir,
+                    personality_dir="personality",
+                    memory_max_turns=8,
+                    memory_keep_recent=4,
+                    streaming_supervisor_context_turns=2,
+                )
+            )
+            runtime.memory.remember("user", "Turn one")
+            runtime.memory.remember("assistant", "Turn two")
+            runtime.memory.remember("user", "Turn three")
+            runtime.memory.remember("assistant", "Turn four")
+            context = runtime.supervisor_provider_conversation_context()
+
+        non_system_messages = [(role, content) for role, content in context if role != "system"]
+        self.assertEqual(
+            non_system_messages,
+            [("user", "Turn three"), ("assistant", "Turn four")],
+        )
 
 
 if __name__ == "__main__":

@@ -116,7 +116,10 @@ class ToolCallingStreamingLoop:
             output: Any = {"status": "error", "message": f"Unsupported tool: {tool_call.name}"}
         else:
             try:
-                result = handler(tool_call.arguments)
+                if getattr(handler, "_twinr_accepts_tool_call", False):
+                    result = handler(tool_call)
+                else:
+                    result = handler(tool_call.arguments)
             except Exception as exc:
                 output = {"status": "error", "message": str(exc)}
             else:
