@@ -9,6 +9,7 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 import select
 import subprocess
 import time
@@ -55,6 +56,56 @@ class SpeechCaptureResult:
     resumed_after_pause_count: int
 
 
+def resolve_pause_resume_confirmation(
+    *,
+    consecutive_resume_chunks: int,
+    required_resume_chunks: int,
+) -> tuple[bool, int]:
+    required_chunks = max(1, int(required_resume_chunks))
+    next_chunks = max(0, int(consecutive_resume_chunks)) + 1
+    if next_chunks >= required_chunks:
+        return True, 0
+    return False, next_chunks
+
+
+def resolve_dynamic_pause_thresholds(
+    *,
+    base_pause_ms: int,
+    base_pause_grace_ms: int,
+    speech_window_ms: int,
+    enabled: bool,
+    short_utterance_max_ms: int,
+    long_utterance_min_ms: int,
+    short_pause_bonus_ms: int,
+    short_pause_grace_bonus_ms: int,
+    medium_pause_penalty_ms: int,
+    medium_pause_grace_penalty_ms: int,
+    long_pause_penalty_ms: int,
+    long_pause_grace_penalty_ms: int,
+) -> tuple[int, int]:
+    pause_ms = max(0, int(base_pause_ms))
+    pause_grace_ms = max(0, int(base_pause_grace_ms))
+    utterance_ms = max(0, int(speech_window_ms))
+    if not enabled or utterance_ms <= 0:
+        return pause_ms, pause_grace_ms
+    if utterance_ms <= max(0, int(short_utterance_max_ms)):
+        return (
+            pause_ms + max(0, int(short_pause_bonus_ms)),
+            pause_grace_ms + max(0, int(short_pause_grace_bonus_ms)),
+        )
+    if utterance_ms < max(0, int(long_utterance_min_ms)):
+        return (
+            max(0, pause_ms - max(0, int(medium_pause_penalty_ms))),
+            max(0, pause_grace_ms - max(0, int(medium_pause_grace_penalty_ms))),
+        )
+    if utterance_ms >= max(0, int(long_utterance_min_ms)):
+        return (
+            max(0, pause_ms - max(0, int(long_pause_penalty_ms))),
+            max(0, pause_grace_ms - max(0, int(long_pause_grace_penalty_ms))),
+        )
+    return pause_ms, pause_grace_ms
+
+
 def pcm16_to_wav_bytes(
     pcm_bytes: bytes,
     *,
@@ -83,6 +134,16 @@ class SilenceDetectedRecorder:
         speech_start_chunks: int = 1,
         start_timeout_s: float = 8.0,
         max_record_seconds: float = 20.0,
+        dynamic_pause_enabled: bool = True,
+        dynamic_pause_short_utterance_max_ms: int = 1000,
+        dynamic_pause_long_utterance_min_ms: int = 5000,
+        dynamic_pause_short_pause_bonus_ms: int = 120,
+        dynamic_pause_short_pause_grace_bonus_ms: int = 0,
+        dynamic_pause_medium_pause_penalty_ms: int = 120,
+        dynamic_pause_medium_pause_grace_penalty_ms: int = 250,
+        dynamic_pause_long_pause_penalty_ms: int = 320,
+        dynamic_pause_long_pause_grace_penalty_ms: int = 220,
+        pause_resume_chunks: int = 2,
     ) -> None:
         self.device = device
         self.sample_rate = sample_rate
@@ -93,6 +154,25 @@ class SilenceDetectedRecorder:
         self.speech_start_chunks = max(1, speech_start_chunks)
         self.start_timeout_s = start_timeout_s
         self.max_record_seconds = max_record_seconds
+        self.dynamic_pause_enabled = dynamic_pause_enabled
+        self.dynamic_pause_short_utterance_max_ms = max(0, dynamic_pause_short_utterance_max_ms)
+        self.dynamic_pause_long_utterance_min_ms = max(0, dynamic_pause_long_utterance_min_ms)
+        self.dynamic_pause_short_pause_bonus_ms = max(0, dynamic_pause_short_pause_bonus_ms)
+        self.dynamic_pause_short_pause_grace_bonus_ms = max(
+            0,
+            dynamic_pause_short_pause_grace_bonus_ms,
+        )
+        self.dynamic_pause_medium_pause_penalty_ms = max(0, dynamic_pause_medium_pause_penalty_ms)
+        self.dynamic_pause_medium_pause_grace_penalty_ms = max(
+            0,
+            dynamic_pause_medium_pause_grace_penalty_ms,
+        )
+        self.dynamic_pause_long_pause_penalty_ms = max(0, dynamic_pause_long_pause_penalty_ms)
+        self.dynamic_pause_long_pause_grace_penalty_ms = max(
+            0,
+            dynamic_pause_long_pause_grace_penalty_ms,
+        )
+        self.pause_resume_chunks = max(1, pause_resume_chunks)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "SilenceDetectedRecorder":
@@ -106,6 +186,16 @@ class SilenceDetectedRecorder:
             speech_start_chunks=config.audio_speech_start_chunks,
             start_timeout_s=config.audio_start_timeout_s,
             max_record_seconds=config.audio_max_record_seconds,
+            dynamic_pause_enabled=config.audio_dynamic_pause_enabled,
+            dynamic_pause_short_utterance_max_ms=config.audio_dynamic_pause_short_utterance_max_ms,
+            dynamic_pause_long_utterance_min_ms=config.audio_dynamic_pause_long_utterance_min_ms,
+            dynamic_pause_short_pause_bonus_ms=config.audio_dynamic_pause_short_pause_bonus_ms,
+            dynamic_pause_short_pause_grace_bonus_ms=config.audio_dynamic_pause_short_pause_grace_bonus_ms,
+            dynamic_pause_medium_pause_penalty_ms=config.audio_dynamic_pause_medium_pause_penalty_ms,
+            dynamic_pause_medium_pause_grace_penalty_ms=config.audio_dynamic_pause_medium_pause_grace_penalty_ms,
+            dynamic_pause_long_pause_penalty_ms=config.audio_dynamic_pause_long_pause_penalty_ms,
+            dynamic_pause_long_pause_grace_penalty_ms=config.audio_dynamic_pause_long_pause_grace_penalty_ms,
+            pause_resume_chunks=config.audio_pause_resume_chunks,
         )
 
     def record_until_pause(self, *, pause_ms: int) -> bytes:
@@ -123,6 +213,8 @@ class SilenceDetectedRecorder:
         speech_start_chunks: int | None = None,
         ignore_initial_ms: int = 0,
         pause_grace_ms: int = 0,
+        on_chunk: Callable[[bytes], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> SpeechCaptureResult:
         command = [
             "arecord",
@@ -147,6 +239,8 @@ class SilenceDetectedRecorder:
         preroll: deque[bytes] = deque(maxlen=max(1, self.preroll_ms // max(1, self.chunk_ms)))
         heard_speech = False
         consecutive_speech_chunks = 0
+        consecutive_resume_chunks = 0
+        speech_started_at: float | None = None
         last_non_silent_at: float | None = None
         pause_candidate_deadline_at: float | None = None
         started_at = time.monotonic()
@@ -172,6 +266,8 @@ class SilenceDetectedRecorder:
                     raise RuntimeError("No speech detected before timeout")
                 if heard_speech and now - started_at >= effective_max_record_seconds:
                     break
+                if heard_speech and should_stop is not None and should_stop():
+                    break
                 if process.poll() is not None:
                     self._raise_process_error(process)
                 if process.stdout is None:
@@ -180,6 +276,8 @@ class SilenceDetectedRecorder:
                 ready, _write_ready, _error_ready = select.select([process.stdout], [], [], 0.25)
                 if not ready:
                     if heard_speech and pause_candidate_deadline_at is not None and time.monotonic() >= pause_candidate_deadline_at:
+                        break
+                    if heard_speech and should_stop is not None and should_stop():
                         break
                     continue
 
@@ -199,11 +297,14 @@ class SilenceDetectedRecorder:
                         preroll.clear()
                         consecutive_speech_chunks = 0
                         continue
+                    if on_chunk is not None:
+                        on_chunk(chunk)
                     preroll.append(chunk)
                     if rms >= self.speech_threshold:
                         consecutive_speech_chunks += 1
                         if consecutive_speech_chunks >= effective_speech_start_chunks:
                             heard_speech = True
+                            speech_started_at = now
                             last_non_silent_at = now
                             pause_candidate_deadline_at = None
                             speech_started_after_ms = int((now - started_at) * 1000)
@@ -214,22 +315,52 @@ class SilenceDetectedRecorder:
                     continue
 
                 captured.extend(chunk)
+                if on_chunk is not None:
+                    on_chunk(chunk)
                 if rms >= self.speech_threshold:
                     if pause_candidate_deadline_at is not None:
+                        confirmed_resume, consecutive_resume_chunks = (
+                            resolve_pause_resume_confirmation(
+                                consecutive_resume_chunks=consecutive_resume_chunks,
+                                required_resume_chunks=self.pause_resume_chunks,
+                            )
+                        )
+                        if not confirmed_resume:
+                            continue
                         resumed_after_pause_count += 1
+                    consecutive_resume_chunks = 0
                     pause_candidate_deadline_at = None
                     last_non_silent_at = now
                     continue
+                consecutive_resume_chunks = 0
                 if last_non_silent_at is None:
                     continue
+                speech_window_ms = 0
+                if speech_started_at is not None:
+                    speech_window_ms = int((last_non_silent_at - speech_started_at) * 1000)
+                effective_pause_ms, effective_pause_grace_ms = resolve_dynamic_pause_thresholds(
+                    base_pause_ms=pause_ms,
+                    base_pause_grace_ms=pause_grace_ms,
+                    speech_window_ms=speech_window_ms,
+                    enabled=self.dynamic_pause_enabled,
+                    short_utterance_max_ms=self.dynamic_pause_short_utterance_max_ms,
+                    long_utterance_min_ms=self.dynamic_pause_long_utterance_min_ms,
+                    short_pause_bonus_ms=self.dynamic_pause_short_pause_bonus_ms,
+                    short_pause_grace_bonus_ms=self.dynamic_pause_short_pause_grace_bonus_ms,
+                    medium_pause_penalty_ms=self.dynamic_pause_medium_pause_penalty_ms,
+                    medium_pause_grace_penalty_ms=self.dynamic_pause_medium_pause_grace_penalty_ms,
+                    long_pause_penalty_ms=self.dynamic_pause_long_pause_penalty_ms,
+                    long_pause_grace_penalty_ms=self.dynamic_pause_long_pause_grace_penalty_ms,
+                )
                 silence_ms = int((now - last_non_silent_at) * 1000)
-                if silence_ms < pause_ms:
+                if silence_ms < effective_pause_ms:
                     continue
                 if effective_pause_grace_ms <= 0:
                     break
                 if pause_candidate_deadline_at is None:
+                    consecutive_resume_chunks = 0
                     pause_candidate_deadline_at = last_non_silent_at + (
-                        pause_ms + effective_pause_grace_ms
+                        effective_pause_ms + effective_pause_grace_ms
                     ) / 1000.0
                     continue
                 if now >= pause_candidate_deadline_at:
@@ -262,6 +393,8 @@ class SilenceDetectedRecorder:
             speech_start_chunks=speech_start_chunks,
             ignore_initial_ms=ignore_initial_ms,
             pause_grace_ms=pause_grace_ms,
+            on_chunk=None,
+            should_stop=None,
         )
         return result.pcm_bytes
 

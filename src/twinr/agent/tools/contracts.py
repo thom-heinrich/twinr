@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Iterable
+from copy import deepcopy
+from typing import Any, Iterable, Sequence
 
 from twinr.agent.base_agent.simple_settings import (
     spoken_voice_options_context,
@@ -14,9 +15,282 @@ _CANONICAL_ENGLISH_MEMORY_NOTE = (
     "Keep names, phone numbers, email addresses, IDs, codes, and exact quoted text verbatim."
 )
 
+# AUDIT-FIX(#2): Encode the documented HH:MM local-time contract as machine-readable validation
+# instead of leaving it to free-form descriptions.
+_LOCAL_TIME_HHMM_PATTERN = r"^(?:[01]\d|2[0-3]):[0-5]\d$"
+_REALTIME_TOP_LEVEL_UNSUPPORTED_SCHEMA_KEYS: frozenset[str] = frozenset(
+    {"allOf", "anyOf", "oneOf", "not", "enum", "if", "then", "else"}
+)
+_REALTIME_VALIDATION_NOTE = (
+    "Realtime compatibility note: some cross-field validation rules are enforced by Twinr at tool execution time "
+    "instead of the API schema. Follow the field descriptions exactly and only call this tool with complete, valid arguments."
+)
 
-def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
-    available = set(tool_names)
+
+# AUDIT-FIX(#1): Normalize accidental bare-string inputs and deduplicate tool names so callers do
+# not silently lose every capability because Python treats str as Iterable[str].
+def _normalize_tool_names(tool_names: Iterable[str] | str | bytes | bytearray | None) -> tuple[str, ...]:
+    if tool_names is None:
+        return ()
+
+    raw_items: Iterable[Any]
+    if isinstance(tool_names, str):
+        raw_items = (tool_names,)
+    elif isinstance(tool_names, (bytes, bytearray)):
+        raw_items = (tool_names.decode("utf-8", errors="ignore"),)
+    else:
+        raw_items = tool_names
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        if raw_item is None:
+            continue
+        if isinstance(raw_item, (bytes, bytearray)):
+            item = raw_item.decode("utf-8", errors="ignore").strip()
+        else:
+            item = str(raw_item).strip()
+        if not item or item in seen:
+            continue
+        normalized.append(item)
+        seen.add(item)
+    return tuple(normalized)
+
+
+def _unique_strings(values: Iterable[Any]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value).strip()
+        if not item or item in seen:
+            continue
+        unique.append(item)
+        seen.add(item)
+    return sorted(unique, key=str.casefold)
+
+
+def _string_property(
+    description: str,
+    *,
+    min_length: int | None = None,
+    enum: Sequence[str] | None = None,
+    pattern: str | None = None,
+    string_format: str | None = None,
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": "string", "description": description}
+    if min_length is not None:
+        schema["minLength"] = min_length
+    if enum is not None:
+        schema["enum"] = list(enum)
+    if pattern is not None:
+        schema["pattern"] = pattern
+    if string_format is not None:
+        schema["format"] = string_format
+    return schema
+
+
+def _number_property(
+    description: str,
+    *,
+    minimum: int | float | None = None,
+    maximum: int | float | None = None,
+    integer: bool = False,
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {
+        "type": "integer" if integer else "number",
+        "description": description,
+    }
+    if minimum is not None:
+        schema["minimum"] = minimum
+    if maximum is not None:
+        schema["maximum"] = maximum
+    return schema
+
+
+def _boolean_property(description: str) -> dict[str, Any]:
+    return {"type": "boolean", "description": description}
+
+
+def _array_property(
+    description: str,
+    items: dict[str, Any],
+    *,
+    min_items: int | None = None,
+    max_items: int | None = None,
+    unique_items: bool | None = None,
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {
+        "type": "array",
+        "description": description,
+        "items": items,
+    }
+    if min_items is not None:
+        schema["minItems"] = min_items
+    if max_items is not None:
+        schema["maxItems"] = max_items
+    if unique_items is not None:
+        schema["uniqueItems"] = unique_items
+    return schema
+
+
+# AUDIT-FIX(#2): Reuse strict date/time and weekday validators across reminder and automation
+# tools so malformed schedules are rejected before any side effects happen.
+def _iso8601_datetime_property(description: str) -> dict[str, Any]:
+    return _string_property(description, string_format="date-time")
+
+
+def _time_of_day_property(description: str) -> dict[str, Any]:
+    return _string_property(description, pattern=_LOCAL_TIME_HHMM_PATTERN)
+
+
+def _weekdays_property(description: str) -> dict[str, Any]:
+    return _array_property(
+        description,
+        _number_property(
+            "Weekday number where Monday is 0 and Sunday is 6.",
+            minimum=0,
+            maximum=6,
+            integer=True,
+        ),
+        min_items=1,
+        max_items=7,
+        unique_items=True,
+    )
+
+
+# AUDIT-FIX(#2): Express schedule-dependent requirements directly in the schema so
+# impossible automation payloads fail validation before execution.
+def _create_time_schedule_rules() -> list[dict[str, Any]]:
+    return [
+        {
+            "if": {"properties": {"schedule": {"const": "once"}}, "required": ["schedule"]},
+            "then": {"required": ["due_at"]},
+        },
+        {
+            "if": {"properties": {"schedule": {"const": "daily"}}, "required": ["schedule"]},
+            "then": {"required": ["time_of_day"]},
+        },
+        {
+            "if": {"properties": {"schedule": {"const": "weekly"}}, "required": ["schedule"]},
+            "then": {"required": ["time_of_day", "weekdays"]},
+        },
+    ]
+
+
+# AUDIT-FIX(#2): Prevent invalid schedule edits and no-op update calls from slipping
+# through to the automation executor.
+def _update_time_schedule_rules() -> list[dict[str, Any]]:
+    return [
+        {
+            "if": {"properties": {"schedule": {"const": "once"}}, "required": ["schedule"]},
+            "then": {"required": ["due_at"]},
+        },
+        {
+            "if": {"properties": {"schedule": {"const": "daily"}}, "required": ["schedule"]},
+            "then": {"required": ["time_of_day"]},
+        },
+        {
+            "if": {"properties": {"schedule": {"const": "weekly"}}, "required": ["schedule"]},
+            "then": {"required": ["time_of_day", "weekdays"]},
+        },
+        {
+            "anyOf": [
+                {"required": ["name"]},
+                {"required": ["description"]},
+                {"required": ["schedule"]},
+                {"required": ["due_at"]},
+                {"required": ["time_of_day"]},
+                {"required": ["weekdays"]},
+                {"required": ["delivery"]},
+                {"required": ["content_mode"]},
+                {"required": ["content"]},
+                {"required": ["allow_web_search"]},
+                {"required": ["enabled"]},
+                {"required": ["tags"]},
+                {"required": ["timezone_name"]},
+            ]
+        },
+    ]
+
+
+# AUDIT-FIX(#2): Require at least one mutable sensor field on update so a bare
+# automation_ref does not produce a confusing no-op tool call.
+def _update_sensor_rules() -> list[dict[str, Any]]:
+    return [
+        {
+            "anyOf": [
+                {"required": ["name"]},
+                {"required": ["description"]},
+                {"required": ["trigger_kind"]},
+                {"required": ["hold_seconds"]},
+                {"required": ["cooldown_seconds"]},
+                {"required": ["delivery"]},
+                {"required": ["content_mode"]},
+                {"required": ["content"]},
+                {"required": ["allow_web_search"]},
+                {"required": ["enabled"]},
+                {"required": ["tags"]},
+            ]
+        }
+    ]
+
+
+# AUDIT-FIX(#2): Constrain setting values by setting kind so the model cannot emit
+# unsupported voices or out-of-range runtime settings.
+def _simple_setting_rules(spoken_voices: Sequence[str]) -> list[dict[str, Any]]:
+    rules: list[dict[str, Any]] = [
+        {
+            "if": {"properties": {"action": {"const": "set"}}, "required": ["action"]},
+            "then": {"required": ["value"]},
+        },
+        {
+            "if": {"properties": {"setting": {"const": "memory_capacity"}}, "required": ["setting"]},
+            "then": {"properties": {"value": {"type": "integer", "minimum": 1, "maximum": 4}}},
+        },
+        {
+            "if": {"properties": {"setting": {"const": "speech_speed"}}, "required": ["setting"]},
+            "then": {"properties": {"value": {"type": "number", "minimum": 0.75, "maximum": 1.15}}},
+        },
+        {
+            "if": {"properties": {"setting": {"const": "speech_pause_ms"}}, "required": ["setting"]},
+            "then": {"properties": {"value": {"type": "integer", "minimum": 0}}},
+        },
+        {
+            "if": {"properties": {"setting": {"const": "follow_up_timeout_s"}}, "required": ["setting"]},
+            "then": {"properties": {"value": {"type": "number", "minimum": 0}}},
+        },
+    ]
+    if spoken_voices:
+        rules.append(
+            {
+                "if": {"properties": {"setting": {"const": "spoken_voice"}}, "required": ["setting"]},
+                "then": {
+                    "properties": {
+                        "action": {"const": "set"},
+                        "value": {
+                            "type": "string",
+                            "minLength": 1,
+                            "enum": list(spoken_voices),
+                        },
+                    },
+                    "required": ["value"],
+                },
+            }
+        )
+    return rules
+
+
+def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray | None) -> list[dict[str, Any]]:
+    normalized_tool_names = _normalize_tool_names(tool_names)
+    available = set(normalized_tool_names)
+
+    # AUDIT-FIX(#4): Snapshot dynamic capability providers once per build so every schema in the
+    # returned list is internally consistent even if the provider is mutable or generator-backed.
+    sensor_trigger_kinds = _unique_strings(supported_sensor_trigger_kinds())
+    setting_names = _unique_strings(supported_setting_names())
+    spoken_voices = _unique_strings(supported_spoken_voices())
+    spoken_voice_catalog = str(spoken_voice_options_context()).strip()
+
     tools: list[dict[str, Any]] = []
     if "print_receipt" in available:
         tools.append(
@@ -33,18 +307,18 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "focus_hint": {
-                            "type": "string",
-                            "description": "Short hint describing what from the recent conversation should be printed.",
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": (
-                                "Exact printable wording. Required when the user asked to print exact text, "
-                                "quoted text, or a literal string."
-                            ),
-                        },
+                        "focus_hint": _string_property(
+                            "Short hint describing what from the recent conversation should be printed.",
+                            min_length=1,
+                        ),
+                        "text": _string_property(
+                            "Exact printable wording. Required when the user asked to print exact text, "
+                            "quoted text, or a literal string.",
+                            min_length=1,
+                        ),
                     },
+                    # AUDIT-FIX(#2): Reject empty print jobs by requiring either focus_hint or text.
+                    "anyOf": [{"required": ["focus_hint"]}, {"required": ["text"]}],
                     "required": [],
                     "additionalProperties": False,
                 },
@@ -62,18 +336,18 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "The exact question to research on the web.",
-                        },
-                        "location_hint": {
-                            "type": "string",
-                            "description": "Optional location such as a city or district relevant to the search.",
-                        },
-                        "date_context": {
-                            "type": "string",
-                            "description": "Optional absolute date or time context if the user referred to relative dates.",
-                        },
+                        "question": _string_property(
+                            "The exact question to research on the web.",
+                            min_length=1,
+                        ),
+                        "location_hint": _string_property(
+                            "Optional location such as a city or district relevant to the search.",
+                            min_length=1,
+                        ),
+                        "date_context": _string_property(
+                            "Optional absolute date or time context if the user referred to relative dates.",
+                            min_length=1,
+                        ),
                     },
                     "required": ["question"],
                     "additionalProperties": False,
@@ -92,26 +366,25 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "due_at": {
-                            "type": "string",
-                            "description": "Absolute local due time in ISO 8601 format, for example 2026-03-14T12:00:00+01:00.",
-                        },
-                        "summary": {
-                            "type": "string",
-                            "description": "Short summary of what Twinr should remind the user about.",
-                        },
-                        "details": {
-                            "type": "string",
-                            "description": "Optional extra detail to include when the reminder is spoken.",
-                        },
-                        "kind": {
-                            "type": "string",
-                            "description": "Short type such as reminder, timer, appointment, medication, task, or alarm.",
-                        },
-                        "original_request": {
-                            "type": "string",
-                            "description": "Optional short quote or paraphrase of the user's original reminder request.",
-                        },
+                        "due_at": _iso8601_datetime_property(
+                            "Absolute local due time in ISO 8601 format, for example 2026-03-14T12:00:00+01:00."
+                        ),
+                        "summary": _string_property(
+                            "Short summary of what Twinr should remind the user about.",
+                            min_length=1,
+                        ),
+                        "details": _string_property(
+                            "Optional extra detail to include when the reminder is spoken.",
+                            min_length=1,
+                        ),
+                        "kind": _string_property(
+                            "Short type such as reminder, timer, appointment, medication, task, or alarm.",
+                            min_length=1,
+                        ),
+                        "original_request": _string_property(
+                            "Optional short quote or paraphrase of the user's original reminder request.",
+                            min_length=1,
+                        ),
                     },
                     "required": ["due_at", "summary"],
                     "additionalProperties": False,
@@ -130,10 +403,9 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "include_disabled": {
-                            "type": "boolean",
-                            "description": "Set true if disabled automations should also be included.",
-                        }
+                        "include_disabled": _boolean_property(
+                            "Set true if disabled automations should also be included."
+                        )
                     },
                     "required": [],
                     "additionalProperties": False,
@@ -152,59 +424,59 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Short operator-friendly name for the automation."},
-                        "description": {"type": "string", "description": "Optional short description of what the automation does."},
-                        "schedule": {
-                            "type": "string",
-                            "enum": ["once", "daily", "weekly"],
-                            "description": "Time schedule type.",
-                        },
-                        "due_at": {
-                            "type": "string",
-                            "description": "Absolute ISO 8601 local datetime with timezone offset for once schedules.",
-                        },
-                        "time_of_day": {
-                            "type": "string",
-                            "description": "Local time in HH:MM for daily or weekly schedules.",
-                        },
-                        "weekdays": {
-                            "type": "array",
-                            "description": "Weekday numbers for weekly schedules, where Monday is 0 and Sunday is 6.",
-                            "items": {"type": "integer"},
-                        },
-                        "delivery": {
-                            "type": "string",
-                            "enum": ["spoken", "printed"],
-                            "description": "Whether the automation should speak or print when it runs.",
-                        },
-                        "content_mode": {
-                            "type": "string",
-                            "enum": ["llm_prompt", "static_text"],
-                            "description": "Use llm_prompt for generated content or static_text for fixed wording.",
-                        },
-                        "content": {"type": "string", "description": "The prompt or static text the automation should use."},
-                        "allow_web_search": {
-                            "type": "boolean",
-                            "description": "Set true when the automation needs fresh live information from the web.",
-                        },
-                        "enabled": {
-                            "type": "boolean",
-                            "description": "Whether the automation should be active immediately.",
-                        },
-                        "tags": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional short tags for operator organization.",
-                        },
-                        "timezone_name": {
-                            "type": "string",
-                            "description": "Optional timezone name. Use the local Twinr timezone unless there is a clear reason not to.",
-                        },
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed.",
-                        },
+                        "name": _string_property(
+                            "Short operator-friendly name for the automation.",
+                            min_length=1,
+                        ),
+                        "description": _string_property(
+                            "Optional short description of what the automation does.",
+                            min_length=1,
+                        ),
+                        "schedule": _string_property(
+                            "Time schedule type.",
+                            enum=["once", "daily", "weekly"],
+                        ),
+                        "due_at": _iso8601_datetime_property(
+                            "Absolute ISO 8601 local datetime with timezone offset for once schedules."
+                        ),
+                        "time_of_day": _time_of_day_property(
+                            "Local time in HH:MM for daily or weekly schedules."
+                        ),
+                        "weekdays": _weekdays_property(
+                            "Weekday numbers for weekly schedules, where Monday is 0 and Sunday is 6."
+                        ),
+                        "delivery": _string_property(
+                            "Whether the automation should speak or print when it runs.",
+                            enum=["spoken", "printed"],
+                        ),
+                        "content_mode": _string_property(
+                            "Use llm_prompt for generated content or static_text for fixed wording.",
+                            enum=["llm_prompt", "static_text"],
+                        ),
+                        "content": _string_property(
+                            "The prompt or static text the automation should use.",
+                            min_length=1,
+                        ),
+                        "allow_web_search": _boolean_property(
+                            "Set true when the automation needs fresh live information from the web."
+                        ),
+                        "enabled": _boolean_property(
+                            "Whether the automation should be active immediately."
+                        ),
+                        "tags": _array_property(
+                            "Optional short tags for operator organization.",
+                            _string_property("Tag.", min_length=1),
+                            unique_items=True,
+                        ),
+                        "timezone_name": _string_property(
+                            "Optional timezone name. Use the local Twinr timezone unless there is a clear reason not to.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed."
+                        ),
                     },
+                    "allOf": _create_time_schedule_rules(),
                     "required": ["name", "schedule", "delivery", "content_mode", "content"],
                     "additionalProperties": False,
                 },
@@ -222,49 +494,52 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Short operator-friendly name for the automation."},
-                        "description": {"type": "string", "description": "Optional short description of what the automation does."},
-                        "trigger_kind": {
-                            "type": "string",
-                            "enum": list(supported_sensor_trigger_kinds()),
-                            "description": "Supported sensor trigger type.",
-                        },
-                        "hold_seconds": {
-                            "type": "number",
-                            "description": "Optional required hold duration before firing. Required for quiet/no-motion triggers.",
-                        },
-                        "cooldown_seconds": {
-                            "type": "number",
-                            "description": "Optional cooldown after the automation fired.",
-                        },
-                        "delivery": {
-                            "type": "string",
-                            "enum": ["spoken", "printed"],
-                            "description": "Whether the automation should speak or print when it runs.",
-                        },
-                        "content_mode": {
-                            "type": "string",
-                            "enum": ["llm_prompt", "static_text"],
-                            "description": "Use llm_prompt for generated content or static_text for fixed wording.",
-                        },
-                        "content": {"type": "string", "description": "The prompt or static text the automation should use."},
-                        "allow_web_search": {
-                            "type": "boolean",
-                            "description": "Set true when the automation needs fresh live information from the web.",
-                        },
-                        "enabled": {
-                            "type": "boolean",
-                            "description": "Whether the automation should be active immediately.",
-                        },
-                        "tags": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional short tags for operator organization.",
-                        },
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed.",
-                        },
+                        "name": _string_property(
+                            "Short operator-friendly name for the automation.",
+                            min_length=1,
+                        ),
+                        "description": _string_property(
+                            "Optional short description of what the automation does.",
+                            min_length=1,
+                        ),
+                        "trigger_kind": _string_property(
+                            "Supported sensor trigger type.",
+                            enum=sensor_trigger_kinds,
+                        ),
+                        "hold_seconds": _number_property(
+                            "Optional required hold duration before firing. Required for quiet/no-motion triggers.",
+                            minimum=0,
+                        ),
+                        "cooldown_seconds": _number_property(
+                            "Optional cooldown after the automation fired.",
+                            minimum=0,
+                        ),
+                        "delivery": _string_property(
+                            "Whether the automation should speak or print when it runs.",
+                            enum=["spoken", "printed"],
+                        ),
+                        "content_mode": _string_property(
+                            "Use llm_prompt for generated content or static_text for fixed wording.",
+                            enum=["llm_prompt", "static_text"],
+                        ),
+                        "content": _string_property(
+                            "The prompt or static text the automation should use.",
+                            min_length=1,
+                        ),
+                        "allow_web_search": _boolean_property(
+                            "Set true when the automation needs fresh live information from the web."
+                        ),
+                        "enabled": _boolean_property(
+                            "Whether the automation should be active immediately."
+                        ),
+                        "tags": _array_property(
+                            "Optional short tags for operator organization.",
+                            _string_property("Tag.", min_length=1),
+                            unique_items=True,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed."
+                        ),
                     },
                     "required": ["name", "trigger_kind", "delivery", "content_mode", "content"],
                     "additionalProperties": False,
@@ -280,57 +555,58 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "automation_ref": {"type": "string", "description": "Automation id or a clear automation name."},
-                        "name": {"type": "string", "description": "Optional new automation name."},
-                        "description": {"type": "string", "description": "Optional new description."},
-                        "schedule": {
-                            "type": "string",
-                            "enum": ["once", "daily", "weekly"],
-                            "description": "Optional new time schedule type.",
-                        },
-                        "due_at": {
-                            "type": "string",
-                            "description": "Absolute ISO 8601 local datetime with timezone offset for once schedules.",
-                        },
-                        "time_of_day": {
-                            "type": "string",
-                            "description": "Local time in HH:MM for daily or weekly schedules.",
-                        },
-                        "weekdays": {
-                            "type": "array",
-                            "description": "Weekday numbers for weekly schedules, where Monday is 0 and Sunday is 6.",
-                            "items": {"type": "integer"},
-                        },
-                        "delivery": {
-                            "type": "string",
-                            "enum": ["spoken", "printed"],
-                            "description": "Optional new delivery mode.",
-                        },
-                        "content_mode": {
-                            "type": "string",
-                            "enum": ["llm_prompt", "static_text"],
-                            "description": "Optional new content mode. If omitted, keep the current mode.",
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Optional new prompt or static text. If omitted, keep the current wording.",
-                        },
-                        "allow_web_search": {
-                            "type": "boolean",
-                            "description": "Optional new live-search flag for llm_prompt content.",
-                        },
-                        "enabled": {"type": "boolean", "description": "Optional enabled toggle."},
-                        "tags": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional full replacement tag list.",
-                        },
-                        "timezone_name": {"type": "string", "description": "Optional new timezone name."},
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed.",
-                        },
+                        "automation_ref": _string_property(
+                            "Automation id or a clear automation name.",
+                            min_length=1,
+                        ),
+                        "name": _string_property("Optional new automation name.", min_length=1),
+                        "description": _string_property(
+                            "Optional new description.",
+                            min_length=1,
+                        ),
+                        "schedule": _string_property(
+                            "Optional new time schedule type.",
+                            enum=["once", "daily", "weekly"],
+                        ),
+                        "due_at": _iso8601_datetime_property(
+                            "Absolute ISO 8601 local datetime with timezone offset for once schedules."
+                        ),
+                        "time_of_day": _time_of_day_property(
+                            "Local time in HH:MM for daily or weekly schedules."
+                        ),
+                        "weekdays": _weekdays_property(
+                            "Weekday numbers for weekly schedules, where Monday is 0 and Sunday is 6."
+                        ),
+                        "delivery": _string_property(
+                            "Optional new delivery mode.",
+                            enum=["spoken", "printed"],
+                        ),
+                        "content_mode": _string_property(
+                            "Optional new content mode. If omitted, keep the current mode.",
+                            enum=["llm_prompt", "static_text"],
+                        ),
+                        "content": _string_property(
+                            "Optional new prompt or static text. If omitted, keep the current wording.",
+                            min_length=1,
+                        ),
+                        "allow_web_search": _boolean_property(
+                            "Optional new live-search flag for llm_prompt content."
+                        ),
+                        "enabled": _boolean_property("Optional enabled toggle."),
+                        "tags": _array_property(
+                            "Optional full replacement tag list.",
+                            _string_property("Tag.", min_length=1),
+                            unique_items=True,
+                        ),
+                        "timezone_name": _string_property(
+                            "Optional new timezone name.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed."
+                        ),
                     },
+                    "allOf": _update_time_schedule_rules(),
                     "required": ["automation_ref"],
                     "additionalProperties": False,
                 },
@@ -349,42 +625,53 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "automation_ref": {"type": "string", "description": "Automation id or a clear automation name."},
-                        "name": {"type": "string", "description": "Optional new automation name."},
-                        "description": {"type": "string", "description": "Optional new description."},
-                        "trigger_kind": {
-                            "type": "string",
-                            "enum": list(supported_sensor_trigger_kinds()),
-                            "description": "Optional new supported sensor trigger type.",
-                        },
-                        "hold_seconds": {"type": "number", "description": "Optional hold duration before firing."},
-                        "cooldown_seconds": {"type": "number", "description": "Optional cooldown after the automation fired."},
-                        "delivery": {
-                            "type": "string",
-                            "enum": ["spoken", "printed"],
-                            "description": "Optional new delivery mode.",
-                        },
-                        "content_mode": {
-                            "type": "string",
-                            "enum": ["llm_prompt", "static_text"],
-                            "description": "Optional new content mode.",
-                        },
-                        "content": {"type": "string", "description": "Optional new prompt or static text."},
-                        "allow_web_search": {
-                            "type": "boolean",
-                            "description": "Optional new live-search flag for llm_prompt content.",
-                        },
-                        "enabled": {"type": "boolean", "description": "Optional enabled toggle."},
-                        "tags": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional full replacement tag list.",
-                        },
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed.",
-                        },
+                        "automation_ref": _string_property(
+                            "Automation id or a clear automation name.",
+                            min_length=1,
+                        ),
+                        "name": _string_property("Optional new automation name.", min_length=1),
+                        "description": _string_property(
+                            "Optional new description.",
+                            min_length=1,
+                        ),
+                        "trigger_kind": _string_property(
+                            "Optional new supported sensor trigger type.",
+                            enum=sensor_trigger_kinds,
+                        ),
+                        "hold_seconds": _number_property(
+                            "Optional hold duration before firing.",
+                            minimum=0,
+                        ),
+                        "cooldown_seconds": _number_property(
+                            "Optional cooldown after the automation fired.",
+                            minimum=0,
+                        ),
+                        "delivery": _string_property(
+                            "Optional new delivery mode.",
+                            enum=["spoken", "printed"],
+                        ),
+                        "content_mode": _string_property(
+                            "Optional new content mode.",
+                            enum=["llm_prompt", "static_text"],
+                        ),
+                        "content": _string_property(
+                            "Optional new prompt or static text.",
+                            min_length=1,
+                        ),
+                        "allow_web_search": _boolean_property(
+                            "Optional new live-search flag for llm_prompt content."
+                        ),
+                        "enabled": _boolean_property("Optional enabled toggle."),
+                        "tags": _array_property(
+                            "Optional full replacement tag list.",
+                            _string_property("Tag.", min_length=1),
+                            unique_items=True,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this persistent automation change when extra confirmation is needed."
+                        ),
                     },
+                    "allOf": _update_sensor_rules(),
                     "required": ["automation_ref"],
                     "additionalProperties": False,
                 },
@@ -399,11 +686,13 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "automation_ref": {"type": "string", "description": "Automation id or a clear automation name."},
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed the deletion when extra confirmation is needed.",
-                        },
+                        "automation_ref": _string_property(
+                            "Automation id or a clear automation name.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed the deletion when extra confirmation is needed."
+                        ),
                     },
                     "required": ["automation_ref"],
                     "additionalProperties": False,
@@ -423,22 +712,21 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "kind": {
-                            "type": "string",
-                            "description": "Short type such as appointment, contact, reminder, preference, fact, or task.",
-                        },
-                        "summary": {
-                            "type": "string",
-                            "description": "Short factual summary of what should be remembered.",
-                        },
-                        "details": {
-                            "type": "string",
-                            "description": "Optional extra detail that helps later recall.",
-                        },
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed the persistent save when extra confirmation is needed.",
-                        },
+                        "kind": _string_property(
+                            "Short type such as appointment, contact, reminder, preference, fact, or task.",
+                            min_length=1,
+                        ),
+                        "summary": _string_property(
+                            "Short factual summary of what should be remembered.",
+                            min_length=1,
+                        ),
+                        "details": _string_property(
+                            "Optional extra detail that helps later recall.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed the persistent save when extra confirmation is needed."
+                        ),
                     },
                     "required": ["summary"],
                     "additionalProperties": False,
@@ -458,26 +746,38 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "given_name": {"type": "string", "description": "First name or main short name of the contact."},
-                        "family_name": {"type": "string", "description": "Optional family name if known."},
-                        "phone": {"type": "string", "description": "Optional phone number if the user gave one."},
-                        "email": {"type": "string", "description": "Optional email if the user gave one."},
-                        "role": {
-                            "type": "string",
-                            "description": "Optional role such as physiotherapist, daughter, neighbor, or friend.",
-                        },
-                        "relation": {
-                            "type": "string",
-                            "description": "Optional relationship wording such as daughter, family, or helper.",
-                        },
-                        "notes": {
-                            "type": "string",
-                            "description": "Optional short detail that helps future disambiguation.",
-                        },
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed the persistent save when extra confirmation is needed.",
-                        },
+                        "given_name": _string_property(
+                            "First name or main short name of the contact.",
+                            min_length=1,
+                        ),
+                        "family_name": _string_property(
+                            "Optional family name if known.",
+                            min_length=1,
+                        ),
+                        "phone": _string_property(
+                            "Optional phone number if the user gave one.",
+                            min_length=1,
+                        ),
+                        "email": _string_property(
+                            "Optional email if the user gave one.",
+                            min_length=1,
+                            string_format="email",
+                        ),
+                        "role": _string_property(
+                            "Optional role such as physiotherapist, daughter, neighbor, or friend.",
+                            min_length=1,
+                        ),
+                        "relation": _string_property(
+                            "Optional relationship wording such as daughter, family, or helper.",
+                            min_length=1,
+                        ),
+                        "notes": _string_property(
+                            "Optional short detail that helps future disambiguation.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed the persistent save when extra confirmation is needed."
+                        ),
                     },
                     "required": ["given_name"],
                     "additionalProperties": False,
@@ -496,12 +796,18 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Name or short name of the contact to look up."},
-                        "family_name": {"type": "string", "description": "Optional family name if the user gave one."},
-                        "role": {
-                            "type": "string",
-                            "description": "Optional role such as physiotherapist, daughter, or neighbor.",
-                        },
+                        "name": _string_property(
+                            "Name or short name of the contact to look up.",
+                            min_length=1,
+                        ),
+                        "family_name": _string_property(
+                            "Optional family name if the user gave one.",
+                            min_length=1,
+                        ),
+                        "role": _string_property(
+                            "Optional role such as physiotherapist, daughter, or neighbor.",
+                            min_length=1,
+                        ),
                     },
                     "required": ["name"],
                     "additionalProperties": False,
@@ -521,13 +827,11 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query_text": {
-                            "type": "string",
-                            "description": (
-                                "Optional short query describing the current topic, such as Corinna, physiotherapist, "
-                                "phone number, spouse, or coffee brand."
-                            ),
-                        },
+                        "query_text": _string_property(
+                            "Optional short query describing the current topic, such as Corinna, physiotherapist, "
+                            "phone number, spouse, or coffee brand.",
+                            min_length=1,
+                        ),
                     },
                     "required": [],
                     "additionalProperties": False,
@@ -546,18 +850,17 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "slot_key": {
-                            "type": "string",
-                            "description": "The conflict slot key to resolve, for example contact:person:corinna_maier:phone.",
-                        },
-                        "selected_memory_id": {
-                            "type": "string",
-                            "description": "The chosen memory_id from the conflict options that should become active.",
-                        },
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed the persistent memory correction when extra confirmation is needed.",
-                        },
+                        "slot_key": _string_property(
+                            "The conflict slot key to resolve, for example contact:person:corinna_maier:phone.",
+                            min_length=1,
+                        ),
+                        "selected_memory_id": _string_property(
+                            "The chosen memory_id from the conflict options that should become active.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed the persistent memory correction when extra confirmation is needed."
+                        ),
                     },
                     "required": ["slot_key", "selected_memory_id"],
                     "additionalProperties": False,
@@ -576,24 +879,29 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "category": {
-                            "type": "string",
-                            "description": "Short category such as brand, store, food, drink, activity, music, or thing.",
-                        },
-                        "value": {
-                            "type": "string",
-                            "description": "The preferred or disliked thing, place, or brand.",
-                        },
-                        "for_product": {"type": "string", "description": "Optional product context, for example coffee."},
-                        "sentiment": {
-                            "type": "string",
-                            "description": "Use prefer, like, dislike, or usually_buy_at.",
-                        },
-                        "details": {"type": "string", "description": "Optional short detail for later recall."},
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed the persistent save when extra confirmation is needed.",
-                        },
+                        "category": _string_property(
+                            "Short category such as brand, store, food, drink, activity, music, or thing.",
+                            min_length=1,
+                        ),
+                        "value": _string_property(
+                            "The preferred or disliked thing, place, or brand.",
+                            min_length=1,
+                        ),
+                        "for_product": _string_property(
+                            "Optional product context, for example coffee.",
+                            min_length=1,
+                        ),
+                        "sentiment": _string_property(
+                            "Use prefer, like, dislike, or usually_buy_at.",
+                            min_length=1,
+                        ),
+                        "details": _string_property(
+                            "Optional short detail for later recall.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed the persistent save when extra confirmation is needed."
+                        ),
                     },
                     "required": ["category", "value"],
                     "additionalProperties": False,
@@ -612,16 +920,18 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "summary": {"type": "string", "description": "Short plan summary."},
-                        "when": {
-                            "type": "string",
-                            "description": "Optional time wording such as today, tomorrow, 2026-03-14, or next Monday.",
-                        },
-                        "details": {"type": "string", "description": "Optional short detail for later recall."},
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed the persistent save when extra confirmation is needed.",
-                        },
+                        "summary": _string_property("Short plan summary.", min_length=1),
+                        "when": _string_property(
+                            "Optional time wording such as today, tomorrow, 2026-03-14, or next Monday.",
+                            min_length=1,
+                        ),
+                        "details": _string_property(
+                            "Optional short detail for later recall.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed the persistent save when extra confirmation is needed."
+                        ),
                     },
                     "required": ["summary"],
                     "additionalProperties": False,
@@ -640,18 +950,17 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "category": {
-                            "type": "string",
-                            "description": "Short category such as preferred_name, location, preference, contact, or routine.",
-                        },
-                        "instruction": {
-                            "type": "string",
-                            "description": "Short, durable instruction or fact to store in the user profile.",
-                        },
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed this persistent profile change when extra confirmation is needed.",
-                        },
+                        "category": _string_property(
+                            "Short category such as preferred_name, location, preference, contact, or routine.",
+                            min_length=1,
+                        ),
+                        "instruction": _string_property(
+                            "Short, durable instruction or fact to store in the user profile.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this persistent profile change when extra confirmation is needed."
+                        ),
                     },
                     "required": ["category", "instruction"],
                     "additionalProperties": False,
@@ -670,18 +979,17 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "category": {
-                            "type": "string",
-                            "description": "Short category such as response_style, humor, language, verbosity, or greeting_style.",
-                        },
-                        "instruction": {
-                            "type": "string",
-                            "description": "Short future-behavior instruction to store in Twinr personality context.",
-                        },
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed this persistent behavior change when extra confirmation is needed.",
-                        },
+                        "category": _string_property(
+                            "Short category such as response_style, humor, language, verbosity, or greeting_style.",
+                            min_length=1,
+                        ),
+                        "instruction": _string_property(
+                            "Short future-behavior instruction to store in Twinr personality context.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this persistent behavior change when extra confirmation is needed."
+                        ),
                     },
                     "required": ["category", "instruction"],
                     "additionalProperties": False,
@@ -702,39 +1010,38 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "setting": {
-                            "type": "string",
-                            "enum": list(supported_setting_names()),
-                            "description": (
-                                "Supported setting. memory_capacity changes how much recent conversation Twinr keeps. "
-                                f"spoken_voice changes the spoken voice and must be set to one of: {', '.join(supported_spoken_voices())}. "
-                                "speech_speed changes the overall speaking speed for both normal TTS and realtime speech. "
-                                "speech_pause_ms changes how long Twinr waits for a short pause before stopping recording. "
-                                "follow_up_timeout_s changes how long the hands-free follow-up listening window stays open."
-                            ),
-                        },
-                        "action": {
-                            "type": "string",
-                            "enum": ["increase", "decrease", "set"],
-                            "description": "Use increase/decrease for relative requests and set when the user gave a concrete value.",
-                        },
+                        "setting": _string_property(
+                            "Supported setting. memory_capacity changes how much recent conversation Twinr keeps. "
+                            f"spoken_voice changes the spoken voice and must be set to one of: {', '.join(spoken_voices)}. "
+                            "speech_speed changes the overall speaking speed for both normal TTS and realtime speech. "
+                            "speech_pause_ms changes how long Twinr waits for a short pause before stopping recording. "
+                            "follow_up_timeout_s changes how long the hands-free follow-up listening window stays open.",
+                            enum=setting_names,
+                        ),
+                        "action": _string_property(
+                            "Use increase/decrease for relative requests and set when the user gave a concrete value.",
+                            enum=["increase", "decrease", "set"],
+                        ),
                         "value": {
-                            "anyOf": [{"type": "number"}, {"type": "string"}],
+                            "anyOf": [
+                                {"type": "number"},
+                                {"type": "string", "minLength": 1},
+                            ],
                             "description": (
                                 "Optional concrete value for action=set. "
                                 "For memory_capacity use levels 1 to 4. "
-                                f"For spoken_voice pass one supported voice name from this catalog: {spoken_voice_options_context()}. "
+                                f"For spoken_voice pass one supported voice name from this catalog: {spoken_voice_catalog}. "
                                 "Do not pass a free-form description. "
                                 "For speech_speed use a factor between 0.75 and 1.15. "
                                 "For speech_pause_ms use milliseconds. "
                                 "For follow_up_timeout_s use seconds."
                             ),
                         },
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed this persistent setting change when extra confirmation is needed.",
-                        },
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this persistent setting change when extra confirmation is needed."
+                        ),
                     },
+                    "allOf": _simple_setting_rules(spoken_voices),
                     "required": ["setting", "action"],
                     "additionalProperties": False,
                 },
@@ -752,10 +1059,9 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed a replacement when extra confirmation is needed.",
-                        }
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed a replacement when extra confirmation is needed."
+                        )
                     },
                     "required": [],
                     "additionalProperties": False,
@@ -785,10 +1091,9 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "confirmed": {
-                            "type": "boolean",
-                            "description": "Set true only after the user clearly confirmed the reset when extra confirmation is needed.",
-                        }
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed the reset when extra confirmation is needed."
+                        )
                     },
                     "required": [],
                     "additionalProperties": False,
@@ -807,10 +1112,14 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "reason": {
-                            "type": "string",
-                            "description": "Optional short note describing why the conversation should end.",
-                        }
+                        "reason": _string_property(
+                            "Optional short note describing why the conversation should end.",
+                            min_length=1,
+                        ),
+                        "spoken_reply": _string_property(
+                            "Short goodbye that Twinr should say immediately while ending the conversation.",
+                            min_length=1,
+                        ),
                     },
                     "required": [],
                     "additionalProperties": False,
@@ -829,10 +1138,10 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "The exact user request about what should be inspected in the camera view.",
-                        }
+                        "question": _string_property(
+                            "The exact user request about what should be inspected in the camera view.",
+                            min_length=1,
+                        )
                     },
                     "required": ["question"],
                     "additionalProperties": False,
@@ -842,7 +1151,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
     return tools
 
 
-def build_compact_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
+def build_compact_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray | None) -> list[dict[str, Any]]:
     return [_compact_tool_schema(schema) for schema in build_agent_tool_schemas(tool_names)]
 
 
@@ -866,15 +1175,9 @@ def _compact_schema_node(node: Any) -> Any:
         for key, value in node.items():
             if key == "description":
                 continue
-            if key in {"type", "required", "additionalProperties", "enum"}:
-                compact[key] = value
-            elif key == "properties" and isinstance(value, dict):
-                compact["properties"] = {
-                    str(property_name): _compact_schema_node(property_schema)
-                    for property_name, property_schema in value.items()
-                }
-            elif key == "items":
-                compact[key] = _compact_schema_node(value)
+            # AUDIT-FIX(#3): Preserve the full JSON-Schema shape during compaction instead of
+            # whitelisting a few keywords and silently dropping anyOf/allOf/if/then/const/format.
+            compact[key] = _compact_schema_node(value)
         return compact
     if isinstance(node, list):
         return [_compact_schema_node(item) for item in node]
@@ -891,5 +1194,51 @@ def _compact_description(value: object) -> str | None:
     return first_sentence[:69].rstrip() + "..."
 
 
-def build_realtime_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
-    return build_agent_tool_schemas(tool_names)
+def _append_realtime_validation_note(description: object) -> str:
+    base = str(description or "").strip()
+    if not base:
+        return _REALTIME_VALIDATION_NOTE
+    if _REALTIME_VALIDATION_NOTE in base:
+        return base
+    return f"{base} {_REALTIME_VALIDATION_NOTE}"
+
+
+def _build_realtime_parameters(parameters: dict[str, Any]) -> tuple[dict[str, Any], tuple[str, ...]]:
+    realtime_parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+    removed_keys = tuple(
+        key for key in sorted(_REALTIME_TOP_LEVEL_UNSUPPORTED_SCHEMA_KEYS) if key in parameters
+    )
+    properties = parameters.get("properties")
+    if isinstance(properties, dict):
+        realtime_parameters["properties"] = deepcopy(properties)
+    required = parameters.get("required")
+    if isinstance(required, list):
+        realtime_parameters["required"] = deepcopy(required)
+    additional_properties = parameters.get("additionalProperties")
+    if isinstance(additional_properties, bool):
+        realtime_parameters["additionalProperties"] = additional_properties
+    description = parameters.get("description")
+    if isinstance(description, str) and description.strip():
+        realtime_parameters["description"] = description.strip()
+    return realtime_parameters, removed_keys
+
+
+def _build_realtime_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    realtime_schema = deepcopy(schema)
+    parameters = schema.get("parameters")
+    if not isinstance(parameters, dict):
+        return realtime_schema
+    realtime_parameters, removed_keys = _build_realtime_parameters(parameters)
+    realtime_schema["parameters"] = realtime_parameters
+    if removed_keys:
+        realtime_schema["description"] = _append_realtime_validation_note(realtime_schema.get("description"))
+    return realtime_schema
+
+
+def build_realtime_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray | None) -> list[dict[str, Any]]:
+    return [_build_realtime_tool_schema(schema) for schema in build_agent_tool_schemas(tool_names)]

@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -9,7 +10,13 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
-from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult, ToolCallingTurnResponse
+from twinr.agent.base_agent.contracts import (
+    AgentToolCall,
+    AgentToolResult,
+    StreamingSpeechEndpointEvent,
+    StreamingTranscriptionResult,
+    ToolCallingTurnResponse,
+)
 from twinr.hardware import VoiceAssessment
 from twinr.memory.longterm import LongTermConsolidationResultV1, LongTermMemoryObjectV1, LongTermSourceRefV1
 from twinr.memory.reminders import now_in_timezone
@@ -39,8 +46,13 @@ def _longterm_source(event_id: str) -> LongTermSourceRefV1:
     )
 
 
+def _fresh_checked_at() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
 class FakeBackend:
     def __init__(self) -> None:
+        self.config = TwinrConfig()
         self.transcribe_calls: list[tuple[bytes, str, str]] = []
         self.respond_calls: list[tuple[str, tuple[tuple[str, str], ...] | None, bool | None]] = []
         self.respond_to_images_calls: list[
@@ -64,6 +76,23 @@ class FakeBackend:
         if on_text_delta is not None:
             for chunk in ("Hello ", "back."):
                 on_text_delta(chunk)
+        return OpenAITextResponse(
+            text=self.answer,
+            response_id="resp_123",
+            request_id="req_123",
+            used_web_search=self.used_web_search,
+        )
+
+    def respond_with_metadata(
+        self,
+        prompt: str,
+        *,
+        conversation=None,
+        instructions=None,
+        allow_web_search=None,
+    ) -> OpenAITextResponse:
+        del instructions
+        self.respond_calls.append((prompt, conversation, allow_web_search))
         return OpenAITextResponse(
             text=self.answer,
             response_id="resp_123",
@@ -167,6 +196,24 @@ class FakeBackend:
             used_web_search=False,
         )
 
+    def fulfill_automation_prompt_with_metadata(
+        self,
+        prompt: str,
+        *,
+        allow_web_search: bool,
+        delivery: str = "spoken",
+    ) -> OpenAITextResponse:
+        del delivery
+        self.respond_calls.append((prompt, None, allow_web_search))
+        return OpenAITextResponse(
+            text=self.answer,
+            response_id="resp_auto_1",
+            request_id="req_auto_1",
+            model="gpt-5.2",
+            token_usage=None,
+            used_web_search=allow_web_search,
+        )
+
 
 class FakeRecorder:
     def __init__(self, recordings: list[bytes | Exception] | None = None) -> None:
@@ -184,11 +231,21 @@ class FakeRecorder:
         speech_start_chunks: int | None = None,
         ignore_initial_ms: int = 0,
         pause_grace_ms: int = 0,
+        on_chunk=None,
+        should_stop=None,
     ):
         del max_record_seconds, speech_start_chunks, ignore_initial_ms
         self.pause_values.append(pause_ms)
         self.start_timeouts.append(start_timeout_s)
         self.pause_grace_values.append(pause_grace_ms)
+        if on_chunk is not None:
+            on_chunk(b"PCM-A")
+            on_chunk(b"PCM-B")
+        if should_stop is not None:
+            for _ in range(50):
+                if should_stop():
+                    break
+                time.sleep(0.001)
         if not self.recordings:
             value: bytes | Exception = b"PCMINPUT"
         else:
@@ -334,6 +391,133 @@ class FakeToolCallingProvider:
         )
 
 
+class FakeTurnStreamingSpeechSession:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.closed = False
+        self._on_endpoint = None
+        self.finalize_calls = 0
+
+    def send_pcm(self, pcm_bytes: bytes) -> None:
+        self.sent.append(pcm_bytes)
+        if len(self.sent) == 2 and self._on_endpoint is not None:
+            self._on_endpoint(
+                StreamingSpeechEndpointEvent(
+                    transcript="ich bin immernoch am programmieren, nur damit du es weisst",
+                    event_type="speech_final",
+                    speech_final=True,
+                )
+            )
+
+    def snapshot(self) -> StreamingTranscriptionResult:
+        return StreamingTranscriptionResult(
+            transcript="ich bin immernoch am programmieren, nur damit du es weisst",
+            request_id="turn-stt-1",
+            saw_interim=True,
+            saw_speech_final=True,
+            saw_utterance_end=False,
+        )
+
+    def finalize(self) -> StreamingTranscriptionResult:
+        self.finalize_calls += 1
+        return StreamingTranscriptionResult(
+            transcript="ich bin immernoch am programmieren, nur damit du es weisst",
+            request_id="turn-stt-1",
+            saw_interim=True,
+            saw_speech_final=True,
+            saw_utterance_end=False,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeTurnStreamingSpeechToTextProvider:
+    def __init__(self, config: TwinrConfig) -> None:
+        self.config = config
+        self.session = FakeTurnStreamingSpeechSession()
+        self.start_calls: list[dict[str, object]] = []
+
+    def transcribe(self, audio_bytes: bytes, **kwargs) -> str:
+        del audio_bytes, kwargs
+        return "ich bin immernoch am programmieren, nur damit du es weisst"
+
+    def transcribe_path(self, path, **kwargs) -> str:
+        del path, kwargs
+        return "ich bin immernoch am programmieren, nur damit du es weisst"
+
+    def start_streaming_session(
+        self,
+        *,
+        sample_rate: int,
+        channels: int,
+        language: str | None = None,
+        prompt: str | None = None,
+        on_interim=None,
+        on_endpoint=None,
+    ):
+        del prompt
+        self.start_calls.append(
+            {
+                "sample_rate": sample_rate,
+                "channels": channels,
+                "language": language,
+            }
+        )
+        self.session._on_endpoint = on_endpoint
+        if on_interim is not None:
+            on_interim("ich bin immernoch")
+        return self.session
+
+
+class FakeTurnToolAgentProvider:
+    def __init__(self, config: TwinrConfig) -> None:
+        self.config = config
+        self.start_calls: list[dict[str, object]] = []
+
+    def start_turn_streaming(
+        self,
+        prompt: str,
+        *,
+        conversation=None,
+        instructions=None,
+        tool_schemas=(),
+        allow_web_search=None,
+        on_text_delta=None,
+    ) -> ToolCallingTurnResponse:
+        del on_text_delta
+        self.start_calls.append(
+            {
+                "prompt": prompt,
+                "conversation": conversation,
+                "instructions": instructions,
+                "tool_schemas": list(tool_schemas),
+                "allow_web_search": allow_web_search,
+            }
+        )
+        return ToolCallingTurnResponse(
+            text="",
+            tool_calls=(
+                AgentToolCall(
+                    name="submit_turn_decision",
+                    call_id="call_turn_1",
+                    arguments={
+                        "decision": "end_turn",
+                        "confidence": 0.94,
+                        "reason": "complete_request",
+                        "transcript": "ich bin immernoch am programmieren, nur damit du es weisst",
+                    },
+                ),
+            ),
+            response_id="resp_turn_controller_1",
+            request_id="req_turn_controller_1",
+            model="gpt-5.2",
+            token_usage=None,
+            used_web_search=False,
+            continuation_token="resp_turn_controller_1",
+        )
+
+
 class HardwareLoopTests(unittest.TestCase):
     def make_loop(
         self,
@@ -343,6 +527,8 @@ class HardwareLoopTests(unittest.TestCase):
         agent_provider=None,
         tts_provider=None,
         tool_agent_provider=None,
+        turn_stt_provider=None,
+        turn_tool_agent_provider=None,
         config: TwinrConfig | None = None,
         recorder: FakeRecorder | None = None,
         camera=None,
@@ -411,6 +597,8 @@ class HardwareLoopTests(unittest.TestCase):
             agent_provider=agent_provider,
             tts_provider=tts_provider,
             tool_agent_provider=tool_agent_provider,
+            turn_stt_provider=turn_stt_provider,
+            turn_tool_agent_provider=turn_tool_agent_provider,
             button_monitor=button_monitor or SimpleNamespace(__enter__=lambda self: self, __exit__=lambda self, exc_type, exc, tb: None),
             recorder=recorder,
             player=player,
@@ -477,6 +665,78 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertIn("status=answering", lines)
         self.assertIn("status=waiting", lines)
         self.assertIn("timing_playback_ms=streamed", lines)
+
+    def test_green_button_uses_processing_feedback_before_answering(self) -> None:
+        backend = FakeBackend()
+        loop, _lines, _recorder, _player, _printer = self.make_loop(backend=backend)
+        feedback_kinds: list[str] = []
+
+        def fake_start(kind: str):
+            feedback_kinds.append(kind)
+            return lambda: None
+
+        loop._start_working_feedback_loop = fake_start  # type: ignore[method-assign]
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(feedback_kinds[0], "processing")
+
+    def test_green_button_can_end_turn_from_streaming_turn_controller(self) -> None:
+        config = TwinrConfig(
+            turn_controller_enabled=True,
+            turn_controller_fast_endpoint_enabled=False,
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+        )
+        backend = FakeBackend()
+        turn_stt_provider = FakeTurnStreamingSpeechToTextProvider(config)
+        turn_tool_agent_provider = FakeTurnToolAgentProvider(config)
+        loop, lines, _recorder, _player, _printer = self.make_loop(
+            backend=backend,
+            config=config,
+            turn_stt_provider=turn_stt_provider,
+            turn_tool_agent_provider=turn_tool_agent_provider,
+        )
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(turn_stt_provider.start_calls[0]["sample_rate"], config.audio_sample_rate)
+        self.assertEqual(turn_stt_provider.session.sent, [b"PCM-A", b"PCM-B"])
+        self.assertTrue(turn_stt_provider.session.closed)
+        self.assertEqual(len(turn_tool_agent_provider.start_calls), 1)
+        self.assertEqual(backend.transcribe_calls, [])
+        self.assertIn("turn_controller_candidate=speech_final", lines)
+        self.assertIn("turn_controller_decision=end_turn", lines)
+        self.assertIn("stt_partial=ich bin immernoch", lines)
+        self.assertIn("timing_stt_ms=", "\n".join(lines))
+
+    def test_green_button_recovers_when_streaming_stt_hears_speech_before_local_threshold(self) -> None:
+        config = TwinrConfig(
+            turn_controller_enabled=True,
+            turn_controller_fast_endpoint_enabled=False,
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+        )
+        backend = FakeBackend()
+        recorder = FakeRecorder(recordings=[RuntimeError("No speech detected before timeout")])
+        turn_stt_provider = FakeTurnStreamingSpeechToTextProvider(config)
+        turn_tool_agent_provider = FakeTurnToolAgentProvider(config)
+        loop, lines, _recorder, _player, _printer = self.make_loop(
+            backend=backend,
+            config=config,
+            recorder=recorder,
+            turn_stt_provider=turn_stt_provider,
+            turn_tool_agent_provider=turn_tool_agent_provider,
+        )
+
+        loop.handle_button_press("green")
+
+        self.assertIn("turn_controller_capture_recovered=true", lines)
+        self.assertEqual(backend.transcribe_calls, [])
+        self.assertEqual(backend.respond_calls[0][0], "ich bin immernoch am programmieren, nur damit du es weisst")
+        self.assertEqual(loop.runtime.last_response, "Hello back.")
 
     def test_green_button_no_speech_timeout_returns_to_waiting(self) -> None:
         backend = FakeBackend()
@@ -808,12 +1068,13 @@ class HardwareLoopTests(unittest.TestCase):
         class FakeVoiceProfileMonitor:
             def assess_wav_bytes(self, audio_bytes: bytes) -> VoiceAssessment:
                 self.audio_bytes = audio_bytes
+                checked_at = _fresh_checked_at()
                 return VoiceAssessment(
                     status="likely_user",
                     label="Likely user",
                     detail="Close to the enrolled template.",
                     confidence=0.81,
-                    checked_at="2026-03-13T12:00:00+00:00",
+                    checked_at=checked_at,
                 )
 
         monitor = FakeVoiceProfileMonitor()
@@ -828,7 +1089,9 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertTrue(monitor.audio_bytes.startswith(b"RIFF"))
         self.assertEqual(loop.runtime.user_voice_status, "likely_user")
         self.assertEqual(loop.runtime.user_voice_confidence, 0.81)
-        self.assertEqual(loop.runtime.user_voice_checked_at, "2026-03-13T12:00:00+00:00")
+        self.assertIsNotNone(loop.runtime.user_voice_checked_at)
+        assert loop.runtime.user_voice_checked_at is not None
+        self.assertTrue(loop.runtime.user_voice_checked_at.endswith("Z"))
         self.assertIsNotNone(backend.respond_calls[0][1])
         _assert_contains_system_message(self, backend.respond_calls[0][1], "Speaker signal: likely match")
         self.assertIn("voice_profile_status=likely_user", lines)

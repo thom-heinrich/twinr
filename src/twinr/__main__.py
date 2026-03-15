@@ -95,6 +95,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the GPIO -> STT -> tool-calling LLM -> TTS -> speaker/printer loop",
     )
     parser.add_argument(
+        "--run-orchestrator-server",
+        action="store_true",
+        help="Run the Twinr websocket orchestrator service",
+    )
+    parser.add_argument(
+        "--orchestrator-probe-turn",
+        help="Send one text turn through the websocket orchestrator and print the streamed result",
+    )
+    parser.add_argument(
         "--loop-duration",
         type=float,
         help="Optional max runtime in seconds for the loop commands",
@@ -151,6 +160,8 @@ def main() -> int:
             args.run_hardware_loop,
             args.run_realtime_loop,
             args.run_streaming_loop,
+            args.run_orchestrator_server,
+            args.orchestrator_probe_turn,
         ]
     )
     uses_camera = bool(args.vision_camera_capture or args.camera_capture_output or args.proactive_observe_once)
@@ -180,6 +191,20 @@ def main() -> int:
 
             app = create_app(Path(args.env_file))
             uvicorn.run(app, host=config.web_host, port=config.web_port)
+            return 0
+
+        if args.run_orchestrator_server:
+            from twinr.orchestrator import create_app
+
+            try:
+                import uvicorn
+            except ImportError as exc:  # pragma: no cover
+                raise RuntimeError(
+                    "The web/orchestrator dependencies are not installed. Run `pip install -e .` in /twinr."
+                ) from exc
+
+            app = create_app(Path(args.env_file))
+            uvicorn.run(app, host=config.orchestrator_host, port=config.orchestrator_port)
             return 0
 
         if args.display_test:
@@ -229,6 +254,52 @@ def main() -> int:
             )
             with loop_instance_lock(config, "streaming-loop"):
                 return loop.run(duration_s=args.loop_duration)
+
+        if args.orchestrator_probe_turn:
+            from twinr.agent.tools import bind_realtime_tool_handlers
+            from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
+            from twinr.orchestrator import OrchestratorTurnRequest, OrchestratorWebSocketClient
+            from twinr.providers import build_streaming_provider_bundle
+
+            if backend is None:
+                raise RuntimeError("Orchestrator probe requires configured providers")
+            provider_bundle = build_streaming_provider_bundle(config, support_backend=backend)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                print_backend=provider_bundle.print_backend,
+                stt_provider=provider_bundle.stt,
+                agent_provider=provider_bundle.agent,
+                tts_provider=provider_bundle.tts,
+                tool_agent_provider=provider_bundle.tool_agent,
+            )
+            client = OrchestratorWebSocketClient(
+                config.orchestrator_ws_url,
+                shared_secret=config.orchestrator_shared_secret,
+            )
+            deltas: list[str] = []
+            result = client.run_turn(
+                OrchestratorTurnRequest(
+                    prompt=args.orchestrator_probe_turn,
+                    conversation=runtime.tool_provider_conversation_context(),
+                    supervisor_conversation=runtime.supervisor_provider_conversation_context(),
+                ),
+                tool_handlers=bind_realtime_tool_handlers(loop.tool_executor),
+                on_ack=lambda event: print(f"ack={event.ack_id}:{event.text}"),
+                on_text_delta=lambda delta: deltas.append(delta),
+            )
+            if deltas:
+                print(f"streamed={''.join(deltas)}")
+            print(f"response={result.text}")
+            print(f"rounds={result.rounds}")
+            print(f"used_web_search={str(result.used_web_search).lower()}")
+            if result.response_id:
+                print(f"response_id={result.response_id}")
+            if result.request_id:
+                print(f"request_id={result.request_id}")
+            if result.model:
+                print(f"model={result.model}")
+            return 0
 
         if args.run_hardware_loop and backend is not None:
             from twinr.agent.workflows.runner import TwinrHardwareLoop

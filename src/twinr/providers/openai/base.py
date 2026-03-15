@@ -5,7 +5,11 @@ from typing import Any, Callable, Sequence
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.language import user_response_language_instruction
-from twinr.agent.base_agent.personality import load_personality_instructions, merge_instructions
+from twinr.agent.base_agent.personality import (
+    load_personality_instructions,
+    load_tool_loop_instructions,
+    merge_instructions,
+)
 
 from .client import _default_client_factory
 from .types import ConversationLike, OpenAIImageInput
@@ -29,6 +33,11 @@ class OpenAIBackendBase:
         if self._base_instructions_override is not None:
             return self._base_instructions_override
         return load_personality_instructions(self.config)
+
+    def _resolve_tool_loop_base_instructions(self) -> str | None:
+        if self._base_instructions_override is not None:
+            return self._base_instructions_override
+        return load_tool_loop_instructions(self.config)
 
     def _call_with_model_fallback(
         self,
@@ -80,13 +89,14 @@ class OpenAIBackendBase:
         reasoning_effort: str,
         max_output_tokens: int | None = None,
         extra_user_content: Sequence[dict[str, Any]] | None = None,
+        prompt_cache_scope: str | None = None,
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": model,
             "input": self._build_input(prompt, conversation, extra_user_content=extra_user_content),
-            "reasoning": {"effort": reasoning_effort},
             "store": False,
         }
+        self._apply_reasoning_effort(request, model=model, reasoning_effort=reasoning_effort)
         merged_instructions = merge_instructions(
             instructions,
             user_response_language_instruction(self.config.openai_realtime_language),
@@ -101,7 +111,50 @@ class OpenAIBackendBase:
         if tools:
             request["tools"] = tools
             request["tool_choice"] = "auto"
+        self._apply_prompt_cache(
+            request,
+            scope=prompt_cache_scope,
+            model=model,
+        )
         return request
+
+    def _apply_prompt_cache(
+        self,
+        request: dict[str, Any],
+        *,
+        scope: str | None,
+        model: str,
+    ) -> None:
+        if not self.config.openai_prompt_cache_enabled:
+            return
+        normalized_scope = (scope or "").strip()
+        if not normalized_scope:
+            return
+        language = (self.config.openai_realtime_language or "default").strip().lower() or "default"
+        request["prompt_cache_key"] = f"twinr:{normalized_scope}:{model.strip().lower()}:{language}"
+        retention = (self.config.openai_prompt_cache_retention or "").strip()
+        if retention:
+            request["prompt_cache_retention"] = retention
+
+    def _apply_reasoning_effort(
+        self,
+        request: dict[str, Any],
+        *,
+        model: str,
+        reasoning_effort: str | None,
+    ) -> None:
+        normalized_effort = (reasoning_effort or "").strip().lower()
+        if not normalized_effort:
+            return
+        if not self._model_supports_reasoning_effort(model):
+            return
+        request["reasoning"] = {"effort": normalized_effort}
+
+    def _model_supports_reasoning_effort(self, model: str) -> bool:
+        normalized = (model or "").strip().lower()
+        if not normalized:
+            return False
+        return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
 
     def _build_input(
         self,
