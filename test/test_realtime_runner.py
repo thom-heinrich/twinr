@@ -2392,6 +2392,26 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("search_tool_call=true", lines)
         self.assertTrue(any(line.startswith("search_source_1=") for line in lines))
 
+    def test_search_tool_call_re_resolves_relative_tomorrow_context(self) -> None:
+        config = TwinrConfig(
+            search_feedback_delay_ms=0,
+            search_feedback_pause_ms=0,
+        )
+        loop, _lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+
+        loop._handle_search_tool_call(
+            {
+                "question": "Wie wird das Wetter morgen in Schwarzenbek?",
+                "location_hint": "Schwarzenbek",
+                "date_context": "2026-03-15",
+            }
+        )
+
+        self.assertEqual(len(print_backend.search_calls), 1)
+        _question, _conversation, _location_hint, date_context = print_backend.search_calls[0]
+        expected_date = (datetime.now(ZoneInfo(config.local_timezone_name)).date() + timedelta(days=1)).isoformat()
+        self.assertIn(expected_date, date_context)
+
     def test_social_trigger_speaks_proactive_prompt(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop()
 

@@ -75,6 +75,19 @@ class LongTermRetrieverTests(unittest.TestCase):
         return retriever, object_store, prompt_context_store, graph_store, midterm_store
 
     def test_build_context_assembles_structured_memory_packet(self) -> None:
+        episode = LongTermMemoryObjectV1(
+            memory_id="episode:corinna_called",
+            kind="episode",
+            summary='Conversation about "Corinna called earlier today."',
+            details='User said: "Corinna called earlier today." Twinr answered: "I can keep that in mind."',
+            source=_source("turn:0"),
+            status="active",
+            confidence=1.0,
+            attributes={
+                "raw_transcript": "Corinna called earlier today.",
+                "raw_response": "I can keep that in mind.",
+            },
+        )
         existing = LongTermMemoryObjectV1(
             memory_id="fact:corinna_phone_old",
             kind="contact_method_fact",
@@ -116,14 +129,14 @@ class LongTermRetrieverTests(unittest.TestCase):
             )
             prompt_context_store.memory_store.remember(
                 kind="episodic_turn",
-                summary='Conversation about "Corinna called earlier today."',
-                details='User said: "Corinna called earlier today." Twinr answered: "I can keep that in mind."',
+                summary='Conversation about "This local-only memory should not be used."',
+                details='User said: "This local-only memory should not be used." Twinr answered: "Ignored."',
             )
             object_store.apply_consolidation(
                 LongTermConsolidationResultV1(
                     turn_id="turn:2",
                     occurred_at=datetime(2026, 3, 14, 12, 0, tzinfo=ZoneInfo("Europe/Berlin")),
-                    episodic_objects=(),
+                    episodic_objects=(episode,),
                     durable_objects=(existing,),
                     deferred_objects=(candidate,),
                     conflicts=(conflict,),
@@ -162,6 +175,26 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertIn("+15555551234", context.durable_context or "")
         self.assertIn("Corinna Maier", context.graph_context or "")
         self.assertIn("contact:person:corinna_maier:phone", context.conflict_context or "")
+        self.assertNotIn("This local-only memory should not be used", context.episodic_context or "")
+
+    def test_build_context_ignores_local_markdown_when_no_structured_episode_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            prompt_context_store.memory_store.remember(
+                kind="episodic_turn",
+                summary='Conversation about "Local markdown only."',
+                details='User said: "Local markdown only." Twinr answered: "This should stay local."',
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "What did we talk about?",
+                    canonical_english_text="What did we talk about?",
+                ),
+                original_query_text="What did we talk about?",
+            )
+
+        self.assertIsNone(context.episodic_context)
 
     def test_select_conflict_queue_respects_canonical_query_profile(self) -> None:
         existing = LongTermMemoryObjectV1(

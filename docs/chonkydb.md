@@ -14,7 +14,7 @@ The current scope is intentionally narrow:
 - define a versioned Twinr graph schema
 - call graph edge, neighbor, path, and pattern endpoints
 
-The external client is still intentionally narrow. Twinr's normal live runtime now routes long-term retrieval and non-blocking episodic persistence through `src/twinr/memory/longterm/`, while remote ChonkyDB network writes remain an explicit future integration step.
+The external client now also backs Twinr's remote-primary long-term memory mode through `src/twinr/memory/longterm/remote_state.py`. In that mode, ChonkyDB becomes the primary long-term source, while local `state/chonkydb` files remain cache and migration artifacts.
 
 ## Twinr graph schema v2
 
@@ -63,7 +63,7 @@ Twinr now has a first local personal-graph layer on top of the schema:
 - remember short user plans such as wanting to go for a walk today
 - feed a compact graph-based personalization hint into the provider context
 
-The current implementation is local-first and writes to `twinr_graph_v2.json` under the configured `TWINR_LONG_TERM_MEMORY_PATH`. It does not yet push real graph writes into the shared external ChonkyDB service during normal Twinr runtime.
+The current implementation still writes a local graph cache under the configured `TWINR_LONG_TERM_MEMORY_PATH`. When `TWINR_LONG_TERM_MEMORY_MODE=remote_primary`, that graph cache is synced through ChonkyDB-backed remote snapshots and is no longer treated as the source of truth.
 
 ### Canonical language contract
 
@@ -108,7 +108,12 @@ Use Twinr naming in `.env`:
 ```bash
 TWINR_LONG_TERM_MEMORY_ENABLED=true
 TWINR_LONG_TERM_MEMORY_BACKEND=chonkydb
+TWINR_LONG_TERM_MEMORY_MODE=remote_primary
+TWINR_LONG_TERM_MEMORY_REMOTE_REQUIRED=true
 TWINR_LONG_TERM_MEMORY_PATH=state/chonkydb
+TWINR_LONG_TERM_MEMORY_REMOTE_READ_TIMEOUT_S=8
+TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S=15
+TWINR_LONG_TERM_MEMORY_MIGRATION_ENABLED=true
 
 TWINR_CHONKYDB_BASE_URL=https://tessairact.com:2149
 TWINR_CHONKYDB_API_KEY=replace-me
@@ -118,6 +123,12 @@ TWINR_CHONKYDB_TIMEOUT_S=20
 ```
 
 Compatibility fallback is present for legacy `CCODEX_MEMORY_BASE_URL` and `CCODEX_MEMORY_API_KEY`, but the Twinr code and docs should call the backend `chonkydb`.
+
+In `remote_primary` mode:
+
+- ChonkyDB is the primary long-term source of truth.
+- local `state/chonkydb/*.json` files are still updated as cache and migration artifacts.
+- if ChonkyDB is unavailable and `TWINR_LONG_TERM_MEMORY_REMOTE_REQUIRED=true`, Twinr withholds long-term graph/fact/midterm memory instead of silently replaying stale local long-term state.
 
 ## Minimal usage
 

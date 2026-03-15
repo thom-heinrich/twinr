@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import hashlib
 from typing import Mapping
 from zoneinfo import ZoneInfo
 
@@ -74,7 +75,16 @@ class LongTermTurnExtractor:
         if not clean_transcript:
             raise ValueError("transcript is required.")
         occurred = occurred_at or datetime.now(ZoneInfo(self.timezone_name))
-        resolved_turn_id = turn_id or f"turn:{occurred.astimezone(ZoneInfo(self.timezone_name)).strftime('%Y%m%dT%H%M%S%z')}"
+        if turn_id is not None:
+            resolved_turn_id = turn_id
+        else:
+            stable_basis = "\n".join((clean_transcript, clean_response, source, occurred.isoformat()))
+            stable_suffix = hashlib.sha1(stable_basis.encode("utf-8")).hexdigest()[:10]
+            resolved_turn_id = (
+                "turn:"
+                + occurred.astimezone(ZoneInfo(self.timezone_name)).strftime("%Y%m%dT%H%M%S%f%z")
+                + f":{stable_suffix}"
+            )
         source_ref = LongTermSourceRefV1(
             source_type=source,
             event_ids=(resolved_turn_id,),

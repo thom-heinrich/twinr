@@ -44,6 +44,13 @@ from twinr.proactive.prompting import (
     proactive_observation_facts,
     proactive_prompt_mode,
 )
+from twinr.proactive.vision_review import (
+    OpenAIProactiveVisionReviewer,
+    ProactiveVisionFrameBuffer,
+    ProactiveVisionReview,
+    is_reviewable_image_trigger,
+    parse_proactive_vision_review_text,
+)
 from twinr.proactive.service import (
     ProactiveCoordinator,
     ProactiveMonitorService,
@@ -65,6 +72,7 @@ __all__ = [
     "OpenWakeWordPrediction",
     "OpenWakeWordStreamingMonitor",
     "OpenAIVisionObservationProvider",
+    "OpenAIProactiveVisionReviewer",
     "ProactiveGovernor",
     "ProactiveGovernorCandidate",
     "ProactiveGovernorDecision",
@@ -72,6 +80,8 @@ __all__ = [
     "ProactiveGovernorReservation",
     "ProactiveAudioSnapshot",
     "ProactiveCoordinator",
+    "ProactiveVisionFrameBuffer",
+    "ProactiveVisionReview",
     "ProactiveMonitorService",
     "ProactiveVisionSnapshot",
     "PresenceSessionController",
@@ -96,7 +106,9 @@ __all__ = [
     "build_default_proactive_monitor",
     "DEFAULT_WAKEWORD_PHRASES",
     "hold_progress",
+    "is_reviewable_image_trigger",
     "parse_vision_observation_text",
+    "parse_proactive_vision_review_text",
     "recent_progress",
     "is_safety_trigger",
     "match_wakeword_transcript",

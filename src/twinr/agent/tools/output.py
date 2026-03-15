@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import re
 import threading
 import time
 import weakref
 from collections.abc import Iterable, Mapping
+from datetime import datetime, timedelta
 from typing import Any, Callable, TypeVar
+from zoneinfo import ZoneInfo
 
 
 _T = TypeVar("_T")
@@ -68,6 +71,61 @@ def _normalize_sources(raw_sources: object) -> list[str]:
 
     text = _normalize_optional_text(raw_sources)
     return [text] if text else []
+
+
+_TODAY_PATTERNS = (
+    re.compile(r"\bheute\b", re.IGNORECASE),
+    re.compile(r"\btoday\b", re.IGNORECASE),
+)
+_TOMORROW_PATTERNS = (
+    re.compile(r"\bmorgen\b", re.IGNORECASE),
+    re.compile(r"\btomorrow\b", re.IGNORECASE),
+)
+_DAY_AFTER_TOMORROW_PATTERNS = (
+    re.compile(r"\bübermorgen\b", re.IGNORECASE),
+    re.compile(r"\buebermorgen\b", re.IGNORECASE),
+    re.compile(r"\bday after tomorrow\b", re.IGNORECASE),
+)
+_YESTERDAY_PATTERNS = (
+    re.compile(r"\bgestern\b", re.IGNORECASE),
+    re.compile(r"\byesterday\b", re.IGNORECASE),
+)
+
+
+def _resolve_search_date_context(
+    question: str,
+    provided_date_context: str,
+    *,
+    timezone_name: str,
+    reference: datetime | None = None,
+) -> str:
+    normalized_question = _normalize_optional_text(question)
+    normalized_context = _normalize_optional_text(provided_date_context)
+    now = reference
+    if now is None:
+        try:
+            now = datetime.now(ZoneInfo(timezone_name))
+        except Exception:
+            now = datetime.now()
+
+    offset_days: int | None = None
+    if any(pattern.search(normalized_question) for pattern in _DAY_AFTER_TOMORROW_PATTERNS):
+        offset_days = 2
+    elif any(pattern.search(normalized_question) for pattern in _TOMORROW_PATTERNS):
+        offset_days = 1
+    elif any(pattern.search(normalized_question) for pattern in _TODAY_PATTERNS):
+        offset_days = 0
+    elif any(pattern.search(normalized_question) for pattern in _YESTERDAY_PATTERNS):
+        offset_days = -1
+
+    if offset_days is None:
+        return normalized_context
+
+    resolved = (now + timedelta(days=offset_days)).date().isoformat()
+    weekday = (now + timedelta(days=offset_days)).strftime("%A")
+    if normalized_context:
+        return f"{weekday}, {resolved} ({timezone_name})"
+    return f"{weekday}, {resolved} ({timezone_name})"
 
 
 # AUDIT-FIX(#6): Normalize vision image collections defensively and drop null entries before invoking the vision backend.
@@ -304,6 +362,11 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
     date_context = _coerce_argument_text(arguments, "date_context")
     if not question:
         raise RuntimeError("search_live_info requires `question`")
+    date_context = _resolve_search_date_context(
+        question,
+        date_context,
+        timezone_name=getattr(owner.config, "local_timezone_name", "Europe/Berlin"),
+    )
 
     # AUDIT-FIX(#4): Emit sanitized telemetry for user-controlled search inputs.
     _emit_kv_safe(owner, "search_tool_call", "true")

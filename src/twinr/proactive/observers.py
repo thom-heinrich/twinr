@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from threading import Lock
 from types import SimpleNamespace
+import time
 
 from twinr.hardware.audio import AmbientAudioLevelSample, AmbientAudioSampler
 from twinr.hardware.camera import V4L2StillCamera
@@ -14,6 +15,10 @@ from twinr.providers.openai.backend import OpenAIBackend, OpenAIImageInput
 class ProactiveVisionSnapshot:
     observation: SocialVisionObservation
     response_text: str
+    captured_at: float | None = None
+    image: OpenAIImageInput | None = None
+    source_device: str | None = None
+    input_format: str | None = None
     response_id: str | None = None
     request_id: str | None = None
     model: str | None = None
@@ -110,21 +115,24 @@ class OpenAIVisionObservationProvider:
     def observe(self) -> ProactiveVisionSnapshot:
         with self.camera_lock:
             capture = self.camera.capture_photo(filename="proactive-camera-capture.png")
+        image = OpenAIImageInput(
+            data=capture.data,
+            content_type=capture.content_type,
+            filename=capture.filename,
+            label="Live proactive camera frame from the device.",
+        )
         response = self.backend.respond_to_images_with_metadata(
             _VISION_CLASSIFIER_PROMPT,
-            images=(
-                OpenAIImageInput(
-                    data=capture.data,
-                    content_type=capture.content_type,
-                    filename=capture.filename,
-                    label="Live proactive camera frame from the device.",
-                ),
-            ),
+            images=(image,),
             allow_web_search=False,
         )
         return ProactiveVisionSnapshot(
             observation=parse_vision_observation_text(response.text),
             response_text=response.text,
+            captured_at=time.monotonic(),
+            image=image,
+            source_device=capture.source_device,
+            input_format=capture.input_format,
             response_id=response.response_id,
             request_id=response.request_id,
             model=response.model,

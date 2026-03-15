@@ -9,6 +9,7 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.client import chonkydb_data_path
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.models import LongTermMidtermPacketV1, LongTermReflectionResultV1
+from twinr.memory.longterm.remote_state import LongTermRemoteStateStore
 from twinr.text_utils import retrieval_terms
 
 
@@ -31,22 +32,26 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
 @dataclass(slots=True)
 class LongTermMidtermStore:
     base_path: Path
+    remote_state: LongTermRemoteStateStore | None = None
     _lock: Lock = field(default_factory=Lock, repr=False)
 
     packet_type = LongTermMidtermPacketV1
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermMidtermStore":
-        return cls(base_path=chonkydb_data_path(config))
+        return cls(
+            base_path=chonkydb_data_path(config),
+            remote_state=LongTermRemoteStateStore.from_config(config),
+        )
 
     @property
     def packets_path(self) -> Path:
         return self.base_path / "twinr_memory_midterm_v1.json"
 
     def load_packets(self) -> tuple[LongTermMidtermPacketV1, ...]:
-        if not self.packets_path.exists():
+        payload = self._load_payload()
+        if payload is None:
             return ()
-        payload = json.loads(self.packets_path.read_text(encoding="utf-8"))
         items = payload.get("packets", [])
         if not isinstance(items, list):
             return ()
@@ -63,10 +68,22 @@ class LongTermMidtermStore:
                 "version": _MIDTERM_STORE_VERSION,
                 "packets": [item.to_payload() for item in sorted(packets, key=lambda row: row.packet_id)],
             }
+            if self.remote_state is not None and self.remote_state.enabled:
+                self.remote_state.save_snapshot(snapshot_kind="midterm", payload=payload)
+                return
             _write_json_atomic(self.packets_path, payload)
 
     def apply_reflection(self, result: LongTermReflectionResultV1) -> None:
         self.save_packets(packets=result.midterm_packets)
+
+    def _load_payload(self) -> dict[str, object] | None:
+        if self.remote_state is not None and self.remote_state.enabled:
+            payload = self.remote_state.load_snapshot(snapshot_kind="midterm", local_path=self.packets_path)
+            return payload
+        if not self.packets_path.exists():
+            return None
+        loaded = json.loads(self.packets_path.read_text(encoding="utf-8"))
+        return dict(loaded) if isinstance(loaded, dict) else None
 
     def select_relevant_packets(
         self,

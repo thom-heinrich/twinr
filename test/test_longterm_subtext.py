@@ -11,11 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.config import TwinrConfig
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 from twinr.memory.context_store import PromptContextStore
+from twinr.memory.longterm.conflicts import LongTermConflictResolver
+from twinr.memory.longterm.models import LongTermConsolidationResultV1, LongTermMemoryObjectV1, LongTermSourceRefV1
 from twinr.memory.longterm.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.retriever import LongTermRetriever
 from twinr.memory.longterm.store import LongTermStructuredStore
 from twinr.memory.longterm.subtext import LongTermSubtextBuilder, LongTermSubtextCompiler
-from twinr.memory.longterm.conflicts import LongTermConflictResolver
 from twinr.memory.query_normalization import LongTermQueryProfile
 
 
@@ -276,10 +277,35 @@ class LongTermRetrieverCompiledSubtextTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config = _config(temp_dir)
             prompt_store = PromptContextStore.from_config(config)
-            prompt_store.memory_store.remember(
-                kind="episodic_turn",
+            object_store = LongTermStructuredStore.from_config(config)
+            episode = LongTermMemoryObjectV1(
+                memory_id="episode:knee",
+                kind="episode",
                 summary='Conversation about "My knee hurts a bit today."',
                 details='User said: "My knee hurts a bit today." Twinr answered: "Then it may be wise to take it easy today."',
+                source=LongTermSourceRefV1(
+                    source_type="conversation_turn",
+                    event_ids=("turn:knee",),
+                    speaker="user",
+                    modality="voice",
+                ),
+                status="active",
+                confidence=1.0,
+                attributes={
+                    "raw_transcript": "My knee hurts a bit today.",
+                    "raw_response": "Then it may be wise to take it easy today.",
+                },
+            )
+            object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:knee",
+                    occurred_at=episode.created_at,
+                    episodic_objects=(episode,),
+                    durable_objects=(),
+                    deferred_objects=(),
+                    conflicts=(),
+                    graph_edges=(),
+                )
             )
             compiler = LongTermSubtextCompiler(
                 config=config,
@@ -300,7 +326,7 @@ class LongTermRetrieverCompiledSubtextTests(unittest.TestCase):
                 config=config,
                 prompt_context_store=prompt_store,
                 graph_store=TwinrPersonalGraphStore.from_config(config),
-                object_store=LongTermStructuredStore.from_config(config),
+                object_store=object_store,
                 midterm_store=LongTermMidtermStore.from_config(config),
                 conflict_resolver=LongTermConflictResolver(),
                 subtext_builder=LongTermSubtextBuilder(

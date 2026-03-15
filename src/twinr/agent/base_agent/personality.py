@@ -9,7 +9,8 @@ from pathlib import Path
 
 from twinr.automations import AutomationStore
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.memory.context_store import PersistentMemoryMarkdownStore
+from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
+from twinr.memory.longterm.remote_state import LongTermRemoteUnavailableError, LongTermRemoteStateStore
 from twinr.memory.reminders import ReminderStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ def _load_common_sections(config: TwinrConfig) -> list[tuple[str, str]]:
     sections = _load_static_sections(config)
     memory_context = _safe_render_context(
         "MEMORY",
-        lambda: PersistentMemoryMarkdownStore(config.memory_markdown_path).render_context(),
+        lambda: PersistentMemoryMarkdownStore.from_config(config).render_context(),
     )  # AUDIT-FIX(#4): Corrupt or transiently unreadable memory must degrade gracefully.
     if memory_context is not None:
         sections.append(("MEMORY", memory_context))
@@ -99,11 +100,49 @@ def _load_static_sections(config: TwinrConfig) -> list[tuple[str, str]]:
     directory = _resolve_personality_directory(config)  # AUDIT-FIX(#2): Keep personality files inside the trusted project root.
     sections: list[tuple[str, str]] = []
     if directory is not None:
+        remote_state = LongTermRemoteStateStore.from_config(config)
         for title, filename in _SECTION_FILES:
-            content = _read_optional_text_file(directory, filename, source_label=filename)  # AUDIT-FIX(#3): Use a single secure open instead of exists()+read_text().
+            if title == "SYSTEM":
+                content = _read_optional_text_file(directory, filename, source_label=filename)  # AUDIT-FIX(#3): Use a single secure open instead of exists()+read_text().
+            elif title == "USER":
+                content = _render_managed_static_section(
+                    directory / filename,
+                    section_title="Twinr managed user updates",
+                    snapshot_kind="user_context",
+                    remote_state=remote_state,
+                )
+            else:
+                content = _render_managed_static_section(
+                    directory / filename,
+                    section_title="Twinr managed personality updates",
+                    snapshot_kind="personality_context",
+                    remote_state=remote_state,
+                )
             if content is not None:
                 sections.append((title, content))
     return sections
+
+
+def _render_managed_static_section(
+    path: Path,
+    *,
+    section_title: str,
+    snapshot_kind: str,
+    remote_state: LongTermRemoteStateStore,
+) -> str | None:
+    store = ManagedContextFileStore(
+        path,
+        section_title=section_title,
+        remote_state=remote_state,
+        remote_snapshot_kind=snapshot_kind,
+    )
+    try:
+        return store.render_context()
+    except LongTermRemoteUnavailableError:
+        raise
+    except Exception:
+        _LOGGER.exception("Failed to render managed context section from %s", path)
+        return None
 
 
 def load_personality_instructions(config: TwinrConfig) -> str | None:

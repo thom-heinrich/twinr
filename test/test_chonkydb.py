@@ -197,8 +197,9 @@ class ChonkyDBClientTests(unittest.TestCase):
 
         first_body = json.loads(opener.calls[0]["body"])
         second_body = json.loads(opener.calls[1]["body"])
-        self.assertEqual(first_body["payload"], {"note": "Bring medication"})
+        self.assertEqual(opener.calls[0]["full_url"], "https://memory.test/v1/external/records/bulk")
         self.assertEqual(first_body["client_request_id"], "req-1")
+        self.assertEqual(first_body["items"][0]["payload"], {"note": "Bring medication"})
         self.assertEqual(second_body["client_request_id"], "bulk-1")
         self.assertEqual(len(second_body["items"]), 2)
 

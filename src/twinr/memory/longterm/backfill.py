@@ -259,8 +259,15 @@ class LongTermOpsEventBackfiller:
                 "request_source": source,
                 "queue": queue,
                 "job": job,
-                "inferred_from_finish_only": inferred,
-                "backfill_source_event": "print_finished" if inferred else "print_job_sent",
+                "inferred_from_print_start": inferred,
+                "backfill_source_event": "print_job_sent" if not inferred else "print_started",
             },
             created_at=occurred_at,
         )
+
+
+__all__ = [
+    "LongTermOpsBackfillBuildResult",
+    "LongTermOpsBackfillRunResult",
+    "LongTermOpsEventBackfiller",
+]

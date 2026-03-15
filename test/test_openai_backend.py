@@ -137,6 +137,41 @@ class FakeSpeechAPI:
         return _StreamingWrapper()
 
 
+class FakeChatCompletionsAPI:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.content = "Morgen in Schwarzenbek 8 Grad, leichter Regen."
+        self.annotations = [
+            SimpleNamespace(
+                url_citation=SimpleNamespace(url="https://weather.example/forecast")
+            )
+        ]
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            id="chatcmpl_123",
+            _request_id="req_chat_123",
+            model=kwargs["model"],
+            usage=SimpleNamespace(
+                prompt_tokens=32,
+                completion_tokens=44,
+                total_tokens=76,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=4),
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=0),
+            ),
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content=self.content,
+                        annotations=self.annotations,
+                    ),
+                )
+            ],
+        )
+
+
 class OpenAIBackendTests(unittest.TestCase):
     def setUp(self) -> None:
         self.responses = FakeResponsesAPI()
@@ -144,6 +179,7 @@ class OpenAIBackendTests(unittest.TestCase):
         self.speech = FakeSpeechAPI()
         self.client = SimpleNamespace(
             responses=self.responses,
+            chat=SimpleNamespace(completions=FakeChatCompletionsAPI()),
             audio=SimpleNamespace(
                 transcriptions=self.transcriptions,
                 speech=self.speech,
@@ -464,7 +500,12 @@ class OpenAIBackendTests(unittest.TestCase):
             )
         ]
 
-        result = self.backend.search_live_info_with_metadata(
+        backend = OpenAIBackend(
+            config=replace(self.config, openai_search_model="gpt-5.2-chat-latest"),
+            client=self.client,
+        )
+
+        result = backend.search_live_info_with_metadata(
             "Wie wird das Wetter morgen?",
             location_hint="Schwarzenbek",
             date_context="Friday, 2026-03-13 10:00 (Europe/Berlin)",
@@ -479,15 +520,15 @@ class OpenAIBackendTests(unittest.TestCase):
             ),
         )
         request = self.responses.calls[0]
-        self.assertEqual(request["model"], self.config.openai_search_model)
+        self.assertEqual(request["model"], "gpt-5.2-chat-latest")
         self.assertEqual(request["include"], ["web_search_call.action.sources"])
         self.assertEqual(request["tools"][0]["type"], "web_search")
         self.assertEqual(request["tools"][0]["search_context_size"], "medium")
         self.assertEqual(
             request["prompt_cache_key"],
-            f"twinr:search:{self.config.openai_search_model}:de",
+            "twinr:search:gpt-5.2-chat-latest:de",
         )
-        self.assertNotIn("reasoning", request)
+        self.assertEqual(request["reasoning"], {"effort": "low"})
         self.assertEqual(request["max_output_tokens"], 160)
         self.assertIn("Location hint: Schwarzenbek", request["input"][-1]["content"][0]["text"])
         self.assertIn("Local date/time context: Friday, 2026-03-13 10:00", request["input"][-1]["content"][0]["text"])
@@ -497,7 +538,7 @@ class OpenAIBackendTests(unittest.TestCase):
         self.responses.output_text = "Morgen in Schwarzenbek 11 Grad, leichter Regen."
 
         backend = OpenAIBackend(
-            config=self.config,
+            config=replace(self.config, openai_search_model="gpt-5.2-chat-latest"),
             client=SimpleNamespace(
                 responses=self.responses,
                 audio=SimpleNamespace(
@@ -585,12 +626,55 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(result.answer, "Morgen in Schwarzenbek bis 11 Grad und zeitweise Regen.")
         self.assertEqual(
             [call["model"] for call in backend._client.responses.calls],
-            ["gpt-5.2", "gpt-5.2", "gpt-5.2-chat-latest"],
+            ["gpt-5.2", "gpt-5.2", "gpt-4o-mini"],
         )
         self.assertEqual(
             [call["max_output_tokens"] for call in backend._client.responses.calls],
             [160, 240, 160],
         )
+
+    def test_search_live_info_uses_search_preview_chat_path(self) -> None:
+        backend = OpenAIBackend(
+            config=replace(self.config, openai_search_model="gpt-4o-mini-search-preview"),
+            client=self.client,
+        )
+
+        result = backend.search_live_info_with_metadata(
+            "Wie wird das Wetter morgen?",
+            location_hint="Schwarzenbek",
+            date_context="Monday, 2026-03-16 08:00 (Europe/Berlin)",
+        )
+
+        self.assertEqual(result.answer, "Morgen in Schwarzenbek 8 Grad, leichter Regen.")
+        self.assertEqual(result.sources, ("https://weather.example/forecast",))
+        self.assertTrue(result.used_web_search)
+        self.assertEqual(result.model, "gpt-4o-mini-search-preview")
+        self.assertEqual(result.token_usage.total_tokens, 76)
+        self.assertEqual(self.client.chat.completions.calls[0]["model"], "gpt-4o-mini-search-preview")
+        self.assertEqual(self.client.chat.completions.calls[0]["web_search_options"], {})
+        self.assertEqual(self.client.chat.completions.calls[0]["messages"][0]["role"], "system")
+        prompt = self.client.chat.completions.calls[0]["messages"][-1]["content"]
+        self.assertIn("Target date (must match): 2026-03-16", prompt)
+        self.assertIn("Equivalent explicit-date query:", prompt)
+        self.assertIn("2026-03-16", prompt)
+        self.assertEqual(self.responses.calls, [])
+
+    def test_search_live_info_adds_iso_target_query_for_explicit_date_questions(self) -> None:
+        backend = OpenAIBackend(
+            config=replace(self.config, openai_search_model="gpt-4o-mini-search-preview"),
+            client=self.client,
+        )
+
+        backend.search_live_info_with_metadata(
+            "Wettervorhersage für Schwarzenbek am 16. März 2026",
+            location_hint="Schwarzenbek",
+            date_context="Monday, 2026-03-16 (Europe/Berlin)",
+        )
+
+        prompt = self.client.chat.completions.calls[-1]["messages"][-1]["content"]
+        self.assertIn("Target date (must match): 2026-03-16", prompt)
+        self.assertIn("Equivalent explicit-date query:", prompt)
+        self.assertIn("target date 2026-03-16", prompt)
 
     def test_compose_print_job_uses_context_and_request_source(self) -> None:
         self.responses.output_text = "TERMINE\nMontag 14 Uhr\nAdresse Praxis"

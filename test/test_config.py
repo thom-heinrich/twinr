@@ -16,7 +16,7 @@ class TwinrConfigTests(unittest.TestCase):
 
             config = TwinrConfig.from_env(env_path)
 
-        self.assertEqual(config.openai_search_model, "gpt-4o-mini")
+        self.assertEqual(config.openai_search_model, "gpt-4o-mini-search-preview")
         self.assertEqual(config.streaming_specialist_model, "gpt-4o-mini")
         self.assertEqual(config.streaming_specialist_reasoning_effort, "low")
 
@@ -210,6 +210,9 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LONG_TERM_MEMORY_RECALL_LIMIT=5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_READ_TIMEOUT_S=5.5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S=11.5",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_RETRY_ATTEMPTS=4",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_RETRY_BACKOFF_S=2.5",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_FLUSH_TIMEOUT_S=75",
                         "TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MODEL=gpt-5.2-mini",
                         "TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MAX_OUTPUT_TOKENS=2600",
                         "TWINR_LONG_TERM_MEMORY_MIDTERM_ENABLED=false",
@@ -479,6 +482,9 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_recall_limit, 5)
         self.assertEqual(config.long_term_memory_remote_read_timeout_s, 5.5)
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 11.5)
+        self.assertEqual(config.long_term_memory_remote_retry_attempts, 4)
+        self.assertEqual(config.long_term_memory_remote_retry_backoff_s, 2.5)
+        self.assertEqual(config.long_term_memory_remote_flush_timeout_s, 75.0)
         self.assertEqual(config.long_term_memory_turn_extractor_model, "gpt-5.2-mini")
         self.assertEqual(config.long_term_memory_turn_extractor_max_output_tokens, 2600)
         self.assertFalse(config.long_term_memory_midterm_enabled)
@@ -596,6 +602,9 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_recall_limit, 3)
         self.assertEqual(config.long_term_memory_remote_read_timeout_s, 8.0)
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 15.0)
+        self.assertEqual(config.long_term_memory_remote_retry_attempts, 3)
+        self.assertEqual(config.long_term_memory_remote_retry_backoff_s, 1.0)
+        self.assertEqual(config.long_term_memory_remote_flush_timeout_s, 60.0)
         self.assertIsNone(config.long_term_memory_turn_extractor_model)
         self.assertEqual(config.long_term_memory_turn_extractor_max_output_tokens, 2200)
         self.assertTrue(config.long_term_memory_midterm_enabled)

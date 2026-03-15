@@ -43,6 +43,7 @@ class SocialAudioObservation:
 @dataclass(frozen=True, slots=True)
 class SocialObservation:
     observed_at: float
+    inspected: bool = True
     pir_motion_detected: bool = False
     low_motion: bool = False
     vision: SocialVisionObservation = field(default_factory=SocialVisionObservation)
@@ -155,6 +156,7 @@ class SocialTriggerEngine:
         self._possible_fall_loss_candidate_at: float | None = None
         self._possible_fall_loss_pose: SocialBodyPose = SocialBodyPose.UNKNOWN
         self._possible_fall_loss_visible_duration_s: float | None = None
+        self._consecutive_visible_inspected_count: int = 0
         self._person_visible: bool = False
         self._current_pose: SocialBodyPose = SocialBodyPose.UNKNOWN
         self._quiet_since: float | None = None
@@ -196,6 +198,10 @@ class SocialTriggerEngine:
             self._last_pir_motion_at = now
 
         absence_duration = self._update_presence_state(now, person_visible=vision.person_visible)
+        self._update_confirmed_visibility_state(
+            inspected=observation.inspected,
+            person_visible=vision.person_visible,
+        )
         self._update_pose_state(now, body_pose=vision.body_pose)
         self._quiet_since = self._next_since(audio.speech_detected is False, self._quiet_since, now)
         self._looking_since = self._next_since(
@@ -717,6 +723,8 @@ class SocialTriggerEngine:
     def _fell_out_of_view_after_fall_like_presence(self, now: float, *, visible_duration: float | None) -> bool:
         if self._possible_fall_candidate_at is not None:
             return True
+        if self._consecutive_visible_inspected_count < 2:
+            return False
         if visible_duration is None or visible_duration < self._fall_visibility_loss_arming_s():
             return False
         if self._current_pose == SocialBodyPose.SLUMPED and self._last_slumped_at is not None:
@@ -818,6 +826,14 @@ class SocialTriggerEngine:
         if self._slumped_since is None:
             return 0.0
         return max(0.0, now - self._slumped_since)
+
+    def _update_confirmed_visibility_state(self, *, inspected: bool, person_visible: bool) -> None:
+        if not inspected:
+            return
+        if person_visible:
+            self._consecutive_visible_inspected_count += 1
+            return
+        self._consecutive_visible_inspected_count = 0
 
     def _seconds(self, value: float | None) -> str:
         if value is None:
