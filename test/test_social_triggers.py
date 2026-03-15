@@ -302,6 +302,38 @@ class SocialTriggerEngineTests(unittest.TestCase):
         self.assertIsNotNone(decision)
         self.assertEqual(decision.trigger_id, "possible_fall")
 
+    def test_possible_fall_visibility_loss_path_requires_confirmed_visible_person_across_multiple_inspections(self) -> None:
+        config = TwinrConfig(
+            proactive_possible_fall_stillness_s=4.0,
+            proactive_possible_fall_visibility_loss_hold_s=8.0,
+            proactive_possible_fall_visibility_loss_arming_s=2.0,
+            proactive_possible_fall_slumped_visibility_loss_arming_s=2.0,
+            proactive_possible_fall_score_threshold=0.65,
+        )
+        engine = SocialTriggerEngine.from_config(config)
+
+        self.observe(
+            engine,
+            0.0,
+            pir=True,
+            person_visible=True,
+            pose=SocialBodyPose.SLUMPED,
+            low_motion=False,
+            speech=False,
+        )
+        decision = self.observe(
+            engine,
+            10.5,
+            person_visible=False,
+            pose=SocialBodyPose.UNKNOWN,
+            low_motion=True,
+            speech=False,
+        )
+
+        self.assertIsNone(decision)
+        possible_fall = self.possible_fall_evaluation(engine)
+        self.assertLess(possible_fall.score, possible_fall.threshold)
+
     def test_showing_intent_needs_object_near_camera(self) -> None:
         engine = SocialTriggerEngine()
         self.observe(

@@ -114,6 +114,7 @@ Sensor-triggered automations currently support the following operator-facing tri
 - `camera_hand_or_object_near_camera`
 
 The proactive monitor now feeds stable PIR, camera, and VAD facts into the automation engine while Twinr is idle. This lets voice-created if-then automations react to sensor facts without exposing raw camera frames or raw audio chunks as tool-level inputs.
+The target-state map for what Twinr should try to derive from PIR, audio, and camera lives in [`SENSOR_FUSION.md`](SENSOR_FUSION.md).
 
 Explicit requests to change future user-profile context or future speaking/behavior rules are written into managed sections inside `personality/USER.md` and `personality/PERSONALITY.md`. Twinr reloads those files on the next provider request instead of baking them permanently into code.
 
@@ -453,6 +454,11 @@ TWINR_PROACTIVE_AUDIO_ENABLED=true
 TWINR_PROACTIVE_AUDIO_DEVICE=plughw:CARD=CameraB409241,DEV=0
 TWINR_PROACTIVE_AUDIO_SAMPLE_MS=1000
 TWINR_PROACTIVE_AUDIO_DISTRESS_ENABLED=false
+TWINR_PROACTIVE_VISION_REVIEW_ENABLED=true
+TWINR_PROACTIVE_VISION_REVIEW_BUFFER_FRAMES=8
+TWINR_PROACTIVE_VISION_REVIEW_MAX_FRAMES=4
+TWINR_PROACTIVE_VISION_REVIEW_MAX_AGE_S=12.0
+TWINR_PROACTIVE_VISION_REVIEW_MIN_SPACING_S=1.2
 TWINR_WAKEWORD_ENABLED=true
 TWINR_WAKEWORD_BACKEND=stt
 TWINR_WAKEWORD_PHRASES="hey twinr, hey twinna, twinr"
@@ -480,6 +486,7 @@ PYTHONPATH=src ./.venv/bin/python -m twinr --env-file /twinr/.env --proactive-au
 The vision path requires `ffmpeg` on the device because Twinr captures still images from V4L2 and then sends one or more images to the OpenAI Responses API in a single request.
 The live hardware loop can also trigger the camera automatically for typical visual requests such as "Schau mich mal an", "Was zeige ich dir?", or "Wie sehe ich heute aus?".
 With `TWINR_PROACTIVE_ENABLED=true`, the hardware and realtime loops also start the proactive monitor and let it issue bounded conversation starters while Twinr is idle.
+With `TWINR_PROACTIVE_VISION_REVIEW_ENABLED=true`, image-driven proactive prompts are reviewed against a short buffered frame sequence before Twinr speaks. That second opinion is conservative: if the recent frames look empty or ambiguous, Twinr skips the proactive prompt instead of speaking.
 With `TWINR_WAKEWORD_ENABLED=true`, the same idle monitor keeps a presence-gated wakeword session armed after recent PIR motion or visible presence. If ambient speech starts with one of the configured aliases, Twinr either answers the rest of the spoken request directly or opens the normal hands-free listening window.
 For lower latency, set `TWINR_WAKEWORD_BACKEND=openwakeword` and point `TWINR_WAKEWORD_OPENWAKEWORD_MODELS` at one or more local `.tflite` or `.onnx` wakeword models. `openWakeWord` runs fully on-device, but it still needs a real model for the chosen phrase; for `Twinr/Twinna/Twinner` that normally means a custom-trained model. Until such a model is configured, Twinr can stay on the slower STT backend.
 
@@ -531,6 +538,33 @@ OPENAI_API_KEY=...
 ```
 
 `OpenAI` remains the support backend for search, print composition, reminder phrasing, proactive phrasing, camera inspection, and spoken TTS while `Deepgram` handles STT and `Groq` handles the main text/tool loop.
+
+Twinr now also exposes the first websocket orchestrator slice for the planned edge/cloud architecture:
+
+```bash
+source .venv/bin/activate
+twinr --env-file /twinr/.env --run-orchestrator-server
+```
+
+And a bounded text probe against that websocket service:
+
+```bash
+source .venv/bin/activate
+twinr --env-file /twinr/.env --orchestrator-probe-turn "Wie wird das Wetter morgen in Schwarzenbek?"
+```
+
+The current orchestrator slice is intentionally not the default runtime yet. It provides:
+
+- a websocket server at `TWINR_ORCHESTRATOR_WS_URL`
+- a structured `ack_id` path for pre-rendered short acknowledgements
+- a remote tool bridge so the specialist worker can request Pi-local tool execution over the websocket connection
+
+New orchestrator config keys:
+
+- `TWINR_ORCHESTRATOR_HOST`
+- `TWINR_ORCHESTRATOR_PORT`
+- `TWINR_ORCHESTRATOR_WS_URL`
+- `TWINR_ORCHESTRATOR_SHARED_SECRET` (optional)
 
 Latency notes:
 

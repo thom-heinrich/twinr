@@ -15,6 +15,7 @@ from twinr.memory.chonkydb.schema import (
     TwinrGraphNodeV1,
 )
 from twinr.memory.longterm.models import LongTermGraphEdgeCandidateV1
+from twinr.memory.longterm.remote_state import LongTermRemoteStateStore
 from twinr.temporal import parse_local_date_text
 from twinr.text_utils import collapse_whitespace, is_valid_stable_identifier, retrieval_terms, slugify_identifier
 
@@ -98,11 +99,13 @@ class TwinrPersonalGraphStore:
         user_node_id: str = "user:main",
         user_label: str = "Main user",
         timezone_name: str = "Europe/Berlin",
+        remote_state: LongTermRemoteStateStore | None = None,
     ) -> None:
         self.path = Path(path)
         self.user_node_id = user_node_id
         self.user_label = _normalize_text(user_label, limit=80) or "Main user"
         self.timezone_name = timezone_name
+        self.remote_state = remote_state
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "TwinrPersonalGraphStore":
@@ -112,9 +115,15 @@ class TwinrPersonalGraphStore:
             path=path,
             user_label=config.user_display_name or "Main user",
             timezone_name=config.local_timezone_name,
+            remote_state=LongTermRemoteStateStore.from_config(config),
         )
 
     def load_document(self) -> TwinrGraphDocumentV1:
+        if self.remote_state is not None and self.remote_state.enabled:
+            payload = self.remote_state.load_snapshot(snapshot_kind="graph", local_path=self.path)
+            if payload is not None:
+                return TwinrGraphDocumentV1.from_payload(payload)
+            return self._empty_document()
         if not self.path.exists():
             return self._empty_document()
         payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -856,7 +865,7 @@ class TwinrPersonalGraphStore:
         )
 
     def _save_document(self, nodes: Mapping[str, TwinrGraphNodeV1], edges: list[TwinrGraphEdgeV1]) -> None:
-        existing = self.load_document() if self.path.exists() else self._empty_document()
+        existing = self.load_document()
         created_at = existing.created_at
         updated_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
         document = TwinrGraphDocumentV1(
@@ -868,8 +877,12 @@ class TwinrPersonalGraphStore:
             edges=tuple(edges),
             metadata={"kind": "personal_graph"},
         )
+        payload = document.to_payload()
+        if self.remote_state is not None and self.remote_state.enabled:
+            self.remote_state.save_snapshot(snapshot_kind="graph", payload=payload)
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(document.to_payload(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def _ensure_user_node(self, nodes: dict[str, TwinrGraphNodeV1]) -> None:
         if self.user_node_id not in nodes:

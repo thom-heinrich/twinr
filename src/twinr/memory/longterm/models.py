@@ -229,6 +229,7 @@ class LongTermMemoryObjectV1:
     value_key: str | None = None
     valid_from: str | None = None
     valid_to: str | None = None
+    archived_at: str | None = None
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
     attributes: Mapping[str, object] | None = None
@@ -276,6 +277,7 @@ class LongTermMemoryObjectV1:
                 "value_key": self.value_key,
                 "valid_from": self.valid_from,
                 "valid_to": self.valid_to,
+                "archived_at": self.archived_at,
                 "created_at": self.created_at.isoformat(),
                 "updated_at": self.updated_at.isoformat(),
                 "source": self.source.to_payload(),
@@ -310,6 +312,7 @@ class LongTermMemoryObjectV1:
             value_key=str(payload["value_key"]) if payload.get("value_key") is not None else None,
             valid_from=str(payload["valid_from"]) if payload.get("valid_from") is not None else None,
             valid_to=str(payload["valid_to"]) if payload.get("valid_to") is not None else None,
+            archived_at=str(payload["archived_at"]) if payload.get("archived_at") is not None else None,
             created_at=datetime.fromisoformat(str(payload["created_at"])) if payload.get("created_at") else _utcnow(),
             updated_at=datetime.fromisoformat(str(payload["updated_at"])) if payload.get("updated_at") else _utcnow(),
             attributes=normalized_attributes or None,
@@ -575,6 +578,7 @@ class LongTermRetentionResultV1:
     kept_objects: tuple[LongTermMemoryObjectV1, ...]
     expired_objects: tuple[LongTermMemoryObjectV1, ...]
     pruned_memory_ids: tuple[str, ...]
+    archived_objects: tuple[LongTermMemoryObjectV1, ...] = ()
     schema: str = LONGTERM_RETENTION_SCHEMA
     version: int = LONGTERM_RETENTION_VERSION
 

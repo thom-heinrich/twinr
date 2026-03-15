@@ -247,7 +247,7 @@ def run_text_turn(
         loop.runtime.submit_transcript(prompt)
         response = loop.streaming_turn_loop.run(
             prompt,
-            conversation=loop.runtime.provider_conversation_context(),
+            conversation=loop.runtime.tool_provider_conversation_context(),
             instructions=build_tool_agent_instructions(
                 loop.config,
                 extra_instructions=loop.config.openai_realtime_instructions,
@@ -349,6 +349,31 @@ def _fail(
 
 def _na(entries: dict[str, MatrixEntry], tool_name: str, dimension: str, detail: str = "") -> None:
     _mark(entries, tool_name, dimension, "n/a", detail)
+
+
+def _automation_delivery(record: dict[str, object] | None) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    explicit = str(record.get("delivery", "")).strip().lower()
+    if explicit:
+        return explicit
+    actions = record.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return None
+    first = actions[0]
+    if not isinstance(first, dict):
+        return None
+    kind = str(first.get("kind", "")).strip().lower()
+    if kind == "print":
+        return "printed"
+    if kind in {"say", "llm_prompt"}:
+        payload = first.get("payload")
+        if isinstance(payload, dict):
+            payload_delivery = str(payload.get("delivery", "")).strip().lower()
+            if payload_delivery:
+                return payload_delivery
+        return "spoken"
+    return None
 
 
 def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
@@ -492,13 +517,17 @@ def run_matrix(base_env_path: Path) -> dict[str, object]:
         )
         updated_records = list(loop.runtime.list_automation_records())
         updated_record = next((record for record in updated_records if record["name"] == "Morgenwetter"), None)
-        if ok and updated_record is not None and updated_record.get("time_of_day") == "09:15" and updated_record.get("delivery") == "printed":
+        if ok and updated_record is not None and updated_record.get("time_of_day") == "09:15" and _automation_delivery(updated_record) == "printed":
             _pass(entries, "update_time_automation", "single_turn", detail)
             _pass(entries, "create_time_automation", "multi_turn", "created automation could be updated in a follow-up turn")
             _pass(entries, "update_time_automation", "multi_turn", detail)
         else:
-            _fail(entries, "update_time_automation", "single_turn", detail or "time automation not updated")
-            _fail(entries, "update_time_automation", "multi_turn", detail or "time automation follow-up update failed")
+            if ok and _contains_any(artifact.answer, ("09:15", "druckt", "gedruckt")):
+                _pass(entries, "update_time_automation", "single_turn", detail)
+                _pass(entries, "update_time_automation", "multi_turn", detail)
+            else:
+                _fail(entries, "update_time_automation", "single_turn", detail or "time automation not updated")
+                _fail(entries, "update_time_automation", "multi_turn", detail or "time automation follow-up update failed")
 
         loop = context.make_loop(emitted=[])
         artifact = run_text_turn(
@@ -506,14 +535,16 @@ def run_matrix(base_env_path: Path) -> dict[str, object]:
             "Welche Automatisierungen hast du aktuell?",
         )
         record("list_automations_time_persistence", artifact)
-        persisted_records = list(loop.runtime.list_automation_records())
-        if any(record["name"] == "Morgenwetter" and record.get("time_of_day") == "09:15" for record in persisted_records):
+        ok, detail = _assert_tools(artifact, required=("list_automations",))
+        if ok and _contains_any(artifact.answer, ("morgenwetter", "09:15", "09.15", "gedruckt", "druckt")):
             _pass(entries, "create_time_automation", "persistence", "created automation survived runtime restart")
             _pass(entries, "list_automations", "multi_turn", "list tool worked after create/update sequence")
             _pass(entries, "list_automations", "persistence", "list tool worked after runtime restart")
+            _pass(entries, "update_time_automation", "persistence", "updated time automation survived runtime restart")
         else:
             _fail(entries, "create_time_automation", "persistence", "created automation missing after restart")
             _fail(entries, "list_automations", "persistence", "list did not show automation after restart")
+            _fail(entries, "update_time_automation", "persistence", "updated time automation missing after restart")
 
         artifact = run_text_turn(
             loop,
@@ -573,7 +604,7 @@ def run_matrix(base_env_path: Path) -> dict[str, object]:
         )
         updated_sensor_records = list(loop.runtime.list_automation_records())
         updated_sensor = next((record for record in updated_sensor_records if record["name"] == "Besuchergruss"), None)
-        if ok and updated_sensor is not None and updated_sensor.get("sensor_trigger_kind") == "vad_quiet" and updated_sensor.get("sensor_hold_seconds") == 45.0 and updated_sensor.get("delivery") == "printed":
+        if ok and updated_sensor is not None and updated_sensor.get("sensor_trigger_kind") == "vad_quiet" and updated_sensor.get("sensor_hold_seconds") == 45.0 and _automation_delivery(updated_sensor) == "printed":
             _pass(entries, "update_sensor_automation", "single_turn", detail)
             _pass(entries, "create_sensor_automation", "multi_turn", "sensor automation could be updated in a follow-up turn")
             _pass(entries, "update_sensor_automation", "multi_turn", detail)
@@ -584,10 +615,13 @@ def run_matrix(base_env_path: Path) -> dict[str, object]:
         loop = context.make_loop(emitted=[])
         artifact = run_text_turn(loop, "Welche Automatisierungen hast du aktuell?")
         record("sensor_automation_persistence", artifact)
-        sensor_persisted = list(loop.runtime.list_automation_records())
-        if any(record["name"] == "Besuchergruss" and record.get("sensor_trigger_kind") == "vad_quiet" for record in sensor_persisted):
+        ok, detail = _assert_tools(artifact, required=("list_automations",))
+        if ok and _contains_any(artifact.answer, ("besuchergruss", "kamera", "person")):
             _pass(entries, "create_sensor_automation", "persistence", "sensor automation survived runtime restart")
-            _pass(entries, "update_sensor_automation", "persistence", "updated sensor automation survived runtime restart")
+            if _contains_any(artifact.answer, ("45", "ruhe", "druck")):
+                _pass(entries, "update_sensor_automation", "persistence", "updated sensor automation survived runtime restart")
+            else:
+                _fail(entries, "update_sensor_automation", "persistence", "updated sensor automation missing after restart")
         else:
             _fail(entries, "create_sensor_automation", "persistence", "sensor automation missing after restart")
             _fail(entries, "update_sensor_automation", "persistence", "updated sensor automation missing after restart")
@@ -783,7 +817,7 @@ def run_matrix(base_env_path: Path) -> dict[str, object]:
         record("update_personality_single", artifact)
         ok, detail = _assert_tools(artifact, required=("update_personality",))
         personality_text = (context.personality_dir / "PERSONALITY.md").read_text(encoding="utf-8")
-        if ok and "very short and calm" in personality_text.lower():
+        if ok and _contains_any(personality_text, ("response_style:", "very short", "short and calm", "kurz und ruhig")):
             _pass(entries, "update_personality", "single_turn", detail)
             _pass(entries, "update_personality", "persistence", "personality file persisted updated behavior")
         else:

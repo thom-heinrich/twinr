@@ -27,6 +27,7 @@ from twinr.proactive import (
     parse_vision_observation_text,
 )
 from twinr.runtime import TwinrRuntime
+from twinr.proactive.vision_review import ProactiveVisionReview
 
 
 class FakeVisionObserver:
@@ -40,6 +41,10 @@ class FakeVisionObserver:
         return SimpleNamespace(
             observation=observation,
             response_text="ok",
+            captured_at=None,
+            image=None,
+            source_device=None,
+            input_format=None,
             response_id="resp_1",
             request_id="req_1",
             model="gpt-5.2",
@@ -75,8 +80,16 @@ class FakeBackend:
         self.text = text
         self.calls = []
 
-    def respond_to_images_with_metadata(self, prompt, *, images, allow_web_search=None):
-        self.calls.append((prompt, list(images), allow_web_search))
+    def respond_to_images_with_metadata(
+        self,
+        prompt,
+        *,
+        images,
+        conversation=None,
+        instructions=None,
+        allow_web_search=None,
+    ):
+        self.calls.append((prompt, list(images), conversation, instructions, allow_web_search))
         return SimpleNamespace(
             text=self.text,
             response_id="resp_vision",
@@ -145,6 +158,20 @@ class FakeWakewordStream:
         if not self.errors:
             return None
         return self.errors.pop(0)
+
+
+class FakeVisionReviewer:
+    def __init__(self, review: ProactiveVisionReview | None) -> None:
+        self.review_result = review
+        self.recorded_snapshots = []
+        self.calls = []
+
+    def record_snapshot(self, snapshot) -> None:
+        self.recorded_snapshots.append(snapshot)
+
+    def review(self, decision, *, observation):
+        self.calls.append((decision, observation))
+        return self.review_result
 
 
 class MutableClock:
@@ -643,7 +670,204 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(skip_events[-1]["data"]["trigger"], "attention_window")
         self.assertEqual(skip_events[-1]["data"]["reason"], "recent_wakeword_attempt")
 
+    def test_coordinator_skips_attention_window_when_buffered_review_rejects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=1.0,
+                proactive_motion_window_s=20.0,
+                proactive_attention_window_s=1.0,
+                proactive_attention_window_score_threshold=0.86,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(0.0)
+            emitted: list[str] = []
+            handled: list[str] = []
+            reviewer = FakeVisionReviewer(
+                ProactiveVisionReview(
+                    approved=False,
+                    decision="skip",
+                    confidence="high",
+                    reason="room looks empty",
+                    scene="empty room",
+                    frame_count=3,
+                    response_id="resp_review",
+                    request_id="req_review",
+                    model="gpt-5.2",
+                )
+            )
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine.from_config(config),
+                trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            looking_toward_device=True,
+                            body_pose=SocialBodyPose.UPRIGHT,
+                        ),
+                        SocialVisionObservation(
+                            person_visible=True,
+                            looking_toward_device=True,
+                            body_pose=SocialBodyPose.UPRIGHT,
+                        ),
+                    ]
+                ),
+                pir_monitor=FakePirMonitor(events=[True], level=True),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                vision_reviewer=reviewer,
+                emit=emitted.append,
+                clock=clock,
+            )
+
+            coordinator.tick()
+            clock.now = 2.5
+            result = coordinator.tick()
+
+            events = runtime.ops_events.tail(limit=20)
+
+        self.assertIsNone(result.decision)
+        self.assertEqual(handled, [])
+        self.assertEqual(len(reviewer.calls), 1)
+        self.assertIn("social_trigger_skipped=vision_review_rejected", emitted)
+        review_events = [entry for entry in events if entry.get("event") == "proactive_vision_reviewed"]
+        self.assertEqual(review_events[-1]["data"]["trigger"], "attention_window")
+        self.assertFalse(review_events[-1]["data"]["approved"])
+        skip_events = [entry for entry in events if entry.get("event") == "social_trigger_skipped"]
+        self.assertEqual(skip_events[-1]["data"]["trigger"], "attention_window")
+        self.assertEqual(skip_events[-1]["data"]["reason"], "vision_review_rejected")
+
+    def test_coordinator_reviews_absence_path_trigger_before_prompting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=0.1,
+                proactive_motion_window_s=5.0,
+                proactive_low_motion_after_s=1.0,
+                proactive_possible_fall_stillness_s=4.0,
+                proactive_possible_fall_visibility_loss_hold_s=4.0,
+                proactive_possible_fall_visibility_loss_arming_s=2.0,
+                proactive_possible_fall_slumped_visibility_loss_arming_s=2.0,
+                proactive_possible_fall_score_threshold=0.65,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(0.0)
+            pir_monitor = FakePirMonitor(events=[True], level=True)
+            handled: list[str] = []
+            reviewer = FakeVisionReviewer(
+                ProactiveVisionReview(
+                    approved=True,
+                    decision="speak",
+                    confidence="medium",
+                    reason="recent frames support concern",
+                    scene="person drops out of view after slumped posture",
+                    frame_count=2,
+                    response_id="resp_review",
+                    request_id="req_review",
+                    model="gpt-5.2",
+                )
+            )
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine.from_config(config),
+                trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
+                    ]
+                ),
+                pir_monitor=pir_monitor,
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                vision_reviewer=reviewer,
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            coordinator.tick()
+            clock.now = 2.5
+            coordinator.tick()
+            pir_monitor.level = False
+            clock.now = 2.55
+            coordinator.tick()
+            clock.now = 7.6
+            result = coordinator.tick()
+
+            events = runtime.ops_events.tail(limit=30)
+
+        self.assertEqual(handled, ["possible_fall"])
+        self.assertIsNotNone(result.decision)
+        self.assertEqual(result.decision.trigger_id, "possible_fall")
+        self.assertEqual(len(reviewer.calls), 1)
+        trigger_events = [entry for entry in events if entry.get("event") == "proactive_trigger_detected"]
+        self.assertEqual(trigger_events[-1]["data"]["trigger"], "possible_fall")
+        self.assertEqual(trigger_events[-1]["data"]["vision_review_decision"], "speak")
+        self.assertEqual(trigger_events[-1]["data"]["vision_review_reason"], "recent frames support concern")
+
     def test_coordinator_dispatches_absence_path_trigger_when_inspection_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=0.1,
+                proactive_motion_window_s=5.0,
+                proactive_low_motion_after_s=1.0,
+                proactive_possible_fall_stillness_s=4.0,
+                proactive_possible_fall_visibility_loss_hold_s=4.0,
+                proactive_possible_fall_visibility_loss_arming_s=2.0,
+                proactive_possible_fall_slumped_visibility_loss_arming_s=2.0,
+                proactive_possible_fall_score_threshold=0.65,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(0.0)
+            pir_monitor = FakePirMonitor(events=[True], level=True)
+            handled: list[str] = []
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine.from_config(config),
+                trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
+                    ]
+                ),
+                pir_monitor=pir_monitor,
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            coordinator.tick()
+            clock.now = 2.5
+            coordinator.tick()
+            pir_monitor.level = False
+            clock.now = 2.55
+            result = coordinator.tick()
+            self.assertIsNone(result.decision)
+            self.assertFalse(result.inspected)
+
+            clock.now = 7.6
+            result = coordinator.tick()
+
+            events = runtime.ops_events.tail(limit=20)
+
+        self.assertEqual(handled, ["possible_fall"])
+        self.assertIsNotNone(result.decision)
+        self.assertEqual(result.decision.trigger_id, "possible_fall")
+        self.assertFalse(result.inspected)
+        trigger_events = [entry for entry in events if entry.get("event") == "proactive_trigger_detected"]
+        self.assertEqual(trigger_events[-1]["data"]["trigger"], "possible_fall")
+        observation_events = [entry for entry in events if entry.get("event") == "proactive_observation"]
+        self.assertEqual(observation_events[-1]["data"]["inspected"], False)
+
+    def test_coordinator_does_not_dispatch_absence_path_trigger_from_single_visible_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 project_root=temp_dir,
@@ -689,14 +913,10 @@ class ProactiveMonitorTests(unittest.TestCase):
 
             events = runtime.ops_events.tail(limit=20)
 
-        self.assertEqual(handled, ["possible_fall"])
-        self.assertIsNotNone(result.decision)
-        self.assertEqual(result.decision.trigger_id, "possible_fall")
-        self.assertFalse(result.inspected)
+        self.assertEqual(handled, [])
+        self.assertIsNone(result.decision)
         trigger_events = [entry for entry in events if entry.get("event") == "proactive_trigger_detected"]
-        self.assertEqual(trigger_events[-1]["data"]["trigger"], "possible_fall")
-        observation_events = [entry for entry in events if entry.get("event") == "proactive_observation"]
-        self.assertEqual(observation_events[-1]["data"]["inspected"], False)
+        self.assertEqual(trigger_events, [])
 
     def test_coordinator_suppresses_second_possible_fall_prompt_within_same_presence_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -729,11 +949,8 @@ class ProactiveMonitorTests(unittest.TestCase):
                     [
                         SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
                         SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
-                        SocialVisionObservation(person_visible=False, body_pose=SocialBodyPose.UNKNOWN),
-                        SocialVisionObservation(person_visible=False, body_pose=SocialBodyPose.UNKNOWN),
                         SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
-                        SocialVisionObservation(person_visible=False, body_pose=SocialBodyPose.UNKNOWN),
-                        SocialVisionObservation(person_visible=False, body_pose=SocialBodyPose.UNKNOWN),
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.SLUMPED),
                     ]
                 ),
                 presence_session=PresenceSessionController(
@@ -750,9 +967,9 @@ class ProactiveMonitorTests(unittest.TestCase):
             coordinator.tick()
             clock.now = 2.5
             coordinator.tick()
-            clock.now = 3.0
+            clock.now = 2.55
             coordinator.tick()
-            clock.now = 7.3
+            clock.now = 22.6
             first = coordinator.tick()
             self.assertIsNotNone(first.decision)
             self.assertEqual(first.decision.trigger_id, "possible_fall")
@@ -762,7 +979,9 @@ class ProactiveMonitorTests(unittest.TestCase):
             coordinator.tick()
             clock.now = 72.5
             coordinator.tick()
-            clock.now = 76.9
+            clock.now = 72.55
+            coordinator.tick()
+            clock.now = 92.6
             second = coordinator.tick()
 
             events = runtime.ops_events.tail(limit=40)

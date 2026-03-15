@@ -202,7 +202,7 @@ class TwinrConfig:
     audio_follow_up_speech_start_chunks: int = 4
     audio_follow_up_ignore_ms: int = 300
     openai_enable_web_search: bool = False
-    openai_search_model: str = "gpt-4o-mini"
+    openai_search_model: str = "gpt-4o-mini-search-preview"
     openai_web_search_context_size: str = "medium"
     openai_search_max_output_tokens: int = 160
     openai_search_retry_max_output_tokens: int = 240
@@ -322,6 +322,9 @@ class TwinrConfig:
     long_term_memory_query_rewrite_enabled: bool = True
     long_term_memory_remote_read_timeout_s: float = 8.0
     long_term_memory_remote_write_timeout_s: float = 15.0
+    long_term_memory_remote_retry_attempts: int = 3
+    long_term_memory_remote_retry_backoff_s: float = 1.0
+    long_term_memory_remote_flush_timeout_s: float = 60.0
     long_term_memory_turn_extractor_model: str | None = None
     long_term_memory_turn_extractor_max_output_tokens: int = 2200
     long_term_memory_midterm_enabled: bool = True
@@ -616,7 +619,8 @@ class TwinrConfig:
             ),
             audio_follow_up_ignore_ms=int(get_value("TWINR_AUDIO_FOLLOW_UP_IGNORE_MS", "300") or "300"),
             openai_enable_web_search=_parse_bool(get_value("TWINR_OPENAI_ENABLE_WEB_SEARCH"), False),
-            openai_search_model=get_value("OPENAI_SEARCH_MODEL", "gpt-4o-mini") or "gpt-4o-mini",
+            openai_search_model=get_value("OPENAI_SEARCH_MODEL", "gpt-4o-mini-search-preview")
+            or "gpt-4o-mini-search-preview",
             openai_web_search_context_size=get_value("TWINR_OPENAI_WEB_SEARCH_CONTEXT_SIZE", "medium") or "medium",
             openai_search_max_output_tokens=int(
                 get_value("TWINR_OPENAI_SEARCH_MAX_OUTPUT_TOKENS", "160") or "160"
@@ -955,6 +959,17 @@ class TwinrConfig:
             long_term_memory_remote_write_timeout_s=_parse_float(
                 get_value("TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S"),
                 15.0,
+            ),
+            long_term_memory_remote_retry_attempts=int(
+                get_value("TWINR_LONG_TERM_MEMORY_REMOTE_RETRY_ATTEMPTS", "3") or "3"
+            ),
+            long_term_memory_remote_retry_backoff_s=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_REMOTE_RETRY_BACKOFF_S"),
+                1.0,
+            ),
+            long_term_memory_remote_flush_timeout_s=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_REMOTE_FLUSH_TIMEOUT_S"),
+                60.0,
             ),
             long_term_memory_turn_extractor_model=(
                 get_value("TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MODEL") or None

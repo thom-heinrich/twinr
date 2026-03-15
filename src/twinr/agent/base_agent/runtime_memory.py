@@ -381,7 +381,7 @@ class TwinrRuntimeMemoryMixin:
             label = self._graph_result_label(result)
             note_stored = False
 
-            if self._should_record_graph_storage(result):
+            if self.config.long_term_memory_mode != "remote_primary" and self._should_record_graph_storage(result):
                 note_content = f"Stored contact: {label}" if label else "Stored contact."
                 note_metadata = {
                     "graph_status": status or "",
@@ -464,7 +464,7 @@ class TwinrRuntimeMemoryMixin:
             edge_type = self._graph_result_edge_type(result)
             note_stored = False
 
-            if self._should_record_graph_storage(result):
+            if self.config.long_term_memory_mode != "remote_primary" and self._should_record_graph_storage(result):
                 note_content = f"Stored preference: {label}" if label else "Stored preference."
                 note_metadata = {
                     "graph_edge_type": edge_type,
@@ -524,7 +524,7 @@ class TwinrRuntimeMemoryMixin:
             edge_type = self._graph_result_edge_type(result)
             note_stored = False
 
-            if self._should_record_graph_storage(result):
+            if self.config.long_term_memory_mode != "remote_primary" and self._should_record_graph_storage(result):
                 note_content = f"Stored plan: {label}" if label else "Stored plan."
                 note_metadata = {
                     "graph_edge_type": edge_type,

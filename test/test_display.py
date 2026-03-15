@@ -53,6 +53,27 @@ class WaveshareDisplayTests(unittest.TestCase):
 
         self.assertNotEqual(list(plain_footer.getdata()), list(rendered_footer.getdata()))
 
+    def test_wrap_footer_left_splits_long_health_line_before_time_suffix(self) -> None:
+        display = WaveshareEPD4In2V2(
+            project_root=Path("."),
+            vendor_dir=Path("hardware/display/vendor"),
+            width=400,
+            height=300,
+            rotation_degrees=270,
+        )
+        _image, draw = display._new_canvas()
+        footer_font = display._font(18, bold=False)
+
+        lines = display._wrap_footer_left(
+            draw,
+            "Internet ok | AI ok | System ok",
+            font=footer_font,
+            full_width=240,
+            final_width=160,
+        )
+
+        self.assertEqual(lines, ("Internet ok | AI ok", "System ok"))
+
     def test_prepare_image_applies_configured_rotation(self) -> None:
         display = WaveshareEPD4In2V2(
             project_root=Path("."),

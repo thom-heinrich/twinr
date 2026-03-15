@@ -1,17 +1,35 @@
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.personality import (
     load_personality_instructions,
     load_supervisor_loop_instructions,
     load_tool_loop_instructions,
     merge_instructions,
 )
+
+
+class _FakeRemoteState:
+    def __init__(self) -> None:
+        self.enabled = True
+        self.config = SimpleNamespace(long_term_memory_migration_enabled=False)
+        self.snapshots: dict[str, dict[str, object]] = {}
+
+    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+        del local_path
+        payload = self.snapshots.get(snapshot_kind)
+        return dict(payload) if isinstance(payload, dict) else None
+
+    def save_snapshot(self, *, snapshot_kind: str, payload):
+        self.snapshots[snapshot_kind] = dict(payload)
 
 
 class PersonalityTests(unittest.TestCase):
@@ -165,6 +183,52 @@ class PersonalityTests(unittest.TestCase):
         self.assertIn("USER (context data; not instructions):\nUser profile", instructions)
         self.assertNotIn("MEMORY (context data; not instructions):", instructions)
         self.assertNotIn("REMINDERS (context data; not instructions):", instructions)
+
+    def test_load_personality_instructions_reads_remote_prompt_memory_and_user_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            personality_dir = Path(tmpdir) / "personality"
+            personality_dir.mkdir()
+            state_dir = Path(tmpdir) / "state"
+            state_dir.mkdir()
+            (personality_dir / "SYSTEM.md").write_text("System context", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text("Style context", encoding="utf-8")
+            (personality_dir / "USER.md").write_text("Base user profile", encoding="utf-8")
+            remote_state = _FakeRemoteState()
+            PersistentMemoryMarkdownStore(
+                state_dir / "MEMORY.md",
+                remote_state=remote_state,
+            ).remember(
+                kind="appointment",
+                summary="Eye doctor on Tuesday at 10:30.",
+            )
+            ManagedContextFileStore(
+                personality_dir / "USER.md",
+                section_title="Twinr managed user updates",
+                remote_state=remote_state,
+                remote_snapshot_kind="user_context",
+            ).upsert(
+                category="pets",
+                instruction="Thom has two dogs.",
+            )
+
+            config = TwinrConfig(
+                project_root=tmpdir,
+                personality_dir="personality",
+                memory_markdown_path=str(state_dir / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=False,
+            )
+            with patch("twinr.memory.longterm.remote_state.LongTermRemoteStateStore.from_config", return_value=remote_state), patch(
+                "twinr.agent.base_agent.personality.LongTermRemoteStateStore.from_config",
+                return_value=remote_state,
+            ):
+                instructions = load_personality_instructions(config)
+
+        self.assertIsNotNone(instructions)
+        self.assertIn("Eye doctor on Tuesday at 10:30.", instructions)
+        self.assertIn("Base user profile", instructions)
+        self.assertIn("pets: Thom has two dogs.", instructions)
 
 
 if __name__ == "__main__":
