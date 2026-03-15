@@ -344,6 +344,7 @@ class LongTermStructuredStore:
         *,
         objects: tuple[LongTermMemoryObjectV1, ...],
         conflicts: tuple[LongTermMemoryConflictV1, ...] = (),
+        archived_objects: tuple[LongTermMemoryObjectV1, ...] = (),
     ) -> None:
         with self._lock:
             objects_payload = {
@@ -359,6 +360,11 @@ class LongTermStructuredStore:
                     for item in sorted(conflicts, key=lambda row: (row.slot_key, row.candidate_memory_id))
                 ],
             }
+            archive_payload = {
+                "schema": _ARCHIVE_STORE_SCHEMA,
+                "version": _ARCHIVE_STORE_VERSION,
+                "objects": [item.to_payload() for item in sorted(archived_objects, key=lambda row: row.memory_id)],
+            }
             self._persist_snapshot_payload(
                 snapshot_kind="objects",
                 local_path=self.objects_path,
@@ -368,6 +374,11 @@ class LongTermStructuredStore:
                 snapshot_kind="conflicts",
                 local_path=self.conflicts_path,
                 payload=conflicts_payload,
+            )
+            self._persist_snapshot_payload(
+                snapshot_kind="archive",
+                local_path=self.archive_path,
+                payload=archive_payload,
             )
 
     def apply_memory_mutation(self, result: LongTermMemoryMutationResultV1) -> None:

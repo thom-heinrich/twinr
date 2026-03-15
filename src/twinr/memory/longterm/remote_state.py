@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import time
 from typing import Iterable, Mapping
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -183,12 +184,19 @@ class LongTermRemoteStateStore:
             enable_chunking=False,
             include_insights_in_response=False,
         )
-        try:
-            write_client.store_record(record)
-        except ChonkyDBError as exc:
-            raise LongTermRemoteUnavailableError(
-                f"Failed to write remote long-term snapshot {snapshot_kind!r}: {exc}"
-            ) from exc
+        last_error: ChonkyDBError | None = None
+        for attempt in range(self._retry_attempts()):
+            try:
+                write_client.store_record(record)
+                return
+            except ChonkyDBError as exc:
+                last_error = exc
+                if attempt + 1 >= self._retry_attempts():
+                    break
+                time.sleep(self._retry_backoff_s())
+        raise LongTermRemoteUnavailableError(
+            f"Failed to write remote long-term snapshot {snapshot_kind!r}: {last_error}"
+        ) from last_error
 
     def _require_client(self, client: ChonkyDBClient | None, *, operation: str) -> ChonkyDBClient:
         if client is not None:
@@ -259,18 +267,30 @@ class LongTermRemoteStateStore:
         *,
         snapshot_kind: str,
     ) -> _RemoteSnapshotFetchResult:
-        try:
-            payload = client.fetch_full_document(
-                origin_uri=self._snapshot_uri(snapshot_kind),
-                include_content=True,
-                max_content_chars=2_000_000,
-            )
-        except ChonkyDBError as exc:
-            if exc.status_code == 404:
-                return _RemoteSnapshotFetchResult(status="not_found")
+        last_error: ChonkyDBError | None = None
+        payload: Mapping[str, object] | None = None
+        for attempt in range(self._retry_attempts()):
+            try:
+                payload = client.fetch_full_document(
+                    origin_uri=self._snapshot_uri(snapshot_kind),
+                    include_content=True,
+                    max_content_chars=512_000,
+                )
+                break
+            except ChonkyDBError as exc:
+                if exc.status_code == 404:
+                    return _RemoteSnapshotFetchResult(status="not_found")
+                last_error = exc
+                if attempt + 1 >= self._retry_attempts():
+                    return _RemoteSnapshotFetchResult(
+                        status="unavailable",
+                        detail=f"Failed to read remote long-term snapshot {snapshot_kind!r}: {exc}",
+                    )
+                time.sleep(self._retry_backoff_s())
+        if payload is None:
             return _RemoteSnapshotFetchResult(
                 status="unavailable",
-                detail=f"Failed to read remote long-term snapshot {snapshot_kind!r}: {exc}",
+                detail=f"Failed to read remote long-term snapshot {snapshot_kind!r}: {last_error}",
             )
         direct = self._extract_snapshot_body(payload, snapshot_kind=snapshot_kind)
         if direct is not None:
@@ -285,6 +305,12 @@ class LongTermRemoteStateStore:
 
     def _snapshot_uri(self, snapshot_kind: str) -> str:
         return f"twinr://longterm/{self.namespace or _REMOTE_NAMESPACE_PREFIX}/{snapshot_kind}"
+
+    def _retry_attempts(self) -> int:
+        return max(int(self.config.long_term_memory_remote_retry_attempts), 1)
+
+    def _retry_backoff_s(self) -> float:
+        return max(float(self.config.long_term_memory_remote_retry_backoff_s), 0.0)
 
 
 def _remote_namespace_for_config(config: TwinrConfig) -> str:
