@@ -217,6 +217,14 @@ class RawReceiptPrinter:
                     stderr,
                 )
                 raise PrinterError("The printer could not complete the printout.")  # AUDIT-FIX(#6): Do not leak raw CUPS stderr or numeric codes into user-facing paths.
+            if self._cups_reported_zero_files(stdout):
+                logger.warning(
+                    "CUPS accepted a zero-file print job: queue=%s stdout=%r stderr=%r",
+                    self.queue,
+                    stdout,
+                    stderr,
+                )
+                raise PrinterError("CUPS accepted the job but received no document data")
             return stdout
         finally:
             if spool_path is not None:
@@ -370,3 +378,8 @@ class RawReceiptPrinter:
             "-o",
             "job-sheets=none,none",
         ]
+
+    @staticmethod
+    def _cups_reported_zero_files(stdout: str) -> bool:
+        normalized = " ".join(str(stdout or "").split()).lower()
+        return "(0 file(s))" in normalized
