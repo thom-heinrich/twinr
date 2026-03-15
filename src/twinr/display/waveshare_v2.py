@@ -2,12 +2,21 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import datetime, timezone  # AUDIT-FIX(#7): Use aware local timestamps instead of naive localtime.
 from importlib import import_module
+import importlib.util  # AUDIT-FIX(#1): Load vendor modules from exact files instead of mutating sys.path.
 from pathlib import Path
+from threading import RLock  # AUDIT-FIX(#3): Serialise shared mutable state and global import mutations.
+import logging  # AUDIT-FIX(#4): Emit diagnosable recovery logs for hardware/display faults.
 import sys
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
+
+
+_LOGGER = logging.getLogger(__name__)
+_IMPORT_LOCK = RLock()
+_SUPPORTED_ROTATIONS = {0, 90, 180, 270}
 
 
 @dataclass(slots=True)
@@ -26,15 +35,36 @@ class WaveshareEPD4In2V2:
     rotation_degrees: int = 270
     full_refresh_interval: int = 0
     _driver_module: object | None = field(default=None, init=False, repr=False)
+    _epdconfig_module: object | None = field(default=None, init=False, repr=False)  # AUDIT-FIX(#5): Keep vendor transport module for deterministic cleanup.
     _epd: object | None = field(default=None, init=False, repr=False)
     _render_count: int = field(default=0, init=False, repr=False)
     _font_cache: dict[str, object] = field(default_factory=dict, init=False, repr=False)
+    _lock: object = field(default_factory=RLock, init=False, repr=False)  # AUDIT-FIX(#3): Protect shared driver/font state.
+
+    # AUDIT-FIX(#1): Canonicalise and validate file-system inputs early so the driver cannot import code outside the Twinr project tree.
+    # AUDIT-FIX(#6): Fail fast on invalid config values instead of crashing later inside PIL or vendor code.
+    def __post_init__(self) -> None:
+        self.project_root = self.project_root.expanduser().resolve(strict=False)
+        self.vendor_dir = self._resolve_vendor_dir(self.vendor_dir)
+        self.rotation_degrees = self.rotation_degrees % 360
+
+        if self.width <= 0 or self.height <= 0:
+            raise RuntimeError("Display width and height must be positive integers.")
+        if self.full_refresh_interval < 0:
+            raise RuntimeError("Display full_refresh_interval must be >= 0.")
+        if self.rotation_degrees not in _SUPPORTED_ROTATIONS:
+            raise RuntimeError(
+                "Display rotation must be one of 0, 90, 180, or 270 degrees."
+            )
+        if self.spi_bus < 0 or self.spi_device < 0:
+            raise RuntimeError("SPI bus and device must be >= 0.")
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "WaveshareEPD4In2V2":
         return cls(
             project_root=Path(config.project_root),
-            vendor_dir=Path(config.project_root) / config.display_vendor_dir,
+            # AUDIT-FIX(#1): Keep the raw configured vendor path and let __post_init__ resolve it safely against project_root.
+            vendor_dir=Path(config.display_vendor_dir),
             driver=config.display_driver,
             spi_bus=config.display_spi_bus,
             spi_device=config.display_spi_device,
@@ -56,6 +86,13 @@ class WaveshareEPD4In2V2:
     def canvas_size(self) -> tuple[int, int]:
         return (self.width, self.height)
 
+    @property
+    def allowed_image_sizes(self) -> tuple[tuple[int, int], ...]:
+        sizes = {self.canvas_size}
+        if self.rotation_degrees in (90, 270):
+            sizes.add((self.height, self.width))
+        return tuple(sorted(sizes))
+
     def show_test_pattern(self) -> None:
         image = self.render_test_image()
         self.show_image(image, clear_first=True)
@@ -76,62 +113,72 @@ class WaveshareEPD4In2V2:
         )
         self.show_image(image, clear_first=False)
 
+    # AUDIT-FIX(#3): Guard mutable driver state with a per-instance lock so concurrent callers cannot double-initialise the panel or corrupt render counters.
+    # AUDIT-FIX(#4): Reset and retry once after display failures to recover from transient SPI/EPD faults.
     def show_image(self, image: object, *, clear_first: bool) -> None:
-        epd = self._get_epd()
-        prepared_image = self._prepare_image(image)
+        with self._lock:
+            prepared_image = self._prepare_image(image)
+            self._validate_prepared_image(prepared_image)
+            last_error: Exception | None = None
+            started_at = time.monotonic()
 
-        if clear_first or self._render_count == 0:
-            self._init_full(epd)
-            if clear_first and hasattr(epd, "Clear"):
-                epd.Clear()
-            prepared = epd.getbuffer(prepared_image)
-            epd.display(prepared)
-            self._render_count = 1
-            return
+            for attempt in range(2):
+                try:
+                    epd = self._get_epd()
+                    self._display_prepared_image(epd, prepared_image, clear_first=clear_first)
+                    if attempt > 0:
+                        _LOGGER.info(
+                            "E-paper render recovered after %.3fs.",
+                            time.monotonic() - started_at,
+                        )
+                    return
+                except Exception as exc:  # pragma: no cover - exercised via hardware fault paths.
+                    last_error = exc
+                    _LOGGER.warning(
+                        "E-paper render attempt %s failed after %.3fs; resetting driver state.",
+                        attempt + 1,
+                        time.monotonic() - started_at,
+                        exc_info=exc,
+                    )
+                    self._reset_driver_state()
 
-        if self.full_refresh_interval > 0 and self._render_count % self.full_refresh_interval == 0:
-            self._init_full(epd)
-            prepared = epd.getbuffer(prepared_image)
-            epd.display(prepared)
-            self._render_count += 1
-            return
+                clear_first = True
 
-        if hasattr(epd, "display_Partial"):
-            prepared = epd.getbuffer(prepared_image)
-            epd.display_Partial(prepared)
-        elif hasattr(epd, "display_Fast") and hasattr(epd, "init_fast"):
-            self._init_fast(epd)
-            prepared = epd.getbuffer(prepared_image)
-            epd.display_Fast(prepared)
-        else:
-            self._init_full(epd)
-            prepared = epd.getbuffer(prepared_image)
-            epd.display(prepared)
-        self._render_count += 1
+            raise RuntimeError(
+                "E-paper display update failed after one recovery attempt."
+            ) from last_error
 
+    # AUDIT-FIX(#3): Keep shutdown atomic relative to display calls.
+    # AUDIT-FIX(#5): Perform best-effort hardware cleanup instead of only suppressing sleep() and leaking SPI/GPIO resources.
     def close(self) -> None:
-        if self._epd is None:
-            return
-        with suppress(Exception):
-            self._epd.sleep()
-        self._epd = None
-        self._render_count = 0
+        with self._lock:
+            self._shutdown_hardware()
+            self._driver_module = None
+            self._epdconfig_module = None
+            self._epd = None
+            self._render_count = 0
 
+    # AUDIT-FIX(#3): Protect font-cache mutation and render helpers from concurrent access.
+    # AUDIT-FIX(#7): Use an aware local datetime so the rendered test timestamp is unambiguous across DST/timezone changes.
     def render_test_image(self) -> object:
-        image, draw = self._new_canvas()
-        canvas_width, canvas_height = image.size
-        title_font = self._font(28, bold=True)
-        body_font = self._font(20, bold=False)
-        draw.rectangle((0, 0, canvas_width - 1, canvas_height - 1), outline=0, width=5)
-        draw.rectangle((0, 0, canvas_width - 1, 58), fill=0)
-        draw.text((16, 12), "TWINR E-PAPER V2", fill=255, font=title_font)
-        draw.text((18, 78), time.strftime("%Y-%m-%d %H:%M:%S"), fill=0, font=body_font)
-        draw.text((18, 116), "BLACK / WHITE TEST", fill=0, font=body_font)
-        draw.text((18, 152), "Display path is ready.", fill=0, font=body_font)
-        draw.rectangle((20, 210, 120, 290), fill=0)
-        draw.rectangle((140, 210, 240, 290), outline=0, width=3)
-        return image
+        with self._lock:
+            image, draw = self._new_canvas()
+            canvas_width, canvas_height = image.size
+            title_font = self._font(28, bold=True)
+            body_font = self._font(20, bold=False)
+            now_text = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+            draw.rectangle((0, 0, canvas_width - 1, canvas_height - 1), outline=0, width=5)
+            draw.rectangle((0, 0, canvas_width - 1, 58), fill=0)
+            draw.text((16, 12), "TWINR E-PAPER V2", fill=255, font=title_font)
+            draw.text((18, 78), now_text, fill=0, font=body_font)
+            draw.text((18, 116), "BLACK / WHITE TEST", fill=0, font=body_font)
+            draw.text((18, 152), "Display path is ready.", fill=0, font=body_font)
+            draw.rectangle((20, 210, 120, 290), fill=0)
+            draw.rectangle((140, 210, 240, 290), outline=0, width=3)
+            return image
 
+    # AUDIT-FIX(#3): Protect font-cache mutation and render helpers from concurrent access.
+    # AUDIT-FIX(#2): Normalise status/headline/detail payloads so error rendering does not crash on non-string inputs.
     def render_status_image(
         self,
         *,
@@ -140,70 +187,86 @@ class WaveshareEPD4In2V2:
         details: tuple[str, ...],
         animation_frame: int = 0,
     ) -> object:
-        image, draw = self._new_canvas()
-        canvas_width, canvas_height = image.size
-        brand_font = self._font(28, bold=True)
-        status_font = self._font(24, bold=True)
-        draw.rectangle((0, 0, canvas_width - 1, canvas_height - 1), fill=255)
-        draw.rectangle((0, 0, canvas_width - 1, 58), fill=0)
-        draw.text((18, 10), "TWINR", fill=255, font=brand_font)
-        status_label = " ".join((headline or status).split())
-        label_text = self._truncate_text(
-            draw,
-            status_label,
-            max_width=max(canvas_width - 170, 110),
-            font=status_font,
-        )
-        label_width = self._text_width(draw, label_text, font=status_font)
-        draw.text((canvas_width - label_width - 18, 12), label_text, fill=255, font=status_font)
+        with self._lock:
+            safe_status = self._normalise_text(status, fallback="status")
+            safe_headline = self._normalise_text(headline, fallback=safe_status)
+            safe_details = self._normalise_details(details)
+            safe_animation_frame = self._normalise_animation_frame(animation_frame)
 
-        self._draw_face(
-            draw,
-            status=status.lower(),
-            animation_frame=animation_frame,
-            canvas_width=canvas_width,
-            canvas_height=canvas_height,
-        )
-        self._draw_details_footer(
-            draw,
-            details=details,
-            canvas_width=canvas_width,
-            canvas_height=canvas_height,
-        )
-        return image
+            image, draw = self._new_canvas()
+            canvas_width, canvas_height = image.size
+            brand_font = self._font(28, bold=True)
+            status_font = self._font(24, bold=True)
+            draw.rectangle((0, 0, canvas_width - 1, canvas_height - 1), fill=255)
+            draw.rectangle((0, 0, canvas_width - 1, 58), fill=0)
+            draw.text((18, 10), "TWINR", fill=255, font=brand_font)
+            status_label = " ".join(safe_headline.split())
+            label_text = self._truncate_text(
+                draw,
+                status_label,
+                max_width=max(canvas_width - 170, 110),
+                font=status_font,
+            )
+            label_width = self._text_width(draw, label_text, font=status_font)
+            draw.text((canvas_width - label_width - 18, 12), label_text, fill=255, font=status_font)
 
+            self._draw_face(
+                draw,
+                status=safe_status.lower(),
+                animation_frame=safe_animation_frame,
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+            )
+            self._draw_details_footer(
+                draw,
+                details=safe_details,
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+            )
+            return image
+
+    # AUDIT-FIX(#1): Replace sys.path mutation with exact-file imports after validating the vendor package layout and origin paths.
+    # AUDIT-FIX(#3): Serialize module loading globally because sys.modules is process-global state.
+    # AUDIT-FIX(#6): Fail fast on non-default SPI settings when the vendor package cannot prove it is configured for them.
     def _load_driver_module(self):
         if self._driver_module is not None:
             return self._driver_module
 
         if self.driver != "waveshare_4in2_v2":
             raise RuntimeError(f"Unsupported display driver: {self.driver}")
-        if not self.vendor_package_dir.exists():
-            raise RuntimeError(
-                "Display vendor files are missing. Run `hardware/display/setup_display.sh` first."
+
+        package_dir = self._validate_vendor_layout()
+        package_init = package_dir / "__init__.py"
+        epdconfig_path = package_dir / "epdconfig.py"
+        driver_path = package_dir / "epd4in2_V2.py"
+
+        with _IMPORT_LOCK:
+            self._load_exact_vendor_module(
+                module_name="waveshare_epd",
+                module_path=package_init,
+                is_package=True,
+            )
+            self._load_exact_vendor_module(
+                module_name="waveshare_epd.epdconfig",
+                module_path=epdconfig_path,
+            )
+            self._load_exact_vendor_module(
+                module_name="waveshare_epd.epd4in2_V2",
+                module_path=driver_path,
             )
 
-        vendor_parent = self.vendor_dir
-        for module_name in [
-            "waveshare_epd",
-            "waveshare_epd.epdconfig",
-            "waveshare_epd.epd4in2_V2",
-        ]:
-            sys.modules.pop(module_name, None)
-
-        sys.path.insert(0, str(vendor_parent))
-        try:
             try:
                 epdconfig = import_module("waveshare_epd.epdconfig")
                 module = import_module("waveshare_epd.epd4in2_V2")
-            except ModuleNotFoundError as exc:
+            except Exception as exc:
                 raise RuntimeError(
-                    "Display vendor files are incomplete. Run `hardware/display/setup_display.sh` again."
+                    "Display vendor files are incomplete or failed to import. "
+                    "Run `hardware/display/setup_display.sh` again."
                 ) from exc
-        finally:
-            sys.path.pop(0)
 
         self._validate_vendor_config(epdconfig)
+        self._validate_driver_module_origin(module, driver_path)
+        self._epdconfig_module = epdconfig
         self._driver_module = module
         return module
 
@@ -220,6 +283,20 @@ class WaveshareEPD4In2V2:
             if actual_value != expected_value:
                 mismatches.append(f"{name}={actual_value} (expected {expected_value})")
 
+        # AUDIT-FIX(#6): Detect non-default SPI settings that would otherwise be accepted but silently ignored by the vendor package.
+        optional_spi = {
+            "SPI_BUS": self.spi_bus,
+            "SPI_DEVICE": self.spi_device,
+        }
+        unverifiable_spi = []
+        for name, expected_value in optional_spi.items():
+            if hasattr(epdconfig, name):
+                actual_value = getattr(epdconfig, name, None)
+                if actual_value != expected_value:
+                    mismatches.append(f"{name}={actual_value} (expected {expected_value})")
+            elif expected_value != 0:
+                unverifiable_spi.append(f"{name}={expected_value}")
+
         if mismatches:
             mismatch_text = ", ".join(mismatches)
             raise RuntimeError(
@@ -227,8 +304,21 @@ class WaveshareEPD4In2V2:
                 f"{mismatch_text}. Run `hardware/display/setup_display.sh` again."
             )
 
+        if unverifiable_spi:
+            unverifiable_text = ", ".join(unverifiable_spi)
+            raise RuntimeError(
+                "Configured SPI bus/device cannot be verified against the installed vendor driver: "
+                f"{unverifiable_text}. Use SPI 0:0 or patch the vendor driver during setup."
+            )
+
+    # AUDIT-FIX(#8): Convert missing Pillow dependency into a clear runtime error instead of a raw ImportError from deep inside a render path.
     def _new_canvas(self) -> tuple[object, object]:
-        from PIL import Image, ImageDraw
+        try:
+            from PIL import Image, ImageDraw
+        except Exception as exc:
+            raise RuntimeError(
+                "Pillow is required for Twinr e-paper rendering."
+            ) from exc
 
         image = Image.new("1", self.canvas_size, 255)
         return image, ImageDraw.Draw(image)
@@ -258,6 +348,7 @@ class WaveshareEPD4In2V2:
             animation_frame=animation_frame,
         )
 
+    # AUDIT-FIX(#2): Only render sanitised detail lines so exception objects or control characters cannot break the status footer.
     def _draw_details_footer(
         self,
         draw: object,
@@ -267,7 +358,7 @@ class WaveshareEPD4In2V2:
         canvas_height: int,
     ) -> None:
         footer_font = self._font(18, bold=False)
-        lines = [line.strip() for line in details if line and line.strip()][:1]
+        lines = self._normalise_details(details)[:1]
         if not lines:
             return
 
@@ -308,14 +399,14 @@ class WaveshareEPD4In2V2:
         center_x, center_y = origin
         eye = self._eye_state(status, animation_frame, side)
 
-        brow_y = center_y - 52 + eye["brow_raise"]
+        brow_y = center_y - 52 + int(eye["brow_raise"])
         if side == "left":
             draw.line(
                 (
                     center_x - 24,
-                    brow_y + eye["brow_slant"],
+                    brow_y + int(eye["brow_slant"]),
                     center_x + 24,
-                    brow_y - eye["brow_slant"],
+                    brow_y - int(eye["brow_slant"]),
                 ),
                 fill=0,
                 width=4,
@@ -324,15 +415,15 @@ class WaveshareEPD4In2V2:
             draw.line(
                 (
                     center_x - 24,
-                    brow_y - eye["brow_slant"],
+                    brow_y - int(eye["brow_slant"]),
                     center_x + 24,
-                    brow_y + eye["brow_slant"],
+                    brow_y + int(eye["brow_slant"]),
                 ),
                 fill=0,
                 width=4,
             )
 
-        if eye["blink"]:
+        if bool(eye["blink"]):
             draw.arc(
                 (
                     center_x - 26,
@@ -347,10 +438,10 @@ class WaveshareEPD4In2V2:
             )
             return
 
-        width = eye["width"]
-        height = eye["height"]
-        offset_x = eye["eye_shift_x"]
-        offset_y = eye["eye_shift_y"]
+        width = int(eye["width"])
+        height = int(eye["height"])
+        offset_x = int(eye["eye_shift_x"])
+        offset_y = int(eye["eye_shift_y"])
         box = (
             center_x - (width // 2) + offset_x,
             center_y - (height // 2) + offset_y,
@@ -360,7 +451,7 @@ class WaveshareEPD4In2V2:
         draw.ellipse(box, fill=0)
         self._draw_eye_highlights(draw, box, eye)
 
-        if eye["lid_arc"]:
+        if bool(eye["lid_arc"]):
             draw.arc(
                 (
                     box[0] + 4,
@@ -425,30 +516,96 @@ class WaveshareEPD4In2V2:
             return
         if status == "printing":
             lift = (0, -1, 0, 1)[animation_frame % 4]
-            draw.arc((center_x - 28, center_y - 6 + lift, center_x + 28, center_y + 16 + lift), start=12, end=168, fill=0, width=4)
+            draw.arc(
+                (center_x - 28, center_y - 6 + lift, center_x + 28, center_y + 16 + lift),
+                start=12,
+                end=168,
+                fill=0,
+                width=4,
+            )
             return
         if status == "error":
-            draw.arc((center_x - 22, center_y + 6, center_x + 22, center_y + 18), start=200, end=340, fill=0, width=4)
+            draw.arc(
+                (center_x - 22, center_y + 6, center_x + 22, center_y + 18),
+                start=200,
+                end=340,
+                fill=0,
+                width=4,
+            )
             return
         draw.arc((center_x - 20, center_y - 8, center_x + 20, center_y + 8), start=20, end=160, fill=0, width=4)
 
     def _prepare_image(self, image: object):
         if hasattr(image, "rotate") and hasattr(image, "size"):
             width, height = image.size
-            if (width, height) == self.canvas_size:
-                return image.rotate(self.rotation_degrees % 360, expand=True)
+            if (width, height) == self.canvas_size and self.rotation_degrees != 0:
+                return image.rotate(self.rotation_degrees, expand=True)
         return image
 
+    # AUDIT-FIX(#4): Validate the prepared image before touching hardware so bad caller input does not masquerade as an SPI/display failure.
+    def _validate_prepared_image(self, image: object) -> None:
+        size = getattr(image, "size", None)
+        if not isinstance(size, tuple) or len(size) != 2:
+            raise RuntimeError(
+                "Display image must expose a two-value `.size` attribute."
+            )
+
+        width = int(size[0])
+        height = int(size[1])
+        if (width, height) not in self.allowed_image_sizes:
+            raise RuntimeError(
+                "Display image size "
+                f"{(width, height)} does not match expected sizes {self.allowed_image_sizes}."
+            )
+
+    # AUDIT-FIX(#4): Keep the success/failure boundary narrow so render counters are only mutated after a successful hardware update.
+    def _display_prepared_image(self, epd: object, prepared_image: object, *, clear_first: bool) -> None:
+        if clear_first or self._render_count == 0:
+            self._init_full(epd)
+            if clear_first and hasattr(epd, "Clear"):
+                epd.Clear()
+            prepared = epd.getbuffer(prepared_image)
+            epd.display(prepared)
+            self._render_count = 1
+            return
+
+        if self.full_refresh_interval > 0 and self._render_count % self.full_refresh_interval == 0:
+            self._init_full(epd)
+            prepared = epd.getbuffer(prepared_image)
+            epd.display(prepared)
+            self._render_count += 1
+            return
+
+        if hasattr(epd, "display_Partial"):
+            prepared = epd.getbuffer(prepared_image)
+            epd.display_Partial(prepared)
+        elif hasattr(epd, "display_Fast") and hasattr(epd, "init_fast"):
+            self._init_fast(epd)
+            prepared = epd.getbuffer(prepared_image)
+            epd.display_Fast(prepared)
+        else:
+            self._init_full(epd)
+            prepared = epd.getbuffer(prepared_image)
+            epd.display(prepared)
+        self._render_count += 1
+
+    # AUDIT-FIX(#3): Only instantiate the vendor driver once per wrapper instance and validate its shape before use.
     def _get_epd(self):
         if self._epd is None:
             module = self._load_driver_module()
+            if not hasattr(module, "EPD"):
+                raise RuntimeError("Display driver module does not expose EPD().")
             self._epd = module.EPD()
         return self._epd
 
     def _init_full(self, epd: object) -> None:
+        if not hasattr(epd, "init"):
+            raise RuntimeError("Display driver instance does not expose init().")
         epd.init()
 
     def _init_fast(self, epd: object) -> None:
+        if not hasattr(epd, "init_fast"):
+            raise RuntimeError("Display driver instance does not expose init_fast().")
         speed_mode = getattr(epd, "Seconds_1_5S", 0)
         epd.init_fast(speed_mode)
 
@@ -582,36 +739,46 @@ class WaveshareEPD4In2V2:
             self._truncate_text(draw, second_line, max_width=final_width, font=font),
         )
 
+    # AUDIT-FIX(#3): Serialise cache access to avoid duplicate font loads and shared-cache races under concurrent render calls.
+    # AUDIT-FIX(#8): Convert missing Pillow dependency into a clear runtime error while retaining graceful font fallback when files are missing.
     def _font(self, size: int, *, bold: bool) -> object:
         cache_key = f"{'bold' if bold else 'regular'}:{max(8, size)}"
-        cached = self._font_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        from PIL import ImageFont
+        with self._lock:
+            cached = self._font_cache.get(cache_key)
+            if cached is not None:
+                return cached
 
-        candidates = (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-        ) if bold else (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-        )
-        font = None
-        for candidate in candidates:
-            if not Path(candidate).exists():
-                continue
-            with suppress(Exception):
-                font = ImageFont.truetype(candidate, size=max(8, size))
-                break
-        if font is None:
-            font = ImageFont.load_default()
-        self._font_cache[cache_key] = font
-        return font
+            try:
+                from PIL import ImageFont
+            except Exception as exc:
+                raise RuntimeError(
+                    "Pillow is required for Twinr e-paper font rendering."
+                ) from exc
 
+            candidates = (
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            ) if bold else (
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            )
+            font = None
+            for candidate in candidates:
+                if not Path(candidate).exists():
+                    continue
+                with suppress(Exception):
+                    font = ImageFont.truetype(candidate, size=max(8, size))
+                    break
+            if font is None:
+                font = ImageFont.load_default()
+            self._font_cache[cache_key] = font
+            return font
+
+    # AUDIT-FIX(#9): Keep layout fallbacks narrow; earlier image/draw validation now catches gross misuse before these helpers need to suppress anything.
     def _text_width(self, draw: object, text: str, *, font: object | None = None) -> int:
         if not text:
             return 0
@@ -621,6 +788,7 @@ class WaveshareEPD4In2V2:
             width = int(text_box[2] - text_box[0])
         return width
 
+    # AUDIT-FIX(#9): Keep layout fallbacks narrow; earlier image/draw validation now catches gross misuse before these helpers need to suppress anything.
     def _text_height(self, draw: object, *, font: object | None = None) -> int:
         height = 12
         with suppress(Exception):
@@ -636,3 +804,158 @@ class WaveshareEPD4In2V2:
         while compact and self._text_width(draw, compact + ellipsis, font=font) > max_width:
             compact = compact[:-1].rstrip()
         return (compact + ellipsis) if compact else ellipsis
+
+    # AUDIT-FIX(#1): Keep vendor imports pinned to project-local paths and reject path traversal outside project_root.
+    def _resolve_vendor_dir(self, vendor_dir: Path) -> Path:
+        candidate = vendor_dir.expanduser()
+        if not candidate.is_absolute():
+            candidate = self.project_root / candidate
+        resolved = candidate.resolve(strict=False)
+        if not resolved.is_relative_to(self.project_root):
+            raise RuntimeError(
+                "Display vendor directory must stay inside the Twinr project root."
+            )
+        return resolved
+
+    # AUDIT-FIX(#1): Reject symlinked or missing vendor entrypoints before importing executable code from disk.
+    def _validate_vendor_layout(self) -> Path:
+        if self.vendor_dir.is_symlink():
+            raise RuntimeError("Display vendor directory must not be a symlink.")
+
+        package_dir = self.vendor_package_dir
+        if not package_dir.exists():
+            raise RuntimeError(
+                "Display vendor files are missing. Run `hardware/display/setup_display.sh` first."
+            )
+        if not package_dir.is_dir():
+            raise RuntimeError("Display vendor package path is invalid.")
+        if package_dir.is_symlink():
+            raise RuntimeError("Display vendor package path must not be a symlink.")
+
+        resolved_package_dir = package_dir.resolve(strict=True)
+        if not resolved_package_dir.is_relative_to(self.project_root):
+            raise RuntimeError(
+                "Display vendor package must stay inside the Twinr project root."
+            )
+
+        required_files = (
+            resolved_package_dir / "__init__.py",
+            resolved_package_dir / "epdconfig.py",
+            resolved_package_dir / "epd4in2_V2.py",
+        )
+        for required_file in required_files:
+            if not required_file.exists():
+                raise RuntimeError(
+                    "Display vendor files are incomplete. "
+                    "Run `hardware/display/setup_display.sh` again."
+                )
+            if not required_file.is_file():
+                raise RuntimeError(f"Display vendor file path is invalid: {required_file.name}.")
+            if required_file.is_symlink():
+                raise RuntimeError(
+                    f"Display vendor file must not be a symlink: {required_file.name}."
+                )
+
+        return resolved_package_dir
+
+    # AUDIT-FIX(#1): Import the vendor package from exact files instead of mutating sys.path.
+    def _load_exact_vendor_module(
+        self,
+        *,
+        module_name: str,
+        module_path: Path,
+        is_package: bool = False,
+    ) -> object:
+        resolved_path = module_path.resolve(strict=True)
+        existing = sys.modules.get(module_name)
+        if existing is not None and self._module_matches_path(existing, resolved_path):
+            return existing
+
+        if existing is not None:
+            sys.modules.pop(module_name, None)
+
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            str(resolved_path),
+            submodule_search_locations=[str(resolved_path.parent)] if is_package else None,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load display vendor module: {module_name}")
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
+        return module
+
+    def _module_matches_path(self, module: object, expected_path: Path) -> bool:
+        module_file = getattr(module, "__file__", None)
+        if not module_file:
+            return False
+        return Path(module_file).resolve(strict=False) == expected_path.resolve(strict=False)
+
+    def _validate_driver_module_origin(self, module: object, expected_path: Path) -> None:
+        if not self._module_matches_path(module, expected_path.resolve(strict=True)):
+            raise RuntimeError(
+                "Loaded display driver module origin does not match the validated vendor path."
+            )
+
+    # AUDIT-FIX(#5): On failures or shutdown, put the panel to sleep and close the vendor transport layer when available.
+    def _shutdown_hardware(self) -> None:
+        epd = self._epd
+        epdconfig = self._epdconfig_module
+
+        if epd is not None and hasattr(epd, "sleep"):
+            with suppress(Exception):
+                epd.sleep()
+
+        if epdconfig is not None and hasattr(epdconfig, "module_exit"):
+            module_exit = getattr(epdconfig, "module_exit")
+            with suppress(Exception):
+                try:
+                    module_exit(cleanup=True)
+                except TypeError:
+                    module_exit()
+
+    # AUDIT-FIX(#4): After any hardware fault, fully discard cached driver state so the next attempt starts from a clean init path.
+    def _reset_driver_state(self) -> None:
+        self._shutdown_hardware()
+        self._epd = None
+        self._render_count = 0
+
+    # AUDIT-FIX(#2): Collapse whitespace and coerce arbitrary values into safe display strings, especially on error-reporting paths.
+    def _normalise_text(self, value: object, *, fallback: str = "") -> str:
+        if value is None:
+            text = fallback
+        else:
+            text = str(value)
+        text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        return " ".join(text.split())
+
+    # AUDIT-FIX(#2): Accept string, iterable, or arbitrary objects for detail payloads so callers can pass exception objects without crashing the UI path.
+    def _normalise_details(self, details: object) -> tuple[str, ...]:
+        if details is None:
+            return ()
+        if isinstance(details, str):
+            text = self._normalise_text(details)
+            return (text,) if text else ()
+
+        with suppress(TypeError):
+            normalised = tuple(
+                text
+                for text in (self._normalise_text(item) for item in details)
+                if text
+            )
+            return normalised
+
+        text = self._normalise_text(details)
+        return (text,) if text else ()
+
+    # AUDIT-FIX(#2): Coerce animation_frame defensively so status rendering keeps working even when callers pass floats, strings, or None.
+    def _normalise_animation_frame(self, value: object) -> int:
+        with suppress(Exception):
+            return int(value)
+        return 0

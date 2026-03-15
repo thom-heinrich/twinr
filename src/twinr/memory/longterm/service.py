@@ -638,6 +638,9 @@ class LongTermMemoryService:
         item: LongTermConversationTurn,
     ) -> PersistentMemoryEntry:
         try:
+            existing_objects = tuple(object_store.load_objects())
+            existing_conflicts = tuple(object_store.load_conflicts())
+            existing_archived = tuple(object_store.load_archived_objects())
             extraction = extractor.extract_conversation_turn(
                 transcript=item.transcript,
                 response=item.response,
@@ -645,15 +648,37 @@ class LongTermMemoryService:
             )
             result = consolidator.consolidate(
                 extraction=extraction,
-                existing_objects=object_store.load_objects(),
+                existing_objects=existing_objects,
             )
-            object_store.apply_consolidation(result)
+            current_objects, current_conflicts = LongTermMemoryService._merge_consolidation_state(
+                object_store=object_store,
+                existing_objects=existing_objects,
+                existing_conflicts=existing_conflicts,
+                result=result,
+            )
             graph_store.apply_candidate_edges(result.graph_edges)
-            reflection = reflector.reflect(objects=object_store.load_objects())
-            object_store.apply_reflection(reflection)
+            reflection = reflector.reflect(objects=current_objects)
+            current_objects = LongTermMemoryService._merge_reflection_objects(
+                object_store=object_store,
+                current_objects=current_objects,
+                reflection=reflection,
+            )
             midterm_store.apply_reflection(reflection)
-            object_store.apply_reflection(sensor_memory.compile(objects=object_store.load_objects(), now=item.created_at))
-            object_store.apply_retention(retention_policy.apply(objects=object_store.load_objects()))
+            sensor_reflection = sensor_memory.compile(objects=current_objects, now=item.created_at)
+            current_objects = LongTermMemoryService._merge_reflection_objects(
+                object_store=object_store,
+                current_objects=current_objects,
+                reflection=sensor_reflection,
+            )
+            retention = retention_policy.apply(objects=current_objects)
+            archived = {item.memory_id: item for item in existing_archived}
+            for archived_item in retention.archived_objects:
+                archived[archived_item.memory_id] = archived_item
+            object_store.write_snapshot(
+                objects=retention.kept_objects,
+                conflicts=current_conflicts,
+                archived_objects=tuple(sorted(archived.values(), key=lambda row: row.memory_id)),
+            )
             if config.long_term_memory_mode == "remote_primary":
                 return None
         except LongTermRemoteUnavailableError:
@@ -691,8 +716,48 @@ class LongTermMemoryService:
     def _persist_episodic_turn(*, store: PromptContextStore, item: LongTermConversationTurn) -> PersistentMemoryEntry:
         quoted_transcript = json.dumps(item.transcript, ensure_ascii=False)
         quoted_response = json.dumps(item.response, ensure_ascii=False)
-        return store.memory_store.remember(
+        local_memory_store = type(store.memory_store)(store.memory_store.path)
+        return local_memory_store.remember(
             kind="episodic_turn",
             summary=f"Conversation about {quoted_transcript}",
             details=f"User said: {quoted_transcript} Twinr answered: {quoted_response}",
         )
+
+    @staticmethod
+    def _merge_consolidation_state(
+        *,
+        object_store: LongTermStructuredStore,
+        existing_objects: tuple,
+        existing_conflicts: tuple,
+        result: LongTermConsolidationResultV1,
+    ) -> tuple[tuple, tuple]:
+        merged_objects = {item.memory_id: item for item in existing_objects}
+        for item in (*result.episodic_objects, *result.durable_objects, *result.deferred_objects):
+            merged_objects[item.memory_id] = object_store._merge_object(
+                existing=merged_objects.get(item.memory_id),
+                incoming=item,
+                increment_support=True,
+            )
+        merged_conflicts = {item.slot_key: item for item in existing_conflicts}
+        for conflict in result.conflicts:
+            merged_conflicts[conflict.slot_key] = conflict
+        return (
+            tuple(sorted(merged_objects.values(), key=lambda row: row.memory_id)),
+            tuple(sorted(merged_conflicts.values(), key=lambda row: (row.slot_key, row.candidate_memory_id))),
+        )
+
+    @staticmethod
+    def _merge_reflection_objects(
+        *,
+        object_store: LongTermStructuredStore,
+        current_objects: tuple,
+        reflection: LongTermReflectionResultV1,
+    ) -> tuple:
+        merged = {item.memory_id: item for item in current_objects}
+        for item in (*reflection.reflected_objects, *reflection.created_summaries):
+            merged[item.memory_id] = object_store._merge_object(
+                existing=merged.get(item.memory_id),
+                incoming=item,
+                increment_support=False,
+            )
+        return tuple(sorted(merged.values(), key=lambda row: row.memory_id))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from io import BytesIO
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from test.longterm_test_program import make_test_extractor
 from twinr.config import TwinrConfig
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig
+from twinr.memory.context_store import PersistentMemoryMarkdownStore
 from twinr.memory.longterm.remote_state import LongTermRemoteStateStore
 from twinr.memory.longterm.service import LongTermMemoryService
 
@@ -122,6 +124,32 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertEqual(body["items"][0]["payload"]["snapshot_kind"], "objects")
         self.assertEqual(body["items"][0]["metadata"]["twinr_snapshot_kind"], "objects")
 
+    def test_remote_snapshot_save_retries_after_transient_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=2,
+                long_term_memory_remote_retry_backoff_s=0.0,
+            )
+            write_opener = FakeOpener()
+            write_opener.queue_exception(TimeoutError("timed out"))
+            write_opener.queue_json({"success": True, "stored": 1})
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=write_opener,
+                ),
+            )
+
+            state.save_snapshot(snapshot_kind="objects", payload={"schema": "object_store", "objects": []})
+
+        self.assertEqual(len(write_opener.calls), 2)
+
     def test_remote_snapshot_loads_from_documents_full_chunk_content(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir)
@@ -170,6 +198,45 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
 
         self.assertEqual(payload, {"schema": "object_store", "objects": [{"memory_id": "fact:2"}]})
 
+    def test_remote_snapshot_load_retries_after_transient_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=2,
+                long_term_memory_remote_retry_backoff_s=0.0,
+            )
+            read_opener = FakeOpener()
+            read_opener.queue_exception(TimeoutError("timed out"))
+            read_opener.queue_json(
+                {
+                    "origin_uri": "twinr://longterm/test-namespace/objects",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "objects",
+                            "body": {"schema": "object_store", "objects": [{"memory_id": "fact:retry"}]},
+                        }
+                    ),
+                }
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+
+            payload = state.load_snapshot(snapshot_kind="objects", local_path=Path(temp_dir) / "objects.json")
+
+        self.assertEqual(payload, {"schema": "object_store", "objects": [{"memory_id": "fact:retry"}]})
+        self.assertEqual(len(read_opener.calls), 2)
+
     def test_remote_snapshot_migrates_from_local_when_remote_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir)
@@ -203,7 +270,10 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
 
     def test_remote_snapshot_raises_when_migration_write_times_out_in_required_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            config = self._config(temp_dir)
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=1,
+            )
             local_path = Path(temp_dir) / "state" / "chonkydb" / "twinr_memory_objects_v1.json"
             local_path.parent.mkdir(parents=True, exist_ok=True)
             local_payload = {"schema": "object_store", "objects": [{"memory_id": "fact:local"}]}
@@ -323,7 +393,7 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
                 response="I will keep our conversation context available.",
             )
             drained = service.flush(timeout_s=2.0)
-            entries = service.prompt_context_store.memory_store.load_entries()
+            entries = PersistentMemoryMarkdownStore(config.memory_markdown_path).load_entries()
             service.shutdown()
 
         self.assertEqual(context.system_messages(), ())
