@@ -156,7 +156,8 @@ def describe_sensor_trigger(trigger: object) -> SensorTriggerSpec | None:
         return None
 
     for trigger_kind, immediate_event_name in _IMMEDIATE_SENSOR_EVENTS.items():
-        if event_name != immediate_event_name:
+        normalized_immediate_event_name = _normalize_event_name(immediate_event_name)
+        if event_name != normalized_immediate_event_name:
             continue
         if _conditions_semantically_equal(all_conditions, _base_conditions(trigger_kind)):
             return SensorTriggerSpec(

@@ -3,12 +3,17 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from types import SimpleNamespace
 
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.display import WaveshareEPD4In2V2
+
+
+def _prepared_image(width: int = 300, height: int = 400):
+    return SimpleNamespace(size=(width, height))
 
 
 class WaveshareDisplayTests(unittest.TestCase):
@@ -175,7 +180,7 @@ class WaveshareDisplayTests(unittest.TestCase):
                 project_root=Path(temp_dir),
                 vendor_dir=Path(temp_dir) / "vendor",
             )
-            token = object()
+            token = _prepared_image()
 
             display.show_image(token, clear_first=True)
 
@@ -248,18 +253,21 @@ class WaveshareDisplayTests(unittest.TestCase):
                 vendor_dir=Path(temp_dir) / "vendor",
             )
 
-            display.show_image("first", clear_first=False)
-            display.show_image("second", clear_first=False)
+            first = _prepared_image()
+            second = _prepared_image()
+
+            display.show_image(first, clear_first=False)
+            display.show_image(second, clear_first=False)
 
             module = display._load_driver_module()
             self.assertEqual(
                 module.EVENTS,
                 [
                     "init",
-                    ("buffer", "first"),
-                    ("display", "first"),
-                    ("buffer", "second"),
-                    ("display_partial", "second"),
+                    ("buffer", first),
+                    ("display", first),
+                    ("buffer", second),
+                    ("display_partial", second),
                 ],
             )
 
@@ -318,19 +326,22 @@ class WaveshareDisplayTests(unittest.TestCase):
                 vendor_dir=Path(temp_dir) / "vendor",
             )
 
-            display.show_image("first", clear_first=False)
-            display.show_image("second", clear_first=False)
+            first = _prepared_image()
+            second = _prepared_image()
+
+            display.show_image(first, clear_first=False)
+            display.show_image(second, clear_first=False)
 
             module = display._load_driver_module()
             self.assertEqual(
                 module.EVENTS,
                 [
                     "init",
-                    ("buffer", "first"),
-                    ("display", "first"),
+                    ("buffer", first),
+                    ("display", first),
                     ("init_fast", 7),
-                    ("buffer", "second"),
-                    ("display_fast", "second"),
+                    ("buffer", second),
+                    ("display_fast", second),
                 ],
             )
 
@@ -383,22 +394,26 @@ class WaveshareDisplayTests(unittest.TestCase):
                 full_refresh_interval=2,
             )
 
-            display.show_image("first", clear_first=False)
-            display.show_image("second", clear_first=False)
-            display.show_image("third", clear_first=False)
+            first = _prepared_image()
+            second = _prepared_image()
+            third = _prepared_image()
+
+            display.show_image(first, clear_first=False)
+            display.show_image(second, clear_first=False)
+            display.show_image(third, clear_first=False)
 
             module = display._load_driver_module()
             self.assertEqual(
                 module.EVENTS,
                 [
                     "init",
-                    ("buffer", "first"),
-                    ("display", "first"),
-                    ("buffer", "second"),
-                    ("display_partial", "second"),
+                    ("buffer", first),
+                    ("display", first),
+                    ("buffer", second),
+                    ("display_partial", second),
                     "init",
-                    ("buffer", "third"),
-                    ("display", "third"),
+                    ("buffer", third),
+                    ("display", third),
                 ],
             )
 
