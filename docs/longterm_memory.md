@@ -21,6 +21,8 @@ This layer keeps long-term memory responsibilities separated from:
   - bounded background writer thread so durable turn storage does not block the response path
 - `service.py`
   - one orchestration surface for retrieval, explicit memory writes, and background episodic persistence
+- `remote_state.py`
+  - remote-primary ChonkyDB snapshot backend with migration hooks and strict degraded-mode semantics
 - `retriever.py`
   - hybrid retrieval and bounded context assembly for silent personalization, explicit recall, and conflict prompts
 - `extract.py`
@@ -34,9 +36,9 @@ This layer keeps long-term memory responsibilities separated from:
 - `consolidator.py`
   - promotion of extracted candidates into episodic vs durable memory plus conflict-aware graph emission
 - `store.py`
-  - local structured persistence for durable objects and unresolved conflicts, plus review/delete/invalidate mutation helpers
+  - structured persistence for durable objects, unresolved conflicts, and archive snapshots, with optional remote-primary backing
 - `midterm_store.py`
-  - separate near-term continuity store for compiled mid-term packets that sit between rolling dialogue and durable facts
+  - separate near-term continuity store for compiled mid-term packets that sit between rolling dialogue and durable facts, locally cached and optionally remote-primary
 - `reflect.py`
   - bounded reflection over stored objects for support-count promotion, compact thread summaries, and compiled mid-term packets
 - `midterm.py`
@@ -48,7 +50,7 @@ This layer keeps long-term memory responsibilities separated from:
 - `conflicts.py`
   - queued clarification items plus explicit conflict resolution that updates object validity instead of silently drifting
 - `retention.py`
-  - bounded retention policy for expiring time-bound memory and pruning low-value ephemeral objects
+  - conservative hierarchical retention policy for expiring time-bound memory, archiving stale episodes/summaries, and pruning low-value ephemeral objects
 - `subtext.py`
   - builds silent personalization context and, when enabled, compiles relevant memory into a bounded structured subtext program for the current turn
 - `subtext_eval.py`
@@ -92,18 +94,26 @@ For non-English user queries, the retrieval path can build a short canonical Eng
   - `TWINR_LONG_TERM_MEMORY_PATH/twinr_memory_midterm_v1.json`
 - local graph-backed long-term structures:
   - `TWINR_LONG_TERM_MEMORY_PATH/twinr_graph_v1.json`
+- archived long-term objects:
+  - `TWINR_LONG_TERM_MEMORY_PATH/twinr_memory_archive_v1.json`
 
-The normal live runtime still does not push every turn into the shared external ChonkyDB service. The external client remains available for future remote retrieval/write integration without coupling the current assistant loop to network latency.
+When `TWINR_LONG_TERM_MEMORY_MODE=remote_primary`, these local files become cache/migration artifacts. ChonkyDB is then the primary long-term source, and the stores read/write snapshot state through the remote backend before updating the local cache.
+
+If remote-primary memory is required and ChonkyDB is unavailable, Twinr falls back only to simple conversation memory (`MEMORY.md`, recent turns, personality/user context). In that mode, long-term graph/fact/midterm retrieval is withheld instead of silently pretending to be available.
 
 ## Config
 
 - `TWINR_LONG_TERM_MEMORY_ENABLED`
 - `TWINR_LONG_TERM_MEMORY_BACKEND`
+- `TWINR_LONG_TERM_MEMORY_MODE`
+- `TWINR_LONG_TERM_MEMORY_REMOTE_REQUIRED`
 - `TWINR_LONG_TERM_MEMORY_PATH`
 - `TWINR_LONG_TERM_MEMORY_BACKGROUND_STORE_TURNS`
 - `TWINR_LONG_TERM_MEMORY_WRITE_QUEUE_SIZE`
 - `TWINR_LONG_TERM_MEMORY_RECALL_LIMIT`
 - `TWINR_LONG_TERM_MEMORY_QUERY_REWRITE_ENABLED`
+- `TWINR_LONG_TERM_MEMORY_REMOTE_READ_TIMEOUT_S`
+- `TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S`
 - `TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MODEL`
 - `TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MAX_OUTPUT_TOKENS`
 - `TWINR_LONG_TERM_MEMORY_MIDTERM_ENABLED`
@@ -128,6 +138,12 @@ The normal live runtime still does not push every turn into the shared external 
 - `TWINR_LONG_TERM_MEMORY_SENSOR_MIN_DAYS_OBSERVED`
 - `TWINR_LONG_TERM_MEMORY_SENSOR_MIN_ROUTINE_RATIO`
 - `TWINR_LONG_TERM_MEMORY_SENSOR_DEVIATION_MIN_DELTA`
+- `TWINR_LONG_TERM_MEMORY_RETENTION_ENABLED`
+- `TWINR_LONG_TERM_MEMORY_RETENTION_MODE`
+- `TWINR_LONG_TERM_MEMORY_RETENTION_RUN_INTERVAL_S`
+- `TWINR_LONG_TERM_MEMORY_ARCHIVE_ENABLED`
+- `TWINR_LONG_TERM_MEMORY_MIGRATION_ENABLED`
+- `TWINR_LONG_TERM_MEMORY_MIGRATION_BATCH_SIZE`
 - `TWINR_CHONKYDB_BASE_URL`
 - `TWINR_CHONKYDB_API_KEY`
 - `TWINR_CHONKYDB_API_KEY_HEADER`
@@ -143,7 +159,7 @@ The normal live runtime still does not push every turn into the shared external 
 - hidden memory should usually shape replies silently instead of being announced explicitly
 - the user-facing reply language stays independent from the internal memory language
 
-By default, the long-term path should stay project-local under `state/chonkydb` so temporary runs and secondary env files do not leak graph data into a shared `/twinr` tree.
+By default, the long-term path should stay project-local under `state/chonkydb` so temporary runs and secondary env files do not leak graph data into a shared `/twinr` tree. Remote-primary mode does not change that local path; it changes which backend is treated as the source of truth.
 
 ## Synthetic eval
 

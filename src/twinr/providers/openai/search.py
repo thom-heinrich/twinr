@@ -8,8 +8,8 @@ from twinr.ops.usage import extract_model_name, extract_token_usage
 from .instructions import SEARCH_AGENT_INSTRUCTIONS, SEARCH_MODEL_FALLBACKS
 from .types import ConversationLike, OpenAISearchResult
 
-_SEARCH_CONTEXT_MAX_TURNS = 4
-_SEARCH_CONTEXT_CHAR_LIMIT = 220
+_SEARCH_CONTEXT_MAX_TURNS = 3
+_SEARCH_CONTEXT_CHAR_LIMIT = 160
 
 
 def _collapse_whitespace(value: str | None) -> str:
@@ -38,7 +38,10 @@ class OpenAISearchMixin:
         best_result: OpenAISearchResult | None = None
 
         for model in self._candidate_search_models():
-            for max_output_tokens in (320, 480):
+            for max_output_tokens in (
+                max(64, int(self.config.openai_search_max_output_tokens)),
+                max(96, int(self.config.openai_search_retry_max_output_tokens)),
+            ):
                 request = self._build_response_request(
                     prompt,
                     conversation=search_conversation,
@@ -47,7 +50,10 @@ class OpenAISearchMixin:
                     model=model,
                     reasoning_effort="medium",
                     max_output_tokens=max_output_tokens,
+                    prompt_cache_scope="search",
                 )
+                if request.get("tools"):
+                    request["tools"][0]["search_context_size"] = self.config.openai_web_search_context_size
                 request["include"] = ["web_search_call.action.sources"]
                 response = self._client.responses.create(**request)
                 candidate = OpenAISearchResult(

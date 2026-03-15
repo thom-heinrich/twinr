@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 from threading import Thread
+from types import SimpleNamespace
 import unittest
 from zoneinfo import ZoneInfo
 
@@ -23,6 +24,21 @@ from twinr.memory.longterm.models import (
 )
 from twinr.memory.longterm.store import LongTermStructuredStore, _write_json_atomic
 from twinr.memory.longterm.truth import LongTermTruthMaintainer
+
+
+class _FakeRemoteState:
+    def __init__(self) -> None:
+        self.enabled = True
+        self.config = SimpleNamespace(long_term_memory_migration_enabled=False)
+        self.snapshots: dict[str, dict[str, object]] = {}
+
+    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+        del local_path
+        payload = self.snapshots.get(snapshot_kind)
+        return dict(payload) if isinstance(payload, dict) else None
+
+    def save_snapshot(self, *, snapshot_kind: str, payload):
+        self.snapshots[snapshot_kind] = dict(payload)
 
 
 def _config(root: str) -> TwinrConfig:
@@ -125,6 +141,36 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(len(objects), 2)
         self.assertEqual(len(conflicts), 1)
         self.assertEqual(conflicts[0].slot_key, "contact:person:corinna_maier:phone")
+
+    def test_remote_primary_store_keeps_snapshots_off_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            result = LongTermConsolidationResultV1(
+                turn_id="turn:test",
+                occurred_at=datetime(2026, 3, 14, 12, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                episodic_objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="episode:turn_test",
+                        kind="episode",
+                        summary="Conversation turn recorded for long-term memory.",
+                        source=_source(),
+                        status="active",
+                        confidence=1.0,
+                    ),
+                ),
+                durable_objects=(),
+                deferred_objects=(),
+                conflicts=(),
+                graph_edges=(),
+            )
+
+            store.apply_consolidation(result)
+            loaded = store.load_objects()
+
+        self.assertFalse(store.objects_path.exists())
+        self.assertEqual(len(loaded), 1)
+        self.assertIn("objects", remote_state.snapshots)
 
     def test_select_relevant_objects_prefers_query_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

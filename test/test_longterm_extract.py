@@ -62,6 +62,24 @@ class LongTermTurnExtractorTests(unittest.TestCase):
         self.assertNotIn("vision problem", rendered)
         self.assertNotIn("sehproblem", rendered)
 
+    def test_generated_turn_ids_do_not_collide_within_the_same_second(self) -> None:
+        extractor = make_test_extractor()
+        occurred_at = datetime(2026, 3, 15, 14, 30, 0, tzinfo=ZoneInfo("Europe/Berlin"))
+
+        first = extractor.extract_conversation_turn(
+            transcript="We talked about topic 001 and the plan for later.",
+            response="I should keep topic 001 in mind.",
+            occurred_at=occurred_at,
+        )
+        second = extractor.extract_conversation_turn(
+            transcript="We talked about topic 002 and the plan for later.",
+            response="I should keep topic 002 in mind.",
+            occurred_at=occurred_at,
+        )
+
+        self.assertNotEqual(first.turn_id, second.turn_id)
+        self.assertNotEqual(first.episode.memory_id, second.episode.memory_id)
+
 
 if __name__ == "__main__":
     unittest.main()

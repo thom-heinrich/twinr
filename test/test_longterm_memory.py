@@ -11,13 +11,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from test.longterm_test_program import make_test_extractor
 from twinr.config import TwinrConfig
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
+from twinr.memory.context_store import PromptContextStore
 from twinr.memory.longterm import (
     LongTermConsolidationResultV1,
+    LongTermConversationTurn,
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,
     LongTermMemoryReflector,
     LongTermMemoryService,
+    LongTermMidtermStore,
     LongTermSourceRefV1,
+    LongTermStructuredStore,
 )
 from twinr.memory.longterm.worker import AsyncLongTermMemoryWriter
 from twinr.memory.query_normalization import LongTermQueryProfile
@@ -84,6 +88,19 @@ class LongTermMemoryServiceTests(unittest.TestCase):
             speaker="user",
             modality="voice",
         )
+
+    def _ops_entry(
+        self,
+        *,
+        event: str,
+        created_at: str,
+        data: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "event": event,
+            "created_at": created_at,
+            "data": dict(data or {}),
+        }
 
     def test_background_worker_persists_episodic_turns_in_memory_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -157,6 +174,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
                 service.writer.shutdown(timeout_s=1.0)
             service.writer = AsyncLongTermMemoryWriter(
                 write_callback=lambda item: LongTermMemoryService._persist_longterm_turn(
+                    config=config,
                     store=service.prompt_context_store,
                     graph_store=service.graph_store,
                     object_store=service.object_store,
@@ -185,6 +203,49 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertFalse(drained)
         self.assertEqual(error_message, "RuntimeError: reflection compiler failed")
+
+    def test_remote_primary_turn_persistence_skips_memory_markdown_after_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+            )
+            prompt_context_store = PromptContextStore.from_config(config)
+            graph_store = TwinrPersonalGraphStore(
+                Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+            )
+            object_store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb")
+            midterm_store = LongTermMidtermStore(base_path=Path(temp_dir) / "state" / "chonkydb")
+            helper = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            try:
+                LongTermMemoryService._persist_longterm_turn(
+                    config=config,
+                    store=prompt_context_store,
+                    graph_store=graph_store,
+                    object_store=object_store,
+                    midterm_store=midterm_store,
+                    extractor=make_test_extractor(),
+                    consolidator=helper.consolidator,
+                    reflector=LongTermMemoryReflector(program=_StubReflectionProgram()),
+                    sensor_memory=helper.sensor_memory,
+                    retention_policy=helper.retention_policy,
+                    item=LongTermConversationTurn(
+                        transcript="Today I want to go for a walk if the weather is nice.",
+                        response="I can keep the weather in mind for your walk.",
+                    ),
+                )
+            finally:
+                helper.shutdown(timeout_s=1.0)
+            objects = object_store.load_objects()
+            memory_path = Path(config.memory_markdown_path)
+
+        self.assertFalse(memory_path.exists())
+        self.assertTrue(any(item.kind == "episode" for item in objects))
 
     def test_provider_context_combines_recent_episodes_and_graph_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -559,6 +620,319 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertGreaterEqual(review.total_count, 2)
         self.assertTrue(all(item.kind != "episode" for item in review.items))
         self.assertTrue(any("Janina" in item.summary for item in review.items))
+
+    def test_backfill_ops_history_builds_patterns_routines_and_deviation_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                long_term_memory_sensor_memory_enabled=True,
+                long_term_memory_sensor_baseline_days=7,
+                long_term_memory_sensor_min_days_observed=4,
+                long_term_memory_sensor_min_routine_ratio=0.6,
+                long_term_memory_sensor_deviation_min_delta=0.5,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            entries = (
+                self._ops_entry(
+                    event="proactive_observation",
+                    created_at="2026-03-09T08:00:00+00:00",
+                    data={
+                        "inspected": True,
+                        "pir_motion_detected": True,
+                        "low_motion": False,
+                        "person_visible": True,
+                        "looking_toward_device": False,
+                        "body_pose": "upright",
+                        "smiling": False,
+                        "hand_or_object_near_camera": False,
+                        "speech_detected": False,
+                        "distress_detected": False,
+                    },
+                ),
+                self._ops_entry(
+                    event="turn_started",
+                    created_at="2026-03-09T08:01:00+00:00",
+                    data={"request_source": "button"},
+                ),
+                self._ops_entry(
+                    event="print_started",
+                    created_at="2026-03-09T13:00:00+00:00",
+                    data={"button": "yellow", "request_source": "button", "queue": "Thermal_GP58"},
+                ),
+                self._ops_entry(
+                    event="print_job_sent",
+                    created_at="2026-03-09T13:00:02+00:00",
+                    data={"queue": "Thermal_GP58", "job": "Thermal_GP58-1"},
+                ),
+                self._ops_entry(
+                    event="proactive_observation",
+                    created_at="2026-03-10T08:05:00+00:00",
+                    data={
+                        "inspected": True,
+                        "pir_motion_detected": True,
+                        "low_motion": False,
+                        "person_visible": True,
+                        "looking_toward_device": True,
+                        "body_pose": "upright",
+                        "smiling": False,
+                        "hand_or_object_near_camera": False,
+                        "speech_detected": False,
+                        "distress_detected": False,
+                    },
+                ),
+                self._ops_entry(
+                    event="turn_started",
+                    created_at="2026-03-10T08:06:00+00:00",
+                    data={"request_source": "button"},
+                ),
+                self._ops_entry(
+                    event="print_started",
+                    created_at="2026-03-10T13:00:00+00:00",
+                    data={"button": "yellow", "request_source": "button", "queue": "Thermal_GP58"},
+                ),
+                self._ops_entry(
+                    event="print_job_sent",
+                    created_at="2026-03-10T13:00:02+00:00",
+                    data={"queue": "Thermal_GP58", "job": "Thermal_GP58-2"},
+                ),
+                self._ops_entry(
+                    event="proactive_observation",
+                    created_at="2026-03-11T08:10:00+00:00",
+                    data={
+                        "inspected": True,
+                        "pir_motion_detected": True,
+                        "low_motion": False,
+                        "person_visible": True,
+                        "looking_toward_device": False,
+                        "body_pose": "upright",
+                        "smiling": False,
+                        "hand_or_object_near_camera": True,
+                        "speech_detected": False,
+                        "distress_detected": False,
+                    },
+                ),
+                self._ops_entry(
+                    event="turn_started",
+                    created_at="2026-03-11T08:11:00+00:00",
+                    data={"request_source": "button"},
+                ),
+                self._ops_entry(
+                    event="print_started",
+                    created_at="2026-03-11T13:00:00+00:00",
+                    data={"button": "yellow", "request_source": "button", "queue": "Thermal_GP58"},
+                ),
+                self._ops_entry(
+                    event="print_job_sent",
+                    created_at="2026-03-11T13:00:02+00:00",
+                    data={"queue": "Thermal_GP58", "job": "Thermal_GP58-3"},
+                ),
+                self._ops_entry(
+                    event="proactive_observation",
+                    created_at="2026-03-13T08:15:00+00:00",
+                    data={
+                        "inspected": True,
+                        "pir_motion_detected": True,
+                        "low_motion": False,
+                        "person_visible": True,
+                        "looking_toward_device": False,
+                        "body_pose": "upright",
+                        "smiling": False,
+                        "hand_or_object_near_camera": True,
+                        "speech_detected": False,
+                        "distress_detected": False,
+                    },
+                ),
+                self._ops_entry(
+                    event="turn_started",
+                    created_at="2026-03-13T08:16:00+00:00",
+                    data={"request_source": "button"},
+                ),
+                self._ops_entry(
+                    event="print_started",
+                    created_at="2026-03-13T13:00:00+00:00",
+                    data={"button": "yellow", "request_source": "button", "queue": "Thermal_GP58"},
+                ),
+                self._ops_entry(
+                    event="print_job_sent",
+                    created_at="2026-03-13T13:00:02+00:00",
+                    data={"queue": "Thermal_GP58", "job": "Thermal_GP58-4"},
+                ),
+            )
+
+            result = service.backfill_ops_multimodal_history(
+                entries=entries,
+                now=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
+            )
+            objects = {item.memory_id: item for item in service.object_store.load_objects()}
+            service.shutdown()
+
+        self.assertEqual(result.scanned_events, len(entries))
+        self.assertEqual(result.sensor_observations, 4)
+        self.assertEqual(result.button_interactions, 8)
+        self.assertEqual(result.print_completions, 4)
+        self.assertEqual(result.applied_evidence, result.generated_evidence)
+        self.assertIn("pattern:presence:morning:near_device", objects)
+        self.assertIn("pattern:camera_interaction:morning", objects)
+        self.assertIn("pattern:button:green:start_listening:morning", objects)
+        self.assertIn("pattern:print:button:afternoon", objects)
+        self.assertIn("routine:presence:weekday:morning", objects)
+        self.assertIn("routine:interaction:conversation_start:weekday:morning", objects)
+        self.assertIn("routine:interaction:print:weekday:afternoon", objects)
+        self.assertIn("deviation:presence:weekday:morning:2026-03-16", objects)
+
+    def test_backfill_ops_history_is_idempotent_when_replayed_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                long_term_memory_sensor_memory_enabled=True,
+                long_term_memory_sensor_baseline_days=7,
+                long_term_memory_sensor_min_days_observed=4,
+                long_term_memory_sensor_min_routine_ratio=0.6,
+                long_term_memory_sensor_deviation_min_delta=0.5,
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            entries = (
+                self._ops_entry(
+                    event="proactive_observation",
+                    created_at="2026-03-09T08:00:00+00:00",
+                    data={
+                        "inspected": True,
+                        "pir_motion_detected": True,
+                        "low_motion": False,
+                        "person_visible": True,
+                        "looking_toward_device": False,
+                        "body_pose": "upright",
+                        "smiling": False,
+                        "hand_or_object_near_camera": False,
+                        "speech_detected": False,
+                        "distress_detected": False,
+                    },
+                ),
+                self._ops_entry(
+                    event="turn_started",
+                    created_at="2026-03-09T08:01:00+00:00",
+                    data={"request_source": "button"},
+                ),
+                self._ops_entry(
+                    event="print_started",
+                    created_at="2026-03-09T13:00:00+00:00",
+                    data={"button": "yellow", "request_source": "button", "queue": "Thermal_GP58"},
+                ),
+                self._ops_entry(
+                    event="print_job_sent",
+                    created_at="2026-03-09T13:00:02+00:00",
+                    data={"queue": "Thermal_GP58", "job": "Thermal_GP58-1"},
+                ),
+            )
+
+            first = service.backfill_ops_multimodal_history(
+                entries=entries,
+                now=datetime(2026, 3, 10, 10, 0, tzinfo=timezone.utc),
+            )
+            source_ids_before = objects = {
+                item.memory_id: tuple(item.source.event_ids)
+                for item in service.object_store.load_objects()
+            }
+            second = service.backfill_ops_multimodal_history(
+                entries=entries,
+                now=datetime(2026, 3, 10, 10, 0, tzinfo=timezone.utc),
+            )
+            source_ids_after = {
+                item.memory_id: tuple(item.source.event_ids)
+                for item in service.object_store.load_objects()
+            }
+            service.shutdown()
+
+        self.assertGreater(first.applied_evidence, 0)
+        self.assertEqual(second.applied_evidence, 0)
+        self.assertEqual(second.skipped_existing, second.generated_evidence)
+        self.assertEqual(source_ids_before, source_ids_after)
+
+    def test_backfill_ops_history_still_compiles_sensor_memory_when_reflection_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                long_term_memory_sensor_memory_enabled=True,
+                long_term_memory_sensor_baseline_days=7,
+                long_term_memory_sensor_min_days_observed=4,
+                long_term_memory_sensor_min_routine_ratio=0.6,
+                long_term_memory_sensor_deviation_min_delta=0.5,
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.reflector = LongTermMemoryReflector(program=_FailingReflectionProgram())
+            entries = (
+                self._ops_entry(
+                    event="proactive_observation",
+                    created_at="2026-03-09T08:00:00+00:00",
+                    data={
+                        "inspected": True,
+                        "pir_motion_detected": True,
+                        "person_visible": True,
+                        "body_pose": "upright",
+                        "speech_detected": False,
+                        "distress_detected": False,
+                    },
+                ),
+                self._ops_entry(
+                    event="proactive_observation",
+                    created_at="2026-03-10T08:00:00+00:00",
+                    data={
+                        "inspected": True,
+                        "pir_motion_detected": True,
+                        "person_visible": True,
+                        "body_pose": "upright",
+                        "speech_detected": False,
+                        "distress_detected": False,
+                    },
+                ),
+                self._ops_entry(
+                    event="proactive_observation",
+                    created_at="2026-03-11T08:00:00+00:00",
+                    data={
+                        "inspected": True,
+                        "pir_motion_detected": True,
+                        "person_visible": True,
+                        "body_pose": "upright",
+                        "speech_detected": False,
+                        "distress_detected": False,
+                    },
+                ),
+                self._ops_entry(
+                    event="proactive_observation",
+                    created_at="2026-03-13T08:00:00+00:00",
+                    data={
+                        "inspected": True,
+                        "pir_motion_detected": True,
+                        "person_visible": True,
+                        "body_pose": "upright",
+                        "speech_detected": False,
+                        "distress_detected": False,
+                    },
+                ),
+            )
+
+            result = service.backfill_ops_multimodal_history(
+                entries=entries,
+                now=datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc),
+            )
+            objects = {item.memory_id: item for item in service.object_store.load_objects()}
+            service.shutdown()
+
+        self.assertEqual(result.reflection_error, "RuntimeError: reflection compiler failed")
+        self.assertIn("routine:presence:weekday:morning", objects)
 
     def test_confirm_memory_can_resolve_open_conflict_via_service(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

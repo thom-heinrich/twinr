@@ -22,6 +22,7 @@ from twinr.memory.longterm.models import (
     LongTermRetentionResultV1,
     LongTermReflectionResultV1,
 )
+from twinr.memory.longterm.remote_state import LongTermRemoteStateStore
 from twinr.text_utils import retrieval_terms
 
 
@@ -29,6 +30,8 @@ _OBJECT_STORE_SCHEMA = "twinr_memory_object_store"
 _OBJECT_STORE_VERSION = 1
 _CONFLICT_STORE_SCHEMA = "twinr_memory_conflict_store"
 _CONFLICT_STORE_VERSION = 1
+_ARCHIVE_STORE_SCHEMA = "twinr_memory_archive_store"
+_ARCHIVE_STORE_VERSION = 1
 
 
 def _normalize_text(value: str | None) -> str:
@@ -74,11 +77,15 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
 @dataclass(slots=True)
 class LongTermStructuredStore:
     base_path: Path
+    remote_state: LongTermRemoteStateStore | None = None
     _lock: Lock = field(default_factory=Lock, repr=False)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermStructuredStore":
-        return cls(base_path=chonkydb_data_path(config))
+        return cls(
+            base_path=chonkydb_data_path(config),
+            remote_state=LongTermRemoteStateStore.from_config(config),
+        )
 
     @property
     def objects_path(self) -> Path:
@@ -88,10 +95,14 @@ class LongTermStructuredStore:
     def conflicts_path(self) -> Path:
         return self.base_path / "twinr_memory_conflicts_v1.json"
 
+    @property
+    def archive_path(self) -> Path:
+        return self.base_path / "twinr_memory_archive_v1.json"
+
     def load_objects(self) -> tuple[LongTermMemoryObjectV1, ...]:
-        if not self.objects_path.exists():
+        payload = self._load_snapshot_payload(snapshot_kind="objects", local_path=self.objects_path)
+        if payload is None:
             return ()
-        payload = json.loads(self.objects_path.read_text(encoding="utf-8"))
         items = payload.get("objects", [])
         if not isinstance(items, list):
             return ()
@@ -102,9 +113,9 @@ class LongTermStructuredStore:
         )
 
     def load_conflicts(self) -> tuple[LongTermMemoryConflictV1, ...]:
-        if not self.conflicts_path.exists():
+        payload = self._load_snapshot_payload(snapshot_kind="conflicts", local_path=self.conflicts_path)
+        if payload is None:
             return ()
-        payload = json.loads(self.conflicts_path.read_text(encoding="utf-8"))
         items = payload.get("conflicts", [])
         if not isinstance(items, list):
             return ()
@@ -126,11 +137,94 @@ class LongTermStructuredStore:
             )
         return tuple(conflicts)
 
+    def load_archived_objects(self) -> tuple[LongTermMemoryObjectV1, ...]:
+        payload = self._load_snapshot_payload(snapshot_kind="archive", local_path=self.archive_path)
+        if payload is None:
+            return ()
+        items = payload.get("objects", [])
+        if not isinstance(items, list):
+            return ()
+        return tuple(
+            LongTermMemoryObjectV1.from_payload(item)
+            for item in items
+            if isinstance(item, dict)
+        )
+
     def get_object(self, memory_id: str) -> LongTermMemoryObjectV1 | None:
         normalized = _normalize_text(memory_id)
         if not normalized:
             return None
         return next((item for item in self.load_objects() if item.memory_id == normalized), None)
+
+    def _load_snapshot_payload(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path: Path,
+    ) -> dict[str, object] | None:
+        if self.remote_state is not None and self.remote_state.enabled:
+            payload = self.remote_state.load_snapshot(
+                snapshot_kind=snapshot_kind,
+                local_path=local_path,
+            )
+            return payload
+        if not local_path.exists():
+            return None
+        loaded = json.loads(local_path.read_text(encoding="utf-8"))
+        return dict(loaded) if isinstance(loaded, dict) else None
+
+    def select_relevant_episodic_objects(
+        self,
+        *,
+        query_text: str | None,
+        limit: int = 4,
+        fallback_limit: int = 2,
+        require_query_match: bool = False,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        objects = tuple(
+            sorted(
+                (
+                    item
+                    for item in self.load_objects()
+                    if item.kind == "episode" and item.status in {"active", "candidate", "uncertain"}
+                ),
+                key=lambda item: (item.updated_at, item.created_at, item.memory_id),
+                reverse=True,
+            )
+        )
+        if not objects:
+            return ()
+        bounded_limit = max(1, limit)
+        clean_query = _normalize_text(query_text)
+        if not clean_query:
+            if require_query_match:
+                return ()
+            return objects[:bounded_limit]
+        selector = self._object_selector(objects)
+        selected_ids = selector.search(
+            clean_query,
+            limit=bounded_limit,
+            category="object",
+            allow_fallback=not require_query_match and fallback_limit > 0,
+        )
+        by_id = {item.memory_id: item for item in objects}
+        selected = [by_id[memory_id] for memory_id in selected_ids if memory_id in by_id]
+        filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
+        if not filtered and not require_query_match and fallback_limit > 0:
+            return objects[: min(bounded_limit, fallback_limit)]
+        return tuple(filtered[:bounded_limit])
+
+    def _persist_snapshot_payload(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path: Path,
+        payload: dict[str, object],
+    ) -> None:
+        if self.remote_state is not None and self.remote_state.enabled:
+            self.remote_state.save_snapshot(snapshot_kind=snapshot_kind, payload=payload)
+            return
+        _write_json_atomic(local_path, payload)
 
     def apply_consolidation(self, result: LongTermConsolidationResultV1) -> None:
         with self._lock:
@@ -158,8 +252,16 @@ class LongTermStructuredStore:
                     for item in sorted(existing_conflicts.values(), key=lambda row: (row.slot_key, row.candidate_memory_id))
                 ],
             }
-            _write_json_atomic(self.objects_path, objects_payload)
-            _write_json_atomic(self.conflicts_path, conflicts_payload)
+            self._persist_snapshot_payload(
+                snapshot_kind="objects",
+                local_path=self.objects_path,
+                payload=objects_payload,
+            )
+            self._persist_snapshot_payload(
+                snapshot_kind="conflicts",
+                local_path=self.conflicts_path,
+                payload=conflicts_payload,
+            )
 
     def apply_reflection(self, result: LongTermReflectionResultV1) -> None:
         with self._lock:
@@ -175,17 +277,38 @@ class LongTermStructuredStore:
                 "version": _OBJECT_STORE_VERSION,
                 "objects": [item.to_payload() for item in sorted(existing_objects.values(), key=lambda row: row.memory_id)],
             }
-            _write_json_atomic(self.objects_path, payload)
+            self._persist_snapshot_payload(
+                snapshot_kind="objects",
+                local_path=self.objects_path,
+                payload=payload,
+            )
 
     def apply_retention(self, result: LongTermRetentionResultV1) -> None:
         with self._lock:
             objects = {item.memory_id: item for item in result.kept_objects}
+            archived_objects = {item.memory_id: item for item in self.load_archived_objects()}
+            for item in result.archived_objects:
+                archived_objects[item.memory_id] = item
             payload = {
                 "schema": _OBJECT_STORE_SCHEMA,
                 "version": _OBJECT_STORE_VERSION,
                 "objects": [item.to_payload() for item in sorted(objects.values(), key=lambda row: row.memory_id)],
             }
-            _write_json_atomic(self.objects_path, payload)
+            archive_payload = {
+                "schema": _ARCHIVE_STORE_SCHEMA,
+                "version": _ARCHIVE_STORE_VERSION,
+                "objects": [item.to_payload() for item in sorted(archived_objects.values(), key=lambda row: row.memory_id)],
+            }
+            self._persist_snapshot_payload(
+                snapshot_kind="objects",
+                local_path=self.objects_path,
+                payload=payload,
+            )
+            self._persist_snapshot_payload(
+                snapshot_kind="archive",
+                local_path=self.archive_path,
+                payload=archive_payload,
+            )
 
     def apply_conflict_resolution(self, result: LongTermConflictResolutionV1) -> None:
         with self._lock:
@@ -205,16 +328,58 @@ class LongTermStructuredStore:
                     for item in sorted(result.remaining_conflicts, key=lambda row: (row.slot_key, row.candidate_memory_id))
                 ],
             }
-            _write_json_atomic(self.objects_path, objects_payload)
-            _write_json_atomic(self.conflicts_path, conflicts_payload)
+            self._persist_snapshot_payload(
+                snapshot_kind="objects",
+                local_path=self.objects_path,
+                payload=objects_payload,
+            )
+            self._persist_snapshot_payload(
+                snapshot_kind="conflicts",
+                local_path=self.conflicts_path,
+                payload=conflicts_payload,
+            )
+
+    def write_snapshot(
+        self,
+        *,
+        objects: tuple[LongTermMemoryObjectV1, ...],
+        conflicts: tuple[LongTermMemoryConflictV1, ...] = (),
+    ) -> None:
+        with self._lock:
+            objects_payload = {
+                "schema": _OBJECT_STORE_SCHEMA,
+                "version": _OBJECT_STORE_VERSION,
+                "objects": [item.to_payload() for item in sorted(objects, key=lambda row: row.memory_id)],
+            }
+            conflicts_payload = {
+                "schema": _CONFLICT_STORE_SCHEMA,
+                "version": _CONFLICT_STORE_VERSION,
+                "conflicts": [
+                    item.to_payload()
+                    for item in sorted(conflicts, key=lambda row: (row.slot_key, row.candidate_memory_id))
+                ],
+            }
+            self._persist_snapshot_payload(
+                snapshot_kind="objects",
+                local_path=self.objects_path,
+                payload=objects_payload,
+            )
+            self._persist_snapshot_payload(
+                snapshot_kind="conflicts",
+                local_path=self.conflicts_path,
+                payload=conflicts_payload,
+            )
 
     def apply_memory_mutation(self, result: LongTermMemoryMutationResultV1) -> None:
         with self._lock:
             existing_objects = {item.memory_id: item for item in self.load_objects()}
+            archived_objects = {item.memory_id: item for item in self.load_archived_objects()}
             for memory_id in result.deleted_memory_ids:
                 existing_objects.pop(memory_id, None)
+                archived_objects.pop(memory_id, None)
             for item in result.updated_objects:
                 existing_objects[item.memory_id] = item
+                archived_objects.pop(item.memory_id, None)
             objects_payload = {
                 "schema": _OBJECT_STORE_SCHEMA,
                 "version": _OBJECT_STORE_VERSION,
@@ -228,8 +393,26 @@ class LongTermStructuredStore:
                     for item in sorted(result.remaining_conflicts, key=lambda row: (row.slot_key, row.candidate_memory_id))
                 ],
             }
-            _write_json_atomic(self.objects_path, objects_payload)
-            _write_json_atomic(self.conflicts_path, conflicts_payload)
+            archive_payload = {
+                "schema": _ARCHIVE_STORE_SCHEMA,
+                "version": _ARCHIVE_STORE_VERSION,
+                "objects": [item.to_payload() for item in sorted(archived_objects.values(), key=lambda row: row.memory_id)],
+            }
+            self._persist_snapshot_payload(
+                snapshot_kind="objects",
+                local_path=self.objects_path,
+                payload=objects_payload,
+            )
+            self._persist_snapshot_payload(
+                snapshot_kind="conflicts",
+                local_path=self.conflicts_path,
+                payload=conflicts_payload,
+            )
+            self._persist_snapshot_payload(
+                snapshot_kind="archive",
+                local_path=self.archive_path,
+                payload=archive_payload,
+            )
 
     def review_objects(
         self,

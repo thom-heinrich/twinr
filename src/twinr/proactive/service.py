@@ -15,6 +15,12 @@ from twinr.proactive.openwakeword_stream import OpenWakeWordStreamingMonitor, Wa
 from twinr.proactive.openwakeword_spotter import WakewordOpenWakeWordSpotter
 from twinr.proactive.observers import AmbientAudioObservationProvider, NullAudioObservationProvider, OpenAIVisionObservationProvider
 from twinr.proactive.presence import PresenceSessionController, PresenceSessionSnapshot
+from twinr.proactive.vision_review import (
+    OpenAIProactiveVisionReviewer,
+    ProactiveVisionFrameBuffer,
+    ProactiveVisionReview,
+    is_reviewable_image_trigger,
+)
 from twinr.proactive.wakeword import WakewordMatch, WakewordPhraseSpotter
 from twinr.providers.openai.backend import OpenAIBackend
 
@@ -48,6 +54,7 @@ class ProactiveCoordinator:
         presence_session: PresenceSessionController | None = None,
         wakeword_spotter: WakewordPhraseSpotter | None = None,
         wakeword_stream: OpenWakeWordStreamingMonitor | None = None,
+        vision_reviewer: OpenAIProactiveVisionReviewer | None = None,
         wakeword_handler: Callable[[WakewordMatch], bool] | None = None,
         idle_predicate: Callable[[], bool] | None = None,
         observation_handler: Callable[[dict[str, Any], tuple[str, ...]], None] | None = None,
@@ -64,6 +71,7 @@ class ProactiveCoordinator:
         self.presence_session = presence_session
         self.wakeword_spotter = wakeword_spotter
         self.wakeword_stream = wakeword_stream
+        self.vision_reviewer = vision_reviewer
         self.wakeword_handler = wakeword_handler
         self.idle_predicate = idle_predicate
         self.observation_handler = observation_handler
@@ -139,19 +147,29 @@ class ProactiveCoordinator:
                         reason=blocked_reason,
                     )
                     return ProactiveTickResult(inspected=False, person_visible=False)
-                return self._handle_decision(
+                reviewed_decision, _review = self._review_trigger(
                     decision,
+                    observation=observation,
+                )
+                if reviewed_decision is None:
+                    return ProactiveTickResult(inspected=False, person_visible=False)
+                return self._handle_decision(
+                    reviewed_decision,
                     observation=observation,
                     inspected=False,
                     presence_snapshot=presence_snapshot,
+                    review=_review,
                 )
             return ProactiveTickResult(inspected=False, person_visible=False)
 
         snapshot = self.vision_observer.observe()
         self._last_capture_at = now
+        if self.vision_reviewer is not None and getattr(snapshot, "image", None) is not None:
+            self.vision_reviewer.record_snapshot(snapshot)
         low_motion = self._is_low_motion(now, motion_active=motion_active)
         observation = SocialObservation(
             observed_at=now,
+            inspected=True,
             pir_motion_detected=motion_active,
             low_motion=low_motion,
             vision=snapshot.observation,
@@ -222,11 +240,21 @@ class ProactiveCoordinator:
                     inspected=True,
                     person_visible=snapshot.observation.person_visible,
                 )
-            return self._handle_decision(
+            reviewed_decision, _review = self._review_trigger(
                 decision,
+                observation=observation,
+            )
+            if reviewed_decision is None:
+                return ProactiveTickResult(
+                    inspected=True,
+                    person_visible=snapshot.observation.person_visible,
+                )
+            return self._handle_decision(
+                reviewed_decision,
                 observation=observation,
                 inspected=True,
                 presence_snapshot=presence_snapshot,
+                review=_review,
             )
         return ProactiveTickResult(
             inspected=True,
@@ -242,6 +270,7 @@ class ProactiveCoordinator:
     ) -> tuple[SocialObservation, SocialTriggerDecision | None]:
         observation = SocialObservation(
             observed_at=now,
+            inspected=False,
             pir_motion_detected=motion_active,
             low_motion=self._is_low_motion(now, motion_active=motion_active),
             vision=SocialVisionObservation(person_visible=False),
@@ -403,8 +432,9 @@ class ProactiveCoordinator:
         observation: SocialObservation,
         inspected: bool,
         presence_snapshot: PresenceSessionSnapshot,
+        review: ProactiveVisionReview | None = None,
     ) -> ProactiveTickResult:
-        self._record_trigger_detected(decision, observation=observation)
+        self._record_trigger_detected(decision, observation=observation, review=review)
         handled = self.trigger_handler(decision)
         presence_session_id = getattr(presence_snapshot, "session_id", None)
         if handled:
@@ -421,6 +451,43 @@ class ProactiveCoordinator:
             inspected=inspected,
             person_visible=observation.vision.person_visible,
         )
+
+    def _review_trigger(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        observation: SocialObservation,
+    ) -> tuple[SocialTriggerDecision | None, ProactiveVisionReview | None]:
+        if self.vision_reviewer is None:
+            return decision, None
+        if not is_reviewable_image_trigger(decision.trigger_id):
+            return decision, None
+        try:
+            review = self.vision_reviewer.review(decision, observation=observation)
+        except Exception as exc:
+            self.emit(f"proactive_vision_review_failed={exc}")
+            self.runtime.ops_events.append(
+                event="proactive_vision_review_failed",
+                level="error",
+                message="Buffered proactive vision review failed.",
+                data={
+                    "trigger": decision.trigger_id,
+                    "error": str(exc),
+                },
+            )
+            return decision, None
+        if review is None:
+            self.runtime.ops_events.append(
+                event="proactive_vision_review_unavailable",
+                message="Buffered proactive vision review was enabled but no usable result was available.",
+                data={"trigger": decision.trigger_id},
+            )
+            return decision, None
+        self._record_vision_review(decision, review=review)
+        if not review.approved:
+            self._record_trigger_skipped_vision_review(decision, review=review)
+            return None, review
+        return decision, review
 
     def _recent_wakeword_attempt_age_s(
         self,
@@ -613,23 +680,88 @@ class ProactiveCoordinator:
         decision: SocialTriggerDecision,
         *,
         observation: SocialObservation,
+        review: ProactiveVisionReview | None = None,
     ) -> None:
+        data = {
+            "trigger": decision.trigger_id,
+            "reason": decision.reason,
+            "priority": int(decision.priority),
+            "prompt": decision.prompt,
+            "score": decision.score,
+            "threshold": decision.threshold,
+            "evidence": [item.to_dict() for item in decision.evidence],
+            "person_visible": observation.vision.person_visible,
+            "body_pose": observation.vision.body_pose.value,
+            "speech_detected": observation.audio.speech_detected,
+            "distress_detected": observation.audio.distress_detected,
+            "low_motion": observation.low_motion,
+        }
+        if review is not None:
+            data.update(
+                {
+                    "vision_review_decision": review.decision,
+                    "vision_review_confidence": review.confidence,
+                    "vision_review_reason": review.reason,
+                    "vision_review_scene": review.scene,
+                    "vision_review_frame_count": review.frame_count,
+                    "vision_review_response_id": review.response_id,
+                    "vision_review_request_id": review.request_id,
+                    "vision_review_model": review.model,
+                }
+            )
         self.runtime.ops_events.append(
             event="proactive_trigger_detected",
             message="Proactive trigger conditions were met.",
+            data=data,
+        )
+
+    def _record_vision_review(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        review: ProactiveVisionReview,
+    ) -> None:
+        self.runtime.ops_events.append(
+            event="proactive_vision_reviewed",
+            message="Buffered proactive camera frames were reviewed before speaking.",
             data={
                 "trigger": decision.trigger_id,
-                "reason": decision.reason,
+                "approved": review.approved,
+                "decision": review.decision,
+                "confidence": review.confidence,
+                "reason": review.reason,
+                "scene": review.scene,
+                "frame_count": review.frame_count,
+                "response_id": review.response_id,
+                "request_id": review.request_id,
+                "model": review.model,
+            },
+        )
+
+    def _record_trigger_skipped_vision_review(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        review: ProactiveVisionReview,
+    ) -> None:
+        self.emit("social_trigger_skipped=vision_review_rejected")
+        self.runtime.ops_events.append(
+            event="social_trigger_skipped",
+            message="Social trigger prompt was skipped because buffered frame review rejected it.",
+            data={
+                "trigger": decision.trigger_id,
+                "reason": "vision_review_rejected",
                 "priority": int(decision.priority),
-                "prompt": decision.prompt,
                 "score": decision.score,
                 "threshold": decision.threshold,
-                "evidence": [item.to_dict() for item in decision.evidence],
-                "person_visible": observation.vision.person_visible,
-                "body_pose": observation.vision.body_pose.value,
-                "speech_detected": observation.audio.speech_detected,
-                "distress_detected": observation.audio.distress_detected,
-                "low_motion": observation.low_motion,
+                "vision_review_decision": review.decision,
+                "vision_review_confidence": review.confidence,
+                "vision_review_reason": review.reason,
+                "vision_review_scene": review.scene,
+                "vision_review_frame_count": review.frame_count,
+                "vision_review_response_id": review.response_id,
+                "vision_review_request_id": review.request_id,
+                "vision_review_model": review.model,
             },
         )
 
@@ -941,6 +1073,17 @@ def build_default_proactive_monitor(
             sample_ms=config.proactive_audio_sample_ms,
             distress_enabled=config.proactive_audio_distress_enabled,
         )
+    vision_reviewer = None
+    if config.proactive_vision_review_enabled:
+        vision_reviewer = OpenAIProactiveVisionReviewer(
+            backend=backend,
+            frame_buffer=ProactiveVisionFrameBuffer(
+                max_items=config.proactive_vision_review_buffer_frames,
+            ),
+            max_frames=config.proactive_vision_review_max_frames,
+            max_age_s=config.proactive_vision_review_max_age_s,
+            min_spacing_s=config.proactive_vision_review_min_spacing_s,
+        )
     coordinator = ProactiveCoordinator(
         config=config,
         runtime=runtime,
@@ -955,6 +1098,7 @@ def build_default_proactive_monitor(
         presence_session=presence_session,
         wakeword_spotter=wakeword_spotter,
         wakeword_stream=wakeword_stream,
+        vision_reviewer=vision_reviewer,
         wakeword_handler=wakeword_handler,
         pir_monitor=configured_pir_monitor(config),
         idle_predicate=idle_predicate,

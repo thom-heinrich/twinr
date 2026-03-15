@@ -58,7 +58,7 @@ _DEFAULT_REALTIME_INSTRUCTIONS = (
     "If the user explicitly asks you to delete the local voice profile, use the reset_voice_profile tool. "
     "When a system message says the current speaker signal is uncertain or unknown, ask for explicit confirmation before persistent or security-sensitive tool actions and set confirmed=true only after the user clearly confirms. "
     "If the user asks you to look at them, an object, a document, or something they are showing to the camera, call the inspect_camera tool. "
-    "If the user clearly wants to stop or pause the conversation for now, call the end_conversation tool and then say a short goodbye."
+    "If the user clearly wants to stop or pause the conversation for now, call the end_conversation tool and include a short goodbye in spoken_reply so the turn can finish immediately."
 )
 
 
@@ -70,6 +70,13 @@ class OpenAIRealtimeTurn:
     model: str | None = None
     token_usage: TokenUsage | None = None
     end_conversation: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _HandledRealtimeTools:
+    names: tuple[str, ...]
+    continue_response: bool = True
+    immediate_response_text: str | None = None
 
 
 def _default_async_client_factory(config: TwinrConfig) -> Any:
@@ -329,8 +336,15 @@ class OpenAIRealtimeSession:
                 function_calls = self._extract_function_calls(response)
                 if function_calls:
                     handled_tools = await self._handle_function_calls(function_calls)
-                    if "end_conversation" in handled_tools:
+                    if "end_conversation" in handled_tools.names:
                         end_conversation = True
+                    if not handled_tools.continue_response:
+                        immediate_text = str(handled_tools.immediate_response_text or "").strip()
+                        if immediate_text:
+                            response_text_fragments.append(immediate_text)
+                            if on_output_text_delta is not None:
+                                on_output_text_delta(immediate_text)
+                        break
                     await self._connection.response.create(response={})
                     continue
                 if not "".join(response_text_fragments).strip():
@@ -452,20 +466,30 @@ class OpenAIRealtimeSession:
             function_calls.append((name, call_id, arguments))
         return tuple(function_calls)
 
-    async def _handle_function_calls(self, function_calls: tuple[tuple[str, str, str], ...]) -> tuple[str, ...]:
+    async def _handle_function_calls(self, function_calls: tuple[tuple[str, str, str], ...]) -> _HandledRealtimeTools:
         handled_names: list[str] = []
+        immediate_response_text: str | None = None
+        continue_response = True
         for name, call_id, arguments_json in function_calls:
             handler = self._tool_handlers.get(name)
+            arguments = self._parse_tool_arguments(arguments_json)
             if handler is None:
                 output = {"status": "error", "message": f"Unsupported tool: {name}"}
             else:
                 handled_names.append(name)
-                arguments = self._parse_tool_arguments(arguments_json)
                 try:
                     result = handler(arguments)
                     output = result if result is not None else {"status": "ok"}
                 except Exception as exc:
                     output = {"status": "error", "message": str(exc)}
+            if (
+                name == "end_conversation"
+                and len(function_calls) == 1
+            ):
+                spoken_reply = str(arguments.get("spoken_reply", "") or "").strip()
+                if spoken_reply:
+                    immediate_response_text = spoken_reply
+                    continue_response = False
             await self._connection.conversation.item.create(
                 item={
                     "type": "function_call_output",
@@ -473,7 +497,11 @@ class OpenAIRealtimeSession:
                     "output": self._serialize_tool_output(output),
                 }
             )
-        return tuple(handled_names)
+        return _HandledRealtimeTools(
+            names=tuple(handled_names),
+            continue_response=continue_response,
+            immediate_response_text=immediate_response_text,
+        )
 
     def _parse_tool_arguments(self, arguments_json: str) -> dict[str, Any]:
         try:

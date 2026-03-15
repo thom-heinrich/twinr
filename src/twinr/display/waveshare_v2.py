@@ -28,6 +28,7 @@ class WaveshareEPD4In2V2:
     _driver_module: object | None = field(default=None, init=False, repr=False)
     _epd: object | None = field(default=None, init=False, repr=False)
     _render_count: int = field(default=0, init=False, repr=False)
+    _font_cache: dict[str, object] = field(default_factory=dict, init=False, repr=False)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "WaveshareEPD4In2V2":
@@ -119,12 +120,14 @@ class WaveshareEPD4In2V2:
     def render_test_image(self) -> object:
         image, draw = self._new_canvas()
         canvas_width, canvas_height = image.size
+        title_font = self._font(28, bold=True)
+        body_font = self._font(20, bold=False)
         draw.rectangle((0, 0, canvas_width - 1, canvas_height - 1), outline=0, width=5)
-        draw.rectangle((0, 0, canvas_width - 1, 48), fill=0)
-        draw.text((14, 14), "TWINR E-PAPER V2", fill=255)
-        draw.text((14, 72), time.strftime("%Y-%m-%d %H:%M:%S"), fill=0)
-        draw.text((14, 110), "BLACK / WHITE TEST", fill=0)
-        draw.text((14, 148), "Display path is ready.", fill=0)
+        draw.rectangle((0, 0, canvas_width - 1, 58), fill=0)
+        draw.text((16, 12), "TWINR E-PAPER V2", fill=255, font=title_font)
+        draw.text((18, 78), time.strftime("%Y-%m-%d %H:%M:%S"), fill=0, font=body_font)
+        draw.text((18, 116), "BLACK / WHITE TEST", fill=0, font=body_font)
+        draw.text((18, 152), "Display path is ready.", fill=0, font=body_font)
         draw.rectangle((20, 210, 120, 290), fill=0)
         draw.rectangle((140, 210, 240, 290), outline=0, width=3)
         return image
@@ -139,13 +142,20 @@ class WaveshareEPD4In2V2:
     ) -> object:
         image, draw = self._new_canvas()
         canvas_width, canvas_height = image.size
+        brand_font = self._font(28, bold=True)
+        status_font = self._font(24, bold=True)
         draw.rectangle((0, 0, canvas_width - 1, canvas_height - 1), fill=255)
-        draw.rectangle((0, 0, canvas_width - 1, 42), fill=0)
-        draw.text((18, 12), "TWINR", fill=255)
-        status_label = (headline or status).upper()
-        label_text = status_label[:16]
-        label_width = min(len(label_text) * 10, canvas_width - 120)
-        draw.text((canvas_width - label_width - 20, 12), label_text, fill=255)
+        draw.rectangle((0, 0, canvas_width - 1, 58), fill=0)
+        draw.text((18, 10), "TWINR", fill=255, font=brand_font)
+        status_label = " ".join((headline or status).split())
+        label_text = self._truncate_text(
+            draw,
+            status_label,
+            max_width=max(canvas_width - 170, 110),
+            font=status_font,
+        )
+        label_width = self._text_width(draw, label_text, font=status_font)
+        draw.text((canvas_width - label_width - 18, 12), label_text, fill=255, font=status_font)
 
         self._draw_face(
             draw,
@@ -233,7 +243,7 @@ class WaveshareEPD4In2V2:
         canvas_height: int,
     ) -> None:
         face_center_x = canvas_width // 2
-        face_center_y = (canvas_height // 2) + 22
+        face_center_y = (canvas_height // 2) + 16
         jitter_x, jitter_y = self._face_offset(status, animation_frame)
 
         left_eye = (face_center_x - 72 + jitter_x, face_center_y - 24 + jitter_y)
@@ -256,24 +266,35 @@ class WaveshareEPD4In2V2:
         canvas_width: int,
         canvas_height: int,
     ) -> None:
+        footer_font = self._font(18, bold=False)
         lines = [line.strip() for line in details if line and line.strip()][:1]
         if not lines:
             return
 
-        divider_y = canvas_height - 40
+        divider_y = canvas_height - 54
         draw.line((28, divider_y, canvas_width - 28, divider_y), fill=0, width=2)
-        text_y = divider_y + 12
+        text_y = divider_y + 8
         for line in lines:
             left_text, right_text = self._split_footer_parts(line)
-            right_width = self._text_width(draw, right_text)
+            right_width = self._text_width(draw, right_text, font=footer_font)
             right_margin = 24
             right_x = max(canvas_width - right_width - right_margin, 24)
-            max_left_width = max(right_x - 36, 120)
-            trimmed_left = self._truncate_text(draw, left_text, max_width=max_left_width)
-            draw.text((24, text_y), trimmed_left, fill=0)
-            if right_text:
-                draw.text((right_x, text_y), right_text, fill=0)
-            text_y += 16
+            single_line_left_width = max(right_x - 36, 120)
+            left_lines = self._wrap_footer_left(
+                draw,
+                left_text,
+                font=footer_font,
+                full_width=canvas_width - 48,
+                final_width=single_line_left_width,
+            )
+            line_height = self._text_height(draw, font=footer_font)
+            for index, left_line in enumerate(left_lines):
+                line_y = text_y + (index * (line_height + 2))
+                max_width = single_line_left_width if index == (len(left_lines) - 1) else (canvas_width - 48)
+                trimmed = self._truncate_text(draw, left_line, max_width=max_width, font=footer_font)
+                draw.text((24, line_y), trimmed, fill=0, font=footer_font)
+                if right_text and index == (len(left_lines) - 1):
+                    draw.text((right_x, line_y), right_text, fill=0, font=footer_font)
 
     def _draw_eye(
         self,
@@ -377,14 +398,26 @@ class WaveshareEPD4In2V2:
             draw.ellipse((center_x - 10, center_y - 8, center_x + 10, center_y + openness), outline=0, width=4)
             return
         if status == "processing":
-            wave_y = center_y + (-1, 1, -1, 1)[animation_frame % 4]
-            draw.arc((center_x - 24, wave_y - 6, center_x - 2, wave_y + 8), start=0, end=180, fill=0, width=4)
-            draw.arc((center_x, wave_y - 6, center_x + 22, wave_y + 8), start=180, end=360, fill=0, width=4)
+            offset_y = (-1, 0, 1, 0)[animation_frame % 4]
+            left_segment = (
+                center_x - 22,
+                center_y + 4 + offset_y,
+                center_x - 4,
+                center_y + 2 + offset_y,
+            )
+            right_segment = (
+                center_x + 4,
+                center_y + 2 + offset_y,
+                center_x + 22,
+                center_y + 4 + offset_y,
+            )
+            draw.line(left_segment, fill=0, width=4)
+            draw.line(right_segment, fill=0, width=4)
             return
         if status == "answering":
-            openness = (12, 18, 10, 16)[animation_frame % 4]
+            openness = (8, 11, 7, 10)[animation_frame % 4]
             draw.rounded_rectangle(
-                (center_x - 16, center_y - 6, center_x + 16, center_y + openness),
+                (center_x - 22, center_y - 2, center_x + 22, center_y + openness),
                 radius=8,
                 outline=0,
                 width=4,
@@ -468,16 +501,16 @@ class WaveshareEPD4In2V2:
             gaze = (-12, -4, 4, 12)[animation_frame % 4]
             state["highlight_dx"] = gaze if side == "left" else gaze - 2
             state["height"] = 68
-            state["brow_raise"] = -2
-            state["brow_slant"] = 7
+            state["brow_raise"] = -1
+            state["brow_slant"] = 4
             state["lid_arc"] = True
             return state
 
         if status == "answering":
             state["height"] = (70, 74, 70, 72)[animation_frame % 4]
             state["highlight_dx"] = (-8, -6, -8, -7)[animation_frame % 4]
-            state["brow_raise"] = -3
-            state["brow_slant"] = 3
+            state["brow_raise"] = -2
+            state["brow_slant"] = 2
             return state
 
         if status == "printing":
@@ -515,20 +548,91 @@ class WaveshareEPD4In2V2:
             return prefix.strip(), f"({suffix}"
         return compact, ""
 
-    def _text_width(self, draw: object, text: str) -> int:
+    def _wrap_footer_left(
+        self,
+        draw: object,
+        text: str,
+        *,
+        font: object | None,
+        full_width: int,
+        final_width: int,
+    ) -> tuple[str, ...]:
+        compact = text.strip()
+        if self._text_width(draw, compact, font=font) <= final_width:
+            return (compact,)
+        parts = [part.strip() for part in compact.split("|") if part.strip()]
+        if len(parts) < 2:
+            first = self._truncate_text(draw, compact, max_width=full_width, font=font)
+            return (first,)
+        first_line_parts: list[str] = []
+        for part in parts:
+            candidate_parts = first_line_parts + [part]
+            candidate_text = " | ".join(candidate_parts)
+            if first_line_parts and self._text_width(draw, candidate_text, font=font) > full_width:
+                break
+            first_line_parts = candidate_parts
+        if not first_line_parts:
+            first_line_parts = [parts[0]]
+        remaining = parts[len(first_line_parts):]
+        if not remaining:
+            return (" | ".join(first_line_parts),)
+        second_line = " | ".join(remaining)
+        return (
+            " | ".join(first_line_parts),
+            self._truncate_text(draw, second_line, max_width=final_width, font=font),
+        )
+
+    def _font(self, size: int, *, bold: bool) -> object:
+        cache_key = f"{'bold' if bold else 'regular'}:{max(8, size)}"
+        cached = self._font_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        from PIL import ImageFont
+
+        candidates = (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ) if bold else (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        )
+        font = None
+        for candidate in candidates:
+            if not Path(candidate).exists():
+                continue
+            with suppress(Exception):
+                font = ImageFont.truetype(candidate, size=max(8, size))
+                break
+        if font is None:
+            font = ImageFont.load_default()
+        self._font_cache[cache_key] = font
+        return font
+
+    def _text_width(self, draw: object, text: str, *, font: object | None = None) -> int:
         if not text:
             return 0
         width = len(text) * 6
         with suppress(Exception):
-            text_box = draw.textbbox((0, 0), text)
+            text_box = draw.textbbox((0, 0), text, font=font)
             width = int(text_box[2] - text_box[0])
         return width
 
-    def _truncate_text(self, draw: object, text: str, *, max_width: int) -> str:
+    def _text_height(self, draw: object, *, font: object | None = None) -> int:
+        height = 12
+        with suppress(Exception):
+            text_box = draw.textbbox((0, 0), "Hg", font=font)
+            height = int(text_box[3] - text_box[1])
+        return height
+
+    def _truncate_text(self, draw: object, text: str, *, max_width: int, font: object | None = None) -> str:
         compact = text.strip()
-        if self._text_width(draw, compact) <= max_width:
+        if self._text_width(draw, compact, font=font) <= max_width:
             return compact
         ellipsis = "..."
-        while compact and self._text_width(draw, compact + ellipsis) > max_width:
+        while compact and self._text_width(draw, compact + ellipsis, font=font) > max_width:
             compact = compact[:-1].rstrip()
         return (compact + ellipsis) if compact else ellipsis
