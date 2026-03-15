@@ -14,8 +14,9 @@ from twinr.memory.chonkydb.schema import (
     TwinrGraphEdgeV1,
     TwinrGraphNodeV1,
 )
+from twinr.memory.longterm.models import LongTermGraphEdgeCandidateV1
 from twinr.temporal import parse_local_date_text
-from twinr.text_utils import collapse_whitespace, retrieval_terms, slugify_identifier
+from twinr.text_utils import collapse_whitespace, is_valid_stable_identifier, retrieval_terms, slugify_identifier
 
 
 def _normalize_text(value: str, *, limit: int) -> str:
@@ -121,6 +122,35 @@ class TwinrPersonalGraphStore:
             raise ValueError("Personal graph file must contain a JSON object.")
         return TwinrGraphDocumentV1.from_payload(payload)
 
+    def apply_candidate_edges(
+        self,
+        graph_edges: tuple[LongTermGraphEdgeCandidateV1, ...] | list[LongTermGraphEdgeCandidateV1],
+    ) -> None:
+        if not graph_edges:
+            return
+        document = self.load_document()
+        nodes = {node.node_id: node for node in document.nodes}
+        edges = list(document.edges)
+        self._ensure_user_node(nodes)
+        for candidate in graph_edges:
+            source_node_id = self._find_or_create_graph_ref_node(nodes, candidate.source_ref)
+            target_node_id = self._find_or_create_graph_ref_node(nodes, candidate.target_ref)
+            edges = self._upsert_edge(
+                edges,
+                TwinrGraphEdgeV1(
+                    source_node_id=source_node_id,
+                    edge_type=candidate.edge_type,
+                    target_node_id=target_node_id,
+                    confidence=candidate.confidence,
+                    confirmed_by_user=candidate.confirmed_by_user,
+                    origin="longterm_turn_extraction",
+                    valid_from=candidate.valid_from,
+                    valid_to=candidate.valid_to,
+                    attributes=dict(candidate.attributes or {}),
+                ),
+            )
+        self._save_document(nodes, edges)
+
     def remember_contact(
         self,
         *,
@@ -224,7 +254,7 @@ class TwinrPersonalGraphStore:
         if clean_role or clean_relation:
             edge = TwinrGraphEdgeV1(
                 source_node_id=person_node_id,
-                edge_type="social_supports_user_as",
+                edge_type="social_related_to_user",
                 target_node_id=self.user_node_id,
                 confirmed_by_user=confirmed_by_user,
                 attributes={
@@ -280,7 +310,7 @@ class TwinrPersonalGraphStore:
             )
 
         self._save_document(nodes, edges)
-        return TwinrGraphWriteResult(status=status, label=label, node_id=person_node_id, edge_type="social_supports_user_as")
+        return TwinrGraphWriteResult(status=status, label=label, node_id=person_node_id, edge_type="social_related_to_user")
 
     def lookup_contact(
         self,
@@ -343,19 +373,8 @@ class TwinrPersonalGraphStore:
         edges = list(document.edges)
         self._ensure_user_node(nodes)
 
-        node_type = "thing"
-        edge_type = "user_likes"
-        if clean_category == "brand":
-            node_type = "brand"
-            edge_type = "user_prefers_brand" if sentiment != "dislike" else "user_dislikes"
-        elif clean_category in {"store", "shop"}:
-            node_type = "place"
-            edge_type = "user_usually_buys_at" if sentiment != "dislike" else "user_dislikes"
-        elif sentiment == "dislike":
-            node_type = clean_category if clean_category in {"food", "drink", "activity", "music"} else "thing"
-            edge_type = "user_dislikes"
-        else:
-            node_type = clean_category if clean_category in {"food", "drink", "activity", "music"} else "thing"
+        node_type = clean_category or "thing"
+        edge_type = "user_avoids" if sentiment == "dislike" else "user_prefers"
 
         node_id = self._find_or_create_named_node(nodes, node_type=node_type, label=clean_value)
         target = nodes[node_id]
@@ -373,6 +392,7 @@ class TwinrPersonalGraphStore:
             graph_ref=target.graph_ref,
         )
         edge_attributes: dict[str, object] = {"category": clean_category}
+        edge_attributes["preference_mode"] = "avoid" if sentiment == "dislike" else "prefer"
         if clean_product:
             edge_attributes["for_product"] = clean_product
         if clean_details:
@@ -472,10 +492,15 @@ class TwinrPersonalGraphStore:
         self._save_document(nodes, edges)
         return TwinrGraphWriteResult(status=status, label=clean_summary, node_id=plan_node_id, edge_type="user_plans")
 
-    def build_prompt_context(self, query_text: str | None) -> str | None:
+    def build_prompt_context(
+        self,
+        query_text: str | None,
+        *,
+        include_contact_methods: bool = True,
+    ) -> str | None:
         document = self.load_document()
         contacts = self._rank_contact_prompt_items(
-            self._prompt_contacts(document, limit=128),
+            self._prompt_contacts(document, limit=128, include_contact_methods=include_contact_methods),
             query_text=query_text,
         )
         preferences = self._rank_preference_prompt_items(
@@ -499,6 +524,7 @@ class TwinrPersonalGraphStore:
             "Structured long-term memory graph for this turn. Internal memory is canonical English. "
             "Use it only when clearly relevant, and never quote it verbatim when replying in another language. "
             "Do not invent personal details that are not grounded in this graph. "
+            "When the user directly asks about contacting a known person, it is acceptable to answer in the practical domain implied by that person's role or relation, without framing that as remembered hidden memory. "
             "Treat phone numbers, email addresses, and other contact methods as reference-only unless the user explicitly asks for them or clearly asks Twinr to place a call or send a message.\n"
             + json.dumps(payload, ensure_ascii=False, indent=2)
         )
@@ -634,24 +660,25 @@ class TwinrPersonalGraphStore:
             kind = str(item.get("type", "")).strip()
             product = _normalize_text(str(item.get("for_product", "")), limit=80)
             category = _normalize_text(str(item.get("category", "")), limit=40)
-            if kind == "preferred_brand":
-                if product:
-                    guidance = (
-                        f"When helping with {product}, quietly bias suggestions toward {value} if it still fits the user's request."
-                    )
-                else:
-                    guidance = f"Let familiarity with {value} gently bias recommendations when relevant."
-            elif kind == "usual_store":
-                guidance = f"When discussing where to buy something, treat {value} as a familiar option if it fits."
-            elif kind == "disliked_item":
+            if kind == "avoidance":
                 guidance = f"Avoid steering the user toward {value} unless they explicitly ask for it."
             else:
-                guidance = f"Let positive familiarity with {value} subtly influence suggestions when relevant."
+                guidance = f"Let familiarity with {value} subtly influence suggestions when relevant."
             cue = {"kind": kind or "preference", "value": value, "guidance": guidance}
             if product:
                 cue["topic"] = product
             elif category:
                 cue["topic"] = category
+            associations = item.get("associations")
+            if isinstance(associations, list) and associations:
+                relation_names = [
+                    _normalize_text(str(entry.get("relation", "")), limit=40)
+                    for entry in associations
+                    if isinstance(entry, dict)
+                ]
+                compact_relations = [name for name in relation_names if name]
+                if compact_relations:
+                    cue["supporting_relations"] = ", ".join(compact_relations[:3])
             cues.append(cue)
         return cues
 
@@ -687,8 +714,10 @@ class TwinrPersonalGraphStore:
             if role:
                 guidance = (
                     f"When this person is relevant, treat {name} as the user's familiar {role}. "
-                    "Use that role to shape urgency, practical reasons to contact them, and next steps. "
-                    "If the advice depends on that role, it is fine to name the role naturally."
+                    "Use that role as hidden planning context for urgency, practical reasons to contact them, and next steps. "
+                    "If the user directly mentions this person, let the answer naturally speak in the practical domain implied by that role or relation instead of generic contact advice. "
+                    "Prefer concrete reasons to contact them, practical domain language, or concrete follow-up questions over generic contact advice. "
+                    "Do not frame the role as remembered hidden biography unless the user needs identity clarification or explicitly asks who this person is."
                 )
             else:
                 guidance = f"When this person is relevant, treat {name} as an already-known person in the user's life."
@@ -716,7 +745,13 @@ class TwinrPersonalGraphStore:
             return parts
         return []
 
-    def _prompt_contacts(self, document: TwinrGraphDocumentV1, *, limit: int = 12) -> list[dict[str, object]]:
+    def _prompt_contacts(
+        self,
+        document: TwinrGraphDocumentV1,
+        *,
+        limit: int = 12,
+        include_contact_methods: bool = True,
+    ) -> list[dict[str, object]]:
         contacts: list[dict[str, object]] = []
         for person in sorted(self._all_contact_nodes(document), key=lambda item: item.label.lower()):
             methods = self._contact_methods(document, person.node_id)
@@ -730,7 +765,7 @@ class TwinrPersonalGraphStore:
                 item["role"] = role_info["role"]
             if role_info["relation"]:
                 item["relation"] = role_info["relation"]
-            if methods:
+            if methods and include_contact_methods:
                 phones = [method for kind, method in methods if kind == "phone"]
                 emails = [method for kind, method in methods if kind == "email"]
                 if phones:
@@ -751,7 +786,7 @@ class TwinrPersonalGraphStore:
             self._outgoing_edges(
                 document,
                 self.user_node_id,
-                edge_types={"user_prefers_brand", "user_likes", "user_dislikes", "user_usually_buys_at"},
+                edge_types={"user_prefers", "user_avoids", "user_engages_with"},
             ),
             key=lambda item: (item.edge_type, item.target_node_id),
         ):
@@ -774,22 +809,11 @@ class TwinrPersonalGraphStore:
             )
             if details:
                 item["details"] = details
-            if target.node_type == "place":
-                item["nearby"] = self._node_is_near_user(document, target.node_id)
-                brands = sorted(
-                    target_brand.label
-                    for target_brand in (
-                        self._node_by_id(document, carry_edge.target_node_id)
-                        for carry_edge in self._outgoing_edges(
-                            document,
-                            target.node_id,
-                            edge_types={"general_carries_brand"},
-                        )
-                    )
-                    if target_brand is not None
-                )
-                if brands:
-                    item["carries_brands"] = brands
+            if self._node_is_near_user(document, target.node_id):
+                item["nearby"] = True
+            associations = self._related_entities(document, target.node_id)
+            if associations:
+                item["associations"] = associations
             entries.append(item)
             if len(entries) >= limit:
                 break
@@ -984,7 +1008,7 @@ class TwinrPersonalGraphStore:
         for edge in document.edges:
             if edge.source_node_id != person_node_id or edge.target_node_id != self.user_node_id:
                 continue
-            if edge.edge_type != "social_supports_user_as":
+            if edge.edge_type != "social_related_to_user":
                 continue
             role = str((edge.attributes or {}).get("role", "")).strip()
             relation = str((edge.attributes or {}).get("relation", "")).strip()
@@ -1080,6 +1104,26 @@ class TwinrPersonalGraphStore:
             seen.add(person.node_id)
         return people
 
+    def _related_entities(
+        self,
+        document: TwinrGraphDocumentV1,
+        node_id: str,
+    ) -> list[dict[str, str]]:
+        related: list[dict[str, str]] = []
+        for edge in self._outgoing_edges(document, node_id, edge_types={"general_related_to"}):
+            target = self._node_by_id(document, edge.target_node_id)
+            if target is None:
+                continue
+            relation = _normalize_text(str((edge.attributes or {}).get("relation", "")), limit=40) or "related_to"
+            related.append(
+                {
+                    "relation": relation,
+                    "label": target.label,
+                    "type": target.node_type,
+                }
+            )
+        return related
+
     def _node_is_near_user(self, document: TwinrGraphDocumentV1, node_id: str) -> bool:
         for edge in self._outgoing_edges(document, node_id, edge_types={"spatial_near"}):
             if edge.target_node_id == self.user_node_id:
@@ -1110,6 +1154,39 @@ class TwinrPersonalGraphStore:
                 return node.node_id
         node_id = self._unique_node_id(node_type, base_slug=_slugify(label, fallback=node_type), existing_ids=set(nodes))
         nodes[node_id] = TwinrGraphNodeV1(node_id=node_id, node_type=node_type, label=label)
+        return node_id
+
+    def _find_or_create_graph_ref_node(
+        self,
+        nodes: dict[str, TwinrGraphNodeV1],
+        graph_ref: str,
+    ) -> str:
+        normalized_ref = collapse_whitespace(graph_ref).strip()
+        if not normalized_ref:
+            raise ValueError("graph_ref is required.")
+        if normalized_ref == self.user_node_id:
+            self._ensure_user_node(nodes)
+            return self.user_node_id
+        for node in nodes.values():
+            if node.graph_ref == normalized_ref or node.node_id == normalized_ref:
+                return node.node_id
+        node_type, _, raw_stable_id = normalized_ref.partition(":")
+        clean_node_type = node_type.strip().lower() or "thing"
+        stable_candidate = raw_stable_id.strip().lower()
+        if stable_candidate and is_valid_stable_identifier(stable_candidate):
+            stable_id = stable_candidate
+        else:
+            stable_id = _slugify(stable_candidate or raw_stable_id or clean_node_type, fallback=clean_node_type)
+        node_id = f"{clean_node_type}:{stable_id}"
+        if node_id in nodes:
+            return node_id
+        label = raw_stable_id.strip().replace("_", " ") or stable_id
+        nodes[node_id] = TwinrGraphNodeV1(
+            node_id=node_id,
+            node_type=clean_node_type,
+            label=label,
+            graph_ref=normalized_ref,
+        )
         return node_id
 
     def _find_plan_node(
@@ -1160,21 +1237,17 @@ class TwinrPersonalGraphStore:
 
     def _preference_prompt_line(self, edge_type: str, label: str, attributes: Mapping[str, object]) -> str:
         product = _normalize_text(str(attributes.get("for_product", "")), limit=60)
-        if edge_type == "user_prefers_brand":
-            if product:
-                return f"User strongly prefers {label} for {product}."
-            return f"User strongly prefers {label}."
-        if edge_type == "user_usually_buys_at":
-            return f"User often buys at {label}."
-        if edge_type == "user_dislikes":
-            return f"User tends to dislike {label}."
-        return f"User likes {label}."
+        if edge_type == "user_avoids":
+            return f"User tends to avoid {label}."
+        if edge_type == "user_engages_with":
+            return f"User often engages with {label}."
+        if product:
+            return f"User prefers {label} for {product}."
+        return f"User prefers {label}."
 
     def _preference_kind(self, edge_type: str) -> str:
-        if edge_type == "user_prefers_brand":
-            return "preferred_brand"
-        if edge_type == "user_usually_buys_at":
-            return "usual_store"
-        if edge_type == "user_dislikes":
-            return "disliked_item"
-        return "liked_item"
+        if edge_type == "user_avoids":
+            return "avoidance"
+        if edge_type == "user_engages_with":
+            return "engagement"
+        return "preference"

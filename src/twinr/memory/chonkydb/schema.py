@@ -1,26 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Mapping
 
 from twinr.memory.chonkydb.models import JsonDict
 from twinr.text_utils import is_valid_identifier_namespace, is_valid_namespaced_identifier
 
 TWINR_GRAPH_SCHEMA_NAME = "twinr_graph"
-TWINR_GRAPH_SCHEMA_VERSION = 1
+TWINR_GRAPH_SCHEMA_VERSION = 2
 
 TWINR_GRAPH_EDGE_TYPES_BY_NAMESPACE: dict[str, tuple[str, ...]] = {
     "social": (
-        "social_family_of",
-        "social_friend_of",
-        "social_supports_user_as",
+        "social_related_to",
+        "social_related_to_user",
     ),
     "general": (
         "general_alias_of",
-        "general_carries_brand",
         "general_has_contact_method",
         "general_related_to",
-        "general_sells",
     ),
     "temporal": (
         "temporal_occurs_on",
@@ -33,11 +30,10 @@ TWINR_GRAPH_EDGE_TYPES_BY_NAMESPACE: dict[str, tuple[str, ...]] = {
         "spatial_near",
     ),
     "user": (
-        "user_dislikes",
-        "user_likes",
         "user_plans",
-        "user_prefers_brand",
-        "user_usually_buys_at",
+        "user_prefers",
+        "user_avoids",
+        "user_engages_with",
     ),
 }
 TWINR_GRAPH_ALLOWED_EDGE_TYPES = frozenset(
@@ -48,13 +44,42 @@ TWINR_GRAPH_ALLOWED_EDGE_TYPES = frozenset(
 TWINR_GRAPH_EDGE_STATUSES = frozenset(("active", "uncertain", "superseded", "invalid"))
 TWINR_GRAPH_NODE_STATUSES = frozenset(("active", "inactive", "merged", "invalid"))
 
+_LEGACY_EDGE_TYPE_MAP: dict[str, tuple[str, dict[str, object]]] = {
+    "social_family_of": ("social_related_to_user", {"relation": "family"}),
+    "social_friend_of": ("social_related_to_user", {"relation": "friend"}),
+    "social_supports_user_as": ("social_related_to_user", {}),
+    "general_carries_brand": ("general_related_to", {"relation": "carries"}),
+    "general_sells": ("general_related_to", {"relation": "sells"}),
+    "user_prefers_brand": ("user_prefers", {"preference_mode": "preferred_brand"}),
+    "user_usually_buys_at": ("user_prefers", {"preference_mode": "usual_source"}),
+    "user_likes": ("user_prefers", {}),
+    "user_dislikes": ("user_avoids", {}),
+}
+
+
+def normalize_graph_edge_type(
+    edge_type: str,
+    attributes: Mapping[str, object] | None = None,
+) -> tuple[str, dict[str, object]]:
+    clean_edge_type = str(edge_type or "").strip()
+    normalized_attributes = dict(attributes or {})
+    if clean_edge_type in _LEGACY_EDGE_TYPE_MAP:
+        canonical_edge_type, defaults = _LEGACY_EDGE_TYPE_MAP[clean_edge_type]
+        for key, value in defaults.items():
+            normalized_attributes.setdefault(key, value)
+        return canonical_edge_type, normalized_attributes
+    return clean_edge_type, normalized_attributes
+
+
 def graph_edge_namespace(edge_type: str) -> str:
-    prefix, _, _rest = edge_type.partition("_")
+    normalized_edge_type, _attributes = normalize_graph_edge_type(edge_type, None)
+    prefix, _, _rest = normalized_edge_type.partition("_")
     return prefix
 
 
 def is_allowed_graph_edge_type(edge_type: str) -> bool:
-    return edge_type in TWINR_GRAPH_ALLOWED_EDGE_TYPES
+    normalized_edge_type, _attributes = normalize_graph_edge_type(edge_type, None)
+    return normalized_edge_type in TWINR_GRAPH_ALLOWED_EDGE_TYPES
 
 
 def _drop_none(payload: JsonDict) -> JsonDict:
@@ -147,7 +172,7 @@ class TwinrGraphEdgeV1:
         _validate_node_id(self.source_node_id, field_name="source_node_id")
         _validate_node_id(self.target_node_id, field_name="target_node_id")
         if not is_allowed_graph_edge_type(self.edge_type):
-            raise ValueError(f"edge_type '{self.edge_type}' is not part of Twinr graph schema v1.")
+            raise ValueError(f"edge_type '{self.edge_type}' is not part of Twinr graph schema v{TWINR_GRAPH_SCHEMA_VERSION}.")
         _validate_status(self.status, allowed=TWINR_GRAPH_EDGE_STATUSES, field_name="status")
         if self.confidence is not None and not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be between 0.0 and 1.0.")
@@ -155,10 +180,11 @@ class TwinrGraphEdgeV1:
             raise ValueError("origin cannot be blank when provided.")
 
     def to_payload(self) -> JsonDict:
+        normalized_edge_type, normalized_attributes = normalize_graph_edge_type(self.edge_type, self.attributes)
         return _drop_none(
             {
                 "source": self.source_node_id,
-                "type": self.edge_type,
+                "type": normalized_edge_type,
                 "target": self.target_node_id,
                 "status": self.status,
                 "confidence": self.confidence,
@@ -166,17 +192,21 @@ class TwinrGraphEdgeV1:
                 "origin": self.origin,
                 "valid_from": self.valid_from,
                 "valid_to": self.valid_to,
-                "attributes": dict(self.attributes) if self.attributes is not None else None,
+                "attributes": normalized_attributes or None,
             }
         )
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "TwinrGraphEdgeV1":
         attributes = payload.get("attributes")
+        normalized_edge_type, normalized_attributes = normalize_graph_edge_type(
+            str(payload.get("type", "")),
+            dict(attributes) if isinstance(attributes, Mapping) else None,
+        )
         confidence = payload.get("confidence")
         return cls(
             source_node_id=str(payload.get("source", "")),
-            edge_type=str(payload.get("type", "")),
+            edge_type=normalized_edge_type,
             target_node_id=str(payload.get("target", "")),
             status=str(payload.get("status", "active")),
             confidence=float(confidence) if isinstance(confidence, (int, float)) else None,
@@ -184,7 +214,7 @@ class TwinrGraphEdgeV1:
             origin=str(payload["origin"]) if payload.get("origin") is not None else None,
             valid_from=str(payload["valid_from"]) if payload.get("valid_from") is not None else None,
             valid_to=str(payload["valid_to"]) if payload.get("valid_to") is not None else None,
-            attributes=dict(attributes) if isinstance(attributes, Mapping) else None,
+            attributes=normalized_attributes or None,
         )
 
 
@@ -256,10 +286,10 @@ class TwinrGraphDocumentV1:
         if isinstance(schema, Mapping):
             raw_version = schema.get("version")
             version = int(raw_version) if isinstance(raw_version, (int, float)) else None
-        if version is not None and version != TWINR_GRAPH_SCHEMA_VERSION:
+        if version is not None and version not in {1, TWINR_GRAPH_SCHEMA_VERSION}:
             raise ValueError(
                 f"Unsupported Twinr graph schema version: {version}. "
-                f"Expected {TWINR_GRAPH_SCHEMA_VERSION}."
+                f"Expected 1 or {TWINR_GRAPH_SCHEMA_VERSION}."
             )
         return cls(
             subject_node_id=str(payload.get("subject_node_id", "")),
@@ -270,3 +300,18 @@ class TwinrGraphDocumentV1:
             updated_at=str(payload["updated_at"]) if payload.get("updated_at") is not None else None,
             metadata=dict(metadata) if isinstance(metadata, Mapping) else None,
         )
+
+
+__all__ = [
+    "TWINR_GRAPH_ALLOWED_EDGE_TYPES",
+    "TWINR_GRAPH_EDGE_STATUSES",
+    "TWINR_GRAPH_NODE_STATUSES",
+    "TWINR_GRAPH_SCHEMA_NAME",
+    "TWINR_GRAPH_SCHEMA_VERSION",
+    "TwinrGraphDocumentV1",
+    "TwinrGraphEdgeV1",
+    "TwinrGraphNodeV1",
+    "graph_edge_namespace",
+    "is_allowed_graph_edge_type",
+    "normalize_graph_edge_type",
+]

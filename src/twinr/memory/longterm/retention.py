@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from twinr.memory.longterm.ontology import kind_matches
 from twinr.memory.longterm.models import LongTermMemoryObjectV1, LongTermRetentionResultV1
 
 
@@ -54,12 +55,13 @@ class LongTermRetentionPolicy:
         )
 
     def _classify(self, *, item: LongTermMemoryObjectV1, now: datetime) -> str:
+        item = item.canonicalized()
         if item.kind == "episode":
             age = now - item.updated_at.astimezone(now.tzinfo or ZoneInfo(self.timezone_name))
             if age > timedelta(days=max(1, self.ephemeral_episode_days)):
                 return "prune"
             return "keep"
-        if item.kind == "situational_observation":
+        if kind_matches(item.kind, "observation", item.attributes):
             age = now - item.updated_at.astimezone(now.tzinfo or ZoneInfo(self.timezone_name))
             if age > timedelta(days=max(1, self.ephemeral_observation_days)):
                 return "prune"

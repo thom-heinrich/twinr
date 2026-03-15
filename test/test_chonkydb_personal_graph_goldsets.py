@@ -58,7 +58,7 @@ class TwinrPersonalGraphGoldsetTests(unittest.TestCase):
             document = store.load_document()
 
         self.assertEqual(document.schema_name, "twinr_graph")
-        self.assertEqual(document.schema_version, 1)
+        self.assertEqual(document.schema_version, 2)
         self.assertEqual(document.subject_node_id, "user:main")
         self.assertEqual(len(document.nodes), len(expected["nodes"]))
         self.assertEqual(len(document.edges), len(expected["edges"]))
@@ -143,10 +143,11 @@ class TwinrPersonalGraphGoldsetTests(unittest.TestCase):
 
             payload = _memory_payload(store.build_prompt_context("Wo bekomme ich heute meinen Lieblingskaffee in der Naehe?") or "")
 
-        store_entry = next(item for item in payload["preferences"] if item["type"] == "usual_store")
+        store_entry = next(item for item in payload["preferences"] if item["value"] == "Store Z")
         self.assertEqual(store_entry["value"], "Store Z")
         self.assertEqual(store_entry["for_product"], "coffee")
-        self.assertEqual(store_entry["carries_brands"], ["Melitta"])
+        self.assertEqual(store_entry["type"], "preference")
+        self.assertEqual(store_entry["associations"], [{"relation": "carries", "label": "Melitta", "type": "brand"}])
         self.assertTrue(store_entry["nearby"])
 
     def test_goldset_structured_context_contains_temporal_plan_person_links(self) -> None:

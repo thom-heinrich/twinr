@@ -144,7 +144,7 @@ class LongTermMultimodalExtractor:
             objects.append(
                 LongTermMemoryObjectV1(
                     memory_id=f"observation:{date_key}:pir_motion",
-                    kind="situational_observation",
+                    kind="observation",
                     summary="Motion was detected near the device.",
                     details="Derived from PIR sensor activity.",
                     source=source_ref,
@@ -154,14 +154,14 @@ class LongTermMultimodalExtractor:
                     value_key="motion_detected",
                     valid_from=date_key,
                     valid_to=date_key,
-                    attributes={"topic": "pir_motion", "event_names": event_names},
+                    attributes={"topic": "pir_motion", "event_names": event_names, "observation_type": "situational"},
                 )
             )
         if person_visible:
             objects.append(
                 LongTermMemoryObjectV1(
                     memory_id=f"observation:{date_key}:camera_person_visible",
-                    kind="situational_observation",
+                    kind="observation",
                     summary="A person was visible near the device.",
                     details="Derived from camera-based presence observation.",
                     source=source_ref,
@@ -171,14 +171,14 @@ class LongTermMultimodalExtractor:
                     value_key="person_visible",
                     valid_from=date_key,
                     valid_to=date_key,
-                    attributes={"topic": "camera_presence", "event_names": event_names},
+                    attributes={"topic": "camera_presence", "event_names": event_names, "observation_type": "situational"},
                 )
             )
         if object_near_camera:
             objects.append(
                 LongTermMemoryObjectV1(
                     memory_id=f"observation:{date_key}:camera_object_near",
-                    kind="situational_observation",
+                    kind="observation",
                     summary="An object or hand was near the camera.",
                     details="Derived from camera interaction observation.",
                     source=source_ref,
@@ -188,14 +188,14 @@ class LongTermMultimodalExtractor:
                     value_key="object_near_camera",
                     valid_from=date_key,
                     valid_to=date_key,
-                    attributes={"topic": "camera_interaction", "event_names": event_names},
+                    attributes={"topic": "camera_interaction", "event_names": event_names, "observation_type": "situational"},
                 )
             )
         if motion_detected or person_visible:
             objects.append(
                 LongTermMemoryObjectV1(
                     memory_id=f"pattern:presence:{daypart}:near_device",
-                    kind="presence_pattern_fact",
+                    kind="pattern",
                     summary=f"Presence near the device was observed in the {daypart}.",
                     details="Low-confidence multimodal pattern derived from PIR/camera evidence.",
                     source=source_ref,
@@ -207,6 +207,7 @@ class LongTermMultimodalExtractor:
                         "daypart": daypart,
                         "uses_pir": motion_detected,
                         "uses_camera": person_visible,
+                        "pattern_type": "presence",
                     },
                 )
             )
@@ -214,7 +215,7 @@ class LongTermMultimodalExtractor:
             objects.append(
                 LongTermMemoryObjectV1(
                     memory_id=f"pattern:camera_interaction:{daypart}",
-                    kind="interaction_pattern_fact",
+                    kind="pattern",
                     summary=f"Camera-side interaction was observed in the {daypart}.",
                     details="Low-confidence multimodal pattern derived from repeated camera-side interaction signals.",
                     source=source_ref,
@@ -222,7 +223,7 @@ class LongTermMultimodalExtractor:
                     sensitivity="low",
                     slot_key=f"pattern:camera_interaction:{daypart}",
                     value_key="camera_interaction_observed",
-                    attributes={"daypart": daypart, "event_names": event_names},
+                    attributes={"daypart": daypart, "event_names": event_names, "pattern_type": "interaction"},
                 )
             )
         return objects
@@ -246,7 +247,7 @@ class LongTermMultimodalExtractor:
         }.get(action, action.replace("_", " "))
         return LongTermMemoryObjectV1(
             memory_id=f"pattern:button:{button}:{action}:{daypart}",
-            kind="interaction_pattern_fact",
+            kind="pattern",
             summary=f"The {button} button was used to {action_label} in the {daypart}.",
             details="Low-confidence button usage pattern derived from a physical interaction event.",
             source=source_ref,
@@ -255,7 +256,7 @@ class LongTermMultimodalExtractor:
             slot_key=f"pattern:button:{button}:{action}:{daypart}",
             value_key="button_used",
             valid_from=date_key,
-            attributes={"button": button, "action": action, "daypart": daypart},
+            attributes={"button": button, "action": action, "daypart": daypart, "pattern_type": "interaction"},
         )
 
     def _extract_print_completed(
@@ -270,7 +271,7 @@ class LongTermMultimodalExtractor:
         request_source = _normalize_text(str(payload.get("request_source", ""))).lower() or "unknown"
         return LongTermMemoryObjectV1(
             memory_id=f"pattern:print:{request_source}:{daypart}",
-            kind="interaction_pattern_fact",
+            kind="pattern",
             summary=f"Printed Twinr output was used in the {daypart}.",
             details=f"Low-confidence print usage pattern derived from a {request_source} print completion event.",
             source=source_ref,
@@ -279,7 +280,7 @@ class LongTermMultimodalExtractor:
             slot_key=f"pattern:print:{request_source}:{daypart}",
             value_key="printed_output",
             valid_from=date_key,
-            attributes={"request_source": request_source, "daypart": daypart},
+            attributes={"request_source": request_source, "daypart": daypart, "pattern_type": "interaction"},
         )
 
     def _extract_camera_capture(
@@ -294,7 +295,7 @@ class LongTermMultimodalExtractor:
         purpose = _normalize_text(str(payload.get("purpose", ""))).lower() or "camera_use"
         return LongTermMemoryObjectV1(
             memory_id=f"pattern:camera_use:{purpose}:{daypart}",
-            kind="interaction_pattern_fact",
+            kind="pattern",
             summary=f"The device camera was used in the {daypart}.",
             details=f"Low-confidence camera usage pattern derived from a {purpose.replace('_', ' ')} event.",
             source=source_ref,
@@ -303,7 +304,7 @@ class LongTermMultimodalExtractor:
             slot_key=f"pattern:camera_use:{purpose}:{daypart}",
             value_key="camera_used",
             valid_from=date_key,
-            attributes={"purpose": purpose, "daypart": daypart},
+            attributes={"purpose": purpose, "daypart": daypart, "pattern_type": "interaction"},
         )
 
     def _daypart(self, occurred_at: datetime) -> str:

@@ -49,7 +49,7 @@ class LongTermMemoryReflectorTests(unittest.TestCase):
         reflector = LongTermMemoryReflector()
         relationship = LongTermMemoryObjectV1(
             memory_id="fact:janina_wife",
-            kind="relationship_fact",
+            kind="fact",
             summary="Janina is the user's wife.",
             source=_source(),
             status="active",
@@ -60,12 +60,13 @@ class LongTermMemoryReflectorTests(unittest.TestCase):
                 "person_ref": "person:janina",
                 "person_name": "Janina",
                 "relation": "wife",
+                "fact_type": "relationship",
                 "support_count": 2,
             },
         )
-        medical_event = LongTermMemoryObjectV1(
-            memory_id="fact:janina_eye_laser",
-            kind="medical_event",
+        appointment_event = LongTermMemoryObjectV1(
+            memory_id="event:janina_eye_laser",
+            kind="event",
             summary="Janina has eye laser treatment at the eye doctor on 2026-03-14.",
             source=_source(),
             status="active",
@@ -74,24 +75,27 @@ class LongTermMemoryReflectorTests(unittest.TestCase):
             value_key="event:janina_eye_laser_2026_03_14",
             valid_from="2026-03-14",
             valid_to="2026-03-14",
-            sensitivity="medical",
+            sensitivity="sensitive",
             attributes={
                 "person_ref": "person:janina",
                 "person_name": "Janina",
-                "treatment": "eye laser treatment",
+                "memory_domain": "appointment",
+                "event_domain": "appointment",
+                "action": "eye laser treatment",
                 "place": "the eye doctor",
                 "support_count": 1,
             },
         )
 
-        result = reflector.reflect(objects=(relationship, medical_event))
+        result = reflector.reflect(objects=(relationship, appointment_event))
 
         self.assertEqual(len(result.created_summaries), 1)
         summary = result.created_summaries[0]
-        self.assertEqual(summary.kind, "thread_summary")
+        self.assertEqual(summary.kind, "summary")
+        self.assertEqual((summary.attributes or {}).get("summary_type"), "thread")
         self.assertIn("Ongoing thread about Janina", summary.summary)
         self.assertIn("eye laser treatment", summary.summary)
-        self.assertEqual(summary.sensitivity, "medical")
+        self.assertEqual(summary.sensitivity, "sensitive")
 
 
 if __name__ == "__main__":

@@ -87,6 +87,13 @@ This separation keeps memory stable and comparable across languages without forc
 
 Twinr should store several different memory forms, not just one.
 
+### 0. Working memory
+
+The active turn window and immediate conversation state.
+
+This is not long-term memory.
+It is the short-horizon layer used for the current exchange.
+
 ### 1. Raw episode evidence
 
 A bounded record of what happened.
@@ -114,6 +121,23 @@ Examples:
 
 Episodes are useful for continuity and recall, but they should not automatically become permanent facts.
 
+### 2.5. Mid-term continuity packets
+
+A bounded near-term layer between rolling dialogue and durable semantic memory.
+
+Examples:
+
+- "Janina has an eye doctor appointment today."
+- "Recent conversation suggests the user may still be deciding about a walk."
+- "Current practical context around Corinna is likely to be a phone-number clarification."
+
+These packets should be:
+
+- compact
+- query-relevant
+- grounded in source memories
+- short-lived compared to durable semantic facts
+
 ### 3. Semantic facts
 
 Stable or semi-stable facts derived from repeated evidence or explicit statements.
@@ -130,9 +154,9 @@ Entities and typed relationships.
 
 Examples:
 
-- `user:main --social_family_of--> person:janina`
-- `person:corinna_maier --social_supports_user_as--> user:main`
-- `user:main --user_prefers_brand--> brand:melitta`
+- `user:main --social_related_to_user--> person:janina` with `relation=spouse`
+- `person:corinna_maier --social_related_to_user--> user:main` with `role=physiotherapist`
+- `user:main --user_prefers--> brand:melitta` with `category=brand` and `for_product=coffee`
 - `event:janina_eye_laser_2026_03_14 --temporal_occurs_on--> day:2026-03-14`
 
 ### 5. Temporal state
@@ -193,7 +217,7 @@ It should become several candidate objects.
 ### Candidate semantic facts
 
 - "Janina is the user's wife."
-- "Janina has an eye-related medical appointment on 2026-03-14."
+- "Janina has an eye-related appointment on 2026-03-14."
 - "Janina is receiving eye laser treatment on 2026-03-14."
 
 ### Candidate temporal facts
@@ -208,7 +232,7 @@ It should become several candidate objects.
 
 ### Candidate graph updates
 
-- `user:main --social_family_of--> person:janina`
+- `user:main --social_related_to_user--> person:janina` with `relation=spouse`
 - `event:janina_eye_laser_2026_03_14 --general_related_to--> person:janina`
 - `event:janina_eye_laser_2026_03_14 --temporal_occurs_on--> day:2026-03-14`
 
@@ -565,7 +589,7 @@ Twinr should:
 
 - avoid over-personalization
 - not surface sensitive knowledge casually
-- keep explicit medical inference conservative
+- keep domain-sensitive inference conservative
 - separate explicit recall from silent personalization
 - support deletion and correction
 - preserve provenance
@@ -661,8 +685,8 @@ Example:
 {
   "schema": "twinr_memory_object",
   "version": 1,
-  "memory_id": "fact:janina_eye_laser_2026_03_14",
-  "kind": "event_fact",
+  "memory_id": "event:janina_eye_laser_2026_03_14",
+  "kind": "event",
   "status": "active",
   "summary": "Janina has eye laser treatment on 2026-03-14.",
   "details": "Derived from a user utterance on 2026-03-14.",
@@ -679,8 +703,10 @@ Example:
   "sensitivity": "private",
   "attributes": {
     "person": "person:janina",
-    "event_type": "medical_appointment",
-    "care_subtype": "eye_laser_treatment"
+    "memory_domain": "appointment",
+    "event_domain": "appointment",
+    "action": "eye laser treatment",
+    "place": "eye doctor"
   },
   "conflicts_with": [],
   "supersedes": []

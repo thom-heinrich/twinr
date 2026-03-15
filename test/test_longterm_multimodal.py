@@ -106,14 +106,18 @@ class LongTermMultimodalTests(unittest.TestCase):
             objects = {item.memory_id: item for item in service.object_store.load_objects()}
             service.shutdown()
 
-        presence = next(item for item in objects.values() if item.kind == "presence_pattern_fact")
+        presence = next(
+            item
+            for item in objects.values()
+            if item.kind == "pattern" and (item.attributes or {}).get("pattern_type") == "presence"
+        )
         interaction = next(
             item for item in objects.values() if item.memory_id.startswith("pattern:camera_interaction:")
         )
         self.assertEqual(presence.status, "active")
         self.assertEqual(interaction.status, "active")
         self.assertGreaterEqual((presence.attributes or {}).get("support_count", 0), 2)
-        self.assertTrue(any(item.kind == "situational_observation" for item in objects.values()))
+        self.assertTrue(any(item.kind == "observation" for item in objects.values()))
 
     def test_runtime_buttons_enqueue_multimodal_button_usage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -127,7 +131,11 @@ class LongTermMultimodalTests(unittest.TestCase):
             objects = tuple(runtime.long_term_memory.object_store.load_objects())
             runtime.shutdown(timeout_s=2.0)
 
-        summaries = [item.summary for item in objects if item.kind == "interaction_pattern_fact"]
+        summaries = [
+            item.summary
+            for item in objects
+            if item.kind == "pattern" and (item.attributes or {}).get("pattern_type") == "interaction"
+        ]
         self.assertTrue(any("green button" in summary for summary in summaries))
         self.assertTrue(any("yellow button" in summary for summary in summaries))
 
@@ -144,7 +152,12 @@ class LongTermMultimodalTests(unittest.TestCase):
 
         self.assertIn("pir", queued_facts)
         self.assertEqual(queued_events, ("pir.motion_detected", "camera.person_visible"))
-        self.assertTrue(any(item.kind == "presence_pattern_fact" for item in objects))
+        self.assertTrue(
+            any(
+                item.kind == "pattern" and (item.attributes or {}).get("pattern_type") == "presence"
+                for item in objects
+            )
+        )
 
     def test_support_camera_capture_enqueues_multimodal_camera_usage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

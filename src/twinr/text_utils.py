@@ -22,8 +22,21 @@ def collapse_whitespace(value: str | None) -> str:
     return " ".join(str(value or "").split()).strip()
 
 
+def sanitize_text_fragment(value: str | None) -> str:
+    normalized = collapse_whitespace(value)
+    if not normalized:
+        return ""
+    clean_chars: list[str] = []
+    for char in normalized:
+        category = unicodedata.category(char)
+        if category.startswith("C"):
+            continue
+        clean_chars.append(char)
+    return collapse_whitespace("".join(clean_chars))
+
+
 def truncate_text(value: str | None, *, limit: int | None = None) -> str:
-    text = collapse_whitespace(value)
+    text = sanitize_text_fragment(value)
     if limit is None or len(text) <= limit:
         return text
     return text[: max(limit - 1, 0)].rstrip() + "…"

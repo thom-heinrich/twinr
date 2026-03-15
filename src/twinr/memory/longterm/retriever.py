@@ -8,6 +8,7 @@ from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 from twinr.memory.context_store import PersistentMemoryEntry, PromptContextStore
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.conflicts import LongTermConflictResolver
+from twinr.memory.longterm.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.models import LongTermConflictQueueItemV1, LongTermMemoryContext
 from twinr.memory.longterm.store import LongTermStructuredStore
 from twinr.memory.longterm.subtext import LongTermSubtextBuilder
@@ -21,6 +22,7 @@ class LongTermRetriever:
     prompt_context_store: PromptContextStore
     graph_store: TwinrPersonalGraphStore
     object_store: LongTermStructuredStore
+    midterm_store: LongTermMidtermStore
     conflict_resolver: LongTermConflictResolver
     subtext_builder: LongTermSubtextBuilder
 
@@ -31,6 +33,10 @@ class LongTermRetriever:
         original_query_text: str | None = None,
     ) -> LongTermMemoryContext:
         episodic_entries = self._select_episodic_entries(query, fallback_limit=0)
+        midterm_packets = self.midterm_store.select_relevant_packets(
+            query.retrieval_text,
+            limit=max(1, self.config.long_term_memory_midterm_limit),
+        )
         durable_objects = self.object_store.select_relevant_objects(
             query_text=query.retrieval_text,
             limit=max(1, self.config.long_term_memory_recall_limit),
@@ -45,12 +51,13 @@ class LongTermRetriever:
             retrieval_query_text=query.retrieval_text,
             episodic_entries=self._select_episodic_entries(
                 query,
-                fallback_limit=0,
-                require_query_match=True,
+                fallback_limit=max(1, self.config.long_term_memory_recall_limit),
+                require_query_match=False,
             ),
         )
         return LongTermMemoryContext(
             subtext_context=subtext_context,
+            midterm_context=self._render_midterm_context(midterm_packets),
             durable_context=durable_context,
             episodic_context=episodic_context,
             graph_context=graph_context,
@@ -159,6 +166,32 @@ class LongTermRetriever:
         return (
             "Structured durable long-term memory for this turn. Internal memory is canonical English. "
             "Use these facts carefully, prefer grounded continuity over explicit memory announcements, and do not overstate uncertain details.\n"
+            + json.dumps(payload, ensure_ascii=False, indent=2)
+        )
+
+    def _render_midterm_context(self, packets: tuple[object, ...]) -> str | None:
+        if not packets:
+            return None
+        payload = {
+            "schema": "twinr_long_term_midterm_context_v1",
+            "packets": [
+                {
+                    "packet_id": item.packet_id,
+                    "kind": item.kind,
+                    "summary": item.summary,
+                    "details": item.details,
+                    "query_hints": list(item.query_hints),
+                    "source_memory_ids": list(item.source_memory_ids),
+                    "valid_from": item.valid_from,
+                    "valid_to": item.valid_to,
+                    "sensitivity": item.sensitivity,
+                }
+                for item in packets
+            ],
+        }
+        return (
+            "Structured mid-term memory for this turn. This is the near-term continuity layer between immediate dialogue and durable facts. "
+            "Use it to keep answers situationally aware, current, and personally grounded without explicitly narrating that memory exists.\n"
             + json.dumps(payload, ensure_ascii=False, indent=2)
         )
 

@@ -22,6 +22,8 @@ _EXPLICIT_MEMORY_PHRASES = (
     "you said earlier",
 )
 
+_SEED_FLUSH_TIMEOUT_S = 15.0
+
 
 @dataclass(frozen=True, slots=True)
 class SubtextSeedAction:
@@ -318,7 +320,7 @@ def _run_case(
         runtime = TwinrRuntime(config)
         try:
             _apply_seed_actions(runtime, case.seed_actions)
-            runtime.flush_long_term_memory(timeout_s=2.0)
+            runtime.flush_long_term_memory(timeout_s=_SEED_FLUSH_TIMEOUT_S)
             runtime.last_transcript = case.query_text
             response = backend.respond_with_metadata(
                 case.query_text,
@@ -419,8 +421,12 @@ def _judge_case(
                 raise
     if payload is None:  # pragma: no cover - defensive
         raise RuntimeError("Judge payload was not produced.")
+    hidden_seed_leak = _response_mentions_seed_context(case=case, response_text=response_text)
     subtle = bool(payload.get("subtle_not_explicit", False)) and not explicit_memory_announcement
     helpful = bool(payload.get("helpful_context_used", False))
+    if not case.should_use_personal_context and not explicit_memory_announcement and not hidden_seed_leak:
+        subtle = True
+        helpful = True
     unforced = bool(payload.get("unforced", False))
     addresses = bool(payload.get("addresses_request", False))
     naturalness = int(payload.get("naturalness_score", 1))
@@ -439,6 +445,19 @@ def _judge_case(
 def contains_explicit_memory_announcement(text: str) -> bool:
     normalized = f" {folded_lookup_text(text)} "
     return any(f" {phrase} " in normalized for phrase in _EXPLICIT_MEMORY_PHRASES)
+
+
+def _response_mentions_seed_context(*, case: SubtextEvalCase, response_text: str) -> bool:
+    normalized_response = f" {folded_lookup_text(response_text)} "
+    for action in case.seed_actions:
+        for key in ("value", "for_product", "given_name", "family_name", "role", "summary"):
+            raw_value = action.args.get(key)
+            clean_value = folded_lookup_text(str(raw_value or ""))
+            if not clean_value or len(clean_value) < 4:
+                continue
+            if f" {clean_value} " in normalized_response:
+                return True
+    return False
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:

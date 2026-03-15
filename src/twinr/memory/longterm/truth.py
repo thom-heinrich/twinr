@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from twinr.memory.longterm.ontology import kind_matches
 from twinr.memory.longterm.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1
 
 
@@ -19,10 +20,11 @@ class LongTermTruthMaintainer:
         existing_objects: tuple[LongTermMemoryObjectV1, ...],
         candidate: LongTermMemoryObjectV1,
     ) -> tuple[LongTermMemoryConflictV1, ...]:
+        candidate = candidate.canonicalized()
         if not candidate.slot_key or not candidate.value_key:
             return ()
         conflicting = tuple(
-            item
+            item.canonicalized()
             for item in existing_objects
             if item.memory_id != candidate.memory_id
             and item.status in self.active_statuses
@@ -48,6 +50,7 @@ class LongTermTruthMaintainer:
         candidate: LongTermMemoryObjectV1,
         existing_objects: tuple[LongTermMemoryObjectV1, ...],
     ) -> LongTermMemoryObjectV1:
+        candidate = candidate.canonicalized()
         conflicts = self.detect_conflicts(existing_objects=existing_objects, candidate=candidate)
         if conflicts:
             return candidate.with_updates(
@@ -68,11 +71,11 @@ class LongTermTruthMaintainer:
         existing_objects: tuple[LongTermMemoryObjectV1, ...],
     ) -> str:
         label = _normalize_text(candidate.summary)
-        if candidate.kind == "contact_method_fact":
+        if kind_matches(candidate.kind, "fact", candidate.attributes, attr_key="fact_type", attr_value="contact_method"):
             return "I have more than one contact detail for this person. Which one should I use?"
-        if candidate.kind == "relationship_fact":
+        if kind_matches(candidate.kind, "fact", candidate.attributes, attr_key="fact_type", attr_value="relationship"):
             return "I have conflicting relationship information. Which one is correct now?"
-        if candidate.kind in {"medical_event", "event_fact"}:
+        if candidate.kind == "event" or candidate.kind == "plan":
             return "I have more than one memory about this event. Which one is correct now?"
         if label:
             return f"I have conflicting memories about this detail: {label} Which one is correct now?"

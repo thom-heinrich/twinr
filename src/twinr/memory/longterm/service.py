@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 import json
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -11,6 +13,7 @@ from twinr.memory.longterm.consolidator import LongTermMemoryConsolidator
 from twinr.memory.longterm.conflicts import LongTermConflictResolver
 from twinr.memory.longterm.extract import LongTermTurnExtractor
 from twinr.memory.longterm.multimodal import LongTermMultimodalExtractor
+from twinr.memory.longterm.ontology import kind_matches
 from twinr.memory.longterm.models import (
     LongTermConsolidationResultV1,
     LongTermConflictQueueItemV1,
@@ -25,13 +28,15 @@ from twinr.memory.longterm.models import (
     LongTermRetentionResultV1,
     LongTermReflectionResultV1,
 )
+from twinr.memory.longterm.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.planner import LongTermProactivePlanner
 from twinr.memory.longterm.proactive import LongTermProactivePolicy, LongTermProactiveReservationV1, LongTermProactiveStateStore
 from twinr.memory.longterm.reflect import LongTermMemoryReflector
 from twinr.memory.longterm.retriever import LongTermRetriever
 from twinr.memory.longterm.retention import LongTermRetentionPolicy
+from twinr.memory.longterm.sensor_memory import LongTermSensorMemoryCompiler
 from twinr.memory.longterm.store import LongTermStructuredStore
-from twinr.memory.longterm.subtext import LongTermSubtextBuilder
+from twinr.memory.longterm.subtext import LongTermSubtextBuilder, LongTermSubtextCompiler
 from twinr.memory.longterm.truth import LongTermTruthMaintainer
 from twinr.memory.longterm.worker import AsyncLongTermMemoryWriter, AsyncLongTermMultimodalWriter
 
@@ -51,6 +56,7 @@ class LongTermMemoryService:
     prompt_context_store: PromptContextStore
     graph_store: TwinrPersonalGraphStore
     object_store: LongTermStructuredStore
+    midterm_store: LongTermMidtermStore
     query_rewriter: LongTermQueryRewriter
     retriever: LongTermRetriever
     extractor: LongTermTurnExtractor
@@ -59,6 +65,7 @@ class LongTermMemoryService:
     consolidator: LongTermMemoryConsolidator
     conflict_resolver: LongTermConflictResolver
     reflector: LongTermMemoryReflector
+    sensor_memory: LongTermSensorMemoryCompiler
     planner: LongTermProactivePlanner
     proactive_policy: LongTermProactivePolicy
     retention_policy: LongTermRetentionPolicy
@@ -77,12 +84,14 @@ class LongTermMemoryService:
         store = prompt_context_store or PromptContextStore.from_config(config)
         graph = graph_store or TwinrPersonalGraphStore.from_config(config)
         object_store = LongTermStructuredStore.from_config(config)
+        midterm_store = LongTermMidtermStore.from_config(config)
         extractor = extractor or LongTermTurnExtractor.from_config(config)
         multimodal_extractor = LongTermMultimodalExtractor(timezone_name=config.local_timezone_name)
         truth_maintainer = LongTermTruthMaintainer()
         consolidator = LongTermMemoryConsolidator(truth_maintainer=truth_maintainer)
         conflict_resolver = LongTermConflictResolver()
-        reflector = LongTermMemoryReflector()
+        reflector = LongTermMemoryReflector.from_config(config)
+        sensor_memory = LongTermSensorMemoryCompiler.from_config(config)
         planner = LongTermProactivePlanner(timezone_name=config.local_timezone_name)
         proactive_state_store = LongTermProactiveStateStore.from_config(config)
         proactive_policy = LongTermProactivePolicy(
@@ -90,12 +99,17 @@ class LongTermMemoryService:
             state_store=proactive_state_store,
         )
         retention_policy = LongTermRetentionPolicy(timezone_name=config.local_timezone_name)
-        subtext_builder = LongTermSubtextBuilder(config=config, graph_store=graph)
+        subtext_builder = LongTermSubtextBuilder(
+            config=config,
+            graph_store=graph,
+            compiler=LongTermSubtextCompiler.from_config(config),
+        )
         retriever = LongTermRetriever(
             config=config,
             prompt_context_store=store,
             graph_store=graph,
             object_store=object_store,
+            midterm_store=midterm_store,
             conflict_resolver=conflict_resolver,
             subtext_builder=subtext_builder,
         )
@@ -105,10 +119,13 @@ class LongTermMemoryService:
             writer = AsyncLongTermMemoryWriter(
                 write_callback=lambda item: cls._persist_longterm_turn(
                     store=store,
+                    graph_store=graph,
                     object_store=object_store,
+                    midterm_store=midterm_store,
                     extractor=extractor,
                     consolidator=consolidator,
                     reflector=reflector,
+                    sensor_memory=sensor_memory,
                     retention_policy=retention_policy,
                     item=item,
                 ),
@@ -117,9 +134,11 @@ class LongTermMemoryService:
             multimodal_writer = AsyncLongTermMultimodalWriter(
                 write_callback=lambda item: cls._persist_multimodal_evidence(
                     object_store=object_store,
+                    midterm_store=midterm_store,
                     multimodal_extractor=multimodal_extractor,
                     consolidator=consolidator,
                     reflector=reflector,
+                    sensor_memory=sensor_memory,
                     retention_policy=retention_policy,
                     item=item,
                 ),
@@ -130,6 +149,7 @@ class LongTermMemoryService:
             prompt_context_store=store,
             graph_store=graph,
             object_store=object_store,
+            midterm_store=midterm_store,
             query_rewriter=LongTermQueryRewriter.from_config(config),
             retriever=retriever,
             extractor=extractor,
@@ -138,6 +158,7 @@ class LongTermMemoryService:
             consolidator=consolidator,
             conflict_resolver=conflict_resolver,
             reflector=reflector,
+            sensor_memory=sensor_memory,
             planner=planner,
             proactive_policy=proactive_policy,
             retention_policy=retention_policy,
@@ -150,6 +171,40 @@ class LongTermMemoryService:
         return self.retriever.build_context(
             query=query,
             original_query_text=query_text,
+        )
+
+    def build_tool_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
+        query = self.query_rewriter.profile(query_text)
+        context = self.retriever.build_context(
+            query=query,
+            original_query_text=query_text,
+        )
+        conflict_queue = self.select_conflict_queue(query_text=query.retrieval_text)
+        conflicting_memory_ids = {
+            option.memory_id
+            for item in conflict_queue
+            for option in item.options
+        }
+        durable_objects = self.object_store.select_relevant_objects(
+            query_text=query.retrieval_text,
+            limit=max(1, self.config.long_term_memory_recall_limit),
+        )
+        filtered_durable_objects = tuple(
+            item
+            for item in durable_objects
+            if not kind_matches(item.kind, "fact", item.attributes, attr_key="fact_type", attr_value="contact_method")
+            and item.memory_id not in conflicting_memory_ids
+        )
+        return LongTermMemoryContext(
+            subtext_context=context.subtext_context,
+            midterm_context=context.midterm_context,
+            durable_context=self.retriever._render_durable_context(filtered_durable_objects),
+            episodic_context=context.episodic_context,
+            graph_context=self.graph_store.build_prompt_context(
+                query.retrieval_text,
+                include_contact_methods=False,
+            ),
+            conflict_context=None,
         )
 
     def enqueue_conversation_turn(
@@ -235,17 +290,39 @@ class LongTermMemoryService:
     def run_reflection(self) -> LongTermReflectionResultV1:
         result = self.reflector.reflect(objects=self.object_store.load_objects())
         self.object_store.apply_reflection(result)
+        self.midterm_store.apply_reflection(result)
+        sensor_memory_result = self.run_sensor_memory()
+        if sensor_memory_result.created_summaries or sensor_memory_result.reflected_objects:
+            return LongTermReflectionResultV1(
+                reflected_objects=tuple((*result.reflected_objects, *sensor_memory_result.reflected_objects)),
+                created_summaries=tuple((*result.created_summaries, *sensor_memory_result.created_summaries)),
+                midterm_packets=result.midterm_packets,
+            )
         return result
 
-    def plan_proactive_candidates(self) -> LongTermProactivePlanV1:
-        return self.planner.plan(objects=self.object_store.load_objects())
+    def run_sensor_memory(self, *, now: datetime | None = None) -> LongTermReflectionResultV1:
+        result = self.sensor_memory.compile(objects=self.object_store.load_objects(), now=now)
+        if result.created_summaries or result.reflected_objects:
+            self.object_store.apply_reflection(result)
+        return result
+
+    def plan_proactive_candidates(
+        self,
+        *,
+        live_facts: Mapping[str, object] | None = None,
+    ) -> LongTermProactivePlanV1:
+        return self.planner.plan(
+            objects=self.object_store.load_objects(),
+            live_facts=live_facts,
+        )
 
     def reserve_proactive_candidate(
         self,
         *,
         now: datetime | None = None,
+        live_facts: Mapping[str, object] | None = None,
     ) -> LongTermProactiveReservationV1 | None:
-        plan = self.plan_proactive_candidates()
+        plan = self.plan_proactive_candidates(live_facts=live_facts)
         return self.proactive_policy.reserve_candidate(plan=plan, now=now)
 
     def reserve_specific_proactive_candidate(
@@ -260,8 +337,9 @@ class LongTermMemoryService:
         self,
         *,
         now: datetime | None = None,
+        live_facts: Mapping[str, object] | None = None,
     ) -> LongTermProactiveCandidateV1 | None:
-        plan = self.plan_proactive_candidates()
+        plan = self.plan_proactive_candidates(live_facts=live_facts)
         return self.proactive_policy.preview_candidate(plan=plan, now=now)
 
     def mark_proactive_candidate_delivered(
@@ -431,10 +509,13 @@ class LongTermMemoryService:
     def _persist_longterm_turn(
         *,
         store: PromptContextStore,
+        graph_store: TwinrPersonalGraphStore,
         object_store: LongTermStructuredStore,
+        midterm_store: LongTermMidtermStore,
         extractor: LongTermTurnExtractor,
         consolidator: LongTermMemoryConsolidator,
         reflector: LongTermMemoryReflector,
+        sensor_memory: LongTermSensorMemoryCompiler,
         retention_policy: LongTermRetentionPolicy,
         item: LongTermConversationTurn,
     ) -> PersistentMemoryEntry:
@@ -448,7 +529,11 @@ class LongTermMemoryService:
             existing_objects=object_store.load_objects(),
         )
         object_store.apply_consolidation(result)
-        object_store.apply_reflection(reflector.reflect(objects=object_store.load_objects()))
+        graph_store.apply_candidate_edges(result.graph_edges)
+        reflection = reflector.reflect(objects=object_store.load_objects())
+        object_store.apply_reflection(reflection)
+        midterm_store.apply_reflection(reflection)
+        object_store.apply_reflection(sensor_memory.compile(objects=object_store.load_objects(), now=item.created_at))
         object_store.apply_retention(retention_policy.apply(objects=object_store.load_objects()))
         return LongTermMemoryService._persist_episodic_turn(store=store, item=item)
 
@@ -456,9 +541,11 @@ class LongTermMemoryService:
     def _persist_multimodal_evidence(
         *,
         object_store: LongTermStructuredStore,
+        midterm_store: LongTermMidtermStore,
         multimodal_extractor: LongTermMultimodalExtractor,
         consolidator: LongTermMemoryConsolidator,
         reflector: LongTermMemoryReflector,
+        sensor_memory: LongTermSensorMemoryCompiler,
         retention_policy: LongTermRetentionPolicy,
         item: LongTermMultimodalEvidence,
     ) -> None:
@@ -468,7 +555,10 @@ class LongTermMemoryService:
             existing_objects=object_store.load_objects(),
         )
         object_store.apply_consolidation(result)
-        object_store.apply_reflection(reflector.reflect(objects=object_store.load_objects()))
+        reflection = reflector.reflect(objects=object_store.load_objects())
+        object_store.apply_reflection(reflection)
+        midterm_store.apply_reflection(reflection)
+        object_store.apply_reflection(sensor_memory.compile(objects=object_store.load_objects(), now=item.created_at))
         object_store.apply_retention(retention_policy.apply(objects=object_store.load_objects()))
 
     @staticmethod

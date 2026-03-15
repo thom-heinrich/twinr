@@ -124,8 +124,8 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "type": "function",
                 "name": "list_automations",
                 "description": (
-                    "List the currently configured time-based and sensor-triggered automations so you can answer questions about them "
-                    "or choose one to update or delete."
+                    "List the currently configured time-based and sensor-triggered automations. "
+                    "Use this for exact questions about current automations and before updating or deleting one when hidden context may be stale."
                 ),
                 "parameters": {
                     "type": "object",
@@ -309,9 +309,12 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                         "content_mode": {
                             "type": "string",
                             "enum": ["llm_prompt", "static_text"],
-                            "description": "Optional new content mode.",
+                            "description": "Optional new content mode. If omitted, keep the current mode.",
                         },
-                        "content": {"type": "string", "description": "Optional new prompt or static text."},
+                        "content": {
+                            "type": "string",
+                            "description": "Optional new prompt or static text. If omitted, keep the current wording.",
+                        },
                         "allow_web_search": {
                             "type": "boolean",
                             "description": "Optional new live-search flag for llm_prompt content.",
@@ -339,7 +342,9 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "type": "function",
                 "name": "update_sensor_automation",
                 "description": (
-                    "Update an existing supported sensor-triggered automation. Use list_automations first if you need to identify it."
+                    "Update an existing supported sensor-triggered automation. "
+                    "You may replace the trigger kind, hold_seconds, delivery, and content in one update. "
+                    "Use list_automations first if you need to identify it."
                 ),
                 "parameters": {
                     "type": "object",
@@ -485,7 +490,8 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "type": "function",
                 "name": "lookup_contact",
                 "description": (
-                    "Look up a remembered contact and return the stored phone number or email, or ask for clarification when multiple matches exist."
+                    "Look up a remembered contact and return the stored phone number or email. "
+                    "Use this for exact contact details instead of relying on hidden memory context, and ask for clarification when multiple matches exist."
                 ),
                 "parameters": {
                     "type": "object",
@@ -509,7 +515,8 @@ def build_agent_tool_schemas(tool_names: Iterable[str]) -> list[dict[str, Any]]:
                 "name": "get_memory_conflicts",
                 "description": (
                     "Inspect open long-term memory conflicts when the user asks what Twinr is unsure about, "
-                    "or when you need the current conflict option IDs before resolving one."
+                    "or when you need the current conflict option IDs before resolving one. "
+                    "Use this tool for exact conflict inspection instead of answering from hidden conflict summaries."
                 ),
                 "parameters": {
                     "type": "object",

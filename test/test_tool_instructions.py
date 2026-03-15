@@ -31,6 +31,16 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("do not call it again", instructions)
         self.assertIn("exact requested detail", instructions)
 
+    def test_tool_instructions_require_exact_retrieval_tools_before_answering(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            instructions = build_tool_agent_instructions(
+                TwinrConfig(openai_api_key="test-key", project_root=temp_dir, personality_dir="personality")
+            )
+
+        self.assertIn("exact saved contact details", instructions)
+        self.assertIn("lookup or list tool first", instructions)
+        self.assertIn("switch from one supported trigger type to another", instructions)
+
 
 if __name__ == "__main__":
     unittest.main()

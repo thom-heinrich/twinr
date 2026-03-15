@@ -501,10 +501,13 @@ def _build_multimodal_eval_cases() -> tuple[MultimodalEvalCase, ...]:
 def _persist_turn(service: LongTermMemoryService, item: LongTermConversationTurn) -> None:
     LongTermMemoryService._persist_longterm_turn(
         store=service.prompt_context_store,
+        graph_store=service.graph_store,
         object_store=service.object_store,
+        midterm_store=service.midterm_store,
         extractor=service.extractor,
         consolidator=service.consolidator,
         reflector=service.reflector,
+        sensor_memory=service.sensor_memory,
         retention_policy=service.retention_policy,
         item=item,
     )
@@ -513,9 +516,11 @@ def _persist_turn(service: LongTermMemoryService, item: LongTermConversationTurn
 def _persist_multimodal(service: LongTermMemoryService, item: LongTermMultimodalEvidence) -> None:
     LongTermMemoryService._persist_multimodal_evidence(
         object_store=service.object_store,
+        midterm_store=service.midterm_store,
         multimodal_extractor=service.multimodal_extractor,
         consolidator=service.consolidator,
         reflector=service.reflector,
+        sensor_memory=service.sensor_memory,
         retention_policy=service.retention_policy,
         item=item,
     )

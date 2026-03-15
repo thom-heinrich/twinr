@@ -10,7 +10,7 @@ def _janina_full_payload(date_key: str) -> dict[str, object]:
     return {
         "objects": [
             {
-                "kind": "relationship_fact",
+                "kind": "fact",
                 "summary": "Janina is the user's wife.",
                 "details": "Derived from the user's statement.",
                 "confidence": 0.98,
@@ -21,10 +21,11 @@ def _janina_full_payload(date_key: str) -> dict[str, object]:
                     "person_ref": "person:janina",
                     "person_name": "Janina",
                     "relation": "wife",
+                    "fact_type": "relationship",
                 },
             },
             {
-                "kind": "situational_observation",
+                "kind": "observation",
                 "summary": "The user described the day as sunday.",
                 "details": "Observed in the transcript.",
                 "confidence": 0.72,
@@ -35,10 +36,11 @@ def _janina_full_payload(date_key: str) -> dict[str, object]:
                 "valid_to": date_key,
                 "attributes": {
                     "topic": "day_name",
+                    "observation_type": "situational",
                 },
             },
             {
-                "kind": "situational_observation",
+                "kind": "observation",
                 "summary": "The user described the day as warm.",
                 "details": "Observed in the transcript.",
                 "confidence": 0.7,
@@ -49,14 +51,15 @@ def _janina_full_payload(date_key: str) -> dict[str, object]:
                 "valid_to": date_key,
                 "attributes": {
                     "topic": "weather",
+                    "observation_type": "situational",
                 },
             },
             {
-                "kind": "medical_event",
+                "kind": "event",
                 "summary": f"Janina has eye laser treatment at the eye doctor on {date_key}.",
                 "details": "Directly stated by the user.",
                 "confidence": 0.93,
-                "sensitivity": "medical",
+                "sensitivity": "sensitive",
                 "slot_key": f"event:person:janina:eye_laser_treatment:{date_key}",
                 "value_key": "eye_laser_treatment",
                 "valid_from": date_key,
@@ -66,14 +69,16 @@ def _janina_full_payload(date_key: str) -> dict[str, object]:
                     "person_name": "Janina",
                     "place": "eye doctor",
                     "place_ref": "place:eye_doctor",
-                    "treatment": "eye laser treatment",
+                    "memory_domain": "appointment",
+                    "event_domain": "appointment",
+                    "action": "eye laser treatment",
                 },
             },
         ],
         "graph_edges": [
             {
                 "source_ref": "user:main",
-                "edge_type": "social_family_of",
+                "edge_type": "social_related_to_user",
                 "target_ref": "person:janina",
                 "confidence": 0.98,
                 "confirmed_by_user": True,
@@ -88,7 +93,7 @@ def _janina_full_payload(date_key: str) -> dict[str, object]:
                 "confidence": 0.9,
                 "confirmed_by_user": True,
                 "attributes": {
-                    "origin": "medical_event",
+                    "origin": "event",
                 },
             },
             {
@@ -107,7 +112,7 @@ def _janina_today_payload(date_key: str) -> dict[str, object]:
     return {
         "objects": [
             {
-                "kind": "relationship_fact",
+                "kind": "fact",
                 "summary": "Janina is the user's wife.",
                 "details": "Derived from the user's statement.",
                 "confidence": 0.98,
@@ -118,14 +123,15 @@ def _janina_today_payload(date_key: str) -> dict[str, object]:
                     "person_ref": "person:janina",
                     "person_name": "Janina",
                     "relation": "wife",
+                    "fact_type": "relationship",
                 },
             },
             {
-                "kind": "medical_event",
+                "kind": "event",
                 "summary": f"Janina has an appointment at the eye doctor on {date_key}.",
                 "details": "Directly stated by the user.",
                 "confidence": 0.9,
-                "sensitivity": "medical",
+                "sensitivity": "sensitive",
                 "slot_key": f"event:person:janina:eye_doctor:{date_key}",
                 "value_key": "eye_doctor",
                 "valid_from": date_key,
@@ -135,13 +141,16 @@ def _janina_today_payload(date_key: str) -> dict[str, object]:
                     "person_name": "Janina",
                     "place": "eye doctor",
                     "place_ref": "place:eye_doctor",
+                    "memory_domain": "appointment",
+                    "event_domain": "appointment",
+                    "action": "eye doctor appointment",
                 },
             },
         ],
         "graph_edges": [
             {
                 "source_ref": "user:main",
-                "edge_type": "social_family_of",
+                "edge_type": "social_related_to_user",
                 "target_ref": "person:janina",
                 "confidence": 0.98,
                 "confirmed_by_user": True,
@@ -165,7 +174,7 @@ def _janina_laser_today_payload(date_key: str) -> dict[str, object]:
     return {
         "objects": [
             {
-                "kind": "relationship_fact",
+                "kind": "fact",
                 "summary": "Janina is the user's wife.",
                 "details": "Derived from the user's statement.",
                 "confidence": 0.98,
@@ -176,14 +185,15 @@ def _janina_laser_today_payload(date_key: str) -> dict[str, object]:
                     "person_ref": "person:janina",
                     "person_name": "Janina",
                     "relation": "wife",
+                    "fact_type": "relationship",
                 },
             },
             {
-                "kind": "medical_event",
+                "kind": "event",
                 "summary": f"Janina has eye laser treatment on {date_key}.",
                 "details": "Directly stated by the user.",
                 "confidence": 0.92,
-                "sensitivity": "medical",
+                "sensitivity": "sensitive",
                 "slot_key": f"event:person:janina:eye_laser_treatment:{date_key}",
                 "value_key": "eye_laser_treatment",
                 "valid_from": date_key,
@@ -191,14 +201,16 @@ def _janina_laser_today_payload(date_key: str) -> dict[str, object]:
                 "attributes": {
                     "person_ref": "person:janina",
                     "person_name": "Janina",
-                    "treatment": "eye laser treatment",
+                    "memory_domain": "appointment",
+                    "event_domain": "appointment",
+                    "action": "eye laser treatment",
                 },
             },
         ],
         "graph_edges": [
             {
                 "source_ref": "user:main",
-                "edge_type": "social_family_of",
+                "edge_type": "social_related_to_user",
                 "target_ref": "person:janina",
                 "confidence": 0.98,
                 "confirmed_by_user": True,
@@ -222,7 +234,7 @@ def _warm_today_payload(date_key: str) -> dict[str, object]:
     return {
         "objects": [
             {
-                "kind": "situational_observation",
+                "kind": "observation",
                 "summary": "The user described the day as warm.",
                 "details": "Observed in the transcript.",
                 "confidence": 0.7,
@@ -233,6 +245,7 @@ def _warm_today_payload(date_key: str) -> dict[str, object]:
                 "valid_to": date_key,
                 "attributes": {
                     "topic": "weather",
+                    "observation_type": "situational",
                 },
             },
         ],

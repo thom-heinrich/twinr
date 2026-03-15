@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from twinr.config import TwinrConfig
+from twinr.memory.longterm import (
+    LongTermMemoryObjectV1,
+    LongTermMemoryReflector,
+    LongTermMidtermStore,
+    LongTermSourceRefV1,
+)
+from twinr.memory.longterm.midterm import _midterm_reflection_schema
+from twinr.memory.longterm.retriever import LongTermRetriever
+from twinr.memory.longterm.store import LongTermStructuredStore
+from twinr.memory.context_store import PromptContextStore
+from twinr.memory.query_normalization import LongTermQueryProfile
+from twinr.memory.longterm.conflicts import LongTermConflictResolver
+from twinr.memory.longterm.subtext import LongTermSubtextBuilder
+from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
+
+
+def _config(root: str) -> TwinrConfig:
+    return TwinrConfig(
+        project_root=root,
+        personality_dir="personality",
+        memory_markdown_path=str(Path(root) / "state" / "MEMORY.md"),
+        long_term_memory_enabled=True,
+        long_term_memory_path=str(Path(root) / "state" / "chonkydb"),
+        long_term_memory_recall_limit=4,
+        long_term_memory_midterm_enabled=True,
+        long_term_memory_midterm_limit=3,
+        user_display_name="Erika",
+    )
+
+
+def _source(event_id: str) -> LongTermSourceRefV1:
+    return LongTermSourceRefV1(
+        source_type="conversation_turn",
+        event_ids=(event_id,),
+        speaker="user",
+        modality="voice",
+    )
+
+
+class StubReflectionProgram:
+    def compile_reflection(
+        self,
+        *,
+        objects,
+        timezone_name: str,
+        packet_limit: int,
+    ):
+        del timezone_name
+        del packet_limit
+        object_ids = {item.memory_id for item in objects}
+        if {"fact:janina_wife", "event:janina_eye_doctor_today"}.issubset(object_ids):
+            return {
+                "midterm_packets": [
+                    {
+                        "packet_id": "midterm:janina_today",
+                        "kind": "recent_life_bundle",
+                        "summary": "Janina is the user's wife and has an eye doctor appointment today.",
+                        "details": "Recent context suggests that questions about Janina today may relate to that appointment.",
+                        "source_memory_ids": [
+                            "fact:janina_wife",
+                            "event:janina_eye_doctor_today",
+                        ],
+                        "query_hints": [
+                            "janina",
+                            "wife",
+                            "eye doctor",
+                            "today",
+                        ],
+                        "sensitivity": "sensitive",
+                        "valid_from": "2026-03-15",
+                        "valid_to": "2026-03-15",
+                        "attributes": {
+                            "scope": "recent_window",
+                            "focus_refs": ["person:janina"],
+                        },
+                    }
+                ]
+            }
+        return {"midterm_packets": []}
+
+
+class LongTermMidtermTests(unittest.TestCase):
+    def test_midterm_schema_is_openai_strict_compatible(self) -> None:
+        schema = _midterm_reflection_schema()
+        packet_schema = schema["properties"]["midterm_packets"]["items"]
+        properties = packet_schema["properties"]
+        required = packet_schema["required"]
+
+        self.assertEqual(set(required), set(properties))
+        self.assertEqual(properties["details"]["anyOf"][1]["type"], "null")
+        self.assertEqual(properties["valid_from"]["anyOf"][1]["type"], "null")
+        self.assertEqual(properties["valid_to"]["anyOf"][1]["type"], "null")
+
+    def test_reflector_can_compile_midterm_packets(self) -> None:
+        reflector = LongTermMemoryReflector(program=StubReflectionProgram(), midterm_packet_limit=3)
+        wife = LongTermMemoryObjectV1(
+            memory_id="fact:janina_wife",
+            kind="fact",
+            summary="Janina is the user's wife.",
+            source=_source("turn:1"),
+            status="active",
+            confidence=0.98,
+            slot_key="relationship:user:main:wife",
+            value_key="person:janina",
+            sensitivity="private",
+            attributes={
+                "person_ref": "person:janina",
+                "person_name": "Janina",
+                "relation": "wife",
+                "fact_type": "relationship",
+                "support_count": 2,
+            },
+        )
+        appointment = LongTermMemoryObjectV1(
+            memory_id="event:janina_eye_doctor_today",
+            kind="event",
+            summary="Janina has an eye doctor appointment today.",
+            source=_source("turn:2"),
+            status="active",
+            confidence=0.93,
+            slot_key="event:person:janina:eye_doctor:2026-03-15",
+            value_key="appointment:janina:eye_doctor:2026-03-15",
+            sensitivity="sensitive",
+            valid_from="2026-03-15",
+            valid_to="2026-03-15",
+            attributes={
+                "person_ref": "person:janina",
+                "person_name": "Janina",
+                "action": "eye doctor appointment",
+                "memory_domain": "appointment",
+            },
+        )
+
+        result = reflector.reflect(objects=(wife, appointment))
+
+        self.assertEqual(len(result.midterm_packets), 1)
+        packet = result.midterm_packets[0]
+        self.assertEqual(packet.packet_id, "midterm:janina_today")
+        self.assertEqual(packet.kind, "recent_life_bundle")
+        self.assertIn("Janina", packet.summary)
+        self.assertIn("eye doctor", packet.summary)
+        self.assertEqual(packet.source_memory_ids, ("fact:janina_wife", "event:janina_eye_doctor_today"))
+
+    def test_midterm_store_selects_query_relevant_packets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = _config(temp_dir)
+            store = LongTermMidtermStore.from_config(config)
+            store.save_packets(
+                packets=(
+                    store.packet_type(
+                        packet_id="midterm:janina_today",
+                        kind="recent_life_bundle",
+                        summary="Janina has an eye doctor appointment today.",
+                        details="Useful when the user asks about Janina today.",
+                        source_memory_ids=("event:janina_eye_doctor_today",),
+                        query_hints=("janina", "eye doctor", "today"),
+                        sensitivity="sensitive",
+                    ),
+                    store.packet_type(
+                        packet_id="midterm:tea_shopping",
+                        kind="shopping_bundle",
+                        summary="The user usually buys tea at Laden Seidel.",
+                        details="Useful for nearby tea suggestions.",
+                        source_memory_ids=("fact:tea_store",),
+                        query_hints=("tea", "laden seidel"),
+                        sensitivity="normal",
+                    ),
+                )
+            )
+
+            janina_packets = store.select_relevant_packets("How is Janina doing today?", limit=2)
+            math_packets = store.select_relevant_packets("What is 27 times 14?", limit=2)
+
+        self.assertEqual([item.packet_id for item in janina_packets], ["midterm:janina_today"])
+        self.assertEqual(math_packets, ())
+
+    def test_retriever_includes_midterm_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = _config(temp_dir)
+            prompt_context_store = PromptContextStore.from_config(config)
+            graph_store = TwinrPersonalGraphStore.from_config(config)
+            object_store = LongTermStructuredStore.from_config(config)
+            midterm_store = LongTermMidtermStore.from_config(config)
+            midterm_store.save_packets(
+                packets=(
+                    midterm_store.packet_type(
+                        packet_id="midterm:janina_today",
+                        kind="recent_life_bundle",
+                        summary="Janina has an eye doctor appointment today.",
+                        details="Useful when the user asks about Janina today.",
+                        source_memory_ids=("event:janina_eye_doctor_today",),
+                        query_hints=("janina", "eye doctor", "today"),
+                        sensitivity="sensitive",
+                    ),
+                )
+            )
+            retriever = LongTermRetriever(
+                config=config,
+                prompt_context_store=prompt_context_store,
+                graph_store=graph_store,
+                object_store=object_store,
+                midterm_store=midterm_store,
+                conflict_resolver=LongTermConflictResolver(),
+                subtext_builder=LongTermSubtextBuilder(config=config, graph_store=graph_store),
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Wie geht es Janina heute?",
+                    canonical_english_text="How is Janina doing today?",
+                ),
+                original_query_text="Wie geht es Janina heute?",
+            )
+
+        self.assertIsNotNone(context.midterm_context)
+        self.assertIn("twinr_long_term_midterm_context_v1", context.midterm_context or "")
+        self.assertIn("Janina has an eye doctor appointment today.", context.midterm_context or "")
+
+
+if __name__ == "__main__":
+    unittest.main()

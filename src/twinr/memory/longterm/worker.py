@@ -27,6 +27,7 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
         self._drain_lock = Lock()
         self._inflight = 0
         self._dropped_count = 0
+        self._last_error_message: str | None = None
         self._worker = Thread(
             target=self._run,
             name=worker_name,
@@ -43,9 +44,16 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
         with self._drain_lock:
             return self._queue.qsize() + self._inflight
 
+    @property
+    def last_error_message(self) -> str | None:
+        with self._drain_lock:
+            return self._last_error_message
+
     def enqueue(self, item: TLongTermItem) -> LongTermEnqueueResult:
         try:
             self._queue.put_nowait(item)
+            with self._drain_lock:
+                self._last_error_message = None
             return LongTermEnqueueResult(
                 accepted=True,
                 pending_count=self.pending_count(),
@@ -65,9 +73,9 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
         deadline = time.monotonic() + max(timeout_s, 0.0)
         while time.monotonic() <= deadline:
             if self.pending_count() <= 0:
-                return True
+                return self.last_error_message is None
             time.sleep(self._poll_interval_s)
-        return self.pending_count() <= 0
+        return self.pending_count() <= 0 and self.last_error_message is None
 
     def shutdown(self, *, timeout_s: float = 2.0) -> None:
         self._stop_event.set()
@@ -86,6 +94,9 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
                 self._inflight += 1
             try:
                 self._write_callback(item)
+            except Exception as exc:
+                with self._drain_lock:
+                    self._last_error_message = f"{type(exc).__name__}: {exc}"
             finally:
                 with self._drain_lock:
                     self._inflight = max(0, self._inflight - 1)

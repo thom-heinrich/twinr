@@ -88,7 +88,7 @@ class TwinrGraphSchemaTests(unittest.TestCase):
         )
         edge = TwinrGraphEdgeV1(
             source_node_id="user:main",
-            edge_type="user_prefers_brand",
+            edge_type="user_prefers",
             target_node_id="brand:melitta",
             confidence=0.86,
             confirmed_by_user=True,
@@ -110,7 +110,7 @@ class TwinrGraphSchemaTests(unittest.TestCase):
         self.assertEqual(payload["schema"], {"name": TWINR_GRAPH_SCHEMA_NAME, "version": TWINR_GRAPH_SCHEMA_VERSION})
         self.assertEqual(payload["subject_node_id"], "user:main")
         self.assertEqual(payload["nodes"][1]["aliases"], ["Melitta Kaffee"])
-        self.assertEqual(payload["edges"][0]["type"], "user_prefers_brand")
+        self.assertEqual(payload["edges"][0]["type"], "user_prefers")
         self.assertEqual(payload["edges"][0]["attributes"], {"for_product": "coffee"})
 
     def test_graph_document_rejects_unknown_edge_type(self) -> None:
@@ -127,7 +127,7 @@ class TwinrGraphSchemaTests(unittest.TestCase):
         place = TwinrGraphNodeV1(node_id="place:store_z", node_type="place", label="Geschaeft Z")
         edge = TwinrGraphEdgeV1(
             source_node_id="user:main",
-            edge_type="user_usually_buys_at",
+            edge_type="user_prefers",
             target_node_id="place:store_z",
         )
 
@@ -141,7 +141,7 @@ class TwinrGraphSchemaTests(unittest.TestCase):
         self.assertEqual(document.node("place:store_z").label, "Geschaeft Z")
 
     def test_edge_catalog_helpers_are_stable(self) -> None:
-        self.assertIn("social_supports_user_as", TWINR_GRAPH_ALLOWED_EDGE_TYPES)
+        self.assertIn("social_related_to_user", TWINR_GRAPH_ALLOWED_EDGE_TYPES)
         self.assertEqual(graph_edge_namespace("spatial_near"), "spatial")
         self.assertTrue(is_allowed_graph_edge_type("general_has_contact_method"))
         self.assertFalse(is_allowed_graph_edge_type("caregiver_knows"))
@@ -160,7 +160,7 @@ class ChonkyDBGraphClientTests(unittest.TestCase):
             ChonkyDBGraphAddEdgeSmartRequest(
                 from_ref="user:main",
                 to_ref="person:corinna_maier",
-                edge_type="social_supports_user_as",
+                edge_type="social_related_to_user",
             )
         )
         client.graph_neighbors(
@@ -175,14 +175,14 @@ class ChonkyDBGraphClientTests(unittest.TestCase):
             ChonkyDBGraphPathRequest(
                 source="user:main",
                 target="brand:melitta",
-                edge_types=("user_prefers_brand",),
+                edge_types=("user_prefers",),
                 return_ids=True,
             )
         )
         client.graph_patterns(
             ChonkyDBGraphPatternsRequest(
                 patterns=(
-                    {"start": "user:main", "edge_type": "user_prefers_brand", "end": "brand:*"},
+                    {"start": "user:main", "edge_type": "user_prefers", "end": "brand:*"},
                 ),
                 include_content=False,
             )
@@ -192,10 +192,10 @@ class ChonkyDBGraphClientTests(unittest.TestCase):
         self.assertTrue(opener.calls[1]["full_url"].endswith("/v1/external/graph/neighbors"))
         self.assertTrue(opener.calls[2]["full_url"].endswith("/v1/external/graph/path"))
         self.assertTrue(opener.calls[3]["full_url"].endswith("/v1/external/graph/patterns"))
-        self.assertEqual(json.loads(opener.calls[0]["body"])["edge_type"], "social_supports_user_as")
+        self.assertEqual(json.loads(opener.calls[0]["body"])["edge_type"], "social_related_to_user")
         self.assertEqual(json.loads(opener.calls[1]["body"])["edge_types"], ["general_has_contact_method"])
         self.assertEqual(json.loads(opener.calls[2]["body"])["target"], "brand:melitta")
-        self.assertEqual(json.loads(opener.calls[3]["body"])["patterns"][0]["edge_type"], "user_prefers_brand")
+        self.assertEqual(json.loads(opener.calls[3]["body"])["patterns"][0]["edge_type"], "user_prefers")
 
     def test_graph_http_errors_raise_chonkydb_error(self) -> None:
         opener = FakeOpener()
@@ -207,7 +207,7 @@ class ChonkyDBGraphClientTests(unittest.TestCase):
                 {
                     "from_ref": "user:main",
                     "to_ref": "person:corinna_maier",
-                    "edge_type": "social_supports_user_as",
+                    "edge_type": "social_related_to_user",
                 }
             )
 

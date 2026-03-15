@@ -21,6 +21,17 @@ class TwinrRuntimeContextMixin:
         messages.extend(self.conversation_context())
         return tuple(messages)
 
+    def tool_provider_conversation_context(self) -> tuple[tuple[str, str], ...]:
+        messages: list[tuple[str, str]] = []
+        messages.append(("system", memory_and_response_contract(self.config.openai_realtime_language)))
+        guidance = self._voice_guidance_message()
+        if guidance:
+            messages.append(("system", guidance))
+        for context_message in self.long_term_memory.build_tool_provider_context(self.last_transcript).system_messages():
+            messages.append(("system", context_message))
+        messages.extend(self.conversation_context())
+        return tuple(messages)
+
     def update_user_voice_assessment(
         self,
         *,

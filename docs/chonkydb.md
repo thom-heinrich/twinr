@@ -16,7 +16,7 @@ The current scope is intentionally narrow:
 
 The external client is still intentionally narrow. Twinr's normal live runtime now routes long-term retrieval and non-blocking episodic persistence through `src/twinr/memory/longterm/`, while remote ChonkyDB network writes remain an explicit future integration step.
 
-## Twinr graph schema v1
+## Twinr graph schema v2
 
 Twinr now carries a small versioned graph format under `src/twinr/memory/chonkydb/schema.py`.
 
@@ -24,7 +24,7 @@ The graph document format is JSON-serializable and intentionally small:
 
 ```json
 {
-  "schema": {"name": "twinr_graph", "version": 1},
+  "schema": {"name": "twinr_graph", "version": 2},
   "subject_node_id": "user:main",
   "nodes": [
     {"id": "user:main", "type": "user", "label": "Erika"},
@@ -33,17 +33,17 @@ The graph document format is JSON-serializable and intentionally small:
   "edges": [
     {
       "source": "person:corinna_maier",
-      "type": "social_supports_user_as",
+      "type": "social_related_to_user",
       "target": "user:main",
       "status": "active",
-      "attributes": {"role": "physiotherapist"},
+      "attributes": {"role": "physiotherapist", "relation": "trusted_helper"},
       "confirmed_by_user": true
     }
   ]
 }
 ```
 
-The current v1 edge namespaces are:
+The current v2 edge namespaces are:
 
 - `social_*`
 - `general_*`
@@ -59,11 +59,11 @@ Twinr now has a first local personal-graph layer on top of the schema:
 
 - remember contacts with phone, email, relation, and role
 - look up contacts with clarification when multiple matches exist
-- remember stable preferences such as liked brands or favored shops
+- remember stable preferences such as favored products, places, brands, services, or recurring activities
 - remember short user plans such as wanting to go for a walk today
 - feed a compact graph-based personalization hint into the provider context
 
-The current implementation is local-first and writes to `twinr_graph_v1.json` under the configured `TWINR_LONG_TERM_MEMORY_PATH`. It does not yet push real graph writes into the shared external ChonkyDB service during normal Twinr runtime.
+The current implementation is local-first and writes to `twinr_graph_v2.json` under the configured `TWINR_LONG_TERM_MEMORY_PATH`. It does not yet push real graph writes into the shared external ChonkyDB service during normal Twinr runtime.
 
 ### Canonical language contract
 
@@ -76,29 +76,25 @@ Twinr now treats memory language and user-output language as separate concerns:
 
 This avoids coupling memory quality to one user language and keeps the memory layer stable even when the user speaks German or switches languages.
 
-### Current v1 edge types
+### Current v2 edge types
 
-- `social_family_of`
-- `social_friend_of`
-- `social_supports_user_as`
+- `social_related_to`
+- `social_related_to_user`
 - `general_alias_of`
-- `general_carries_brand`
 - `general_has_contact_method`
 - `general_related_to`
-- `general_sells`
 - `temporal_occurs_on`
 - `temporal_usually_happens_in`
 - `temporal_valid_from`
 - `temporal_valid_to`
 - `spatial_located_in`
 - `spatial_near`
-- `user_dislikes`
-- `user_likes`
+- `user_avoids`
+- `user_engages_with`
 - `user_plans`
-- `user_prefers_brand`
-- `user_usually_buys_at`
+- `user_prefers`
 
-### Why v1 looks like this
+### Why v2 looks like this
 
 - stable IDs keep people and places disambiguated
 - typed edges give Twinr structured recall for relationships and preferences
@@ -163,9 +159,10 @@ document = TwinrGraphDocumentV1(
     edges=(
         TwinrGraphEdgeV1(
             source_node_id="user:main",
-            edge_type="user_prefers_brand",
+            edge_type="user_prefers",
             target_node_id="brand:melitta",
             confidence=0.86,
+            attributes={"category": "brand", "for_product": "coffee"},
         ),
     ),
 )
@@ -174,14 +171,14 @@ client.add_graph_edge_smart(
     ChonkyDBGraphAddEdgeSmartRequest(
         from_ref="user:main",
         to_ref="brand:melitta",
-        edge_type="user_prefers_brand",
+        edge_type="user_prefers",
     )
 )
 
 neighbors = client.graph_neighbors(
     ChonkyDBGraphNeighborsRequest(
         label_or_id="user:main",
-        edge_types=("user_prefers_brand",),
+        edge_types=("user_prefers",),
         with_edges=True,
     )
 )
