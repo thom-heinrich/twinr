@@ -2,6 +2,7 @@ from twinr.providers.openai.adapters import (
     OpenAIAgentTextProvider,
     OpenAIProviderBundle,
     OpenAISpeechToTextProvider,
+    OpenAISupervisorDecisionProvider,
     OpenAIToolCallingAgentProvider,
     OpenAITextToSpeechProvider,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "OpenAIRealtimeSession",
     "OpenAIRealtimeTurn",
     "OpenAISpeechToTextProvider",
+    "OpenAISupervisorDecisionProvider",
     "OpenAITextResponse",
     "OpenAITextToSpeechProvider",
     "OpenAIToolCallingAgentProvider",
