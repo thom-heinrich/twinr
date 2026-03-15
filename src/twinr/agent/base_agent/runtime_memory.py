@@ -94,6 +94,8 @@ class TwinrRuntimeMemoryMixin:
             raise ValueError("timeout_s must be a positive finite float") from exc
         if not math.isfinite(timeout) or timeout <= 0.0:
             raise ValueError("timeout_s must be a positive finite float")
+        if self.config.long_term_memory_mode == "remote_primary":
+            timeout = max(timeout, float(self.config.long_term_memory_remote_flush_timeout_s))
         return timeout
 
     # AUDIT-FIX(#6): Prevent timezone-naive datetimes from entering reminder/proactive scheduling paths.
