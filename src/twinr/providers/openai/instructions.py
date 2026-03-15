@@ -54,6 +54,6 @@ PROACTIVE_PROMPT_INSTRUCTIONS = (
 )
 STT_MODEL_FALLBACKS = ("whisper-1",)
 TTS_MODEL_FALLBACKS = ("tts-1", "tts-1-hd")
-SEARCH_MODEL_FALLBACKS = ("gpt-5.2-chat-latest",)
+SEARCH_MODEL_FALLBACKS = ("gpt-4o-mini", "gpt-5.2-chat-latest")
 _LEGACY_TTS_VOICES = {"nova", "shimmer", "echo", "onyx", "fable", "alloy", "ash", "sage", "coral"}
 _LEGACY_TTS_FALLBACK_VOICE = "sage"
