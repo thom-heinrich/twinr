@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from queue import Queue
 from threading import Event, Lock, Thread
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.contracts import (
+    FirstWordProvider,
+    FirstWordReply,
     SupervisorDecision,
     ToolCallingAgentProvider,
     StreamingSpeechToTextProvider,
@@ -16,9 +17,10 @@ from twinr.agent.base_agent.turn_controller import _normalize_turn_text
 from twinr.agent.base_agent.turn_controller import ToolCallingTurnDecisionEvaluator
 from twinr.agent.tools import (
     DualLaneToolLoop,
-    SUPERVISOR_FAST_ACK_PHRASES,
+    SpeechLaneDelta,
     ToolCallingStreamingLoop,
     build_agent_tool_schemas,
+    build_first_word_instructions,
     build_compact_agent_tool_schemas,
     build_compact_tool_agent_instructions,
     build_supervisor_decision_instructions,
@@ -28,9 +30,15 @@ from twinr.agent.tools import (
     realtime_tool_names,
 )
 from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
+from twinr.agent.workflows.speech_output import InterruptibleSpeechOutput
 from twinr.hardware.audio import SilenceDetectedRecorder, pcm16_to_wav_bytes
 from twinr.providers.factory import build_streaming_provider_bundle
-from twinr.providers.openai import OpenAIBackend, OpenAISupervisorDecisionProvider, OpenAIToolCallingAgentProvider
+from twinr.providers.openai import (
+    OpenAIBackend,
+    OpenAIFirstWordProvider,
+    OpenAISupervisorDecisionProvider,
+    OpenAIToolCallingAgentProvider,
+)
 
 
 class _StreamingSessionPlaceholder:
@@ -106,21 +114,34 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self.streaming_turn_loop = streaming_turn_loop or self._build_streaming_turn_loop(
             tool_schemas=tool_schemas,
         )
-        self._fast_ack_wav_cache: dict[str, bytes] = {}
+        self.first_word_provider: FirstWordProvider | None = getattr(self, "first_word_provider", None)
         self._speculative_supervisor_lock = Lock()
         self._speculative_supervisor_done = Event()
         self._speculative_supervisor_started = False
         self._speculative_supervisor_transcript = ""
         self._speculative_supervisor_decision: SupervisorDecision | None = None
-        self._prime_fast_ack_cache()
+        self._speculative_first_word_lock = Lock()
+        self._speculative_first_word_done = Event()
+        self._speculative_first_word_started = False
+        self._speculative_first_word_transcript = ""
+        self._speculative_first_word_reply: FirstWordReply | None = None
+        self._speculative_handoff_lock = Lock()
+        self._speculative_handoff_done = Event()
+        self._speculative_handoff_started = False
+        self._speculative_handoff_transcript = ""
+        self._speculative_handoff_decision: SupervisorDecision | None = None
+        self._speculative_handoff_result = None
         self._supervisor_cache_prewarmed = False
+        self._first_word_cache_prewarmed = False
         self._prime_supervisor_decision_cache()
+        self._prime_first_word_cache()
 
     def _build_streaming_turn_loop(
         self,
         *,
         tool_schemas,
     ):
+        self.first_word_provider = None
         llm_name = (self.config.llm_provider or "").strip().lower()
         if (
             llm_name == "openai"
@@ -134,25 +155,37 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 if name in supervisor_tool_names
             }
             supervisor_tool_schemas = build_agent_tool_schemas(supervisor_tool_names)
+            backend = OpenAIBackend(config=self.config)
             supervisor_provider = OpenAIToolCallingAgentProvider(
-                OpenAIBackend(config=self.config),
+                backend,
                 model_override=self.config.streaming_supervisor_model,
                 reasoning_effort_override=self.config.streaming_supervisor_reasoning_effort,
                 base_instructions_override=load_supervisor_loop_instructions(self.config),
                 replace_base_instructions=True,
             )
             supervisor_decision_provider = OpenAISupervisorDecisionProvider(
-                OpenAIBackend(config=self.config),
+                backend,
                 model_override=self.config.streaming_supervisor_model,
                 reasoning_effort_override=self.config.streaming_supervisor_reasoning_effort,
                 base_instructions_override=load_supervisor_loop_instructions(self.config),
                 replace_base_instructions=True,
             )
             specialist_provider = OpenAIToolCallingAgentProvider(
-                OpenAIBackend(config=self.config),
+                backend,
                 model_override=self.config.streaming_specialist_model,
                 reasoning_effort_override=self.config.streaming_specialist_reasoning_effort,
             )
+            if self.config.streaming_first_word_enabled:
+                self.first_word_provider = OpenAIFirstWordProvider(
+                    backend,
+                    model_override=self.config.streaming_first_word_model,
+                    reasoning_effort_override=self.config.streaming_first_word_reasoning_effort,
+                    base_instructions_override=build_first_word_instructions(
+                        self.config,
+                        extra_instructions=self.config.openai_realtime_instructions,
+                    ),
+                    replace_base_instructions=True,
+                )
             return DualLaneToolLoop(
                 supervisor_provider=supervisor_provider,
                 specialist_provider=specialist_provider,
@@ -191,6 +224,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             self.agent_provider,
             self.tts_provider,
             self.print_backend,
+            self.first_word_provider,
             self.tool_agent_provider,
             self.turn_stt_provider,
             self.turn_tool_agent_provider,
@@ -219,27 +253,11 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self.streaming_turn_loop = self._build_streaming_turn_loop(
             tool_schemas=tool_schemas,
         )
-        self._fast_ack_wav_cache = {}
         self._reset_speculative_supervisor_decision()
-        self._prime_fast_ack_cache()
         self._supervisor_cache_prewarmed = False
+        self._first_word_cache_prewarmed = False
         self._prime_supervisor_decision_cache()
-
-    def _prime_fast_ack_cache(self) -> None:
-        if not isinstance(self.streaming_turn_loop, DualLaneToolLoop):
-            return
-        for phrase in SUPERVISOR_FAST_ACK_PHRASES:
-            normalized = phrase.strip()
-            if not normalized or normalized in self._fast_ack_wav_cache:
-                continue
-            try:
-                self._fast_ack_wav_cache[normalized] = self.tts_provider.synthesize(normalized)
-            except Exception as exc:
-                self.emit(f"fast_ack_cache_failed={type(exc).__name__}")
-                return
-
-    def _cached_fast_ack_wav_bytes(self, text: str) -> bytes | None:
-        return self._fast_ack_wav_cache.get(text.strip())
+        self._prime_first_word_cache()
 
     def _reset_speculative_supervisor_decision(self) -> None:
         with self._speculative_supervisor_lock:
@@ -247,6 +265,17 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             self._speculative_supervisor_started = False
             self._speculative_supervisor_transcript = ""
             self._speculative_supervisor_decision = None
+        with self._speculative_first_word_lock:
+            self._speculative_first_word_done = Event()
+            self._speculative_first_word_started = False
+            self._speculative_first_word_transcript = ""
+            self._speculative_first_word_reply = None
+        with self._speculative_handoff_lock:
+            self._speculative_handoff_done = Event()
+            self._speculative_handoff_started = False
+            self._speculative_handoff_transcript = ""
+            self._speculative_handoff_decision = None
+            self._speculative_handoff_result = None
 
     def _capture_and_transcribe_streaming(
         self,
@@ -263,7 +292,88 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         )
 
     def _on_streaming_stt_interim(self, text: str) -> None:
+        self._maybe_start_speculative_first_word(text)
         self._maybe_start_speculative_supervisor_decision(text)
+
+    def _on_streaming_stt_endpoint(self, event) -> None:
+        transcript = str(getattr(event, "transcript", "") or "").strip()
+        if transcript:
+            self._maybe_start_speculative_first_word(transcript)
+            self._maybe_start_speculative_supervisor_decision(transcript)
+
+    def _maybe_start_speculative_first_word(self, text: str) -> None:
+        if not self.config.streaming_first_word_enabled:
+            return
+        if not self.config.streaming_first_word_prefetch_enabled:
+            return
+        provider = self.first_word_provider
+        if provider is None:
+            return
+        cleaned = text.strip()
+        if len(cleaned) < max(1, int(self.config.streaming_first_word_prefetch_min_chars)):
+            return
+        with self._speculative_first_word_lock:
+            if self._speculative_first_word_started:
+                return
+            self._speculative_first_word_started = True
+            self._speculative_first_word_transcript = cleaned
+            done_event = self._speculative_first_word_done
+            conversation = self.runtime.first_word_provider_conversation_context()
+        worker = Thread(
+            target=self._speculative_first_word_worker,
+            args=(provider, cleaned, conversation, done_event),
+            daemon=True,
+        )
+        worker.start()
+
+    def _speculative_first_word_worker(
+        self,
+        provider: FirstWordProvider,
+        transcript: str,
+        conversation,
+        done_event: Event,
+    ) -> None:
+        reply: FirstWordReply | None = None
+        try:
+            reply = provider.reply(
+                transcript,
+                conversation=conversation,
+                instructions=None,
+            )
+        except Exception as exc:
+            self.emit(f"speculative_first_word_failed={type(exc).__name__}")
+        finally:
+            with self._speculative_first_word_lock:
+                if self._speculative_first_word_transcript == transcript:
+                    self._speculative_first_word_reply = reply
+            done_event.set()
+
+    def _consume_speculative_first_word(self, transcript: str) -> FirstWordReply | None:
+        if not self.config.streaming_first_word_enabled:
+            return None
+        with self._speculative_first_word_lock:
+            if not self._speculative_first_word_started:
+                return None
+            done_event = self._speculative_first_word_done
+            seeded_transcript = self._speculative_first_word_transcript
+        wait_ms = max(0, int(self.config.streaming_first_word_prefetch_wait_ms))
+        if wait_ms > 0 and not done_event.is_set():
+            done_event.wait(wait_ms / 1000.0)
+        with self._speculative_first_word_lock:
+            reply = self._speculative_first_word_reply
+        if reply is None:
+            return None
+        normalized_seed = _normalize_turn_text(seeded_transcript)
+        normalized_final = _normalize_turn_text(transcript)
+        if not normalized_seed or not normalized_final:
+            return None
+        if not (
+            normalized_final.startswith(normalized_seed)
+            or normalized_seed.startswith(normalized_final)
+        ):
+            return None
+        self.emit("speculative_first_word_hit=true")
+        return reply
 
     def _maybe_start_speculative_supervisor_decision(self, text: str) -> None:
         if not self.config.streaming_supervisor_prefetch_enabled:
@@ -312,6 +422,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             with self._speculative_supervisor_lock:
                 if self._speculative_supervisor_transcript == transcript:
                     self._speculative_supervisor_decision = decision
+            self._maybe_start_speculative_handoff(transcript, decision)
             done_event.set()
 
     def _consume_speculative_supervisor_decision(self, transcript: str) -> SupervisorDecision | None:
@@ -327,7 +438,10 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             done_event.wait(wait_ms / 1000.0)
         with self._speculative_supervisor_lock:
             decision = self._speculative_supervisor_decision
-        if decision is None or decision.action != "handoff":
+        if decision is None:
+            return None
+        action = str(getattr(decision, "action", "") or "").strip().lower()
+        if action not in {"direct", "handoff", "end_conversation"}:
             return None
         normalized_seed = _normalize_turn_text(seeded_transcript)
         normalized_final = _normalize_turn_text(transcript)
@@ -340,6 +454,96 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             return None
         self.emit("speculative_supervisor_hit=true")
         return decision
+
+    def _maybe_start_speculative_handoff(
+        self,
+        transcript: str,
+        decision: SupervisorDecision | None,
+    ) -> None:
+        if not isinstance(self.streaming_turn_loop, DualLaneToolLoop):
+            return
+        if decision is None or decision.action != "handoff":
+            return
+        if str(getattr(decision, "kind", "") or "").strip().lower() != "search":
+            return
+        cleaned = transcript.strip()
+        if not cleaned:
+            return
+        with self._speculative_handoff_lock:
+            if self._speculative_handoff_started:
+                return
+            self._speculative_handoff_started = True
+            self._speculative_handoff_transcript = cleaned
+            self._speculative_handoff_decision = decision
+            done_event = self._speculative_handoff_done
+            specialist_conversation = self.runtime.tool_provider_conversation_context()
+        worker = Thread(
+            target=self._speculative_handoff_worker,
+            args=(cleaned, decision, specialist_conversation, done_event),
+            daemon=True,
+        )
+        worker.start()
+
+    def _speculative_handoff_worker(
+        self,
+        transcript: str,
+        decision: SupervisorDecision,
+        specialist_conversation,
+        done_event: Event,
+    ) -> None:
+        result = None
+        try:
+            result = self.streaming_turn_loop.run_handoff_only(
+                transcript,
+                conversation=specialist_conversation,
+                specialist_conversation=specialist_conversation,
+                handoff=decision,
+                instructions=None,
+                allow_web_search=False,
+                on_text_delta=None,
+                on_lane_text_delta=None,
+                emit_filler=False,
+            )
+        except Exception as exc:
+            self.emit(f"speculative_handoff_failed={type(exc).__name__}")
+        finally:
+            with self._speculative_handoff_lock:
+                if self._speculative_handoff_transcript == transcript:
+                    self._speculative_handoff_result = result
+            done_event.set()
+
+    def _consume_speculative_handoff_result(
+        self,
+        transcript: str,
+        decision: SupervisorDecision | None,
+        *,
+        wait_for_completion: bool,
+    ):
+        if decision is None or decision.action != "handoff":
+            return None
+        with self._speculative_handoff_lock:
+            if not self._speculative_handoff_started:
+                return None
+            done_event = self._speculative_handoff_done
+            seeded_transcript = self._speculative_handoff_transcript
+            seeded_decision = self._speculative_handoff_decision
+        normalized_seed = _normalize_turn_text(seeded_transcript)
+        normalized_final = _normalize_turn_text(transcript)
+        if not normalized_seed or not normalized_final:
+            return None
+        if not (
+            normalized_final.startswith(normalized_seed)
+            or normalized_seed.startswith(normalized_final)
+        ):
+            return None
+        if seeded_decision is None:
+            return None
+        if str(getattr(seeded_decision, "kind", "") or "").strip().lower() != str(getattr(decision, "kind", "") or "").strip().lower():
+            return None
+        if wait_for_completion and not done_event.is_set():
+            done_event.wait()
+        with self._speculative_handoff_lock:
+            return self._speculative_handoff_result
 
     def _prime_supervisor_decision_cache(self) -> None:
         if self._supervisor_cache_prewarmed:
@@ -358,6 +562,82 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             self._supervisor_cache_prewarmed = True
         except Exception as exc:
             self.emit(f"supervisor_cache_prewarm_failed={type(exc).__name__}")
+
+    def _prime_first_word_cache(self) -> None:
+        if self._first_word_cache_prewarmed:
+            return
+        provider = self.first_word_provider
+        if provider is None:
+            return
+        try:
+            provider.reply(
+                "Sag bitte nur kurz Hallo.",
+                conversation=(),
+                instructions=None,
+            )
+            self._first_word_cache_prewarmed = True
+        except Exception as exc:
+            self.emit(f"first_word_cache_prewarm_failed={type(exc).__name__}")
+
+    def _generate_first_word_reply(self, transcript: str) -> FirstWordReply | None:
+        if not self.config.streaming_first_word_enabled:
+            return None
+        provider = self.first_word_provider
+        if provider is None:
+            return None
+        try:
+            return provider.reply(
+                transcript,
+                conversation=self.runtime.first_word_provider_conversation_context(),
+                instructions=None,
+            )
+        except Exception as exc:
+            self.emit(f"first_word_sync_failed={type(exc).__name__}")
+            return None
+
+    def _run_dual_lane_final_response(
+        self,
+        transcript: str,
+        *,
+        turn_instructions: str | None,
+    ):
+        prefetched_decision = self._consume_speculative_supervisor_decision(transcript)
+        if prefetched_decision is not None and getattr(prefetched_decision, "action", None) == "handoff":
+            fast_result = self._consume_speculative_handoff_result(
+                transcript,
+                prefetched_decision,
+                wait_for_completion=False,
+            )
+            if fast_result is not None:
+                return fast_result
+            response = self._consume_speculative_handoff_result(
+                transcript,
+                prefetched_decision,
+                wait_for_completion=True,
+            )
+            if response is not None:
+                return response
+            return self.streaming_turn_loop.run_handoff_only(
+                transcript,
+                conversation=self.runtime.tool_provider_conversation_context(),
+                specialist_conversation=self.runtime.tool_provider_conversation_context(),
+                handoff=prefetched_decision,
+                instructions=turn_instructions,
+                allow_web_search=False,
+                on_text_delta=None,
+                on_lane_text_delta=None,
+                emit_filler=False,
+            )
+        return self.streaming_turn_loop.run(
+            transcript,
+            conversation=self.runtime.tool_provider_conversation_context(),
+            supervisor_conversation=self.runtime.supervisor_provider_conversation_context(),
+            prefetched_decision=prefetched_decision,
+            instructions=turn_instructions,
+            allow_web_search=False,
+            on_text_delta=None,
+            on_lane_text_delta=None,
+        )
 
     def _run_single_audio_turn(
         self,
@@ -390,7 +670,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             with self._audio_lock:
                 if isinstance(self.stt_provider, StreamingSpeechToTextProvider):
                     try:
-                        capture_result, transcript, capture_ms, stt_ms = self._capture_and_transcribe_streaming(
+                        capture_result, transcript, capture_ms, stt_ms, _turn_label = self._capture_and_transcribe_streaming(
                             listening_window=listening_window,
                             speech_start_chunks=speech_start_chunks,
                             ignore_initial_ms=ignore_initial_ms,
@@ -521,64 +801,42 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self._emit_status(force=True)
         stop_processing_feedback = self._start_working_feedback_loop("processing")
 
-        spoken_segments: Queue[str | None] = Queue()
-        tts_error: list[Exception] = []
         first_audio_at: list[float | None] = [None]
         answer_started = False
-        pending_segment = ""
-
-        def tts_worker() -> None:
-            first_segment = True
-            while True:
-                segment = spoken_segments.get()
-                if segment is None:
-                    return
-                try:
-                    cached_ack = self._cached_fast_ack_wav_bytes(segment) if first_segment else None
-                    if cached_ack is not None:
-                        if first_audio_at[0] is None:
-                            first_audio_at[0] = time.monotonic()
-                        self.player.play_wav_bytes(cached_ack)
-                        first_segment = False
-                        continue
-
-                    def mark_first_chunk():
-                        for chunk in self.tts_provider.synthesize_stream(
-                            segment,
-                            chunk_size=max(512, int(self.config.openai_tts_stream_chunk_size)),
-                        ):
-                            if first_audio_at[0] is None:
-                                first_audio_at[0] = time.monotonic()
-                            yield chunk
-
-                    self.player.play_wav_chunks(mark_first_chunk())
-                    first_segment = False
-                except Exception as exc:
-                    tts_error.append(exc)
-                    return
-
-        worker = Thread(target=tts_worker, daemon=True)
-        worker.start()
 
         def queue_ready_segments(delta: str) -> None:
-            nonlocal answer_started, pending_segment
-            pending_segment += delta
-            while True:
-                boundary = self._segment_boundary(pending_segment)
-                if boundary is None:
-                    return
-                segment = pending_segment[:boundary].strip()
-                pending_segment = pending_segment[boundary:].lstrip()
-                if not segment:
-                    continue
-                if not answer_started:
-                    stop_processing_feedback()
-                    self.runtime.begin_answering()
-                    self._emit_status(force=True)
-                    answer_started = True
-                spoken_segments.put(segment)
+            speech_output.submit_text_delta(delta)
+
+        def queue_lane_segments(delta: SpeechLaneDelta) -> None:
+            speech_output.submit_lane_delta(delta)
+
+        def mark_answering_started() -> None:
+            nonlocal answer_started
+            if answer_started:
+                return
+            stop_processing_feedback()
+            self.runtime.begin_answering()
+            self._emit_status(force=True)
+            answer_started = True
+
+        def mark_first_audio() -> None:
+            if first_audio_at[0] is None:
+                first_audio_at[0] = time.monotonic()
+
+        speech_output = InterruptibleSpeechOutput(
+            tts_provider=self.tts_provider,
+            player=self.player,
+            chunk_size=max(512, int(self.config.openai_tts_stream_chunk_size)),
+            segment_boundary=self._segment_boundary,
+            on_speaking_started=mark_answering_started,
+            on_first_audio=mark_first_audio,
+            on_preempt=lambda: self.emit("tts_lane_preempted=true"),
+            playback_lock=self._audio_lock,
+        )
 
         llm_started = time.monotonic()
+        first_word_reply: FirstWordReply | None = None
+        first_word_source = "none"
         try:
             if isinstance(self.streaming_turn_loop, DualLaneToolLoop):
                 turn_instructions = None
@@ -595,16 +853,60 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                     )
                 )
             if isinstance(self.streaming_turn_loop, DualLaneToolLoop):
-                prefetched_decision = self._consume_speculative_supervisor_decision(transcript)
-                response = self.streaming_turn_loop.run(
-                    transcript,
-                    conversation=self.runtime.tool_provider_conversation_context(),
-                    supervisor_conversation=self.runtime.supervisor_provider_conversation_context(),
-                    prefetched_decision=prefetched_decision,
-                    instructions=turn_instructions,
-                    allow_web_search=False,
-                    on_text_delta=queue_ready_segments,
-                )
+                response_holder: dict[str, object] = {}
+                final_error: list[Exception] = []
+                final_done = Event()
+
+                def _final_worker() -> None:
+                    try:
+                        response_holder["response"] = self._run_dual_lane_final_response(
+                            transcript,
+                            turn_instructions=turn_instructions,
+                        )
+                    except Exception as exc:
+                        final_error.append(exc)
+                    finally:
+                        final_done.set()
+
+                final_worker = Thread(target=_final_worker, daemon=True)
+                final_worker.start()
+
+                first_word_reply = self._consume_speculative_first_word(transcript)
+                if first_word_reply is not None:
+                    first_word_source = "prefetched"
+                else:
+                    first_word_reply = self._generate_first_word_reply(transcript)
+                    if first_word_reply is not None:
+                        first_word_source = "sync"
+                if first_word_reply is not None:
+                    self.emit(f"first_word_mode={first_word_reply.mode}")
+                    self.emit(f"first_word_source={first_word_source}")
+                    queue_lane_segments(
+                        SpeechLaneDelta(
+                            text=first_word_reply.spoken_text,
+                            lane="direct" if first_word_reply.mode == "direct" else "filler",
+                            replace_current=False,
+                        )
+                    )
+
+                final_done.wait()
+                if final_error:
+                    raise final_error[0]
+                response = response_holder["response"]
+                response_text = str(getattr(response, "text", "") or "").strip()
+                first_word_text = first_word_reply.spoken_text if first_word_reply is not None else ""
+                if response_text and (
+                    not first_word_text
+                    or _normalize_turn_text(response_text) != _normalize_turn_text(first_word_text)
+                ):
+                    queue_lane_segments(
+                        SpeechLaneDelta(
+                            text=response_text,
+                            lane="final" if first_word_text else "direct",
+                            replace_current=bool(first_word_text),
+                            atomic=True,
+                        )
+                    )
             else:
                 response = self.streaming_turn_loop.run(
                     transcript,
@@ -621,20 +923,21 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 self._emit_status(force=True)
                 answer_started = True
             answer = self.runtime.finalize_agent_turn(response.text)
-            if pending_segment.strip():
-                if not answer_started:
-                    stop_processing_feedback()
-                    self.runtime.begin_answering()
-                    self._emit_status(force=True)
-                    answer_started = True
-                spoken_segments.put(pending_segment.strip())
+            speech_output.flush()
         finally:
-            spoken_segments.put(None)
+            try:
+                close_timeout_s = max(
+                    0.1,
+                    float(getattr(self.config, "tts_worker_join_timeout_s", 30.0)),
+                )
+            except (TypeError, ValueError):
+                close_timeout_s = 30.0
+            speech_output.close(
+                timeout_s=close_timeout_s,
+            )
             stop_processing_feedback()
 
-        worker.join()
-        if tts_error:
-            raise tts_error[0]
+        speech_output.raise_if_error()
         if not answer_started:
             stop_processing_feedback()
             self.runtime.begin_answering()

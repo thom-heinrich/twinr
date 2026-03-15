@@ -51,9 +51,14 @@ class TwinrRuntimeSnapshotMixin:
             self.last_response = self._coerce_optional_text(self._snapshot_get(snapshot, "last_response"))
             self.user_voice_status = self._coerce_optional_text(self._snapshot_get(snapshot, "user_voice_status"))
             self.user_voice_confidence = self._coerce_optional_float(self._snapshot_get(snapshot, "user_voice_confidence"))
-            self.user_voice_checked_at = self._parse_optional_snapshot_timestamp(
+            restored_voice_checked_at = self._parse_optional_snapshot_timestamp(
                 self._snapshot_get(snapshot, "user_voice_checked_at")
-            )  # AUDIT-FIX(#3): Restore voice-check timestamps as datetimes, not raw strings.
+            )
+            self.user_voice_checked_at = (
+                restored_voice_checked_at.isoformat().replace("+00:00", "Z")
+                if restored_voice_checked_at is not None
+                else None
+            )  # AUDIT-FIX(#3): Runtime context expects canonical UTC strings, not datetime objects.
 
             legacy_turns = self._restore_legacy_turns(self._snapshot_get(snapshot, "memory_turns", ()))
             raw_tail = self._restore_raw_tail(self._snapshot_get(snapshot, "memory_raw_tail", ()))

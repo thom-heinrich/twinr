@@ -91,9 +91,23 @@ class StubReflectionProgram:
         return {"midterm_packets": []}
 
 
+class _FakeRemoteState:
+    def __init__(self) -> None:
+        self.enabled = True
+        self.snapshots: dict[str, dict[str, object]] = {}
+
+    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+        del local_path
+        payload = self.snapshots.get(snapshot_kind)
+        return dict(payload) if isinstance(payload, dict) else None
+
+    def save_snapshot(self, *, snapshot_kind: str, payload):
+        self.snapshots[snapshot_kind] = dict(payload)
+
+
 class LongTermMidtermTests(unittest.TestCase):
     def test_midterm_schema_is_openai_strict_compatible(self) -> None:
-        schema = _midterm_reflection_schema()
+        schema = _midterm_reflection_schema(max_packets=3)
         packet_schema = schema["properties"]["midterm_packets"]["items"]
         properties = packet_schema["properties"]
         required = packet_schema["required"]
@@ -184,7 +198,23 @@ class LongTermMidtermTests(unittest.TestCase):
             math_packets = store.select_relevant_packets("What is 27 times 14?", limit=2)
 
         self.assertEqual([item.packet_id for item in janina_packets], ["midterm:janina_today"])
-        self.assertEqual(math_packets, ())
+        self.assertEqual([item.packet_id for item in math_packets], ["midterm:janina_today", "midterm:tea_shopping"])
+
+    def test_ensure_remote_snapshot_seeds_empty_midterm_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            created = store.ensure_remote_snapshot()
+
+        self.assertTrue(created)
+        self.assertEqual(
+            remote_state.snapshots["midterm"],
+            {"schema": "twinr_memory_midterm_store", "version": 1, "packets": []},
+        )
 
     def test_retriever_includes_midterm_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

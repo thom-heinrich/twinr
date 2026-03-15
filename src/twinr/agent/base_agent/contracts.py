@@ -112,6 +112,26 @@ class SupervisorDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class FirstWordReply:
+    mode: str
+    spoken_text: str
+    response_id: str | None = None
+    request_id: str | None = None
+    model: str | None = None
+    token_usage: object | None = None
+
+    def __post_init__(self) -> None:
+        normalized_mode = self.mode.strip().lower()
+        if normalized_mode not in {"direct", "filler"}:
+            raise ValueError(f"Unsupported first-word mode: {self.mode}")
+        text = str(self.spoken_text or "").strip()
+        if not text:
+            raise ValueError("FirstWordReply.spoken_text must not be empty")
+        object.__setattr__(self, "mode", normalized_mode)
+        object.__setattr__(self, "spoken_text", text)
+
+
+@dataclass(frozen=True, slots=True)
 class StreamingTranscriptionResult:
     transcript: str
     request_id: str | None = None
@@ -307,6 +327,18 @@ class SupervisorDecisionProvider(ConfigurableProvider, Protocol):
         conversation: ConversationLike | None = None,
         instructions: str | None = None,
     ) -> SupervisorDecision:
+        ...
+
+
+@runtime_checkable
+class FirstWordProvider(ConfigurableProvider, Protocol):
+    def reply(
+        self,
+        prompt: str,
+        *,
+        conversation: ConversationLike | None = None,
+        instructions: str | None = None,
+    ) -> FirstWordReply:
         ...
 
 

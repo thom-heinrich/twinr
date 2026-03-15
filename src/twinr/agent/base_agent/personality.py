@@ -6,6 +6,7 @@ import stat  # AUDIT-FIX(#3): Reject non-regular files during reads.
 from collections.abc import Callable  # AUDIT-FIX(#4): Type external renderers used for guarded loads.
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 
 from twinr.automations import AutomationStore
 from twinr.agent.base_agent.config import TwinrConfig
@@ -21,6 +22,8 @@ _SECTION_FILES = (
     ("PERSONALITY", "PERSONALITY.md"),
     ("USER", "USER.md"),
 )
+_REMOTE_CONTEXT_WARNING_LOCK = Lock()
+_REMOTE_CONTEXT_WARNINGS: set[str] = set()
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,12 +140,15 @@ def _render_managed_static_section(
         remote_snapshot_kind=snapshot_kind,
     )
     try:
-        return store.render_context()
-    except LongTermRemoteUnavailableError:
+        rendered = store.render_context()
+    except LongTermRemoteUnavailableError as exc:
+        _warn_remote_context_once(path=path, snapshot_kind=snapshot_kind, exc=exc)
         raise
     except Exception:
         _LOGGER.exception("Failed to render managed context section from %s", path)
         return None
+    _clear_remote_context_warning(path=path, snapshot_kind=snapshot_kind)
+    return rendered
 
 
 def load_personality_instructions(config: TwinrConfig) -> str | None:
@@ -178,6 +184,13 @@ def load_turn_controller_instructions(config: TwinrConfig) -> str | None:
     return merge_instructions(
         load_tool_loop_instructions(config),
         load_named_instruction_file(config, config.turn_controller_instructions_file),
+    )
+
+
+def load_conversation_closure_instructions(config: TwinrConfig) -> str | None:
+    return merge_instructions(
+        load_tool_loop_instructions(config),
+        load_named_instruction_file(config, config.conversation_closure_instructions_file),
     )
 
 
@@ -332,12 +345,55 @@ def _read_text_relative_no_symlink(base_dir: Path, filename: str) -> str:
 def _safe_render_context(section_title: str, renderer: Callable[[], str | None]) -> str | None:
     try:
         rendered = renderer()
+    except LongTermRemoteUnavailableError as exc:
+        warning_key = f"dynamic:{section_title}"
+        if _mark_remote_context_warning(warning_key):
+            _LOGGER.warning(
+                "Unable to render %s context because required remote long-term memory is unavailable: %s",
+                section_title,
+                exc,
+            )
+        raise
     except Exception:
         _LOGGER.exception(
             "Unable to render %s context; continuing without it.",
             section_title,
         )
         return None
+    _clear_remote_context_warning_key(f"dynamic:{section_title}")
 
     normalized = (rendered or "").strip()
     return normalized or None
+
+
+def _warn_remote_context_once(
+    *,
+    path: Path,
+    snapshot_kind: str,
+    exc: Exception,
+) -> None:
+    warning_key = f"static:{snapshot_kind}:{path}"
+    if _mark_remote_context_warning(warning_key):
+        _LOGGER.warning(
+            "Unable to read required remote long-term snapshot %r for %s; failing closed: %s",
+            snapshot_kind,
+            path,
+            exc,
+        )
+
+
+def _mark_remote_context_warning(key: str) -> bool:
+    with _REMOTE_CONTEXT_WARNING_LOCK:
+        if key in _REMOTE_CONTEXT_WARNINGS:
+            return False
+        _REMOTE_CONTEXT_WARNINGS.add(key)
+        return True
+
+
+def _clear_remote_context_warning(*, path: Path, snapshot_kind: str) -> None:
+    _clear_remote_context_warning_key(f"static:{snapshot_kind}:{path}")
+
+
+def _clear_remote_context_warning_key(key: str) -> None:
+    with _REMOTE_CONTEXT_WARNING_LOCK:
+        _REMOTE_CONTEXT_WARNINGS.discard(key)

@@ -1,10 +1,17 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+import contextlib
+import hashlib
 import json
+import logging
+import os
 from pathlib import Path
-from typing import Mapping
+import tempfile
+import threading
+from typing import Iterable, Iterator, Mapping
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.client import chonkydb_data_path
@@ -19,9 +26,46 @@ from twinr.memory.longterm.remote_state import LongTermRemoteStateStore
 from twinr.temporal import parse_local_date_text
 from twinr.text_utils import collapse_whitespace, is_valid_stable_identifier, retrieval_terms, slugify_identifier
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Linux/RPi provides fcntl, but keep the module import-safe.
+    fcntl = None  # type: ignore[assignment]
 
-def _normalize_text(value: str, *, limit: int) -> str:
-    text = collapse_whitespace(value)
+
+logger = logging.getLogger(__name__)
+
+_CONTACT_METHOD_QUERY_TOKENS = frozenset(
+    {
+        "anrufen",
+        "call",
+        "contact",
+        "dial",
+        "email",
+        "mail",
+        "message",
+        "nachricht",
+        "nummer",
+        "number",
+        "phone",
+        "reach",
+        "rufen",
+        "sms",
+        "telefon",
+        "text",
+        "write",
+    }
+)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_text(value: object, *, limit: int) -> str:
+    # AUDIT-FIX(#9): Normalize non-string inputs defensively so malformed upstream payloads do not explode user flows.
+    if limit <= 0:
+        return ""
+    text = collapse_whitespace(str(value or ""))
     if not text:
         return ""
     if len(text) <= limit:
@@ -33,21 +77,33 @@ def _slugify(value: str, *, fallback: str) -> str:
     return slugify_identifier(value, fallback=fallback)
 
 
-def _tokenize(value: str) -> tuple[str, ...]:
-    return retrieval_terms(value)
+def _tokenize(value: object) -> tuple[str, ...]:
+    return retrieval_terms(str(value or ""))
 
 
-def _canonical_phone(value: str) -> str:
-    digits = "".join(ch for ch in str(value or "") if ch.isdigit() or ch == "+")
-    return digits
+def _canonical_phone(value: object) -> str:
+    # AUDIT-FIX(#3): Canonicalize phones deterministically so matching uses a stable representation.
+    raw = str(value or "").strip()
+    has_leading_plus = raw.startswith("+")
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return ""
+    return f"+{digits}" if has_leading_plus else digits
 
 
-def _canonical_email(value: str) -> str:
+def _canonical_email(value: object) -> str:
     return str(value or "").strip().lower()
 
 
 def _infer_day_key(when_text: str | None, *, timezone_name: str) -> str | None:
-    resolved = parse_local_date_text(when_text, timezone_name=timezone_name)
+    if not when_text:
+        return None
+    try:
+        resolved = parse_local_date_text(when_text, timezone_name=timezone_name)
+    except Exception:
+        # AUDIT-FIX(#7): Bad date text must degrade gracefully instead of taking down plan persistence for senior users.
+        logger.warning("Failed to parse local date text for graph memory.", exc_info=True)
+        return None
     return resolved.isoformat() if resolved is not None else None
 
 
@@ -101,11 +157,15 @@ class TwinrPersonalGraphStore:
         timezone_name: str = "Europe/Berlin",
         remote_state: LongTermRemoteStateStore | None = None,
     ) -> None:
-        self.path = Path(path)
+        self.path = Path(path).expanduser()
         self.user_node_id = user_node_id
         self.user_label = _normalize_text(user_label, limit=80) or "Main user"
         self.timezone_name = timezone_name
         self.remote_state = remote_state
+        self._backup_path = self.path.with_name(f"{self.path.name}.bak")
+        self._lock_path = self.path.with_name(f"{self.path.name}.lock")
+        # AUDIT-FIX(#1): Protect the full read-modify-write cycle against concurrent callers in-process.
+        self._document_lock_handle = threading.RLock()
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "TwinrPersonalGraphStore":
@@ -119,17 +179,27 @@ class TwinrPersonalGraphStore:
         )
 
     def load_document(self) -> TwinrGraphDocumentV1:
-        if self.remote_state is not None and self.remote_state.enabled:
-            payload = self.remote_state.load_snapshot(snapshot_kind="graph", local_path=self.path)
-            if payload is not None:
-                return TwinrGraphDocumentV1.from_payload(payload)
+        with self._document_lock():
+            local_document = self._load_local_document_locked()
+            if local_document is not None:
+                return local_document
+            remote_document = self._load_remote_document()
+            if remote_document is not None:
+                # AUDIT-FIX(#2): Keep a local durable copy so state survives intermittent network or remote outages.
+                self._write_document_locked(remote_document)
+                return remote_document
             return self._empty_document()
-        if not self.path.exists():
-            return self._empty_document()
-        payload = json.loads(self.path.read_text(encoding="utf-8"))
-        if not isinstance(payload, Mapping):
-            raise ValueError("Personal graph file must contain a JSON object.")
-        return TwinrGraphDocumentV1.from_payload(payload)
+
+    def ensure_remote_snapshot(self) -> bool:
+        if self.remote_state is None or not self.remote_state.enabled:
+            return False
+        with self._document_lock():
+            remote_document = self._load_remote_document()
+            if remote_document is not None:
+                return False
+            document = self._load_local_document_locked() or self._empty_document()
+            self.remote_state.save_snapshot(snapshot_kind="graph", payload=document.to_payload())
+            return True
 
     def apply_candidate_edges(
         self,
@@ -137,28 +207,33 @@ class TwinrPersonalGraphStore:
     ) -> None:
         if not graph_edges:
             return
-        document = self.load_document()
-        nodes = {node.node_id: node for node in document.nodes}
-        edges = list(document.edges)
-        self._ensure_user_node(nodes)
-        for candidate in graph_edges:
-            source_node_id = self._find_or_create_graph_ref_node(nodes, candidate.source_ref)
-            target_node_id = self._find_or_create_graph_ref_node(nodes, candidate.target_ref)
-            edges = self._upsert_edge(
-                edges,
-                TwinrGraphEdgeV1(
-                    source_node_id=source_node_id,
-                    edge_type=candidate.edge_type,
-                    target_node_id=target_node_id,
-                    confidence=candidate.confidence,
-                    confirmed_by_user=candidate.confirmed_by_user,
-                    origin="longterm_turn_extraction",
-                    valid_from=candidate.valid_from,
-                    valid_to=candidate.valid_to,
-                    attributes=dict(candidate.attributes or {}),
-                ),
-            )
-        self._save_document(nodes, edges)
+        with self._document_lock():
+            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            nodes = {node.node_id: node for node in document.nodes}
+            edges = list(document.edges)
+            self._ensure_user_node(nodes)
+            for candidate in graph_edges:
+                try:
+                    source_node_id = self._find_or_create_graph_ref_node(nodes, candidate.source_ref)
+                    target_node_id = self._find_or_create_graph_ref_node(nodes, candidate.target_ref)
+                    edges = self._upsert_edge(
+                        edges,
+                        TwinrGraphEdgeV1(
+                            source_node_id=source_node_id,
+                            edge_type=candidate.edge_type,
+                            target_node_id=target_node_id,
+                            confidence=candidate.confidence,
+                            confirmed_by_user=candidate.confirmed_by_user,
+                            origin="longterm_turn_extraction",
+                            valid_from=candidate.valid_from,
+                            valid_to=candidate.valid_to,
+                            attributes=dict(candidate.attributes or {}),
+                        ),
+                    )
+                except Exception:
+                    # AUDIT-FIX(#9): Skip malformed extraction candidates instead of dropping the full memory write batch.
+                    logger.warning("Skipping invalid long-term graph edge candidate.", exc_info=True)
+            self._save_document_locked(nodes, edges, created_at=document.created_at)
 
     def remember_contact(
         self,
@@ -182,143 +257,137 @@ class TwinrPersonalGraphStore:
         if not clean_given:
             raise ValueError("given_name is required.")
 
-        document = self.load_document()
-        nodes = {node.node_id: node for node in document.nodes}
-        edges = list(document.edges)
-        self._ensure_user_node(nodes)
-        candidates = self._contact_candidates(
-            document=document,
-            given_name=clean_given,
-            family_name=clean_family,
-            role=clean_role,
-            phone=clean_phone or None,
-            email=clean_email or None,
-        )
-        if candidates:
-            unique = self._resolve_contact_candidate(
+        match_role = clean_role or clean_relation
+        with self._document_lock():
+            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            nodes = {node.node_id: node for node in document.nodes}
+            edges = list(document.edges)
+            self._ensure_user_node(nodes)
+            candidates = self._contact_candidates(
                 document=document,
-                candidates=candidates,
+                given_name=clean_given,
                 family_name=clean_family,
-                role=clean_role,
+                role=match_role,
                 phone=clean_phone or None,
                 email=clean_email or None,
             )
-            if unique is None:
-                options = self._contact_options(document, candidates)
-                return TwinrGraphWriteResult(
-                    status="needs_clarification",
-                    label=clean_given,
-                    node_id="",
-                    question=self._contact_conflict_question(clean_given, options),
-                    options=options,
+            if candidates:
+                unique = self._resolve_contact_candidate(
+                    document=document,
+                    candidates=candidates,
+                    family_name=clean_family,
+                    role=match_role,
+                    phone=clean_phone or None,
+                    email=clean_email or None,
                 )
-            person = unique
-            label = self._merge_person_label(person.label, clean_given, clean_family)
-            aliases = set(person.aliases)
-            aliases.add(person.label)
-            aliases.add(clean_given)
-            attributes = dict(person.attributes or {})
-            if clean_notes:
-                attributes["notes"] = clean_notes
-            if clean_relation:
-                attributes["relation"] = clean_relation
-            if clean_family:
-                attributes["family_name"] = clean_family
-            attributes["given_name"] = clean_given
-            nodes[person.node_id] = TwinrGraphNodeV1(
-                node_id=person.node_id,
-                node_type="person",
-                label=label,
-                aliases=tuple(sorted(alias for alias in aliases if alias.strip() and alias.strip() != label)),
-                attributes=attributes or None,
-                status=person.status,
-                graph_ref=person.graph_ref,
-            )
-            status = "updated"
-            person_node_id = person.node_id
-        else:
-            label = self._merge_person_label("", clean_given, clean_family)
-            person_node_id = self._unique_node_id(
-                node_type="person",
-                base_slug=_slugify(label, fallback=_slugify(clean_given, fallback="person")),
-                existing_ids=set(nodes),
-            )
-            attributes: dict[str, object] = {"given_name": clean_given}
-            if clean_family:
-                attributes["family_name"] = clean_family
-            if clean_relation:
-                attributes["relation"] = clean_relation
-            if clean_notes:
-                attributes["notes"] = clean_notes
-            aliases = tuple(alias for alias in {clean_given} if alias != label)
-            nodes[person_node_id] = TwinrGraphNodeV1(
-                node_id=person_node_id,
-                node_type="person",
-                label=label,
-                aliases=aliases,
-                attributes=attributes,
-            )
-            status = "created"
+                if unique is None:
+                    options = self._contact_options(document, candidates)
+                    return TwinrGraphWriteResult(
+                        status="needs_clarification",
+                        label=clean_given,
+                        node_id="",
+                        question=self._contact_conflict_question(clean_given, options),
+                        options=options,
+                    )
+                person = unique
+                label = self._merge_person_label(person.label, clean_given, clean_family)
+                aliases = set(person.aliases)
+                aliases.add(person.label)
+                aliases.add(clean_given)
+                attributes = dict(person.attributes or {})
+                if clean_notes:
+                    attributes["notes"] = clean_notes
+                if clean_relation:
+                    attributes["relation"] = clean_relation
+                if clean_family:
+                    attributes["family_name"] = clean_family
+                attributes["given_name"] = clean_given
+                nodes[person.node_id] = TwinrGraphNodeV1(
+                    node_id=person.node_id,
+                    node_type="person",
+                    label=label,
+                    aliases=tuple(sorted(alias for alias in aliases if alias.strip() and alias.strip() != label)),
+                    attributes=attributes or None,
+                    status=person.status,
+                    graph_ref=person.graph_ref,
+                )
+                status = "updated"
+                person_node_id = person.node_id
+            else:
+                label = self._merge_person_label("", clean_given, clean_family)
+                person_node_id = self._unique_node_id(
+                    node_type="person",
+                    base_slug=_slugify(label, fallback=_slugify(clean_given, fallback="person")),
+                    existing_ids=set(nodes),
+                )
+                attributes: dict[str, object] = {"given_name": clean_given}
+                if clean_family:
+                    attributes["family_name"] = clean_family
+                if clean_relation:
+                    attributes["relation"] = clean_relation
+                if clean_notes:
+                    attributes["notes"] = clean_notes
+                aliases = tuple(alias for alias in sorted({clean_given}) if alias != label)
+                nodes[person_node_id] = TwinrGraphNodeV1(
+                    node_id=person_node_id,
+                    node_type="person",
+                    label=label,
+                    aliases=aliases,
+                    attributes=attributes,
+                )
+                status = "created"
 
-        if clean_role or clean_relation:
-            edge = TwinrGraphEdgeV1(
-                source_node_id=person_node_id,
-                edge_type="social_related_to_user",
-                target_node_id=self.user_node_id,
-                confirmed_by_user=confirmed_by_user,
-                attributes={
-                    "role": clean_role or clean_relation or "known_contact",
-                    "relation": clean_relation or "",
-                },
-            )
-            edges = self._upsert_edge(edges, edge)
+            if clean_role or clean_relation:
+                edge = TwinrGraphEdgeV1(
+                    source_node_id=person_node_id,
+                    edge_type="social_related_to_user",
+                    target_node_id=self.user_node_id,
+                    confirmed_by_user=confirmed_by_user,
+                    attributes={
+                        "role": clean_role or clean_relation or "known_contact",
+                        "relation": clean_relation or "",
+                    },
+                )
+                edges = self._upsert_edge(edges, edge)
 
-        if clean_phone:
-            phone_label = phone.strip() if phone and phone.strip() else clean_phone
-            phone_node_id = self._contact_method_node_id("phone", clean_phone, set(nodes))
-            nodes.setdefault(
-                phone_node_id,
-                TwinrGraphNodeV1(
-                    node_id=phone_node_id,
+            if clean_phone:
+                phone_label = _normalize_text(phone or "", limit=80) or clean_phone
+                phone_node_id = self._ensure_contact_method_node(
+                    nodes,
                     node_type="phone",
                     label=phone_label,
-                    attributes={"canonical": clean_phone},
-                ),
-            )
-            edges = self._upsert_edge(
-                edges,
-                TwinrGraphEdgeV1(
-                    source_node_id=person_node_id,
-                    edge_type="general_has_contact_method",
-                    target_node_id=phone_node_id,
-                    confirmed_by_user=confirmed_by_user,
-                    attributes={"kind": "phone"},
-                ),
-            )
+                    canonical_value=clean_phone,
+                )
+                edges = self._upsert_edge(
+                    edges,
+                    TwinrGraphEdgeV1(
+                        source_node_id=person_node_id,
+                        edge_type="general_has_contact_method",
+                        target_node_id=phone_node_id,
+                        confirmed_by_user=confirmed_by_user,
+                        attributes={"kind": "phone"},
+                    ),
+                )
 
-        if clean_email:
-            email_node_id = self._contact_method_node_id("email", clean_email, set(nodes))
-            nodes.setdefault(
-                email_node_id,
-                TwinrGraphNodeV1(
-                    node_id=email_node_id,
+            if clean_email:
+                email_node_id = self._ensure_contact_method_node(
+                    nodes,
                     node_type="email",
                     label=clean_email,
-                    attributes={"canonical": clean_email},
-                ),
-            )
-            edges = self._upsert_edge(
-                edges,
-                TwinrGraphEdgeV1(
-                    source_node_id=person_node_id,
-                    edge_type="general_has_contact_method",
-                    target_node_id=email_node_id,
-                    confirmed_by_user=confirmed_by_user,
-                    attributes={"kind": "email"},
-                ),
-            )
+                    canonical_value=clean_email,
+                )
+                edges = self._upsert_edge(
+                    edges,
+                    TwinrGraphEdgeV1(
+                        source_node_id=person_node_id,
+                        edge_type="general_has_contact_method",
+                        target_node_id=email_node_id,
+                        confirmed_by_user=confirmed_by_user,
+                        attributes={"kind": "email"},
+                    ),
+                )
 
-        self._save_document(nodes, edges)
+            self._save_document_locked(nodes, edges, created_at=document.created_at)
         return TwinrGraphWriteResult(status=status, label=label, node_id=person_node_id, edge_type="social_related_to_user")
 
     def lookup_contact(
@@ -375,48 +444,57 @@ class TwinrPersonalGraphStore:
         clean_value = _normalize_text(value, limit=100)
         clean_product = _normalize_text(for_product or "", limit=80) or None
         clean_details = _normalize_text(details or "", limit=140) or None
+        clean_sentiment = _normalize_text(sentiment, limit=20).lower()
         if not clean_value:
             raise ValueError("value is required.")
-        document = self.load_document()
-        nodes = {node.node_id: node for node in document.nodes}
-        edges = list(document.edges)
-        self._ensure_user_node(nodes)
+        if clean_sentiment in {"avoid", "dislike"}:
+            edge_type = "user_avoids"
+            preference_mode = "avoid"
+        elif clean_sentiment in {"like", "prefer"}:
+            edge_type = "user_prefers"
+            preference_mode = "prefer"
+        else:
+            # AUDIT-FIX(#8): Reject unknown sentiment values instead of silently storing the wrong preference polarity.
+            raise ValueError("sentiment must be one of: prefer, like, dislike, avoid.")
+        with self._document_lock():
+            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            nodes = {node.node_id: node for node in document.nodes}
+            edges = list(document.edges)
+            self._ensure_user_node(nodes)
 
-        node_type = clean_category or "thing"
-        edge_type = "user_avoids" if sentiment == "dislike" else "user_prefers"
-
-        node_id = self._find_or_create_named_node(nodes, node_type=node_type, label=clean_value)
-        target = nodes[node_id]
-        attributes = dict(target.attributes or {})
-        attributes["category"] = clean_category
-        if clean_details:
-            attributes["details"] = clean_details
-        nodes[node_id] = TwinrGraphNodeV1(
-            node_id=target.node_id,
-            node_type=target.node_type,
-            label=target.label,
-            aliases=target.aliases,
-            attributes=attributes,
-            status=target.status,
-            graph_ref=target.graph_ref,
-        )
-        edge_attributes: dict[str, object] = {"category": clean_category}
-        edge_attributes["preference_mode"] = "avoid" if sentiment == "dislike" else "prefer"
-        if clean_product:
-            edge_attributes["for_product"] = clean_product
-        if clean_details:
-            edge_attributes["details"] = clean_details
-        edges = self._upsert_edge(
-            edges,
-            TwinrGraphEdgeV1(
-                source_node_id=self.user_node_id,
-                edge_type=edge_type,
-                target_node_id=node_id,
-                confirmed_by_user=confirmed_by_user,
-                attributes=edge_attributes,
-            ),
-        )
-        self._save_document(nodes, edges)
+            node_type = clean_category or "thing"
+            node_id = self._find_or_create_named_node(nodes, node_type=node_type, label=clean_value)
+            target = nodes[node_id]
+            attributes = dict(target.attributes or {})
+            attributes["category"] = clean_category
+            if clean_details:
+                attributes["details"] = clean_details
+            nodes[node_id] = TwinrGraphNodeV1(
+                node_id=target.node_id,
+                node_type=target.node_type,
+                label=target.label,
+                aliases=target.aliases,
+                attributes=attributes,
+                status=target.status,
+                graph_ref=target.graph_ref,
+            )
+            edge_attributes: dict[str, object] = {"category": clean_category}
+            edge_attributes["preference_mode"] = preference_mode
+            if clean_product:
+                edge_attributes["for_product"] = clean_product
+            if clean_details:
+                edge_attributes["details"] = clean_details
+            edges = self._upsert_edge(
+                edges,
+                TwinrGraphEdgeV1(
+                    source_node_id=self.user_node_id,
+                    edge_type=edge_type,
+                    target_node_id=node_id,
+                    confirmed_by_user=confirmed_by_user,
+                    attributes=edge_attributes,
+                ),
+            )
+            self._save_document_locked(nodes, edges, created_at=document.created_at)
         return TwinrGraphWriteResult(status="updated", label=clean_value, node_id=node_id, edge_type=edge_type)
 
     def remember_plan(
@@ -433,72 +511,73 @@ class TwinrPersonalGraphStore:
         if not clean_summary:
             raise ValueError("summary is required.")
         day_key = _infer_day_key(clean_when, timezone_name=self.timezone_name)
-        document = self.load_document()
-        nodes = {node.node_id: node for node in document.nodes}
-        edges = list(document.edges)
-        self._ensure_user_node(nodes)
+        with self._document_lock():
+            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            nodes = {node.node_id: node for node in document.nodes}
+            edges = list(document.edges)
+            self._ensure_user_node(nodes)
 
-        base_slug = _slugify(f"{clean_summary}_{day_key or clean_when or 'plan'}", fallback="plan")
-        existing_plan = self._find_plan_node(nodes.values(), summary=clean_summary, day_key=day_key, when_text=clean_when)
-        if existing_plan is None:
-            plan_node_id = self._unique_node_id("plan", base_slug=base_slug, existing_ids=set(nodes))
-            attributes: dict[str, object] = {}
-            if clean_when:
-                attributes["when_text"] = clean_when
-            if day_key:
-                attributes["day_key"] = day_key
-            if clean_details:
-                attributes["details"] = clean_details
-            nodes[plan_node_id] = TwinrGraphNodeV1(
-                node_id=plan_node_id,
-                node_type="plan",
-                label=clean_summary,
-                attributes=attributes or None,
-            )
-            status = "created"
-        else:
-            plan_node_id = existing_plan.node_id
-            attributes = dict(existing_plan.attributes or {})
-            if clean_when:
-                attributes["when_text"] = clean_when
-            if day_key:
-                attributes["day_key"] = day_key
-            if clean_details:
-                attributes["details"] = clean_details
-            nodes[plan_node_id] = TwinrGraphNodeV1(
-                node_id=existing_plan.node_id,
-                node_type=existing_plan.node_type,
-                label=clean_summary,
-                aliases=existing_plan.aliases,
-                attributes=attributes or None,
-                status=existing_plan.status,
-                graph_ref=existing_plan.graph_ref,
-            )
-            status = "updated"
+            base_slug = _slugify(f"{clean_summary}_{day_key or clean_when or 'plan'}", fallback="plan")
+            existing_plan = self._find_plan_node(nodes.values(), summary=clean_summary, day_key=day_key, when_text=clean_when)
+            if existing_plan is None:
+                plan_node_id = self._unique_node_id("plan", base_slug=base_slug, existing_ids=set(nodes))
+                attributes: dict[str, object] = {}
+                if clean_when:
+                    attributes["when_text"] = clean_when
+                if day_key:
+                    attributes["day_key"] = day_key
+                if clean_details:
+                    attributes["details"] = clean_details
+                nodes[plan_node_id] = TwinrGraphNodeV1(
+                    node_id=plan_node_id,
+                    node_type="plan",
+                    label=clean_summary,
+                    attributes=attributes or None,
+                )
+                status = "created"
+            else:
+                plan_node_id = existing_plan.node_id
+                attributes = dict(existing_plan.attributes or {})
+                if clean_when:
+                    attributes["when_text"] = clean_when
+                if day_key:
+                    attributes["day_key"] = day_key
+                if clean_details:
+                    attributes["details"] = clean_details
+                nodes[plan_node_id] = TwinrGraphNodeV1(
+                    node_id=existing_plan.node_id,
+                    node_type=existing_plan.node_type,
+                    label=clean_summary,
+                    aliases=existing_plan.aliases,
+                    attributes=attributes or None,
+                    status=existing_plan.status,
+                    graph_ref=existing_plan.graph_ref,
+                )
+                status = "updated"
 
-        edges = self._upsert_edge(
-            edges,
-            TwinrGraphEdgeV1(
-                source_node_id=self.user_node_id,
-                edge_type="user_plans",
-                target_node_id=plan_node_id,
-                confirmed_by_user=confirmed_by_user,
-                attributes={"when_text": clean_when or "", "day_key": day_key or ""},
-            ),
-        )
-        if day_key:
-            day_node_id = self._find_or_create_named_node(nodes, node_type="day", label=day_key)
             edges = self._upsert_edge(
                 edges,
                 TwinrGraphEdgeV1(
-                    source_node_id=plan_node_id,
-                    edge_type="temporal_occurs_on",
-                    target_node_id=day_node_id,
+                    source_node_id=self.user_node_id,
+                    edge_type="user_plans",
+                    target_node_id=plan_node_id,
                     confirmed_by_user=confirmed_by_user,
+                    attributes={"when_text": clean_when or "", "day_key": day_key or ""},
                 ),
             )
+            if day_key:
+                day_node_id = self._find_or_create_named_node(nodes, node_type="day", label=day_key)
+                edges = self._upsert_edge(
+                    edges,
+                    TwinrGraphEdgeV1(
+                        source_node_id=plan_node_id,
+                        edge_type="temporal_occurs_on",
+                        target_node_id=day_node_id,
+                        confirmed_by_user=confirmed_by_user,
+                    ),
+                )
 
-        self._save_document(nodes, edges)
+            self._save_document_locked(nodes, edges, created_at=document.created_at)
         return TwinrGraphWriteResult(status=status, label=clean_summary, node_id=plan_node_id, edge_type="user_plans")
 
     def build_prompt_context(
@@ -507,9 +586,18 @@ class TwinrPersonalGraphStore:
         *,
         include_contact_methods: bool = True,
     ) -> str | None:
-        document = self.load_document()
+        try:
+            document = self.load_document()
+        except Exception:
+            logger.warning("Failed to load graph memory prompt context.", exc_info=True)
+            return None
         contacts = self._rank_contact_prompt_items(
-            self._prompt_contacts(document, limit=128, include_contact_methods=include_contact_methods),
+            self._prompt_contacts(
+                document,
+                limit=128,
+                # AUDIT-FIX(#6): Only expose phone numbers and email addresses to the model when the query clearly asks for contact details.
+                include_contact_methods=include_contact_methods and self._query_requests_contact_methods(query_text),
+            ),
             query_text=query_text,
         )
         preferences = self._rank_preference_prompt_items(
@@ -542,7 +630,11 @@ class TwinrPersonalGraphStore:
         clean_query = _normalize_text(query_text or "", limit=220)
         if not clean_query:
             return None
-        document = self.load_document()
+        try:
+            document = self.load_document()
+        except Exception:
+            logger.warning("Failed to load graph memory subtext payload.", exc_info=True)
+            return None
         preference_items = self._rank_preference_prompt_items(
             self._prompt_preferences(document, limit=128),
             query_text=clean_query,
@@ -556,7 +648,7 @@ class TwinrPersonalGraphStore:
             fallback_limit=0,
         )
         contact_items = self._rank_contact_prompt_items(
-            self._prompt_contacts(document, limit=128),
+            self._prompt_contacts(document, limit=128, include_contact_methods=False),
             query_text=clean_query,
             limit=3,
             fallback_limit=0,
@@ -631,33 +723,42 @@ class TwinrPersonalGraphStore:
         clean_query = _normalize_text(query_text or "", limit=220)
         if not clean_query:
             return items[:limit]
-        selector = FullTextSelector(
-            tuple(
-                FullTextDocument(
-                    doc_id=str(index),
-                    category="prompt_item",
-                    content=self._prompt_item_search_text(item),
+        try:
+            selector = FullTextSelector(
+                tuple(
+                    FullTextDocument(
+                        doc_id=str(index),
+                        category="prompt_item",
+                        content=self._prompt_item_search_text(item),
+                    )
+                    for index, item in enumerate(items)
                 )
-                for index, item in enumerate(items)
             )
-        )
-        selected_ids = selector.search(
-            clean_query,
-            limit=limit,
-            category="prompt_item",
-            allow_fallback=fallback_limit > 0,
-        )
+            selected_ids = selector.search(
+                clean_query,
+                limit=limit,
+                category="prompt_item",
+                allow_fallback=fallback_limit > 0,
+            )
+        except Exception:
+            # AUDIT-FIX(#9): Prompt ranking is optional memory enrichment and must never crash the turn.
+            logger.warning("Prompt item ranking failed; using deterministic fallback order.", exc_info=True)
+            if fallback_limit <= 0:
+                return []
+            return items[: min(limit, fallback_limit)]
         if not selected_ids:
             if fallback_limit <= 0:
                 return []
             return items[:fallback_limit]
         selected: list[dict[str, object]] = []
+        seen_indices: set[int] = set()
         for item_id in selected_ids:
-            if not item_id.isdigit():
+            if not str(item_id).isdigit():
                 continue
             index = int(item_id)
-            if 0 <= index < len(items):
+            if 0 <= index < len(items) and index not in seen_indices:
                 selected.append(items[index])
+                seen_indices.add(index)
         return selected
 
     def _subtext_preferences(self, items: list[dict[str, object]]) -> list[dict[str, str]]:
@@ -763,7 +864,7 @@ class TwinrPersonalGraphStore:
     ) -> list[dict[str, object]]:
         contacts: list[dict[str, object]] = []
         for person in sorted(self._all_contact_nodes(document), key=lambda item: item.label.lower()):
-            methods = self._contact_methods(document, person.node_id)
+            methods = self._contact_methods(document, person.node_id, canonical=False)
             role_info = self._contact_role_info(document, person.node_id)
             item: dict[str, object] = {
                 "name": person.label,
@@ -853,7 +954,7 @@ class TwinrPersonalGraphStore:
 
     def _empty_document(self) -> TwinrGraphDocumentV1:
         user = TwinrGraphNodeV1(node_id=self.user_node_id, node_type="user", label=self.user_label)
-        now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+        now = _utc_now_iso()  # AUDIT-FIX(#7): Emit timezone-aware UTC timestamps instead of naive datetimes with a manual suffix.
         return TwinrGraphDocumentV1(
             subject_node_id=self.user_node_id,
             graph_id="graph:user_main",
@@ -864,25 +965,19 @@ class TwinrPersonalGraphStore:
             metadata={"kind": "personal_graph"},
         )
 
-    def _save_document(self, nodes: Mapping[str, TwinrGraphNodeV1], edges: list[TwinrGraphEdgeV1]) -> None:
-        existing = self.load_document()
-        created_at = existing.created_at
-        updated_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-        document = TwinrGraphDocumentV1(
-            subject_node_id=self.user_node_id,
-            graph_id="graph:user_main",
-            created_at=created_at,
-            updated_at=updated_at,
-            nodes=tuple(nodes.values()),
-            edges=tuple(edges),
-            metadata={"kind": "personal_graph"},
-        )
-        payload = document.to_payload()
-        if self.remote_state is not None and self.remote_state.enabled:
-            self.remote_state.save_snapshot(snapshot_kind="graph", payload=payload)
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    def _save_document(
+        self,
+        nodes: Mapping[str, TwinrGraphNodeV1],
+        edges: list[TwinrGraphEdgeV1],
+        *,
+        created_at: str | None = None,
+    ) -> None:
+        with self._document_lock():
+            # AUDIT-FIX(#1): Keep the public save path safe even if a new caller invokes it directly.
+            effective_created_at = created_at or (
+                self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            ).created_at
+            self._save_document_locked(nodes, edges, created_at=effective_created_at)
 
     def _ensure_user_node(self, nodes: dict[str, TwinrGraphNodeV1]) -> None:
         if self.user_node_id not in nodes:
@@ -905,18 +1000,32 @@ class TwinrPersonalGraphStore:
         full_label = self._merge_person_label("", given_name, family_name)
         given_tokens = set(_tokenize(given_name))
         family_tokens = set(_tokenize(family_name or ""))
+        requested_role = (role or "").strip().lower()
         ranked: list[tuple[int, TwinrGraphNodeV1]] = []
         for node in document.nodes:
             if node.node_type != "person":
                 continue
             stored_family = _normalize_text(str((node.attributes or {}).get("family_name", "")), limit=80) or None
-            if family_name and stored_family and stored_family.lower() != family_name.lower():
-                continue
-            score = 0
             labels = {node.label, *node.aliases}
-            label_tokens = set()
+            label_tokens: set[str] = set()
             for label in labels:
                 label_tokens.update(_tokenize(label))
+            option = self._contact_option(document, node)
+            exact_contact_match = bool(
+                (phone and phone in option.phones)
+                or (email and email in option.emails)
+            )
+            if family_name:
+                family_matches = bool(
+                    exact_contact_match
+                    or
+                    (stored_family and stored_family.lower() == family_name.lower())
+                    or (family_tokens and family_tokens <= label_tokens)
+                )
+                if not family_matches:
+                    # AUDIT-FIX(#4): Do not merge a partially specified person into a same-first-name contact when the family name does not match.
+                    continue
+            score = 0
             if full_label and full_label.lower() == node.label.lower():
                 score += 8
             if given_tokens and given_tokens <= label_tokens:
@@ -924,11 +1033,11 @@ class TwinrPersonalGraphStore:
             if family_tokens and family_tokens <= label_tokens:
                 score += 3
             role_detail = (self._contact_role(document, node.node_id) or "").lower()
-            if role and role_detail and role.lower() not in role_detail:
+            if requested_role and requested_role not in role_detail and not exact_contact_match and role_detail:
+                # AUDIT-FIX(#4): A requested role is a disambiguator, not a soft preference.
                 continue
-            if role and role.lower() and role.lower() in role_detail:
+            if requested_role:
                 score += 4
-            option = self._contact_option(document, node)
             if phone and phone in option.phones:
                 score += 5
             if email and email in option.emails:
@@ -952,10 +1061,28 @@ class TwinrPersonalGraphStore:
             return None
         if len(candidates) == 1:
             option = self._contact_option(document, candidates[0])
-            if not any((family_name, role)) and (option.phones or option.emails or option.role):
-                if (phone and phone not in option.phones) or (email and email not in option.emails):
+            candidate = candidates[0]
+            exact_contact_match = bool(
+                (phone and phone in option.phones)
+                or (email and email in option.emails)
+            )
+            if family_name:
+                stored_family = _normalize_text(str((candidate.attributes or {}).get("family_name", "")), limit=80).lower()
+                family_tokens = set(_tokenize(family_name))
+                label_tokens = set(_tokenize(candidate.label))
+                if not (
+                    exact_contact_match
+                    or (stored_family and stored_family == family_name.lower())
+                    or (family_tokens and family_tokens <= label_tokens)
+                ):
                     return None
-            return candidates[0]
+            if role and option.role and role.lower() not in option.role.lower():
+                return None
+            if (phone and option.phones and phone not in option.phones) or (
+                email and option.emails and email not in option.emails
+            ):
+                return None
+            return candidate
         if family_name or role or phone or email:
             first = candidates[0]
             second = candidates[1]
@@ -1000,13 +1127,13 @@ class TwinrPersonalGraphStore:
         return [node for node in document.nodes if node.node_type == "person"]
 
     def _contact_option(self, document: TwinrGraphDocumentV1, person: TwinrGraphNodeV1) -> TwinrGraphContactOption:
-        methods = self._contact_methods(document, person.node_id)
+        methods = self._contact_methods(document, person.node_id, canonical=True)
         return TwinrGraphContactOption(
             person_node_id=person.node_id,
             label=person.label,
             role=self._contact_role(document, person.node_id),
-            phones=tuple(method for kind, method in methods if kind == "phone"),
-            emails=tuple(method for kind, method in methods if kind == "email"),
+            phones=tuple(sorted(method for kind, method in methods if kind == "phone")),
+            emails=tuple(sorted(method for kind, method in methods if kind == "email")),
         )
 
     def _contact_role(self, document: TwinrGraphDocumentV1, person_node_id: str) -> str | None:
@@ -1031,8 +1158,15 @@ class TwinrPersonalGraphStore:
             }
         return {"role": None, "relation": None}
 
-    def _contact_methods(self, document: TwinrGraphDocumentV1, person_node_id: str) -> tuple[tuple[str, str], ...]:
+    def _contact_methods(
+        self,
+        document: TwinrGraphDocumentV1,
+        person_node_id: str,
+        *,
+        canonical: bool = False,
+    ) -> tuple[tuple[str, str], ...]:
         methods: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
         for edge in document.edges:
             if edge.source_node_id != person_node_id or edge.edge_type != "general_has_contact_method":
                 continue
@@ -1040,23 +1174,38 @@ class TwinrPersonalGraphStore:
             if target is None:
                 continue
             kind = str((edge.attributes or {}).get("kind", target.node_type or "")).strip() or target.node_type
-            methods.append((kind, target.label))
-        return tuple(methods)
+            if canonical:
+                value = _normalize_text(str((target.attributes or {}).get("canonical", target.label)), limit=320)
+                if kind == "phone":
+                    value = _canonical_phone(value)
+                elif kind == "email":
+                    value = _canonical_email(value)
+            else:
+                value = _normalize_text(target.label, limit=160)
+            if not value:
+                continue
+            item = (kind, value)
+            if item in seen:
+                continue
+            seen.add(item)
+            methods.append(item)
+        return tuple(sorted(methods))
 
     def _contact_conflict_question(self, name: str, options: tuple[TwinrGraphContactOption, ...]) -> str:
-        labels = []
+        labels: list[str] = []
         for option in options[:3]:
             if option.detail:
                 labels.append(f"{option.label} ({option.detail})")
             else:
                 labels.append(option.label)
+        # AUDIT-FIX(#10): Keep clarification prompts plain and concrete for senior users.
         if not labels:
-            return f"I know multiple entries for {name}. Which one do you mean?"
+            return f"I know more than one person named {name}. Which one do you mean?"
         if len(labels) == 1:
-            return f"Do you mean {labels[0]}?"
+            return f"Did you mean {labels[0]}?"
         if len(labels) == 2:
-            return f"I know two contacts named {name}: {labels[0]} or {labels[1]}?"
-        return f"I know multiple contacts named {name}: {', '.join(labels[:-1])}, or {labels[-1]}?"
+            return f"I know two people named {name}: {labels[0]} or {labels[1]}?"
+        return f"I know more than one person named {name}: {', '.join(labels[:-1])}, or {labels[-1]}?"
 
     def _node_by_id(self, document: TwinrGraphDocumentV1, node_id: str) -> TwinrGraphNodeV1 | None:
         for node in document.nodes:
@@ -1174,7 +1323,7 @@ class TwinrPersonalGraphStore:
         nodes: dict[str, TwinrGraphNodeV1],
         graph_ref: str,
     ) -> str:
-        normalized_ref = collapse_whitespace(graph_ref).strip()
+        normalized_ref = collapse_whitespace(str(graph_ref or "")).strip()
         if not normalized_ref:
             raise ValueError("graph_ref is required.")
         if normalized_ref == self.user_node_id:
@@ -1183,28 +1332,37 @@ class TwinrPersonalGraphStore:
         for node in nodes.values():
             if node.graph_ref == normalized_ref or node.node_id == normalized_ref:
                 return node.node_id
-        node_type, _, raw_stable_id = normalized_ref.partition(":")
-        clean_node_type = node_type.strip().lower() or "thing"
+        raw_node_type, _, raw_stable_id = normalized_ref.partition(":")
+        clean_node_type = _slugify(raw_node_type.strip().lower(), fallback="thing")
         stable_candidate = raw_stable_id.strip().lower()
         if stable_candidate and is_valid_stable_identifier(stable_candidate):
             stable_id = stable_candidate
         else:
             stable_id = _slugify(stable_candidate or raw_stable_id or clean_node_type, fallback=clean_node_type)
-        node_id = f"{clean_node_type}:{stable_id}"
-        if node_id in nodes:
-            return node_id
+        candidate_node_id = f"{clean_node_type}:{stable_id}"
+        if candidate_node_id in nodes:
+            existing = nodes[candidate_node_id]
+            if existing.graph_ref == normalized_ref:
+                return candidate_node_id
+            digest = hashlib.sha1(normalized_ref.encode("utf-8")).hexdigest()[:8]
+            # AUDIT-FIX(#5): Avoid merging distinct graph refs that happen to slug to the same node id.
+            candidate_node_id = self._unique_node_id(
+                clean_node_type,
+                base_slug=f"{stable_id}_{digest}",
+                existing_ids=set(nodes),
+            )
         label = raw_stable_id.strip().replace("_", " ") or stable_id
-        nodes[node_id] = TwinrGraphNodeV1(
-            node_id=node_id,
+        nodes[candidate_node_id] = TwinrGraphNodeV1(
+            node_id=candidate_node_id,
             node_type=clean_node_type,
             label=label,
             graph_ref=normalized_ref,
         )
-        return node_id
+        return candidate_node_id
 
     def _find_plan_node(
         self,
-        nodes,
+        nodes: Iterable[TwinrGraphNodeV1],
         *,
         summary: str,
         day_key: str | None,
@@ -1234,7 +1392,9 @@ class TwinrPersonalGraphStore:
         candidate = f"{node_type}:{base_slug}"
         if candidate not in existing_ids:
             return candidate
-        return candidate
+        digest = hashlib.sha1(f"{node_type}:{canonical_value}".encode("utf-8")).hexdigest()[:8]
+        # AUDIT-FIX(#5): Disambiguate slug collisions instead of forcing unrelated methods onto one node id.
+        return self._unique_node_id(node_type, base_slug=f"{base_slug}_{digest}", existing_ids=existing_ids)
 
     def _upsert_edge(self, edges: list[TwinrGraphEdgeV1], new_edge: TwinrGraphEdgeV1) -> list[TwinrGraphEdgeV1]:
         for index, edge in enumerate(edges):
@@ -1264,3 +1424,184 @@ class TwinrPersonalGraphStore:
         if edge_type == "user_engages_with":
             return "engagement"
         return "preference"
+
+    @contextlib.contextmanager
+    def _document_lock(self) -> Iterator[None]:
+        with self._document_lock_handle:
+            if fcntl is None:
+                yield
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._lock_path, "a+b") as lock_handle:
+                # AUDIT-FIX(#1): Add an advisory file lock so multiple worker threads/processes cannot interleave writes.
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    def _load_local_document_locked(self) -> TwinrGraphDocumentV1 | None:
+        for candidate_path in (self.path, self._backup_path):
+            payload = self._read_json_file_locked(candidate_path)
+            if payload is None:
+                continue
+            document = self._document_from_payload(payload, source=str(candidate_path))
+            if document is not None:
+                return document
+        return None
+
+    def _load_remote_document(self) -> TwinrGraphDocumentV1 | None:
+        if self.remote_state is None or not self.remote_state.enabled:
+            return None
+        try:
+            payload = self.remote_state.load_snapshot(snapshot_kind="graph", local_path=self.path)
+        except LongTermRemoteUnavailableError:
+            if self.remote_state.required:
+                raise
+            logger.warning("Failed to load remote graph snapshot; continuing with local-only state.", exc_info=True)
+            return None
+        except Exception:
+            # AUDIT-FIX(#2): Remote state is optional; network failures must not break local graph memory.
+            logger.warning("Failed to load remote graph snapshot; continuing with local-only state.", exc_info=True)
+            return None
+        return self._document_from_payload(payload, source="remote_graph_snapshot")
+
+    def _document_from_payload(self, payload: object, *, source: str) -> TwinrGraphDocumentV1 | None:
+        if payload is None:
+            return None
+        if not isinstance(payload, Mapping):
+            logger.warning("Ignoring non-mapping graph payload from %s.", source)
+            return None
+        try:
+            return TwinrGraphDocumentV1.from_payload(payload)
+        except ValueError as exc:
+            if str(exc).startswith("Unsupported Twinr graph schema"):
+                raise
+            logger.warning("Ignoring invalid graph payload from %s.", source, exc_info=True)
+            return None
+        except Exception:
+            # AUDIT-FIX(#2): Corrupt state should be quarantined and bypassed instead of crashing the assistant.
+            logger.warning("Ignoring invalid graph payload from %s.", source, exc_info=True)
+            return None
+
+    def _read_json_file_locked(self, path: Path) -> Mapping[str, object] | None:
+        try:
+            raw_bytes = self._read_bytes_no_symlink(path)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            # AUDIT-FIX(#1): Refuse unsafe or unreadable state files and fall back cleanly.
+            logger.warning("Failed to read graph file %s safely.", path, exc_info=True)
+            return None
+        try:
+            payload = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            logger.warning("Failed to decode graph file %s.", path, exc_info=True)
+            return None
+        if not isinstance(payload, Mapping):
+            logger.warning("Ignoring graph file %s because it does not contain a JSON object.", path)
+            return None
+        return payload
+
+    def _save_document_locked(
+        self,
+        nodes: Mapping[str, TwinrGraphNodeV1],
+        edges: list[TwinrGraphEdgeV1],
+        *,
+        created_at: str,
+    ) -> None:
+        updated_at = _utc_now_iso()
+        document = TwinrGraphDocumentV1(
+            subject_node_id=self.user_node_id,
+            graph_id="graph:user_main",
+            created_at=created_at,
+            updated_at=updated_at,
+            nodes=tuple(sorted(nodes.values(), key=lambda item: item.node_id)),
+            edges=tuple(
+                sorted(
+                    edges,
+                    key=lambda item: (item.source_node_id, item.edge_type, item.target_node_id),
+                )
+            ),
+            metadata={"kind": "personal_graph"},
+        )
+        self._write_document_locked(document)
+        payload = document.to_payload()
+        if self.remote_state is not None and self.remote_state.enabled:
+            try:
+                self.remote_state.save_snapshot(snapshot_kind="graph", payload=payload)
+            except Exception:
+                # AUDIT-FIX(#2): Remote sync failures should be observable in logs but must not drop the local durable write.
+                logger.warning("Failed to save remote graph snapshot; local graph state is still durable.", exc_info=True)
+
+    def _write_document_locked(self, document: TwinrGraphDocumentV1) -> None:
+        payload_text = json.dumps(document.to_payload(), ensure_ascii=False, indent=2) + "\n"
+        # AUDIT-FIX(#1): Write through a temp file plus atomic replace so power loss cannot leave a torn JSON document behind.
+        self._write_text_atomic_locked(self.path, payload_text)
+        # AUDIT-FIX(#2): Keep a last-known-good backup for recovery from partial corruption on the primary file.
+        self._write_text_atomic_locked(self._backup_path, payload_text)
+
+    def _write_text_atomic_locked(self, path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+            self._fsync_directory(path.parent)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temp_path.unlink()
+
+    def _read_bytes_no_symlink(self, path: Path) -> bytes:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        handle = os.fdopen(fd, "rb")
+        try:
+            return handle.read()
+        finally:
+            handle.close()
+
+    def _fsync_directory(self, directory: Path) -> None:
+        if not hasattr(os, "O_DIRECTORY"):
+            return
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    def _query_requests_contact_methods(self, query_text: str | None) -> bool:
+        tokens = set(_tokenize(query_text or ""))
+        return bool(tokens & _CONTACT_METHOD_QUERY_TOKENS)
+
+    def _ensure_contact_method_node(
+        self,
+        nodes: dict[str, TwinrGraphNodeV1],
+        *,
+        node_type: str,
+        label: str,
+        canonical_value: str,
+    ) -> str:
+        for node in nodes.values():
+            if node.node_type != node_type:
+                continue
+            existing_canonical = _normalize_text(str((node.attributes or {}).get("canonical", "")), limit=320)
+            if existing_canonical == canonical_value:
+                return node.node_id
+        node_id = self._contact_method_node_id(node_type, canonical_value, set(nodes))
+        nodes[node_id] = TwinrGraphNodeV1(
+            node_id=node_id,
+            node_type=node_type,
+            label=label,
+            attributes={"canonical": canonical_value},
+        )
+        return node_id

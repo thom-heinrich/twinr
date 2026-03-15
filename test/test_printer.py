@@ -51,7 +51,7 @@ class RawReceiptPrinterTests(unittest.TestCase):
         self.assertEqual(
             command,
             [
-                "lp",
+                printer.lp_binary,
                 "-d",
                 "Test",
                 "-o",
@@ -67,11 +67,13 @@ class RawReceiptPrinterTests(unittest.TestCase):
         printer = RawReceiptPrinter(queue="Test")
         observed: dict[str, object] = {}
 
-        def fake_run(command, *, capture_output: bool, check: bool):
+        def fake_run(command, *, capture_output: bool, check: bool, stdin, timeout):
             spool_path = Path(command[-1])
             observed["command"] = command
             observed["payload"] = spool_path.read_bytes()
             observed["path_exists_during_run"] = spool_path.exists()
+            observed["stdin"] = stdin
+            observed["timeout"] = timeout
             return type("CompletedProcess", (), {"returncode": 0, "stdout": b"request id is Test-2 (1 file(s))", "stderr": b""})()
 
         with patch("twinr.hardware.printer.subprocess.run", side_effect=fake_run):
@@ -80,6 +82,8 @@ class RawReceiptPrinterTests(unittest.TestCase):
         self.assertEqual(response, "request id is Test-2 (1 file(s))")
         self.assertEqual(observed["payload"], b"HELLO\n")
         self.assertTrue(observed["path_exists_during_run"])
+        self.assertEqual(observed["stdin"], -3)
+        self.assertEqual(observed["timeout"], printer.print_timeout_seconds)
         self.assertFalse(Path(observed["command"][-1]).exists())
 
     def test_print_bytes_rejects_zero_file_cups_response(self) -> None:

@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.config import TwinrConfig
 from twinr.agent.base_agent.contracts import AgentToolResult
 from twinr.providers.openai import (
+    OpenAIFirstWordProvider,
     OpenAIProviderBundle,
     OpenAISupervisorDecisionProvider,
     OpenAIToolCallingAgentProvider,
@@ -120,6 +121,18 @@ class FakeToolBackend:
 
     def _resolve_tool_loop_base_instructions(self) -> str:
         return "Tool-loop base instructions"
+
+    def _call_with_model_fallback(self, preferred_model: str, fallback_models, call):
+        attempted: list[str] = []
+        for model in (preferred_model, *fallback_models):
+            if not model or model in attempted:
+                continue
+            attempted.append(model)
+            try:
+                return call(model), model
+            except Exception:
+                continue
+        raise AssertionError("No fake create result configured")
 
     def _build_response_request(
         self,
@@ -248,6 +261,45 @@ class OpenAIToolCallingAgentProviderTests(unittest.TestCase):
             [tool["type"] for tool in request["tools"]],
             ["web_search", "function"],
         )
+
+    def test_first_word_provider_requests_structured_fast_reply(self) -> None:
+        backend = FakeToolBackend(
+            TwinrConfig(
+                openai_api_key="test-key",
+                streaming_first_word_model="gpt-4.1-nano",
+                streaming_first_word_max_output_tokens=36,
+            )
+        )
+        backend._client.responses.create_results.append(
+            SimpleNamespace(
+                id="resp_first_word_1",
+                _request_id="req_first_word_1",
+                model="gpt-4.1-nano",
+                output_text='{"mode":"filler","spoken_text":"Ich schaue kurz nach."}',
+                output=[],
+                usage=None,
+            )
+        )
+        provider = OpenAIFirstWordProvider(
+            backend,
+            model_override="gpt-4.1-nano",
+            base_instructions_override="Fast first-word instructions",
+            replace_base_instructions=True,
+        )
+
+        reply = provider.reply(
+            "Wie ist das Wetter heute?",
+            conversation=(("assistant", "Vorherige Antwort"),),
+        )
+
+        request = backend._client.responses.create_requests[0]
+        self.assertEqual(reply.mode, "filler")
+        self.assertEqual(reply.spoken_text, "Ich schaue kurz nach.")
+        self.assertEqual(request["model"], "gpt-4.1-nano")
+        self.assertEqual(request["max_output_tokens"], 36)
+        self.assertEqual(request["prompt_cache_key"], "twinr:first_word:gpt-4.1-nano:de")
+        self.assertIn("Fast first-word instructions", request["instructions"])
+        self.assertEqual(request["text"]["format"]["name"], "twinr_first_word_reply")
 
     def test_continue_turn_streaming_sends_function_call_outputs(self) -> None:
         backend = FakeToolBackend(self.config)

@@ -1,10 +1,35 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import errno
+import fcntl
 import json
+import math
+import os
+import stat
+import tempfile
+import threading
+from contextlib import contextmanager
+from typing import Iterator
+from uuid import uuid4
+
+_PATH_LOCKS: dict[str, threading.RLock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+class ReminderStoreError(RuntimeError):
+    pass
+
+
+class ReminderStoreCorruptionError(ReminderStoreError):
+    pass
+
+
+class ReminderStoreSecurityError(ReminderStoreError):
+    pass
 
 
 def _normalize_text(value: str | None, *, limit: int) -> str:
@@ -22,11 +47,67 @@ def _slugify(value: str | None, *, fallback: str) -> str:
     return normalized or fallback
 
 
+def _safe_int(value: object, *, default: int, minimum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def _safe_float(value: object, *, default: float, minimum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return max(minimum, parsed)
+
+
+def _path_lock_for(path: Path) -> threading.RLock:
+    key = os.path.abspath(os.fspath(path))
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
+
+
 def resolve_timezone(timezone_name: str | None) -> ZoneInfo:
     try:
         return ZoneInfo((timezone_name or "").strip() or "Europe/Berlin")
     except Exception:
         return ZoneInfo("UTC")
+
+
+def _localize_naive_datetime(value: datetime, *, zone: ZoneInfo, field_name: str) -> datetime:
+    # AUDIT-FIX(#1): Reject ambiguous and nonexistent wall-clock times instead of silently creating invalid reminders.
+    candidate_fold_0 = value.replace(tzinfo=zone, fold=0)
+    candidate_fold_1 = value.replace(tzinfo=zone, fold=1)
+    roundtrip_fold_0 = candidate_fold_0.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None)
+    roundtrip_fold_1 = candidate_fold_1.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None)
+    valid_fold_0 = roundtrip_fold_0 == value
+    valid_fold_1 = roundtrip_fold_1 == value
+
+    if valid_fold_0 and valid_fold_1:
+        if candidate_fold_0.utcoffset() != candidate_fold_1.utcoffset():
+            raise ValueError(f"{field_name} is ambiguous in timezone {zone.key}; include an explicit UTC offset")
+        return candidate_fold_0
+    if valid_fold_0:
+        return candidate_fold_0
+    if valid_fold_1:
+        return candidate_fold_1
+    raise ValueError(f"{field_name} falls into a nonexistent local time in timezone {zone.key}; include an explicit UTC offset")
+
+
+def _coerce_datetime(value: datetime, *, timezone_name: str | None, field_name: str) -> datetime:
+    # AUDIT-FIX(#8): Normalize externally supplied datetimes so mixed naive/aware values cannot break ordering or retries.
+    zone = resolve_timezone(timezone_name)
+    if value.tzinfo is None:
+        return _localize_naive_datetime(value, zone=zone, field_name=field_name)
+    return value.astimezone(zone)
 
 
 def now_in_timezone(timezone_name: str | None) -> datetime:
@@ -46,12 +127,14 @@ def parse_due_at(value: str, *, timezone_name: str | None) -> datetime:
 
     zone = resolve_timezone(timezone_name)
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=zone)
+        # AUDIT-FIX(#1): Validate DST transitions for naive local datetimes before assigning the store timezone.
+        return _localize_naive_datetime(parsed, zone=zone, field_name="due_at")
     return parsed.astimezone(zone)
 
 
 def format_due_label(value: datetime, *, timezone_name: str | None) -> str:
-    localized = value.astimezone(resolve_timezone(timezone_name))
+    # AUDIT-FIX(#8): Accept only normalized aware timestamps for rendering to avoid hidden local-time drift.
+    localized = _coerce_datetime(value, timezone_name=timezone_name, field_name="due_at")
     return localized.strftime("%A, %d.%m.%Y %H:%M")
 
 
@@ -62,8 +145,9 @@ class ReminderEntry:
     summary: str
     due_at: datetime
     details: str | None = None
-    created_at: datetime = datetime.min
-    updated_at: datetime = datetime.min
+    # AUDIT-FIX(#11): Use timezone-aware defaults so ad-hoc ReminderEntry construction cannot trigger naive/aware comparison failures.
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     source: str = "tool"
     original_request: str | None = None
     delivery_attempts: int = 0
@@ -86,29 +170,23 @@ class ReminderStore:
         retry_delay_s: float = 90.0,
         max_entries: int = 48,
     ) -> None:
-        self.path = Path(path)
-        self.timezone_name = timezone_name or "Europe/Berlin"
-        self.retry_delay_s = max(5.0, float(retry_delay_s))
-        self.max_entries = max(8, int(max_entries))
+        raw_path = Path(path).expanduser()
+        normalized_path = Path(os.path.abspath(os.fspath(raw_path)))
+        if not normalized_path.name:
+            raise ValueError("path must point to a file")
+
+        self.path = normalized_path
+        # AUDIT-FIX(#4): Use a dedicated lock file plus a per-path in-process lock to serialize all file-backed state mutations.
+        self._lock_path = self.path.with_name(f".{self.path.name}.lock")
+        self._thread_lock = _path_lock_for(self.path)
+        self.timezone_name = (timezone_name or "Europe/Berlin").strip() or "Europe/Berlin"
+        # AUDIT-FIX(#6): Invalid .env values must degrade to safe defaults instead of crashing startup.
+        self.retry_delay_s = _safe_float(retry_delay_s, default=90.0, minimum=5.0)
+        self.max_entries = _safe_int(max_entries, default=48, minimum=8)
 
     def load_entries(self) -> tuple[ReminderEntry, ...]:
-        if not self.path.exists():
-            return ()
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return ()
-        items = payload.get("entries", [])
-        if not isinstance(items, list):
-            return ()
-        entries: list[ReminderEntry] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            entry = self._entry_from_payload(item)
-            if entry is not None:
-                entries.append(entry)
-        return tuple(self._sorted_entries(entries))
+        with self._locked_store():
+            return self._load_entries_locked()
 
     def schedule(
         self,
@@ -123,6 +201,7 @@ class ReminderStore:
         clean_summary = _normalize_text(summary, limit=220)
         clean_details = _normalize_text(details, limit=420) or None
         clean_kind = _slugify(kind, fallback="reminder")
+        clean_source = _normalize_text(source, limit=80) or "tool"
         clean_original_request = _normalize_text(original_request, limit=220) or None
         if not clean_summary:
             raise ValueError("summary must not be empty")
@@ -132,104 +211,129 @@ class ReminderStore:
         if parsed_due_at < now - timedelta(seconds=60):
             raise ValueError("due_at must not be in the past")
 
-        entries = list(self.load_entries())
-        fingerprint = (clean_kind, clean_summary.lower(), parsed_due_at.isoformat())
-        for index, existing in enumerate(entries):
-            existing_fingerprint = (
-                existing.kind,
-                existing.summary.lower(),
-                existing.due_at.isoformat(),
-            )
-            if existing.delivered or existing_fingerprint != fingerprint:
-                continue
-            updated = replace(
-                existing,
-                details=clean_details or existing.details,
-                updated_at=now,
-                source=source,
-                original_request=clean_original_request or existing.original_request,
-                last_error=None,
-            )
-            entries[index] = updated
-            self._write_entries(tuple(entries))
-            return updated
+        with self._locked_store():
+            entries = list(self._load_entries_locked())
+            fingerprint = (clean_kind, clean_summary.casefold(), parsed_due_at.isoformat())
+            for index, existing in enumerate(entries):
+                existing_fingerprint = (
+                    existing.kind,
+                    existing.summary.casefold(),
+                    existing.due_at.isoformat(),
+                )
+                if existing.delivered or existing_fingerprint != fingerprint:
+                    continue
+                updated = replace(
+                    existing,
+                    details=clean_details if clean_details is not None else existing.details,
+                    updated_at=now,
+                    source=clean_source,
+                    original_request=clean_original_request or existing.original_request,
+                    last_error=None,
+                )
+                entries[index] = updated
+                self._write_entries_locked(tuple(entries))
+                return updated
 
-        created_at = now
-        entry = ReminderEntry(
-            reminder_id=f"REM-{created_at.strftime('%Y%m%dT%H%M%S%fZ')}",
-            kind=clean_kind,
-            summary=clean_summary,
-            due_at=parsed_due_at,
-            details=clean_details,
-            created_at=created_at,
-            updated_at=created_at,
-            source=source,
-            original_request=clean_original_request,
-        )
-        entries.append(entry)
-        self._write_entries(tuple(entries))
-        return entry
+            created_at = now
+            entry = ReminderEntry(
+                # AUDIT-FIX(#9): Generate reminder IDs in real UTC and add entropy so concurrent schedules cannot collide.
+                reminder_id=f"REM-{created_at.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{uuid4().hex[:8]}",
+                kind=clean_kind,
+                summary=clean_summary,
+                due_at=parsed_due_at,
+                details=clean_details,
+                created_at=created_at,
+                updated_at=created_at,
+                source=clean_source,
+                original_request=clean_original_request,
+            )
+            entries.append(entry)
+            self._write_entries_locked(tuple(entries))
+            return entry
 
     def reserve_due(self, *, now: datetime | None = None, limit: int = 1) -> tuple[ReminderEntry, ...]:
-        current_time = now or now_in_timezone(self.timezone_name)
-        entries = list(self.load_entries())
-        selected: list[ReminderEntry] = []
-        changed = False
-        for index, entry in enumerate(entries):
-            if len(selected) >= max(1, limit):
-                break
-            if entry.delivered:
-                continue
-            if entry.due_at > current_time:
-                continue
-            if entry.next_attempt_at is not None and entry.next_attempt_at > current_time:
-                continue
-            reserved = replace(
-                entry,
-                delivery_attempts=entry.delivery_attempts + 1,
-                last_attempted_at=current_time,
-                next_attempt_at=current_time + timedelta(seconds=self.retry_delay_s),
-                updated_at=current_time,
-                last_error=None,
-            )
-            entries[index] = reserved
-            selected.append(reserved)
-            changed = True
-        if changed:
-            self._write_entries(tuple(entries))
-        return tuple(selected)
+        # AUDIT-FIX(#10): Respect zero and negative limits instead of silently reserving one reminder.
+        effective_limit = _safe_int(limit, default=1, minimum=0)
+        if effective_limit == 0:
+            return ()
+        current_time = _coerce_datetime(
+            now or now_in_timezone(self.timezone_name),
+            timezone_name=self.timezone_name,
+            field_name="now",
+        )
+        with self._locked_store():
+            entries = list(self._load_entries_locked())
+            selected: list[ReminderEntry] = []
+            changed = False
+            for index, entry in enumerate(entries):
+                if len(selected) >= effective_limit:
+                    break
+                if entry.delivered:
+                    continue
+                if entry.due_at > current_time:
+                    continue
+                if entry.next_attempt_at is not None and entry.next_attempt_at > current_time:
+                    continue
+                reserved = replace(
+                    entry,
+                    delivery_attempts=entry.delivery_attempts + 1,
+                    last_attempted_at=current_time,
+                    next_attempt_at=current_time + timedelta(seconds=self.retry_delay_s),
+                    updated_at=current_time,
+                    last_error=None,
+                )
+                entries[index] = reserved
+                selected.append(reserved)
+                changed = True
+            if changed:
+                self._write_entries_locked(tuple(entries))
+            return tuple(selected)
 
     def peek_due(self, *, now: datetime | None = None, limit: int = 1) -> tuple[ReminderEntry, ...]:
-        current_time = now or now_in_timezone(self.timezone_name)
+        # AUDIT-FIX(#10): Respect zero and negative limits instead of silently returning one reminder.
+        effective_limit = _safe_int(limit, default=1, minimum=0)
+        if effective_limit == 0:
+            return ()
+        current_time = _coerce_datetime(
+            now or now_in_timezone(self.timezone_name),
+            timezone_name=self.timezone_name,
+            field_name="now",
+        )
         selected: list[ReminderEntry] = []
-        for entry in self.load_entries():
-            if len(selected) >= max(1, limit):
-                break
-            if entry.delivered:
-                continue
-            if entry.due_at > current_time:
-                continue
-            if entry.next_attempt_at is not None and entry.next_attempt_at > current_time:
-                continue
-            selected.append(entry)
+        with self._locked_store():
+            for entry in self._load_entries_locked():
+                if len(selected) >= effective_limit:
+                    break
+                if entry.delivered:
+                    continue
+                if entry.due_at > current_time:
+                    continue
+                if entry.next_attempt_at is not None and entry.next_attempt_at > current_time:
+                    continue
+                selected.append(entry)
         return tuple(selected)
 
     def mark_delivered(self, reminder_id: str, *, delivered_at: datetime | None = None) -> ReminderEntry:
-        current_time = delivered_at or now_in_timezone(self.timezone_name)
-        entries = list(self.load_entries())
-        for index, entry in enumerate(entries):
-            if entry.reminder_id != reminder_id:
-                continue
-            delivered = replace(
-                entry,
-                delivered_at=current_time,
-                updated_at=current_time,
-                next_attempt_at=None,
-                last_error=None,
-            )
-            entries[index] = delivered
-            self._write_entries(tuple(entries))
-            return delivered
+        current_time = _coerce_datetime(
+            delivered_at or now_in_timezone(self.timezone_name),
+            timezone_name=self.timezone_name,
+            field_name="delivered_at",
+        )
+        with self._locked_store():
+            entries = list(self._load_entries_locked())
+            for index, entry in enumerate(entries):
+                if entry.reminder_id != reminder_id:
+                    continue
+                delivered = replace(
+                    entry,
+                    delivered_at=current_time,
+                    updated_at=current_time,
+                    next_attempt_at=None,
+                    last_error=None,
+                )
+                entries[index] = delivered
+                self._write_entries_locked(tuple(entries))
+                return delivered
         raise KeyError(f"Unknown reminder_id: {reminder_id}")
 
     def mark_failed(
@@ -239,47 +343,55 @@ class ReminderStore:
         error: str,
         failed_at: datetime | None = None,
     ) -> ReminderEntry:
-        current_time = failed_at or now_in_timezone(self.timezone_name)
-        entries = list(self.load_entries())
-        for index, entry in enumerate(entries):
-            if entry.reminder_id != reminder_id:
-                continue
-            failed = replace(
-                entry,
-                updated_at=current_time,
-                last_error=_normalize_text(error, limit=220) or "unknown error",
-                next_attempt_at=current_time + timedelta(seconds=self.retry_delay_s),
-            )
-            entries[index] = failed
-            self._write_entries(tuple(entries))
-            return failed
+        current_time = _coerce_datetime(
+            failed_at or now_in_timezone(self.timezone_name),
+            timezone_name=self.timezone_name,
+            field_name="failed_at",
+        )
+        with self._locked_store():
+            entries = list(self._load_entries_locked())
+            for index, entry in enumerate(entries):
+                if entry.reminder_id != reminder_id:
+                    continue
+                failed = replace(
+                    entry,
+                    updated_at=current_time,
+                    last_error=_normalize_text(error, limit=220) or "unknown error",
+                    next_attempt_at=current_time + timedelta(seconds=self.retry_delay_s),
+                )
+                entries[index] = failed
+                self._write_entries_locked(tuple(entries))
+                return failed
         raise KeyError(f"Unknown reminder_id: {reminder_id}")
 
     def delete(self, reminder_id: str) -> ReminderEntry:
-        entries = list(self.load_entries())
-        for index, entry in enumerate(entries):
-            if entry.reminder_id != reminder_id:
-                continue
-            removed = entries.pop(index)
-            self._write_entries(tuple(entries))
-            return removed
+        with self._locked_store():
+            entries = list(self._load_entries_locked())
+            for index, entry in enumerate(entries):
+                if entry.reminder_id != reminder_id:
+                    continue
+                removed = entries.pop(index)
+                self._write_entries_locked(tuple(entries))
+                return removed
         raise KeyError(f"Unknown reminder_id: {reminder_id}")
 
     def render_context(self, *, limit: int = 8) -> str | None:
-        pending = [entry for entry in self.load_entries() if not entry.delivered]
+        effective_limit = _safe_int(limit, default=8, minimum=1)
+        with self._locked_store():
+            pending = [entry for entry in self._load_entries_locked() if not entry.delivered]
         if not pending:
             return None
         lines = ["Scheduled reminders and timers:"]
-        for entry in pending[:limit]:
+        for entry in pending[:effective_limit]:
             line = f"- [{entry.kind}] {format_due_label(entry.due_at, timezone_name=self.timezone_name)} — {entry.summary}"
-            if entry.details and entry.details.lower() != entry.summary.lower():
+            if entry.details and entry.details.casefold() != entry.summary.casefold():
                 line += f" Details: {entry.details}"
             lines.append(line)
         return "\n".join(lines)
 
     def _entry_from_payload(self, item: dict[str, object]) -> ReminderEntry | None:
         summary = _normalize_text(item.get("summary"), limit=220)
-        reminder_id = str(item.get("reminder_id", "")).strip()
+        reminder_id = _normalize_text(str(item.get("reminder_id", "")).strip(), limit=96)
         due_at_raw = str(item.get("due_at", "")).strip()
         if not summary or not reminder_id or not due_at_raw:
             return None
@@ -295,9 +407,10 @@ class ReminderStore:
             details=_normalize_text(item.get("details"), limit=420) or None,
             created_at=self._parse_timestamp(item.get("created_at")) or due_at,
             updated_at=self._parse_timestamp(item.get("updated_at")) or due_at,
-            source=str(item.get("source", "tool")).strip() or "tool",
+            source=_normalize_text(item.get("source"), limit=80) or "tool",
             original_request=_normalize_text(item.get("original_request"), limit=220) or None,
-            delivery_attempts=max(0, int(item.get("delivery_attempts", 0) or 0)),
+            # AUDIT-FIX(#7): Malformed numeric payload fields must not crash store loading.
+            delivery_attempts=_safe_int(item.get("delivery_attempts", 0), default=0, minimum=0),
             last_attempted_at=self._parse_timestamp(item.get("last_attempted_at")),
             next_attempt_at=self._parse_timestamp(item.get("next_attempt_at")),
             delivered_at=self._parse_timestamp(item.get("delivered_at")),
@@ -313,14 +426,82 @@ class ReminderStore:
         except ValueError:
             return None
 
-    def _write_entries(self, entries: tuple[ReminderEntry, ...]) -> None:
+    def _load_entries_locked(self) -> tuple[ReminderEntry, ...]:
+        payload = self._read_payload_locked()
+        if payload is None:
+            return ()
+        items = payload.get("entries", [])
+        if not isinstance(items, list):
+            # AUDIT-FIX(#7): Treat structurally invalid JSON as corruption instead of crashing with AttributeError later.
+            raise ReminderStoreCorruptionError(f"Reminder store at {self.path} contains an invalid 'entries' payload")
+        entries: list[ReminderEntry] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            entry = self._entry_from_payload(item)
+            if entry is not None:
+                entries.append(entry)
+        return tuple(self._sorted_entries(entries))
+
+    def _read_payload_locked(self) -> dict[str, object] | None:
+        try:
+            raw_payload = self._read_text_file(self.path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ReminderStoreError(f"Unable to read reminder store at {self.path}") from exc
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError as exc:
+            # AUDIT-FIX(#3): Never treat corrupted JSON as an empty store because that would erase pending reminders on the next write.
+            raise ReminderStoreCorruptionError(
+                f"Reminder store at {self.path} is corrupted and must be repaired before modification"
+            ) from exc
+        if not isinstance(payload, dict):
+            # AUDIT-FIX(#7): Top-level JSON must be validated explicitly because json.loads may return a list or scalar.
+            raise ReminderStoreCorruptionError(f"Reminder store at {self.path} must contain a JSON object")
+        return payload
+
+    def _write_entries_locked(self, entries: tuple[ReminderEntry, ...]) -> None:
         normalized_entries = self._trim_entries(self._sorted_entries(entries))
         payload = {
             "updated_at": now_in_timezone(self.timezone_name).isoformat(),
             "entries": [self._entry_to_payload(entry) for entry in normalized_entries],
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._write_payload_locked(payload)
+
+    def _write_payload_locked(self, payload: dict[str, object]) -> None:
+        self._ensure_safe_storage_location()
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        temp_path: Path | None = None
+        try:
+            file_descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                dir=os.fspath(self.path.parent),
+                text=True,
+            )
+            temp_path = Path(temp_name)
+            os.fchmod(file_descriptor, 0o600)
+            with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # AUDIT-FIX(#2,#3): Persist through a same-directory atomic replace so crashes and symlink swaps cannot truncate the live store.
+            os.replace(temp_path, self.path)
+            directory_fd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            raise ReminderStoreError(f"Unable to persist reminder store at {self.path}") from exc
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _entry_to_payload(self, entry: ReminderEntry) -> dict[str, object]:
         return {
@@ -356,6 +537,89 @@ class ReminderStore:
         pending = [entry for entry in entries if not entry.delivered]
         delivered = [entry for entry in entries if entry.delivered]
         if len(pending) >= self.max_entries:
-            return pending[: self.max_entries]
+            # AUDIT-FIX(#5): Never evict pending reminders just to satisfy the history cap; missing a future reminder is worse than a larger file.
+            return pending
         remaining = self.max_entries - len(pending)
+        if remaining <= 0:
+            return pending
         return pending + delivered[-remaining:]
+
+    @contextmanager
+    def _locked_store(self) -> Iterator[None]:
+        self._ensure_safe_storage_location()
+        with self._thread_lock:
+            lock_fd = self._open_lock_file()
+            try:
+                # AUDIT-FIX(#4): Serialize every load/mutate/write transaction under an OS-level file lock.
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+
+    def _ensure_safe_storage_location(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ReminderStoreError(f"Unable to prepare reminder store directory {self.path.parent}") from exc
+        # AUDIT-FIX(#2): Validate the entire storage location before any read or write.
+        self._assert_safe_directory_chain(self.path.parent)
+        self._assert_safe_regular_file(self.path, allow_missing=True)
+        self._assert_safe_regular_file(self._lock_path, allow_missing=True)
+
+    def _assert_safe_directory_chain(self, directory: Path) -> None:
+        current = directory
+        while True:
+            try:
+                info = current.lstat()
+            except OSError as exc:
+                raise ReminderStoreError(f"Unable to inspect reminder store directory {current}") from exc
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise ReminderStoreSecurityError(f"Reminder store directory {current} is not a safe directory")
+            if current.parent == current:
+                break
+            current = current.parent
+
+    def _assert_safe_regular_file(self, path: Path, *, allow_missing: bool) -> None:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            if allow_missing:
+                return
+            raise
+        except OSError as exc:
+            raise ReminderStoreError(f"Unable to inspect reminder store path {path}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ReminderStoreSecurityError(f"Reminder store path {path} is not a regular file")
+
+    def _open_lock_file(self) -> int:
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            return os.open(self._lock_path, flags, 0o600)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ReminderStoreSecurityError(
+                    f"Reminder store lock path {self._lock_path} must not be a symlink"
+                ) from exc
+            raise ReminderStoreError(f"Unable to open reminder store lock file {self._lock_path}") from exc
+
+    def _read_text_file(self, path: Path) -> str:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            file_descriptor = os.open(path, flags)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise ReminderStoreSecurityError(f"Reminder store path {path} must not be a symlink") from exc
+            raise
+        with os.fdopen(file_descriptor, "r", encoding="utf-8") as handle:
+            return handle.read()

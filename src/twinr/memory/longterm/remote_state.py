@@ -1,20 +1,40 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field  # AUDIT-FIX(#10): Field support is needed for stable exception/internal state handling.
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging  # AUDIT-FIX(#5): Add diagnostics for remote-boundary failures without crashing callers.
+import math  # AUDIT-FIX(#7): Clamp invalid numeric config values safely.
+import os  # AUDIT-FIX(#2): Use no-follow local file opens to avoid symlink races during fallback reads.
 from pathlib import Path
+import stat  # AUDIT-FIX(#2): Require regular files for local snapshot fallback reads.
+import threading  # AUDIT-FIX(#5): Protect lightweight circuit-breaker state across concurrent callers.
 import time
 from typing import Iterable, Mapping
+from urllib.parse import quote  # AUDIT-FIX(#6): Encode URI path segments safely.
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig, ChonkyDBError
 from twinr.memory.chonkydb.models import ChonkyDBRecordRequest
 
 
+_LOGGER = logging.getLogger(__name__)  # AUDIT-FIX(#5): Keep operational visibility for degraded-mode events.
+
 _REMOTE_NAMESPACE_PREFIX = "twinr_longterm_v1"
 _SNAPSHOT_SCHEMA = "twinr_remote_snapshot_v1"
+_DEFAULT_REMOTE_READ_TIMEOUT_S = 10.0  # AUDIT-FIX(#7): Safe fallback defaults for malformed .env values.
+_DEFAULT_REMOTE_WRITE_TIMEOUT_S = 15.0
+_DEFAULT_RETRY_ATTEMPTS = 3
+_DEFAULT_RETRY_BACKOFF_S = 0.5
+_DEFAULT_MAX_CONTENT_CHARS = 262_144
+_DEFAULT_MAX_CONTENT_CHARS_CAP = 8_388_608  # 8 MiB cap for RPi-friendly snapshot fetches.
+_DEFAULT_LOCAL_SNAPSHOT_MAX_BYTES = 8_388_608
+_DEFAULT_CIRCUIT_BREAKER_COOLDOWN_S = 15.0
+_MAX_NAMESPACE_LENGTH = 255
+_MAX_SNAPSHOT_KIND_LENGTH = 255
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -23,19 +43,108 @@ def _normalize_text(value: str | None) -> str:
     return " ".join(str(value or "").split()).strip()
 
 
+def _strip_text(value: str | None) -> str:
+    return str(value or "").strip()
+
+
 def _mapping_dict(value: Mapping[str, object] | None) -> dict[str, object] | None:
     if value is None:
         return None
     return dict(value)
 
 
+def _reject_non_finite_json_constant(value: str) -> object:  # AUDIT-FIX(#12): Reject NaN/Infinity so remote snapshots stay standards-compliant.
+    raise ValueError(f"Unsupported JSON constant {value!r}.")
+
+
 def _safe_json_text(payload: Mapping[str, object]) -> str:
-    return json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        dict(payload),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,  # AUDIT-FIX(#12): Emit only strict JSON for remote interoperability.
+    )
+
+
+def _redact_secrets(text: str, *, secrets: Iterable[str]) -> str:
+    redacted = " ".join(str(text).split())
+    for secret in secrets:
+        cleaned = _strip_text(secret)
+        if cleaned:
+            redacted = redacted.replace(cleaned, "[redacted]")
+    return redacted
+
+
+def _coerce_int(
+    value: object,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < minimum:
+        parsed = minimum
+    if maximum is not None and parsed > maximum:
+        parsed = maximum
+    return parsed
+
+
+def _coerce_float(
+    value: object,
+    *,
+    default: float,
+    minimum: float,
+    maximum: float | None = None,
+) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    if parsed < minimum:
+        parsed = minimum
+    if maximum is not None and parsed > maximum:
+        parsed = maximum
+    return parsed
+
+
+def _coerce_timeout_s(value: object, *, default: float) -> float:
+    return _coerce_float(value, default=default, minimum=0.1, maximum=300.0)
+
+
+def _safe_resolve_path(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):  # pragma: no cover - defensive path hardening
+        return Path(os.path.abspath(os.fspath(path)))
+
+
+def _normalize_storage_token(value: str, *, field_name: str, max_length: int) -> str:
+    normalized = _normalize_text(value)
+    if not normalized:
+        raise ValueError(f"{field_name} must not be empty.")
+    if len(normalized) > max_length:
+        raise ValueError(f"{field_name} must not exceed {max_length} characters.")
+    if any(ord(char) < 32 or ord(char) == 127 for char in normalized):
+        raise ValueError(f"{field_name} must not contain control characters.")
+    return normalized
+
+
+def _encode_uri_path_segment(value: str) -> str:
+    return quote(value, safe="")
 
 
 @dataclass(frozen=True, slots=True)
 class LongTermRemoteUnavailableError(RuntimeError):
     message: str
+
+    def __post_init__(self) -> None:  # AUDIT-FIX(#10): Initialize RuntimeError.args for normal exception semantics.
+        RuntimeError.__init__(self, self.message)
 
     def __str__(self) -> str:
         return self.message
@@ -61,34 +170,62 @@ class LongTermRemoteStateStore:
     read_client: ChonkyDBClient | None = None
     write_client: ChonkyDBClient | None = None
     namespace: str | None = None
+    _state_lock: threading.Lock = field(init=False, repr=False, default_factory=threading.Lock)  # AUDIT-FIX(#5): Guard circuit state across concurrent callers.
+    _circuit_open_until_monotonic: float = field(init=False, repr=False, default=0.0)
+    _consecutive_failures: int = field(init=False, repr=False, default=0)
 
     def __post_init__(self) -> None:
-        if not self.namespace:
-            self.namespace = _remote_namespace_for_config(self.config)
+        namespace = self.namespace or _remote_namespace_for_config(self.config)
+        self.namespace = _normalize_storage_token(  # AUDIT-FIX(#6): Normalize namespace once so URIs stay stable and safe.
+            namespace,
+            field_name="namespace",
+            max_length=_MAX_NAMESPACE_LENGTH,
+        )
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermRemoteStateStore":
         namespace = _remote_namespace_for_config(config)
-        if not (config.chonkydb_base_url and config.chonkydb_api_key):
+        if not (
+            config.long_term_memory_enabled and config.long_term_memory_mode == "remote_primary"
+        ):  # AUDIT-FIX(#11): Avoid creating remote clients when remote-primary mode is disabled.
             return cls(config=config, namespace=namespace)
-        read_client = ChonkyDBClient(
-            ChonkyDBConnectionConfig(
-                base_url=config.chonkydb_base_url,
-                api_key=config.chonkydb_api_key,
-                api_key_header=config.chonkydb_api_key_header,
-                allow_bearer_auth=config.chonkydb_allow_bearer_auth,
-                timeout_s=config.long_term_memory_remote_read_timeout_s,
+
+        base_url = _strip_text(config.chonkydb_base_url)
+        api_key = _strip_text(config.chonkydb_api_key)
+        if not (base_url and api_key):
+            return cls(config=config, namespace=namespace)
+
+        try:  # AUDIT-FIX(#7): Fail closed on malformed client config instead of crashing during startup.
+            read_client = ChonkyDBClient(
+                ChonkyDBConnectionConfig(
+                    base_url=base_url,
+                    api_key=api_key,
+                    api_key_header=config.chonkydb_api_key_header,
+                    allow_bearer_auth=config.chonkydb_allow_bearer_auth,
+                    timeout_s=_coerce_timeout_s(
+                        config.long_term_memory_remote_read_timeout_s,
+                        default=_DEFAULT_REMOTE_READ_TIMEOUT_S,
+                    ),
+                )
             )
-        )
-        write_client = ChonkyDBClient(
-            ChonkyDBConnectionConfig(
-                base_url=config.chonkydb_base_url,
-                api_key=config.chonkydb_api_key,
-                api_key_header=config.chonkydb_api_key_header,
-                allow_bearer_auth=config.chonkydb_allow_bearer_auth,
-                timeout_s=config.long_term_memory_remote_write_timeout_s,
+            write_client = ChonkyDBClient(
+                ChonkyDBConnectionConfig(
+                    base_url=base_url,
+                    api_key=api_key,
+                    api_key_header=config.chonkydb_api_key_header,
+                    allow_bearer_auth=config.chonkydb_allow_bearer_auth,
+                    timeout_s=_coerce_timeout_s(
+                        config.long_term_memory_remote_write_timeout_s,
+                        default=_DEFAULT_REMOTE_WRITE_TIMEOUT_S,
+                    ),
+                )
             )
-        )
+        except Exception as exc:  # pragma: no cover - depends on external client implementation
+            _LOGGER.warning(
+                "Failed to initialize ChonkyDB clients: %s",
+                _redact_secrets(f"{type(exc).__name__}: {exc}", secrets=(api_key,)),
+            )
+            return cls(config=config, namespace=namespace)
         return cls(
             config=config,
             read_client=read_client,
@@ -107,13 +244,26 @@ class LongTermRemoteStateStore:
     def status(self) -> LongTermRemoteStatus:
         if not self.enabled:
             return LongTermRemoteStatus(mode="disabled", ready=False)
+        if self._circuit_is_open():  # AUDIT-FIX(#5): Short-circuit repeated failures so the device recovers faster under bad Wi-Fi.
+            return LongTermRemoteStatus(
+                mode="remote_primary",
+                ready=False,
+                detail="Remote long-term memory is temporarily cooling down after recent failures.",
+            )
         if self.read_client is None or self.write_client is None:
             return LongTermRemoteStatus(mode="remote_primary", ready=False, detail="ChonkyDB is not configured.")
         try:
             instance = self.read_client.instance()
-        except (ChonkyDBError, ValueError) as exc:
-            return LongTermRemoteStatus(mode="remote_primary", ready=False, detail=str(exc))
-        if not instance.ready:
+        except Exception as exc:  # AUDIT-FIX(#5): Normalize all client-boundary failures instead of leaking unexpected exceptions.
+            self._note_remote_failure()
+            _LOGGER.warning("ChonkyDB health check failed: %s", self._safe_exception_text(exc))
+            return LongTermRemoteStatus(
+                mode="remote_primary",
+                ready=False,
+                detail=f"ChonkyDB health check failed ({type(exc).__name__}).",  # AUDIT-FIX(#8): Do not surface raw exception strings.
+            )
+        self._note_remote_success()
+        if not bool(getattr(instance, "ready", False)):
             return LongTermRemoteStatus(
                 mode="remote_primary",
                 ready=False,
@@ -122,80 +272,156 @@ class LongTermRemoteStateStore:
         return LongTermRemoteStatus(mode="remote_primary", ready=True)
 
     def load_snapshot(self, *, snapshot_kind: str, local_path: Path | None = None) -> dict[str, object] | None:
+        normalized_snapshot_kind = self._normalize_snapshot_kind(snapshot_kind)  # AUDIT-FIX(#6): Validate snapshot IDs before they become remote keys.
         if not self.enabled:
             return None
-        read_client = self._require_client(self.read_client, operation="read")
-        result = self._load_snapshot_via_uri(read_client, snapshot_kind=snapshot_kind)
+        try:
+            read_client = self._require_client(self.read_client, operation="read")
+        except LongTermRemoteUnavailableError as exc:
+            if self.required:
+                raise
+            local_payload = None
+            if local_path is not None:
+                local_payload = self._load_local_snapshot(
+                    local_path,
+                    snapshot_kind=normalized_snapshot_kind,
+                )  # AUDIT-FIX(#4): Missing remote client config should still allow safe local fallback in optional mode.
+            if local_payload is not None:
+                return local_payload
+            if self.required:
+                raise
+            _LOGGER.warning(
+                "Remote long-term read client unavailable for %r: %s",
+                normalized_snapshot_kind,
+                self._safe_exception_text(exc),
+            )
+            return None
+
+        result = self._load_snapshot_via_uri(
+            read_client,
+            snapshot_kind=normalized_snapshot_kind,
+            local_path=local_path,
+        )
         if result.payload is not None:
             return result.payload
+
+        local_payload: dict[str, object] | None = None
+        if local_path is not None and result.status in {"not_found", "unavailable"}:
+            local_payload = self._load_local_snapshot(
+                local_path,
+                snapshot_kind=normalized_snapshot_kind,
+            )  # AUDIT-FIX(#1): Corrupt or unreadable local fallback data must not crash the caller.
+
         if result.status == "unavailable":
             if self.required:
                 raise LongTermRemoteUnavailableError(
                     result.detail
-                    or f"Failed to read remote long-term snapshot {snapshot_kind!r}."
+                    or self._remote_failure_detail("read", normalized_snapshot_kind)
                 )
+            if local_payload is not None:
+                return local_payload  # AUDIT-FIX(#4): Use local snapshot as graceful offline fallback when remote is flaky.
             return None
-        if (
-            result.status == "not_found"
-            and self.config.long_term_memory_migration_enabled
-            and local_path is not None
-            and local_path.exists()
-        ):
-            payload = json.loads(local_path.read_text(encoding="utf-8"))
-            if isinstance(payload, Mapping):
+
+        if result.status == "not_found":
+            if self.required and not self.config.long_term_memory_migration_enabled:
+                return None
+            if local_payload is None:
+                return None
+            if self.config.long_term_memory_migration_enabled:
                 try:
-                    self.save_snapshot(snapshot_kind=snapshot_kind, payload=payload)
-                except LongTermRemoteUnavailableError:
+                    self.save_snapshot(snapshot_kind=normalized_snapshot_kind, payload=local_payload)
+                except LongTermRemoteUnavailableError as exc:
                     if self.required:
                         raise
-                    return None
-                return dict(payload)
+                    _LOGGER.warning(
+                        "Failed to migrate local snapshot %r to remote store: %s",
+                        normalized_snapshot_kind,
+                        self._safe_exception_text(exc),
+                    )
+                    return local_payload  # AUDIT-FIX(#4): Keep the usable local snapshot even when remote write-back fails.
+            return local_payload
+
         return None
 
+    def ensure_snapshot(self, *, snapshot_kind: str, payload: Mapping[str, object]) -> bool:
+        normalized_snapshot_kind = self._normalize_snapshot_kind(snapshot_kind)  # AUDIT-FIX(#6): Keep snapshot identity validation consistent across operations.
+        if not self.enabled:
+            return False
+        read_client = self._require_client(self.read_client, operation="read")
+        result = self._load_snapshot_via_uri(read_client, snapshot_kind=normalized_snapshot_kind)
+        if result.payload is not None:
+            return False
+        if result.status == "unavailable":
+            raise LongTermRemoteUnavailableError(
+                result.detail
+                or self._remote_failure_detail("read", normalized_snapshot_kind)
+            )
+        self.save_snapshot(snapshot_kind=normalized_snapshot_kind, payload=payload)
+        return True
+
     def save_snapshot(self, *, snapshot_kind: str, payload: Mapping[str, object]) -> None:
+        normalized_snapshot_kind = self._normalize_snapshot_kind(snapshot_kind)  # AUDIT-FIX(#6): Prevent malformed snapshot kinds from becoming URIs.
         if not self.enabled:
             return
         write_client = self._require_client(self.write_client, operation="write")
+        if self._circuit_is_open():  # AUDIT-FIX(#5): Fail fast while the remote circuit breaker is open.
+            raise LongTermRemoteUnavailableError(
+                "Remote long-term memory is temporarily cooling down after recent failures."
+            )
+
+        namespace = self.namespace or _REMOTE_NAMESPACE_PREFIX
         updated_at = _utcnow_iso()
+        body = _mapping_dict(payload) or {}
+        snapshot_document = {
+            "schema": _SNAPSHOT_SCHEMA,
+            "namespace": namespace,
+            "snapshot_kind": normalized_snapshot_kind,
+            "updated_at": updated_at,
+            "body": body,
+        }
+        try:  # AUDIT-FIX(#12): Reject non-JSON-safe payloads before handing them to the remote client.
+            snapshot_content = _safe_json_text(snapshot_document)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Snapshot payload must be JSON-serializable and contain only finite JSON values."
+            ) from exc
+
         record = ChonkyDBRecordRequest(
-            payload={
-                "schema": _SNAPSHOT_SCHEMA,
-                "namespace": self.namespace or _REMOTE_NAMESPACE_PREFIX,
-                "snapshot_kind": snapshot_kind,
-                "updated_at": updated_at,
-                "body": dict(payload),
-            },
+            payload=snapshot_document,
             metadata={
-                "twinr_namespace": self.namespace or _REMOTE_NAMESPACE_PREFIX,
-                "twinr_snapshot_kind": snapshot_kind,
+                "twinr_namespace": namespace,
+                "twinr_snapshot_kind": normalized_snapshot_kind,
                 "twinr_snapshot_updated_at": updated_at,
                 "twinr_snapshot_schema": _SNAPSHOT_SCHEMA,
             },
-            uri=self._snapshot_uri(snapshot_kind),
-            content=_safe_json_text(
-                {
-                    "schema": _SNAPSHOT_SCHEMA,
-                    "namespace": self.namespace or _REMOTE_NAMESPACE_PREFIX,
-                    "snapshot_kind": snapshot_kind,
-                    "updated_at": updated_at,
-                    "body": dict(payload),
-                }
-            ),
+            uri=self._snapshot_uri(normalized_snapshot_kind),
+            content=snapshot_content,
             enable_chunking=False,
             include_insights_in_response=False,
         )
-        last_error: ChonkyDBError | None = None
-        for attempt in range(self._retry_attempts()):
+        last_error: Exception | None = None
+        attempts = self._retry_attempts()
+        backoff_s = self._retry_backoff_s()
+        for attempt in range(attempts):
             try:
                 write_client.store_record(record)
+                self._note_remote_success()
                 return
-            except ChonkyDBError as exc:
+            except Exception as exc:  # AUDIT-FIX(#5): Catch all remote client failures, not only ChonkyDBError subclasses.
                 last_error = exc
-                if attempt + 1 >= self._retry_attempts():
+                self._note_remote_failure()
+                if attempt + 1 >= attempts:
                     break
-                time.sleep(self._retry_backoff_s())
+                if backoff_s > 0:
+                    time.sleep(backoff_s)
+        if last_error is not None:
+            _LOGGER.warning(
+                "Failed to write remote long-term snapshot %r: %s",
+                normalized_snapshot_kind,
+                self._safe_exception_text(last_error),
+            )
         raise LongTermRemoteUnavailableError(
-            f"Failed to write remote long-term snapshot {snapshot_kind!r}: {last_error}"
+            self._remote_failure_detail("write", normalized_snapshot_kind, exc=last_error)  # AUDIT-FIX(#8): Keep outward-facing errors generic and secret-safe.
         ) from last_error
 
     def _require_client(self, client: ChonkyDBClient | None, *, operation: str) -> ChonkyDBClient:
@@ -211,8 +437,12 @@ class LongTermRemoteStateStore:
         *,
         snapshot_kind: str,
     ) -> dict[str, object] | None:
+        namespace = self.namespace or _REMOTE_NAMESPACE_PREFIX
         for candidate in self._iter_snapshot_candidates(payload):
-            if candidate.get("namespace") != (self.namespace or _REMOTE_NAMESPACE_PREFIX):
+            schema = candidate.get("schema")
+            if schema is not None and schema != _SNAPSHOT_SCHEMA:  # AUDIT-FIX(#9): Ignore incompatible snapshot schemas instead of accepting stale/foreign records.
+                continue
+            if candidate.get("namespace") != namespace:
                 continue
             if candidate.get("snapshot_kind") != snapshot_kind:
                 continue
@@ -222,6 +452,8 @@ class LongTermRemoteStateStore:
         return None
 
     def _iter_snapshot_candidates(self, payload: Mapping[str, object]) -> Iterable[Mapping[str, object]]:
+        yield payload  # AUDIT-FIX(#9): Support direct fetch responses where the snapshot document is top-level.
+
         direct = payload.get("payload")
         if isinstance(direct, Mapping):
             yield direct
@@ -231,6 +463,11 @@ class LongTermRemoteStateStore:
             nested_payload = nested.get("payload")
             if isinstance(nested_payload, Mapping):
                 yield nested_payload
+            nested_content = nested.get("content")
+            if isinstance(nested_content, str):
+                parsed = self._parse_snapshot_content(nested_content)
+                if parsed is not None:
+                    yield parsed
 
         content = payload.get("content")
         if isinstance(content, str):
@@ -254,8 +491,11 @@ class LongTermRemoteStateStore:
 
     def _parse_snapshot_content(self, content: str) -> Mapping[str, object] | None:
         try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
+            parsed = json.loads(
+                content,
+                parse_constant=_reject_non_finite_json_constant,  # AUDIT-FIX(#12): Keep remote snapshot parsing strict and deterministic.
+            )
+        except (json.JSONDecodeError, ValueError):
             return None
         if isinstance(parsed, Mapping):
             return parsed
@@ -266,63 +506,314 @@ class LongTermRemoteStateStore:
         client: ChonkyDBClient,
         *,
         snapshot_kind: str,
+        local_path: Path | None = None,
     ) -> _RemoteSnapshotFetchResult:
-        last_error: ChonkyDBError | None = None
-        payload: Mapping[str, object] | None = None
-        for attempt in range(self._retry_attempts()):
+        if self._circuit_is_open():  # AUDIT-FIX(#5): Skip repeat remote calls while the breaker is open.
+            return _RemoteSnapshotFetchResult(
+                status="unavailable",
+                detail="Remote long-term memory is temporarily cooling down after recent failures.",
+            )
+
+        last_error: Exception | None = None
+        attempts = self._retry_attempts()
+        backoff_s = self._retry_backoff_s()
+        for attempt in range(attempts):
             try:
                 payload = client.fetch_full_document(
                     origin_uri=self._snapshot_uri(snapshot_kind),
                     include_content=True,
-                    max_content_chars=512_000,
+                    max_content_chars=self._max_content_chars(local_path=local_path),
                 )
-                break
-            except ChonkyDBError as exc:
-                if exc.status_code == 404:
+            except Exception as exc:  # AUDIT-FIX(#5): Convert all client-boundary failures into stable fetch results.
+                if isinstance(exc, ChonkyDBError) and exc.status_code == 404:
+                    self._note_remote_success()
                     return _RemoteSnapshotFetchResult(status="not_found")
                 last_error = exc
-                if attempt + 1 >= self._retry_attempts():
+                self._note_remote_failure()
+                if attempt + 1 >= attempts:
+                    _LOGGER.warning(
+                        "Failed to read remote long-term snapshot %r: %s",
+                        snapshot_kind,
+                        self._safe_exception_text(exc),
+                    )
                     return _RemoteSnapshotFetchResult(
                         status="unavailable",
-                        detail=f"Failed to read remote long-term snapshot {snapshot_kind!r}: {exc}",
+                        detail=self._remote_failure_detail("read", snapshot_kind, exc=exc),  # AUDIT-FIX(#8): Avoid surfacing raw client exception text.
                     )
-                time.sleep(self._retry_backoff_s())
-        if payload is None:
+                if backoff_s > 0:
+                    time.sleep(backoff_s)
+                continue
+
+            if not isinstance(payload, Mapping):  # AUDIT-FIX(#9): Validate response shape before treating it as a mapping.
+                self._note_remote_failure()
+                _LOGGER.warning(
+                    "Remote long-term snapshot %r returned payload type %s instead of Mapping.",
+                    snapshot_kind,
+                    type(payload).__name__,
+                )
+                return _RemoteSnapshotFetchResult(
+                    status="unavailable",
+                    detail=(
+                        f"Remote long-term snapshot {snapshot_kind!r} returned malformed content "
+                        "that Twinr could not parse."
+                    ),
+                )
+
+            self._note_remote_success()
+            direct = self._extract_snapshot_body(payload, snapshot_kind=snapshot_kind)
+            if direct is not None:
+                return _RemoteSnapshotFetchResult(status="found", payload=direct)
             return _RemoteSnapshotFetchResult(
                 status="unavailable",
-                detail=f"Failed to read remote long-term snapshot {snapshot_kind!r}: {last_error}",
+                detail=(
+                    f"Remote long-term snapshot {snapshot_kind!r} returned malformed content "
+                    "that Twinr could not parse."
+                ),
             )
-        direct = self._extract_snapshot_body(payload, snapshot_kind=snapshot_kind)
-        if direct is not None:
-            return _RemoteSnapshotFetchResult(status="found", payload=direct)
+
         return _RemoteSnapshotFetchResult(
             status="unavailable",
-            detail=(
-                f"Remote long-term snapshot {snapshot_kind!r} returned malformed content "
-                "that Twinr could not parse."
-            ),
+            detail=self._remote_failure_detail("read", snapshot_kind, exc=last_error),
         )
 
     def _snapshot_uri(self, snapshot_kind: str) -> str:
-        return f"twinr://longterm/{self.namespace or _REMOTE_NAMESPACE_PREFIX}/{snapshot_kind}"
+        namespace_segment = _encode_uri_path_segment(self.namespace or _REMOTE_NAMESPACE_PREFIX)
+        snapshot_segment = _encode_uri_path_segment(
+            self._normalize_snapshot_kind(snapshot_kind)
+        )  # AUDIT-FIX(#6): Percent-encode each URI path segment to avoid ambiguous keys.
+        return f"twinr://longterm/{namespace_segment}/{snapshot_segment}"
 
     def _retry_attempts(self) -> int:
-        return max(int(self.config.long_term_memory_remote_retry_attempts), 1)
+        return _coerce_int(
+            getattr(self.config, "long_term_memory_remote_retry_attempts", _DEFAULT_RETRY_ATTEMPTS),
+            default=_DEFAULT_RETRY_ATTEMPTS,
+            minimum=1,
+            maximum=10,
+        )  # AUDIT-FIX(#7): Clamp malformed or extreme retry configs.
 
     def _retry_backoff_s(self) -> float:
-        return max(float(self.config.long_term_memory_remote_retry_backoff_s), 0.0)
+        return _coerce_float(
+            getattr(self.config, "long_term_memory_remote_retry_backoff_s", _DEFAULT_RETRY_BACKOFF_S),
+            default=_DEFAULT_RETRY_BACKOFF_S,
+            minimum=0.0,
+            maximum=30.0,
+        )  # AUDIT-FIX(#7): Clamp invalid backoff config to sane bounds.
 
+    def _max_content_chars(self, *, local_path: Path | None) -> int:
+        cap = self._max_content_chars_cap()
+        configured = _coerce_int(
+            getattr(self.config, "long_term_memory_remote_max_content_chars", _DEFAULT_MAX_CONTENT_CHARS),
+            default=_DEFAULT_MAX_CONTENT_CHARS,
+            minimum=1,
+            maximum=cap,
+        )
+        if local_path is None:
+            return configured
+        candidate_path = self._validated_local_snapshot_path(local_path)
+        if candidate_path is None:
+            return configured
+        try:
+            path_stat = candidate_path.lstat()
+        except OSError:
+            return configured
+        if not stat.S_ISREG(path_stat.st_mode):  # AUDIT-FIX(#2): Ignore non-regular paths when sizing remote fetches.
+            return configured
+        requested = max(configured, int(path_stat.st_size) + 131_072)
+        return min(requested, cap)  # AUDIT-FIX(#3): Cap remote fetch size so oversized local files cannot pressure RPi memory.
+
+    def _max_content_chars_cap(self) -> int:
+        return _coerce_int(
+            getattr(
+                self.config,
+                "long_term_memory_remote_max_content_chars_cap",
+                _DEFAULT_MAX_CONTENT_CHARS_CAP,
+            ),
+            default=_DEFAULT_MAX_CONTENT_CHARS_CAP,
+            minimum=_DEFAULT_MAX_CONTENT_CHARS,
+            maximum=64 * 1024 * 1024,
+        )
+
+    def _local_snapshot_max_bytes(self) -> int:
+        return _coerce_int(
+            getattr(
+                self.config,
+                "long_term_memory_remote_local_snapshot_max_bytes",
+                _DEFAULT_LOCAL_SNAPSHOT_MAX_BYTES,
+            ),
+            default=_DEFAULT_LOCAL_SNAPSHOT_MAX_BYTES,
+            minimum=1,
+            maximum=64 * 1024 * 1024,
+        )
+
+    def _circuit_breaker_cooldown_s(self) -> float:
+        return _coerce_float(
+            getattr(
+                self.config,
+                "long_term_memory_remote_circuit_breaker_cooldown_s",
+                _DEFAULT_CIRCUIT_BREAKER_COOLDOWN_S,
+            ),
+            default=_DEFAULT_CIRCUIT_BREAKER_COOLDOWN_S,
+            minimum=0.0,
+            maximum=300.0,
+        )
+
+    def _circuit_is_open(self) -> bool:
+        with self._state_lock:
+            return time.monotonic() < self._circuit_open_until_monotonic
+
+    def _note_remote_success(self) -> None:
+        with self._state_lock:
+            self._consecutive_failures = 0
+            self._circuit_open_until_monotonic = 0.0
+
+    def _note_remote_failure(self) -> None:
+        cooldown_s = self._circuit_breaker_cooldown_s()
+        if cooldown_s <= 0:
+            return
+        with self._state_lock:
+            self._consecutive_failures += 1
+            multiplier = min(self._consecutive_failures, 4)
+            self._circuit_open_until_monotonic = max(
+                self._circuit_open_until_monotonic,
+                time.monotonic() + (cooldown_s * multiplier),
+            )
+
+    def _remote_failure_detail(
+        self,
+        operation: str,
+        snapshot_kind: str,
+        *,
+        exc: Exception | None = None,
+    ) -> str:
+        if exc is None:
+            return f"Failed to {operation} remote long-term snapshot {snapshot_kind!r}."
+        return f"Failed to {operation} remote long-term snapshot {snapshot_kind!r} ({type(exc).__name__})."
+
+    def _safe_exception_text(self, exc: BaseException) -> str:
+        return _redact_secrets(
+            f"{type(exc).__name__}: {exc}",
+            secrets=(self.config.chonkydb_api_key,),
+        )
+
+    def _normalize_snapshot_kind(self, snapshot_kind: str) -> str:
+        return _normalize_storage_token(
+            snapshot_kind,
+            field_name="snapshot_kind",
+            max_length=_MAX_SNAPSHOT_KIND_LENGTH,
+        )
+
+    def _validated_local_snapshot_path(self, local_path: Path) -> Path | None:
+        project_root = _safe_resolve_path(Path(self.config.project_root))
+        candidate = local_path if local_path.is_absolute() else (project_root / local_path)
+        candidate_absolute = Path(os.path.abspath(os.fspath(candidate)))
+        resolved_target = _safe_resolve_path(candidate_absolute)
+
+        configured_memory_path = Path(self.config.long_term_memory_path)
+        configured_candidate = (
+            configured_memory_path
+            if configured_memory_path.is_absolute()
+            else (project_root / configured_memory_path)
+        )
+        configured_absolute = Path(os.path.abspath(os.fspath(configured_candidate)))
+        resolved_configured_target = _safe_resolve_path(configured_absolute)
+
+        if configured_absolute.exists() and configured_absolute.is_dir():
+            allowed = resolved_target.is_relative_to(resolved_configured_target)
+        else:
+            allowed = resolved_target == resolved_configured_target
+
+        if not allowed:
+            _LOGGER.warning(
+                "Rejected local snapshot path %s because it escapes the configured Twinr memory path.",
+                candidate_absolute,
+            )
+            return None  # AUDIT-FIX(#2): Prevent traversal/symlink escapes outside the configured Twinr memory path.
+        return candidate_absolute
+
+    def _load_local_snapshot(self, local_path: Path, *, snapshot_kind: str) -> dict[str, object] | None:
+        candidate_path = self._validated_local_snapshot_path(local_path)
+        if candidate_path is None:
+            return None
+
+        open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(candidate_path, open_flags)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            _LOGGER.warning(
+                "Failed to open local snapshot fallback %s for %r: %s",
+                candidate_path,
+                snapshot_kind,
+                self._safe_exception_text(exc),
+            )
+            return None
+
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):  # AUDIT-FIX(#2): Only regular files are valid snapshot fallbacks.
+                _LOGGER.warning(
+                    "Rejected local snapshot fallback %s for %r because it is not a regular file.",
+                    candidate_path,
+                    snapshot_kind,
+                )
+                return None
+            if file_stat.st_size > self._local_snapshot_max_bytes():  # AUDIT-FIX(#3): Refuse oversized fallback files on constrained RPi hardware.
+                _LOGGER.warning(
+                    "Rejected local snapshot fallback %s for %r because it exceeds %s bytes.",
+                    candidate_path,
+                    snapshot_kind,
+                    self._local_snapshot_max_bytes(),
+                )
+                return None
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                try:
+                    payload = json.load(
+                        handle,
+                        parse_constant=_reject_non_finite_json_constant,  # AUDIT-FIX(#12): Reject non-standard JSON values in local fallback files too.
+                    )
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError) as exc:
+                    _LOGGER.warning(
+                        "Failed to parse local snapshot fallback %s for %r: %s",
+                        candidate_path,
+                        snapshot_kind,
+                        self._safe_exception_text(exc),
+                    )
+                    return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+        if not isinstance(payload, Mapping):
+            _LOGGER.warning(
+                "Rejected local snapshot fallback %s for %r because the JSON root is %s, not an object.",
+                candidate_path,
+                snapshot_kind,
+                type(payload).__name__,
+            )
+            return None
+        return dict(payload)
 
 def _remote_namespace_for_config(config: TwinrConfig) -> str:
     override = _normalize_text(config.long_term_memory_remote_namespace)
     if override:
-        return override
-    root = Path(config.project_root).resolve()
+        return _normalize_storage_token(
+            override,
+            field_name="namespace",
+            max_length=_MAX_NAMESPACE_LENGTH,
+        )  # AUDIT-FIX(#6): Validate configured namespace overrides before they become URI components.
+    root = _safe_resolve_path(Path(config.project_root))  # AUDIT-FIX(#7): Avoid crashing on odd paths or symlink loops during namespace derivation.
     memory_path = Path(config.long_term_memory_path)
     resolved_memory_path = memory_path if memory_path.is_absolute() else (root / memory_path)
-    digest = hashlib.sha1(str(resolved_memory_path.resolve()).encode("utf-8")).hexdigest()[:12]
-    stem = root.name or "twinr"
-    return f"{_REMOTE_NAMESPACE_PREFIX}:{stem}:{digest}"
+    resolved_memory_path = _safe_resolve_path(resolved_memory_path)
+    digest = hashlib.sha1(str(resolved_memory_path).encode("utf-8")).hexdigest()[:12]
+    stem = _normalize_text(root.name) or "twinr"
+    return _normalize_storage_token(
+        f"{_REMOTE_NAMESPACE_PREFIX}:{stem}:{digest}",
+        field_name="namespace",
+        max_length=_MAX_NAMESPACE_LENGTH,
+    )
 
 
 __all__ = [

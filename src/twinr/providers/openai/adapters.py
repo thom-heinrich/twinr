@@ -12,6 +12,8 @@ from twinr.agent.base_agent.contracts import (
     AgentTextProvider,
     CompositeSpeechAgentProvider,
     ConversationLike,
+    FirstWordProvider,
+    FirstWordReply,
     ProviderBundle,
     SearchResponse,
     SpeechToTextProvider,
@@ -502,6 +504,25 @@ _SUPERVISOR_DECISION_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+_FIRST_WORD_REPLY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "mode": {
+            "type": "string",
+            "enum": ["direct", "filler"],
+            "description": "direct for a tiny safe answer, filler for a tiny provisional progress line.",
+        },
+        "spoken_text": {
+            "type": "string",
+            "description": "One short user-facing spoken line.",
+        },
+    },
+    "required": ["mode", "spoken_text"],
+    "additionalProperties": False,
+}
+
+_FIRST_WORD_MODEL_FALLBACKS: tuple[str, ...] = ("gpt-4o-mini",)
+
 
 @dataclass
 class OpenAISupervisorDecisionProvider:
@@ -581,6 +602,87 @@ class OpenAISupervisorDecisionProvider:
             response_id=getattr(response, "id", None),
             request_id=getattr(response, "_request_id", None),
             model=extract_model_name(response, model),
+            token_usage=extract_token_usage(response),
+        )
+
+
+@dataclass
+class OpenAIFirstWordProvider:
+    backend: OpenAIBackend
+    model_override: str | None = None
+    reasoning_effort_override: str | None = None
+    base_instructions_override: str | None = None
+    replace_base_instructions: bool = False
+
+    @property
+    def config(self) -> TwinrConfig:
+        return self.backend.config
+
+    @config.setter
+    def config(self, value: TwinrConfig) -> None:
+        self.backend.config = value
+
+    def _resolved_model(self) -> str:
+        override = (self.model_override or "").strip()
+        if override:
+            return override
+        return self.config.streaming_first_word_model
+
+    def _resolved_reasoning_effort(self) -> str | None:
+        override = (self.reasoning_effort_override or "").strip()
+        if override:
+            return override
+        resolved = (self.config.streaming_first_word_reasoning_effort or "").strip()
+        return resolved or None
+
+    def _merged_base_instructions(self, instructions: str | None) -> str | None:
+        if self.replace_base_instructions:
+            return merge_instructions(self.base_instructions_override, instructions)
+        return merge_instructions(self.base_instructions_override, instructions)
+
+    def reply(
+        self,
+        prompt: str,
+        *,
+        conversation: ConversationLike | None = None,
+        instructions: str | None = None,
+    ) -> FirstWordReply:
+        preferred_model = self._resolved_model()
+        reasoning_effort = self._resolved_reasoning_effort()
+
+        def _call(model: str):
+            request = self.backend._build_response_request(
+                prompt,
+                conversation=conversation,
+                instructions=self._merged_base_instructions(instructions),
+                allow_web_search=False,
+                model=model,
+                reasoning_effort=reasoning_effort or "",
+                max_output_tokens=max(16, int(self.config.streaming_first_word_max_output_tokens)),
+                prompt_cache_scope="first_word",
+            )
+            request["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "twinr_first_word_reply",
+                    "schema": _FIRST_WORD_REPLY_SCHEMA,
+                    "strict": True,
+                }
+            }
+            return self.backend._client.responses.create(**request)
+
+        response, model_used = self.backend._call_with_model_fallback(
+            preferred_model,
+            _FIRST_WORD_MODEL_FALLBACKS,
+            _call,
+        )
+        payload = json.loads(self.backend._extract_output_text(response) or "{}")
+        return FirstWordReply(
+            mode=str(payload.get("mode", "filler") or "filler"),
+            spoken_text=str(payload.get("spoken_text", "") or "").strip(),
+            response_id=getattr(response, "id", None),
+            request_id=getattr(response, "_request_id", None),
+            model=extract_model_name(response, model_used),
             token_usage=extract_token_usage(response),
         )
 

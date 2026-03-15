@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
+from queue import Empty, Queue
 from shutil import which
+from threading import Event as ThreadEvent, Lock, Thread
 from typing import Iterator
 import select
 import subprocess
@@ -318,7 +319,12 @@ class GpioButtonMonitor:
         self._last_event_ns: dict[int, int] = {}
         self._last_values: dict[int, int] = {}
         self._binding_by_offset = {binding.line_offset: binding for binding in bindings}
-        self._pending_events: deque[ButtonEvent] = deque()
+        self._pending_events: Queue[ButtonEvent] = Queue()
+        self._pending_events_lock = Lock()
+        self._sampler_state_lock = Lock()
+        self._background_poll_stop: ThreadEvent | None = None
+        self._background_poll_thread: Thread | None = None
+        self._background_poll_error: Exception | None = None
         self._cli_tools: dict[str, str] = {}
 
     def _is_open(self) -> bool:
@@ -342,12 +348,14 @@ class GpioButtonMonitor:
         if _has_legacy_gpiod_api(module):
             # AUDIT-FIX(#5): Legacy gpiod path now validates bias before opening the chip to avoid leaking descriptors on config errors.
             self._open_legacy_gpiod()
+            self._start_background_sampler()
             return self
 
         # AUDIT-FIX(#4): Resolve and cache absolute CLI tool paths once, then reuse them instead of executing PATH-dependent bare names.
         self._resolve_cli_tool("gpioget")
         # AUDIT-FIX(#2): Prime the CLI fallback using the corrected gpioget invocation so failures happen during open(), not first poll().
         self._last_values = self._read_cli_values()
+        self._start_background_sampler()
         return self
 
     def _open_modern_gpiod(self) -> None:
@@ -436,14 +444,27 @@ class GpioButtonMonitor:
         request = self._request
         line_by_offset = self._line_by_offset
         chip = self._chip
+        background_poll_stop = self._background_poll_stop
+        background_poll_thread = self._background_poll_thread
 
         self._request = None
         self._request_poller = None
         self._line_by_offset = {}
         self._chip = None
+        self._background_poll_stop = None
+        self._background_poll_thread = None
+        self._background_poll_error = None
         self._last_event_ns.clear()
         self._last_values.clear()
-        self._pending_events.clear()
+        if background_poll_stop is not None:
+            background_poll_stop.set()
+        if background_poll_thread is not None and background_poll_thread.is_alive():
+            background_poll_thread.join(timeout=max(0.2, self.debounce_ms / 1000.0 + (_SAMPLE_INTERVAL_S * 4)))
+        while True:
+            try:
+                self._pending_events.get_nowait()
+            except Empty:
+                break
 
         if request is not None:
             try:
@@ -544,7 +565,7 @@ class GpioButtonMonitor:
 
             self._last_event_ns[line_offset] = timestamp_ns
             self._last_values[line_offset] = current_value
-            self._pending_events.append(
+            self._enqueue_pending_event(
                 ButtonEvent(
                     name=binding.name,
                     line_offset=line_offset,
@@ -554,37 +575,25 @@ class GpioButtonMonitor:
                 )
             )
 
-    def poll(self, timeout: float | None = None) -> ButtonEvent | None:
-        if not self._is_open():
-            self.open()
+    def _enqueue_pending_event(self, event: ButtonEvent) -> None:
+        with self._pending_events_lock:
+            self._pending_events.put_nowait(event)
 
-        if not self._last_values and self._request is None and not self._line_by_offset:
-            return None
+    def _dequeue_pending_event(self) -> ButtonEvent | None:
+        with self._pending_events_lock:
+            try:
+                return self._pending_events.get_nowait()
+            except Empty:
+                return None
 
-        normalized_timeout = _normalize_timeout(timeout)
-
-        if self._pending_events:
-            return self._pending_events.popleft()
-
-        if self._request is not None:
-            deadline = None if normalized_timeout is None else time.monotonic() + normalized_timeout
-            while True:
-                if self._pending_events:
-                    return self._pending_events.popleft()
-
-                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                if deadline is not None and remaining <= 0:
-                    return None
-
-                if not self._wait_for_request_events(remaining):
-                    return None
-                self._queue_request_events()
-
-        deadline = None if normalized_timeout is None else time.monotonic() + normalized_timeout
-
-        while True:
-            timestamp_ns = time.monotonic_ns()
-            current_values = self._read_current_values()
+    def _collect_level_change_events(
+        self,
+        *,
+        timestamp_ns: int,
+        current_values: dict[int, int],
+    ) -> list[ButtonEvent]:
+        events: list[ButtonEvent] = []
+        with self._sampler_state_lock:
             for binding in self.bindings:
                 previous_value = self._last_values.get(binding.line_offset)
                 current_value = current_values.get(binding.line_offset)
@@ -596,13 +605,102 @@ class GpioButtonMonitor:
                 self._last_event_ns[binding.line_offset] = timestamp_ns
                 self._last_values[binding.line_offset] = current_value
                 event_type = 1 if current_value > previous_value else 0
-                return ButtonEvent(
-                    name=binding.name,
-                    line_offset=binding.line_offset,
-                    action=edge_to_action(event_type, self.active_low),
-                    raw_edge=edge_name(event_type),
-                    timestamp_ns=timestamp_ns,
+                events.append(
+                    ButtonEvent(
+                        name=binding.name,
+                        line_offset=binding.line_offset,
+                        action=edge_to_action(event_type, self.active_low),
+                        raw_edge=edge_name(event_type),
+                        timestamp_ns=timestamp_ns,
+                    )
                 )
+        return events
+
+    def _background_sampling_enabled(self) -> bool:
+        return self._request is None and (bool(self._line_by_offset) or bool(self._cli_tools))
+
+    def _start_background_sampler(self) -> None:
+        if not self._background_sampling_enabled():
+            return
+        if self._background_poll_thread is not None:
+            return
+        stop_event = ThreadEvent()
+        self._background_poll_stop = stop_event
+        self._background_poll_error = None
+        self._background_poll_thread = Thread(
+            target=self._background_poll_worker,
+            name=f"{self.consumer}-sampler",
+            daemon=True,
+        )
+        self._background_poll_thread.start()
+
+    def _background_poll_worker(self) -> None:
+        stop_event = self._background_poll_stop
+        if stop_event is None:
+            return
+        try:
+            while not stop_event.wait(_SAMPLE_INTERVAL_S):
+                timestamp_ns = time.monotonic_ns()
+                current_values = self._read_current_values()
+                for event in self._collect_level_change_events(
+                    timestamp_ns=timestamp_ns,
+                    current_values=current_values,
+                ):
+                    self._enqueue_pending_event(event)
+        except Exception as exc:
+            self._background_poll_error = exc
+
+    def poll(self, timeout: float | None = None) -> ButtonEvent | None:
+        if not self._is_open():
+            self.open()
+
+        if not self._last_values and self._request is None and not self._line_by_offset:
+            return None
+
+        normalized_timeout = _normalize_timeout(timeout)
+
+        queued_event = self._dequeue_pending_event()
+        if queued_event is not None:
+            return queued_event
+
+        if self._request is not None:
+            deadline = None if normalized_timeout is None else time.monotonic() + normalized_timeout
+            while True:
+                queued_event = self._dequeue_pending_event()
+                if queued_event is not None:
+                    return queued_event
+
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                if deadline is not None and remaining <= 0:
+                    return None
+
+                if not self._wait_for_request_events(remaining):
+                    return None
+                self._queue_request_events()
+
+        if self._background_poll_thread is not None:
+            if self._background_poll_error is not None:
+                raise RuntimeError("Legacy GPIO button sampler failed") from self._background_poll_error
+            if normalized_timeout == 0.0:
+                return self._dequeue_pending_event()
+            try:
+                return self._pending_events.get(timeout=normalized_timeout)
+            except Empty:
+                if self._background_poll_error is not None:
+                    raise RuntimeError("Legacy GPIO button sampler failed") from self._background_poll_error
+                return None
+
+        deadline = None if normalized_timeout is None else time.monotonic() + normalized_timeout
+
+        while True:
+            timestamp_ns = time.monotonic_ns()
+            current_values = self._read_current_values()
+            events = self._collect_level_change_events(
+                timestamp_ns=timestamp_ns,
+                current_values=current_values,
+            )
+            if events:
+                return events[0]
 
             if deadline is not None and time.monotonic() >= deadline:
                 return None

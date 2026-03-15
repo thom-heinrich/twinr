@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from twinr.agent.base_agent.adaptive_timing import AdaptiveListeningWindow, AdaptiveTimingProfile
 from twinr.agent.base_agent.language import memory_and_response_contract
 from twinr.memory import LongTermMemoryService, TwinrPersonalGraphStore
+from twinr.memory.longterm.remote_state import LongTermRemoteUnavailableError
 from twinr.proactive import ProactiveGovernor
 
 
@@ -104,13 +105,20 @@ class TwinrRuntimeContextMixin:
                 return
 
     @staticmethod
-    def _parse_aware_utc_datetime(value: str | None) -> datetime | None:
-        raw = (value or "").strip()
-        if not raw:
+    def _parse_aware_utc_datetime(value: object | None) -> datetime | None:
+        if value is None:
             return None
-        try:
-            parsed = datetime.fromisoformat(raw)
-        except ValueError:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            try:
+                parsed = datetime.fromisoformat(raw)
+            except ValueError:
+                return None
+        else:
             return None
         if parsed.tzinfo is None:
             # AUDIT-FIX(#2): Reject timezone-naive timestamps so voice-trust freshness cannot drift on DST/local clock assumptions.
@@ -140,7 +148,7 @@ class TwinrRuntimeContextMixin:
         # AUDIT-FIX(#7): Clamp confidence to a real percentage range before it influences provider authorization guidance.
         return max(0.0, min(1.0, value))
 
-    def _normalize_checked_at(self, checked_at: str | None) -> str | None:
+    def _normalize_checked_at(self, checked_at: object | None) -> str | None:
         parsed = self._parse_aware_utc_datetime(checked_at)
         if parsed is None:
             return None
@@ -243,6 +251,16 @@ class TwinrRuntimeContextMixin:
                 )
                 for context_message in context_builder.system_messages():
                     messages.append(("system", str(context_message)))
+            except LongTermRemoteUnavailableError as exc:
+                self._safe_append_ops_event(
+                    event="provider_context_memory_failed",
+                    message="Twinr could not build provider context because required remote long-term memory is unavailable.",
+                    data={
+                        "error_type": type(exc).__name__,
+                        "tool_context": tool_context,
+                    },
+                )
+                raise
             except Exception as exc:
                 # AUDIT-FIX(#4): Long-term-memory failure should degrade to short-term context, not crash the turn.
                 self._safe_append_ops_event(
@@ -283,6 +301,29 @@ class TwinrRuntimeContextMixin:
 
             messages.extend(
                 self._raw_tail_context_unlocked(limit=max(int(self.config.streaming_supervisor_context_turns), 0))
+            )
+            return tuple(messages)
+
+    def first_word_provider_conversation_context(self) -> tuple[tuple[str, str], ...]:
+        with self._runtime_context_lock():
+            messages: list[tuple[str, str]] = []
+            try:
+                contract = memory_and_response_contract(self.config.openai_realtime_language)
+            except Exception as exc:
+                self._safe_append_ops_event(
+                    event="first_word_context_contract_failed",
+                    message="Twinr could not build the first-word language contract and continued with reduced context.",
+                    data={"error_type": type(exc).__name__},
+                )
+            else:
+                messages.append(("system", contract))
+
+            guidance = self._voice_guidance_message()
+            if guidance:
+                messages.append(("system", guidance))
+
+            messages.extend(
+                self._raw_tail_context_unlocked(limit=max(int(self.config.streaming_first_word_context_turns), 0))
             )
             return tuple(messages)
 
@@ -337,6 +378,7 @@ class TwinrRuntimeContextMixin:
                     config,
                     graph_store=new_graph_memory,
                 )
+                new_long_term_memory.ensure_remote_ready()
                 new_proactive_governor = ProactiveGovernor.from_config(config)
                 new_adaptive_timing_store = old_adaptive_timing_store.__class__(
                     config.adaptive_timing_store_path,

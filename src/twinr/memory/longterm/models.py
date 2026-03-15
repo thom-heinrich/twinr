@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Mapping
+from types import MappingProxyType
+from typing import Callable, Mapping, TypeVar, cast
 
 from twinr.memory.longterm.ontology import (
     LONGTERM_MEMORY_SENSITIVITIES,
@@ -52,28 +54,329 @@ LONGTERM_MEMORY_STATUSES = frozenset(
 LONGTERM_MEMORY_SENSITIVITY = LONGTERM_MEMORY_SENSITIVITIES
 
 
+_T = TypeVar("_T")
+_MISSING = object()
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _normalize_text(value: str | None) -> str:
-    return " ".join(str(value or "").split()).strip()
+def _normalize_text(value: object | None) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).split()).strip()
 
 
 def _drop_none(payload: dict[str, object]) -> dict[str, object]:
     return {key: value for key, value in payload.items() if value is not None}
 
 
+# AUDIT-FIX(#3): Freeze nested JSON-like state so frozen dataclasses stay effectively immutable.
+def _freeze_jsonish(value: object) -> object:
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("mapping keys must be strings.")
+            frozen[key] = _freeze_jsonish(item)
+        return MappingProxyType(frozen)
+    if isinstance(value, list):
+        return tuple(_freeze_jsonish(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_jsonish(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze_jsonish(item) for item in value)
+    if isinstance(value, frozenset):
+        return frozenset(_freeze_jsonish(item) for item in value)
+    return deepcopy(value)
+
+
+def _thaw_jsonish(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_jsonish(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_jsonish(item) for item in value]
+    if isinstance(value, frozenset):
+        return [_thaw_jsonish(item) for item in value]
+    return deepcopy(value)
+
+
 def _mapping_dict(value: Mapping[str, object] | None) -> dict[str, object] | None:
     if value is None:
         return None
-    return dict(value)
+    if not isinstance(value, Mapping):
+        raise ValueError("value must be a mapping.")
+    return cast(dict[str, object], _thaw_jsonish(value))
 
 
-def _tuple_str(value: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
-    if not value:
-        return ()
-    return tuple(str(item) for item in value if str(item).strip())
+def _freeze_mapping(value: Mapping[str, object] | None, *, field_name: str) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be a mapping.")
+    return cast(Mapping[str, object], _freeze_jsonish(dict(value)))
+
+
+# AUDIT-FIX(#4): Reject silent None/"None"/type coercions at the persistence boundary.
+def _require_str(value: object, *, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string.")
+    if not _normalize_text(value):
+        raise ValueError(f"{field_name} is required.")
+    return value
+
+
+def _optional_str(
+    value: object | None,
+    *,
+    field_name: str,
+    blank_to_none: bool = False,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string when provided.")
+    if not _normalize_text(value):
+        if blank_to_none:
+            return None
+        raise ValueError(f"{field_name} cannot be blank when provided.")
+    return value
+
+
+def _payload_value(payload: Mapping[str, object], key: str) -> object:
+    if key in payload:
+        return payload[key]
+    return _MISSING
+
+
+def _payload_required_str(payload: Mapping[str, object], key: str) -> str:
+    value = _payload_value(payload, key)
+    if value is _MISSING or value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string.")
+    return value
+
+
+def _payload_optional_str(
+    payload: Mapping[str, object],
+    key: str,
+    *,
+    default: str | None = None,
+    blank_to_none: bool = False,
+) -> str | None:
+    value = _payload_value(payload, key)
+    if value is _MISSING or value is None:
+        return default
+    return _optional_str(value, field_name=key, blank_to_none=blank_to_none)
+
+
+# AUDIT-FIX(#1): Avoid bool("false") == True when hydrating persisted payloads.
+def _coerce_bool(value: object, *, field_name: str, default: bool = False) -> bool:
+    if value is _MISSING or value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off", ""}:
+            return False
+    raise ValueError(f"{field_name} must be a boolean.")
+
+
+def _coerce_float(value: object, *, field_name: str, default: float | None = None) -> float:
+    if value is _MISSING or value is None:
+        if default is not None:
+            return default
+        raise ValueError(f"{field_name} is required.")
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a float.")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            if default is not None:
+                return default
+            raise ValueError(f"{field_name} is required.")
+        try:
+            return float(text)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be a float.") from exc
+    raise ValueError(f"{field_name} must be a float.")
+
+
+def _coerce_int(value: object, *, field_name: str, default: int | None = None) -> int:
+    if value is _MISSING or value is None:
+        if default is not None:
+            return default
+        raise ValueError(f"{field_name} is required.")
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer.")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            if default is not None:
+                return default
+            raise ValueError(f"{field_name} is required.")
+        try:
+            return int(text)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be an integer.") from exc
+    raise ValueError(f"{field_name} must be an integer.")
+
+
+# AUDIT-FIX(#6): Guard negative or impossible count fields before they poison queue/review state.
+def _coerce_non_negative_int(value: object, *, field_name: str) -> int:
+    coerced = _coerce_int(value, field_name=field_name)
+    if coerced < 0:
+        raise ValueError(f"{field_name} cannot be negative.")
+    return coerced
+
+
+# AUDIT-FIX(#2): Canonicalize naive/aware datetimes to timezone-aware UTC for DST-safe comparisons.
+def _coerce_datetime(
+    value: object,
+    *,
+    field_name: str,
+    default: datetime | None = None,
+) -> datetime:
+    if value is _MISSING or value is None:
+        if default is not None:
+            return default
+        raise ValueError(f"{field_name} is required.")
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            if default is not None:
+                return default
+            raise ValueError(f"{field_name} is required.")
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be an ISO-8601 datetime.") from exc
+    else:
+        raise ValueError(f"{field_name} must be a datetime or ISO-8601 string.")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+# AUDIT-FIX(#7): Normalize tuple-like fields consistently and reject non-string members early.
+def _coerce_str_tuple(
+    value: object | None,
+    *,
+    field_name: str,
+    allow_empty: bool = True,
+) -> tuple[str, ...]:
+    if value is None:
+        result: tuple[str, ...] = ()
+    elif isinstance(value, (list, tuple)):
+        items: list[str] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, str):
+                raise ValueError(f"{field_name}[{index}] must be a string.")
+            if not _normalize_text(item):
+                raise ValueError(f"{field_name}[{index}] cannot be blank.")
+            items.append(item)
+        result = tuple(items)
+    else:
+        raise ValueError(f"{field_name} must be a list or tuple of strings.")
+    if not result and not allow_empty:
+        raise ValueError(f"{field_name} cannot be empty.")
+    return result
+
+
+def _coerce_instance(value: object, field_name: str, cls: type[_T]) -> _T:
+    if isinstance(value, cls):
+        return value
+    raise ValueError(f"{field_name} must be a {cls.__name__}.")
+
+
+def _coerce_tuple(
+    value: object | None,
+    *,
+    field_name: str,
+    item_name: str,
+    item_coercer: Callable[[object, str], _T],
+    allow_empty: bool = True,
+) -> tuple[_T, ...]:
+    if value is None:
+        result: tuple[_T, ...] = ()
+    elif isinstance(value, (list, tuple)):
+        result = tuple(item_coercer(item, f"{field_name}[{index}]") for index, item in enumerate(value))
+    else:
+        raise ValueError(f"{field_name} must be a list or tuple of {item_name}.")
+    if not result and not allow_empty:
+        raise ValueError(f"{field_name} cannot be empty.")
+    return result
+
+
+# AUDIT-FIX(#8): Enforce schema/version invariants on every versioned model path.
+def _validate_schema_version(
+    *,
+    schema: object,
+    expected_schema: str,
+    version: object,
+    expected_version: int,
+) -> None:
+    if not isinstance(schema, str):
+        raise ValueError("schema must be a string.")
+    if schema != expected_schema:
+        raise ValueError(f"schema must be {expected_schema!r}.")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError("version must be an integer.")
+    if version != expected_version:
+        raise ValueError(f"version must be {expected_version}.")
+
+
+def _coerce_source_ref(value: object, field_name: str) -> "LongTermSourceRefV1":
+    if isinstance(value, LongTermSourceRefV1):
+        return value
+    if isinstance(value, Mapping):
+        return LongTermSourceRefV1.from_payload(value)
+    raise ValueError(f"{field_name} must be a LongTermSourceRefV1 or mapping.")
+
+
+def _coerce_memory_object(value: object, field_name: str) -> "LongTermMemoryObjectV1":
+    if isinstance(value, LongTermMemoryObjectV1):
+        return value
+    if isinstance(value, Mapping):
+        return LongTermMemoryObjectV1.from_payload(value)
+    raise ValueError(f"{field_name} must be a LongTermMemoryObjectV1 or mapping.")
+
+
+def _coerce_graph_edge(value: object, field_name: str) -> "LongTermGraphEdgeCandidateV1":
+    return _coerce_instance(value, field_name, LongTermGraphEdgeCandidateV1)
+
+
+def _coerce_conflict(value: object, field_name: str) -> "LongTermMemoryConflictV1":
+    return _coerce_instance(value, field_name, LongTermMemoryConflictV1)
+
+
+def _coerce_midterm_packet(value: object, field_name: str) -> "LongTermMidtermPacketV1":
+    if isinstance(value, LongTermMidtermPacketV1):
+        return value
+    if isinstance(value, Mapping):
+        return LongTermMidtermPacketV1.from_payload(value)
+    raise ValueError(f"{field_name} must be a LongTermMidtermPacketV1 or mapping.")
+
+
+def _coerce_proactive_candidate(value: object, field_name: str) -> "LongTermProactiveCandidateV1":
+    return _coerce_instance(value, field_name, LongTermProactiveCandidateV1)
+
+
+def _coerce_conflict_option(value: object, field_name: str) -> "LongTermConflictOptionV1":
+    return _coerce_instance(value, field_name, LongTermConflictOptionV1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,12 +386,28 @@ class LongTermConversationTurn:
     source: str = "conversation"
     created_at: datetime = field(default_factory=_utcnow)
 
+    def __post_init__(self) -> None:
+        # AUDIT-FIX(#4): Refuse non-string conversation fields instead of silently stringifying them later.
+        if not isinstance(self.transcript, str):
+            raise ValueError("transcript must be a string.")
+        if not isinstance(self.response, str):
+            raise ValueError("response must be a string.")
+        object.__setattr__(self, "source", _require_str(self.source, field_name="source"))
+        # AUDIT-FIX(#2): Keep direct-construction timestamps comparable with persisted UTC timestamps.
+        object.__setattr__(self, "created_at", _coerce_datetime(self.created_at, field_name="created_at"))
+
 
 @dataclass(frozen=True, slots=True)
 class LongTermEnqueueResult:
     accepted: bool
     pending_count: int
     dropped_count: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "accepted", _coerce_bool(self.accepted, field_name="accepted"))
+        # AUDIT-FIX(#6): Prevent impossible negative queue counters.
+        object.__setattr__(self, "pending_count", _coerce_non_negative_int(self.pending_count, field_name="pending_count"))
+        object.__setattr__(self, "dropped_count", _coerce_non_negative_int(self.dropped_count, field_name="dropped_count"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,16 +422,20 @@ class LongTermMultimodalEvidence:
     version: int = LONGTERM_MULTIMODAL_EVIDENCE_VERSION
 
     def __post_init__(self) -> None:
-        if not _normalize_text(self.event_name):
-            raise ValueError("event_name is required.")
-        if not _normalize_text(self.modality):
-            raise ValueError("modality is required.")
-        if not _normalize_text(self.source):
-            raise ValueError("source is required.")
-        if self.schema != LONGTERM_MULTIMODAL_EVIDENCE_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_MULTIMODAL_EVIDENCE_SCHEMA!r}.")
-        if self.version != LONGTERM_MULTIMODAL_EVIDENCE_VERSION:
-            raise ValueError(f"version must be {LONGTERM_MULTIMODAL_EVIDENCE_VERSION}.")
+        object.__setattr__(self, "event_name", _require_str(self.event_name, field_name="event_name"))
+        object.__setattr__(self, "modality", _require_str(self.modality, field_name="modality"))
+        object.__setattr__(self, "source", _require_str(self.source, field_name="source"))
+        object.__setattr__(self, "message", _optional_str(self.message, field_name="message", blank_to_none=True))
+        # AUDIT-FIX(#3): Detach caller-owned evidence payloads from frozen dataclass instances.
+        object.__setattr__(self, "data", _freeze_mapping(self.data, field_name="data"))
+        # AUDIT-FIX(#2): Normalize evidence timestamps to aware UTC.
+        object.__setattr__(self, "created_at", _coerce_datetime(self.created_at, field_name="created_at"))
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_MULTIMODAL_EVIDENCE_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_MULTIMODAL_EVIDENCE_VERSION,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,12 +472,11 @@ class LongTermSourceRefV1:
     modality: str | None = None
 
     def __post_init__(self) -> None:
-        if not _normalize_text(self.source_type):
-            raise ValueError("source_type is required.")
-        if self.speaker is not None and not _normalize_text(self.speaker):
-            raise ValueError("speaker cannot be blank when provided.")
-        if self.modality is not None and not _normalize_text(self.modality):
-            raise ValueError("modality cannot be blank when provided.")
+        object.__setattr__(self, "source_type", _require_str(self.source_type, field_name="source_type"))
+        # AUDIT-FIX(#7): Accept tuple/list inputs consistently and preserve IDs instead of silently dropping tuple-form input.
+        object.__setattr__(self, "event_ids", _coerce_str_tuple(self.event_ids, field_name="event_ids"))
+        object.__setattr__(self, "speaker", _optional_str(self.speaker, field_name="speaker"))
+        object.__setattr__(self, "modality", _optional_str(self.modality, field_name="modality"))
 
     def to_payload(self) -> dict[str, object]:
         return _drop_none(
@@ -168,12 +490,12 @@ class LongTermSourceRefV1:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "LongTermSourceRefV1":
-        event_ids = payload.get("event_ids")
+        # AUDIT-FIX(#4): Treat nulls as missing instead of stringifying them into the literal "None".
         return cls(
-            source_type=str(payload.get("type", "")),
-            event_ids=tuple(str(item) for item in event_ids if isinstance(item, str)) if isinstance(event_ids, list) else (),
-            speaker=str(payload["speaker"]) if payload.get("speaker") is not None else None,
-            modality=str(payload["modality"]) if payload.get("modality") is not None else None,
+            source_type=_payload_required_str(payload, "type"),
+            event_ids=_coerce_str_tuple(payload.get("event_ids"), field_name="event_ids"),
+            speaker=_payload_optional_str(payload, "speaker"),
+            modality=_payload_optional_str(payload, "modality"),
         )
 
 
@@ -189,12 +511,15 @@ class LongTermGraphEdgeCandidateV1:
     attributes: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
-        if not _normalize_text(self.source_ref):
-            raise ValueError("source_ref is required.")
-        if not _normalize_text(self.edge_type):
-            raise ValueError("edge_type is required.")
-        if not _normalize_text(self.target_ref):
-            raise ValueError("target_ref is required.")
+        object.__setattr__(self, "source_ref", _require_str(self.source_ref, field_name="source_ref"))
+        object.__setattr__(self, "edge_type", _require_str(self.edge_type, field_name="edge_type"))
+        object.__setattr__(self, "target_ref", _require_str(self.target_ref, field_name="target_ref"))
+        object.__setattr__(self, "confidence", _coerce_float(self.confidence, field_name="confidence"))
+        object.__setattr__(self, "confirmed_by_user", _coerce_bool(self.confirmed_by_user, field_name="confirmed_by_user"))
+        object.__setattr__(self, "valid_from", _optional_str(self.valid_from, field_name="valid_from", blank_to_none=True))
+        object.__setattr__(self, "valid_to", _optional_str(self.valid_to, field_name="valid_to", blank_to_none=True))
+        # AUDIT-FIX(#3): Freeze graph-edge attributes to avoid caller-side mutation races.
+        object.__setattr__(self, "attributes", _freeze_mapping(self.attributes, field_name="attributes"))
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be between 0.0 and 1.0.")
 
@@ -239,25 +564,45 @@ class LongTermMemoryObjectV1:
     version: int = LONGTERM_MEMORY_OBJECT_VERSION
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(self.sensitivity))
-        if not _normalize_text(self.memory_id):
-            raise ValueError("memory_id is required.")
-        if not _normalize_text(self.kind):
-            raise ValueError("kind is required.")
-        if not _normalize_text(self.summary):
-            raise ValueError("summary is required.")
+        # AUDIT-FIX(#3): Enforce constructor invariants, canonicalize ontology data, and detach nested mutable state.
+        object.__setattr__(self, "memory_id", _require_str(self.memory_id, field_name="memory_id"))
+        object.__setattr__(self, "summary", _require_str(self.summary, field_name="summary"))
+        object.__setattr__(self, "source", _coerce_source_ref(self.source, field_name="source"))
+        frozen_attributes = _freeze_mapping(self.attributes, field_name="attributes")
+        normalized_kind, normalized_attributes = normalize_memory_kind(
+            _require_str(self.kind, field_name="kind"),
+            _mapping_dict(frozen_attributes),
+        )
+        object.__setattr__(self, "kind", normalized_kind)
+        object.__setattr__(self, "attributes", _freeze_mapping(normalized_attributes or None, field_name="attributes"))
+        object.__setattr__(self, "details", _optional_str(self.details, field_name="details", blank_to_none=True))
+        object.__setattr__(self, "status", _require_str(self.status, field_name="status"))
+        object.__setattr__(self, "confidence", _coerce_float(self.confidence, field_name="confidence"))
+        object.__setattr__(self, "canonical_language", _require_str(self.canonical_language, field_name="canonical_language"))
+        object.__setattr__(self, "confirmed_by_user", _coerce_bool(self.confirmed_by_user, field_name="confirmed_by_user"))
+        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(_require_str(self.sensitivity, field_name="sensitivity")))
+        object.__setattr__(self, "slot_key", _optional_str(self.slot_key, field_name="slot_key", blank_to_none=True))
+        object.__setattr__(self, "value_key", _optional_str(self.value_key, field_name="value_key", blank_to_none=True))
+        object.__setattr__(self, "valid_from", _optional_str(self.valid_from, field_name="valid_from", blank_to_none=True))
+        object.__setattr__(self, "valid_to", _optional_str(self.valid_to, field_name="valid_to", blank_to_none=True))
+        object.__setattr__(self, "archived_at", _optional_str(self.archived_at, field_name="archived_at", blank_to_none=True))
+        object.__setattr__(self, "conflicts_with", _coerce_str_tuple(self.conflicts_with, field_name="conflicts_with"))
+        object.__setattr__(self, "supersedes", _coerce_str_tuple(self.supersedes, field_name="supersedes"))
+        # AUDIT-FIX(#2): Force all memory timestamps onto aware UTC to avoid naive/aware comparison crashes.
+        object.__setattr__(self, "created_at", _coerce_datetime(self.created_at, field_name="created_at"))
+        object.__setattr__(self, "updated_at", _coerce_datetime(self.updated_at, field_name="updated_at"))
         if self.status not in LONGTERM_MEMORY_STATUSES:
             raise ValueError(f"status must be one of: {', '.join(sorted(LONGTERM_MEMORY_STATUSES))}.")
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be between 0.0 and 1.0.")
-        if not _normalize_text(self.canonical_language):
-            raise ValueError("canonical_language is required.")
         if self.sensitivity not in LONGTERM_MEMORY_SENSITIVITY:
             raise ValueError(f"sensitivity must be one of: {', '.join(sorted(LONGTERM_MEMORY_SENSITIVITY))}.")
-        if self.schema != LONGTERM_MEMORY_OBJECT_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_MEMORY_OBJECT_SCHEMA!r}.")
-        if self.version != LONGTERM_MEMORY_OBJECT_VERSION:
-            raise ValueError(f"version must be {LONGTERM_MEMORY_OBJECT_VERSION}.")
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_MEMORY_OBJECT_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_MEMORY_OBJECT_VERSION,
+        )
 
     def to_payload(self) -> dict[str, object]:
         return _drop_none(
@@ -293,48 +638,52 @@ class LongTermMemoryObjectV1:
         if not isinstance(source_payload, Mapping):
             raise ValueError("source payload is required.")
         attributes = payload.get("attributes")
+        if attributes is not None and not isinstance(attributes, Mapping):
+            raise ValueError("attributes must be a mapping when provided.")
         normalized_kind, normalized_attributes = normalize_memory_kind(
-            str(payload.get("kind", "")),
+            _payload_required_str(payload, "kind"),
             dict(attributes) if isinstance(attributes, Mapping) else None,
         )
         return cls(
-            memory_id=str(payload.get("memory_id", "")),
+            memory_id=_payload_required_str(payload, "memory_id"),
             kind=normalized_kind,
-            summary=str(payload.get("summary", "")),
+            summary=_payload_required_str(payload, "summary"),
             source=LongTermSourceRefV1.from_payload(source_payload),
-            details=str(payload["details"]) if payload.get("details") is not None else None,
-            status=str(payload.get("status", "candidate")),
-            confidence=float(payload.get("confidence", 0.5)),
-            canonical_language=str(payload.get("canonical_language", "en")),
-            confirmed_by_user=bool(payload.get("confirmed_by_user", False)),
-            sensitivity=normalize_memory_sensitivity(str(payload.get("sensitivity", "normal"))),
-            slot_key=str(payload["slot_key"]) if payload.get("slot_key") is not None else None,
-            value_key=str(payload["value_key"]) if payload.get("value_key") is not None else None,
-            valid_from=str(payload["valid_from"]) if payload.get("valid_from") is not None else None,
-            valid_to=str(payload["valid_to"]) if payload.get("valid_to") is not None else None,
-            archived_at=str(payload["archived_at"]) if payload.get("archived_at") is not None else None,
-            created_at=datetime.fromisoformat(str(payload["created_at"])) if payload.get("created_at") else _utcnow(),
-            updated_at=datetime.fromisoformat(str(payload["updated_at"])) if payload.get("updated_at") else _utcnow(),
+            details=_payload_optional_str(payload, "details", blank_to_none=True),
+            status=cast(str, _payload_optional_str(payload, "status", default="candidate")),
+            confidence=_coerce_float(payload.get("confidence", 0.5), field_name="confidence", default=0.5),
+            canonical_language=cast(str, _payload_optional_str(payload, "canonical_language", default="en")),
+            # AUDIT-FIX(#1): Parse persisted booleans strictly so "false" does not become True.
+            confirmed_by_user=_coerce_bool(payload.get("confirmed_by_user", False), field_name="confirmed_by_user", default=False),
+            sensitivity=normalize_memory_sensitivity(cast(str, _payload_optional_str(payload, "sensitivity", default="normal"))),
+            slot_key=_payload_optional_str(payload, "slot_key", blank_to_none=True),
+            value_key=_payload_optional_str(payload, "value_key", blank_to_none=True),
+            valid_from=_payload_optional_str(payload, "valid_from", blank_to_none=True),
+            valid_to=_payload_optional_str(payload, "valid_to", blank_to_none=True),
+            archived_at=_payload_optional_str(payload, "archived_at", blank_to_none=True),
+            # AUDIT-FIX(#2): Salvage legacy naive timestamps by interpreting them as UTC and normalizing them.
+            created_at=_coerce_datetime(payload.get("created_at", _MISSING), field_name="created_at", default=_utcnow()),
+            updated_at=_coerce_datetime(payload.get("updated_at", _MISSING), field_name="updated_at", default=_utcnow()),
             attributes=normalized_attributes or None,
-            conflicts_with=_tuple_str(
-                payload.get("conflicts_with")
-                if isinstance(payload.get("conflicts_with"), (list, tuple))
-                else None
-            ),
-            supersedes=_tuple_str(
-                payload.get("supersedes")
-                if isinstance(payload.get("supersedes"), (list, tuple))
-                else None
-            ),
-            schema=str(payload.get("schema", LONGTERM_MEMORY_OBJECT_SCHEMA)),
-            version=int(payload.get("version", LONGTERM_MEMORY_OBJECT_VERSION)),
+            conflicts_with=_coerce_str_tuple(payload.get("conflicts_with"), field_name="conflicts_with"),
+            supersedes=_coerce_str_tuple(payload.get("supersedes"), field_name="supersedes"),
+            schema=cast(str, _payload_optional_str(payload, "schema", default=LONGTERM_MEMORY_OBJECT_SCHEMA)),
+            version=_coerce_int(payload.get("version", LONGTERM_MEMORY_OBJECT_VERSION), field_name="version", default=LONGTERM_MEMORY_OBJECT_VERSION),
         )
 
     def with_updates(self, **changes: object) -> "LongTermMemoryObjectV1":
         payload = self.to_payload()
-        payload.update(changes)
-        if "source" not in payload or not isinstance(payload["source"], Mapping):
+        normalized_changes = dict(changes)
+        # AUDIT-FIX(#5): Accept LongTermSourceRefV1 updates directly instead of silently discarding them.
+        if isinstance(normalized_changes.get("source"), LongTermSourceRefV1):
+            normalized_changes["source"] = cast(LongTermSourceRefV1, normalized_changes["source"]).to_payload()
+        payload.update(normalized_changes)
+        if "source" not in payload:
             payload["source"] = self.source.to_payload()
+        elif isinstance(payload["source"], LongTermSourceRefV1):
+            payload["source"] = cast(LongTermSourceRefV1, payload["source"]).to_payload()
+        elif not isinstance(payload["source"], Mapping):
+            raise ValueError("source must be a LongTermSourceRefV1 or mapping.")
         if "created_at" in payload and isinstance(payload["created_at"], datetime):
             payload["created_at"] = payload["created_at"].isoformat()
         if "updated_at" in payload and isinstance(payload["updated_at"], datetime):
@@ -342,8 +691,8 @@ class LongTermMemoryObjectV1:
         return LongTermMemoryObjectV1.from_payload(payload)
 
     def canonicalized(self) -> "LongTermMemoryObjectV1":
-        normalized_kind, normalized_attributes = normalize_memory_kind(self.kind, self.attributes)
-        current_attributes = dict(self.attributes or {})
+        normalized_kind, normalized_attributes = normalize_memory_kind(self.kind, _mapping_dict(self.attributes))
+        current_attributes = _mapping_dict(self.attributes) or {}
         if normalized_kind == self.kind and normalized_attributes == current_attributes:
             return self
         return self.with_updates(
@@ -363,16 +712,18 @@ class LongTermMemoryConflictV1:
     version: int = LONGTERM_MEMORY_CONFLICT_VERSION
 
     def __post_init__(self) -> None:
-        if not _normalize_text(self.slot_key):
-            raise ValueError("slot_key is required.")
-        if not _normalize_text(self.candidate_memory_id):
-            raise ValueError("candidate_memory_id is required.")
-        if not self.existing_memory_ids:
-            raise ValueError("existing_memory_ids cannot be empty.")
-        if not _normalize_text(self.question):
-            raise ValueError("question is required.")
-        if not _normalize_text(self.reason):
-            raise ValueError("reason is required.")
+        object.__setattr__(self, "slot_key", _require_str(self.slot_key, field_name="slot_key"))
+        object.__setattr__(self, "candidate_memory_id", _require_str(self.candidate_memory_id, field_name="candidate_memory_id"))
+        object.__setattr__(self, "existing_memory_ids", _coerce_str_tuple(self.existing_memory_ids, field_name="existing_memory_ids", allow_empty=False))
+        object.__setattr__(self, "question", _require_str(self.question, field_name="question"))
+        object.__setattr__(self, "reason", _require_str(self.reason, field_name="reason"))
+        # AUDIT-FIX(#8): This versioned model now rejects schema/version mismatches like its peers.
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_MEMORY_CONFLICT_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_MEMORY_CONFLICT_VERSION,
+        )
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -398,12 +749,38 @@ class LongTermTurnExtractionV1:
     version: int = LONGTERM_TURN_EXTRACTION_VERSION
 
     def __post_init__(self) -> None:
-        if not _normalize_text(self.turn_id):
-            raise ValueError("turn_id is required.")
-        if self.schema != LONGTERM_TURN_EXTRACTION_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_TURN_EXTRACTION_SCHEMA!r}.")
-        if self.version != LONGTERM_TURN_EXTRACTION_VERSION:
-            raise ValueError(f"version must be {LONGTERM_TURN_EXTRACTION_VERSION}.")
+        object.__setattr__(self, "turn_id", _require_str(self.turn_id, field_name="turn_id"))
+        # AUDIT-FIX(#3): Fail early on wrong nested types instead of crashing later during serialization/use.
+        object.__setattr__(self, "episode", _coerce_memory_object(self.episode, field_name="episode"))
+        object.__setattr__(
+            self,
+            "candidate_objects",
+            _coerce_tuple(
+                self.candidate_objects,
+                field_name="candidate_objects",
+                item_name="LongTermMemoryObjectV1",
+                item_coercer=_coerce_memory_object,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "graph_edges",
+            _coerce_tuple(
+                self.graph_edges,
+                field_name="graph_edges",
+                item_name="LongTermGraphEdgeCandidateV1",
+                item_coercer=_coerce_graph_edge,
+            ),
+        )
+        object.__setattr__(self, "warnings", _coerce_str_tuple(self.warnings, field_name="warnings"))
+        # AUDIT-FIX(#2): Keep extraction timestamps UTC-normalized.
+        object.__setattr__(self, "occurred_at", _coerce_datetime(self.occurred_at, field_name="occurred_at"))
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_TURN_EXTRACTION_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_TURN_EXTRACTION_VERSION,
+        )
 
     def all_objects(self) -> tuple[LongTermMemoryObjectV1, ...]:
         return (self.episode, *self.candidate_objects)
@@ -422,12 +799,66 @@ class LongTermConsolidationResultV1:
     version: int = LONGTERM_CONSOLIDATION_VERSION
 
     def __post_init__(self) -> None:
-        if not _normalize_text(self.turn_id):
-            raise ValueError("turn_id is required.")
-        if self.schema != LONGTERM_CONSOLIDATION_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_CONSOLIDATION_SCHEMA!r}.")
-        if self.version != LONGTERM_CONSOLIDATION_VERSION:
-            raise ValueError(f"version must be {LONGTERM_CONSOLIDATION_VERSION}.")
+        object.__setattr__(self, "turn_id", _require_str(self.turn_id, field_name="turn_id"))
+        # AUDIT-FIX(#3): Normalize tuple/list inputs and validate nested result objects at construction time.
+        object.__setattr__(
+            self,
+            "episodic_objects",
+            _coerce_tuple(
+                self.episodic_objects,
+                field_name="episodic_objects",
+                item_name="LongTermMemoryObjectV1",
+                item_coercer=_coerce_memory_object,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "durable_objects",
+            _coerce_tuple(
+                self.durable_objects,
+                field_name="durable_objects",
+                item_name="LongTermMemoryObjectV1",
+                item_coercer=_coerce_memory_object,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "deferred_objects",
+            _coerce_tuple(
+                self.deferred_objects,
+                field_name="deferred_objects",
+                item_name="LongTermMemoryObjectV1",
+                item_coercer=_coerce_memory_object,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "conflicts",
+            _coerce_tuple(
+                self.conflicts,
+                field_name="conflicts",
+                item_name="LongTermMemoryConflictV1",
+                item_coercer=_coerce_conflict,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "graph_edges",
+            _coerce_tuple(
+                self.graph_edges,
+                field_name="graph_edges",
+                item_name="LongTermGraphEdgeCandidateV1",
+                item_coercer=_coerce_graph_edge,
+            ),
+        )
+        # AUDIT-FIX(#2): Keep consolidation timestamps UTC-normalized.
+        object.__setattr__(self, "occurred_at", _coerce_datetime(self.occurred_at, field_name="occurred_at"))
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_CONSOLIDATION_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_CONSOLIDATION_VERSION,
+        )
 
     @property
     def clarification_needed(self) -> bool:
@@ -443,10 +874,43 @@ class LongTermReflectionResultV1:
     version: int = LONGTERM_REFLECTION_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema != LONGTERM_REFLECTION_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_REFLECTION_SCHEMA!r}.")
-        if self.version != LONGTERM_REFLECTION_VERSION:
-            raise ValueError(f"version must be {LONGTERM_REFLECTION_VERSION}.")
+        # AUDIT-FIX(#3): Validate nested reflection payloads immediately, not only when later consumed.
+        object.__setattr__(
+            self,
+            "reflected_objects",
+            _coerce_tuple(
+                self.reflected_objects,
+                field_name="reflected_objects",
+                item_name="LongTermMemoryObjectV1",
+                item_coercer=_coerce_memory_object,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "created_summaries",
+            _coerce_tuple(
+                self.created_summaries,
+                field_name="created_summaries",
+                item_name="LongTermMemoryObjectV1",
+                item_coercer=_coerce_memory_object,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "midterm_packets",
+            _coerce_tuple(
+                self.midterm_packets,
+                field_name="midterm_packets",
+                item_name="LongTermMidtermPacketV1",
+                item_coercer=_coerce_midterm_packet,
+            ),
+        )
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_REFLECTION_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_REFLECTION_VERSION,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,19 +931,31 @@ class LongTermMidtermPacketV1:
     version: int = LONGTERM_MIDTERM_PACKET_VERSION
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(self.sensitivity))
-        if not _normalize_text(self.packet_id):
-            raise ValueError("packet_id is required.")
-        if not _normalize_text(self.kind):
-            raise ValueError("kind is required.")
-        if not _normalize_text(self.summary):
-            raise ValueError("summary is required.")
-        if (self.canonical_language or "en").strip().lower() != "en":
+        object.__setattr__(self, "packet_id", _require_str(self.packet_id, field_name="packet_id"))
+        object.__setattr__(self, "kind", _require_str(self.kind, field_name="kind"))
+        object.__setattr__(self, "summary", _require_str(self.summary, field_name="summary"))
+        object.__setattr__(self, "details", _optional_str(self.details, field_name="details", blank_to_none=True))
+        object.__setattr__(self, "source_memory_ids", _coerce_str_tuple(self.source_memory_ids, field_name="source_memory_ids"))
+        object.__setattr__(self, "query_hints", _coerce_str_tuple(self.query_hints, field_name="query_hints"))
+        canonical_language = _require_str(self.canonical_language, field_name="canonical_language").strip().lower()
+        object.__setattr__(self, "canonical_language", canonical_language)
+        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(_require_str(self.sensitivity, field_name="sensitivity")))
+        object.__setattr__(self, "valid_from", _optional_str(self.valid_from, field_name="valid_from", blank_to_none=True))
+        object.__setattr__(self, "valid_to", _optional_str(self.valid_to, field_name="valid_to", blank_to_none=True))
+        # AUDIT-FIX(#2): Keep packet timestamps comparable with memory object timestamps.
+        object.__setattr__(self, "updated_at", _coerce_datetime(self.updated_at, field_name="updated_at"))
+        # AUDIT-FIX(#3): Freeze nested packet attributes to avoid shared-state mutation.
+        object.__setattr__(self, "attributes", _freeze_mapping(self.attributes, field_name="attributes"))
+        if canonical_language != "en":
             raise ValueError("midterm packets must use canonical English.")
-        if self.schema != LONGTERM_MIDTERM_PACKET_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_MIDTERM_PACKET_SCHEMA!r}.")
-        if self.version != LONGTERM_MIDTERM_PACKET_VERSION:
-            raise ValueError(f"version must be {LONGTERM_MIDTERM_PACKET_VERSION}.")
+        if self.sensitivity not in LONGTERM_MEMORY_SENSITIVITY:
+            raise ValueError(f"sensitivity must be one of: {', '.join(sorted(LONGTERM_MEMORY_SENSITIVITY))}.")
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_MIDTERM_PACKET_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_MIDTERM_PACKET_VERSION,
+        )
 
     def to_payload(self) -> dict[str, object]:
         return _drop_none(
@@ -503,19 +979,25 @@ class LongTermMidtermPacketV1:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "LongTermMidtermPacketV1":
+        attributes = payload.get("attributes")
+        if attributes is not None and not isinstance(attributes, Mapping):
+            raise ValueError("attributes must be a mapping when provided.")
         return cls(
-            packet_id=str(payload.get("packet_id", "")),
-            kind=str(payload.get("kind", "")),
-            summary=str(payload.get("summary", "")),
-            details=str(payload["details"]) if payload.get("details") is not None else None,
-            source_memory_ids=_tuple_str(payload.get("source_memory_ids")),
-            query_hints=_tuple_str(payload.get("query_hints")),
-            canonical_language=str(payload.get("canonical_language", "en") or "en"),
-            sensitivity=str(payload.get("sensitivity", "normal") or "normal"),
-            valid_from=str(payload["valid_from"]) if payload.get("valid_from") is not None else None,
-            valid_to=str(payload["valid_to"]) if payload.get("valid_to") is not None else None,
-            updated_at=datetime.fromisoformat(str(payload["updated_at"])) if payload.get("updated_at") else _utcnow(),
-            attributes=_mapping_dict(payload.get("attributes")) if isinstance(payload.get("attributes"), Mapping) else None,
+            packet_id=_payload_required_str(payload, "packet_id"),
+            kind=_payload_required_str(payload, "kind"),
+            summary=_payload_required_str(payload, "summary"),
+            details=_payload_optional_str(payload, "details", blank_to_none=True),
+            source_memory_ids=_coerce_str_tuple(payload.get("source_memory_ids"), field_name="source_memory_ids"),
+            query_hints=_coerce_str_tuple(payload.get("query_hints"), field_name="query_hints"),
+            canonical_language=cast(str, _payload_optional_str(payload, "canonical_language", default="en")),
+            sensitivity=cast(str, _payload_optional_str(payload, "sensitivity", default="normal")),
+            valid_from=_payload_optional_str(payload, "valid_from", blank_to_none=True),
+            valid_to=_payload_optional_str(payload, "valid_to", blank_to_none=True),
+            updated_at=_coerce_datetime(payload.get("updated_at", _MISSING), field_name="updated_at", default=_utcnow()),
+            attributes=_mapping_dict(attributes) if isinstance(attributes, Mapping) else None,
+            # AUDIT-FIX(#8): Preserve stored schema/version so incompatible packets cannot masquerade as v1 objects.
+            schema=cast(str, _payload_optional_str(payload, "schema", default=LONGTERM_MIDTERM_PACKET_SCHEMA)),
+            version=_coerce_int(payload.get("version", LONGTERM_MIDTERM_PACKET_VERSION), field_name="version", default=LONGTERM_MIDTERM_PACKET_VERSION),
         )
 
 
@@ -531,15 +1013,14 @@ class LongTermProactiveCandidateV1:
     sensitivity: str = "normal"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(self.sensitivity))
-        if not _normalize_text(self.candidate_id):
-            raise ValueError("candidate_id is required.")
-        if not _normalize_text(self.kind):
-            raise ValueError("kind is required.")
-        if not _normalize_text(self.summary):
-            raise ValueError("summary is required.")
-        if not _normalize_text(self.rationale):
-            raise ValueError("rationale is required.")
+        object.__setattr__(self, "candidate_id", _require_str(self.candidate_id, field_name="candidate_id"))
+        object.__setattr__(self, "kind", _require_str(self.kind, field_name="kind"))
+        object.__setattr__(self, "summary", _require_str(self.summary, field_name="summary"))
+        object.__setattr__(self, "rationale", _require_str(self.rationale, field_name="rationale"))
+        object.__setattr__(self, "due_date", _optional_str(self.due_date, field_name="due_date", blank_to_none=True))
+        object.__setattr__(self, "confidence", _coerce_float(self.confidence, field_name="confidence"))
+        object.__setattr__(self, "source_memory_ids", _coerce_str_tuple(self.source_memory_ids, field_name="source_memory_ids"))
+        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(_require_str(self.sensitivity, field_name="sensitivity")))
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be between 0.0 and 1.0.")
         if self.sensitivity not in LONGTERM_MEMORY_SENSITIVITY:
@@ -567,10 +1048,23 @@ class LongTermProactivePlanV1:
     version: int = LONGTERM_PROACTIVE_PLAN_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema != LONGTERM_PROACTIVE_PLAN_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_PROACTIVE_PLAN_SCHEMA!r}.")
-        if self.version != LONGTERM_PROACTIVE_PLAN_VERSION:
-            raise ValueError(f"version must be {LONGTERM_PROACTIVE_PLAN_VERSION}.")
+        # AUDIT-FIX(#3): Normalize proactive plan candidates to an immutable tuple and validate each element.
+        object.__setattr__(
+            self,
+            "candidates",
+            _coerce_tuple(
+                self.candidates,
+                field_name="candidates",
+                item_name="LongTermProactiveCandidateV1",
+                item_coercer=_coerce_proactive_candidate,
+            ),
+        )
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_PROACTIVE_PLAN_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_PROACTIVE_PLAN_VERSION,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -583,10 +1077,44 @@ class LongTermRetentionResultV1:
     version: int = LONGTERM_RETENTION_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema != LONGTERM_RETENTION_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_RETENTION_SCHEMA!r}.")
-        if self.version != LONGTERM_RETENTION_VERSION:
-            raise ValueError(f"version must be {LONGTERM_RETENTION_VERSION}.")
+        # AUDIT-FIX(#3): Normalize retention result collections and validate nested types immediately.
+        object.__setattr__(
+            self,
+            "kept_objects",
+            _coerce_tuple(
+                self.kept_objects,
+                field_name="kept_objects",
+                item_name="LongTermMemoryObjectV1",
+                item_coercer=_coerce_memory_object,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "expired_objects",
+            _coerce_tuple(
+                self.expired_objects,
+                field_name="expired_objects",
+                item_name="LongTermMemoryObjectV1",
+                item_coercer=_coerce_memory_object,
+            ),
+        )
+        object.__setattr__(self, "pruned_memory_ids", _coerce_str_tuple(self.pruned_memory_ids, field_name="pruned_memory_ids"))
+        object.__setattr__(
+            self,
+            "archived_objects",
+            _coerce_tuple(
+                self.archived_objects,
+                field_name="archived_objects",
+                item_name="LongTermMemoryObjectV1",
+                item_coercer=_coerce_memory_object,
+            ),
+        )
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_RETENTION_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_RETENTION_VERSION,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,10 +1126,11 @@ class LongTermConflictOptionV1:
     value_key: str | None = None
 
     def __post_init__(self) -> None:
-        if not _normalize_text(self.memory_id):
-            raise ValueError("memory_id is required.")
-        if not _normalize_text(self.summary):
-            raise ValueError("summary is required.")
+        object.__setattr__(self, "memory_id", _require_str(self.memory_id, field_name="memory_id"))
+        object.__setattr__(self, "summary", _require_str(self.summary, field_name="summary"))
+        object.__setattr__(self, "status", _require_str(self.status, field_name="status"))
+        object.__setattr__(self, "details", _optional_str(self.details, field_name="details", blank_to_none=True))
+        object.__setattr__(self, "value_key", _optional_str(self.value_key, field_name="value_key", blank_to_none=True))
         if self.status not in LONGTERM_MEMORY_STATUSES:
             raise ValueError(f"status must be one of: {', '.join(sorted(LONGTERM_MEMORY_STATUSES))}.")
 
@@ -628,20 +1157,28 @@ class LongTermConflictQueueItemV1:
     version: int = LONGTERM_CONFLICT_QUEUE_VERSION
 
     def __post_init__(self) -> None:
-        if not _normalize_text(self.slot_key):
-            raise ValueError("slot_key is required.")
-        if not _normalize_text(self.question):
-            raise ValueError("question is required.")
-        if not _normalize_text(self.reason):
-            raise ValueError("reason is required.")
-        if not _normalize_text(self.candidate_memory_id):
-            raise ValueError("candidate_memory_id is required.")
-        if not self.options:
-            raise ValueError("options cannot be empty.")
-        if self.schema != LONGTERM_CONFLICT_QUEUE_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_CONFLICT_QUEUE_SCHEMA!r}.")
-        if self.version != LONGTERM_CONFLICT_QUEUE_VERSION:
-            raise ValueError(f"version must be {LONGTERM_CONFLICT_QUEUE_VERSION}.")
+        object.__setattr__(self, "slot_key", _require_str(self.slot_key, field_name="slot_key"))
+        object.__setattr__(self, "question", _require_str(self.question, field_name="question"))
+        object.__setattr__(self, "reason", _require_str(self.reason, field_name="reason"))
+        object.__setattr__(self, "candidate_memory_id", _require_str(self.candidate_memory_id, field_name="candidate_memory_id"))
+        # AUDIT-FIX(#3): Normalize option collections and validate element types eagerly.
+        object.__setattr__(
+            self,
+            "options",
+            _coerce_tuple(
+                self.options,
+                field_name="options",
+                item_name="LongTermConflictOptionV1",
+                item_coercer=_coerce_conflict_option,
+                allow_empty=False,
+            ),
+        )
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_CONFLICT_QUEUE_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_CONFLICT_QUEUE_VERSION,
+        )
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -665,16 +1202,36 @@ class LongTermConflictResolutionV1:
     version: int = LONGTERM_CONFLICT_RESOLUTION_VERSION
 
     def __post_init__(self) -> None:
-        if not _normalize_text(self.slot_key):
-            raise ValueError("slot_key is required.")
-        if not _normalize_text(self.selected_memory_id):
-            raise ValueError("selected_memory_id is required.")
-        if not self.updated_objects:
-            raise ValueError("updated_objects cannot be empty.")
-        if self.schema != LONGTERM_CONFLICT_RESOLUTION_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_CONFLICT_RESOLUTION_SCHEMA!r}.")
-        if self.version != LONGTERM_CONFLICT_RESOLUTION_VERSION:
-            raise ValueError(f"version must be {LONGTERM_CONFLICT_RESOLUTION_VERSION}.")
+        object.__setattr__(self, "slot_key", _require_str(self.slot_key, field_name="slot_key"))
+        object.__setattr__(self, "selected_memory_id", _require_str(self.selected_memory_id, field_name="selected_memory_id"))
+        # AUDIT-FIX(#3): Normalize updated/conflict object collections to immutable tuples and validate elements.
+        object.__setattr__(
+            self,
+            "updated_objects",
+            _coerce_tuple(
+                self.updated_objects,
+                field_name="updated_objects",
+                item_name="LongTermMemoryObjectV1",
+                item_coercer=_coerce_memory_object,
+                allow_empty=False,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "remaining_conflicts",
+            _coerce_tuple(
+                self.remaining_conflicts,
+                field_name="remaining_conflicts",
+                item_name="LongTermMemoryConflictV1",
+                item_coercer=_coerce_conflict,
+            ),
+        )
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_CONFLICT_RESOLUTION_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_CONFLICT_RESOLUTION_VERSION,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -692,13 +1249,18 @@ class LongTermMemoryReviewItemV1:
     value_key: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(self.sensitivity))
-        if not _normalize_text(self.memory_id):
-            raise ValueError("memory_id is required.")
-        if not _normalize_text(self.kind):
-            raise ValueError("kind is required.")
-        if not _normalize_text(self.summary):
-            raise ValueError("summary is required.")
+        object.__setattr__(self, "memory_id", _require_str(self.memory_id, field_name="memory_id"))
+        object.__setattr__(self, "kind", _require_str(self.kind, field_name="kind"))
+        object.__setattr__(self, "summary", _require_str(self.summary, field_name="summary"))
+        object.__setattr__(self, "status", _require_str(self.status, field_name="status"))
+        object.__setattr__(self, "confidence", _coerce_float(self.confidence, field_name="confidence"))
+        # AUDIT-FIX(#2): Normalize review timestamps to aware UTC.
+        object.__setattr__(self, "updated_at", _coerce_datetime(self.updated_at, field_name="updated_at"))
+        object.__setattr__(self, "details", _optional_str(self.details, field_name="details", blank_to_none=True))
+        object.__setattr__(self, "confirmed_by_user", _coerce_bool(self.confirmed_by_user, field_name="confirmed_by_user"))
+        object.__setattr__(self, "sensitivity", normalize_memory_sensitivity(_require_str(self.sensitivity, field_name="sensitivity")))
+        object.__setattr__(self, "slot_key", _optional_str(self.slot_key, field_name="slot_key", blank_to_none=True))
+        object.__setattr__(self, "value_key", _optional_str(self.value_key, field_name="value_key", blank_to_none=True))
         if self.status not in LONGTERM_MEMORY_STATUSES:
             raise ValueError(f"status must be one of: {', '.join(sorted(LONGTERM_MEMORY_STATUSES))}.")
         if not 0.0 <= self.confidence <= 1.0:
@@ -736,14 +1298,33 @@ class LongTermMemoryReviewResultV1:
     version: int = LONGTERM_MEMORY_REVIEW_VERSION
 
     def __post_init__(self) -> None:
-        if self.total_count < 0:
-            raise ValueError("total_count cannot be negative.")
+        # AUDIT-FIX(#3): Normalize the item collection to an immutable tuple and validate its elements.
+        object.__setattr__(
+            self,
+            "items",
+            _coerce_tuple(
+                self.items,
+                field_name="items",
+                item_name="LongTermMemoryReviewItemV1",
+                item_coercer=lambda value, field_name: _coerce_instance(value, field_name, LongTermMemoryReviewItemV1),
+            ),
+        )
+        # AUDIT-FIX(#6): Reject impossible review counters like negative totals or totals smaller than the returned page.
+        object.__setattr__(self, "total_count", _coerce_non_negative_int(self.total_count, field_name="total_count"))
+        object.__setattr__(self, "query_text", _optional_str(self.query_text, field_name="query_text", blank_to_none=True))
+        object.__setattr__(self, "status_filter", _optional_str(self.status_filter, field_name="status_filter", blank_to_none=True))
+        object.__setattr__(self, "kind_filter", _optional_str(self.kind_filter, field_name="kind_filter", blank_to_none=True))
+        object.__setattr__(self, "include_episodes", _coerce_bool(self.include_episodes, field_name="include_episodes"))
+        if self.total_count < len(self.items):
+            raise ValueError("total_count cannot be smaller than the number of returned items.")
         if self.status_filter is not None and self.status_filter not in LONGTERM_MEMORY_STATUSES:
             raise ValueError(f"status_filter must be one of: {', '.join(sorted(LONGTERM_MEMORY_STATUSES))}.")
-        if self.schema != LONGTERM_MEMORY_REVIEW_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_MEMORY_REVIEW_SCHEMA!r}.")
-        if self.version != LONGTERM_MEMORY_REVIEW_VERSION:
-            raise ValueError(f"version must be {LONGTERM_MEMORY_REVIEW_VERSION}.")
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_MEMORY_REVIEW_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_MEMORY_REVIEW_VERSION,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -757,16 +1338,40 @@ class LongTermMemoryMutationResultV1:
     version: int = LONGTERM_MEMORY_MUTATION_VERSION
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "action", _require_str(self.action, field_name="action"))
+        object.__setattr__(self, "target_memory_id", _require_str(self.target_memory_id, field_name="target_memory_id"))
+        # AUDIT-FIX(#3): Normalize mutation result collections before downstream consumers iterate them.
+        object.__setattr__(
+            self,
+            "updated_objects",
+            _coerce_tuple(
+                self.updated_objects,
+                field_name="updated_objects",
+                item_name="LongTermMemoryObjectV1",
+                item_coercer=_coerce_memory_object,
+            ),
+        )
+        object.__setattr__(self, "deleted_memory_ids", _coerce_str_tuple(self.deleted_memory_ids, field_name="deleted_memory_ids"))
+        object.__setattr__(
+            self,
+            "remaining_conflicts",
+            _coerce_tuple(
+                self.remaining_conflicts,
+                field_name="remaining_conflicts",
+                item_name="LongTermMemoryConflictV1",
+                item_coercer=_coerce_conflict,
+            ),
+        )
         if self.action not in LONGTERM_MEMORY_MUTATION_ACTIONS:
             raise ValueError(f"action must be one of: {', '.join(sorted(LONGTERM_MEMORY_MUTATION_ACTIONS))}.")
-        if not _normalize_text(self.target_memory_id):
-            raise ValueError("target_memory_id is required.")
         if not self.updated_objects and not self.deleted_memory_ids:
             raise ValueError("mutation result must contain updated objects or deleted ids.")
-        if self.schema != LONGTERM_MEMORY_MUTATION_SCHEMA:
-            raise ValueError(f"schema must be {LONGTERM_MEMORY_MUTATION_SCHEMA!r}.")
-        if self.version != LONGTERM_MEMORY_MUTATION_VERSION:
-            raise ValueError(f"version must be {LONGTERM_MEMORY_MUTATION_VERSION}.")
+        _validate_schema_version(
+            schema=self.schema,
+            expected_schema=LONGTERM_MEMORY_MUTATION_SCHEMA,
+            version=self.version,
+            expected_version=LONGTERM_MEMORY_MUTATION_VERSION,
+        )
 
 
 __all__ = [
@@ -778,6 +1383,8 @@ __all__ = [
     "LONGTERM_CONFLICT_RESOLUTION_VERSION",
     "LONGTERM_MEMORY_CONFLICT_SCHEMA",
     "LONGTERM_MEMORY_CONFLICT_VERSION",
+    "LONGTERM_MIDTERM_PACKET_SCHEMA",
+    "LONGTERM_MIDTERM_PACKET_VERSION",
     "LONGTERM_MULTIMODAL_EVIDENCE_SCHEMA",
     "LONGTERM_MULTIMODAL_EVIDENCE_VERSION",
     "LONGTERM_MEMORY_OBJECT_SCHEMA",
@@ -810,6 +1417,7 @@ __all__ = [
     "LongTermMemoryMutationResultV1",
     "LongTermMemoryReviewItemV1",
     "LongTermMemoryReviewResultV1",
+    "LongTermMidtermPacketV1",
     "LongTermMultimodalEvidence",
     "LongTermProactiveCandidateV1",
     "LongTermProactivePlanV1",

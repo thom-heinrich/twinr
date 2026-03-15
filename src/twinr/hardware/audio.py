@@ -817,10 +817,16 @@ class WaveAudioPlayer:
             return
         self.play_pcm16_chunks([bytes(pcm)], sample_rate=sample_rate, channels=1)
 
-    def play_wav_chunks(self, chunks: Iterable[bytes]) -> None:
+    def play_wav_chunks(
+        self,
+        chunks: Iterable[bytes],
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> None:
         self._play_stream(
             ["aplay", "-q", "-D", self.device, "-t", "wav", "-"],
             chunks,
+            should_stop=should_stop,
         )
 
     def play_pcm16_chunks(
@@ -829,6 +835,7 @@ class WaveAudioPlayer:
         *,
         sample_rate: int,
         channels: int = 1,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         normalized_sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
         normalized_channels = _ensure_int("channels", channels, minimum=1)
@@ -849,9 +856,16 @@ class WaveAudioPlayer:
                 "-",
             ],
             chunks,
+            should_stop=should_stop,
         )
 
-    def _play_stream(self, command: list[str], chunks: Iterable[bytes]) -> None:
+    def _play_stream(
+        self,
+        command: list[str],
+        chunks: Iterable[bytes],
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> None:
         process = _spawn_audio_process(
             command,
             stdin=subprocess.PIPE,
@@ -865,10 +879,15 @@ class WaveAudioPlayer:
             os.set_blocking(stdin_fd, False)
             # AUDIT-FIX(#4): Write to aplay with backpressure-aware, timeout-bounded non-blocking I/O.
             for chunk in chunks:
+                if should_stop is not None and should_stop():
+                    break
                 if not chunk:
                     continue
                 view = memoryview(chunk)
                 while view:
+                    if should_stop is not None and should_stop():
+                        view = view[:0]
+                        break
                     if process.poll() is not None:
                         self._raise_stream_error(process)
                     if not _wait_for_writable(

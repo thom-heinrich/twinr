@@ -67,6 +67,14 @@ class _SpecialistRecord:
     result: StreamingToolLoopResult  # AUDIT-FIX(#14): Remove the unused always-empty trigger field so merge state cannot lie about provenance.
 
 
+@dataclass(frozen=True, slots=True)
+class SpeechLaneDelta:
+    text: str
+    lane: str
+    replace_current: bool = False
+    atomic: bool = False
+
+
 class DualLaneToolLoop:
     def __init__(
         self,
@@ -106,6 +114,253 @@ class DualLaneToolLoop:
             "Das hat gerade nicht geklappt. Bitte versuche es noch einmal.",
         )
 
+    def resolve_supervisor_decision(
+        self,
+        prompt: str,
+        *,
+        conversation: ConversationLike | None = None,
+        prefetched_decision: Any | None = None,
+        instructions: str | None = None,
+    ) -> Any | None:
+        if prefetched_decision is not None:
+            return prefetched_decision
+        if self.supervisor_decision_provider is None:
+            return None
+        try:
+            return self.supervisor_decision_provider.decide(
+                prompt,
+                conversation=conversation,
+                instructions=merge_instructions(self.supervisor_instructions, instructions),
+            )
+        except Exception:
+            logger.exception(
+                "Supervisor decision provider failed; falling back to the supervisor loop."
+            )
+            return None
+
+    def _run_direct_search_handoff(
+        self,
+        prompt: str,
+        arguments: dict[str, Any],
+    ) -> StreamingToolLoopResult:
+        search_handler = self.tool_handlers.get("search_live_info")
+        if search_handler is None:
+            raise RuntimeError("search_live_info handler is not configured")
+        search_prompt = _strip_text(arguments.get("prompt")) or prompt
+        call_id = _make_call_id("search_live_info")
+        tool_arguments = {"question": search_prompt}
+        output = search_handler(tool_arguments)
+        answer_text = _strip_text(
+            output.get("answer")
+            or output.get("spoken_answer")
+            or output.get("text")
+        )
+        if not answer_text:
+            raise RuntimeError("direct search handoff returned empty answer text")
+        return _make_loop_result(
+            text=answer_text,
+            rounds=1,
+            tool_calls=(
+                AgentToolCall(
+                    name="search_live_info",
+                    call_id=call_id,
+                    arguments=tool_arguments,
+                    raw_arguments=_safe_json_dumps(tool_arguments),
+                ),
+            ),
+            tool_results=(
+                AgentToolResult(
+                    call_id=call_id,
+                    name="search_live_info",
+                    output=output,
+                    serialized_output=_safe_json_dumps(output),
+                ),
+            ),
+            response_id=_strip_text(output.get("response_id")) or None,
+            request_id=_strip_text(output.get("request_id")) or None,
+            model=_strip_text(output.get("model")) or None,
+            token_usage=output.get("token_usage"),
+            used_web_search=bool(output.get("used_web_search", True)),
+        )
+
+    def _resolve_specialist_result(
+        self,
+        prompt: str,
+        *,
+        normalized_arguments: dict[str, Any],
+        specialist_conversation: ConversationLike | None,
+        instructions: str | None,
+        allow_web_search: bool | None,
+    ) -> StreamingToolLoopResult:
+        specialist_prompt = _strip_text(normalized_arguments.get("prompt")) or prompt
+        if normalized_arguments["kind"] == "search":
+            return self._run_direct_search_handoff(prompt, normalized_arguments)
+        return ToolCallingStreamingLoop(
+            provider=self.specialist_provider,
+            tool_handlers=self.tool_handlers,
+            tool_schemas=self.tool_schemas,
+            max_rounds=self.max_rounds,
+        ).run(
+            specialist_prompt,
+            conversation=specialist_conversation,
+            instructions=merge_instructions(
+                self.specialist_instructions,
+                instructions,
+                _specialist_handoff_context(normalized_arguments),
+            ),
+            allow_web_search=_handoff_allow_web_search(
+                normalized_arguments,
+                allow_web_search,
+            ),
+            on_text_delta=None,
+        )
+
+    def run_handoff_only(
+        self,
+        prompt: str,
+        *,
+        handoff: Any,
+        conversation: ConversationLike | None = None,
+        specialist_conversation: ConversationLike | None = None,
+        instructions: str | None = None,
+        allow_web_search: bool | None = None,
+        on_text_delta: Callable[[str], None] | None = None,
+        on_lane_text_delta: Callable[[SpeechLaneDelta], None] | None = None,
+        emit_filler: bool = True,
+    ) -> StreamingToolLoopResult:
+        resolved_specialist_conversation = (
+            specialist_conversation if specialist_conversation is not None else conversation
+        )
+        if isinstance(handoff, dict):
+            raw_arguments = dict(handoff)
+            response_id = raw_arguments.get("response_id")
+            request_id = raw_arguments.get("request_id")
+            model = raw_arguments.get("model")
+            token_usage = raw_arguments.get("token_usage")
+        else:
+            raw_arguments = {
+                "kind": getattr(handoff, "kind", None),
+                "goal": getattr(handoff, "goal", None),
+                "spoken_ack": getattr(handoff, "spoken_ack", None),
+                "prompt": getattr(handoff, "prompt", None),
+                "allow_web_search": getattr(handoff, "allow_web_search", None),
+            }
+            response_id = getattr(handoff, "response_id", None)
+            request_id = getattr(handoff, "request_id", None)
+            model = getattr(handoff, "model", None)
+            token_usage = getattr(handoff, "token_usage", None)
+
+        normalized_arguments = _normalize_handoff_arguments(
+            raw_arguments,
+            fallback_prompt=prompt,
+            default_spoken_ack=self.default_spoken_ack,
+        )
+
+        def _emit_user_text(
+            text: str,
+            *,
+            lane: str = "direct",
+            replace_current: bool = False,
+            atomic: bool = False,
+        ) -> None:
+            _safe_emit_speech_delta(
+                on_lane_text_delta,
+                on_text_delta,
+                SpeechLaneDelta(
+                    text=text,
+                    lane=lane,
+                    replace_current=replace_current,
+                    atomic=atomic,
+                ),
+            )
+
+        spoken_ack = normalized_arguments["spoken_ack"]
+        if emit_filler and spoken_ack:
+            _emit_user_text(
+                spoken_ack,
+                lane="filler",
+            )
+
+        try:
+            specialist_result = self._resolve_specialist_result(
+                prompt,
+                normalized_arguments=normalized_arguments,
+                specialist_conversation=resolved_specialist_conversation,
+                instructions=instructions,
+                allow_web_search=allow_web_search,
+            )
+            status = "ok"
+            error_code: str | None = None
+        except Exception:
+            logger.exception("Specialist handoff failed.")
+            specialist_result = _make_loop_result(
+                text=self.default_error_reply,
+                rounds=0,
+                tool_calls=(),
+                tool_results=(),
+                response_id=None,
+                request_id=None,
+                model=None,
+                token_usage=None,
+                used_web_search=False,
+            )
+            status = "error"
+            error_code = "specialist_worker_failed"
+
+        handoff_output = {
+            "status": status,
+            "kind": normalized_arguments["kind"],
+            "goal": normalized_arguments["goal"],
+            "spoken_ack": spoken_ack,
+            "answer_text": _strip_text(specialist_result.text),
+            "used_web_search": bool(specialist_result.used_web_search),
+            "tool_calls": len(specialist_result.tool_calls),
+            "rounds": specialist_result.rounds,
+        }
+        if error_code is not None:
+            handoff_output["error"] = error_code
+
+        final_text = _strip_text(specialist_result.text) or self.default_error_reply
+        if on_text_delta is not None or on_lane_text_delta is not None:
+            _emit_user_text(
+                final_text,
+                lane="final",
+                replace_current=emit_filler and bool(spoken_ack),
+                atomic=True,
+            )
+
+        call_id = _first_non_none(
+            response_id,
+            _make_call_id("handoff_specialist_worker"),
+        )
+        return _make_loop_result(
+            text=final_text,
+            rounds=1 + specialist_result.rounds,
+            tool_calls=(
+                AgentToolCall(
+                    name="handoff_specialist_worker",
+                    call_id=call_id,
+                    arguments=normalized_arguments,
+                    raw_arguments=_safe_json_dumps(normalized_arguments),
+                ),
+                *specialist_result.tool_calls,
+            ),
+            tool_results=(
+                AgentToolResult(
+                    call_id=call_id,
+                    name="handoff_specialist_worker",
+                    output=handoff_output,
+                    serialized_output=_safe_json_dumps(handoff_output),
+                ),
+                *specialist_result.tool_results,
+            ),
+            response_id=_first_non_none(specialist_result.response_id, response_id),
+            request_id=_first_non_none(specialist_result.request_id, request_id),
+            model=_first_non_none(specialist_result.model, model),
+            token_usage=_merge_token_usage(token_usage, specialist_result.token_usage),
+            used_web_search=bool(specialist_result.used_web_search),
+        )
+
     def run(
         self,
         prompt: str,
@@ -113,17 +368,34 @@ class DualLaneToolLoop:
         conversation: ConversationLike | None = None,
         supervisor_conversation: ConversationLike | None = None,
         specialist_conversation: ConversationLike | None = None,
+        prefetched_decision: Any | None = None,
         instructions: str | None = None,
         allow_web_search: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
+        on_lane_text_delta: Callable[[SpeechLaneDelta], None] | None = None,
     ) -> StreamingToolLoopResult:
         specialist_records: list[_SpecialistRecord] = []
         supervisor_text_emitted = False  # AUDIT-FIX(#15): Track supervisor output with a boolean sentinel instead of storing and re-joining the full stream.
         resolved_supervisor_conversation = supervisor_conversation if supervisor_conversation is not None else conversation
         resolved_specialist_conversation = specialist_conversation if specialist_conversation is not None else conversation
 
-        def _emit_user_text(text: str) -> None:
-            _safe_emit_text_delta(on_text_delta, text)  # AUDIT-FIX(#1): Guard TTS/UI callback failures so they cannot abort the turn.
+        def _emit_user_text(
+            text: str,
+            *,
+            lane: str = "direct",
+            replace_current: bool = False,
+            atomic: bool = False,
+        ) -> None:
+            _safe_emit_speech_delta(
+                on_lane_text_delta,
+                on_text_delta,
+                SpeechLaneDelta(
+                    text=text,
+                    lane=lane,
+                    replace_current=replace_current,
+                    atomic=atomic,
+                ),
+            )  # AUDIT-FIX(#1): Guard TTS/UI callback failures so they cannot abort the turn.
 
         def handoff_specialist_worker(arguments: dict[str, Any]) -> dict[str, Any]:
             normalized_arguments = _normalize_handoff_arguments(
@@ -133,28 +405,18 @@ class DualLaneToolLoop:
             )  # AUDIT-FIX(#12): Validate and normalize supervisor-provided handoff payloads consistently.
             spoken_ack = normalized_arguments["spoken_ack"]
             if spoken_ack and not supervisor_text_emitted:
-                _emit_user_text(spoken_ack)  # AUDIT-FIX(#8): Keep the senior informed even when the fast lane has not produced text yet.
+                _emit_user_text(
+                    spoken_ack,
+                    lane="filler",
+                )  # AUDIT-FIX(#8): Keep the senior informed even when the fast lane has not produced text yet.
 
-            specialist_prompt = _strip_text(normalized_arguments.get("prompt")) or prompt
             try:
-                specialist_result = ToolCallingStreamingLoop(
-                    provider=self.specialist_provider,
-                    tool_handlers=self.tool_handlers,
-                    tool_schemas=self.tool_schemas,
-                    max_rounds=self.max_rounds,
-                ).run(
-                    specialist_prompt,
-                    conversation=resolved_specialist_conversation,
-                    instructions=merge_instructions(
-                        self.specialist_instructions,
-                        instructions,
-                        _specialist_handoff_context(normalized_arguments),
-                    ),
-                    allow_web_search=_handoff_allow_web_search(
-                        normalized_arguments,
-                        allow_web_search,
-                    ),
-                    on_text_delta=None,
+                specialist_result = self._resolve_specialist_result(
+                    prompt,
+                    normalized_arguments=normalized_arguments,
+                    specialist_conversation=resolved_specialist_conversation,
+                    instructions=instructions,
+                    allow_web_search=allow_web_search,
                 )
                 status = "ok"
                 error_code: str | None = None
@@ -189,18 +451,12 @@ class DualLaneToolLoop:
                 output["error"] = error_code
             return output
 
-        decision = None
-        if self.supervisor_decision_provider is not None:
-            try:
-                decision = self.supervisor_decision_provider.decide(
-                    prompt,
-                    conversation=resolved_supervisor_conversation,
-                    instructions=merge_instructions(self.supervisor_instructions, instructions),
-                )
-            except Exception:
-                logger.exception(
-                    "Supervisor decision provider failed; falling back to the supervisor loop."
-                )  # AUDIT-FIX(#1): Do not let a decision-router failure take down the whole turn.
+        decision = self.resolve_supervisor_decision(
+            prompt,
+            conversation=resolved_supervisor_conversation,
+            prefetched_decision=prefetched_decision,
+            instructions=instructions,
+        )
 
         if decision is not None:
             action = _normalize_decision_action(getattr(decision, "action", None))
@@ -208,7 +464,7 @@ class DualLaneToolLoop:
                 reply = _strip_text(getattr(decision, "spoken_reply", None) or getattr(decision, "spoken_ack", None))
                 if not reply:
                     reply = self.default_error_reply  # AUDIT-FIX(#8): Never return a silent direct turn to a senior user.
-                _emit_user_text(reply)
+                _emit_user_text(reply, lane="direct")
                 return _make_loop_result(
                     text=reply,
                     rounds=1,
@@ -238,7 +494,7 @@ class DualLaneToolLoop:
                     getattr(decision, "response_id", None),
                     _make_call_id("end_conversation"),
                 )  # AUDIT-FIX(#6): Ensure a unique fallback ID for tool/result pairing.
-                _emit_user_text(reply)
+                _emit_user_text(reply, lane="direct")
                 return _make_loop_result(
                     text=reply,
                     rounds=1,
@@ -265,63 +521,16 @@ class DualLaneToolLoop:
                     used_web_search=False,
                 )
 
-            handoff_arguments = _normalize_handoff_arguments(
-                {
-                    "kind": getattr(decision, "kind", None),
-                    "goal": getattr(decision, "goal", None),
-                    "spoken_ack": getattr(decision, "spoken_ack", None),
-                    "prompt": getattr(decision, "prompt", None),
-                    "allow_web_search": getattr(decision, "allow_web_search", None),
-                },
-                fallback_prompt=prompt,
-                default_spoken_ack=self.default_spoken_ack,
-            )  # AUDIT-FIX(#4,#12): Normalize the handoff payload and preserve the original allow_web_search value for shared parsing.
-            call_id = _first_non_none(
-                getattr(decision, "response_id", None),
-                _make_call_id("handoff_specialist_worker"),
-            )  # AUDIT-FIX(#6): Ensure the synthetic handoff call ID cannot collide across turns.
-            handoff_output = handoff_specialist_worker(handoff_arguments)
-            specialist_result = specialist_records[-1].result  # AUDIT-FIX(#2): Safe because handoff_specialist_worker now always appends a record.
-            final_text = _strip_text(specialist_result.text) or self.default_error_reply
-            _emit_user_text(final_text)  # AUDIT-FIX(#8): Stream the specialist answer on the decision path instead of speaking only the acknowledgement.
-            return _make_loop_result(
-                text=final_text,
-                rounds=1 + specialist_result.rounds,
-                tool_calls=(
-                    AgentToolCall(
-                        name="handoff_specialist_worker",
-                        call_id=call_id,
-                        arguments=handoff_arguments,
-                        raw_arguments=_safe_json_dumps(handoff_arguments),
-                    ),
-                    *specialist_result.tool_calls,
-                ),  # AUDIT-FIX(#6): Persist valid raw tool arguments for auditing and deterministic replay.
-                tool_results=(
-                    AgentToolResult(
-                        call_id=call_id,
-                        name="handoff_specialist_worker",
-                        output=handoff_output,
-                        serialized_output=_safe_json_dumps(handoff_output),
-                    ),
-                    *specialist_result.tool_results,
-                ),  # AUDIT-FIX(#7): Avoid secondary crashes when tool outputs are not JSON-serializable by default.
-                response_id=_first_non_none(
-                    specialist_result.response_id,
-                    getattr(decision, "response_id", None),
-                ),
-                request_id=_first_non_none(
-                    specialist_result.request_id,
-                    getattr(decision, "request_id", None),
-                ),
-                model=_first_non_none(
-                    specialist_result.model,
-                    getattr(decision, "model", None),
-                ),
-                token_usage=_merge_token_usage(
-                    getattr(decision, "token_usage", None),
-                    specialist_result.token_usage,
-                ),  # AUDIT-FIX(#10): Accumulate token usage instead of dropping specialist cost/accounting data.
-                used_web_search=bool(specialist_result.used_web_search),
+            return self.run_handoff_only(
+                prompt,
+                handoff=decision,
+                conversation=conversation,
+                specialist_conversation=resolved_specialist_conversation,
+                instructions=instructions,
+                allow_web_search=allow_web_search,
+                on_text_delta=on_text_delta,
+                on_lane_text_delta=on_lane_text_delta,
+                emit_filler=True,
             )
 
         supervisor_handlers = dict(self.supervisor_tool_handlers)
@@ -470,6 +679,30 @@ def _safe_emit_text_delta(
         on_text_delta(raw)
     except Exception:
         logger.exception("on_text_delta callback failed.")  # AUDIT-FIX(#1): Treat output-channel faults as non-fatal so the loop can still return a final result.
+
+
+def _safe_emit_speech_delta(
+    on_lane_text_delta: Callable[[SpeechLaneDelta], None] | None,
+    on_text_delta: Callable[[str], None] | None,
+    delta: SpeechLaneDelta,
+) -> None:
+    raw = _coerce_text(delta.text)
+    if not raw:
+        return
+    if on_lane_text_delta is not None:
+        try:
+            on_lane_text_delta(
+                SpeechLaneDelta(
+                    text=raw,
+                    lane=_strip_text(delta.lane) or "direct",
+                    replace_current=bool(delta.replace_current),
+                    atomic=bool(delta.atomic),
+                )
+            )
+            return
+        except Exception:
+            logger.exception("on_lane_text_delta callback failed.")
+    _safe_emit_text_delta(on_text_delta, raw)
 
 
 def _safe_json_dumps(value: Any) -> str:

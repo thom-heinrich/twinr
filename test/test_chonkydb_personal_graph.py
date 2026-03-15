@@ -190,6 +190,22 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
         self.assertTrue(document.edges)
         self.assertIn("graph", remote_state.snapshots)
 
+    def test_ensure_remote_snapshot_seeds_empty_graph_document(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+
+            created = store.ensure_remote_snapshot()
+
+        self.assertTrue(created)
+        self.assertIn("graph", remote_state.snapshots)
+        self.assertEqual(remote_state.snapshots["graph"]["metadata"]["kind"], "personal_graph")
+
 
 if __name__ == "__main__":
     unittest.main()

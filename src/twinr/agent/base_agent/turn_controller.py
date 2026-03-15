@@ -18,6 +18,7 @@ from twinr.agent.base_agent.contracts import (
 from twinr.agent.base_agent.personality import load_turn_controller_instructions
 
 TurnDecisionName = Literal["continue_listening", "end_turn"]
+TurnDecisionLabel = Literal["complete", "incomplete", "backchannel", "wait"]
 
 _DEFAULT_CONTEXT_TURNS = 8
 _DEFAULT_MAX_TRANSCRIPT_CHARS = 4096
@@ -42,6 +43,10 @@ _TURN_DECISION_TOOL_SCHEMA: dict[str, object] = {
                 "type": "string",
                 "enum": ["continue_listening", "end_turn"],
             },
+            "label": {
+                "type": "string",
+                "enum": ["complete", "incomplete", "backchannel", "wait"],
+            },
             "confidence": {
                 "type": "number",
                 "minimum": 0,
@@ -54,7 +59,7 @@ _TURN_DECISION_TOOL_SCHEMA: dict[str, object] = {
                 "type": "string",
             },
         },
-        "required": ["decision", "confidence", "reason", "transcript"],
+        "required": ["decision", "label", "confidence", "reason", "transcript"],
     },
 }
 
@@ -295,9 +300,14 @@ class TurnEvaluationCandidate:
 @dataclass(frozen=True, slots=True)
 class TurnDecision:
     decision: TurnDecisionName
+    label: TurnDecisionLabel
     confidence: float
     reason: str
     transcript: str
+
+    @property
+    def ends_turn(self) -> bool:
+        return self.decision == "end_turn"
 
 
 class TurnDecisionEvaluator(Protocol):
@@ -370,7 +380,7 @@ class ToolCallingTurnDecisionEvaluator:
                 maximum=65536,
             ),
         )
-        prompt = self._build_prompt(candidate)
+        prompt = self._build_prompt(candidate, compact_conversation)
         provider_kwargs: dict[str, object] = {}
         if self._provider_timeout_kwarg_name is not None:
             provider_kwargs[self._provider_timeout_kwarg_name] = _config_float(
@@ -416,25 +426,54 @@ class ToolCallingTurnDecisionEvaluator:
             fallback_transcript=fallback_transcript,
         )
 
-    def _build_prompt(self, candidate: TurnEvaluationCandidate) -> str:
+    def _build_prompt(
+        self,
+        candidate: TurnEvaluationCandidate,
+        conversation: tuple[tuple[str, str], ...],
+    ) -> str:
+        last_assistant_turn = ""
+        recent_assistant_question = False
+        for role, content in reversed(conversation):
+            if role != "assistant":
+                continue
+            last_assistant_turn = _coerce_text(content, max_chars=240)
+            recent_assistant_question = last_assistant_turn.rstrip().endswith("?")
+            break
+        transcript = _coerce_text(
+            candidate.transcript,
+            max_chars=_config_int(
+                self.config,
+                "turn_controller_max_transcript_chars",
+                _DEFAULT_MAX_TRANSCRIPT_CHARS,
+                minimum=64,
+                maximum=32768,
+            ),
+        )
         payload = {
             "task": "Decide whether the active user turn should end now or continue listening.",
             "candidate": {
-                "transcript": _coerce_text(
-                    candidate.transcript,
-                    max_chars=_config_int(
-                        self.config,
-                        "turn_controller_max_transcript_chars",
-                        _DEFAULT_MAX_TRANSCRIPT_CHARS,
-                        minimum=64,
-                        maximum=32768,
-                    ),
-                ),
+                "transcript": transcript,
+                "transcript_chars": len(transcript),
+                "transcript_words": len(tuple(part for part in transcript.split() if part)),
                 "event_type": _coerce_text(candidate.event_type, default="endpoint", max_chars=64) or "endpoint",
                 "request_id": _coerce_text(candidate.request_id, max_chars=128) or None,
                 "is_final": bool(candidate.is_final),
                 "speech_final": bool(candidate.speech_final),
                 "from_finalize": bool(candidate.from_finalize),
+            },
+            "dialogue_context": {
+                "recent_assistant_question": recent_assistant_question,
+                "recent_assistant_turn": last_assistant_turn or None,
+                "recent_turn_count": len(conversation),
+            },
+            "policy_hints": {
+                "backchannel_max_chars": _config_int(
+                    self.config,
+                    "turn_controller_backchannel_max_chars",
+                    24,
+                    minimum=1,
+                    maximum=512,
+                ),
             },
         }
         # AUDIT-FIX(#9): Use compact JSON so prompt tokens stay bounded on a Raspberry Pi class device.
@@ -450,6 +489,14 @@ class ToolCallingTurnDecisionEvaluator:
         decision: TurnDecisionName = "continue_listening"
         if raw_decision == "end_turn":
             decision = "end_turn"
+        raw_label = _coerce_text(payload.get("label", ""), max_chars=32).lower()
+        label: TurnDecisionLabel = "wait"
+        if raw_label in {"complete", "incomplete", "backchannel", "wait"}:
+            label = raw_label  # type: ignore[assignment]
+        elif decision == "end_turn":
+            label = "complete"
+        elif fallback_transcript.strip():
+            label = "incomplete"
         # AUDIT-FIX(#4): Clamp and validate confidence with finite-number checks.
         confidence_value = _coerce_probability(payload.get("confidence", 0.0), default=0.0)
         reason = _coerce_text(
@@ -474,6 +521,7 @@ class ToolCallingTurnDecisionEvaluator:
         ) or fallback_transcript.strip()
         return TurnDecision(
             decision=decision,
+            label=label,
             confidence=confidence_value,
             reason=reason,
             transcript=transcript,
@@ -496,6 +544,7 @@ class ToolCallingTurnDecisionEvaluator:
     def _fallback_decision(self, *, reason: str, transcript: str) -> TurnDecision:
         return TurnDecision(
             decision="continue_listening",
+            label="wait",
             confidence=0.0,
             reason=_coerce_text(
                 reason,
@@ -684,6 +733,7 @@ class StreamingTurnController:
                 # AUDIT-FIX(#8): Reset inflight state if a worker thread cannot be created.
                 start_failure_decision = TurnDecision(
                     decision="continue_listening",
+                    label="wait",
                     confidence=0.0,
                     reason=f"turn_controller_runner_start_error:{type(exc).__name__}",
                     transcript=fallback_transcript,
@@ -783,6 +833,7 @@ class StreamingTurnController:
             if self._evaluator_worker_active:
                 return TurnDecision(
                     decision="continue_listening",
+                    label="wait",
                     confidence=0.0,
                     reason="turn_controller_worker_busy",
                     transcript=candidate.transcript,
@@ -822,6 +873,7 @@ class StreamingTurnController:
                 self._evaluator_worker_active = False
             return TurnDecision(
                 decision="continue_listening",
+                label="wait",
                 confidence=0.0,
                 reason=f"turn_controller_worker_start_error:{type(exc).__name__}",
                 transcript=candidate.transcript,
@@ -830,6 +882,7 @@ class StreamingTurnController:
         if not done.wait(timeout_seconds):
             return TurnDecision(
                 decision="continue_listening",
+                label="wait",
                 confidence=0.0,
                 reason="turn_controller_timeout",
                 transcript=candidate.transcript,
@@ -838,6 +891,7 @@ class StreamingTurnController:
         if error_holder:
             return TurnDecision(
                 decision="continue_listening",
+                label="wait",
                 confidence=0.0,
                 reason=f"turn_controller_error:{type(error_holder[0]).__name__}",
                 transcript=candidate.transcript,
@@ -846,6 +900,7 @@ class StreamingTurnController:
         if not decision_holder:
             return TurnDecision(
                 decision="continue_listening",
+                label="wait",
                 confidence=0.0,
                 reason="turn_controller_no_result",
                 transcript=candidate.transcript,
@@ -881,6 +936,7 @@ class StreamingTurnController:
         )
         return TurnDecision(
             decision=safe_decision,
+            label=decision.label if decision.label in {"complete", "incomplete", "backchannel", "wait"} else ("complete" if safe_decision == "end_turn" else "wait"),
             confidence=_coerce_probability(decision.confidence, default=0.0),
             reason=_coerce_text(
                 decision.reason,
@@ -899,6 +955,7 @@ class StreamingTurnController:
     def _decision_emit_messages(self, decision: TurnDecision) -> list[str]:
         return [
             self._format_emit("turn_controller_decision", decision.decision),
+            self._format_emit("turn_controller_label", decision.label),
             self._format_emit("turn_controller_confidence", f"{_coerce_probability(decision.confidence, default=0.0):.2f}"),
             self._format_emit("turn_controller_reason", decision.reason),
         ]
@@ -949,6 +1006,7 @@ class StreamingTurnController:
         if bool(_safe_getattr(event, "speech_final", False)):
             return TurnDecision(
                 decision="end_turn",
+                label="complete",
                 confidence=1.0,
                 reason="speech_final_fast_path",
                 transcript=cleaned,
@@ -962,6 +1020,7 @@ class StreamingTurnController:
             if normalized and previous_partial_normalized and normalized == previous_partial_normalized:
                 return TurnDecision(
                     decision="end_turn",
+                    label="complete",
                     confidence=_coerce_probability(
                         _safe_getattr(
                             self._config,

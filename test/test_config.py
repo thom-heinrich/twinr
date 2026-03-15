@@ -9,6 +9,13 @@ from twinr.config import TwinrConfig
 
 
 class TwinrConfigTests(unittest.TestCase):
+    def test_parse_float_accepts_optional_bounds(self) -> None:
+        from twinr.agent.base_agent.config import _parse_float
+
+        self.assertEqual(_parse_float("0.1", 2.0, minimum=0.25), 0.25)
+        self.assertEqual(_parse_float("9.5", 2.0, maximum=5.0), 5.0)
+        self.assertEqual(_parse_float(None, 2.0, minimum=1.0), 2.0)
+
     def test_frontier_streaming_defaults_favor_fast_search_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -17,6 +24,13 @@ class TwinrConfigTests(unittest.TestCase):
             config = TwinrConfig.from_env(env_path)
 
         self.assertEqual(config.openai_search_model, "gpt-4o-mini-search-preview")
+        self.assertEqual(config.streaming_first_word_model, "gpt-4.1-nano")
+        self.assertEqual(config.streaming_first_word_context_turns, 1)
+        self.assertEqual(config.streaming_first_word_max_output_tokens, 32)
+        self.assertEqual(config.streaming_first_word_prefetch_min_chars, 4)
+        self.assertEqual(config.streaming_first_word_prefetch_wait_ms, 40)
+        self.assertEqual(config.streaming_supervisor_prefetch_min_chars, 8)
+        self.assertEqual(config.streaming_supervisor_prefetch_wait_ms, 80)
         self.assertEqual(config.streaming_specialist_model, "gpt-4o-mini")
         self.assertEqual(config.streaming_specialist_reasoning_effort, "low")
 
@@ -68,10 +82,26 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_TURN_CONTROLLER_FAST_ENDPOINT_ENABLED=false",
                         "TWINR_TURN_CONTROLLER_FAST_ENDPOINT_MIN_CHARS=14",
                         "TWINR_TURN_CONTROLLER_FAST_ENDPOINT_MIN_CONFIDENCE=0.82",
+                        "TWINR_TURN_CONTROLLER_BACKCHANNEL_MAX_CHARS=18",
+                        "TWINR_TURN_CONTROLLER_INTERRUPT_ENABLED=false",
+                        "TWINR_TURN_CONTROLLER_INTERRUPT_WINDOW_MS=360",
+                        "TWINR_TURN_CONTROLLER_INTERRUPT_POLL_MS=75",
+                        "TWINR_TURN_CONTROLLER_INTERRUPT_MIN_ACTIVE_RATIO=0.25",
+                        "TWINR_TURN_CONTROLLER_INTERRUPT_MIN_TRANSCRIPT_CHARS=6",
+                        "TWINR_TURN_CONTROLLER_INTERRUPT_CONSECUTIVE_WINDOWS=3",
                         "TWINR_STREAMING_EARLY_TRANSCRIPT_ENABLED=false",
                         "TWINR_STREAMING_EARLY_TRANSCRIPT_MIN_CHARS=18",
                         "TWINR_STREAMING_EARLY_TRANSCRIPT_WAIT_MS=420",
                         "TWINR_CONVERSATION_FOLLOW_UP_ENABLED=true",
+                        "TWINR_CONVERSATION_FOLLOW_UP_AFTER_PROACTIVE_ENABLED=true",
+                        "TWINR_CONVERSATION_CLOSURE_GUARD_ENABLED=false",
+                        "TWINR_CONVERSATION_CLOSURE_CONTEXT_TURNS=3",
+                        "TWINR_CONVERSATION_CLOSURE_INSTRUCTIONS_FILE=ALT_CONVERSATION_CLOSURE.md",
+                        "TWINR_CONVERSATION_CLOSURE_PROVIDER_TIMEOUT_SECONDS=1.25",
+                        "TWINR_CONVERSATION_CLOSURE_MAX_TRANSCRIPT_CHARS=333",
+                        "TWINR_CONVERSATION_CLOSURE_MAX_RESPONSE_CHARS=444",
+                        "TWINR_CONVERSATION_CLOSURE_MAX_REASON_CHARS=111",
+                        "TWINR_CONVERSATION_CLOSURE_MIN_CONFIDENCE=0.72",
                         "TWINR_CONVERSATION_FOLLOW_UP_TIMEOUT_S=3.5",
                         "TWINR_AUDIO_BEEP_FREQUENCY_HZ=1175",
                         "TWINR_AUDIO_BEEP_DURATION_MS=220",
@@ -337,10 +367,26 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertFalse(config.turn_controller_fast_endpoint_enabled)
         self.assertEqual(config.turn_controller_fast_endpoint_min_chars, 14)
         self.assertEqual(config.turn_controller_fast_endpoint_min_confidence, 0.82)
+        self.assertEqual(config.turn_controller_backchannel_max_chars, 18)
+        self.assertFalse(config.turn_controller_interrupt_enabled)
+        self.assertEqual(config.turn_controller_interrupt_window_ms, 360)
+        self.assertEqual(config.turn_controller_interrupt_poll_ms, 75)
+        self.assertEqual(config.turn_controller_interrupt_min_active_ratio, 0.25)
+        self.assertEqual(config.turn_controller_interrupt_min_transcript_chars, 6)
+        self.assertEqual(config.turn_controller_interrupt_consecutive_windows, 3)
         self.assertFalse(config.streaming_early_transcript_enabled)
         self.assertEqual(config.streaming_early_transcript_min_chars, 18)
         self.assertEqual(config.streaming_early_transcript_wait_ms, 420)
         self.assertTrue(config.conversation_follow_up_enabled)
+        self.assertTrue(config.conversation_follow_up_after_proactive_enabled)
+        self.assertFalse(config.conversation_closure_guard_enabled)
+        self.assertEqual(config.conversation_closure_context_turns, 3)
+        self.assertEqual(config.conversation_closure_instructions_file, "ALT_CONVERSATION_CLOSURE.md")
+        self.assertEqual(config.conversation_closure_provider_timeout_seconds, 1.25)
+        self.assertEqual(config.conversation_closure_max_transcript_chars, 333)
+        self.assertEqual(config.conversation_closure_max_response_chars, 444)
+        self.assertEqual(config.conversation_closure_max_reason_chars, 111)
+        self.assertEqual(config.conversation_closure_min_confidence, 0.72)
         self.assertEqual(config.conversation_follow_up_timeout_s, 3.5)
         self.assertEqual(config.audio_beep_frequency_hz, 1175)
         self.assertEqual(config.audio_beep_duration_ms, 220)
@@ -564,6 +610,16 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.printer_line_width, 28)
         self.assertEqual(config.print_button_cooldown_s, 2.5)
 
+    def test_remote_primary_always_forces_fail_closed_remote_semantics(self) -> None:
+        config = TwinrConfig(
+            long_term_memory_enabled=True,
+            long_term_memory_mode="remote_primary",
+            long_term_memory_remote_required=False,
+        )
+
+        self.assertEqual(config.long_term_memory_mode, "remote_primary")
+        self.assertTrue(config.long_term_memory_remote_required)
+
     def test_defaults_raise_memory_capacity(self) -> None:
         config = TwinrConfig()
 
@@ -578,9 +634,24 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertTrue(config.turn_controller_fast_endpoint_enabled)
         self.assertEqual(config.turn_controller_fast_endpoint_min_chars, 10)
         self.assertEqual(config.turn_controller_fast_endpoint_min_confidence, 0.9)
+        self.assertEqual(config.turn_controller_backchannel_max_chars, 24)
+        self.assertTrue(config.turn_controller_interrupt_enabled)
+        self.assertEqual(config.turn_controller_interrupt_window_ms, 420)
+        self.assertEqual(config.turn_controller_interrupt_poll_ms, 120)
+        self.assertEqual(config.turn_controller_interrupt_min_active_ratio, 0.18)
+        self.assertEqual(config.turn_controller_interrupt_min_transcript_chars, 4)
+        self.assertEqual(config.turn_controller_interrupt_consecutive_windows, 2)
         self.assertTrue(config.streaming_early_transcript_enabled)
         self.assertEqual(config.streaming_early_transcript_min_chars, 10)
         self.assertEqual(config.streaming_early_transcript_wait_ms, 250)
+        self.assertTrue(config.conversation_closure_guard_enabled)
+        self.assertEqual(config.conversation_closure_context_turns, 4)
+        self.assertEqual(config.conversation_closure_instructions_file, "CONVERSATION_CLOSURE.md")
+        self.assertEqual(config.conversation_closure_provider_timeout_seconds, 2.0)
+        self.assertEqual(config.conversation_closure_max_transcript_chars, 512)
+        self.assertEqual(config.conversation_closure_max_response_chars, 512)
+        self.assertEqual(config.conversation_closure_max_reason_chars, 256)
+        self.assertEqual(config.conversation_closure_min_confidence, 0.65)
         self.assertTrue(config.audio_dynamic_pause_enabled)
         self.assertEqual(config.audio_dynamic_pause_short_utterance_max_ms, 1000)
         self.assertEqual(config.audio_dynamic_pause_long_utterance_min_ms, 5000)
@@ -700,6 +771,14 @@ class TwinrConfigTests(unittest.TestCase):
                 "\n".join(
                     [
                         "TWINR_STREAMING_DUAL_LANE_ENABLED=false",
+                        "TWINR_STREAMING_FIRST_WORD_ENABLED=false",
+                        "TWINR_STREAMING_FIRST_WORD_MODEL=gpt-4o-mini",
+                        "TWINR_STREAMING_FIRST_WORD_REASONING_EFFORT=low",
+                        "TWINR_STREAMING_FIRST_WORD_CONTEXT_TURNS=1",
+                        "TWINR_STREAMING_FIRST_WORD_MAX_OUTPUT_TOKENS=36",
+                        "TWINR_STREAMING_FIRST_WORD_PREFETCH_ENABLED=false",
+                        "TWINR_STREAMING_FIRST_WORD_PREFETCH_MIN_CHARS=5",
+                        "TWINR_STREAMING_FIRST_WORD_PREFETCH_WAIT_MS=45",
                         "TWINR_STREAMING_SUPERVISOR_MODEL=gpt-4o-mini",
                         "TWINR_STREAMING_SUPERVISOR_REASONING_EFFORT=low",
                         "TWINR_STREAMING_SPECIALIST_MODEL=gpt-5.2-chat-latest",
@@ -712,6 +791,14 @@ class TwinrConfigTests(unittest.TestCase):
             config = TwinrConfig.from_env(env_path)
 
         self.assertFalse(config.streaming_dual_lane_enabled)
+        self.assertFalse(config.streaming_first_word_enabled)
+        self.assertEqual(config.streaming_first_word_model, "gpt-4o-mini")
+        self.assertEqual(config.streaming_first_word_reasoning_effort, "low")
+        self.assertEqual(config.streaming_first_word_context_turns, 1)
+        self.assertEqual(config.streaming_first_word_max_output_tokens, 36)
+        self.assertFalse(config.streaming_first_word_prefetch_enabled)
+        self.assertEqual(config.streaming_first_word_prefetch_min_chars, 5)
+        self.assertEqual(config.streaming_first_word_prefetch_wait_ms, 45)
         self.assertEqual(config.streaming_supervisor_model, "gpt-4o-mini")
         self.assertEqual(config.streaming_supervisor_reasoning_effort, "low")
         self.assertEqual(config.streaming_specialist_model, "gpt-5.2-chat-latest")

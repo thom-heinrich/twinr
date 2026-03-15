@@ -99,8 +99,8 @@ class DisplayServiceTests(unittest.TestCase):
             self.assertEqual(
                 [(status, headline, details) for status, headline, details, _frame in display.calls],
                 [
-                    ("waiting", "Waiting", ("Internet ok | AI ok | System ok (12:34)",)),
-                    ("printing", "Printing", ("Internet ok | AI ok | System ok (12:34)",)),
+                    ("waiting", "Waiting", ("Internet ok", "AI ok", "System ok", "Zeit 12:34")),
+                    ("printing", "Printing", ("Internet ok", "AI ok", "System ok", "Zeit 12:34")),
                 ],
             )
 
@@ -121,7 +121,7 @@ class DisplayServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(headline, "Error")
-        self.assertEqual(details, ("Internet ok | AI ok | System Fehler (12:34)",))
+        self.assertEqual(details, ("Internet ok", "AI ok", "System Fehler", "Zeit 12:34"))
 
     def test_build_status_content_warns_when_conversation_loop_is_missing(self) -> None:
         loop = TwinrStatusDisplayLoop(
@@ -140,7 +140,7 @@ class DisplayServiceTests(unittest.TestCase):
 
         _headline, details = loop._build_status_content(RuntimeSnapshot(status="waiting"))
 
-        self.assertEqual(details, ("Internet down | AI ok | System Achtung (12:34)",))
+        self.assertEqual(details, ("Internet fehlt", "AI wartet", "System Achtung", "Zeit 12:34"))
 
     def test_build_status_content_shows_missing_ai_when_no_key_is_configured(self) -> None:
         loop = TwinrStatusDisplayLoop(
@@ -156,7 +156,7 @@ class DisplayServiceTests(unittest.TestCase):
 
         _headline, details = loop._build_status_content(RuntimeSnapshot(status="waiting"))
 
-        self.assertEqual(details, ("Internet ok | AI fehlt | System ok (12:34)",))
+        self.assertEqual(details, ("Internet ok", "AI fehlt", "System ok", "Zeit 12:34"))
 
     def test_waiting_animation_frame_changes_over_time(self) -> None:
         loop = TwinrStatusDisplayLoop(

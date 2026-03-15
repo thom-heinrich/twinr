@@ -87,19 +87,26 @@ def _parse_optional_int(value: str | None) -> int | None:
     return int(value)
 
 
-def _parse_float(value: str | None, default: float) -> float:
+def _parse_float(
+    value: str | None,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
     if value is None or not value.strip():
-        return default
-    return float(value)
-
-
-def _parse_clamped_float(value: str | None, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
-    parsed = _parse_float(value, default)
+        parsed = default
+    else:
+        parsed = float(value)
     if minimum is not None:
         parsed = max(minimum, parsed)
     if maximum is not None:
         parsed = min(maximum, parsed)
     return parsed
+
+
+def _parse_clamped_float(value: str | None, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    return _parse_float(value, default, minimum=minimum, maximum=maximum)
 
 
 def _parse_csv_ints(value: str | None, default: tuple[int, ...]) -> tuple[int, ...]:
@@ -164,20 +171,44 @@ class TwinrConfig:
     turn_controller_fast_endpoint_enabled: bool = True
     turn_controller_fast_endpoint_min_chars: int = 10
     turn_controller_fast_endpoint_min_confidence: float = 0.9
+    turn_controller_backchannel_max_chars: int = 24
+    turn_controller_interrupt_enabled: bool = True
+    turn_controller_interrupt_window_ms: int = 420
+    turn_controller_interrupt_poll_ms: int = 120
+    turn_controller_interrupt_min_active_ratio: float = 0.18
+    turn_controller_interrupt_min_transcript_chars: int = 4
+    turn_controller_interrupt_consecutive_windows: int = 2
     streaming_early_transcript_enabled: bool = True
     streaming_early_transcript_min_chars: int = 10
     streaming_early_transcript_wait_ms: int = 250
     streaming_dual_lane_enabled: bool = True
+    streaming_first_word_enabled: bool = True
+    streaming_first_word_model: str = "gpt-4.1-nano"
+    streaming_first_word_reasoning_effort: str = ""
+    streaming_first_word_context_turns: int = 1
+    streaming_first_word_max_output_tokens: int = 32
+    streaming_first_word_prefetch_enabled: bool = True
+    streaming_first_word_prefetch_min_chars: int = 4
+    streaming_first_word_prefetch_wait_ms: int = 40
     streaming_supervisor_model: str = "gpt-4o-mini"
     streaming_supervisor_reasoning_effort: str = "low"
     streaming_supervisor_context_turns: int = 4
     streaming_supervisor_max_output_tokens: int = 80
     streaming_supervisor_prefetch_enabled: bool = True
-    streaming_supervisor_prefetch_min_chars: int = 18
-    streaming_supervisor_prefetch_wait_ms: int = 120
+    streaming_supervisor_prefetch_min_chars: int = 8
+    streaming_supervisor_prefetch_wait_ms: int = 80
     streaming_specialist_model: str | None = "gpt-4o-mini"
     streaming_specialist_reasoning_effort: str | None = "low"
     conversation_follow_up_enabled: bool = False
+    conversation_follow_up_after_proactive_enabled: bool = False
+    conversation_closure_guard_enabled: bool = True
+    conversation_closure_context_turns: int = 4
+    conversation_closure_instructions_file: str = "CONVERSATION_CLOSURE.md"
+    conversation_closure_provider_timeout_seconds: float = 2.0
+    conversation_closure_max_transcript_chars: int = 512
+    conversation_closure_max_response_chars: int = 512
+    conversation_closure_max_reason_chars: int = 256
+    conversation_closure_min_confidence: float = 0.65
     conversation_follow_up_timeout_s: float = 4.0
     audio_beep_frequency_hz: int = 1046
     audio_beep_duration_ms: int = 180
@@ -224,6 +255,7 @@ class TwinrConfig:
     streaming_tts_soft_segment_chars: int = 72
     streaming_tts_hard_segment_chars: int = 120
     openai_tts_stream_chunk_size: int = 2048
+    tts_worker_join_timeout_s: float = 60.0
     orchestrator_host: str = "0.0.0.0"
     orchestrator_port: int = 8797
     orchestrator_ws_url: str = "ws://127.0.0.1:8797/ws/orchestrator"
@@ -322,6 +354,8 @@ class TwinrConfig:
     long_term_memory_query_rewrite_enabled: bool = True
     long_term_memory_remote_read_timeout_s: float = 8.0
     long_term_memory_remote_write_timeout_s: float = 15.0
+    long_term_memory_remote_max_content_chars: int = 2_000_000
+    long_term_memory_remote_shard_max_content_chars: int = 1_000_000
     long_term_memory_remote_retry_attempts: int = 3
     long_term_memory_remote_retry_backoff_s: float = 1.0
     long_term_memory_remote_flush_timeout_s: float = 60.0
@@ -406,6 +440,15 @@ class TwinrConfig:
     print_max_lines: int = 8
     print_max_chars: int = 320
     print_context_turns: int = 6
+
+    def __post_init__(self) -> None:
+        normalized_mode = str(self.long_term_memory_mode or "local_first").strip().lower() or "local_first"
+        object.__setattr__(self, "long_term_memory_mode", normalized_mode)
+        object.__setattr__(
+            self,
+            "long_term_memory_remote_required",
+            normalized_mode == "remote_primary",
+        )
 
     @property
     def button_gpios(self) -> dict[str, int]:
@@ -521,6 +564,31 @@ class TwinrConfig:
                 minimum=0.0,
                 maximum=1.0,
             ),
+            turn_controller_backchannel_max_chars=int(
+                get_value("TWINR_TURN_CONTROLLER_BACKCHANNEL_MAX_CHARS", "24") or "24"
+            ),
+            turn_controller_interrupt_enabled=_parse_bool(
+                get_value("TWINR_TURN_CONTROLLER_INTERRUPT_ENABLED"),
+                True,
+            ),
+            turn_controller_interrupt_window_ms=int(
+                get_value("TWINR_TURN_CONTROLLER_INTERRUPT_WINDOW_MS", "420") or "420"
+            ),
+            turn_controller_interrupt_poll_ms=int(
+                get_value("TWINR_TURN_CONTROLLER_INTERRUPT_POLL_MS", "120") or "120"
+            ),
+            turn_controller_interrupt_min_active_ratio=_parse_clamped_float(
+                get_value("TWINR_TURN_CONTROLLER_INTERRUPT_MIN_ACTIVE_RATIO"),
+                0.18,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            turn_controller_interrupt_min_transcript_chars=int(
+                get_value("TWINR_TURN_CONTROLLER_INTERRUPT_MIN_TRANSCRIPT_CHARS", "4") or "4"
+            ),
+            turn_controller_interrupt_consecutive_windows=int(
+                get_value("TWINR_TURN_CONTROLLER_INTERRUPT_CONSECUTIVE_WINDOWS", "2") or "2"
+            ),
             streaming_early_transcript_enabled=_parse_bool(
                 get_value("TWINR_STREAMING_EARLY_TRANSCRIPT_ENABLED"),
                 True,
@@ -534,6 +602,36 @@ class TwinrConfig:
             streaming_dual_lane_enabled=_parse_bool(
                 get_value("TWINR_STREAMING_DUAL_LANE_ENABLED"),
                 True,
+            ),
+            streaming_first_word_enabled=_parse_bool(
+                get_value("TWINR_STREAMING_FIRST_WORD_ENABLED"),
+                True,
+            ),
+            streaming_first_word_model=(
+                get_value("TWINR_STREAMING_FIRST_WORD_MODEL", "gpt-4.1-nano") or "gpt-4.1-nano"
+            ),
+            streaming_first_word_reasoning_effort=(
+                get_value("TWINR_STREAMING_FIRST_WORD_REASONING_EFFORT", "") or ""
+            ),
+            streaming_first_word_context_turns=max(
+                0,
+                int(get_value("TWINR_STREAMING_FIRST_WORD_CONTEXT_TURNS", "1") or "1"),
+            ),
+            streaming_first_word_max_output_tokens=max(
+                16,
+                int(get_value("TWINR_STREAMING_FIRST_WORD_MAX_OUTPUT_TOKENS", "32") or "32"),
+            ),
+            streaming_first_word_prefetch_enabled=_parse_bool(
+                get_value("TWINR_STREAMING_FIRST_WORD_PREFETCH_ENABLED"),
+                True,
+            ),
+            streaming_first_word_prefetch_min_chars=max(
+                1,
+                int(get_value("TWINR_STREAMING_FIRST_WORD_PREFETCH_MIN_CHARS", "4") or "4"),
+            ),
+            streaming_first_word_prefetch_wait_ms=max(
+                0,
+                int(get_value("TWINR_STREAMING_FIRST_WORD_PREFETCH_WAIT_MS", "40") or "40"),
             ),
             streaming_supervisor_model=(
                 get_value("TWINR_STREAMING_SUPERVISOR_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
@@ -552,10 +650,10 @@ class TwinrConfig:
                 True,
             ),
             streaming_supervisor_prefetch_min_chars=int(
-                get_value("TWINR_STREAMING_SUPERVISOR_PREFETCH_MIN_CHARS", "18") or "18"
+                get_value("TWINR_STREAMING_SUPERVISOR_PREFETCH_MIN_CHARS", "8") or "8"
             ),
             streaming_supervisor_prefetch_wait_ms=int(
-                get_value("TWINR_STREAMING_SUPERVISOR_PREFETCH_WAIT_MS", "120") or "120"
+                get_value("TWINR_STREAMING_SUPERVISOR_PREFETCH_WAIT_MS", "80") or "80"
             ),
             streaming_specialist_model=(
                 get_value("TWINR_STREAMING_SPECIALIST_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
@@ -566,6 +664,41 @@ class TwinrConfig:
             conversation_follow_up_enabled=_parse_bool(
                 get_value("TWINR_CONVERSATION_FOLLOW_UP_ENABLED"),
                 False,
+            ),
+            conversation_follow_up_after_proactive_enabled=_parse_bool(
+                get_value("TWINR_CONVERSATION_FOLLOW_UP_AFTER_PROACTIVE_ENABLED"),
+                False,
+            ),
+            conversation_closure_guard_enabled=_parse_bool(
+                get_value("TWINR_CONVERSATION_CLOSURE_GUARD_ENABLED"),
+                True,
+            ),
+            conversation_closure_context_turns=int(
+                get_value("TWINR_CONVERSATION_CLOSURE_CONTEXT_TURNS", "4") or "4"
+            ),
+            conversation_closure_instructions_file=(
+                get_value("TWINR_CONVERSATION_CLOSURE_INSTRUCTIONS_FILE", "CONVERSATION_CLOSURE.md")
+                or "CONVERSATION_CLOSURE.md"
+            ),
+            conversation_closure_provider_timeout_seconds=_parse_float(
+                get_value("TWINR_CONVERSATION_CLOSURE_PROVIDER_TIMEOUT_SECONDS"),
+                2.0,
+                minimum=0.25,
+            ),
+            conversation_closure_max_transcript_chars=int(
+                get_value("TWINR_CONVERSATION_CLOSURE_MAX_TRANSCRIPT_CHARS", "512") or "512"
+            ),
+            conversation_closure_max_response_chars=int(
+                get_value("TWINR_CONVERSATION_CLOSURE_MAX_RESPONSE_CHARS", "512") or "512"
+            ),
+            conversation_closure_max_reason_chars=int(
+                get_value("TWINR_CONVERSATION_CLOSURE_MAX_REASON_CHARS", "256") or "256"
+            ),
+            conversation_closure_min_confidence=_parse_clamped_float(
+                get_value("TWINR_CONVERSATION_CLOSURE_MIN_CONFIDENCE"),
+                0.65,
+                minimum=0.0,
+                maximum=1.0,
             ),
             conversation_follow_up_timeout_s=_parse_float(
                 get_value("TWINR_CONVERSATION_FOLLOW_UP_TIMEOUT_S"),
@@ -653,6 +786,10 @@ class TwinrConfig:
             ),
             openai_tts_stream_chunk_size=int(
                 get_value("OPENAI_TTS_STREAM_CHUNK_SIZE", "2048") or "2048"
+            ),
+            tts_worker_join_timeout_s=_parse_float(
+                get_value("TWINR_TTS_WORKER_JOIN_TIMEOUT_S"),
+                60.0,
             ),
             orchestrator_host=get_value("TWINR_ORCHESTRATOR_HOST", "0.0.0.0") or "0.0.0.0",
             orchestrator_port=int(get_value("TWINR_ORCHESTRATOR_PORT", "8797") or "8797"),
@@ -959,6 +1096,12 @@ class TwinrConfig:
             long_term_memory_remote_write_timeout_s=_parse_float(
                 get_value("TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S"),
                 15.0,
+            ),
+            long_term_memory_remote_max_content_chars=int(
+                get_value("TWINR_LONG_TERM_MEMORY_REMOTE_MAX_CONTENT_CHARS", "2000000") or "2000000"
+            ),
+            long_term_memory_remote_shard_max_content_chars=int(
+                get_value("TWINR_LONG_TERM_MEMORY_REMOTE_SHARD_MAX_CONTENT_CHARS", "1000000") or "1000000"
             ),
             long_term_memory_remote_retry_attempts=int(
                 get_value("TWINR_LONG_TERM_MEMORY_REMOTE_RETRY_ATTEMPTS", "3") or "3"

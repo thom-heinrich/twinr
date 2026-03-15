@@ -6,7 +6,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.contracts import AgentToolCall, ToolCallingTurnResponse
-from twinr.agent.tools.dual_lane_loop import DualLaneToolLoop
+from twinr.agent.tools.dual_lane_loop import DualLaneToolLoop, SpeechLaneDelta
 
 
 class FakeSupervisorProvider:
@@ -44,6 +44,7 @@ class FakeSupervisorProvider:
                     arguments={
                         "kind": "search",
                         "goal": "Find the weather for tomorrow in Schwarzenbek.",
+                        "spoken_ack": "Ich schaue kurz nach.",
                         "allow_web_search": True,
                     },
                 ),
@@ -174,7 +175,59 @@ class FakeSupervisorDecisionProvider:
 
 
 class DualLaneLoopTests(unittest.TestCase):
-    def test_search_handoff_runs_specialist_and_preserves_streamed_ack(self) -> None:
+    def test_prefetched_handoff_emits_filler_then_preempting_final_lane(self) -> None:
+        supervisor = FakeSupervisorProvider()
+        specialist = FakeSpecialistProvider()
+        lane_events: list[SpeechLaneDelta] = []
+
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            tool_handlers={
+                "search_live_info": lambda arguments: {"answer": "8 Grad", "arguments": arguments},
+            },
+            tool_schemas=[{"type": "function", "name": "search_live_info"}],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+
+        result = loop.run(
+            "Wie wird das Wetter morgen in Schwarzenbek?",
+            prefetched_decision=SimpleNamespace(
+                action="handoff",
+                spoken_ack="Ich schaue kurz nach und sage dir gleich Bescheid.",
+                kind="search",
+                goal="Find the weather for tomorrow in Schwarzenbek.",
+                allow_web_search=True,
+                response_id="decision_1",
+                request_id="req_decision_1",
+                model="gpt-4o-mini",
+                token_usage=None,
+            ),
+            on_lane_text_delta=lane_events.append,
+        )
+
+        self.assertEqual(
+            lane_events,
+            [
+                SpeechLaneDelta(
+                    text="Ich schaue kurz nach und sage dir gleich Bescheid.",
+                    lane="filler",
+                    replace_current=False,
+                ),
+                SpeechLaneDelta(
+                    text="8 Grad",
+                    lane="final",
+                    replace_current=True,
+                    atomic=True,
+                ),
+            ],
+        )
+        self.assertEqual(result.text, "8 Grad")
+        self.assertTrue(result.used_web_search)
+        self.assertEqual(specialist.start_calls, [])
+
+    def test_search_handoff_runs_direct_search_worker_and_preserves_streamed_ack(self) -> None:
         supervisor = FakeSupervisorProvider()
         specialist = FakeSpecialistProvider()
         streamed: list[str] = []
@@ -204,8 +257,7 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertTrue(result.used_web_search)
         self.assertEqual(len(search_calls), 1)
         self.assertEqual(supervisor.start_calls[0]["tool_schemas"][-1]["name"], "handoff_specialist_worker")
-        self.assertTrue(specialist.start_calls[0]["allow_web_search"])
-        self.assertIn("Specialist instructions", specialist.start_calls[0]["instructions"])
+        self.assertEqual(specialist.start_calls, [])
         self.assertGreaterEqual(len(result.tool_calls), 2)
 
     def test_handoff_tool_can_emit_immediate_ack_without_supervisor_text(self) -> None:
@@ -265,7 +317,7 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertEqual(streamed[0], "Ich schaue kurz nach.")
         self.assertTrue(result.used_web_search)
         self.assertEqual(result.text, "Morgen wird es kühler und trocken.")
-        self.assertEqual(len(specialist.start_calls), 1)
+        self.assertEqual(len(specialist.start_calls), 0)
 
     def test_handoff_tool_ack_does_not_duplicate_existing_supervisor_text(self) -> None:
         supervisor = FakeSupervisorProvider()
@@ -313,10 +365,7 @@ class DualLaneLoopTests(unittest.TestCase):
         )
 
         self.assertEqual(supervisor.start_calls[0]["conversation"], (("user", "kurzer supervisor-kontext"),))
-        self.assertEqual(
-            specialist.start_calls[0]["conversation"],
-            (("system", "reicher specialist-kontext"), ("user", "voller suchkontext")),
-        )
+        self.assertEqual(specialist.start_calls, [])
 
     def test_direct_supervisor_answer_skips_specialist(self) -> None:
         class DirectSupervisor(FakeSupervisorProvider):
@@ -381,7 +430,7 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertEqual(streamed[0], "Einen Moment bitte.")
         self.assertEqual(len(supervisor.start_calls), 0)
         self.assertEqual(decision_provider.calls[0]["conversation"], (("user", "kurzer kontext"),))
-        self.assertEqual(specialist.start_calls[0]["conversation"], (("user", "voller suchkontext"),))
+        self.assertEqual(specialist.start_calls, [])
         self.assertEqual(result.tool_calls[0].name, "handoff_specialist_worker")
         self.assertTrue(result.used_web_search)
 
@@ -411,6 +460,102 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertEqual(result.text, "Hallo!")
         self.assertEqual(streamed, ["Hallo!"])
         self.assertEqual(len(specialist.start_calls), 0)
+
+    def test_prefetched_decision_skips_supervisor_decision_provider_roundtrip(self) -> None:
+        supervisor = FakeSupervisorProvider()
+        specialist = FakeSpecialistProvider()
+        decision_provider = FakeSupervisorDecisionProvider(
+            {
+                "action": "direct",
+                "spoken_reply": "Hallo!",
+            }
+        )
+        prefetched_decision = SimpleNamespace(
+            action="direct",
+            spoken_reply="Schon da.",
+            spoken_ack=None,
+            kind=None,
+            goal=None,
+            allow_web_search=None,
+            response_id="prefetched_1",
+            request_id="prefetched_req_1",
+            model="gpt-4o-mini",
+            token_usage=None,
+        )
+        streamed: list[str] = []
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            supervisor_decision_provider=decision_provider,
+            tool_handlers={},
+            tool_schemas=[],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+
+        result = loop.run(
+            "Alles ok bei dir?",
+            prefetched_decision=prefetched_decision,
+            on_text_delta=streamed.append,
+        )
+
+        self.assertEqual(result.text, "Schon da.")
+        self.assertEqual(streamed, ["Schon da."])
+        self.assertEqual(decision_provider.calls, [])
+        self.assertEqual(supervisor.start_calls, [])
+        self.assertEqual(specialist.start_calls, [])
+
+    def test_run_handoff_only_emits_filler_then_atomic_final(self) -> None:
+        supervisor = FakeSupervisorProvider()
+        specialist = FakeSpecialistProvider()
+        lane_events: list[SpeechLaneDelta] = []
+        search_calls: list[dict[str, object]] = []
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            tool_handlers={
+                "search_live_info": lambda arguments: search_calls.append(arguments) or {"answer": "8 Grad"},
+            },
+            tool_schemas=[{"type": "function", "name": "search_live_info"}],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+
+        result = loop.run_handoff_only(
+            "Wie wird das Wetter morgen in Schwarzenbek?",
+            handoff=SimpleNamespace(
+                action="handoff",
+                spoken_ack="Ich schaue kurz nach.",
+                kind="search",
+                goal="Find the weather.",
+                allow_web_search=True,
+                response_id="prefetch_resp",
+                request_id="prefetch_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            ),
+            on_lane_text_delta=lane_events.append,
+        )
+
+        self.assertEqual(
+            lane_events,
+            [
+                SpeechLaneDelta(
+                    text="Ich schaue kurz nach.",
+                    lane="filler",
+                    replace_current=False,
+                ),
+                SpeechLaneDelta(
+                    text="8 Grad",
+                    lane="final",
+                    replace_current=True,
+                    atomic=True,
+                ),
+            ],
+        )
+        self.assertEqual(result.text, "8 Grad")
+        self.assertEqual(search_calls, [{"question": "Wie wird das Wetter morgen in Schwarzenbek?"}])
+        self.assertEqual(specialist.start_calls, [])
 
 
 if __name__ == "__main__":

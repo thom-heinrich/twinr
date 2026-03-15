@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 from pathlib import Path
-from tempfile import TemporaryDirectory
+import shutil
+from tempfile import TemporaryDirectory, mkdtemp
 from typing import Mapping
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.context_store import (
@@ -21,6 +22,11 @@ from twinr.memory.longterm.models import (
 )
 from twinr.memory.longterm.service import LongTermMemoryService
 from twinr.memory.query_normalization import LongTermQueryProfile
+
+
+_FIXED_SEED_TARGET = 500
+_FIXED_CASE_TARGET = 50
+_FALLBACK_TIMEZONE_NAME = "Europe/Berlin"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +54,7 @@ class MultimodalEvalCaseResult:
     missing_episodic: tuple[str, ...]
     present_forbidden_durable: tuple[str, ...]
     present_forbidden_episodic: tuple[str, ...]
+    error: str | None = None  # AUDIT-FIX(#3): Preserve per-case retrieval failures without aborting the full evaluation run.
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,69 +114,194 @@ class _StaticQueryRewriter:
 
 def run_multimodal_longterm_eval(
     *,
-    seed_target: int = 500,
-    case_target: int = 50,
+    seed_target: int = _FIXED_SEED_TARGET,
+    case_target: int = _FIXED_CASE_TARGET,
     project_root: str | Path | None = None,
 ) -> MultimodalEvalResult:
-    if seed_target != 500:
-        raise ValueError("seed_target is fixed to 500 for the current multimodal eval.")
-    if case_target != 50:
-        raise ValueError("case_target is fixed to 50 for the current multimodal eval.")
+    if seed_target != _FIXED_SEED_TARGET:
+        raise ValueError(
+            f"seed_target is fixed to {_FIXED_SEED_TARGET} for the current multimodal eval."
+        )
+    if case_target != _FIXED_CASE_TARGET:
+        raise ValueError(
+            f"case_target is fixed to {_FIXED_CASE_TARGET} for the current multimodal eval."
+        )
 
-    with TemporaryDirectory(dir=str(project_root) if project_root is not None else None) as temp_dir:
-        root = Path(temp_dir)
-        config = TwinrConfig(
-            project_root=str(root),
-            personality_dir="personality",
-            memory_markdown_path=str(root / "state" / "MEMORY.md"),
-            long_term_memory_enabled=True,
-            long_term_memory_background_store_turns=False,
-            long_term_memory_recall_limit=6,
-            long_term_memory_path=str(root / "state" / "chonkydb"),
-            openai_realtime_language="de",
-            openai_web_search_timezone="Europe/Berlin",
+    base_dir = _resolve_project_root(project_root)
+    with TemporaryDirectory(  # AUDIT-FIX(#1,#4): Use a unique workspace under a validated base directory; snapshot results before cleanup.
+        dir=str(base_dir) if base_dir is not None else None,
+        prefix="twinr-multimodal-eval-work-",
+    ) as temp_dir:
+        workspace_root = Path(temp_dir).resolve(strict=True)
+        result = _run_multimodal_longterm_eval_in_root(
+            workspace_root=workspace_root,
+            seed_target=seed_target,
+            case_target=case_target,
         )
-        personality_dir = root / "personality"
-        personality_dir.mkdir(parents=True, exist_ok=True)
-        prompt_context_store = PromptContextStore(
-            memory_store=PersistentMemoryMarkdownStore(config.memory_markdown_path, max_entries=2048),
-            user_store=ManagedContextFileStore(
-                personality_dir / "USER.md",
-                section_title="Twinr managed user updates",
-            ),
-            personality_store=ManagedContextFileStore(
-                personality_dir / "PERSONALITY.md",
-                section_title="Twinr managed personality updates",
-            ),
+        return _snapshot_eval_result(
+            workspace_root=workspace_root,
+            result=result,
+            base_dir=base_dir,
         )
+
+
+def _resolve_project_root(project_root: str | Path | None) -> Path | None:
+    if project_root is None:
+        return None
+
+    candidate = Path(project_root).expanduser()
+    if _path_has_existing_symlink_component(candidate):  # AUDIT-FIX(#4): Reject symlinked base paths to prevent writes outside the intended tree.
+        raise ValueError("project_root and its existing parent directories must not be symlinks.")
+    if candidate.exists() and not candidate.is_dir():
+        raise ValueError("project_root must point to a directory.")
+    candidate.mkdir(parents=True, exist_ok=True)  # AUDIT-FIX(#4): Create a missing base directory instead of failing later inside tempfile.
+    return candidate.resolve(strict=True)
+
+
+def _path_has_existing_symlink_component(path: Path) -> bool:
+    current = path
+    while True:
+        if current.is_symlink():
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def _run_multimodal_longterm_eval_in_root(
+    *,
+    workspace_root: Path,
+    seed_target: int,
+    case_target: int,
+) -> MultimodalEvalResult:
+    state_dir = workspace_root / "state"
+    personality_dir = workspace_root / "personality"
+    state_dir.mkdir(parents=True, exist_ok=True)  # AUDIT-FIX(#2): Ensure file-backed state parents exist before store/service initialization.
+    personality_dir.mkdir(parents=True, exist_ok=True)
+
+    config = TwinrConfig(
+        project_root=str(workspace_root),
+        personality_dir="personality",
+        memory_markdown_path=str(state_dir / "MEMORY.md"),
+        long_term_memory_enabled=True,
+        long_term_memory_background_store_turns=False,
+        long_term_memory_recall_limit=6,
+        long_term_memory_path=str(state_dir / "chonkydb"),
+        openai_realtime_language="de",
+        openai_web_search_timezone="Europe/Berlin",
+    )
+    prompt_context_store = PromptContextStore(
+        memory_store=PersistentMemoryMarkdownStore(config.memory_markdown_path, max_entries=2048),
+        user_store=ManagedContextFileStore(
+            personality_dir / "USER.md",
+            section_title="Twinr managed user updates",
+        ),
+        personality_store=ManagedContextFileStore(
+            personality_dir / "PERSONALITY.md",
+            section_title="Twinr managed personality updates",
+        ),
+    )
+
+    service: LongTermMemoryService | None = None
+    active_exception: BaseException | None = None
+    try:
         service = LongTermMemoryService.from_config(
             config,
             prompt_context_store=prompt_context_store,
         )
-        try:
-            seed_stats = _seed_multimodal_store(service)
-            cases = _build_multimodal_eval_cases()
-            service.query_rewriter = _StaticQueryRewriter(
-                {case.query_text: case.canonical_query_text for case in cases}
+        seed_stats = _seed_multimodal_store(service)
+        if seed_stats.total_seed_entries != seed_target:
+            raise AssertionError(  # AUDIT-FIX(#7): Fail fast when fixture drift changes the fixed 500-entry seed contract.
+                f"Expected {seed_target} total seed entries, got {seed_stats.total_seed_entries}."
             )
-            case_results = tuple(_run_case(service, case) for case in cases)
-            summary = _summarize(case_results)
-            object_store_path = str(service.object_store.objects_path)
-            memory_path = str(Path(config.memory_markdown_path))
-            return MultimodalEvalResult(
-                seed_stats=seed_stats,
-                summary=summary,
-                cases=case_results,
-                temp_root=str(root),
-                object_store_path=object_store_path,
-                memory_path=memory_path,
+
+        cases = _build_multimodal_eval_cases()
+        if len(cases) != case_target:
+            raise AssertionError(
+                f"Expected {case_target} multimodal eval cases, got {len(cases)}."
             )
-        finally:
-            service.shutdown(timeout_s=30.0)
+
+        service.query_rewriter = _StaticQueryRewriter(
+            {case.query_text: case.canonical_query_text for case in cases}
+        )
+        case_results = tuple(_run_case(service, case) for case in cases)
+        summary = _summarize(case_results)
+        object_store_path = str(service.object_store.objects_path)
+        memory_path = str(Path(config.memory_markdown_path))
+        return MultimodalEvalResult(
+            seed_stats=seed_stats,
+            summary=summary,
+            cases=case_results,
+            temp_root=str(workspace_root),
+            object_store_path=object_store_path,
+            memory_path=memory_path,
+        )
+    except BaseException as exc:
+        active_exception = exc
+        raise
+    finally:
+        if service is not None:
+            try:
+                service.shutdown(timeout_s=30.0)  # AUDIT-FIX(#5): Do not let shutdown errors mask the real failure that triggered cleanup.
+            except Exception:
+                if active_exception is None:
+                    raise
+
+
+def _snapshot_eval_result(
+    *,
+    workspace_root: Path,
+    result: MultimodalEvalResult,
+    base_dir: Path | None,
+) -> MultimodalEvalResult:
+    snapshot_root = Path(
+        mkdtemp(
+            dir=str(base_dir) if base_dir is not None else None,
+            prefix="twinr-multimodal-eval-artifacts-",
+        )
+    ).resolve(strict=True)
+
+    try:
+        shutil.copytree(workspace_root, snapshot_root, dirs_exist_ok=True)  # AUDIT-FIX(#1): Persist artifacts referenced by the returned paths beyond the workspace lifetime.
+    except Exception:
+        shutil.rmtree(snapshot_root, ignore_errors=True)
+        raise
+
+    return MultimodalEvalResult(
+        seed_stats=result.seed_stats,
+        summary=result.summary,
+        cases=result.cases,
+        temp_root=str(snapshot_root),
+        object_store_path=_remap_snapshot_path(
+            original_path=result.object_store_path,
+            workspace_root=workspace_root,
+            snapshot_root=snapshot_root,
+        ),
+        memory_path=_remap_snapshot_path(
+            original_path=result.memory_path,
+            workspace_root=workspace_root,
+            snapshot_root=snapshot_root,
+        ),
+    )
+
+
+def _remap_snapshot_path(
+    *,
+    original_path: str,
+    workspace_root: Path,
+    snapshot_root: Path,
+) -> str:
+    original = Path(original_path)
+    try:
+        relative_path = original.resolve(strict=False).relative_to(workspace_root)
+    except ValueError:
+        return original_path
+    return str((snapshot_root / relative_path).resolve(strict=False))
 
 
 def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeedStats:
-    timezone = ZoneInfo(service.config.local_timezone_name)
+    timezone = _resolve_eval_timezone(service)
     total_multimodal = 0
     total_turns = 0
 
@@ -303,6 +435,8 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
         total_multimodal += 1
 
     targeted_episodes = _targeted_episodes(timezone)
+    if len(targeted_episodes) > 300:
+        raise AssertionError("Targeted episodes exceed the fixed 300-turn episodic budget.")  # AUDIT-FIX(#7): Guard against silent fixture drift.
     for episode in targeted_episodes:
         _persist_turn(
             service,
@@ -326,14 +460,38 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
         )
         total_turns += 1
 
-    object_count = len(service.object_store.load_objects())
-    episodic_count = len(service.prompt_context_store.memory_store.load_entries())
-    return MultimodalEvalSeedStats(
+    object_count = _count_loaded_items(service.object_store.load_objects())
+    episodic_count = _count_loaded_items(service.prompt_context_store.memory_store.load_entries())
+    seed_stats = MultimodalEvalSeedStats(
         multimodal_events=total_multimodal,
         episodic_turns=total_turns,
         consolidated_object_count=object_count,
         episodic_entry_count=episodic_count,
     )
+    if seed_stats.total_seed_entries != _FIXED_SEED_TARGET:
+        raise AssertionError(
+            f"Expected {_FIXED_SEED_TARGET} total seeded entries, got {seed_stats.total_seed_entries}."
+        )
+    return seed_stats
+
+
+def _resolve_eval_timezone(service: LongTermMemoryService) -> ZoneInfo:
+    timezone_name = getattr(service.config, "local_timezone_name", None) or _FALLBACK_TIMEZONE_NAME
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo(_FALLBACK_TIMEZONE_NAME)  # AUDIT-FIX(#6): Keep the fixed eval dataset usable even when local_timezone_name is absent or invalid.
+
+
+def _count_loaded_items(items: object) -> int:
+    try:
+        return len(items)  # type: ignore[arg-type]
+    except TypeError:
+        try:
+            iterator = iter(items)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise TypeError("Loaded store items must be sized or iterable.") from exc
+        return sum(1 for _ in iterator)
 
 
 def _targeted_episodes(timezone: ZoneInfo) -> tuple[_TargetEpisode, ...]:
@@ -528,9 +686,28 @@ def _persist_multimodal(service: LongTermMemoryService, item: LongTermMultimodal
 
 
 def _run_case(service: LongTermMemoryService, case: MultimodalEvalCase) -> MultimodalEvalCaseResult:
-    context = service.build_provider_context(case.query_text)
-    durable_text = context.durable_context or ""
-    episodic_text = context.episodic_context or ""
+    try:
+        context = service.build_provider_context(case.query_text)
+        if not isinstance(context, LongTermMemoryContext):
+            raise TypeError(
+                f"build_provider_context returned {type(context).__name__}, expected LongTermMemoryContext."
+            )
+    except Exception as exc:
+        return MultimodalEvalCaseResult(  # AUDIT-FIX(#3): Convert single-case failures into explicit failed results so the suite still completes.
+            case_id=case.case_id,
+            category=case.category,
+            passed=False,
+            durable_context_present=False,
+            episodic_context_present=False,
+            missing_durable=case.expected_durable_contains,
+            missing_episodic=case.expected_episodic_contains,
+            present_forbidden_durable=(),
+            present_forbidden_episodic=(),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    durable_text = _normalized_context_text(context, "durable_context")
+    episodic_text = _normalized_context_text(context, "episodic_context")
     missing_durable = tuple(
         needle for needle in case.expected_durable_contains if needle not in durable_text
     )
@@ -544,6 +721,8 @@ def _run_case(service: LongTermMemoryService, case: MultimodalEvalCase) -> Multi
         needle for needle in case.expected_episodic_absent if needle in episodic_text
     )
 
+    durable_present = _context_text_present(context, "durable_context")
+    episodic_present = _context_text_present(context, "episodic_context")
     passed = (
         not missing_durable
         and not missing_episodic
@@ -551,21 +730,32 @@ def _run_case(service: LongTermMemoryService, case: MultimodalEvalCase) -> Multi
         and not forbidden_episodic
     )
     if case.expect_durable_context is not None:
-        passed = passed and ((context.durable_context is not None) == case.expect_durable_context)
+        passed = passed and (durable_present == case.expect_durable_context)  # AUDIT-FIX(#8): Treat empty/whitespace-only context as absent to avoid false positives.
     if case.expect_episodic_context is not None:
-        passed = passed and ((context.episodic_context is not None) == case.expect_episodic_context)
+        passed = passed and (episodic_present == case.expect_episodic_context)
 
     return MultimodalEvalCaseResult(
         case_id=case.case_id,
         category=case.category,
         passed=passed,
-        durable_context_present=context.durable_context is not None,
-        episodic_context_present=context.episodic_context is not None,
+        durable_context_present=durable_present,
+        episodic_context_present=episodic_present,
         missing_durable=missing_durable,
         missing_episodic=missing_episodic,
         present_forbidden_durable=forbidden_durable,
         present_forbidden_episodic=forbidden_episodic,
     )
+
+
+def _normalized_context_text(context: LongTermMemoryContext, attribute_name: str) -> str:
+    raw_value = getattr(context, attribute_name, None)
+    if raw_value is None:
+        return ""
+    return str(raw_value).strip()
+
+
+def _context_text_present(context: LongTermMemoryContext, attribute_name: str) -> bool:
+    return bool(_normalized_context_text(context, attribute_name))
 
 
 def _summarize(results: tuple[MultimodalEvalCaseResult, ...]) -> MultimodalEvalSummary:
@@ -612,6 +802,7 @@ def _result_to_payload(result: MultimodalEvalResult) -> dict[str, object]:
                 "missing_episodic": list(case.missing_episodic),
                 "present_forbidden_durable": list(case.present_forbidden_durable),
                 "present_forbidden_episodic": list(case.present_forbidden_episodic),
+                "error": case.error,
             }
             for case in result.cases
         ],
@@ -621,9 +812,26 @@ def _result_to_payload(result: MultimodalEvalResult) -> dict[str, object]:
     }
 
 
+def _error_payload(exc: BaseException) -> dict[str, object]:
+    return {
+        "error": {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+    }
+
+
 def main() -> int:
-    result = run_multimodal_longterm_eval()
-    print(json.dumps(_result_to_payload(result), ensure_ascii=False, indent=2))
+    try:
+        result = run_multimodal_longterm_eval()
+    except Exception as exc:
+        print(
+            json.dumps(_error_payload(exc), ensure_ascii=False, indent=2),
+            flush=True,
+        )  # AUDIT-FIX(#9): Emit machine-readable failure output instead of an opaque traceback-only crash.
+        return 1
+
+    print(json.dumps(_result_to_payload(result), ensure_ascii=False, indent=2), flush=True)
     return 0
 
 
