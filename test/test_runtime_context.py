@@ -5,12 +5,15 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.runtime import TwinrRuntime
-from twinr.agent.base_agent.runtime_state import RuntimeSnapshotStore
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+from twinr.memory.longterm.core.models import LongTermMemoryContext
+from twinr.agent.base_agent.state.snapshot import RuntimeSnapshotStore
 
 
 class RuntimeContextTests(unittest.TestCase):
@@ -61,6 +64,110 @@ class RuntimeContextTests(unittest.TestCase):
             try:
                 self.assertEqual(runtime.user_voice_checked_at, "2026-03-15T18:57:56Z")
                 runtime.provider_conversation_context()
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_search_provider_context_skips_long_term_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime.memory.remember("user", "Erster Turn")
+                runtime.memory.remember("assistant", "Zweiter Turn")
+                runtime.memory.remember("user", "Letzte Frage")
+                runtime.memory.remember("assistant", "Letzte Antwort")
+
+                class _FailingLongTermMemory:
+                    def build_provider_context(self, query_text):
+                        raise AssertionError("search context must not query long-term provider context")
+
+                    def build_tool_provider_context(self, query_text):
+                        raise AssertionError("search context must not query long-term tool context")
+
+                runtime.long_term_memory = _FailingLongTermMemory()
+
+                context = runtime.search_provider_conversation_context()
+
+                self.assertGreater(len(context), 0)
+                self.assertEqual(
+                    [(role, content) for role, content in context if role != "system"],
+                    [("user", "Erster Turn"), ("assistant", "Zweiter Turn"), ("user", "Letzte Frage"), ("assistant", "Letzte Antwort")][-3:],
+                )
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_provider_context_degrades_when_remote_long_term_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime.memory.remember("user", "Letzte Frage")
+
+                class _UnavailableLongTermMemory:
+                    def build_provider_context(self, query_text):
+                        raise LongTermRemoteUnavailableError("remote unavailable")
+
+                    def build_tool_provider_context(self, query_text):
+                        raise LongTermRemoteUnavailableError("remote unavailable")
+
+                runtime.long_term_memory = _UnavailableLongTermMemory()
+
+                provider_context = runtime.provider_conversation_context()
+                tool_context = runtime.tool_provider_conversation_context()
+
+                self.assertIn(("user", "Letzte Frage"), provider_context)
+                self.assertIn(("user", "Letzte Frage"), tool_context)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_first_word_context_includes_one_relevant_memory_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime.memory.remember("user", "Mir ging es gestern nicht gut.")
+                runtime.last_transcript = "Geht's dir heute gut?"
+
+                class _MemoryAwareLongTermMemory:
+                    def build_provider_context(self, query_text):
+                        self.query_text = query_text
+                        return LongTermMemoryContext(
+                            subtext_context="Relevant memory: The user had a headache yesterday.",
+                            durable_context="Durable memory: preferred pharmacy nearby.",
+                        )
+
+                runtime.long_term_memory = _MemoryAwareLongTermMemory()
+
+                context = runtime.first_word_provider_conversation_context()
+
+                self.assertIn(
+                    ("system", "Relevant memory: The user had a headache yesterday."),
+                    context,
+                )
+                self.assertNotIn(
+                    ("system", "Durable memory: preferred pharmacy nearby."),
+                    context,
+                )
+                self.assertIn(("user", "Mir ging es gestern nicht gut."), context)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_runtime_startup_degrades_when_remote_long_term_bootstrap_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+
+            class _FailingLongTermMemory:
+                def ensure_remote_ready(self):
+                    raise LongTermRemoteUnavailableError("remote unavailable at startup")
+
+                def shutdown(self, *, timeout_s: float = 0.0):
+                    return None
+
+                def close(self):
+                    return None
+
+            with patch("twinr.agent.base_agent.runtime.base.LongTermMemoryService.from_config", return_value=_FailingLongTermMemory()):
+                runtime = TwinrRuntime(config=config)
+            try:
+                self.assertIsNotNone(runtime.ops_events)
+                self.assertEqual(runtime.status.value, "waiting")
             finally:
                 runtime.shutdown(timeout_s=1.0)
 

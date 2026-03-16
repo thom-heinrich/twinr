@@ -8,8 +8,8 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.memory.longterm.models import LongTermSourceRefV1
-from twinr.memory.longterm.propositions import (
+from twinr.memory.longterm.core.models import LongTermSourceRefV1
+from twinr.memory.longterm.ingestion.propositions import (
     LongTermTurnPropositionBundleV1,
     LongTermTurnPropositionCompiler,
     _turn_proposition_schema,

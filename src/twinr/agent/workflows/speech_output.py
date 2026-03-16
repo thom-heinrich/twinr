@@ -6,7 +6,7 @@ from threading import Event, Lock, Thread
 from typing import Callable, Protocol
 import time
 
-from twinr.agent.tools.dual_lane_loop import SpeechLaneDelta
+from twinr.agent.tools.runtime.dual_lane_loop import SpeechLaneDelta
 
 
 class StreamingTextToSpeechProviderLike(Protocol):

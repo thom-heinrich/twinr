@@ -24,6 +24,13 @@ _CONVERSATION_WEB_SEARCH_OPTIONS = (("auto", "Auto"), ("always", "Always"), ("ne
 _VISION_DETAIL_OPTIONS = (("auto", "Auto"), ("low", "Low"), ("high", "High"))
 _GPIO_BIAS_OPTIONS = (("pull-up", "Pull-up"), ("pull-down", "Pull-down"), ("disabled", "Off"))
 _WAKEWORD_BACKEND_OPTIONS = (("stt", "STT"), ("openwakeword", "openWakeWord"))
+_WAKEWORD_PRIMARY_BACKEND_OPTIONS = (("openwakeword", "openWakeWord"), ("stt", "STT"))
+_WAKEWORD_FALLBACK_BACKEND_OPTIONS = (("stt", "STT"), ("disabled", "Disabled"))
+_WAKEWORD_VERIFIER_MODE_OPTIONS = (
+    ("ambiguity_only", "Only ambiguous hits"),
+    ("always", "Always verify"),
+    ("disabled", "Disabled"),
+)
 _EMAIL_PROFILE_OPTIONS = (("gmail", "Gmail"), ("generic_imap_smtp", "Generic IMAP/SMTP"))
 _CALENDAR_SOURCE_OPTIONS = (("ics_file", "ICS file"), ("ics_url", "ICS URL"))
 _EMAIL_SECRET_KEY = EMAIL_APP_PASSWORD_ENV_KEY

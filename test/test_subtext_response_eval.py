@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.memory.longterm.subtext_eval import (
+from twinr.memory.longterm.evaluation.subtext_eval import (
     _extract_json_object,
     contains_explicit_memory_announcement,
     default_subtext_eval_cases,

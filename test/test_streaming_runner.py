@@ -14,10 +14,11 @@ from twinr.agent.base_agent.contracts import (
     StreamingTranscriptionResult,
     ToolCallingTurnResponse,
 )
-from twinr.agent.tools.dual_lane_loop import DualLaneToolLoop
+from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
+from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop
 from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
 from twinr.config import TwinrConfig
-from twinr.memory.longterm.models import (
+from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,
@@ -191,6 +192,27 @@ class FakeStreamingSpeechSession:
         self.closed = True
 
 
+class BareSpeechFinalStreamingSpeechSession(FakeStreamingSpeechSession):
+    def snapshot(self) -> StreamingTranscriptionResult:
+        return StreamingTranscriptionResult(
+            transcript="Bitte gut.",
+            request_id="dg-stream-2",
+            saw_interim=False,
+            saw_speech_final=True,
+            saw_utterance_end=False,
+        )
+
+    def finalize(self) -> StreamingTranscriptionResult:
+        self.finalize_calls += 1
+        return StreamingTranscriptionResult(
+            transcript="Gut.",
+            request_id="dg-stream-2",
+            saw_interim=False,
+            saw_speech_final=True,
+            saw_utterance_end=False,
+        )
+
+
 class FakeStreamingSpeechToTextProvider(FakeSpeechToTextProvider):
     def __init__(self, config: TwinrConfig) -> None:
         super().__init__(config)
@@ -223,6 +245,124 @@ class FakeStreamingSpeechToTextProvider(FakeSpeechToTextProvider):
         if on_interim is not None:
             on_interim("Stream partiell")
         return self.session
+
+
+class BareSpeechFinalStreamingSpeechToTextProvider(FakeStreamingSpeechToTextProvider):
+    def __init__(self, config: TwinrConfig) -> None:
+        super().__init__(config)
+        self.session = BareSpeechFinalStreamingSpeechSession()
+        self.transcribe_calls: list[dict[str, object]] = []
+
+    def start_streaming_session(
+        self,
+        *,
+        sample_rate: int,
+        channels: int,
+        language: str | None = None,
+        prompt: str | None = None,
+        on_interim=None,
+        on_endpoint=None,
+    ):
+        del prompt, on_interim, on_endpoint
+        self.start_calls.append(
+            {
+                "sample_rate": sample_rate,
+                "channels": channels,
+                "language": language,
+            }
+        )
+        return self.session
+
+    def transcribe(self, audio_bytes: bytes, **kwargs) -> str:
+        self.transcribe_calls.append(
+            {
+                "audio_len": len(audio_bytes),
+                **kwargs,
+            }
+        )
+        return "Geht's dir heute gut?"
+
+
+class ShortInterimStreamingSpeechSession(FakeStreamingSpeechSession):
+    def snapshot(self) -> StreamingTranscriptionResult:
+        return StreamingTranscriptionResult(
+            transcript="Gut?",
+            request_id="dg-stream-3",
+            saw_interim=True,
+            saw_speech_final=True,
+            saw_utterance_end=False,
+        )
+
+    def finalize(self) -> StreamingTranscriptionResult:
+        self.finalize_calls += 1
+        return StreamingTranscriptionResult(
+            transcript="Gut?",
+            request_id="dg-stream-3",
+            saw_interim=True,
+            saw_speech_final=True,
+            saw_utterance_end=False,
+        )
+
+
+class ShortInterimStreamingSpeechToTextProvider(FakeStreamingSpeechToTextProvider):
+    def __init__(self, config: TwinrConfig) -> None:
+        super().__init__(config)
+        self.session = ShortInterimStreamingSpeechSession()
+        self.transcribe_calls: list[dict[str, object]] = []
+
+    def transcribe(self, audio_bytes: bytes, **kwargs) -> str:
+        self.transcribe_calls.append(
+            {
+                "audio_len": len(audio_bytes),
+                **kwargs,
+            }
+        )
+        return "Geht's dir heute gut?"
+
+
+class UtteranceEndOnlyStreamingSpeechSession(FakeStreamingSpeechSession):
+    def snapshot(self) -> StreamingTranscriptionResult:
+        return StreamingTranscriptionResult(
+            transcript="Heute gut, alles okay?",
+            request_id="dg-stream-4",
+            saw_interim=True,
+            saw_speech_final=False,
+            saw_utterance_end=True,
+            confidence=0.74,
+        )
+
+    def finalize(self) -> StreamingTranscriptionResult:
+        self.finalize_calls += 1
+        return StreamingTranscriptionResult(
+            transcript="Heute gut, alles okay?",
+            request_id="dg-stream-4",
+            saw_interim=True,
+            saw_speech_final=False,
+            saw_utterance_end=True,
+            confidence=0.74,
+        )
+
+
+class UtteranceEndOnlyStreamingSpeechToTextProvider(FakeStreamingSpeechToTextProvider):
+    def __init__(self, config: TwinrConfig) -> None:
+        super().__init__(config)
+        self.session = UtteranceEndOnlyStreamingSpeechSession()
+        self.transcribe_calls: list[dict[str, object]] = []
+
+    def transcribe(self, audio_bytes: bytes, **kwargs) -> str:
+        self.transcribe_calls.append({"audio_len": len(audio_bytes), **kwargs})
+        return "Heute gut, alles okay?"
+
+
+class FakeVerifierSpeechToTextProvider(FakeSpeechToTextProvider):
+    def __init__(self, config: TwinrConfig, *, transcript: str) -> None:
+        super().__init__(config)
+        self.transcript_value = transcript
+        self.calls: list[dict[str, object]] = []
+
+    def transcribe(self, audio_bytes: bytes, **kwargs) -> str:
+        self.calls.append({"audio_len": len(audio_bytes), **kwargs})
+        return self.transcript_value
 
 
 class FakeFirstWordProvider:
@@ -378,6 +518,20 @@ class StubSupervisorDecision:
         self.action = action
         self.spoken_reply = spoken_reply
         self.spoken_ack = None
+
+
+class StubConversationClosureEvaluator:
+    def __init__(self, *, close_now: bool, confidence: float = 0.93, reason: str = "explicit_goodbye") -> None:
+        self.decision = ConversationClosureDecision(
+            close_now=close_now,
+            confidence=confidence,
+            reason=reason,
+        )
+        self.calls: list[dict[str, object]] = []
+
+    def evaluate(self, **kwargs) -> ConversationClosureDecision:
+        self.calls.append(kwargs)
+        return self.decision
         self.kind = None
         self.goal = None
         self.allow_web_search = None
@@ -538,6 +692,177 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertTrue(stt_provider.session.closed)
         self.assertIn("transcript=Streaming Hallo Twinr", lines)
         self.assertIn("stt_streaming_early=true", lines)
+
+    def test_audio_turn_defers_bare_speech_final_until_finalize(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tool_agent = FakeToolAgentProvider(config)
+            support_provider = FakePrintBackend(config)
+            tts_provider = FakeTextToSpeechProvider(config)
+            player = FakePlayer()
+            printer = FakePrinter()
+            usage_store = FakeUsageStore()
+            stt_provider = BareSpeechFinalStreamingSpeechToTextProvider(config)
+            lines: list[str] = []
+
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=tool_agent,
+                print_backend=support_provider,
+                stt_provider=stt_provider,
+                agent_provider=support_provider,
+                tts_provider=tts_provider,
+                recorder=FakeRecorder(),
+                player=player,
+                printer=printer,
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=usage_store,
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+                emit=lines.append,
+            )
+
+            keep_listening = loop._run_single_audio_turn(
+                initial_source="button",
+                follow_up=False,
+                listening_window=runtime.listening_window(initial_source="button", follow_up=False),
+                listen_source="button",
+                proactive_trigger=None,
+                speech_start_chunks=None,
+                ignore_initial_ms=0,
+                timeout_emit_key="listen_timeout",
+                timeout_message="Listening timed out before speech started.",
+                play_initial_beep=False,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertEqual(stt_provider.session.finalize_calls, 1)
+        self.assertEqual(len(stt_provider.transcribe_calls), 1)
+        self.assertIn("transcript=Geht's dir heute gut?", lines)
+        self.assertIn("stt_streaming_recovered_via_batch=true", lines)
+        self.assertNotIn("stt_streaming_early=true", lines)
+
+    def test_audio_turn_recovers_short_interim_finalize_with_batch_stt(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tool_agent = FakeToolAgentProvider(config)
+            support_provider = FakePrintBackend(config)
+            tts_provider = FakeTextToSpeechProvider(config)
+            player = FakePlayer()
+            printer = FakePrinter()
+            usage_store = FakeUsageStore()
+            stt_provider = ShortInterimStreamingSpeechToTextProvider(config)
+            lines: list[str] = []
+
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=tool_agent,
+                print_backend=support_provider,
+                stt_provider=stt_provider,
+                agent_provider=support_provider,
+                tts_provider=tts_provider,
+                recorder=FakeRecorder(),
+                player=player,
+                printer=printer,
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=usage_store,
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+                emit=lines.append,
+            )
+
+            keep_listening = loop._run_single_audio_turn(
+                initial_source="button",
+                follow_up=False,
+                listening_window=runtime.listening_window(initial_source="button", follow_up=False),
+                listen_source="button",
+                proactive_trigger=None,
+                speech_start_chunks=None,
+                ignore_initial_ms=0,
+                timeout_emit_key="listen_timeout",
+                timeout_message="Listening timed out before speech started.",
+                play_initial_beep=False,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertEqual(stt_provider.session.finalize_calls, 1)
+        self.assertEqual(len(stt_provider.transcribe_calls), 1)
+        self.assertIn("transcript=Geht's dir heute gut?", lines)
+        self.assertIn("stt_streaming_recovered_via_batch=true", lines)
+
+    def test_audio_turn_verifies_utterance_end_fast_path_with_openai_verifier(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            tool_agent = FakeToolAgentProvider(config)
+            support_provider = FakePrintBackend(config)
+            tts_provider = FakeTextToSpeechProvider(config)
+            player = FakePlayer()
+            printer = FakePrinter()
+            usage_store = FakeUsageStore()
+            stt_provider = UtteranceEndOnlyStreamingSpeechToTextProvider(config)
+            verifier_provider = FakeVerifierSpeechToTextProvider(
+                config,
+                transcript="Geht's dir heute gut?",
+            )
+            lines: list[str] = []
+
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=tool_agent,
+                print_backend=support_provider,
+                stt_provider=stt_provider,
+                verification_stt_provider=verifier_provider,
+                agent_provider=support_provider,
+                tts_provider=tts_provider,
+                recorder=FakeRecorder(),
+                player=player,
+                printer=printer,
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=usage_store,
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+                emit=lines.append,
+            )
+
+            keep_listening = loop._run_single_audio_turn(
+                initial_source="button",
+                follow_up=False,
+                listening_window=runtime.listening_window(initial_source="button", follow_up=False),
+                listen_source="button",
+                proactive_trigger=None,
+                speech_start_chunks=None,
+                ignore_initial_ms=0,
+                timeout_emit_key="listen_timeout",
+                timeout_message="Listening timed out before speech started.",
+                play_initial_beep=False,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertEqual(stt_provider.session.finalize_calls, 1)
+        self.assertEqual(len(verifier_provider.calls), 1)
+        self.assertIn("stt_streaming_verified_via_openai=true", lines)
+        self.assertIn("transcript=Geht's dir heute gut?", lines)
 
     def test_segment_boundary_prefers_clause_and_soft_wrap(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -853,7 +1178,7 @@ class StreamingRunnerTests(unittest.TestCase):
             )
 
         self.assertTrue(keep_listening)
-        self.assertEqual(tts_provider.stream_calls[-1], "Heute wird es sonnig.")
+        self.assertEqual(tts_provider.stream_calls, ["Ich schaue kurz nach.", "Heute wird es sonnig."])
         self.assertEqual(runtime.last_response, "Heute wird es sonnig.")
 
     def test_sync_first_word_direct_skips_final_lane_and_returns_to_waiting(self) -> None:
@@ -887,6 +1212,11 @@ class StreamingRunnerTests(unittest.TestCase):
                 config,
                 reply=FirstWordReply(mode="direct", spoken_text="Ja, alles gut."),
             )
+            processing_feedback_calls: list[str] = []
+            loop._start_working_feedback_loop = lambda kind: (  # type: ignore[method-assign]
+                processing_feedback_calls.append(kind),
+                (lambda: None),
+            )[1]
             def _unexpected_final_lane(*args, **kwargs):
                 raise AssertionError("direct first-word replies must not invoke the final lane")
 
@@ -901,8 +1231,57 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertTrue(keep_listening)
         self.assertEqual(tts_provider.stream_calls, ["Ja, alles gut."])
         self.assertEqual(runtime.last_response, "Ja, alles gut.")
+        self.assertEqual(processing_feedback_calls, [])
         self.assertEqual(runtime.status.value, "waiting")
         self.assertEqual(runtime.snapshot_store.load().status, "waiting")
+
+    def test_direct_goodbye_turn_uses_closure_guard_to_suppress_follow_up(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                conversation_follow_up_enabled=True,
+                conversation_closure_guard_enabled=True,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            tts_provider = FakeTextToSpeechProvider(config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=tts_provider,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            loop.first_word_provider = FakeFirstWordProvider(
+                config,
+                reply=FirstWordReply(mode="direct", spoken_text="Bis dann!"),
+            )
+            closure = StubConversationClosureEvaluator(close_now=True)
+            loop.conversation_closure_evaluator = closure
+
+            keep_listening = loop._run_single_text_turn(
+                transcript="Bis später.",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        self.assertFalse(keep_listening)
+        self.assertEqual(tts_provider.stream_calls, ["Bis dann!"])
+        self.assertEqual(runtime.last_response, "Bis dann!")
+        self.assertEqual(len(closure.calls), 1)
+        self.assertEqual(closure.calls[0]["user_transcript"], "Bis später.")
 
     def test_final_lane_waits_for_first_audio_gate(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1012,6 +1391,58 @@ class StreamingRunnerTests(unittest.TestCase):
             [("user", "Letzte Frage"), ("assistant", "Letzte Antwort")],
         )
         self.assertGreater(len(specialist_context), len(supervisor_context))
+
+    def test_search_handoff_avoids_heavy_tool_context(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            runtime.tool_provider_conversation_context = lambda: (_ for _ in ()).throw(AssertionError("heavy tool context must not be requested"))  # type: ignore[method-assign]
+            decision = SimpleNamespace(
+                action="handoff",
+                spoken_ack="Ich schaue kurz nach.",
+                spoken_reply=None,
+                kind="search",
+                goal="Check the weather.",
+                allow_web_search=True,
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            loop._consume_speculative_supervisor_decision = lambda transcript: None  # type: ignore[method-assign]
+            dual_lane.supervisor_decision_provider = object()  # type: ignore[attr-defined]
+            dual_lane.resolve_supervisor_decision = lambda *args, **kwargs: decision  # type: ignore[method-assign]
+
+            result = loop._run_dual_lane_final_response(
+                "Wie wird das Wetter heute?",
+                turn_instructions=None,
+            )
+
+        self.assertEqual(result.text, "Heute wird es sonnig.")
+        self.assertEqual(len(dual_lane.run_handoff_calls), 1)
+        self.assertEqual(len(dual_lane.run_calls), 0)
 
     def test_consume_speculative_supervisor_decision_accepts_direct_reply(self) -> None:
         with TemporaryDirectory() as temp_dir:

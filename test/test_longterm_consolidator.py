@@ -9,14 +9,14 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from test.longterm_test_program import make_test_extractor
-from twinr.memory.longterm.consolidator import LongTermMemoryConsolidator
-from twinr.memory.longterm.models import (
+from twinr.memory.longterm.reasoning.consolidator import LongTermMemoryConsolidator
+from twinr.memory.longterm.core.models import (
     LongTermGraphEdgeCandidateV1,
     LongTermMemoryObjectV1,
     LongTermSourceRefV1,
     LongTermTurnExtractionV1,
 )
-from twinr.memory.longterm.truth import LongTermTruthMaintainer
+from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
 
 
 def _source() -> LongTermSourceRefV1:

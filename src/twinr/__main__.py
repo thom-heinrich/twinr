@@ -56,6 +56,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Capture one proactive ambient-audio observation and print the parsed fields",
     )
     parser.add_argument(
+        "--wakeword-eval",
+        action="store_true",
+        help="Evaluate the current wakeword detector against labeled captures or a JSONL manifest.",
+    )
+    parser.add_argument(
+        "--wakeword-autotune",
+        action="store_true",
+        help="Search for a better wakeword calibration profile from labeled captures or a JSONL manifest.",
+    )
+    parser.add_argument(
+        "--wakeword-manifest",
+        type=Path,
+        help="Optional JSONL manifest of labeled wakeword captures for eval/autotune.",
+    )
+    parser.add_argument(
+        "--wakeword-label-capture",
+        type=Path,
+        help="Record an operator label for one stored wakeword capture.",
+    )
+    parser.add_argument(
+        "--wakeword-label",
+        help="Operator label to save for --wakeword-label-capture, for example correct or false_positive.",
+    )
+    parser.add_argument(
+        "--wakeword-label-notes",
+        help="Optional operator note stored with --wakeword-label-capture.",
+    )
+    parser.add_argument(
         "--openai-web-search",
         action="store_true",
         default=None,
@@ -430,6 +458,67 @@ def main() -> int:
                 print(f"proactive_audio_peak_rms={snapshot.sample.peak_rms}")
                 print(f"proactive_audio_average_rms={snapshot.sample.average_rms}")
                 print(f"proactive_audio_active_ratio={snapshot.sample.active_ratio:.2f}")
+
+        if args.wakeword_label_capture:
+            if not args.wakeword_label:
+                raise RuntimeError("--wakeword-label is required with --wakeword-label-capture")
+            from twinr.proactive import append_wakeword_capture_label
+
+            entry = append_wakeword_capture_label(
+                config,
+                capture_path=args.wakeword_label_capture,
+                label=args.wakeword_label,
+                notes=args.wakeword_label_notes,
+            )
+            print(f"wakeword_label_capture={args.wakeword_label_capture}")
+            print(f"wakeword_label={entry['data']['label']}")
+            return 0
+
+        if args.wakeword_eval:
+            from twinr.proactive import run_wakeword_eval
+
+            verifier_backend = backend
+            if verifier_backend is None and config.wakeword_verifier_mode != "disabled" and config.openai_api_key:
+                from twinr.providers.openai import OpenAIBackend
+
+                verifier_backend = OpenAIBackend(config=config)
+            report = run_wakeword_eval(
+                config=config,
+                manifest_path=args.wakeword_manifest,
+                backend=verifier_backend,
+            )
+            print(f"wakeword_eval_entries={report.evaluated_entries}")
+            print(f"wakeword_eval_precision={report.metrics.precision:.4f}")
+            print(f"wakeword_eval_recall={report.metrics.recall:.4f}")
+            print(f"wakeword_eval_fpr={report.metrics.false_positive_rate:.4f}")
+            print(f"wakeword_eval_fnr={report.metrics.false_negative_rate:.4f}")
+            if report.report_path is not None:
+                print(f"wakeword_eval_report={report.report_path}")
+            return 0
+
+        if args.wakeword_autotune:
+            from twinr.proactive import autotune_wakeword_profile
+
+            verifier_backend = backend
+            if verifier_backend is None and config.wakeword_verifier_mode != "disabled" and config.openai_api_key:
+                from twinr.providers.openai import OpenAIBackend
+
+                verifier_backend = OpenAIBackend(config=config)
+            recommendation = autotune_wakeword_profile(
+                config=config,
+                manifest_path=args.wakeword_manifest,
+                backend=verifier_backend,
+            )
+            print(f"wakeword_autotune_precision={recommendation.metrics.precision:.4f}")
+            print(f"wakeword_autotune_recall={recommendation.metrics.recall:.4f}")
+            print(f"wakeword_autotune_fpr={recommendation.metrics.false_positive_rate:.4f}")
+            print(f"wakeword_autotune_score={recommendation.score:.4f}")
+            if recommendation.profile_path is not None:
+                print(f"wakeword_autotune_profile={recommendation.profile_path}")
+            print(f"wakeword_autotune_threshold={recommendation.profile.threshold}")
+            print(f"wakeword_autotune_patience_frames={recommendation.profile.patience_frames}")
+            print(f"wakeword_autotune_activation_samples={recommendation.profile.activation_samples}")
+            return 0
 
         if args.vision_prompt and backend is not None:
             from twinr.providers.openai import OpenAIImageInput

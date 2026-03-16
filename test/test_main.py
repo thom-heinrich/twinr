@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 import importlib
 import sys
@@ -177,6 +177,145 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(companion_calls, [True])
         self.assertEqual(fake_loop.duration_s, 0.0)
+
+    def test_wakeword_label_capture_dispatches_to_proactive_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("", encoding="utf-8")
+            capture_path = root / "capture.wav"
+            capture_path.write_bytes(b"RIFFtest")
+            calls: list[tuple[Path, str, str | None]] = []
+            fake_proactive_module = ModuleType("twinr.proactive")
+
+            def _append_label(config, *, capture_path, label, notes=None):
+                del config
+                calls.append((Path(capture_path), label, notes))
+                return {"data": {"label": label}}
+
+            fake_proactive_module.append_wakeword_capture_label = _append_label
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(sys.modules, {"twinr.proactive": fake_proactive_module}):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    sys.argv = [
+                        "twinr",
+                        "--env-file",
+                        str(env_path),
+                        "--wakeword-label-capture",
+                        str(capture_path),
+                        "--wakeword-label",
+                        "correct",
+                        "--wakeword-label-notes",
+                        "operator confirmed",
+                    ]
+                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [(capture_path, "correct", "operator confirmed")])
+
+    def test_wakeword_eval_dispatches_to_proactive_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
+            manifest_path = root / "manifest.jsonl"
+            manifest_path.write_text("", encoding="utf-8")
+            calls: list[tuple[Path, object | None]] = []
+            fake_proactive_module = ModuleType("twinr.proactive")
+
+            def _run_eval(*, config, manifest_path=None, backend=None):
+                del config
+                calls.append((Path(manifest_path), backend))
+                return SimpleNamespace(
+                    evaluated_entries=2,
+                    metrics=SimpleNamespace(
+                        precision=1.0,
+                        recall=1.0,
+                        false_positive_rate=0.0,
+                        false_negative_rate=0.0,
+                    ),
+                    report_path=root / "report.json",
+                )
+
+            fake_proactive_module.run_wakeword_eval = _run_eval
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(sys.modules, {"twinr.proactive": fake_proactive_module}):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    sys.argv = [
+                        "twinr",
+                        "--env-file",
+                        str(env_path),
+                        "--wakeword-eval",
+                        "--wakeword-manifest",
+                        str(manifest_path),
+                    ]
+                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [(manifest_path, None)])
+
+    def test_wakeword_autotune_dispatches_to_proactive_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
+            manifest_path = root / "manifest.jsonl"
+            manifest_path.write_text("", encoding="utf-8")
+            calls: list[tuple[Path, object | None]] = []
+            fake_proactive_module = ModuleType("twinr.proactive")
+
+            def _autotune(*, config, manifest_path=None, backend=None):
+                del config
+                calls.append((Path(manifest_path), backend))
+                return SimpleNamespace(
+                    metrics=SimpleNamespace(
+                        precision=0.9,
+                        recall=0.8,
+                        false_positive_rate=0.1,
+                    ),
+                    score=0.84,
+                    profile_path=root / "wakeword_profile.json",
+                    profile=SimpleNamespace(
+                        threshold=0.08,
+                        patience_frames=2,
+                        activation_samples=3,
+                    ),
+                )
+
+            fake_proactive_module.autotune_wakeword_profile = _autotune
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(sys.modules, {"twinr.proactive": fake_proactive_module}):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    sys.argv = [
+                        "twinr",
+                        "--env-file",
+                        str(env_path),
+                        "--wakeword-autotune",
+                        "--wakeword-manifest",
+                        str(manifest_path),
+                    ]
+                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [(manifest_path, None)])
 
 
 if __name__ == "__main__":

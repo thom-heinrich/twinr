@@ -5,7 +5,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.contracts import AgentToolCall, ToolCallingTurnResponse
-from twinr.agent.tools.streaming_loop import ToolCallingStreamingLoop
+from twinr.agent.tools.runtime.streaming_loop import ToolCallingStreamingLoop
 
 
 class FakeToolCallingProvider:

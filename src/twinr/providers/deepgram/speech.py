@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 import json
+import logging
 import mimetypes
+import os
+import stat
+import time
 
 import httpx
 from websockets.sync.client import connect as websocket_connect
@@ -19,14 +23,35 @@ from twinr.agent.base_agent.contracts import (
     StreamingTranscriptionResult,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _extract_transcript(payload: dict[str, object]) -> str:
-    transcript = (
-        payload.get("results", {})
-        .get("channels", [{}])[0]
-        .get("alternatives", [{}])[0]
-        .get("transcript", "")
-    )
+    # AUDIT-FIX(#5): Validate Deepgram payload structure defensively so malformed 2xx responses do not explode with AttributeError/IndexError.
+    if not isinstance(payload, dict):
+        raise RuntimeError("Deepgram response payload must be a JSON object")
+
+    results = payload.get("results")
+    if not isinstance(results, dict):
+        raise RuntimeError("Deepgram response missing 'results' object")
+
+    channels = results.get("channels")
+    if not isinstance(channels, list) or not channels:
+        return ""
+
+    first_channel = channels[0]
+    if not isinstance(first_channel, dict):
+        raise RuntimeError("Deepgram response channel entry was not an object")
+
+    alternatives = first_channel.get("alternatives")
+    if not isinstance(alternatives, list) or not alternatives:
+        return ""
+
+    first_alternative = alternatives[0]
+    if not isinstance(first_alternative, dict):
+        raise RuntimeError("Deepgram response alternative entry was not an object")
+
+    transcript = first_alternative.get("transcript", "")
     if not isinstance(transcript, str):
         raise RuntimeError("Deepgram response did not contain a string transcript")
     return transcript.strip()
@@ -46,6 +71,39 @@ def _extract_streaming_transcript(payload: dict[str, object]) -> str:
     return transcript.strip() if isinstance(transcript, str) else ""
 
 
+def _extract_streaming_confidence(payload: dict[str, object]) -> float | None:
+    channel = payload.get("channel", {})
+    if not isinstance(channel, dict):
+        return None
+    alternatives = channel.get("alternatives", ())
+    if not isinstance(alternatives, list) or not alternatives:
+        return None
+    first = alternatives[0]
+    if not isinstance(first, dict):
+        return None
+    raw_confidence = first.get("confidence")
+    if isinstance(raw_confidence, (int, float)):
+        confidence = float(raw_confidence)
+        if 0.0 <= confidence <= 1.0:
+            return confidence
+    words = first.get("words")
+    if not isinstance(words, list) or not words:
+        return None
+    confidences: list[float] = []
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+        raw_word_confidence = word.get("confidence")
+        if not isinstance(raw_word_confidence, (int, float)):
+            continue
+        confidence = float(raw_word_confidence)
+        if 0.0 <= confidence <= 1.0:
+            confidences.append(confidence)
+    if not confidences:
+        return None
+    return sum(confidences) / len(confidences)
+
+
 def _build_websocket_url(
     *,
     base_url: str,
@@ -58,8 +116,22 @@ def _build_websocket_url(
     endpointing_ms: int,
     utterance_end_ms: int,
 ) -> str:
-    split = urlsplit(base_url.rstrip("/"))
-    scheme = "wss" if split.scheme == "https" else "ws"
+    # AUDIT-FIX(#1): Preserve secure ws/wss schemes and reject invalid base URLs instead of silently downgrading TLS or producing malformed URLs.
+    normalized_base_url = base_url.strip()
+    if not normalized_base_url:
+        raise ValueError("Deepgram base URL must not be empty")
+
+    split = urlsplit(normalized_base_url.rstrip("/"))
+    if split.scheme not in {"http", "https", "ws", "wss"} or not split.netloc:
+        raise ValueError(f"Invalid Deepgram base URL: {base_url!r}")
+
+    scheme_map = {
+        "http": "ws",
+        "https": "wss",
+        "ws": "ws",
+        "wss": "wss",
+    }
+    scheme = scheme_map[split.scheme]
     params: dict[str, str] = {
         "model": model,
         "encoding": "linear16",
@@ -80,80 +152,109 @@ def _build_websocket_url(
     return urlunsplit((scheme, split.netloc, path, urlencode(params), ""))
 
 
+def _require_positive_int(name: str, value: int) -> int:
+    # AUDIT-FIX(#9): Fail fast on invalid audio transport settings locally instead of shipping broken parameters to Deepgram.
+    if isinstance(value, bool) or int(value) <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
+
+
 class _DeepgramStreamingSession(StreamingSpeechToTextSession):
     def __init__(
         self,
         *,
         connection,
         finalize_timeout_s: float,
+        keepalive_interval_s: float,
+        send_timeout_s: float,
+        max_pending_messages: int,
         on_interim: Callable[[str], None] | None = None,
         on_endpoint: Callable[[StreamingSpeechEndpointEvent], None] | None = None,
     ) -> None:
         self._connection = connection
         self._finalize_timeout_s = max(0.5, float(finalize_timeout_s))
+        self._keepalive_interval_s = max(0.0, float(keepalive_interval_s))
+        self._send_timeout_s = max(0.5, float(send_timeout_s))
         self._on_interim = on_interim
         self._on_endpoint = on_endpoint
+        self._state_lock = Lock()
         self._send_lock = Lock()
-        self._outgoing: Queue[bytes | str] = Queue()
+        # AUDIT-FIX(#2): Carry optional per-message acknowledgements so finalize/close no longer depend on unbounded Queue.join() waits.
+        # AUDIT-FIX(#6): Bound the outbound queue to prevent memory blowups if the network stalls while audio continues arriving.
+        self._outgoing: Queue[tuple[bytes | str, Event | None]] = Queue(maxsize=max(1, int(max_pending_messages)))
         self._done = Event()
         self._closed = Event()
-        self._reader_error: Exception | None = None
+        self._finalize_requested = Event()
+        self._stream_error: Exception | None = None
         self._final_segments: list[str] = []
         self._latest_interim: str = ""
         self._saw_interim = False
         self._saw_speech_final = False
         self._saw_utterance_end = False
+        self._latest_confidence: float | None = None
+        self._last_send_monotonic = time.monotonic()
         self._request_id = self._read_request_id()
-        self._sender = Thread(target=self._sender_loop, daemon=True)
+        self._sender = Thread(target=self._sender_loop, daemon=True, name="deepgram-stt-sender")
         self._sender.start()
-        self._reader = Thread(target=self._reader_loop, daemon=True)
+        self._reader = Thread(target=self._reader_loop, daemon=True, name="deepgram-stt-reader")
         self._reader.start()
+        # AUDIT-FIX(#4): Keep the Deepgram stream alive across long senior pauses to avoid NET-0001 disconnects during silence.
+        self._keepalive = Thread(target=self._keepalive_loop, daemon=True, name="deepgram-stt-keepalive")
+        self._keepalive.start()
 
     def send_pcm(self, pcm_bytes: bytes) -> None:
         if not pcm_bytes:
             return
-        if self._reader_error is not None:
-            raise self._reader_error
-        self._outgoing.put(bytes(pcm_bytes))
+        # AUDIT-FIX(#6): Reject writes after shutdown or sender failure instead of silently queueing audio that can never be delivered.
+        self._raise_if_unusable()
+        self._enqueue(bytes(pcm_bytes))
 
     def finalize(self) -> StreamingTranscriptionResult:
-        if self._reader_error is not None:
-            raise self._reader_error
+        self._raise_if_unusable(allow_closed=False)
+        self._finalize_requested.set()
+
+        # AUDIT-FIX(#2): Bound control-message delivery waits so finalize cannot deadlock the voice turn forever if the sender thread dies.
+        finalize_ack = Event()
         if self._sender.is_alive():
-            self._outgoing.join()
-        try:
-            self._outgoing.put("Finalize")
-            if self._sender.is_alive():
-                self._outgoing.join()
-        except Exception:
-            pass
+            self._enqueue("Finalize", ack=finalize_ack, allow_error=True)
+            finalize_ack.wait(timeout=self._send_timeout_s)
+
         self._done.wait(timeout=self._finalize_timeout_s)
-        if self._reader_error is not None and not self._final_segments and not self._latest_interim:
-            raise self._reader_error
-        transcript = " ".join(segment for segment in self._final_segments if segment).strip()
-        if not transcript:
-            transcript = self._latest_interim.strip()
-        self.close()
-        return self._result_snapshot(transcript=transcript)
+        transcript = self._current_transcript()
+        error = self._get_stream_error()
+        try:
+            if error is not None and not transcript:
+                raise error
+            return self._result_snapshot(transcript=transcript)
+        finally:
+            self.close()
 
     def snapshot(self) -> StreamingTranscriptionResult:
-        transcript = " ".join(segment for segment in self._final_segments if segment).strip()
-        if not transcript:
-            transcript = self._latest_interim.strip()
-        return self._result_snapshot(transcript=transcript)
+        return self._result_snapshot(transcript=self._current_transcript())
 
     def close(self) -> None:
         if self._closed.is_set():
             return
+
         self._closed.set()
-        self._outgoing.put("CloseStream")
+        # AUDIT-FIX(#2): Attempt a graceful Deepgram CloseStream, but never block indefinitely on a dead sender or stuck queue.
+        close_ack = Event()
         if self._sender.is_alive():
-            self._outgoing.join()
+            try:
+                self._enqueue("CloseStream", ack=close_ack, allow_error=True, allow_closed=True)
+                close_ack.wait(timeout=self._send_timeout_s)
+            except Exception:
+                pass
+
         try:
             self._connection.close()
         except Exception:
             pass
+
         self._done.set()
+
+        if self._keepalive.is_alive():
+            self._keepalive.join(timeout=1.0)
         if self._sender.is_alive():
             self._sender.join(timeout=1.0)
         if self._reader.is_alive():
@@ -177,28 +278,42 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
                     continue
                 payload = json.loads(message)
                 event_type = str(payload.get("type", "")).strip()
+
                 if event_type == "Results":
                     transcript = _extract_streaming_transcript(payload)
+                    confidence = _extract_streaming_confidence(payload)
                     is_final = bool(payload.get("is_final"))
                     speech_final = bool(payload.get("speech_final"))
                     from_finalize = bool(payload.get("from_finalize"))
-                    if transcript:
-                        if is_final:
-                            if not self._final_segments or self._final_segments[-1] != transcript:
-                                self._final_segments.append(transcript)
-                            self._latest_interim = transcript
-                        else:
-                            self._latest_interim = transcript
-                            self._saw_interim = True
-                            if self._on_interim is not None:
-                                self._on_interim(transcript)
                     metadata = payload.get("metadata", {})
-                    if self._request_id is None and isinstance(metadata, dict):
-                        request_id = metadata.get("request_id")
-                        if isinstance(request_id, str) and request_id.strip():
-                            self._request_id = request_id.strip()
-                    if speech_final and transcript and not from_finalize and self._on_endpoint is not None:
-                        self._on_endpoint(
+
+                    with self._state_lock:
+                        if transcript:
+                            if is_final:
+                                if not self._final_segments or self._final_segments[-1] != transcript:
+                                    self._final_segments.append(transcript)
+                                self._latest_interim = transcript
+                            else:
+                                self._latest_interim = transcript
+                                self._saw_interim = True
+                        if confidence is not None:
+                            self._latest_confidence = confidence
+
+                        if isinstance(metadata, dict) and self._request_id is None:
+                            request_id = metadata.get("request_id")
+                            if isinstance(request_id, str) and request_id.strip():
+                                self._request_id = request_id.strip()
+
+                        if speech_final:
+                            self._saw_speech_final = True
+
+                    if transcript and not is_final:
+                        # AUDIT-FIX(#3): Isolate callback failures so UI/observer bugs do not tear down the transcription transport.
+                        self._safe_invoke_callback(self._on_interim, transcript)
+
+                    if speech_final and transcript and not from_finalize:
+                        self._safe_invoke_callback(
+                            self._on_endpoint,
                             StreamingSpeechEndpointEvent(
                                 transcript=transcript,
                                 event_type="speech_final",
@@ -206,65 +321,185 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
                                 is_final=is_final,
                                 speech_final=speech_final,
                                 from_finalize=from_finalize,
-                            )
+                            ),
                         )
-                    if speech_final or (is_final and from_finalize):
-                        self._saw_speech_final = True
+
+                    # AUDIT-FIX(#10): Track actual speech_final separately from finalize completion so result flags remain semantically correct.
+                    if speech_final or (self._finalize_requested.is_set() and is_final):
                         self._done.set()
+
                 elif event_type == "UtteranceEnd":
-                    self._saw_utterance_end = True
-                    transcript = " ".join(segment for segment in self._final_segments if segment).strip()
-                    if not transcript:
-                        transcript = self._latest_interim.strip()
-                    if transcript and self._on_endpoint is not None:
-                        self._on_endpoint(
+                    with self._state_lock:
+                        self._saw_utterance_end = True
+                    transcript = self._current_transcript()
+                    if transcript:
+                        self._safe_invoke_callback(
+                            self._on_endpoint,
                             StreamingSpeechEndpointEvent(
                                 transcript=transcript,
                                 event_type="utterance_end",
                                 request_id=self._request_id,
-                            )
+                            ),
                         )
                     self._done.set()
-                elif event_type in {"CloseStream", "Metadata"}:
+
+                elif event_type == "Metadata":
+                    # AUDIT-FIX(#7): Capture request_id from Metadata frames because Deepgram may only emit it there after close/finalize.
+                    request_id = payload.get("request_id")
+                    if isinstance(request_id, str) and request_id.strip():
+                        with self._state_lock:
+                            if self._request_id is None:
+                                self._request_id = request_id.strip()
                     continue
+
+                elif event_type == "CloseStream":
+                    continue
+
+                elif event_type == "SpeechStarted":
+                    continue
+
+                elif event_type == "Error":
+                    message_text = str(payload.get("description") or payload.get("message") or "Deepgram streaming error").strip()
+                    self._set_stream_error(RuntimeError(message_text))
+                    return
+
         except Exception as exc:  # pragma: no cover - network close races
             if not self._closed.is_set():
-                self._reader_error = exc
+                self._set_stream_error(exc)
         finally:
             self._done.set()
 
     def _result_snapshot(self, *, transcript: str) -> StreamingTranscriptionResult:
+        with self._state_lock:
+            request_id = self._request_id
+            saw_interim = self._saw_interim
+            saw_speech_final = self._saw_speech_final
+            saw_utterance_end = self._saw_utterance_end
+            confidence = self._latest_confidence
         return StreamingTranscriptionResult(
             transcript=transcript,
-            request_id=self._request_id,
-            saw_interim=self._saw_interim,
-            saw_speech_final=self._saw_speech_final,
-            saw_utterance_end=self._saw_utterance_end,
+            request_id=request_id,
+            saw_interim=saw_interim,
+            saw_speech_final=saw_speech_final,
+            saw_utterance_end=saw_utterance_end,
+            confidence=confidence,
         )
 
     def _sender_loop(self) -> None:
         try:
             while True:
-                payload = self._outgoing.get()
                 try:
-                    if self._reader_error is not None and payload not in {"CloseStream", "Finalize"}:
+                    payload, ack = self._outgoing.get(timeout=0.5)
+                except Empty:
+                    if self._closed.is_set():
+                        return
+                    continue
+
+                try:
+                    if self._get_stream_error() is not None and payload not in {"CloseStream", "Finalize"}:
                         continue
+
                     with self._send_lock:
                         if isinstance(payload, bytes):
                             self._connection.send(payload)
                         else:
                             self._connection.send(json.dumps({"type": payload}))
+
+                    with self._state_lock:
+                        self._last_send_monotonic = time.monotonic()
+
                     if payload == "CloseStream":
                         return
+
                 except Exception as exc:  # pragma: no cover - network close races
                     if not self._closed.is_set():
-                        self._reader_error = exc
-                        self._done.set()
+                        self._set_stream_error(exc)
                     return
+
                 finally:
+                    if ack is not None:
+                        ack.set()
                     self._outgoing.task_done()
         finally:
             self._done.set()
+
+    def _keepalive_loop(self) -> None:
+        if self._keepalive_interval_s <= 0:
+            return
+
+        while not self._closed.wait(timeout=self._keepalive_interval_s):
+            if self._finalize_requested.is_set() or self._get_stream_error() is not None:
+                continue
+            if not self._sender.is_alive():
+                return
+
+            with self._state_lock:
+                idle_for_s = time.monotonic() - self._last_send_monotonic
+
+            if idle_for_s < self._keepalive_interval_s:
+                continue
+
+            try:
+                self._enqueue("KeepAlive", allow_error=True)
+            except Exception:
+                logger.warning("Deepgram keepalive enqueue failed; continuing without keepalive", exc_info=True)
+                return
+
+    def _enqueue(
+        self,
+        payload: bytes | str,
+        *,
+        ack: Event | None = None,
+        allow_error: bool = False,
+        allow_closed: bool = False,
+    ) -> None:
+        if not allow_closed and self._closed.is_set():
+            raise RuntimeError("Streaming session is closed")
+        if not allow_error:
+            self._raise_if_unusable()
+        elif not self._sender.is_alive():
+            raise RuntimeError("Streaming session sender thread is not running")
+        try:
+            if ack is None and isinstance(payload, bytes):
+                self._outgoing.put_nowait((payload, ack))
+            else:
+                self._outgoing.put((payload, ack), timeout=self._send_timeout_s)
+        except Full as exc:
+            raise RuntimeError("Streaming session outbound queue is full") from exc
+
+    def _current_transcript(self) -> str:
+        with self._state_lock:
+            transcript = " ".join(segment for segment in self._final_segments if segment).strip()
+            if not transcript:
+                transcript = self._latest_interim.strip()
+            return transcript
+
+    def _safe_invoke_callback(self, callback: Callable[[Any], None] | None, value: Any) -> None:
+        if callback is None:
+            return
+        try:
+            callback(value)
+        except Exception:  # pragma: no cover - callback behavior belongs to caller tests
+            logger.exception("Deepgram streaming callback raised and was ignored")
+
+    def _set_stream_error(self, exc: Exception) -> None:
+        with self._state_lock:
+            if self._stream_error is None:
+                self._stream_error = exc
+        self._done.set()
+
+    def _get_stream_error(self) -> Exception | None:
+        with self._state_lock:
+            return self._stream_error
+
+    def _raise_if_unusable(self, *, allow_closed: bool = False) -> None:
+        error = self._get_stream_error()
+        if error is not None:
+            raise error
+        if not allow_closed and self._closed.is_set():
+            raise RuntimeError("Streaming session is closed")
+        if not self._sender.is_alive():
+            raise RuntimeError("Streaming session sender thread is not running")
 
 
 class DeepgramSpeechToTextProvider:
@@ -276,8 +511,20 @@ class DeepgramSpeechToTextProvider:
         websocket_connector: Callable[..., Any] | None = None,
     ) -> None:
         self.config = config
+        self._owns_client = client is None
+        # AUDIT-FIX(#8): Track ownership and expose close() so provider-created HTTP clients can release pooled sockets cleanly at shutdown.
         self._client = client or httpx.Client(timeout=self.config.deepgram_timeout_s)
         self._websocket_connector = websocket_connector or websocket_connect
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> DeepgramSpeechToTextProvider:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def transcribe(
         self,
@@ -289,6 +536,9 @@ class DeepgramSpeechToTextProvider:
         prompt: str | None = None,
     ) -> str:
         del filename, prompt
+        if not audio_bytes:
+            return ""
+
         api_key = (self.config.deepgram_api_key or "").strip()
         if not api_key:
             raise RuntimeError("DEEPGRAM_API_KEY is required to use the Deepgram speech provider")
@@ -302,17 +552,22 @@ class DeepgramSpeechToTextProvider:
         if self.config.deepgram_stt_smart_format:
             params["smart_format"] = "true"
 
-        response = self._client.post(
-            f"{self.config.deepgram_base_url.rstrip('/')}/listen",
-            params=params,
-            headers={
-                "Authorization": f"Token {api_key}",
-                "Content-Type": content_type or "application/octet-stream",
-            },
-            content=audio_bytes,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response = self._client.post(
+                f"{self.config.deepgram_base_url.rstrip('/')}/listen",
+                params=params,
+                headers={
+                    "Authorization": f"Token {api_key}",
+                    "Content-Type": content_type or "application/octet-stream",
+                },
+                content=audio_bytes,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            # AUDIT-FIX(#11): Re-raise transport and decode failures as controlled runtime errors for cleaner upstream recovery paths.
+            raise RuntimeError(f"Deepgram transcription request failed: {exc}") from exc
+
         return _extract_transcript(payload)
 
     def transcribe_path(
@@ -324,8 +579,37 @@ class DeepgramSpeechToTextProvider:
     ) -> str:
         audio_path = Path(path)
         content_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+
+        open_flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            # AUDIT-FIX(#12): Refuse symlink traversal on platforms that support O_NOFOLLOW.
+            open_flags |= os.O_NOFOLLOW
+
+        try:
+            fd = os.open(audio_path, open_flags)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Audio path does not exist: {audio_path}") from exc
+        except OSError as exc:
+            if audio_path.is_symlink():
+                raise RuntimeError(f"Refusing to transcribe symlinked path: {audio_path}") from exc
+            raise RuntimeError(f"Unable to open audio path safely: {audio_path}") from exc
+
+        try:
+            file_stat = os.fstat(fd)
+            # AUDIT-FIX(#12): Only regular files are accepted; devices, pipes, and directories are rejected before any bytes leave the device.
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise RuntimeError(f"Audio path is not a regular file: {audio_path}")
+
+            # AUDIT-FIX(#13): Use an explicit file descriptor wrapper so the file handle is always closed deterministically.
+            with os.fdopen(fd, "rb") as audio_file:
+                fd = -1
+                audio_bytes = audio_file.read()
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
         return self.transcribe(
-            audio_path.read_bytes(),
+            audio_bytes,
             filename=audio_path.name,
             content_type=content_type,
             language=language,
@@ -346,7 +630,30 @@ class DeepgramSpeechToTextProvider:
         api_key = (self.config.deepgram_api_key or "").strip()
         if not api_key:
             raise RuntimeError("DEEPGRAM_API_KEY is required to use the Deepgram speech provider")
+
+        sample_rate = _require_positive_int("sample_rate", sample_rate)
+        channels = _require_positive_int("channels", channels)
         resolved_language = (language or self.config.deepgram_stt_language or "").strip() or None
+
+        # AUDIT-FIX(#14): Bound incoming message size instead of disabling limits completely; STT results are tiny, unbounded frames are unnecessary risk.
+        max_message_bytes = max(
+            64 * 1024,
+            int(getattr(self.config, "deepgram_streaming_max_message_bytes", 4 * 1024 * 1024)),
+        )
+        keepalive_interval_s = max(
+            0.0,
+            float(getattr(self.config, "deepgram_streaming_keepalive_interval_s", 4.0)),
+        )
+        send_timeout_s = max(
+            0.5,
+            float(getattr(self.config, "deepgram_streaming_send_timeout_s", self.config.deepgram_timeout_s)),
+        )
+
+        max_pending_messages = max(
+            8,
+            int(getattr(self.config, "deepgram_streaming_max_pending_messages", 256)),
+        )
+
         connection = self._websocket_connector(
             _build_websocket_url(
                 base_url=self.config.deepgram_base_url,
@@ -364,11 +671,14 @@ class DeepgramSpeechToTextProvider:
             },
             open_timeout=self.config.deepgram_timeout_s,
             close_timeout=self.config.deepgram_timeout_s,
-            max_size=None,
+            max_size=max_message_bytes,
         )
         return _DeepgramStreamingSession(
             connection=connection,
             finalize_timeout_s=self.config.deepgram_streaming_finalize_timeout_s,
+            keepalive_interval_s=keepalive_interval_s,
+            send_timeout_s=send_timeout_s,
+            max_pending_messages=max_pending_messages,
             on_interim=on_interim,
             on_endpoint=on_endpoint,
         )

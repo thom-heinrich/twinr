@@ -1,0 +1,43 @@
+schema_version: 1
+name: settings
+path: src/twinr/agent/base_agent/settings
+kind: python-package
+visibility: internal
+summary: Bounded runtime-adjustable setting helpers and safe .env persistence for the base agent.
+owned_concerns:
+  - Supported simple-setting catalog for memory capacity, spoken voice, speech speed, and bounded numeric timing values
+  - Normalization of user-requested setting changes into stable summaries and env updates
+  - Prompt-facing context that describes the current adjustable setting state
+  - Safe read-modify-write persistence for tool-driven `.env` updates
+out_of_scope:
+  - Full config parsing and default loading in `src/twinr/agent/base_agent/config.py`
+  - Web dashboard env editing outside this bounded simple-setting surface
+  - Tool confirmation flow and runtime-side application of changed values
+  - Provider/runtime behavior beyond exposing supported settings and voice options
+files:
+  - path: __init__.py
+    role: Package marker with package-level summary only
+  - path: simple_settings.py
+    role: Canonical simple-setting catalog and `.env` persistence helpers
+    exports:
+      - SimpleSettingUpdate
+      - supported_setting_names
+      - supported_spoken_voices
+      - spoken_voice_options_context
+      - spoken_voice_language_note
+      - adjustable_settings_context
+      - update_simple_setting
+      - write_env_updates
+      - memory_capacity_level
+      - current_spoken_voice
+      - current_speech_speed
+      - current_numeric_setting
+tests:
+  - path: test/test_simple_settings.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_openai_realtime.py
+primary_callers:
+  - path: src/twinr/agent/tools/handlers/settings.py
+  - path: src/twinr/agent/tools/prompting/instructions.py
+  - path: src/twinr/agent/tools/schemas/contracts.py
+  - path: src/twinr/providers/openai/realtime.py

@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
-from twinr.memory.longterm.models import LongTermGraphEdgeCandidateV1
+from twinr.memory.longterm.core.models import LongTermGraphEdgeCandidateV1
 
 
 class _FakeRemoteState:

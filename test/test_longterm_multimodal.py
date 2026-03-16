@@ -13,7 +13,7 @@ from twinr.agent.workflows.realtime_runner_background import TwinrRealtimeBackgr
 from twinr.agent.workflows.realtime_runner_support import TwinrRealtimeSupportMixin
 from twinr.config import TwinrConfig
 from twinr.runtime import TwinrRuntime
-from twinr.memory.longterm.service import LongTermMemoryService
+from twinr.memory.longterm.runtime.service import LongTermMemoryService
 
 
 class _FakeCameraCapture:

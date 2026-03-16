@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+import binascii
+import html
+import ipaddress
+import logging
+import os
+import secrets
+from functools import partial
 from pathlib import Path
-from urllib.parse import quote_plus
+from typing import Any
+from urllib.parse import quote_plus, urlsplit
 
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 
 from twinr.agent.base_agent import AdaptiveTimingStore, TwinrConfig
 from twinr.hardware.voice_profile import VoiceProfileMonitor
@@ -58,16 +69,271 @@ from twinr.web.viewmodels import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+_DEFAULT_ALLOWED_HOSTS = "localhost,127.0.0.1,[::1]"
+_DEFAULT_MAX_FORM_BYTES = 64 * 1024
+_MAX_FORM_BYTES_CAP = 1024 * 1024
+
+
+def _env_bool(raw_value: Any, *, default: bool) -> bool:
+    if raw_value is None:
+        return default
+    value = str(raw_value).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _env_int(raw_value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _normalize_host_header(raw_host: str) -> str:
+    host = raw_host.strip()
+    if not host:
+        return ""
+    if host.startswith("["):
+        end = host.find("]")
+        if end != -1:
+            return host[1:end].strip().lower()
+    if host.count(":") == 1:
+        return host.split(":", 1)[0].strip().lower()
+    return host.lower()
+
+
+def _parse_allowed_hosts(raw_value: str | None) -> tuple[str, ...]:
+    configured = raw_value or _DEFAULT_ALLOWED_HOSTS
+    hosts = []
+    for chunk in configured.split(","):
+        normalized = _normalize_host_header(chunk)
+        if normalized:
+            hosts.append(normalized)
+    return tuple(dict.fromkeys(hosts))
+
+
+def _is_allowed_host(host: str, allowed_hosts: tuple[str, ...]) -> bool:
+    if not host:
+        return False
+    if "*" in allowed_hosts:
+        return True
+    return host in allowed_hosts
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().lower()
+    if normalized in {"", "localhost"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _has_valid_basic_auth(request: Request, username: str, password: str) -> bool:
+    header = request.headers.get("authorization", "")
+    if not header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return False
+    provided_username, separator, provided_password = decoded.partition(":")
+    if not separator:
+        return False
+    return secrets.compare_digest(provided_username, username) and secrets.compare_digest(provided_password, password)
+
+
+def _request_origin(request: Request) -> str:
+    host = request.headers.get("host", "").strip()
+    return f"{request.url.scheme}://{host}".rstrip("/")
+
+
+def _is_same_origin_url(candidate: str, expected_origin: str) -> bool:
+    parsed = urlsplit(candidate)
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/") == expected_origin.rstrip("/")
+
+
+def _has_trusted_same_origin(request: Request) -> bool:
+    expected_origin = _request_origin(request)
+    origin = request.headers.get("origin", "").strip()
+    if origin:
+        return _is_same_origin_url(origin, expected_origin)
+    referer = request.headers.get("referer", "").strip()
+    if referer:
+        return _is_same_origin_url(referer, expected_origin)
+    sec_fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+    return sec_fetch_site in {"same-origin", "none"}
+
+
+def _secure_response(response: Response) -> Response:
+    response.headers.setdefault("Cache-Control", "no-store")
+    response.headers.setdefault("Pragma", "no-cache")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    return response
+
+
+def _error_response(request: Request, *, status_code: int, message: str) -> Response:
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept or "*/*" in accept:
+        body = (
+            "<!doctype html>"
+            "<html lang=\"en\">"
+            "<head><meta charset=\"utf-8\"><title>Twinr Control</title></head>"
+            f"<body><h1>Twinr Control</h1><p>{html.escape(message)}</p></body></html>"
+        )
+        return _secure_response(HTMLResponse(body, status_code=status_code))
+    return _secure_response(PlainTextResponse(message, status_code=status_code))
+
+
+def _public_error_message(exc: Exception, *, fallback: str) -> str:
+    if isinstance(exc, HTTPException):
+        detail = exc.detail if isinstance(exc.detail, str) else ""
+        clean_detail = " ".join(detail.split()).strip()
+        if clean_detail:
+            return clean_detail
+        return fallback
+    if isinstance(exc, ValueError):
+        clean_value = " ".join(str(exc).split()).strip()
+        if clean_value and len(clean_value) <= 160 and not any(token in clean_value for token in ("/", "\\", "Traceback", "ALSA", "errno")):
+            return clean_value
+    if isinstance(exc, PermissionError):
+        return "Twinr could not access the needed local file or device."
+    if isinstance(exc, FileNotFoundError):
+        return "Twinr could not find the needed local file."
+    return fallback
+
+
+def _redirect_with_error(path: str, message: str) -> RedirectResponse:
+    return RedirectResponse(f"{path}?error={quote_plus(message)}", status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _redirect_saved(path: str) -> RedirectResponse:
+    return RedirectResponse(f"{path}?saved=1", status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _require_non_empty(value: str, *, message: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(message)
+    return normalized
+
+
+def _safe_project_subpath(project_root: Path, configured_path: str | Path, *, label: str) -> Path:
+    resolved_root = project_root.resolve()
+    candidate = (resolved_root / Path(configured_path)).resolve()
+    try:
+        candidate.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"{label} must stay inside the Twinr project folder.") from exc
+    return candidate
+
+
+def _safe_file_in_dir(parent_dir: Path, filename: str, *, label: str) -> Path:
+    leaf = Path(filename)
+    if leaf.name != filename:
+        raise ValueError(f"{label} must be a single file name.")
+    candidate = parent_dir / leaf
+    if candidate.is_symlink():
+        raise ValueError(f"{label} cannot be a symlink.")
+    if candidate.exists():
+        resolved_candidate = candidate.resolve()
+        try:
+            resolved_candidate.relative_to(parent_dir.resolve())
+        except ValueError as exc:
+            raise ValueError(f"{label} must stay inside its parent folder.") from exc
+    return candidate
+
+
+def _resolve_downloadable_file(root: Path, requested_name: str) -> Path:
+    try:
+        candidate = _resolve_named_file(root, requested_name)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="The requested file was not found.") from exc
+
+    root_resolved = root.resolve()
+    if candidate.is_symlink():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="The requested file was not found.")
+
+    try:
+        resolved_candidate = candidate.resolve(strict=True)
+        resolved_candidate.relative_to(root_resolved)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="The requested file was not found.") from exc
+
+    if not resolved_candidate.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="The requested file was not found.")
+    return resolved_candidate
+
+
+def _reminder_sort_key(entry: Any) -> tuple[int, str]:
+    due_at = getattr(entry, "due_at", None)
+    if due_at is None:
+        return (1, "")
+    return (0, str(due_at))
+
+
+# AUDIT-FIX(#5): Push blocking disk, zip, and hardware helpers off the event loop to keep the single-process UI responsive.
+async def _call_sync(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+    return await run_in_threadpool(partial(func, *args, **kwargs))
+
+
+# AUDIT-FIX(#3): Accept only bounded standard form posts so a bad client cannot memory-DoS the Raspberry Pi.
+async def _parse_bounded_form(request: Request, *, max_form_bytes: int) -> dict[str, str]:
+    content_type = request.headers.get("content-type", "")
+    if content_type and not content_type.startswith("application/x-www-form-urlencoded"):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="This page accepts only standard form posts.",
+        )
+
+    raw_length = request.headers.get("content-length", "").strip()
+    if raw_length:
+        try:
+            declared_length = int(raw_length)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The form size header was invalid.") from exc
+        if declared_length < 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The form size header was invalid.")
+        if declared_length > max_form_bytes:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="That form submission is too large.")
+
+    body = await request.body()
+    if len(body) > max_form_bytes:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="That form submission is too large.")
+    return parse_urlencoded_form(body)
+
+
 def create_app(env_file: str | Path = ".env") -> FastAPI:
     env_path = Path(env_file).resolve()
-    project_root = env_path.parent
+    if env_path.is_dir():
+        raise RuntimeError(f"Twinr Control expected an env file path, got directory: {env_path}")
+    project_root = env_path.parent.resolve()
     ops_paths = resolve_ops_paths(project_root)
-    templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
+
+    templates_dir = Path(__file__).resolve().parent / "templates"
+    static_dir = Path(__file__).resolve().parent / "static"
+    if not templates_dir.is_dir():
+        raise RuntimeError(f"Twinr Control templates directory is missing: {templates_dir}")
+    if not static_dir.is_dir():
+        raise RuntimeError(f"Twinr Control static directory is missing: {static_dir}")
+
+    templates = Jinja2Templates(directory=str(templates_dir))
 
     app = FastAPI(title="Twinr Control", version="0.1.0")
     app.mount(
         "/static",
-        StaticFiles(directory=str(Path(__file__).resolve().parent / "static")),
+        StaticFiles(directory=str(static_dir)),
         name="static",
     )
 
@@ -78,22 +344,119 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
         templates=templates,
     )
 
+    try:
+        _startup_config, startup_env_values = ctx.load_state()
+    except Exception:
+        startup_env_values = {}
+
+    security_env_values = {
+        **startup_env_values,
+        **{key: value for key, value in os.environ.items() if key.startswith("TWINR_WEB_")},
+    }
+
+    # AUDIT-FIX(#1,#3): Lock down the control plane defaults and bound form-body size to protect the local device.
+    max_form_bytes = _env_int(
+        security_env_values.get("TWINR_WEB_MAX_FORM_BYTES"),
+        default=_DEFAULT_MAX_FORM_BYTES,
+        minimum=4 * 1024,
+        maximum=_MAX_FORM_BYTES_CAP,
+    )
+    allowed_hosts = _parse_allowed_hosts(security_env_values.get("TWINR_WEB_ALLOWED_HOSTS"))
+    allow_remote = _env_bool(security_env_values.get("TWINR_WEB_ALLOW_REMOTE"), default=False)
+    require_auth = _env_bool(
+        security_env_values.get("TWINR_WEB_REQUIRE_AUTH"),
+        default=bool(security_env_values.get("TWINR_WEB_USERNAME") or security_env_values.get("TWINR_WEB_PASSWORD")),
+    )
+    auth_username = str(security_env_values.get("TWINR_WEB_USERNAME", "")).strip()
+    auth_password = str(security_env_values.get("TWINR_WEB_PASSWORD", ""))
+    if require_auth and not (auth_username and auth_password):
+        raise RuntimeError("Twinr Control requires both TWINR_WEB_USERNAME and TWINR_WEB_PASSWORD when auth is enabled.")
+    if allow_remote and not require_auth:
+        raise RuntimeError("Twinr Control remote access requires auth. Set TWINR_WEB_USERNAME and TWINR_WEB_PASSWORD.")
+
+    # AUDIT-FIX(#7): Serialize file-backed control-plane writes inside the single-process app to avoid state corruption.
+    state_write_lock = asyncio.Lock()
+    ops_job_lock = asyncio.Lock()
+    voice_profile_lock = asyncio.Lock()
+
+    @app.middleware("http")
+    async def guard_control_plane(request: Request, call_next: Any) -> Response:
+        normalized_host = _normalize_host_header(request.headers.get("host", ""))
+        if not _is_allowed_host(normalized_host, allowed_hosts):
+            return _error_response(
+                request,
+                status_code=status.HTTP_400_BAD_REQUEST,
+                message="Twinr Control rejected this host name. Check TWINR_WEB_ALLOWED_HOSTS.",
+            )
+
+        client_host = request.client.host if request.client else ""
+        if not allow_remote and not _is_loopback_host(client_host):
+            return _error_response(
+                request,
+                status_code=status.HTTP_403_FORBIDDEN,
+                message=(
+                    "Twinr Control only accepts browser access from this device right now. "
+                    "To allow remote access, set TWINR_WEB_ALLOW_REMOTE=1, TWINR_WEB_ALLOWED_HOSTS, and web credentials."
+                ),
+            )
+
+        # AUDIT-FIX(#1,#2): Require auth when configured and block cross-site state-changing requests.
+        if require_auth and not _has_valid_basic_auth(request, auth_username, auth_password):
+            response = _error_response(
+                request,
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                message="Sign-in is required for Twinr Control.",
+            )
+            response.headers["WWW-Authenticate"] = 'Basic realm="Twinr Control", charset="UTF-8"'
+            return response
+
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _has_trusted_same_origin(request):
+            return _error_response(
+                request,
+                status_code=status.HTTP_403_FORBIDDEN,
+                message="Twinr blocked that form because it did not look like a trusted same-browser request.",
+            )
+
+        response = await call_next(request)
+        return _secure_response(response)
+
+    @app.exception_handler(HTTPException)
+    async def handle_http_exception(request: Request, exc: HTTPException) -> Response:
+        return _error_response(
+            request,
+            status_code=exc.status_code,
+            message=_public_error_message(exc, fallback="Twinr Control could not finish that request."),
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_exception(request: Request, exc: Exception) -> Response:
+        # AUDIT-FIX(#6): Keep internal errors in logs and show plain, non-technical fallback text to the operator.
+        logger.exception("Unhandled Twinr Control error on %s %s", request.method, request.url.path, exc_info=exc)
+        return _error_response(
+            request,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="Twinr Control hit a local problem and could not finish that page. Please try again.",
+        )
+
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request) -> HTMLResponse:
-        config, env_values = ctx.load_state()
-        snapshot = ctx.load_snapshot(config)
-        reminders = ctx.reminder_store(config).load_entries()
-        pending_reminders = tuple(entry for entry in reminders if not entry.delivered)
+        config, env_values = await _call_sync(ctx.load_state)
+        snapshot = await _call_sync(ctx.load_snapshot, config)
+        reminders = await _call_sync(ctx.reminder_store(config).load_entries)
+        # AUDIT-FIX(#10): Sort pending reminders before selecting the next one so the dashboard reflects the true earliest due item.
+        pending_reminders = tuple(sorted((entry for entry in reminders if not entry.delivered), key=_reminder_sort_key))
         delivered_reminders = tuple(entry for entry in reminders if entry.delivered)
         next_due_entry = pending_reminders[0] if pending_reminders else None
         ops_event_store = ctx.event_store()
-        checks = run_config_checks(config)
+        checks = await _call_sync(run_config_checks, config)
         checks_summary = check_summary(checks)
-        usage_summary = ctx.usage_store().summary(within_hours=24)
-        health_snapshot = collect_system_health(config, snapshot=snapshot, event_store=ops_event_store)
+        usage_store = ctx.usage_store()
+        usage_summary = await _call_sync(usage_store.summary, within_hours=24)
+        recent_event_rows = await _call_sync(ops_event_store.tail, limit=25)
+        health_snapshot = await _call_sync(collect_system_health, config, snapshot=snapshot, event_store=ops_event_store)
         recent_errors = [
             entry
-            for entry in ops_event_store.tail(limit=25)
+            for entry in recent_event_rows
             if str(entry.get("level", "")).lower() == "error"
         ][-3:]
         cards = (
@@ -169,7 +532,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/ops/self-test", response_class=HTMLResponse)
     async def ops_self_test(request: Request) -> HTMLResponse:
-        config, _env_values = ctx.load_state()
+        config, _env_values = await _call_sync(ctx.load_state)
+        tests = await _call_sync(TwinrSelfTestRunner.available_tests)
         return ctx.render(
             request,
             "ops_self_test.html",
@@ -177,16 +541,28 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             active_page="ops_self_test",
             restart_notice="These self-tests run against the local device and may access real hardware.",
             config=config,
-            tests=TwinrSelfTestRunner.available_tests(),
+            tests=tests,
             result=None,
             artifact_href=None,
         )
 
     @app.post("/ops/self-test", response_class=HTMLResponse)
-    async def run_ops_self_test(request: Request) -> HTMLResponse:
-        config, _env_values = ctx.load_state()
-        form = parse_urlencoded_form(await request.body())
-        result = TwinrSelfTestRunner(config).run(form.get("test_name", ""))
+    async def run_ops_self_test(request: Request) -> Response:
+        try:
+            config, _env_values = await _call_sync(ctx.load_state)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            test_name = _require_non_empty(form.get("test_name", ""), message="Please choose a self-test.")
+            async with ops_job_lock:
+                # AUDIT-FIX(#5,#6): Offload the blocking self-test runner and turn failures into safe operator feedback.
+                result = await _call_sync(TwinrSelfTestRunner(config).run, test_name)
+            tests = await _call_sync(TwinrSelfTestRunner.available_tests)
+        except Exception as exc:
+            logger.exception("Twinr self-test failed", exc_info=exc)
+            return _redirect_with_error(
+                "/ops/self-test",
+                _public_error_message(exc, fallback="Twinr could not run that self-test. Please try again."),
+            )
+
         artifact_href = None
         if result.artifact_name:
             artifact_href = f"/ops/self-test/artifacts/{result.artifact_name}"
@@ -197,66 +573,74 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             active_page="ops_self_test",
             restart_notice="These self-tests run against the local device and may access real hardware.",
             config=config,
-            tests=TwinrSelfTestRunner.available_tests(),
+            tests=tests,
             result=result,
             artifact_href=artifact_href,
         )
 
     @app.get("/ops/self-test/artifacts/{artifact_name}")
     async def download_self_test_artifact(artifact_name: str) -> FileResponse:
-        artifact_path = _resolve_named_file(ctx.ops_paths.self_tests_root, artifact_name)
+        # AUDIT-FIX(#8): Re-validate downloadable artifact paths here so missing or unsafe names fail closed with a 404.
+        artifact_path = _resolve_downloadable_file(ctx.ops_paths.self_tests_root, artifact_name)
         return FileResponse(artifact_path, filename=artifact_path.name)
 
     @app.get("/ops/logs", response_class=HTMLResponse)
     async def ops_logs(request: Request) -> HTMLResponse:
+        logs = await _call_sync(ctx.event_store().tail, limit=100)
         return ctx.render(
             request,
             "ops_logs.html",
             page_title="Ops Logs",
             active_page="ops_logs",
             restart_notice="This view shows the latest 100 structured local events.",
-            logs=_format_log_rows(ctx.event_store().tail(limit=100)),
+            logs=_format_log_rows(logs),
         )
 
     @app.get("/ops/usage", response_class=HTMLResponse)
     async def ops_usage(request: Request) -> HTMLResponse:
         store = ctx.usage_store()
+        summary_all = await _call_sync(store.summary)
+        summary_24h = await _call_sync(store.summary, within_hours=24)
+        usage_rows = await _call_sync(store.tail, limit=100)
         return ctx.render(
             request,
             "ops_usage.html",
             page_title="LLM Usage",
             active_page="ops_usage",
             restart_notice="Usage records are written locally whenever Twinr completes a tracked OpenAI response call.",
-            summary_all=store.summary(),
-            summary_24h=store.summary(within_hours=24),
-            usage_rows=_format_usage_rows(store.tail(limit=100)),
+            summary_all=summary_all,
+            summary_24h=summary_24h,
+            usage_rows=_format_usage_rows(usage_rows),
             usage_path=str(ctx.ops_paths.usage_path),
         )
 
     @app.get("/ops/health", response_class=HTMLResponse)
     async def ops_health(request: Request) -> HTMLResponse:
-        config, _env_values = ctx.load_state()
-        snapshot = ctx.load_snapshot(config)
+        config, _env_values = await _call_sync(ctx.load_state)
+        snapshot = await _call_sync(ctx.load_snapshot, config)
         ops_event_store = ctx.event_store()
+        recent_event_rows = await _call_sync(ops_event_store.tail, limit=25)
         recent_errors = [
             entry
-            for entry in ops_event_store.tail(limit=25)
+            for entry in recent_event_rows
             if str(entry.get("level", "")).lower() == "error"
         ][-5:]
+        health = await _call_sync(collect_system_health, config, snapshot=snapshot, event_store=ops_event_store)
         return ctx.render(
             request,
             "ops_health.html",
             page_title="System Health",
             active_page="ops_health",
             restart_notice="This page reads live Raspberry Pi and Twinr process state from the local machine.",
-            health=collect_system_health(config, snapshot=snapshot, event_store=ops_event_store),
+            health=health,
             snapshot=snapshot,
             recent_errors=_format_log_rows(recent_errors),
         )
 
     @app.get("/ops/devices", response_class=HTMLResponse)
     async def ops_devices(request: Request) -> HTMLResponse:
-        config, _env_values = ctx.load_state()
+        config, _env_values = await _call_sync(ctx.load_state)
+        overview = await _call_sync(collect_device_overview, config, event_store=ctx.event_store())
         return ctx.render(
             request,
             "ops_devices.html",
@@ -266,13 +650,13 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 "This page shows only signals Twinr can confirm locally. "
                 "Unknown means the current device path does not expose that signal."
             ),
-            overview=collect_device_overview(config, event_store=ctx.event_store()),
+            overview=overview,
         )
 
     @app.get("/ops/config", response_class=HTMLResponse)
     async def ops_config(request: Request) -> HTMLResponse:
-        config, env_values = ctx.load_state()
-        checks = run_config_checks(config)
+        config, env_values = await _call_sync(ctx.load_state)
+        checks = await _call_sync(run_config_checks, config)
         return ctx.render(
             request,
             "ops_config.html",
@@ -288,7 +672,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/ops/support", response_class=HTMLResponse)
     async def ops_support(request: Request) -> HTMLResponse:
-        config, _env_values = ctx.load_state()
+        config, _env_values = await _call_sync(ctx.load_state)
+        bundles = await _call_sync(_recent_named_files, ctx.ops_paths.bundles_root, suffix=".zip")
         return ctx.render(
             request,
             "ops_support.html",
@@ -297,13 +682,24 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             restart_notice="Bundles are written under artifacts/ops/support_bundles and contain only redacted environment data.",
             config=config,
             bundle=None,
-            bundles=_recent_named_files(ctx.ops_paths.bundles_root, suffix=".zip"),
+            bundles=bundles,
         )
 
     @app.post("/ops/support", response_class=HTMLResponse)
-    async def create_support_bundle(request: Request) -> HTMLResponse:
-        config, _env_values = ctx.load_state()
-        bundle = build_support_bundle(config, env_path=ctx.env_path)
+    async def create_support_bundle(request: Request) -> Response:
+        try:
+            config, _env_values = await _call_sync(ctx.load_state)
+            await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            async with ops_job_lock:
+                bundle = await _call_sync(build_support_bundle, config, env_path=ctx.env_path)
+            bundles = await _call_sync(_recent_named_files, ctx.ops_paths.bundles_root, suffix=".zip")
+        except Exception as exc:
+            logger.exception("Twinr support bundle creation failed", exc_info=exc)
+            return _redirect_with_error(
+                "/ops/support",
+                _public_error_message(exc, fallback="Twinr could not build the support bundle. Please try again."),
+            )
+
         return ctx.render(
             request,
             "ops_support.html",
@@ -312,21 +708,21 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             restart_notice="Bundles are written under artifacts/ops/support_bundles and contain only redacted environment data.",
             config=config,
             bundle=bundle,
-            bundles=_recent_named_files(ctx.ops_paths.bundles_root, suffix=".zip"),
+            bundles=bundles,
         )
 
     @app.get("/ops/support/download/{bundle_name}")
     async def download_support_bundle(bundle_name: str) -> FileResponse:
-        bundle_path = _resolve_named_file(ctx.ops_paths.bundles_root, bundle_name)
-        return FileResponse(bundle_path, filename=bundle_path.name)
+        artifact_path = _resolve_downloadable_file(ctx.ops_paths.bundles_root, bundle_name)
+        return FileResponse(artifact_path, filename=artifact_path.name)
 
     @app.get("/integrations", response_class=HTMLResponse)
     async def integrations(request: Request) -> HTMLResponse:
-        _config, env_values = ctx.load_state()
+        _config, env_values = await _call_sync(ctx.load_state)
         store = ctx.integration_store()
-        email_record = store.get("email_mailbox")
-        calendar_record = store.get("calendar_agenda")
-        runtime = build_managed_integrations(ctx.project_root, env_path=ctx.env_path)
+        email_record = await _call_sync(store.get, "email_mailbox")
+        calendar_record = await _call_sync(store.get, "calendar_agenda")
+        runtime = await _call_sync(build_managed_integrations, ctx.project_root, env_path=ctx.env_path)
         return ctx.render(
             request,
             "integrations_page.html",
@@ -345,30 +741,39 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/integrations")
     async def save_integrations(request: Request) -> RedirectResponse:
-        _config, env_values = ctx.load_state()
-        form = parse_urlencoded_form(await request.body())
-        integration_id = form.get("_integration_id", "").strip()
-        store = ctx.integration_store()
-
         try:
-            if integration_id == "email_mailbox":
-                record, env_updates = _build_email_integration_record(form, env_values)
-            elif integration_id == "calendar_agenda":
-                record, env_updates = _build_calendar_integration_record(form)
-            else:
-                raise ValueError("Unknown integration form submission.")
-        except ValueError as exc:
-            return RedirectResponse(f"/integrations?error={quote_plus(str(exc))}", status_code=303)
+            _config, env_values = await _call_sync(ctx.load_state)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            integration_id = _require_non_empty(
+                form.get("_integration_id", ""),
+                message="Please choose a valid integration form.",
+            )
+            store = ctx.integration_store()
 
-        store.save(record)
-        if env_updates:
-            write_env_updates(ctx.env_path, env_updates)
-        return RedirectResponse("/integrations?saved=1", status_code=303)
+            if integration_id == "email_mailbox":
+                record, env_updates = await _call_sync(_build_email_integration_record, form, env_values)
+            elif integration_id == "calendar_agenda":
+                record, env_updates = await _call_sync(_build_calendar_integration_record, form)
+            else:
+                raise ValueError("Please choose a valid integration form.")
+
+            # AUDIT-FIX(#7): Keep integration store writes and matching .env updates serialized.
+            async with state_write_lock:
+                await _call_sync(store.save, record)
+                if env_updates:
+                    await _call_sync(write_env_updates, ctx.env_path, env_updates)
+        except Exception as exc:
+            logger.exception("Twinr integration save failed", exc_info=exc)
+            return _redirect_with_error(
+                "/integrations",
+                _public_error_message(exc, fallback="Twinr could not save that integration. Please check the fields and try again."),
+            )
+        return _redirect_saved("/integrations")
 
     @app.get("/voice-profile", response_class=HTMLResponse)
     async def voice_profile_page(request: Request) -> HTMLResponse:
-        config, _env_values = ctx.load_state()
-        snapshot = ctx.load_snapshot(config)
+        config, _env_values = await _call_sync(ctx.load_state)
+        snapshot = await _call_sync(ctx.load_snapshot, config)
         return ctx.render(
             request,
             "voice_profile_page.html",
@@ -385,39 +790,56 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
         )
 
     @app.post("/voice-profile", response_class=HTMLResponse)
-    async def voice_profile_action(request: Request) -> HTMLResponse:
-        config, _env_values = ctx.load_state()
-        snapshot = ctx.load_snapshot(config)
-        monitor = VoiceProfileMonitor.from_config(config)
-        form = parse_urlencoded_form(await request.body())
-        action = form.get("_action", "").strip()
-
+    async def voice_profile_action(request: Request) -> Response:
         try:
-            if action == "enroll":
-                sample = _capture_voice_profile_sample(config)
-                template = monitor.enroll_wav_bytes(sample)
-                action_result = {
-                    "status": "ok",
-                    "title": "Profile updated",
-                    "detail": (
-                        f"Stored local template sample {template.sample_count}/{config.voice_profile_max_samples}. "
-                        "No raw audio was kept."
-                    ),
-                }
-            elif action == "verify":
-                sample = _capture_voice_profile_sample(config)
-                assessment = monitor.assess_wav_bytes(sample)
-                action_result = _voice_action_result(assessment)
-            elif action == "reset":
-                monitor.reset()
-                action_result = {
-                    "status": "ok",
-                    "title": "Profile reset",
-                    "detail": "The local voice profile template was deleted.",
-                }
-            else:
-                raise ValueError("Unknown voice profile action.")
+            config, _env_values = await _call_sync(ctx.load_state)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            action = _require_non_empty(form.get("_action", ""), message="Please choose a voice profile action.")
+
+            async with voice_profile_lock:
+                # AUDIT-FIX(#5,#6,#11): Run microphone/profile work off the event loop, sanitize failures, and reload snapshot after changes.
+                if action == "enroll":
+                    def _enroll() -> dict[str, str]:
+                        monitor = VoiceProfileMonitor.from_config(config)
+                        sample = _capture_voice_profile_sample(config)
+                        template = monitor.enroll_wav_bytes(sample)
+                        return {
+                            "status": "ok",
+                            "title": "Profile updated",
+                            "detail": (
+                                f"Stored local template sample {template.sample_count}/{config.voice_profile_max_samples}. "
+                                "No raw audio was kept."
+                            ),
+                        }
+
+                    action_result = await _call_sync(_enroll)
+                elif action == "verify":
+                    def _verify() -> dict[str, str]:
+                        monitor = VoiceProfileMonitor.from_config(config)
+                        sample = _capture_voice_profile_sample(config)
+                        assessment = monitor.assess_wav_bytes(sample)
+                        return _voice_action_result(assessment)
+
+                    action_result = await _call_sync(_verify)
+                elif action == "reset":
+                    def _reset() -> dict[str, str]:
+                        monitor = VoiceProfileMonitor.from_config(config)
+                        monitor.reset()
+                        return {
+                            "status": "ok",
+                            "title": "Profile reset",
+                            "detail": "The local voice profile template was deleted.",
+                        }
+
+                    action_result = await _call_sync(_reset)
+                else:
+                    raise ValueError("Please choose a valid voice profile action.")
+
+            snapshot = await _call_sync(ctx.load_snapshot, config)
         except Exception as exc:
+            logger.exception("Twinr voice profile action failed", exc_info=exc)
+            config, _env_values = await _call_sync(ctx.load_state)
+            snapshot = await _call_sync(ctx.load_snapshot, config)
             return ctx.render(
                 request,
                 "voice_profile_page.html",
@@ -430,7 +852,14 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                     "Phase 1 uses the normal conversation microphone only. No raw enrollment audio is stored, "
                     "and support bundles omit live voice-assessment fields."
                 ),
-                **_voice_profile_page_context(config, snapshot, action_error=str(exc)),
+                **_voice_profile_page_context(
+                    config,
+                    snapshot,
+                    action_error=_public_error_message(
+                        exc,
+                        fallback="Twinr could not finish that voice profile step. Please try again.",
+                    ),
+                ),
             )
 
         return ctx.render(
@@ -450,10 +879,17 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/automations", response_class=HTMLResponse)
     async def automations(request: Request) -> HTMLResponse:
-        config, _env_values = ctx.load_state()
+        config, _env_values = await _call_sync(ctx.load_state)
         store = ctx.automation_store(config)
-        integration_family_providers = integration_automation_family_providers(ctx.project_root)
+        integration_family_providers = tuple(await _call_sync(integration_automation_family_providers, ctx.project_root))
         edit_ref = request.query_params.get("edit", "").strip() or None
+        page_context = await _call_sync(
+            build_automation_page_context,
+            store,
+            timezone_name=config.local_timezone_name,
+            edit_ref=edit_ref,
+            integration_blocks=tuple(provider.block() for provider in integration_family_providers),
+        )
         return ctx.render(
             request,
             "automations_page.html",
@@ -466,55 +902,59 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 "Automations let Twinr do scheduled or sensor-driven work without adding new user-facing modes. "
                 "This page stays family-based so future integrations can add their own automation blocks."
             ),
-            **build_automation_page_context(
-                store,
-                timezone_name=config.local_timezone_name,
-                edit_ref=edit_ref,
-                integration_blocks=tuple(provider.block() for provider in integration_family_providers),
-            ),
+            **page_context,
         )
 
     @app.post("/automations")
     async def save_automations(request: Request) -> RedirectResponse:
-        config = TwinrConfig.from_env(ctx.env_path)
-        form = parse_urlencoded_form(await request.body())
-        action = form.get("_action", "").strip()
-        store = ctx.automation_store(config)
-        integration_family_providers = integration_automation_family_providers(ctx.project_root)
         try:
-            if action == "save_time_automation":
-                save_time_automation(store, form, timezone_name=config.local_timezone_name)
-            elif action == "save_sensor_automation":
-                save_sensor_automation(store, form)
-            elif action == "toggle_automation":
-                automation_id = form.get("automation_id", "").strip()
-                if not automation_id:
-                    raise ValueError("Missing automation id.")
-                toggle_automation_enabled(store, automation_id)
-            elif action == "delete_automation":
-                automation_id = form.get("automation_id", "").strip()
-                if not automation_id:
-                    raise ValueError("Missing automation id.")
-                delete_automation(store, automation_id)
-            elif any(provider.handles_action(action) for provider in integration_family_providers):
-                handled = False
-                for provider in integration_family_providers:
-                    if not provider.handles_action(action):
-                        continue
-                    handled = provider.handle_action(action, form=form, automation_store=store)
-                    if handled:
-                        break
-                if not handled:
-                    raise ValueError("This integration automation family is not writable yet.")
-            else:
-                raise ValueError("Unknown automation form submission.")
-        except ValueError as exc:
-            return RedirectResponse(f"/automations?error={quote_plus(str(exc))}", status_code=303)
-        return RedirectResponse("/automations?saved=1", status_code=303)
+            config = await _call_sync(TwinrConfig.from_env, ctx.env_path)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            action = _require_non_empty(form.get("_action", ""), message="Please choose an automation action.")
+            store = ctx.automation_store(config)
+            integration_family_providers = tuple(await _call_sync(integration_automation_family_providers, ctx.project_root))
+
+            # AUDIT-FIX(#7,#9): Serialize automation writes and fail fast on invalid action/input combinations.
+            async with state_write_lock:
+                if action == "save_time_automation":
+                    await _call_sync(save_time_automation, store, form, timezone_name=config.local_timezone_name)
+                elif action == "save_sensor_automation":
+                    await _call_sync(save_sensor_automation, store, form)
+                elif action == "toggle_automation":
+                    automation_id = _require_non_empty(
+                        form.get("automation_id", ""),
+                        message="Please choose an automation to change.",
+                    )
+                    await _call_sync(toggle_automation_enabled, store, automation_id)
+                elif action == "delete_automation":
+                    automation_id = _require_non_empty(
+                        form.get("automation_id", ""),
+                        message="Please choose an automation to delete.",
+                    )
+                    await _call_sync(delete_automation, store, automation_id)
+                elif any(provider.handles_action(action) for provider in integration_family_providers):
+                    handled = False
+                    for provider in integration_family_providers:
+                        if not provider.handles_action(action):
+                            continue
+                        handled = await _call_sync(provider.handle_action, action, form=form, automation_store=store)
+                        if handled:
+                            break
+                    if not handled:
+                        raise ValueError("That integration automation cannot be changed yet.")
+                else:
+                    raise ValueError("Please choose a valid automation action.")
+        except Exception as exc:
+            logger.exception("Twinr automation save failed", exc_info=exc)
+            return _redirect_with_error(
+                "/automations",
+                _public_error_message(exc, fallback="Twinr could not save that automation. Please check the fields and try again."),
+            )
+        return _redirect_saved("/automations")
 
     @app.get("/connect", response_class=HTMLResponse)
     async def connect(request: Request) -> HTMLResponse:
-        _config, env_values = ctx.load_state()
+        _config, env_values = await _call_sync(ctx.load_state)
         sections = _connect_sections(env_values)
         return ctx.render(
             request,
@@ -528,21 +968,30 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/connect")
     async def save_connect(request: Request) -> RedirectResponse:
-        env_values = ctx.load_state()[1]
-        form = parse_urlencoded_form(await request.body())
-        updates = _collect_standard_updates(form, exclude={"OPENAI_API_KEY", "DEEPINFRA_API_KEY", "OPENROUTER_API_KEY"})
-        for secret_key in ("OPENAI_API_KEY", "DEEPINFRA_API_KEY", "OPENROUTER_API_KEY"):
-            secret_value = form.get(secret_key, "").strip()
-            if secret_value:
-                updates[secret_key] = secret_value
-            elif secret_key not in env_values and secret_key == "OPENAI_API_KEY":
-                updates.setdefault(secret_key, "")
-        write_env_updates(ctx.env_path, updates)
-        return RedirectResponse("/connect?saved=1", status_code=303)
+        try:
+            env_values = (await _call_sync(ctx.load_state))[1]
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            updates = _collect_standard_updates(form, exclude={"OPENAI_API_KEY", "DEEPINFRA_API_KEY", "OPENROUTER_API_KEY"})
+            for secret_key in ("OPENAI_API_KEY", "DEEPINFRA_API_KEY", "OPENROUTER_API_KEY"):
+                secret_value = form.get(secret_key, "").strip()
+                if secret_value:
+                    updates[secret_key] = secret_value
+                elif secret_key not in env_values and secret_key == "OPENAI_API_KEY":
+                    updates.setdefault(secret_key, "")
+            # AUDIT-FIX(#7): Serialize provider credential writes to avoid partial .env updates.
+            async with state_write_lock:
+                await _call_sync(write_env_updates, ctx.env_path, updates)
+        except Exception as exc:
+            logger.exception("Twinr connect settings save failed", exc_info=exc)
+            return _redirect_with_error(
+                "/connect",
+                _public_error_message(exc, fallback="Twinr could not save those provider settings. Please try again."),
+            )
+        return _redirect_saved("/connect")
 
     @app.get("/settings", response_class=HTMLResponse)
     async def settings(request: Request) -> HTMLResponse:
-        config, env_values = ctx.load_state()
+        config, env_values = await _call_sync(ctx.load_state)
         sections = _settings_sections(config, env_values)
         return ctx.render(
             request,
@@ -557,22 +1006,35 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/settings")
     async def save_settings(request: Request) -> RedirectResponse:
-        config = TwinrConfig.from_env(ctx.env_path)
-        form = parse_urlencoded_form(await request.body())
-        action = form.get("_action", "save_settings")
-        if action == "reset_adaptive_timing":
-            AdaptiveTimingStore(config.adaptive_timing_store_path, config=config).reset()
-            return RedirectResponse("/settings?saved=1", status_code=303)
-        write_env_updates(ctx.env_path, _collect_standard_updates(form, exclude={"_action"}))
-        return RedirectResponse("/settings?saved=1", status_code=303)
+        try:
+            config = await _call_sync(TwinrConfig.from_env, ctx.env_path)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            action = form.get("_action", "save_settings").strip() or "save_settings"
+            if action not in {"save_settings", "reset_adaptive_timing"}:
+                raise ValueError("Please choose a valid settings action.")
+            # AUDIT-FIX(#7,#9): Serialize settings writes and refuse unknown actions instead of silently falling through.
+            async with state_write_lock:
+                if action == "reset_adaptive_timing":
+                    await _call_sync(AdaptiveTimingStore(config.adaptive_timing_store_path, config=config).reset)
+                else:
+                    await _call_sync(write_env_updates, ctx.env_path, _collect_standard_updates(form, exclude={"_action"}))
+        except Exception as exc:
+            logger.exception("Twinr settings save failed", exc_info=exc)
+            return _redirect_with_error(
+                "/settings",
+                _public_error_message(exc, fallback="Twinr could not save those settings. Please try again."),
+            )
+        return _redirect_saved("/settings")
 
     @app.get("/memory", response_class=HTMLResponse)
     async def memory(request: Request) -> HTMLResponse:
-        config, env_values = ctx.load_state()
+        config, env_values = await _call_sync(ctx.load_state)
         sections = _memory_sections(config, env_values)
-        snapshot = ctx.load_snapshot(config)
+        snapshot = await _call_sync(ctx.load_snapshot, config)
         durable_store = ctx.memory_store(config)
-        reminder_rows = _reminder_rows(ctx.reminder_store(config).load_entries(), timezone_name=config.local_timezone_name)
+        durable_entries = await _call_sync(durable_store.load_entries)
+        reminder_entries = await _call_sync(ctx.reminder_store(config).load_entries)
+        reminder_rows = _reminder_rows(reminder_entries, timezone_name=config.local_timezone_name)
         return ctx.render(
             request,
             "memory_page.html",
@@ -582,7 +1044,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             form_action="/memory",
             sections=sections,
             snapshot=snapshot,
-            durable_memory_entries=durable_store.load_entries(),
+            durable_memory_entries=durable_entries,
             durable_memory_path=str(Path(config.memory_markdown_path)),
             reminder_entries=tuple(row for row in reminder_rows if not row["delivered"]),
             delivered_reminder_entries=tuple(row for row in reminder_rows if row["delivered"]),
@@ -593,55 +1055,76 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/memory")
     async def save_memory(request: Request) -> RedirectResponse:
-        config = TwinrConfig.from_env(ctx.env_path)
-        form = parse_urlencoded_form(await request.body())
-        action = form.get("_action", "save_settings")
-        if action == "add_memory":
-            ctx.memory_store(config).remember(
-                kind=form.get("memory_kind", "") or "memory",
-                summary=form.get("memory_summary", ""),
-                details=form.get("memory_details", "") or None,
+        try:
+            config = await _call_sync(TwinrConfig.from_env, ctx.env_path)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            action = form.get("_action", "save_settings").strip() or "save_settings"
+            if action not in {
+                "save_settings",
+                "add_memory",
+                "add_reminder",
+                "mark_reminder_delivered",
+                "delete_reminder",
+            }:
+                raise ValueError("Please choose a valid memory action.")
+
+            async with state_write_lock:
+                # AUDIT-FIX(#9): Reject unknown actions and require the core fields that keep memory/reminder records coherent.
+                if action == "add_memory":
+                    summary = _require_non_empty(form.get("memory_summary", ""), message="Please enter a short memory summary.")
+                    await _call_sync(
+                        ctx.memory_store(config).remember,
+                        kind=form.get("memory_kind", "") or "memory",
+                        summary=summary,
+                        details=form.get("memory_details", "") or None,
+                    )
+                elif action == "add_reminder":
+                    due_at = _require_non_empty(form.get("reminder_due_at", ""), message="Please choose when the reminder is due.")
+                    summary = _require_non_empty(form.get("reminder_summary", ""), message="Please enter a reminder summary.")
+                    await _call_sync(
+                        ctx.reminder_store(config).schedule,
+                        due_at=due_at,
+                        summary=summary,
+                        details=form.get("reminder_details", "") or None,
+                        kind=form.get("reminder_kind", "") or "reminder",
+                        source="web_ui",
+                        original_request=form.get("reminder_original_request", "") or None,
+                    )
+                elif action == "mark_reminder_delivered":
+                    reminder_id = _require_non_empty(
+                        form.get("reminder_id", ""),
+                        message="Please choose a reminder first.",
+                    )
+                    await _call_sync(ctx.reminder_store(config).mark_delivered, reminder_id)
+                elif action == "delete_reminder":
+                    reminder_id = _require_non_empty(
+                        form.get("reminder_id", ""),
+                        message="Please choose a reminder first.",
+                    )
+                    await _call_sync(ctx.reminder_store(config).delete, reminder_id)
+                else:
+                    await _call_sync(write_env_updates, ctx.env_path, _collect_standard_updates(form, exclude={"_action"}))
+        except KeyError as exc:
+            logger.exception("Twinr reminder lookup failed", exc_info=exc)
+            return _redirect_with_error("/memory", "That reminder was not found anymore.")
+        except Exception as exc:
+            logger.exception("Twinr memory save failed", exc_info=exc)
+            return _redirect_with_error(
+                "/memory",
+                _public_error_message(exc, fallback="Twinr could not save that memory change. Please try again."),
             )
-            return RedirectResponse("/memory?saved=1", status_code=303)
-        if action == "add_reminder":
-            try:
-                ctx.reminder_store(config).schedule(
-                    due_at=form.get("reminder_due_at", ""),
-                    summary=form.get("reminder_summary", ""),
-                    details=form.get("reminder_details", "") or None,
-                    kind=form.get("reminder_kind", "") or "reminder",
-                    source="web_ui",
-                    original_request=form.get("reminder_original_request", "") or None,
-                )
-            except ValueError as exc:
-                return RedirectResponse(f"/memory?error={quote_plus(str(exc))}", status_code=303)
-            return RedirectResponse("/memory?saved=1", status_code=303)
-        if action == "mark_reminder_delivered":
-            reminder_id = form.get("reminder_id", "").strip()
-            if not reminder_id:
-                return RedirectResponse("/memory?error=Missing+reminder+id", status_code=303)
-            try:
-                ctx.reminder_store(config).mark_delivered(reminder_id)
-            except KeyError:
-                return RedirectResponse("/memory?error=Reminder+not+found", status_code=303)
-            return RedirectResponse("/memory?saved=1", status_code=303)
-        if action == "delete_reminder":
-            reminder_id = form.get("reminder_id", "").strip()
-            if not reminder_id:
-                return RedirectResponse("/memory?error=Missing+reminder+id", status_code=303)
-            try:
-                ctx.reminder_store(config).delete(reminder_id)
-            except KeyError:
-                return RedirectResponse("/memory?error=Reminder+not+found", status_code=303)
-            return RedirectResponse("/memory?saved=1", status_code=303)
-        write_env_updates(ctx.env_path, _collect_standard_updates(form, exclude={"_action"}))
-        return RedirectResponse("/memory?saved=1", status_code=303)
+        return _redirect_saved("/memory")
 
     @app.get("/personality", response_class=HTMLResponse)
     async def personality(request: Request) -> HTMLResponse:
-        config, _env_values = ctx.load_state()
-        personality_dir = ctx.project_root / config.personality_dir
+        config, _env_values = await _call_sync(ctx.load_state)
+        # AUDIT-FIX(#4): Resolve the configured personality directory under the project root before any file access.
+        personality_dir = _safe_project_subpath(ctx.project_root, config.personality_dir, label="Personality directory")
+        system_file = _safe_file_in_dir(personality_dir, "SYSTEM.md", label="Personality system file")
         store = ctx.personality_context_store(config)
+        system_text = await _call_sync(read_text_file, system_file)
+        base_text = await _call_sync(store.load_base_text)
+        managed_entries = await _call_sync(store.load_entries)
         return ctx.render(
             request,
             "context_page.html",
@@ -656,21 +1139,21 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 FileBackedSetting(
                     key="SYSTEM",
                     label="SYSTEM.md",
-                    value=read_text_file(personality_dir / "SYSTEM.md"),
+                    value=system_text,
                     help_text="Core product behavior and permanent operating rules.",
                     input_type="textarea",
                 ),
                 FileBackedSetting(
                     key="PERSONALITY_BASE",
                     label="PERSONALITY.md base text",
-                    value=store.load_base_text(),
+                    value=base_text,
                     help_text="The stable hand-written part of the personality file. Managed tool updates are shown separately below.",
                     input_type="textarea",
                 ),
             ),
             managed_section_title="Managed personality updates",
             managed_section_description="These entries were added by explicit user requests such as “speak more slowly” or “be less funny”.",
-            managed_entries=store.load_entries(),
+            managed_entries=managed_entries,
             managed_form_title="Add or update a managed personality rule",
             managed_form_description="Use a short category so future updates replace the right rule instead of creating duplicates.",
             managed_category_placeholder="response_style",
@@ -681,25 +1164,41 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/personality")
     async def save_personality(request: Request) -> RedirectResponse:
-        config = TwinrConfig.from_env(ctx.env_path)
-        personality_dir = ctx.project_root / config.personality_dir
-        store = ctx.personality_context_store(config)
-        form = parse_urlencoded_form(await request.body())
-        action = form.get("_action", "save_base")
-        if action == "upsert_managed":
-            store.upsert(
-                category=form.get("category", ""),
-                instruction=form.get("instruction", ""),
+        try:
+            config = await _call_sync(TwinrConfig.from_env, ctx.env_path)
+            # AUDIT-FIX(#4): Re-check the configured personality path on write so edits cannot escape the project tree.
+            personality_dir = _safe_project_subpath(ctx.project_root, config.personality_dir, label="Personality directory")
+            system_file = _safe_file_in_dir(personality_dir, "SYSTEM.md", label="Personality system file")
+            store = ctx.personality_context_store(config)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            action = form.get("_action", "save_base").strip() or "save_base"
+            if action not in {"save_base", "upsert_managed"}:
+                raise ValueError("Please choose a valid personality action.")
+            # AUDIT-FIX(#7,#9): Serialize personality writes and require non-empty managed rule fields.
+            async with state_write_lock:
+                if action == "upsert_managed":
+                    await _call_sync(
+                        store.upsert,
+                        category=_require_non_empty(form.get("category", ""), message="Please enter a short category."),
+                        instruction=_require_non_empty(form.get("instruction", ""), message="Please enter a short instruction."),
+                    )
+                else:
+                    await _call_sync(write_text_file, system_file, form.get("SYSTEM", ""))
+                    await _call_sync(store.replace_base_text, form.get("PERSONALITY_BASE", ""))
+        except Exception as exc:
+            logger.exception("Twinr personality save failed", exc_info=exc)
+            return _redirect_with_error(
+                "/personality",
+                _public_error_message(exc, fallback="Twinr could not save that personality change. Please try again."),
             )
-            return RedirectResponse("/personality?saved=1", status_code=303)
-        write_text_file(personality_dir / "SYSTEM.md", form.get("SYSTEM", ""))
-        store.replace_base_text(form.get("PERSONALITY_BASE", ""))
-        return RedirectResponse("/personality?saved=1", status_code=303)
+        return _redirect_saved("/personality")
 
     @app.get("/user", response_class=HTMLResponse)
     async def user(request: Request) -> HTMLResponse:
-        config, _env_values = ctx.load_state()
+        config, _env_values = await _call_sync(ctx.load_state)
         store = ctx.user_context_store(config)
+        base_text = await _call_sync(store.load_base_text)
+        managed_entries = await _call_sync(store.load_entries)
         return ctx.render(
             request,
             "context_page.html",
@@ -714,14 +1213,14 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 FileBackedSetting(
                     key="USER_BASE",
                     label="USER.md base text",
-                    value=store.load_base_text(),
+                    value=base_text,
                     help_text="Short profile facts about the current Twinr user.",
                     input_type="textarea",
                 ),
             ),
             managed_section_title="Managed user profile updates",
             managed_section_description="These entries were added by explicit user requests such as “remember that I have two dogs”.",
-            managed_entries=store.load_entries(),
+            managed_entries=managed_entries,
             managed_form_title="Add or update a managed user fact",
             managed_form_description="Use a short category so future edits replace the right fact instead of duplicating it.",
             managed_category_placeholder="pets",
@@ -732,17 +1231,29 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/user")
     async def save_user(request: Request) -> RedirectResponse:
-        config = TwinrConfig.from_env(ctx.env_path)
-        store = ctx.user_context_store(config)
-        form = parse_urlencoded_form(await request.body())
-        action = form.get("_action", "save_base")
-        if action == "upsert_managed":
-            store.upsert(
-                category=form.get("category", ""),
-                instruction=form.get("instruction", ""),
+        try:
+            config = await _call_sync(TwinrConfig.from_env, ctx.env_path)
+            store = ctx.user_context_store(config)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            action = form.get("_action", "save_base").strip() or "save_base"
+            if action not in {"save_base", "upsert_managed"}:
+                raise ValueError("Please choose a valid user action.")
+            # AUDIT-FIX(#7,#9): Serialize user-profile writes and require non-empty managed fact fields.
+            async with state_write_lock:
+                if action == "upsert_managed":
+                    await _call_sync(
+                        store.upsert,
+                        category=_require_non_empty(form.get("category", ""), message="Please enter a short category."),
+                        instruction=_require_non_empty(form.get("instruction", ""), message="Please enter a short fact."),
+                    )
+                else:
+                    await _call_sync(store.replace_base_text, form.get("USER_BASE", ""))
+        except Exception as exc:
+            logger.exception("Twinr user save failed", exc_info=exc)
+            return _redirect_with_error(
+                "/user",
+                _public_error_message(exc, fallback="Twinr could not save that user profile change. Please try again."),
             )
-            return RedirectResponse("/user?saved=1", status_code=303)
-        store.replace_base_text(form.get("USER_BASE", ""))
-        return RedirectResponse("/user?saved=1", status_code=303)
+        return _redirect_saved("/user")
 
     return app

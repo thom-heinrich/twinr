@@ -1,14 +1,14 @@
-from twinr.memory.longterm.consolidator import LongTermMemoryConsolidator
-from twinr.memory.longterm.conflicts import LongTermConflictResolver
-from twinr.memory.longterm.extract import LongTermTurnExtractor
-from twinr.memory.longterm.midterm import (
+from twinr.memory.longterm.reasoning.consolidator import LongTermMemoryConsolidator
+from twinr.memory.longterm.reasoning.conflicts import LongTermConflictResolver
+from twinr.memory.longterm.ingestion.extract import LongTermTurnExtractor
+from twinr.memory.longterm.reasoning.midterm import (
     LongTermStructuredReflectionProgram,
     OpenAIStructuredReflectionProgram,
     structured_reflection_program_from_config,
 )
-from twinr.memory.longterm.midterm_store import LongTermMidtermStore
-from twinr.memory.longterm.multimodal import LongTermMultimodalExtractor
-from twinr.memory.longterm.models import (
+from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
+from twinr.memory.longterm.ingestion.multimodal import LongTermMultimodalExtractor
+from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermConflictOptionV1,
     LongTermConflictQueueItemV1,
@@ -31,26 +31,26 @@ from twinr.memory.longterm.models import (
     LongTermSourceRefV1,
     LongTermTurnExtractionV1,
 )
-from twinr.memory.longterm.planner import LongTermProactivePlanner
-from twinr.memory.longterm.propositions import (
+from twinr.memory.longterm.proactive.planner import LongTermProactivePlanner
+from twinr.memory.longterm.ingestion.propositions import (
     LongTermTurnPropositionBundleV1,
     LongTermTurnPropositionCompiler,
 )
-from twinr.memory.longterm.proactive import (
+from twinr.memory.longterm.proactive.state import (
     LongTermProactiveHistoryEntryV1,
     LongTermProactivePolicy,
     LongTermProactiveReservationV1,
     LongTermProactiveStateStore,
 )
-from twinr.memory.longterm.reflect import LongTermMemoryReflector
-from twinr.memory.longterm.retriever import LongTermRetriever
-from twinr.memory.longterm.retention import LongTermRetentionPolicy
-from twinr.memory.longterm.sensor_memory import LongTermSensorMemoryCompiler
-from twinr.memory.longterm.service import LongTermMemoryService
-from twinr.memory.longterm.store import LongTermStructuredStore
-from twinr.memory.longterm.subtext import LongTermSubtextBuilder
-from twinr.memory.longterm.truth import LongTermTruthMaintainer
-from twinr.memory.longterm.worker import AsyncLongTermMemoryWriter, AsyncLongTermMultimodalWriter
+from twinr.memory.longterm.reasoning.reflect import LongTermMemoryReflector
+from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
+from twinr.memory.longterm.reasoning.retention import LongTermRetentionPolicy
+from twinr.memory.longterm.ingestion.sensor_memory import LongTermSensorMemoryCompiler
+from twinr.memory.longterm.runtime.service import LongTermMemoryService
+from twinr.memory.longterm.storage.store import LongTermStructuredStore
+from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder
+from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
+from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter, AsyncLongTermMultimodalWriter
 
 __all__ = [
     "AsyncLongTermMemoryWriter",
@@ -123,7 +123,7 @@ def __getattr__(name: str):
         "LongTermEvalSummary",
         "run_synthetic_longterm_eval",
     }:
-        from twinr.memory.longterm import eval as eval_module
+        from twinr.memory.longterm.evaluation import eval as eval_module
 
         return getattr(eval_module, name)
     if name in {
@@ -134,7 +134,7 @@ def __getattr__(name: str):
         "MultimodalEvalSummary",
         "run_multimodal_longterm_eval",
     }:
-        from twinr.memory.longterm import multimodal_eval as multimodal_eval_module
+        from twinr.memory.longterm.evaluation import multimodal_eval as multimodal_eval_module
 
         return getattr(multimodal_eval_module, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

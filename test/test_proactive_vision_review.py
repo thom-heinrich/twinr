@@ -13,8 +13,8 @@ from twinr.proactive import (
     SocialTriggerPriority,
     SocialVisionObservation,
 )
-from twinr.proactive.observers import ProactiveVisionSnapshot
-from twinr.proactive.vision_review import (
+from twinr.proactive.social.observers import ProactiveVisionSnapshot
+from twinr.proactive.social.vision_review import (
     OpenAIProactiveVisionReviewer,
     ProactiveVisionFrameBuffer,
     parse_proactive_vision_review_text,

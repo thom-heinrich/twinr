@@ -8,7 +8,7 @@ from threading import Lock, RLock, Thread
 from typing import Callable
 import time
 
-from twinr.agent.base_agent.adaptive_timing import AdaptiveListeningWindow
+from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveListeningWindow
 from twinr.agent.base_agent.contracts import (
     AgentTextProvider,
     CombinedSpeechAgentProvider,
@@ -19,7 +19,7 @@ from twinr.agent.base_agent.contracts import (
     ToolCallingAgentProvider,
 )
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.turn_controller import (
+from twinr.agent.base_agent.conversation.turn_controller import (
     StreamingTurnController,
     ToolCallingTurnDecisionEvaluator,
     _normalize_turn_text,
@@ -460,6 +460,8 @@ class TwinrHardwareLoop:
         if len(transcript) < min_chars:
             return None
         if snapshot.saw_speech_final:
+            if not snapshot.saw_interim:
+                return None
             return snapshot
         if not (
             self.config.deepgram_streaming_stop_on_utterance_end

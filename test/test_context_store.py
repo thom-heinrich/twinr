@@ -7,7 +7,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
-from twinr.memory.longterm.remote_state import LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 
 class _FakeRemoteState:

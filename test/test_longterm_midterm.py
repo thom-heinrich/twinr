@@ -16,13 +16,13 @@ from twinr.memory.longterm import (
     LongTermMidtermStore,
     LongTermSourceRefV1,
 )
-from twinr.memory.longterm.midterm import _midterm_reflection_schema
-from twinr.memory.longterm.retriever import LongTermRetriever
-from twinr.memory.longterm.store import LongTermStructuredStore
+from twinr.memory.longterm.reasoning.midterm import _midterm_reflection_schema
+from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
+from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.context_store import PromptContextStore
 from twinr.memory.query_normalization import LongTermQueryProfile
-from twinr.memory.longterm.conflicts import LongTermConflictResolver
-from twinr.memory.longterm.subtext import LongTermSubtextBuilder
+from twinr.memory.longterm.reasoning.conflicts import LongTermConflictResolver
+from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 
 

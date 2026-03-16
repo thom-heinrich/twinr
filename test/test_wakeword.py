@@ -20,6 +20,7 @@ from twinr.proactive import (
     WakewordOpenWakeWordSpotter,
     WakewordPhraseSpotter,
     normalize_detector_label,
+    wakeword_primary_prompt,
 )
 from twinr.runtime import TwinrRuntime
 
@@ -295,7 +296,7 @@ class WakewordTests(unittest.TestCase):
         self.assertTrue(match.detected)
         self.assertEqual(match.matched_phrase, "hallo twina")
         self.assertEqual(len(backend.calls), 2)
-        self.assertEqual(backend.calls[0][2], "Twinr, Twinna, Twina, Twinner.")
+        self.assertEqual(backend.calls[0][2], wakeword_primary_prompt(("hallo twina", "hey twinr", "twina")))
         self.assertIsNone(backend.calls[1][2])
 
     def test_openwakeword_spotter_detects_local_model_hit(self) -> None:
@@ -505,7 +506,7 @@ class WakewordTests(unittest.TestCase):
         self.assertEqual(match.transcript, "Twinr bist du da")
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(backend.calls[0][1], "de")
-        self.assertEqual(backend.calls[0][2], "Twinr, Twinna, Twina, Twinner.")
+        self.assertEqual(backend.calls[0][2], wakeword_primary_prompt(("hey twinr", "twinr")))
 
     def test_openwakeword_spotter_requires_transcript_confirmation_when_enabled(self) -> None:
         backend = FakeBackend("irgendwas anderes")

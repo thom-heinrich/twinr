@@ -23,6 +23,7 @@ class SocialTriggerEngineTests(unittest.TestCase):
         engine: SocialTriggerEngine,
         now: float,
         *,
+        inspected: bool = True,
         pir: bool = False,
         low_motion: bool = False,
         person_visible: bool = False,
@@ -36,6 +37,7 @@ class SocialTriggerEngineTests(unittest.TestCase):
         return engine.observe(
             SocialObservation(
                 observed_at=now,
+                inspected=inspected,
                 pir_motion_detected=pir,
                 low_motion=low_motion,
                 vision=SocialVisionObservation(

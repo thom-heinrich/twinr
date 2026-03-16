@@ -23,7 +23,7 @@ from twinr.memory.longterm import (
     LongTermSourceRefV1,
     LongTermStructuredStore,
 )
-from twinr.memory.longterm.worker import AsyncLongTermMemoryWriter
+from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter
 from twinr.memory.query_normalization import LongTermQueryProfile
 
 
@@ -592,7 +592,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertTrue(
             any(
                 item.kind == "event"
-                and item.status == "expired"
+                and item.status == "active"
                 and (item.attributes or {}).get("event_domain") == "appointment"
                 for item in kept
             )

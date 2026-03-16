@@ -138,6 +138,7 @@ class StreamingTranscriptionResult:
     saw_interim: bool = False
     saw_speech_final: bool = False
     saw_utterance_end: bool = False
+    confidence: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

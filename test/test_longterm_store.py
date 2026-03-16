@@ -14,17 +14,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from test.longterm_test_program import make_test_extractor
 from twinr.config import TwinrConfig
-from twinr.memory.longterm.consolidator import LongTermMemoryConsolidator
-from twinr.memory.longterm.models import (
+from twinr.memory.longterm.reasoning.consolidator import LongTermMemoryConsolidator
+from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermGraphEdgeCandidateV1,
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,
     LongTermSourceRefV1,
 )
-from twinr.memory.longterm.remote_state import LongTermRemoteUnavailableError
-from twinr.memory.longterm.store import LongTermStructuredStore, _write_json_atomic
-from twinr.memory.longterm.truth import LongTermTruthMaintainer
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.store import LongTermStructuredStore, _write_json_atomic
+from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
 
 
 class _FakeRemoteState:

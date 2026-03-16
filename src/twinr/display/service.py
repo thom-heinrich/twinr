@@ -8,7 +8,7 @@ import socket
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.runtime_state import RuntimeSnapshot, RuntimeSnapshotStore
+from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
 from twinr.display.waveshare_v2 import WaveshareEPD4In2V2
 from twinr.ops.health import TwinrSystemHealth, collect_system_health
 

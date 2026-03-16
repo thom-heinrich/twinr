@@ -11,12 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.config import TwinrConfig
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 from twinr.memory.context_store import PromptContextStore
-from twinr.memory.longterm.conflicts import LongTermConflictResolver
-from twinr.memory.longterm.models import LongTermConsolidationResultV1, LongTermMemoryObjectV1, LongTermSourceRefV1
-from twinr.memory.longterm.midterm_store import LongTermMidtermStore
-from twinr.memory.longterm.retriever import LongTermRetriever
-from twinr.memory.longterm.store import LongTermStructuredStore
-from twinr.memory.longterm.subtext import LongTermSubtextBuilder, LongTermSubtextCompiler
+from twinr.memory.longterm.reasoning.conflicts import LongTermConflictResolver
+from twinr.memory.longterm.core.models import LongTermConsolidationResultV1, LongTermMemoryObjectV1, LongTermSourceRefV1
+from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
+from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
+from twinr.memory.longterm.storage.store import LongTermStructuredStore
+from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder, LongTermSubtextCompiler
 from twinr.memory.query_normalization import LongTermQueryProfile
 
 

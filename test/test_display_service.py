@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
 from twinr.display.service import TwinrStatusDisplayLoop
-from twinr.agent.base_agent.runtime_state import RuntimeSnapshot, RuntimeSnapshotStore
+from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
 from twinr.ops.health import ServiceHealth, TwinrSystemHealth
 
 

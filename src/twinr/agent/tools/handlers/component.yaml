@@ -1,0 +1,90 @@
+schema_version: 1
+name: handlers
+path: src/twinr/agent/tools/handlers
+kind: python-package
+visibility: internal
+summary: Concrete realtime tool handlers and shared guard helpers for automation, memory, reminder, output, settings, and voice-profile tool calls.
+owned_concerns:
+  - Validate and normalize tool-call payloads at the handler boundary
+  - Translate tool requests into bounded runtime reads and mutations
+  - Keep handler-local telemetry, audit events, and follow-up side effects best-effort
+  - Share live-audio, sensitive-action confirmation, and primitive coercion helpers across handler families
+out_of_scope:
+  - Tool registry, binding, schemas, or prompt instruction assembly
+  - Runtime, store, provider, backend, or web-dashboard implementations
+  - Workflow-loop orchestration and background delivery control
+  - Operator-facing UI behavior outside tool responses
+files:
+  - path: __init__.py
+    role: Package marker with package-level summary
+  - path: automations.py
+    role: Automation CRUD handlers and delivery normalization helpers
+    exports:
+      - handle_list_automations
+      - handle_create_time_automation
+      - handle_create_sensor_automation
+      - handle_update_time_automation
+      - handle_update_sensor_automation
+      - handle_delete_automation
+      - normalize_delivery
+  - path: memory.py
+    role: Durable-memory, contact, preference, and plan handlers
+    exports:
+      - handle_remember_memory
+      - handle_remember_contact
+      - handle_lookup_contact
+      - handle_get_memory_conflicts
+      - handle_resolve_memory_conflict
+      - handle_remember_preference
+      - handle_remember_plan
+      - handle_update_user_profile
+      - handle_update_personality
+  - path: output.py
+    role: Print, search, camera, and conversation-output handlers
+    exports:
+      - handle_print_receipt
+      - handle_search_live_info
+      - handle_inspect_camera
+      - handle_end_conversation
+  - path: reminders.py
+    role: Reminder scheduling handler
+    exports:
+      - handle_schedule_reminder
+  - path: settings.py
+    role: Bounded simple-setting mutation handler
+    exports:
+      - handle_update_simple_setting
+  - path: support.py
+    role: Shared voice guards and primitive argument coercion
+    exports:
+      - VoiceGuardError
+      - MissingLiveAudioError
+      - SensitiveActionConfirmationRequired
+      - ArgumentValidationError
+      - require_current_turn_audio
+      - require_sensitive_voice_confirmation
+      - optional_bool
+      - optional_float
+  - path: voice_profile.py
+    role: Voice-profile enrollment, status, and reset handlers
+    exports:
+      - handle_enroll_voice_profile
+      - handle_get_voice_profile_status
+      - handle_reset_voice_profile
+primary_callers:
+  - path: src/twinr/agent/tools/runtime/executor.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+  - path: src/twinr/agent/workflows/realtime_runner_background.py
+  - path: src/twinr/__main__.py
+tests:
+  - path: test/test_realtime_runner.py
+  - path: test/test_openai_realtime.py
+  - path: test/test_automations.py
+  - path: test/test_reminders.py
+  - path: test/test_simple_settings.py
+  - path: test/test_voice_profile.py
+  - path: test/test_runner.py
+  - path: test/test_streaming_tool_loop.py
+  - path: test/run_pi_tool_matrix.py

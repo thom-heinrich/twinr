@@ -18,7 +18,7 @@ from twinr.memory.longterm import (
     LongTermMemoryService,
     LongTermSourceRefV1,
 )
-from twinr.memory.longterm.proactive import _write_json_atomic
+from twinr.memory.longterm.proactive.state import _write_json_atomic
 
 
 def _source(event_id: str) -> LongTermSourceRefV1:

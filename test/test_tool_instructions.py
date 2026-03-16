@@ -5,8 +5,9 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.tools.instructions import (
+from twinr.agent.tools.prompting.instructions import (
     build_compact_tool_agent_instructions,
+    build_first_word_instructions,
     build_supervisor_decision_instructions,
     build_supervisor_tool_agent_instructions,
     build_tool_agent_instructions,
@@ -79,6 +80,16 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("must not imply the task is already finished", instructions)
         self.assertIn("put the full user-facing answer into spoken_reply", instructions)
         self.assertIn("Do not wait for the specialist result", instructions)
+
+    def test_first_word_instructions_encourage_warm_conversational_replies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            instructions = build_first_word_instructions(
+                TwinrConfig(openai_api_key="test-key", project_root=temp_dir, personality_dir="personality")
+            )
+
+        self.assertIn("one or two short sentences", instructions)
+        self.assertIn("short warm follow-up question", instructions)
+        self.assertIn("relevant remembered user detail", instructions)
 
 
 if __name__ == "__main__":

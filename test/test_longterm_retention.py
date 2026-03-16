@@ -9,9 +9,9 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
-from twinr.memory.longterm.models import LongTermMemoryObjectV1, LongTermSourceRefV1
-from twinr.memory.longterm.retention import LongTermRetentionPolicy
-from twinr.memory.longterm.store import LongTermStructuredStore
+from twinr.memory.longterm.core.models import LongTermMemoryObjectV1, LongTermSourceRefV1
+from twinr.memory.longterm.reasoning.retention import LongTermRetentionPolicy
+from twinr.memory.longterm.storage.store import LongTermStructuredStore
 
 
 class LongTermRetentionPolicyTests(unittest.TestCase):

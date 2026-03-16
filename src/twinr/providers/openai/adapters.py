@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Sequence
 import json
+import logging
+import re
 
 from twinr.agent.base_agent.contracts import (
     AgentToolCall,
@@ -25,12 +27,16 @@ from twinr.agent.base_agent.contracts import (
     ToolCallingTurnResponse,
 )
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.language import user_response_language_instruction
-from twinr.agent.base_agent.personality import merge_instructions
+from twinr.agent.base_agent.conversation.language import user_response_language_instruction
+from twinr.agent.base_agent.prompting.personality import merge_instructions
 from twinr.ops.usage import extract_model_name, extract_token_usage
 
 from .backend import OpenAIBackend
 from .types import OpenAIImageInput
+
+
+logger = logging.getLogger(__name__)  # AUDIT-FIX(#3): Callback isolation needs local logging instead of hard-failing completed turns.
+_O_SERIES_MODEL_PATTERN = re.compile(r"^o\d+(?:[-_.].*)?$")  # AUDIT-FIX(#5): Reasoning support must follow generic o-series model IDs.
 
 
 @dataclass
@@ -54,6 +60,8 @@ class OpenAISpeechToTextProvider:
         language: str | None = None,
         prompt: str | None = None,
     ) -> str:
+        if not audio_bytes:
+            return ""  # AUDIT-FIX(#4): Short-circuit accidental empty captures instead of sending a doomed STT request upstream.
         return self.backend.transcribe(
             audio_bytes,
             filename=filename,
@@ -69,6 +77,8 @@ class OpenAISpeechToTextProvider:
         language: str | None = None,
         prompt: str | None = None,
     ) -> str:
+        if isinstance(path, str) and not path.strip():
+            return ""  # AUDIT-FIX(#4): Blank path input is equivalent to “no audio” and should not trigger a backend failure.
         return self.backend.transcribe_path(path, language=language, prompt=prompt)
 
 
@@ -226,6 +236,8 @@ class OpenAITextToSpeechProvider:
         response_format: str | None = None,
         instructions: str | None = None,
     ) -> bytes:
+        if not text.strip():
+            return b""  # AUDIT-FIX(#4): Blank spoken replies should degrade to silence, not an upstream TTS request.
         return self.backend.synthesize(
             text,
             voice=voice,
@@ -242,6 +254,10 @@ class OpenAITextToSpeechProvider:
         instructions: str | None = None,
         chunk_size: int = 4096,
     ):
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be >= 1")  # AUDIT-FIX(#4): Reject invalid chunk sizing before the backend can fail unpredictably.
+        if not text.strip():
+            return iter(())  # AUDIT-FIX(#4): Blank spoken replies should produce an empty stream.
         return self.backend.synthesize_stream(
             text,
             voice=voice,
@@ -302,20 +318,21 @@ class OpenAIToolCallingAgentProvider:
         on_text_delta: Callable[[str], None] | None = None,
     ) -> ToolCallingTurnResponse:
         model = self._resolved_model()
+        reasoning_effort = self._resolved_reasoning_effort()
         request = self.backend._build_response_request(
             prompt,
             conversation=conversation,
             instructions=self._merged_base_instructions(instructions),
             allow_web_search=allow_web_search,
             model=model,
-            reasoning_effort=self._resolved_reasoning_effort(),
+            reasoning_effort=reasoning_effort,
             prompt_cache_scope="tool_loop_start",
         )
         _apply_reasoning_effort_request(
             self.backend,
             request,
             model=model,
-            reasoning_effort=self._resolved_reasoning_effort(),
+            reasoning_effort=reasoning_effort,  # AUDIT-FIX(#3,#5): Normalize reasoning config before the request leaves this provider.
         )
         request["store"] = True
         self._merge_tool_schemas(request, tool_schemas)
@@ -351,7 +368,7 @@ class OpenAIToolCallingAgentProvider:
             self.backend,
             request,
             model=model,
-            reasoning_effort=self._resolved_reasoning_effort(),
+            reasoning_effort=self._resolved_reasoning_effort(),  # AUDIT-FIX(#3,#5): Apply the same reasoning gating on tool-loop continuation requests.
         )
         merged_instructions = merge_instructions(
             self._merged_base_instructions(instructions),
@@ -400,9 +417,10 @@ class OpenAIToolCallingAgentProvider:
             retry_request.pop("reasoning", None)
             streamed_text, response = self._consume_stream(retry_request, on_text_delta=on_text_delta)
 
-        text = streamed_text.strip() or self.backend._extract_output_text(response)
-        if text and not streamed_text.strip() and on_text_delta is not None:
-            on_text_delta(text)
+        fallback_text = _coerce_text(self.backend._extract_output_text(response)).strip()
+        text = streamed_text.strip() or fallback_text  # AUDIT-FIX(#1,#2): Never propagate None for tool-only turns or failed text extraction.
+        if text and not streamed_text.strip():
+            _emit_text_delta(on_text_delta, text, context="tool-loop fallback text")  # AUDIT-FIX(#2): Callback failures must not crash a completed model turn.
         response_id = getattr(response, "id", None)
         return ToolCallingTurnResponse(
             text=text,
@@ -421,19 +439,19 @@ class OpenAIToolCallingAgentProvider:
         *,
         on_text_delta: Callable[[str], None] | None = None,
     ) -> tuple[str, Any]:
-        streamed_text = ""
+        streamed_chunks: list[str] = []
         with self.backend._client.responses.stream(**request) as stream:
             for event in stream:
                 if getattr(event, "type", None) != "response.output_text.delta":
                     continue
-                delta = str(getattr(event, "delta", ""))
+                delta = _coerce_text(getattr(event, "delta", ""))
                 if not delta:
                     continue
-                streamed_text += delta
-                if on_text_delta is not None:
-                    on_text_delta(delta)
+                streamed_chunks.append(delta)
+                _emit_text_delta(on_text_delta, delta, context="tool-loop stream delta")  # AUDIT-FIX(#2): Protect the upstream response from callback-layer faults.
             response = stream.get_final_response()
-        return streamed_text, response
+        _validate_response_status(response, context="tool-loop response")  # AUDIT-FIX(#1): Failed/incomplete responses must not be treated as successful turns.
+        return "".join(streamed_chunks), response
 
     def _extract_tool_calls(self, response: Any) -> tuple[AgentToolCall, ...]:
         output_items = getattr(response, "output", None) or []
@@ -572,15 +590,22 @@ class OpenAISupervisorDecisionProvider:
         instructions: str | None = None,
     ) -> SupervisorDecision:
         model = self._resolved_model()
+        reasoning_effort = self._resolved_reasoning_effort()
         request = self.backend._build_response_request(
             prompt,
             conversation=conversation,
             instructions=self._merged_base_instructions(instructions),
             allow_web_search=False,
             model=model,
-            reasoning_effort=self._resolved_reasoning_effort(),
+            reasoning_effort=reasoning_effort,
             max_output_tokens=max(32, int(self.config.streaming_supervisor_max_output_tokens)),
             prompt_cache_scope="supervisor_decision",
+        )
+        _apply_reasoning_effort_request(
+            self.backend,
+            request,
+            model=model,
+            reasoning_effort=reasoning_effort,  # AUDIT-FIX(#3,#5): Gate reasoning support before supervisor requests hit the API.
         )
         request["text"] = {
             "format": {
@@ -590,10 +615,22 @@ class OpenAISupervisorDecisionProvider:
                 "strict": True,
             }
         }
-        response = self.backend._client.responses.create(**request)
-        payload = json.loads(self.backend._extract_output_text(response) or "{}")
+        response = _create_response_with_reasoning_fallback(
+            self.backend,
+            request,
+            context="supervisor decision",  # AUDIT-FIX(#1,#3): Validate response status and retry once without unsupported reasoning.
+        )
+        payload = _load_json_object(
+            _coerce_text(self.backend._extract_output_text(response)),
+            context="supervisor decision",
+        )
         return SupervisorDecision(
-            action=str(payload.get("action", "handoff") or "handoff"),
+            action=_validated_choice(
+                payload.get("action"),
+                allowed=("direct", "handoff", "end_conversation"),
+                default="handoff",
+                context="supervisor decision action",
+            ),  # AUDIT-FIX(#1): Reject malformed structured output instead of silently routing the turn incorrectly.
             spoken_ack=_optional_text(payload.get("spoken_ack")),
             spoken_reply=_optional_text(payload.get("spoken_reply")),
             kind=_optional_text(payload.get("kind")),
@@ -626,7 +663,8 @@ class OpenAIFirstWordProvider:
         override = (self.model_override or "").strip()
         if override:
             return override
-        return self.config.streaming_first_word_model
+        resolved = (self.config.streaming_first_word_model or "").strip()
+        return resolved or self.config.default_model  # AUDIT-FIX(#3): Prevent blank first-word model config from turning into an invalid API request.
 
     def _resolved_reasoning_effort(self) -> str | None:
         override = (self.reasoning_effort_override or "").strip()
@@ -661,6 +699,12 @@ class OpenAIFirstWordProvider:
                 max_output_tokens=max(16, int(self.config.streaming_first_word_max_output_tokens)),
                 prompt_cache_scope="first_word",
             )
+            _apply_reasoning_effort_request(
+                self.backend,
+                request,
+                model=model,
+                reasoning_effort=reasoning_effort,  # AUDIT-FIX(#3,#5): Fallback models like gpt-4o-mini must not inherit unsupported reasoning config.
+            )
             request["text"] = {
                 "format": {
                     "type": "json_schema",
@@ -669,17 +713,29 @@ class OpenAIFirstWordProvider:
                     "strict": True,
                 }
             }
-            return self.backend._client.responses.create(**request)
+            return _create_response_with_reasoning_fallback(
+                self.backend,
+                request,
+                context="first-word reply",  # AUDIT-FIX(#1,#3): Validate final status and retry without unsupported reasoning when needed.
+            )
 
         response, model_used = self.backend._call_with_model_fallback(
             preferred_model,
             _FIRST_WORD_MODEL_FALLBACKS,
             _call,
         )
-        payload = json.loads(self.backend._extract_output_text(response) or "{}")
+        payload = _load_json_object(
+            _coerce_text(self.backend._extract_output_text(response)),
+            context="first-word reply",
+        )
         return FirstWordReply(
-            mode=str(payload.get("mode", "filler") or "filler"),
-            spoken_text=str(payload.get("spoken_text", "") or "").strip(),
+            mode=_validated_choice(
+                payload.get("mode"),
+                allowed=("direct", "filler"),
+                default="filler",
+                context="first-word mode",
+            ),  # AUDIT-FIX(#1): Enforce the contract instead of forwarding malformed mode values downstream.
+            spoken_text=_coerce_text(payload.get("spoken_text")).strip(),
             response_id=getattr(response, "id", None),
             request_id=getattr(response, "_request_id", None),
             model=extract_model_name(response, model_used),
@@ -690,12 +746,18 @@ class OpenAIFirstWordProvider:
 def _is_reasoning_unsupported_error(exc: Exception) -> bool:
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
-        message = str(body.get("error", {}).get("message", "")).lower()
-        param = str(body.get("error", {}).get("param", "")).lower()
-        if "reasoning.effort" in param or "reasoning.effort" in message:
+        error = body.get("error", {})
+        message = str(error.get("message", "")).lower()
+        param = str(error.get("param", "")).lower()
+        code = str(error.get("code", "")).lower()
+        if "reasoning" in param:
+            return True  # AUDIT-FIX(#3): Retry both `reasoning` and `reasoning.effort` parameter rejections.
+        if "reasoning" in message and ("not supported" in message or "unsupported" in message):
+            return True
+        if code == "unsupported_parameter" and "reasoning" in message:
             return True
     message = str(exc).lower()
-    return "reasoning.effort" in message and "not supported" in message
+    return "reasoning" in message and ("not supported" in message or "unsupported" in message)
 
 
 def _apply_reasoning_effort_request(
@@ -727,7 +789,7 @@ def _model_supports_reasoning_effort(model: str) -> bool:
     normalized = (model or "").strip().lower()
     if not normalized:
         return False
-    return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
+    return normalized.startswith("gpt-5") or bool(_O_SERIES_MODEL_PATTERN.match(normalized))  # AUDIT-FIX(#5): Reasoning support is defined for gpt-5 and generic o-series models, not a frozen allowlist.
 
 
 def _optional_text(value: Any) -> str | None:
@@ -762,6 +824,120 @@ def _normalize_openai_function_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return copied
 
 
+def _coerce_text(value: Any) -> str:
+    # AUDIT-FIX(#2): Tool-loop callers expect string output even when the SDK returns None for tool-only turns.
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _validated_choice(
+    value: Any,
+    *,
+    allowed: Sequence[str],
+    default: str,
+    context: str,
+) -> str:
+    # AUDIT-FIX(#1): Structured-output fields must stay inside their declared enum domain before they hit downstream routing.
+    candidate = str(value or default).strip() or default
+    if candidate in allowed:
+        return candidate
+    raise RuntimeError(f"{context} must be one of {tuple(allowed)!r}, got {candidate!r}")
+
+
+def _load_json_object(text: str, *, context: str) -> dict[str, Any]:
+    # AUDIT-FIX(#1): Treat empty/malformed structured output as a protocol failure, not a silent default branch.
+    payload_text = text.strip()
+    if not payload_text:
+        raise RuntimeError(f"{context} returned empty structured output")  # AUDIT-FIX(#1): Empty structured-output bodies are protocol violations, not silent defaults.
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{context} returned invalid JSON: {exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{context} must decode to a JSON object")
+    return payload
+
+
+def _emit_text_delta(
+    on_text_delta: Callable[[str], None] | None,
+    text: str,
+    *,
+    context: str,
+) -> None:
+    # AUDIT-FIX(#2): Streaming callbacks are observer-side effects and must not be allowed to kill the provider response.
+    if on_text_delta is None or not text:
+        return
+    try:
+        on_text_delta(text)
+    except Exception:
+        logger.warning("%s callback failed; continuing without streaming callback delivery", context, exc_info=True)
+
+
+def _create_response_with_reasoning_fallback(
+    backend: Any,
+    request: dict[str, Any],
+    *,
+    context: str,
+) -> Any:
+    # AUDIT-FIX(#1,#3): Centralize create-path status validation and unsupported-reasoning retry logic.
+    try:
+        response = backend._client.responses.create(**request)
+    except Exception as exc:
+        if not _is_reasoning_unsupported_error(exc) or "reasoning" not in request:
+            raise
+        retry_request = dict(request)
+        retry_request.pop("reasoning", None)
+        response = backend._client.responses.create(**retry_request)
+    _validate_response_status(response, context=context)
+    return response
+
+
+def _validate_response_status(response: Any, *, context: str) -> None:
+    # AUDIT-FIX(#1): Failed/incomplete SDK responses must surface as errors before blank text is mistaken for success.
+    status = str(getattr(response, "status", "") or "").strip().lower()
+    if not status or status == "completed":
+        return
+    detail_parts = [f"{context} finished with status={status!r}"]
+    error_detail = _extract_detail_message(getattr(response, "error", None))
+    if error_detail:
+        detail_parts.append(f"error={error_detail}")
+    incomplete_detail = _extract_detail_message(getattr(response, "incomplete_details", None))
+    if incomplete_detail:
+        detail_parts.append(f"incomplete={incomplete_detail}")
+    raise RuntimeError("; ".join(detail_parts))
+
+
+def _extract_detail_message(detail: Any) -> str | None:
+    if detail is None:
+        return None
+    if isinstance(detail, dict):
+        code = _optional_text(detail.get("code"))
+        message = _optional_text(detail.get("message"))
+        reason = _optional_text(detail.get("reason"))
+        parts = [part for part in (code, reason, message) if part]
+        return ": ".join(parts) if parts else _optional_text(detail)
+    code = _optional_text(getattr(detail, "code", None))
+    message = _optional_text(getattr(detail, "message", None))
+    reason = _optional_text(getattr(detail, "reason", None))
+    parts = [part for part in (code, reason, message) if part]
+    if parts:
+        return ": ".join(parts)
+    return _optional_text(detail)
+
+
+def _provider_bundle_field_names(bundle_cls: type[Any]) -> set[str]:
+    # AUDIT-FIX(#6): Support newer ProviderBundle shapes without breaking older dataclass layouts.
+    if is_dataclass(bundle_cls):
+        return {field.name for field in fields(bundle_cls)}
+    annotations = getattr(bundle_cls, "__annotations__", None)
+    if isinstance(annotations, dict):
+        return set(annotations)
+    return set()
+
+
 @dataclass
 class OpenAIProviderBundle(ProviderBundle):
     backend: OpenAIBackend
@@ -773,14 +949,25 @@ class OpenAIProviderBundle(ProviderBundle):
         agent = OpenAIAgentTextProvider(backend)
         tts = OpenAITextToSpeechProvider(backend)
         tool_agent = OpenAIToolCallingAgentProvider(backend)
-        return cls(
-            stt=stt,
-            agent=agent,
-            tts=tts,
-            tool_agent=tool_agent,
-            backend=backend,
-            combined=CompositeSpeechAgentProvider(stt=stt, agent=agent, tts=tts),
-        )
+        supervisor = OpenAISupervisorDecisionProvider(backend)
+        first_word = OpenAIFirstWordProvider(backend)
+        combined = CompositeSpeechAgentProvider(stt=stt, agent=agent, tts=tts)
+        bundle_kwargs: dict[str, Any] = {
+            "stt": stt,
+            "agent": agent,
+            "tts": tts,
+            "tool_agent": tool_agent,
+            "backend": backend,
+            "combined": combined,
+        }
+        field_names = _provider_bundle_field_names(cls)
+        for field_name in ("supervisor", "supervisor_provider", "supervisor_decision", "supervisor_decision_provider"):
+            if field_name in field_names:
+                bundle_kwargs[field_name] = supervisor  # AUDIT-FIX(#6): Wire optional supervisor fields when the ProviderBundle shape supports them.
+        for field_name in ("first_word", "first_word_provider"):
+            if field_name in field_names:
+                bundle_kwargs[field_name] = first_word  # AUDIT-FIX(#6): Wire optional first-word fields without breaking older bundle shapes.
+        return cls(**bundle_kwargs)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> OpenAIProviderBundle:

@@ -1,0 +1,84 @@
+schema_version: 1
+name: runtime
+path: src/twinr/agent/tools/runtime
+kind: python-package
+visibility: internal
+summary: Bind realtime tool handlers and run the bounded single-lane and dual-lane tool loops used by Twinr live turns.
+owned_concerns:
+  - Adapt workflow owners into the handler method surface used for realtime tool execution
+  - Validate the canonical realtime tool-name to handler binding map before live turns start
+  - Run the generic streaming tool loop that alternates provider turns and tool execution
+  - Run the dual-lane supervisor and specialist handoff loop with speech-lane events
+out_of_scope:
+  - Concrete tool-side business logic or runtime mutations inside src/twinr/agent/tools/handlers
+  - Tool schema authoring and prompt instruction assembly in sibling packages
+  - Workflow/session orchestration above the tool-loop boundary
+  - Provider transport implementations beyond the tool-calling contracts they satisfy
+files:
+  - path: __init__.py
+    role: Package export surface for runtime tool orchestration
+    exports:
+      - DualLaneToolLoop
+      - RealtimeToolBindingError
+      - RealtimeToolExecutor
+      - SpeechLaneDelta
+      - StreamingToolLoopResult
+      - ToolCallingStreamingLoop
+      - bind_realtime_tool_handlers
+      - realtime_tool_names
+  - path: executor.py
+    role: Thin dispatcher from workflow owners to handler modules
+    exports:
+      - RealtimeToolExecutor
+  - path: registry.py
+    role: Canonical realtime tool binding registry and bootstrap validation
+    exports:
+      - RealtimeToolBindingError
+      - bind_realtime_tool_handlers
+      - realtime_tool_names
+  - path: streaming_loop.py
+    role: Generic bounded streaming tool-calling loop
+    exports:
+      - StreamingToolLoopResult
+      - ToolCallingStreamingLoop
+  - path: dual_lane_loop.py
+    role: Supervisor and specialist handoff loop with speech-lane deltas
+    exports:
+      - DualLaneToolLoop
+      - SpeechLaneDelta
+public_api:
+  module: twinr.agent.tools.runtime
+  exports:
+    - DualLaneToolLoop
+    - RealtimeToolBindingError
+    - RealtimeToolExecutor
+    - SpeechLaneDelta
+    - StreamingToolLoopResult
+    - ToolCallingStreamingLoop
+    - bind_realtime_tool_handlers
+    - realtime_tool_names
+compatibility_reexports:
+  - path: src/twinr/agent/tools/__init__.py
+    names:
+      - DualLaneToolLoop
+      - RealtimeToolExecutor
+      - SpeechLaneDelta
+      - StreamingToolLoopResult
+      - ToolCallingStreamingLoop
+      - bind_realtime_tool_handlers
+      - realtime_tool_names
+primary_callers:
+  - path: src/twinr/__main__.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/speech_output.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+  - path: src/twinr/orchestrator/session.py
+tests:
+  - path: test/test_dual_lane_loop.py
+  - path: test/test_openai_realtime.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_runner.py
+  - path: test/test_speech_output.py
+  - path: test/test_streaming_runner.py
+  - path: test/test_streaming_tool_loop.py

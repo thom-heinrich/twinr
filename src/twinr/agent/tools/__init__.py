@@ -1,25 +1,25 @@
-from twinr.agent.tools.executor import RealtimeToolExecutor
-from twinr.agent.tools.contracts import (
-    build_agent_tool_schemas,
-    build_compact_agent_tool_schemas,
-    build_realtime_tool_schemas,
-)
-from twinr.agent.tools.instructions import (
+from twinr.agent.tools.prompting.instructions import (
     COMPACT_TOOL_AGENT_INSTRUCTIONS,
     DEFAULT_TOOL_AGENT_INSTRUCTIONS,
     FIRST_WORD_AGENT_INSTRUCTIONS,
     SUPERVISOR_FAST_ACK_PHRASES,
-    build_first_word_instructions,
     build_compact_tool_agent_instructions,
-    build_supervisor_decision_instructions,
+    build_first_word_instructions,
     build_specialist_tool_agent_instructions,
+    build_supervisor_decision_instructions,
     build_supervisor_tool_agent_instructions,
     build_tool_agent_instructions,
     tool_agent_time_context,
 )
-from twinr.agent.tools.registry import bind_realtime_tool_handlers, realtime_tool_names
-from twinr.agent.tools.dual_lane_loop import DualLaneToolLoop, SpeechLaneDelta
-from twinr.agent.tools.streaming_loop import StreamingToolLoopResult, ToolCallingStreamingLoop
+from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop, SpeechLaneDelta
+from twinr.agent.tools.runtime.executor import RealtimeToolExecutor
+from twinr.agent.tools.runtime.registry import bind_realtime_tool_handlers, realtime_tool_names
+from twinr.agent.tools.runtime.streaming_loop import StreamingToolLoopResult, ToolCallingStreamingLoop
+from twinr.agent.tools.schemas.contracts import (
+    build_agent_tool_schemas,
+    build_compact_agent_tool_schemas,
+    build_realtime_tool_schemas,
+)
 
 __all__ = [
     "COMPACT_TOOL_AGENT_INSTRUCTIONS",

@@ -8,7 +8,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
-from twinr.memory.longterm.remote_state import LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.personality import (
     load_personality_instructions,
@@ -228,8 +228,8 @@ class PersonalityTests(unittest.TestCase):
                 long_term_memory_mode="remote_primary",
                 long_term_memory_remote_required=False,
             )
-            with patch("twinr.memory.longterm.remote_state.LongTermRemoteStateStore.from_config", return_value=remote_state), patch(
-                "twinr.agent.base_agent.personality.LongTermRemoteStateStore.from_config",
+            with patch("twinr.memory.longterm.storage.remote_state.LongTermRemoteStateStore.from_config", return_value=remote_state), patch(
+                "twinr.agent.base_agent.prompting.personality.LongTermRemoteStateStore.from_config",
                 return_value=remote_state,
             ):
                 instructions = load_personality_instructions(config)
@@ -286,9 +286,12 @@ class PersonalityTests(unittest.TestCase):
                 long_term_memory_remote_required=True,
             )
             failing_remote = _FailingRemoteState()
-            with patch("twinr.agent.base_agent.personality.LongTermRemoteStateStore.from_config", return_value=failing_remote):
-                with self.assertRaises(LongTermRemoteUnavailableError):
-                    load_personality_instructions(config)
+            with patch("twinr.agent.base_agent.prompting.personality.LongTermRemoteStateStore.from_config", return_value=failing_remote):
+                instructions = load_personality_instructions(config)
+
+        self.assertIsNotNone(instructions)
+        self.assertIn("Base user profile", instructions)
+        self.assertIn("Thom has two dogs.", instructions)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,14 @@
 from pathlib import Path
+from tempfile import TemporaryFile
+from unittest import mock
+import os
 import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.hardware.audio import (
+    WaveAudioPlayer,
     resolve_dynamic_pause_thresholds,
     resolve_pause_resume_confirmation,
 )
@@ -82,6 +86,70 @@ class DynamicPauseThresholdTests(unittest.TestCase):
         )
 
         self.assertEqual((pause_ms, pause_grace_ms), (880, 230))
+
+
+class _FakePlaybackProcess:
+    def __init__(self) -> None:
+        self.stdin = TemporaryFile()
+        self.stderr = TemporaryFile()
+        self.stdout = None
+        self.returncode = None
+        self.terminate_calls = 0
+        self.wait_calls = 0
+        self.wait_timeouts: list[float | None] = []
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        self.wait_timeouts.append(timeout)
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+class WaveAudioPlayerTests(unittest.TestCase):
+    def test_preempted_stream_terminates_aplay_without_waiting_for_drain(self) -> None:
+        player = WaveAudioPlayer(device="default")
+        process = _FakePlaybackProcess()
+        stop_requested = [False]
+        original_os_write = os.write
+
+        def fake_write(fd, view):
+            written = original_os_write(fd, view)
+            stop_requested[0] = True
+            return written
+
+        with (
+            mock.patch("twinr.hardware.audio._spawn_audio_process", return_value=process),
+            mock.patch("twinr.hardware.audio._wait_for_writable", return_value=True),
+            mock.patch("twinr.hardware.audio.os.set_blocking"),
+            mock.patch("twinr.hardware.audio.os.write", side_effect=fake_write),
+        ):
+            player.play_wav_chunks(
+                [b"chunk-1", b"chunk-2"],
+                should_stop=lambda: stop_requested[0],
+            )
+
+        self.assertGreaterEqual(process.terminate_calls, 1)
+        self.assertEqual(process.wait_timeouts, [1.0])
+
+    def test_stop_playback_terminates_active_process(self) -> None:
+        player = WaveAudioPlayer(device="default")
+        process = _FakePlaybackProcess()
+
+        player._set_active_process(process)
+        player.stop_playback()
+
+        self.assertGreaterEqual(process.terminate_calls, 1)
 
 
 if __name__ == "__main__":

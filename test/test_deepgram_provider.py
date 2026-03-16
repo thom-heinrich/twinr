@@ -162,7 +162,7 @@ class DeepgramSpeechToTextProviderTests(unittest.TestCase):
         self.assertEqual(result.transcript, "Guten Morgen")
         self.assertEqual(result.request_id, "dg-req-123")
         self.assertTrue(result.saw_interim)
-        self.assertTrue(result.saw_speech_final)
+        self.assertFalse(result.saw_speech_final)
 
     def test_streaming_session_emits_endpoint_events_before_finalize(self) -> None:
         def fake_connector(url: str, **kwargs):

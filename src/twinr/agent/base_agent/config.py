@@ -181,6 +181,12 @@ class TwinrConfig:
     streaming_early_transcript_enabled: bool = True
     streaming_early_transcript_min_chars: int = 10
     streaming_early_transcript_wait_ms: int = 250
+    streaming_transcript_verifier_enabled: bool = True
+    streaming_transcript_verifier_model: str = "gpt-4o-mini-transcribe"
+    streaming_transcript_verifier_max_words: int = 6
+    streaming_transcript_verifier_max_chars: int = 32
+    streaming_transcript_verifier_min_confidence: float = 0.92
+    streaming_transcript_verifier_max_capture_ms: int = 6500
     streaming_dual_lane_enabled: bool = True
     streaming_first_word_enabled: bool = True
     streaming_first_word_model: str = "gpt-4o-mini"
@@ -284,7 +290,11 @@ class TwinrConfig:
     proactive_vision_review_max_age_s: float = 12.0
     proactive_vision_review_min_spacing_s: float = 1.2
     wakeword_enabled: bool = False
-    wakeword_backend: str = "stt"
+    wakeword_backend: str = "openwakeword"
+    wakeword_primary_backend: str = "openwakeword"
+    wakeword_fallback_backend: str = "stt"
+    wakeword_verifier_mode: str = "ambiguity_only"
+    wakeword_verifier_margin: float = 0.08
     wakeword_phrases: tuple[str, ...] = DEFAULT_WAKEWORD_PHRASES
     wakeword_sample_ms: int = 1800
     wakeword_presence_grace_s: float = 15.0 * 60.0
@@ -303,6 +313,8 @@ class TwinrConfig:
     wakeword_openwakeword_enable_speex: bool = False
     wakeword_openwakeword_transcribe_on_detect: bool = False
     wakeword_openwakeword_inference_framework: str = "tflite"
+    wakeword_calibration_profile_path: str = "state/wakeword_calibration.json"
+    wakeword_calibration_recommended_path: str = "state/wakeword_calibration.recommended.json"
     proactive_person_returned_absence_s: float = 20.0 * 60.0
     proactive_person_returned_recent_motion_s: float = 30.0
     proactive_attention_window_s: float = 6.0
@@ -395,6 +407,7 @@ class TwinrConfig:
     chonkydb_api_key_header: str = "x-api-key"
     chonkydb_allow_bearer_auth: bool = False
     chonkydb_timeout_s: float = 20.0
+    chonkydb_max_response_bytes: int = 32 * 1024 * 1024
     restore_runtime_state_on_startup: bool = False
     reminder_poll_interval_s: float = 1.0
     reminder_retry_delay_s: float = 90.0
@@ -519,6 +532,22 @@ class TwinrConfig:
                 return os.environ[name]
             return file_values.get(name, default)
 
+        wakeword_primary_backend = (
+            get_value(
+                "TWINR_WAKEWORD_PRIMARY_BACKEND",
+                get_value("TWINR_WAKEWORD_BACKEND", "openwakeword"),
+            )
+            or "openwakeword"
+        ).strip().lower()
+        wakeword_verifier_mode = (
+            get_value("TWINR_WAKEWORD_VERIFIER_MODE")
+            or (
+                "always"
+                if _parse_bool(get_value("TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT"), False)
+                else "ambiguity_only"
+            )
+        ).strip().lower()
+
         return cls(
             openai_api_key=get_value("OPENAI_API_KEY"),
             openai_project_id=get_value("OPENAI_PROJ_ID"),
@@ -639,6 +668,32 @@ class TwinrConfig:
             ),
             streaming_early_transcript_wait_ms=int(
                 get_value("TWINR_STREAMING_EARLY_TRANSCRIPT_WAIT_MS", "250") or "250"
+            ),
+            streaming_transcript_verifier_enabled=_parse_bool(
+                get_value("TWINR_STREAMING_TRANSCRIPT_VERIFIER_ENABLED"),
+                True,
+            ),
+            streaming_transcript_verifier_model=(
+                get_value("TWINR_STREAMING_TRANSCRIPT_VERIFIER_MODEL", "gpt-4o-mini-transcribe")
+                or "gpt-4o-mini-transcribe"
+            ),
+            streaming_transcript_verifier_max_words=max(
+                1,
+                int(get_value("TWINR_STREAMING_TRANSCRIPT_VERIFIER_MAX_WORDS", "6") or "6"),
+            ),
+            streaming_transcript_verifier_max_chars=max(
+                8,
+                int(get_value("TWINR_STREAMING_TRANSCRIPT_VERIFIER_MAX_CHARS", "32") or "32"),
+            ),
+            streaming_transcript_verifier_min_confidence=_parse_clamped_float(
+                get_value("TWINR_STREAMING_TRANSCRIPT_VERIFIER_MIN_CONFIDENCE"),
+                0.92,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            streaming_transcript_verifier_max_capture_ms=max(
+                1000,
+                int(get_value("TWINR_STREAMING_TRANSCRIPT_VERIFIER_MAX_CAPTURE_MS", "6500") or "6500"),
             ),
             streaming_dual_lane_enabled=_parse_bool(
                 get_value("TWINR_STREAMING_DUAL_LANE_ENABLED"),
@@ -882,7 +937,18 @@ class TwinrConfig:
                 1.2,
             ),
             wakeword_enabled=_parse_bool(get_value("TWINR_WAKEWORD_ENABLED"), False),
-            wakeword_backend=(get_value("TWINR_WAKEWORD_BACKEND", "stt") or "stt").strip().lower(),
+            wakeword_backend=wakeword_primary_backend,
+            wakeword_primary_backend=wakeword_primary_backend,
+            wakeword_fallback_backend=(
+                get_value("TWINR_WAKEWORD_FALLBACK_BACKEND", "stt") or "stt"
+            ).strip().lower(),
+            wakeword_verifier_mode=wakeword_verifier_mode,
+            wakeword_verifier_margin=_parse_clamped_float(
+                get_value("TWINR_WAKEWORD_VERIFIER_MARGIN"),
+                0.08,
+                minimum=0.0,
+                maximum=1.0,
+            ),
             wakeword_phrases=_parse_csv_strings(
                 get_value("TWINR_WAKEWORD_PHRASES"),
                 DEFAULT_WAKEWORD_PHRASES,
@@ -952,6 +1018,16 @@ class TwinrConfig:
             wakeword_openwakeword_inference_framework=(
                 get_value("TWINR_WAKEWORD_OPENWAKEWORD_INFERENCE_FRAMEWORK", "tflite") or "tflite"
             ).strip().lower(),
+            wakeword_calibration_profile_path=get_value(
+                "TWINR_WAKEWORD_CALIBRATION_PROFILE_PATH",
+                str(project_root / "state" / "wakeword_calibration.json"),
+            )
+            or str(project_root / "state" / "wakeword_calibration.json"),
+            wakeword_calibration_recommended_path=get_value(
+                "TWINR_WAKEWORD_CALIBRATION_RECOMMENDED_PATH",
+                str(project_root / "state" / "wakeword_calibration.recommended.json"),
+            )
+            or str(project_root / "state" / "wakeword_calibration.recommended.json"),
             proactive_person_returned_absence_s=_parse_float(
                 get_value("TWINR_PROACTIVE_PERSON_RETURNED_ABSENCE_S"),
                 20.0 * 60.0,
@@ -1277,6 +1353,9 @@ class TwinrConfig:
             chonkydb_api_key_header=get_value("TWINR_CHONKYDB_API_KEY_HEADER", "x-api-key") or "x-api-key",
             chonkydb_allow_bearer_auth=_parse_bool(get_value("TWINR_CHONKYDB_ALLOW_BEARER_AUTH"), False),
             chonkydb_timeout_s=_parse_float(get_value("TWINR_CHONKYDB_TIMEOUT_S"), 20.0),
+            chonkydb_max_response_bytes=int(
+                get_value("TWINR_CHONKYDB_MAX_RESPONSE_BYTES", str(32 * 1024 * 1024)) or str(32 * 1024 * 1024)
+            ),
             restore_runtime_state_on_startup=_parse_bool(
                 get_value("TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP"),
                 False,

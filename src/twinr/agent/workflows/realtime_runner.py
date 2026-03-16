@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from difflib import SequenceMatcher
 from queue import Queue
 from threading import Event, Lock, Thread
 from typing import Callable
 import time
 
-from twinr.agent.base_agent.adaptive_timing import AdaptiveListeningWindow
+from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveListeningWindow
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.contracts import (
     AgentTextProvider,
@@ -18,12 +19,12 @@ from twinr.agent.base_agent.contracts import (
     TextToSpeechProvider,
     ToolCallingAgentProvider,
 )
-from twinr.agent.base_agent.turn_controller import (
+from twinr.agent.base_agent.conversation.turn_controller import (
     StreamingTurnController,
     ToolCallingTurnDecisionEvaluator,
     _normalize_turn_text,
 )
-from twinr.agent.base_agent.conversation_closure import (
+from twinr.agent.base_agent.conversation.closure import (
     ConversationClosureDecision,
     ToolCallingConversationClosureEvaluator,
 )
@@ -68,6 +69,7 @@ class TwinrRealtimeHardwareLoop(
         tts_provider: TextToSpeechProvider | None = None,
         turn_stt_provider: StreamingSpeechToTextProvider | None = None,
         turn_tool_agent_provider: ToolCallingAgentProvider | None = None,
+        verification_stt_provider: SpeechToTextProvider | None = None,
         conversation_closure_evaluator: ToolCallingConversationClosureEvaluator | None = None,
         button_monitor=None,
         recorder: SilenceDetectedRecorder | None = None,
@@ -92,6 +94,7 @@ class TwinrRealtimeHardwareLoop(
         self.tts_provider = tts_provider or print_backend or (openai_bundle.tts if openai_bundle is not None else None)
         if self.stt_provider is None or self.agent_provider is None or self.tts_provider is None:
             raise ValueError("TwinrRealtimeHardwareLoop requires STT, agent, and TTS providers")
+        self.transcript_verifier_provider = verification_stt_provider
         self.print_backend = print_backend or (
             openai_bundle.combined
             if openai_bundle is not None
@@ -560,6 +563,175 @@ class TwinrRealtimeHardwareLoop(
                 transcript_hint = controller_hint.strip()
         return transcript_hint
 
+    def _maybe_recover_low_evidence_streaming_transcript(
+        self,
+        *,
+        stt_provider: StreamingSpeechToTextProvider,
+        capture_result: SpeechCaptureResult | None,
+        transcript: str,
+        saw_interim: bool,
+        capture_ms: int,
+    ) -> str:
+        cleaned = str(transcript or "").strip()
+        if not cleaned:
+            return cleaned
+        if capture_result is None or not capture_result.pcm_bytes:
+            return cleaned
+
+        word_count = len(cleaned.split())
+        min_chars = max(8, int(self.config.streaming_early_transcript_min_chars))
+        looks_complete = len(cleaned) >= min_chars and word_count >= 3
+        if looks_complete:
+            return cleaned
+        if saw_interim and capture_ms < 1200 and word_count >= 2:
+            return cleaned
+
+        try:
+            audio_bytes = pcm16_to_wav_bytes(
+                capture_result.pcm_bytes,
+                sample_rate=self._recorder_sample_rate(),
+                channels=self.config.audio_channels,
+            )
+            recovered = stt_provider.transcribe(
+                audio_bytes,
+                filename="twinr-streaming-recover.wav",
+                content_type="audio/wav",
+                language=self.config.deepgram_stt_language,
+            ).strip()
+        except Exception as exc:
+            self.emit(f"stt_streaming_recover_failed={type(exc).__name__}")
+            return cleaned
+
+        if not recovered:
+            return cleaned
+        recovered_words = len(recovered.split())
+        if len(recovered) <= len(cleaned) and recovered_words <= word_count:
+            return cleaned
+
+        self.emit("stt_streaming_recovered_via_batch=true")
+        return recovered
+
+    def _should_verify_streaming_transcript(
+        self,
+        *,
+        transcript: str,
+        capture_result: SpeechCaptureResult | None,
+        capture_ms: int,
+        saw_speech_final: bool,
+        saw_utterance_end: bool,
+        confidence: float | None,
+    ) -> bool:
+        verifier = getattr(self, "transcript_verifier_provider", None)
+        if verifier is None or not callable(getattr(verifier, "transcribe", None)):
+            return False
+        cleaned = str(transcript or "").strip()
+        if not cleaned:
+            return False
+        if capture_result is None or not capture_result.pcm_bytes:
+            return False
+        if capture_ms > max(1000, int(self.config.streaming_transcript_verifier_max_capture_ms)):
+            return False
+        word_count = len(cleaned.split())
+        if (
+            word_count > max(1, int(self.config.streaming_transcript_verifier_max_words))
+            and len(cleaned) > max(8, int(self.config.streaming_transcript_verifier_max_chars))
+        ):
+            return False
+        if saw_utterance_end and not saw_speech_final:
+            return True
+        if confidence is None:
+            return word_count <= max(1, int(self.config.streaming_transcript_verifier_max_words))
+        return confidence < float(self.config.streaming_transcript_verifier_min_confidence)
+
+    def _build_streaming_transcript_verifier_prompt(
+        self,
+        *,
+        transcript_hint: str,
+    ) -> str:
+        conversation = self.runtime.supervisor_provider_conversation_context()
+        tail_lines: list[str] = []
+        for role, content in conversation[-2:]:
+            role_text = str(role or "").strip()
+            content_text = str(content or "").strip()
+            if not role_text or not content_text:
+                continue
+            tail_lines.append(f"{role_text}: {content_text}")
+        context_block = "\n".join(tail_lines).strip()
+        prompt_lines = [
+            "Die Audiodatei enthält eine kurze deutsche Äußerung an einen Sprachassistenten.",
+            "Transkribiere wörtlich auf Deutsch.",
+            "Behalte umgangssprachliche Kurzformen wie 'geht's', 'hab's' oder 'wie wär's' korrekt bei.",
+            "Rate nicht. Wenn ein Streaming-Hinweis unten steht, nutze ihn nur als schwachen Kontext, nicht als Wahrheit.",
+        ]
+        if context_block:
+            prompt_lines.append("Letzter Gesprächskontext:")
+            prompt_lines.append(context_block)
+        normalized_hint = str(transcript_hint or "").strip()
+        if normalized_hint:
+            prompt_lines.append(f"Streaming-Hinweis: {normalized_hint}")
+        return "\n".join(prompt_lines)
+
+    def _maybe_verify_streaming_transcript(
+        self,
+        *,
+        capture_result: SpeechCaptureResult | None,
+        transcript: str,
+        capture_ms: int,
+        saw_speech_final: bool,
+        saw_utterance_end: bool,
+        confidence: float | None,
+    ) -> str:
+        if not self._should_verify_streaming_transcript(
+            transcript=transcript,
+            capture_result=capture_result,
+            capture_ms=capture_ms,
+            saw_speech_final=saw_speech_final,
+            saw_utterance_end=saw_utterance_end,
+            confidence=confidence,
+        ):
+            return str(transcript or "").strip()
+
+        verifier = getattr(self, "transcript_verifier_provider", None)
+        if verifier is None:
+            return str(transcript or "").strip()
+
+        try:
+            audio_bytes = pcm16_to_wav_bytes(
+                capture_result.pcm_bytes,
+                sample_rate=self._recorder_sample_rate(),
+                channels=self.config.audio_channels,
+            )
+            verified = verifier.transcribe(
+                audio_bytes,
+                filename="twinr-streaming-verify.wav",
+                content_type="audio/wav",
+                language=self.config.deepgram_stt_language,
+                prompt=self._build_streaming_transcript_verifier_prompt(
+                    transcript_hint=transcript,
+                ),
+            ).strip()
+        except Exception as exc:
+            self.emit(f"stt_streaming_verify_failed={type(exc).__name__}")
+            return str(transcript or "").strip()
+
+        cleaned = str(transcript or "").strip()
+        if not verified:
+            return cleaned
+        if _normalize_turn_text(verified) == _normalize_turn_text(cleaned):
+            self.emit("stt_streaming_verified_via_openai=true")
+            return verified
+
+        similarity = SequenceMatcher(
+            None,
+            _normalize_turn_text(cleaned),
+            _normalize_turn_text(verified),
+        ).ratio()
+        if similarity < 0.9 or len(verified) > len(cleaned):
+            self.emit("stt_streaming_verifier_disagreement=true")
+            self.emit("stt_streaming_verified_via_openai=true")
+            return verified
+        return cleaned
+
     def _on_streaming_stt_interim(self, text: str) -> None:
         del text
 
@@ -581,6 +753,7 @@ class TwinrRealtimeHardwareLoop(
         capture_result: SpeechCaptureResult | None = None
         capture_ms = 0
         streaming_send_error: list[Exception] = []
+        early_transcript_hint = ""
 
         def current_turn_label() -> str | None:
             if controller is None:
@@ -668,8 +841,29 @@ class TwinrRealtimeHardwareLoop(
                 self.emit(f"stt_streaming_interim={str(early_result.saw_interim).lower()}")
                 self.emit(f"stt_streaming_speech_final={str(early_result.saw_speech_final).lower()}")
                 self.emit(f"stt_streaming_utterance_end={str(early_result.saw_utterance_end).lower()}")
-                self.emit("stt_streaming_early=true")
-                return capture_result, early_result.transcript.strip(), capture_ms, 0, current_turn_label()
+                self.emit(
+                    "stt_streaming_early=true"
+                    if bool(getattr(early_result, "saw_speech_final", False))
+                    else "stt_streaming_early_hint=true"
+                )
+                early_transcript_hint = self._maybe_recover_low_evidence_streaming_transcript(
+                    stt_provider=stt_provider,
+                    capture_result=capture_result,
+                    transcript=early_result.transcript.strip(),
+                    saw_interim=bool(getattr(early_result, "saw_interim", False)),
+                    capture_ms=capture_ms,
+                )
+                if bool(getattr(early_result, "saw_speech_final", False)):
+                    transcript = self._maybe_verify_streaming_transcript(
+                        capture_result=capture_result,
+                        transcript=early_transcript_hint,
+                        capture_ms=capture_ms,
+                        saw_speech_final=True,
+                        saw_utterance_end=bool(getattr(early_result, "saw_utterance_end", False)),
+                        confidence=getattr(early_result, "confidence", None),
+                    )
+                    return capture_result, transcript, capture_ms, 0, current_turn_label()
+                self.emit("stt_streaming_deferred_until_finalize=true")
 
             stt_started = time.monotonic()
             try:
@@ -691,10 +885,25 @@ class TwinrRealtimeHardwareLoop(
             self.emit(f"stt_streaming_utterance_end={str(result.saw_utterance_end).lower()}")
             transcript = (result.transcript or "").strip()
             if not transcript:
-                transcript = self._best_effort_streaming_transcript_hint(
+                transcript = early_transcript_hint or self._best_effort_streaming_transcript_hint(
                     partial_text=partial_cache[0],
                     controller=controller,
                 )
+            transcript = self._maybe_recover_low_evidence_streaming_transcript(
+                stt_provider=stt_provider,
+                capture_result=capture_result,
+                transcript=transcript,
+                saw_interim=bool(getattr(result, "saw_interim", False)),
+                capture_ms=capture_ms,
+            )
+            transcript = self._maybe_verify_streaming_transcript(
+                capture_result=capture_result,
+                transcript=transcript,
+                capture_ms=capture_ms,
+                saw_speech_final=bool(getattr(result, "saw_speech_final", False)),
+                saw_utterance_end=bool(getattr(result, "saw_utterance_end", False)),
+                confidence=getattr(result, "confidence", None),
+            )
             return capture_result, transcript, capture_ms, stt_ms, current_turn_label()
         finally:
             try:
@@ -742,6 +951,8 @@ class TwinrRealtimeHardwareLoop(
         if len(transcript) < min_chars:
             return None
         if getattr(snapshot, "saw_speech_final", False):
+            if not bool(getattr(snapshot, "saw_interim", False)):
+                return None
             return snapshot
         if not (
             self.config.deepgram_streaming_stop_on_utterance_end

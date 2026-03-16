@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent.turn_controller import (
+from twinr.agent.base_agent.conversation.turn_controller import (
     StreamingTurnController,
     ToolCallingTurnDecisionEvaluator,
     TurnEvaluationCandidate,
@@ -139,6 +139,7 @@ class TurnControllerTests(unittest.TestCase):
             conversation_factory=lambda: (),
             emit=lines.append,
         )
+        controller.on_interim("ich bin")
 
         controller.on_endpoint(
             StreamingSpeechEndpointEvent(
@@ -153,6 +154,37 @@ class TurnControllerTests(unittest.TestCase):
         self.assertEqual(provider.calls, [])
         self.assertIn("turn_controller_reason=speech_final_fast_path", lines)
         self.assertIn("turn_controller_label=complete", lines)
+
+    def test_streaming_turn_controller_waits_for_finalize_on_bare_speech_final(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+            turn_controller_fast_endpoint_enabled=True,
+            turn_controller_fast_endpoint_min_chars=6,
+        )
+        provider = FakeTurnToolAgentProvider(config)
+        evaluator = ToolCallingTurnDecisionEvaluator(config=config, provider=provider)
+        lines: list[str] = []
+        controller = StreamingTurnController(
+            config=config,
+            evaluator=evaluator,
+            conversation_factory=lambda: (),
+            emit=lines.append,
+        )
+
+        controller.on_endpoint(
+            StreamingSpeechEndpointEvent(
+                transcript="bitte gut",
+                event_type="speech_final",
+                speech_final=True,
+            )
+        )
+
+        self.assertFalse(controller.should_stop_capture())
+        self.assertEqual(controller.latest_transcript(), "bitte gut")
+        self.assertEqual(provider.calls, [])
+        self.assertIn("turn_controller_reason=speech_final_wait_for_finalize", lines)
 
     def test_streaming_turn_controller_fast_path_stops_on_stable_utterance_end(self) -> None:
         config = TwinrConfig(

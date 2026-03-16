@@ -6,7 +6,7 @@ import json
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent.adaptive_timing import AdaptiveTimingStore
+from twinr.agent.base_agent.conversation.adaptive_timing import AdaptiveTimingStore
 from twinr.config import TwinrConfig
 
 

@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.memory.longterm.eval import run_synthetic_longterm_eval
+from twinr.memory.longterm.evaluation.eval import run_synthetic_longterm_eval
 
 
 class LongTermMemoryEvalTests(unittest.TestCase):

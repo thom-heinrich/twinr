@@ -644,36 +644,28 @@ Twinr should maintain at least these eval families:
 - localized output
 - no quality collapse for German or mixed-language turns
 
-## Proposed module split
+## Package layout
 
-The target system should grow around these modules under `src/twinr/memory/longterm/`.
+The implementation now lives in focused subpackages under `src/twinr/memory/longterm/`.
+The package root now exposes the public package API only; implementation modules live in
+the subpackages below.
 
-- `ingest.py`
-  - intake for turn events and non-conversation evidence
-- `extract.py`
-  - candidate-memory extraction from episodes
-- `normalize.py`
-  - canonical English normalization and schema formatting
-- `propositions.py`
-  - memory atom definitions and extraction results
-- `truth.py`
-  - validity, conflict, provenance, supersession
-- `consolidator.py`
-  - promotion, merging, summarization, demotion
-- `retriever.py`
-  - hybrid retrieval for explicit recall and subtext
-- `subtext.py`
-  - response-shaping cues
-- `planner.py`
-  - proactive surfacing decisions
-- `conflicts.py`
-  - clarification queue and resolution logic
-- `multimodal.py`
-  - non-text evidence adapters
-- `retention.py`
-  - decay, forgetting, summarization, archival
-- `evals/`
-  - benchmark-like suites and goldsets
+- `core/`
+  - shared schemas, envelopes, and ontology helpers
+- `ingestion/`
+  - intake for turn events, propositions, sensors, and multimodal evidence
+- `reasoning/`
+  - truth maintenance, consolidation, conflicts, reflection, and retention logic
+- `retrieval/`
+  - retrieval context and subtext/personalization builders
+- `proactive/`
+  - proactive planning plus persisted proactive state
+- `storage/`
+  - object storage, midterm storage, and remote snapshot boundaries
+- `runtime/`
+  - top-level long-term service orchestration and bounded background workers
+- `evaluation/`
+  - synthetic, multimodal, and subtext evaluation harnesses
 
 ## Canonical data envelope
 

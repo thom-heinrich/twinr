@@ -248,12 +248,12 @@ Use the existing repo layout and extend it conservatively.
 ### Refactor
 
 - move the remaining tool handler execution out of `src/twinr/agent/workflows/realtime_runner.py`
-- keep `src/twinr/agent/tools/registry.py` as the canonical tool registry
-- add an executor under `src/twinr/agent/tools/` that is reusable from non-Realtime paths
+- keep `src/twinr/agent/tools/runtime/registry.py` as the canonical tool registry
+- add an executor under `src/twinr/agent/tools/runtime/` that is reusable from non-Realtime paths
 
 Recommended new agent-side pieces:
 
-- `src/twinr/agent/tools/executor.py`
+- `src/twinr/agent/tools/runtime/executor.py`
 - `src/twinr/agent/tools/handlers/`
   - `memory.py`
   - `printing.py`

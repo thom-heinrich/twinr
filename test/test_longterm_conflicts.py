@@ -10,15 +10,15 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
-from twinr.memory.longterm.conflicts import LongTermConflictResolver
-from twinr.memory.longterm.models import (
+from twinr.memory.longterm.reasoning.conflicts import LongTermConflictResolver
+from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,
     LongTermSourceRefV1,
 )
-from twinr.memory.longterm.service import LongTermMemoryService
-from twinr.memory.longterm.store import LongTermStructuredStore
+from twinr.memory.longterm.runtime.service import LongTermMemoryService
+from twinr.memory.longterm.storage.store import LongTermStructuredStore
 
 
 def _config(root: str) -> TwinrConfig:

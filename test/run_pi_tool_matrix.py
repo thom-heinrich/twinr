@@ -23,7 +23,7 @@ from twinr.agent.tools import (
     realtime_tool_names,
 )
 from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
-from twinr.memory.longterm.models import (
+from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,

@@ -401,10 +401,10 @@ That is enough for a strong, calm, senior-friendly device if the fusion stays co
 
 Internal code paths:
 
-- `src/twinr/proactive/engine.py`
-- `src/twinr/proactive/observers.py`
-- `src/twinr/proactive/presence.py`
-- `src/twinr/proactive/service.py`
+- `src/twinr/proactive/social/engine.py`
+- `src/twinr/proactive/social/observers.py`
+- `src/twinr/proactive/runtime/presence.py`
+- `src/twinr/proactive/runtime/service.py`
 - `src/twinr/hardware/audio.py`
 - `src/twinr/hardware/pir.py`
 

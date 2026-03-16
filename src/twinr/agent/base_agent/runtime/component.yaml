@@ -1,0 +1,79 @@
+schema_version: 1
+name: runtime
+path: src/twinr/agent/base_agent/runtime
+kind: python-package
+visibility: internal
+summary: Compose TwinrRuntime from focused mixins for lifecycle, flow, context, memory, automations, and snapshot durability.
+owned_concerns:
+  - Assemble the canonical TwinrRuntime surface from focused runtime mixins
+  - Bootstrap and shut down runtime-owned stores and background-capable services
+  - Drive state-machine transitions for listening, answering, printing, and failures
+  - Assemble provider-facing conversation context, adaptive timing, and voice guidance
+  - Mediate on-device memory, durable memory, reminders, automations, and runtime snapshot persistence
+out_of_scope:
+  - Workflow loops and hardware/audio orchestration in src/twinr/agent/workflows
+  - Provider transport adapters or instruction authoring
+  - Underlying reminder, automation, graph-memory, or snapshot store implementations
+  - State-machine definitions outside the runtime-facing API
+files:
+  - path: __init__.py
+    role: Lazy package export for TwinrRuntime
+    exports:
+      - TwinrRuntime
+  - path: runtime.py
+    role: Assembly-only TwinrRuntime composition
+    exports:
+      - TwinrRuntime
+  - path: base.py
+    role: Lifecycle bootstrap, shared runtime wiring, and shutdown coordination
+    exports:
+      - TwinrRuntimeBase
+  - path: flow.py
+    role: State transitions, transcript flow, and print lifecycle
+    exports:
+      - TwinrRuntimeFlowMixin
+  - path: context.py
+    role: Provider context, adaptive timing, voice state, and live config
+    exports:
+      - TwinrRuntimeContextMixin
+  - path: memory.py
+    role: Structured memory and durable-memory mutation helpers
+    exports:
+      - TwinrRuntimeMemoryMixin
+  - path: automation.py
+    role: Reminder and automation mutation/query helpers
+    exports:
+      - TwinrRuntimeAutomationMixin
+  - path: snapshot.py
+    role: Canonical runtime snapshot save and restore
+    exports:
+      - TwinrRuntimeSnapshotMixin
+compatibility_reexports:
+  - path: src/twinr/agent/base_agent/__init__.py
+    names:
+      - TwinrRuntime
+  - path: src/twinr/agent/__init__.py
+    names:
+      - TwinrRuntime
+  - path: src/twinr/__init__.py
+    names:
+      - TwinrRuntime
+  - path: src/twinr/runtime.py
+    mode: star
+primary_callers:
+  - path: src/twinr/__main__.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+  - path: src/twinr/agent/workflows/realtime_runner_background.py
+  - path: src/twinr/proactive/runtime/service.py
+  - path: src/twinr/memory/longterm/evaluation/subtext_eval.py
+tests:
+  - path: test/test_runtime_context.py
+  - path: test/test_state_machine.py
+  - path: test/test_runner.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_streaming_runner.py
+  - path: test/test_automations.py
+  - path: test/test_reminders.py
+  - path: test/test_proactive_monitor.py

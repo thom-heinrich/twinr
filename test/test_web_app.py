@@ -281,7 +281,7 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Add scheduled automation", response.text)
         self.assertIn("Add sensor automation", response.text)
         self.assertIn("Tell Thom the morning weather in Schwarzenbek.", response.text)
-        self.assertIn("background microphone has been quiet", response.text)
+        self.assertIn("room microphone has been quiet", response.text)
 
     def test_automations_page_shows_configured_integration_family_state(self) -> None:
         client, env_path = self.make_client()
@@ -450,10 +450,13 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Proactive timing", response.text)
         self.assertIn("Proactive sensitivity", response.text)
         self.assertIn("Wakeword mode", response.text)
-        self.assertIn("Wakeword backend", response.text)
+        self.assertIn("Primary wakeword detector", response.text)
+        self.assertIn("Fallback detector", response.text)
+        self.assertIn("STT verifier", response.text)
         self.assertIn("Wakeword phrases", response.text)
         self.assertIn("openWakeWord models", response.text)
-        self.assertIn("Transcribe after detect", response.text)
+        self.assertIn("Calibration profile", response.text)
+        self.assertIn("Recommended profile", response.text)
         self.assertIn("Wake presence grace (s)", response.text)
         self.assertIn("Wake audio ratio", response.text)
         self.assertIn("Wake active chunks", response.text)
@@ -470,7 +473,10 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Optional speaking instructions sent with text-to-speech requests.", response.text)
         self.assertIn("TTS speed", response.text)
         self.assertIn("Realtime speed", response.text)
-        self.assertIn("STT works without a custom model but is slower. openWakeWord runs locally and needs one or more configured wakeword models.", response.text)
+        self.assertIn(
+            "openWakeWord is the professional default for passive listening. STT stays available as an explicit degraded fallback path.",
+            response.text,
+        )
         self.assertIn("After this many quiet seconds without motion, the scene is treated as idle / low-motion.", response.text)
 
     def test_settings_page_renders_current_adaptive_timing_profile(self) -> None:
@@ -489,8 +495,8 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("8.75 s", response.text)
-        self.assertIn("1340 ms", response.text)
-        self.assertIn("990 ms", response.text)
+        self.assertIn("1230 ms", response.text)
+        self.assertIn("470 ms", response.text)
         self.assertIn("1 ok / 1 timeout", response.text)
         self.assertIn("Persistent learned timing profile on disk.", response.text)
 
@@ -648,13 +654,13 @@ class WebAppTests(unittest.TestCase):
         )
         reminder_store = ReminderStore(env_path.parent / "state" / "reminders.json")
         reminder_store.schedule(
-            due_at="2026-03-15T09:00",
+            due_at="2030-03-15T09:00",
             kind="medication",
             summary="An die Tabletten erinnern.",
             details="Nach dem Fruehstueck.",
         )
         delivered = reminder_store.schedule(
-            due_at="2026-03-15T12:00",
+            due_at="2030-03-15T12:00",
             kind="appointment",
             summary="An den Arzttermin erinnern.",
             details="Dr. Meyer in Hamburg.",
@@ -766,7 +772,7 @@ class WebAppTests(unittest.TestCase):
             "/memory",
             data={
                 "_action": "add_reminder",
-                "reminder_due_at": "2026-03-15T12:00",
+                "reminder_due_at": "2030-03-15T12:00",
                 "reminder_kind": "appointment",
                 "reminder_summary": "An den Arzttermin erinnern.",
                 "reminder_details": "Unterlagen mitnehmen.",
@@ -785,7 +791,7 @@ class WebAppTests(unittest.TestCase):
         client, env_path = self.make_client()
         reminder_store = ReminderStore(env_path.parent / "state" / "reminders.json")
         reminder = reminder_store.schedule(
-            due_at="2026-03-15T12:00",
+            due_at="2030-03-15T12:00",
             kind="appointment",
             summary="An den Arzttermin erinnern.",
         )
@@ -807,7 +813,7 @@ class WebAppTests(unittest.TestCase):
         client, env_path = self.make_client()
         reminder_store = ReminderStore(env_path.parent / "state" / "reminders.json")
         reminder = reminder_store.schedule(
-            due_at="2026-03-15T12:00",
+            due_at="2030-03-15T12:00",
             kind="appointment",
             summary="An den Arzttermin erinnern.",
         )

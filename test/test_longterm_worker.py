@@ -8,8 +8,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.memory.longterm.models import LongTermConversationTurn
-from twinr.memory.longterm.worker import AsyncLongTermMemoryWriter
+from twinr.memory.longterm.core.models import LongTermConversationTurn
+from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter
 
 
 class LongTermWorkerTests(unittest.TestCase):

@@ -108,6 +108,12 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_STREAMING_EARLY_TRANSCRIPT_ENABLED=false",
                         "TWINR_STREAMING_EARLY_TRANSCRIPT_MIN_CHARS=18",
                         "TWINR_STREAMING_EARLY_TRANSCRIPT_WAIT_MS=420",
+                        "TWINR_STREAMING_TRANSCRIPT_VERIFIER_ENABLED=false",
+                        "TWINR_STREAMING_TRANSCRIPT_VERIFIER_MODEL=gpt-4o-transcribe",
+                        "TWINR_STREAMING_TRANSCRIPT_VERIFIER_MAX_WORDS=4",
+                        "TWINR_STREAMING_TRANSCRIPT_VERIFIER_MAX_CHARS=20",
+                        "TWINR_STREAMING_TRANSCRIPT_VERIFIER_MIN_CONFIDENCE=0.88",
+                        "TWINR_STREAMING_TRANSCRIPT_VERIFIER_MAX_CAPTURE_MS=4200",
                         "TWINR_CONVERSATION_FOLLOW_UP_ENABLED=true",
                         "TWINR_CONVERSATION_FOLLOW_UP_AFTER_PROACTIVE_ENABLED=true",
                         "TWINR_CONVERSATION_CLOSURE_GUARD_ENABLED=false",
@@ -188,6 +194,10 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_PROACTIVE_VISION_REVIEW_MIN_SPACING_S=1.7",
                         "TWINR_WAKEWORD_ENABLED=true",
                         "TWINR_WAKEWORD_BACKEND=openwakeword",
+                        "TWINR_WAKEWORD_PRIMARY_BACKEND=openwakeword",
+                        "TWINR_WAKEWORD_FALLBACK_BACKEND=stt",
+                        "TWINR_WAKEWORD_VERIFIER_MODE=ambiguity_only",
+                        "TWINR_WAKEWORD_VERIFIER_MARGIN=0.11",
                         "TWINR_WAKEWORD_PHRASES=hey twinr, hey twinna, twinr, twinner",
                         "TWINR_WAKEWORD_SAMPLE_MS=1700",
                         "TWINR_WAKEWORD_PRESENCE_GRACE_S=600",
@@ -206,6 +216,8 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_WAKEWORD_OPENWAKEWORD_ENABLE_SPEEX=true",
                         "TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT=false",
                         "TWINR_WAKEWORD_OPENWAKEWORD_INFERENCE_FRAMEWORK=onnx",
+                        "TWINR_WAKEWORD_CALIBRATION_PROFILE_PATH=state/custom_wakeword_calibration.json",
+                        "TWINR_WAKEWORD_CALIBRATION_RECOMMENDED_PATH=state/custom_wakeword_calibration.recommended.json",
                         "TWINR_PROACTIVE_PERSON_RETURNED_ABSENCE_S=1400",
                         "TWINR_PROACTIVE_PERSON_RETURNED_RECENT_MOTION_S=45",
                         "TWINR_PROACTIVE_ATTENTION_WINDOW_S=7.5",
@@ -294,6 +306,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_CHONKYDB_API_KEY_HEADER=x-api-key",
                         "TWINR_CHONKYDB_ALLOW_BEARER_AUTH=true",
                         "TWINR_CHONKYDB_TIMEOUT_S=14.5",
+                        "TWINR_CHONKYDB_MAX_RESPONSE_BYTES=25165824",
                         "TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP=true",
                         "TWINR_REMINDER_POLL_INTERVAL_S=2.5",
                         "TWINR_REMINDER_RETRY_DELAY_S=45.0",
@@ -393,6 +406,12 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertFalse(config.streaming_early_transcript_enabled)
         self.assertEqual(config.streaming_early_transcript_min_chars, 18)
         self.assertEqual(config.streaming_early_transcript_wait_ms, 420)
+        self.assertFalse(config.streaming_transcript_verifier_enabled)
+        self.assertEqual(config.streaming_transcript_verifier_model, "gpt-4o-transcribe")
+        self.assertEqual(config.streaming_transcript_verifier_max_words, 4)
+        self.assertEqual(config.streaming_transcript_verifier_max_chars, 20)
+        self.assertEqual(config.streaming_transcript_verifier_min_confidence, 0.88)
+        self.assertEqual(config.streaming_transcript_verifier_max_capture_ms, 4200)
         self.assertTrue(config.conversation_follow_up_enabled)
         self.assertTrue(config.conversation_follow_up_after_proactive_enabled)
         self.assertFalse(config.conversation_closure_guard_enabled)
@@ -473,6 +492,10 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_vision_review_min_spacing_s, 1.7)
         self.assertTrue(config.wakeword_enabled)
         self.assertEqual(config.wakeword_backend, "openwakeword")
+        self.assertEqual(config.wakeword_primary_backend, "openwakeword")
+        self.assertEqual(config.wakeword_fallback_backend, "stt")
+        self.assertEqual(config.wakeword_verifier_mode, "ambiguity_only")
+        self.assertEqual(config.wakeword_verifier_margin, 0.11)
         self.assertEqual(config.wakeword_phrases, ("hey twinr", "hey twinna", "twinr", "twinner"))
         self.assertEqual(config.wakeword_sample_ms, 1700)
         self.assertEqual(config.wakeword_presence_grace_s, 600.0)
@@ -494,6 +517,14 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertTrue(config.wakeword_openwakeword_enable_speex)
         self.assertFalse(config.wakeword_openwakeword_transcribe_on_detect)
         self.assertEqual(config.wakeword_openwakeword_inference_framework, "onnx")
+        self.assertEqual(
+            config.wakeword_calibration_profile_path,
+            "state/custom_wakeword_calibration.json",
+        )
+        self.assertEqual(
+            config.wakeword_calibration_recommended_path,
+            "state/custom_wakeword_calibration.recommended.json",
+        )
         self.assertEqual(config.proactive_person_returned_absence_s, 1400.0)
         self.assertEqual(config.proactive_person_returned_recent_motion_s, 45.0)
         self.assertEqual(config.proactive_attention_window_s, 7.5)
@@ -582,6 +613,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.chonkydb_api_key_header, "x-api-key")
         self.assertTrue(config.chonkydb_allow_bearer_auth)
         self.assertEqual(config.chonkydb_timeout_s, 14.5)
+        self.assertEqual(config.chonkydb_max_response_bytes, 25165824)
         self.assertTrue(config.restore_runtime_state_on_startup)
         self.assertEqual(config.reminder_poll_interval_s, 2.5)
         self.assertEqual(config.reminder_retry_delay_s, 45.0)
@@ -660,6 +692,12 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertTrue(config.streaming_early_transcript_enabled)
         self.assertEqual(config.streaming_early_transcript_min_chars, 10)
         self.assertEqual(config.streaming_early_transcript_wait_ms, 250)
+        self.assertTrue(config.streaming_transcript_verifier_enabled)
+        self.assertEqual(config.streaming_transcript_verifier_model, "gpt-4o-mini-transcribe")
+        self.assertEqual(config.streaming_transcript_verifier_max_words, 6)
+        self.assertEqual(config.streaming_transcript_verifier_max_chars, 32)
+        self.assertEqual(config.streaming_transcript_verifier_min_confidence, 0.92)
+        self.assertEqual(config.streaming_transcript_verifier_max_capture_ms, 6500)
         self.assertTrue(config.conversation_closure_guard_enabled)
         self.assertEqual(config.conversation_closure_context_turns, 4)
         self.assertEqual(config.conversation_closure_instructions_file, "CONVERSATION_CLOSURE.md")
@@ -752,6 +790,25 @@ class TwinrConfigTests(unittest.TestCase):
             config = TwinrConfig.from_env(env_path)
 
         self.assertEqual(config.wakeword_openwakeword_threshold, 0.001)
+
+    def test_wakeword_transcribe_on_detect_legacy_flag_maps_to_verifier_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_WAKEWORD_ENABLED=true",
+                        "TWINR_WAKEWORD_BACKEND=openwakeword",
+                        "TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT=true",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.wakeword_primary_backend, "openwakeword")
+        self.assertEqual(config.wakeword_verifier_mode, "always")
 
     def test_from_env_defaults_long_term_memory_path_to_project_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

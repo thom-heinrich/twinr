@@ -1,0 +1,54 @@
+name: prompting
+path: src/twinr/agent/base_agent/prompting
+kind: python-package
+summary: Assemble hidden base-agent context and loop-specific instruction strings.
+responsibilities:
+  - Load ordered static sections from personality files.
+  - Merge runtime memory, reminder, and automation context for the appropriate loop.
+  - Provide shared instruction loaders and instruction-merging helpers.
+out_of_scope:
+  - Provider-specific prompt copy or phrasing.
+  - Storage implementations for memory, reminders, automations, or remote snapshots.
+  - Conversation policy beyond selecting an instruction bundle.
+files:
+  - path: __init__.py
+    role: Package marker with package-level summary only.
+  - path: personality.py
+    role: Canonical context loading and instruction assembly.
+public_api:
+  module: twinr.agent.base_agent.prompting.personality
+  callables:
+    - PersonalityContext
+    - load_tool_loop_personality_context
+    - load_supervisor_loop_personality_context
+    - load_personality_context
+    - load_personality_instructions
+    - load_tool_loop_instructions
+    - load_supervisor_loop_instructions
+    - load_named_instruction_file
+    - load_turn_controller_instructions
+    - load_conversation_closure_instructions
+    - merge_instructions
+compatibility_reexports:
+  - path: src/twinr/agent/base_agent/__init__.py
+    names:
+      - load_personality_instructions
+      - merge_instructions
+  - path: src/twinr/agent/base_agent/personality.py
+    mode: star
+  - path: src/twinr/personality.py
+    mode: star
+primary_callers:
+  - path: src/twinr/providers/openai/base.py
+  - path: src/twinr/providers/openai/realtime.py
+  - path: src/twinr/providers/openai/adapters.py
+  - path: src/twinr/providers/openai/phrasing.py
+  - path: src/twinr/providers/groq/adapters.py
+  - path: src/twinr/agent/base_agent/conversation/turn_controller.py
+  - path: src/twinr/agent/base_agent/conversation/closure.py
+  - path: src/twinr/agent/tools/prompting/instructions.py
+  - path: src/twinr/agent/tools/runtime/dual_lane_loop.py
+  - path: src/twinr/orchestrator/session.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+tests:
+  - path: test/test_personality.py

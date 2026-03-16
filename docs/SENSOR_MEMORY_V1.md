@@ -236,8 +236,8 @@ Pragmatic V1 approach:
 Recommended extension points:
 
 - `src/twinr/memory/longterm/planner.py`
-- `src/twinr/proactive/service.py`
-- `src/twinr/proactive/governor.py`
+- `src/twinr/proactive/runtime/service.py`
+- `src/twinr/proactive/governance/governor.py`
 
 Planner should emit candidates such as:
 

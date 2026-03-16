@@ -1,8 +1,10 @@
 from __future__ import annotations
+##REFACTOR: 2026-03-16##
 
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 import re
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.ops.usage import TokenUsage, extract_model_name, extract_token_usage
 
@@ -29,6 +31,43 @@ _YESTERDAY_PATTERNS = (
     re.compile(r"\bgestern\b", re.IGNORECASE),
     re.compile(r"\byesterday\b", re.IGNORECASE),
 )
+_NEXT_WEEKDAY_EN_RE = re.compile(
+    r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+_NEXT_WEEKDAY_DE_RE = re.compile(
+    r"\bn(?:ä|ae)chst(?:e|en|er|es)?\s+"
+    r"(montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonntag)\b",
+    re.IGNORECASE,
+)
+_ENGLISH_RELATIVE_PATTERNS = frozenset(
+    {
+        _TODAY_PATTERNS[1],
+        _TOMORROW_PATTERNS[1],
+        _DAY_AFTER_TOMORROW_PATTERNS[2],
+        _YESTERDAY_PATTERNS[1],
+    }
+)
+_WEEKDAY_INDEX_BY_NAME = {
+    "monday": 0,
+    "montag": 0,
+    "tuesday": 1,
+    "dienstag": 1,
+    "wednesday": 2,
+    "mittwoch": 2,
+    "thursday": 3,
+    "donnerstag": 3,
+    "friday": 4,
+    "freitag": 4,
+    "saturday": 5,
+    "samstag": 5,
+    "sunday": 6,
+    "sonntag": 6,
+}
+_VALID_SEARCH_CONTEXT_SIZES = frozenset({"low", "medium", "high"})
+_DEFAULT_SEARCH_MAX_OUTPUT_TOKENS = 512
+_DEFAULT_SEARCH_RETRY_MAX_OUTPUT_TOKENS = 768
+_FALLBACK_SEARCH_MODEL = "gpt-5"
 
 
 def _collapse_whitespace(value: str | None) -> str:
@@ -44,17 +83,44 @@ def _coerce_int(value: Any) -> int | None:
         return None
 
 
-def _resolved_explicit_search_query(question: str, date_context: str | None) -> str | None:
-    normalized_question = _collapse_whitespace(question)
+def _coerce_positive_int(value: Any, *, default: int, minimum: int = 1) -> int:
+    coerced = _coerce_int(value)
+    if coerced is None:
+        return default
+    return max(minimum, coerced)
+
+
+def _normalize_search_context_size(value: Any) -> str | None:
+    normalized = _collapse_whitespace(None if value is None else str(value)).lower()
+    if normalized in _VALID_SEARCH_CONTEXT_SIZES:
+        return normalized
+    return None
+
+
+def _parse_context_reference_date(date_context: str | None) -> date | None:
     normalized_context = _collapse_whitespace(date_context)
-    if not normalized_question or not normalized_context:
+    if not normalized_context:
         return None
     match = _DATE_CONTEXT_ISO_RE.search(normalized_context)
     if match is None:
         return None
-    resolved_date = match.group(1)
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
 
-    replacement = None
+
+def _contains_explicit_iso_date(value: str) -> bool:
+    return _DATE_CONTEXT_ISO_RE.search(value) is not None
+
+
+def _date_phrase_for_pattern(pattern: re.Pattern[str], resolved_date: str) -> str:
+    if pattern in _ENGLISH_RELATIVE_PATTERNS:
+        return f"on {resolved_date}"
+    return f"am {resolved_date}"
+
+
+def _replace_relative_day_reference(question: str, resolved_date: str) -> str | None:
     for patterns in (
         _DAY_AFTER_TOMORROW_PATTERNS,
         _TOMORROW_PATTERNS,
@@ -62,16 +128,50 @@ def _resolved_explicit_search_query(question: str, date_context: str | None) -> 
         _YESTERDAY_PATTERNS,
     ):
         for pattern in patterns:
-            if pattern.search(normalized_question):
-                replacement = pattern.sub(f"am {resolved_date}", normalized_question, count=1)
-                break
-        if replacement is not None:
-            break
-    if replacement is not None and replacement != normalized_question:
-        return replacement
-    if resolved_date in normalized_question:
+            if pattern.search(question):
+                return pattern.sub(_date_phrase_for_pattern(pattern, resolved_date), question, count=1)
+    return None
+
+
+def _replace_next_weekday_reference(question: str, reference_date: date) -> str | None:
+    for pattern, is_english in ((_NEXT_WEEKDAY_EN_RE, True), (_NEXT_WEEKDAY_DE_RE, False)):
+        match = pattern.search(question)
+        if match is None:
+            continue
+        weekday_name = match.group(1).strip().lower()
+        target_weekday = _WEEKDAY_INDEX_BY_NAME.get(weekday_name)
+        if target_weekday is None:
+            continue
+        delta_days = (target_weekday - reference_date.weekday()) % 7
+        if delta_days == 0:
+            delta_days = 7
+        resolved_date = (reference_date + timedelta(days=delta_days)).isoformat()
+        replacement = f"on {resolved_date}" if is_english else f"am {resolved_date}"
+        return pattern.sub(replacement, question, count=1)
+    return None
+
+
+def _resolved_explicit_search_query(question: str, date_context: str | None) -> str | None:
+    normalized_question = _collapse_whitespace(question)
+    if not normalized_question:
+        return None
+    if _contains_explicit_iso_date(normalized_question):
+        # AUDIT-FIX(#2): Do not append a second target date to a question that already names an ISO date.
         return normalized_question
-    return f"{normalized_question} (target date {resolved_date})"
+    reference_date = _parse_context_reference_date(date_context)
+    if reference_date is None:
+        return None
+
+    # AUDIT-FIX(#2): Resolve weekday-relative queries like "next Monday" into a concrete ISO date.
+    replaced_weekday = _replace_next_weekday_reference(normalized_question, reference_date)
+    if replaced_weekday is not None and replaced_weekday != normalized_question:
+        return replaced_weekday
+
+    # AUDIT-FIX(#2): Only synthesize an explicit-date retrieval query when the user actually used a relative date phrase.
+    replaced_relative_day = _replace_relative_day_reference(normalized_question, reference_date.isoformat())
+    if replaced_relative_day is not None and replaced_relative_day != normalized_question:
+        return replaced_relative_day
+    return None
 
 
 class OpenAISearchMixin:
@@ -83,7 +183,7 @@ class OpenAISearchMixin:
         location_hint: str | None = None,
         date_context: str | None = None,
     ) -> OpenAISearchResult:
-        normalized_question = question.strip()
+        normalized_question = _collapse_whitespace(question)
         if not normalized_question:
             raise RuntimeError("search_live_info requires a non-empty question")
         prompt = self._build_search_prompt(
@@ -93,36 +193,52 @@ class OpenAISearchMixin:
         )
         instructions = SEARCH_AGENT_INSTRUCTIONS
         search_conversation = self._prepare_search_conversation(conversation)
-        best_result: OpenAISearchResult | None = None
+        last_error: Exception | None = None
+        output_token_candidates = self._search_output_token_candidates()
 
         for model in self._candidate_search_models():
-            if self._is_search_preview_model(model) and self._search_preview_supported():
-                candidate = self._search_with_preview_model(
-                    model,
-                    prompt,
-                    conversation=search_conversation,
-                    instructions=instructions,
-                )
-                if candidate.answer:
-                    return candidate
-            for max_output_tokens in (
-                max(64, int(self.config.openai_search_max_output_tokens)),
-                max(96, int(self.config.openai_search_retry_max_output_tokens)),
-            ):
-                request = self._build_response_request(
-                    prompt,
-                    conversation=search_conversation,
-                    instructions=instructions,
-                    allow_web_search=True,
-                    model=model,
-                    reasoning_effort="low",
-                    max_output_tokens=max_output_tokens,
-                    prompt_cache_scope="search",
-                )
-                if request.get("tools"):
-                    request["tools"][0]["search_context_size"] = self.config.openai_web_search_context_size
-                request["include"] = ["web_search_call.action.sources"]
-                response = self._client.responses.create(**request)
+            if self._is_search_preview_model(model):
+                if not self._search_preview_supported():
+                    continue
+                for max_output_tokens in output_token_candidates:
+                    try:
+                        # AUDIT-FIX(#3): Keep per-model fallback alive if a preview request fails transiently.
+                        candidate, is_complete = self._search_with_preview_model(
+                            model,
+                            prompt,
+                            conversation=search_conversation,
+                            instructions=instructions,
+                            location_hint=location_hint,
+                            max_output_tokens=max_output_tokens,
+                        )
+                    except Exception as exc:  # pragma: no cover - defensive runtime fallback
+                        last_error = exc
+                        continue
+                    if candidate.answer and is_complete:
+                        return candidate
+                continue
+
+            for max_output_tokens in output_token_candidates:
+                try:
+                    request = self._build_response_request(
+                        prompt,
+                        conversation=search_conversation,
+                        instructions=instructions,
+                        allow_web_search=True,
+                        model=model,
+                        reasoning_effort="low",
+                        max_output_tokens=max_output_tokens,
+                        prompt_cache_scope="search",
+                    )
+                    # AUDIT-FIX(#6): Patch the actual web-search tool only, validate search_context_size, and preserve other include fields.
+                    self._apply_web_search_request_overrides(request, location_hint=location_hint)
+                    self._ensure_web_search_sources_included(request)
+                    # AUDIT-FIX(#3): Keep trying remaining models/attempts on transient Responses API failures.
+                    response = self._client.responses.create(**request)
+                except Exception as exc:  # pragma: no cover - defensive runtime fallback
+                    last_error = exc
+                    continue
+
                 candidate = OpenAISearchResult(
                     answer=self._sanitize_search_answer(self._extract_output_text(response)),
                     sources=self._extract_web_search_sources(response),
@@ -132,13 +248,13 @@ class OpenAISearchMixin:
                     token_usage=extract_token_usage(response),
                     used_web_search=self._used_web_search(response),
                 )
-                if candidate.answer and not self._response_has_incomplete_message(response):
+                if candidate.answer and self._response_is_complete(response):
                     return candidate
-                if candidate.answer and (best_result is None or len(candidate.answer) > len(best_result.answer)):
-                    best_result = candidate
 
-        if best_result is not None:
-            return best_result
+        if last_error is not None:
+            raise RuntimeError(
+                f"OpenAI web search failed after exhausting configured models and retries: {last_error}"
+            ) from last_error
         raise RuntimeError("OpenAI web search returned no usable answer text")
 
     def _search_with_preview_model(
@@ -148,7 +264,9 @@ class OpenAISearchMixin:
         *,
         conversation: ConversationLike | None,
         instructions: str,
-    ) -> OpenAISearchResult:
+        location_hint: str | None,
+        max_output_tokens: int,
+    ) -> tuple[OpenAISearchResult, bool]:
         messages: list[dict[str, str]] = []
         if instructions.strip():
             messages.append({"role": "system", "content": instructions.strip()})
@@ -162,14 +280,16 @@ class OpenAISearchMixin:
                 if normalized_content:
                     messages.append({"role": normalized_role, "content": normalized_content})
         messages.append({"role": "user", "content": prompt})
+        # AUDIT-FIX(#8): Provide structured geography/search-context hints to the Chat Completions web-search models.
         response = self._client.chat.completions.create(
             model=model,
-            web_search_options={},
+            web_search_options=self._build_preview_web_search_options(location_hint=location_hint),
+            max_completion_tokens=max_output_tokens,
             messages=messages,
         )
         message = response.choices[0].message if getattr(response, "choices", None) else None
-        answer = _collapse_whitespace(getattr(message, "content", "") or "")
-        return OpenAISearchResult(
+        answer = self._sanitize_search_answer(getattr(message, "content", "") or "")
+        result = OpenAISearchResult(
             answer=answer,
             sources=self._extract_preview_search_sources(message),
             response_id=getattr(response, "id", None),
@@ -178,6 +298,8 @@ class OpenAISearchMixin:
             token_usage=self._extract_preview_usage(response),
             used_web_search=True,
         )
+        # AUDIT-FIX(#7): Reject truncated/filtered preview answers instead of returning potentially partial output.
+        return result, self._preview_response_is_complete(response)
 
     def _build_search_prompt(
         self,
@@ -187,10 +309,13 @@ class OpenAISearchMixin:
         date_context: str | None,
     ) -> str:
         parts = [f"User question: {question}"]
-        resolved_location = (location_hint or self.config.openai_web_search_city or "").strip()
+        resolved_location = (
+            _collapse_whitespace(location_hint)
+            or _collapse_whitespace(getattr(self.config, "openai_web_search_city", None))
+        )
         if resolved_location:
             parts.append(f"Location hint: {resolved_location}")
-        resolved_date_context = (date_context or self._relative_date_context()).strip()
+        resolved_date_context = _collapse_whitespace(date_context) or self._relative_date_context()
         explicit_query = _resolved_explicit_search_query(question, resolved_date_context)
         resolved_date = None
         match = _DATE_CONTEXT_ISO_RE.search(resolved_date_context)
@@ -234,28 +359,42 @@ class OpenAISearchMixin:
         return tuple(deduped)
 
     def _relative_date_context(self) -> str:
-        timezone_name = self.config.openai_web_search_timezone or self.config.local_timezone_name
+        timezone_name = self._configured_timezone_name()
+        effective_label: str
         try:
-            now = datetime.now(datetime.now().astimezone().tzinfo if not timezone_name else __import__("zoneinfo").ZoneInfo(timezone_name))
-        except Exception:
-            now = datetime.now()
-        return now.strftime(f"%A, %Y-%m-%d %H:%M ({timezone_name})")
+            if timezone_name:
+                # AUDIT-FIX(#1): Use a real ZoneInfo object and never emit a misleading configured label after fallback.
+                now = datetime.now(ZoneInfo(timezone_name))
+                effective_label = timezone_name
+            else:
+                now = datetime.now(timezone.utc).astimezone()
+                effective_label = getattr(now.tzinfo, "key", None) or now.tzname() or "local"
+        except ZoneInfoNotFoundError:
+            now = datetime.now(timezone.utc).astimezone()
+            effective_label = getattr(now.tzinfo, "key", None) or now.tzname() or "local"
+        return now.strftime(f"%A, %Y-%m-%d %H:%M ({effective_label})")
 
     def _candidate_search_models(self) -> tuple[str, ...]:
         candidates: list[str] = []
-        configured = (self.config.openai_search_model or "").strip()
+        configured = _collapse_whitespace(getattr(self.config, "openai_search_model", None))
         if configured:
             candidates.append(configured)
         for fallback in SEARCH_MODEL_FALLBACKS:
-            if fallback not in candidates:
-                candidates.append(fallback)
-        default_model = (self.config.default_model or "").strip()
+            normalized_fallback = _collapse_whitespace(fallback)
+            if normalized_fallback and normalized_fallback not in candidates:
+                candidates.append(normalized_fallback)
+        default_model = _collapse_whitespace(getattr(self.config, "default_model", None))
         if default_model and default_model not in candidates:
             candidates.append(default_model)
+        if not candidates:
+            # AUDIT-FIX(#5): Ensure a deterministic last-resort model candidate instead of an empty iteration set.
+            candidates.append(_FALLBACK_SEARCH_MODEL)
         return tuple(candidates)
 
     def _is_search_preview_model(self, model: str) -> bool:
-        return "search-preview" in (model or "").strip().lower()
+        normalized = _collapse_whitespace(model).lower()
+        # AUDIT-FIX(#5): Search-chat model families are not limited to names containing "search-preview".
+        return "search-preview" in normalized or normalized.endswith("-search-api")
 
     def _search_preview_supported(self) -> bool:
         chat = getattr(self._client, "chat", None)
@@ -337,3 +476,121 @@ class OpenAISearchMixin:
         if len(trimmed) > 1 and trimmed[0][0] == "assistant":
             trimmed = trimmed[1:]
         return tuple(trimmed) if trimmed else None
+
+    def _configured_timezone_name(self) -> str | None:
+        timezone_name = _collapse_whitespace(
+            getattr(self.config, "openai_web_search_timezone", None)
+            or getattr(self.config, "local_timezone_name", None)
+        )
+        return timezone_name or None
+
+    def _search_output_token_candidates(self) -> tuple[int, ...]:
+        # AUDIT-FIX(#4): Parse env-backed token limits defensively so invalid config cannot crash the search path.
+        primary = _coerce_positive_int(
+            getattr(self.config, "openai_search_max_output_tokens", None),
+            default=_DEFAULT_SEARCH_MAX_OUTPUT_TOKENS,
+            minimum=64,
+        )
+        retry = _coerce_positive_int(
+            getattr(self.config, "openai_search_retry_max_output_tokens", None),
+            default=_DEFAULT_SEARCH_RETRY_MAX_OUTPUT_TOKENS,
+            minimum=96,
+        )
+        if primary == retry:
+            return (primary,)
+        return (primary, retry)
+
+    def _response_is_complete(self, response: Any) -> bool:
+        status = _collapse_whitespace(getattr(response, "status", None)).lower()
+        if status and status != "completed":
+            return False
+        return not self._response_has_incomplete_message(response)
+
+    def _preview_response_is_complete(self, response: Any) -> bool:
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return False
+        finish_reason = _collapse_whitespace(getattr(choices[0], "finish_reason", None)).lower()
+        return finish_reason in {"", "stop"}
+
+    def _apply_web_search_request_overrides(self, request: dict[str, Any], *, location_hint: str | None) -> None:
+        tools = request.get("tools")
+        if not isinstance(tools, list):
+            return
+        search_context_size = _normalize_search_context_size(
+            getattr(self.config, "openai_web_search_context_size", None)
+        )
+        # AUDIT-FIX(#8): Use structured user_location on Responses web_search instead of relying on prompt prose alone.
+        user_location = self._build_responses_web_search_user_location(location_hint=location_hint)
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_type = _collapse_whitespace(tool.get("type")).lower()
+            if tool_type not in {"web_search", "web_search_preview"}:
+                continue
+            if search_context_size is not None:
+                tool["search_context_size"] = search_context_size
+            if user_location is not None and tool_type == "web_search":
+                tool["user_location"] = user_location
+            break
+
+    def _ensure_web_search_sources_included(self, request: dict[str, Any]) -> None:
+        include = request.get("include")
+        if include is None:
+            request["include"] = ["web_search_call.action.sources"]
+            return
+        if not isinstance(include, list):
+            request["include"] = [include, "web_search_call.action.sources"]
+            return
+        if "web_search_call.action.sources" not in include:
+            include.append("web_search_call.action.sources")
+
+    def _build_responses_web_search_user_location(self, *, location_hint: str | None) -> dict[str, str] | None:
+        city = _collapse_whitespace(location_hint) or _collapse_whitespace(
+            getattr(self.config, "openai_web_search_city", None)
+        )
+        region = _collapse_whitespace(getattr(self.config, "openai_web_search_region", None))
+        country = _collapse_whitespace(getattr(self.config, "openai_web_search_country", None)).upper()
+        timezone_name = self._configured_timezone_name()
+
+        payload: dict[str, str] = {"type": "approximate"}
+        if city:
+            payload["city"] = city
+        if region:
+            payload["region"] = region
+        if len(country) == 2 and country.isalpha():
+            payload["country"] = country
+        if timezone_name:
+            payload["timezone"] = timezone_name
+        return payload if len(payload) > 1 else None
+
+    def _build_preview_web_search_options(self, *, location_hint: str | None) -> dict[str, Any]:
+        options: dict[str, Any] = {}
+        search_context_size = _normalize_search_context_size(
+            getattr(self.config, "openai_web_search_context_size", None)
+        )
+        if search_context_size is not None:
+            options["search_context_size"] = search_context_size
+
+        city = _collapse_whitespace(location_hint) or _collapse_whitespace(
+            getattr(self.config, "openai_web_search_city", None)
+        )
+        region = _collapse_whitespace(getattr(self.config, "openai_web_search_region", None))
+        country = _collapse_whitespace(getattr(self.config, "openai_web_search_country", None)).upper()
+        timezone_name = self._configured_timezone_name()
+
+        approximate: dict[str, str] = {}
+        if city:
+            approximate["city"] = city
+        if region:
+            approximate["region"] = region
+        if len(country) == 2 and country.isalpha():
+            approximate["country"] = country
+        if timezone_name:
+            approximate["timezone"] = timezone_name
+        if approximate:
+            options["user_location"] = {
+                "type": "approximate",
+                "approximate": approximate,
+            }
+        return options

@@ -14,7 +14,7 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.text_utils import collapse_whitespace, slugify_identifier
 
 if TYPE_CHECKING:
-    from twinr.memory.longterm.remote_state import LongTermRemoteStateStore
+    from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -582,7 +582,7 @@ class PersistentMemoryMarkdownStore:
         *,
         remote_state: "LongTermRemoteStateStore | None" = None,
     ) -> "PersistentMemoryMarkdownStore":
-        from twinr.memory.longterm.remote_state import LongTermRemoteStateStore
+        from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
         if remote_state is None:
             remote_state = LongTermRemoteStateStore.from_config(config)
@@ -873,7 +873,7 @@ class PromptContextStore:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "PromptContextStore":
-        from twinr.memory.longterm.remote_state import LongTermRemoteStateStore
+        from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
         # AUDIT-FIX(#1): Resolve the personality directory under project_root so .env paths cannot escape the project tree.
         personality_dir = _resolve_storage_path(

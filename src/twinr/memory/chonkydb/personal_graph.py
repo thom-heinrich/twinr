@@ -21,8 +21,8 @@ from twinr.memory.chonkydb.schema import (
     TwinrGraphEdgeV1,
     TwinrGraphNodeV1,
 )
-from twinr.memory.longterm.models import LongTermGraphEdgeCandidateV1
-from twinr.memory.longterm.remote_state import LongTermRemoteStateStore
+from twinr.memory.longterm.core.models import LongTermGraphEdgeCandidateV1
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 from twinr.temporal import parse_local_date_text
 from twinr.text_utils import collapse_whitespace, is_valid_stable_identifier, retrieval_terms, slugify_identifier
 

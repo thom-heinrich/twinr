@@ -256,7 +256,7 @@ class ChonkyDBClientTests(unittest.TestCase):
         self.assertEqual(error.status_code, 400)
         self.assertEqual(error.response_json, {"type": "validation_error", "detail": "bad request"})
 
-    def test_fetch_full_document_accepts_large_snapshot_payload_within_8_mib_limit(self) -> None:
+    def test_fetch_full_document_accepts_large_snapshot_payload_within_configured_response_limit(self) -> None:
         opener = FakeOpener()
         opener.queue_json({"success": True, "content": "x" * (5 * 1024 * 1024)})
         client = ChonkyDBClient(
@@ -268,6 +268,22 @@ class ChonkyDBClientTests(unittest.TestCase):
 
         self.assertTrue(payload["success"])
         self.assertEqual(len(payload["content"]), 5 * 1024 * 1024)
+
+    def test_fetch_full_document_accepts_payload_above_8_mib_with_higher_response_limit(self) -> None:
+        opener = FakeOpener()
+        opener.queue_json({"success": True, "content": "x" * (9 * 1024 * 1024)})
+        client = ChonkyDBClient(
+            ChonkyDBConnectionConfig(
+                base_url="https://memory.test",
+                max_response_bytes=16 * 1024 * 1024,
+            ),
+            opener=opener,
+        )
+
+        payload = client.fetch_full_document(document_id="doc-8")
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(len(payload["content"]), 9 * 1024 * 1024)
 
     def test_fetch_full_document_requires_identifier(self) -> None:
         client = ChonkyDBClient(ChonkyDBConnectionConfig(base_url="https://memory.test"), opener=FakeOpener())
@@ -286,10 +302,12 @@ class ChonkyDBClientTests(unittest.TestCase):
             chonkydb_api_key_header="x-api-key",
             chonkydb_allow_bearer_auth=False,
             chonkydb_timeout_s=12.5,
+            chonkydb_max_response_bytes=24 * 1024 * 1024,
         )
 
         client = ChonkyDBClient.from_twinr_config(config, opener=FakeOpener())
 
         self.assertEqual(client.config.base_url, "https://memory.test")
         self.assertEqual(client.config.timeout_s, 12.5)
+        self.assertEqual(client.config.max_response_bytes, 24 * 1024 * 1024)
         self.assertEqual(chonkydb_data_path(config), Path("/tmp/project/state/chonkydb"))

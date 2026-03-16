@@ -10,8 +10,8 @@ from threading import Event, RLock, Thread, current_thread
 from typing import Callable
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.conversation_closure import ToolCallingConversationClosureEvaluator
-from twinr.agent.base_agent.turn_controller import ToolCallingTurnDecisionEvaluator
+from twinr.agent.base_agent.conversation.closure import ToolCallingConversationClosureEvaluator
+from twinr.agent.base_agent.conversation.turn_controller import ToolCallingTurnDecisionEvaluator
 from twinr.agent.workflows.working_feedback import WorkingFeedbackKind, start_working_feedback_loop
 from twinr.providers.openai import OpenAIImageInput
 

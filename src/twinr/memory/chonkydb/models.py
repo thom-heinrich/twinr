@@ -349,6 +349,7 @@ class ChonkyDBConnectionConfig:
     api_key_header: str = "x-api-key"
     allow_bearer_auth: bool = False
     timeout_s: float = 20.0
+    max_response_bytes: int = 32 * 1024 * 1024
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", _normalize_base_url(self.base_url))  # AUDIT-FIX(#2)
@@ -356,6 +357,7 @@ class ChonkyDBConnectionConfig:
         object.__setattr__(self, "api_key_header", _normalize_header_name(self.api_key_header))  # AUDIT-FIX(#2)
         object.__setattr__(self, "allow_bearer_auth", _coerce_bool(self.allow_bearer_auth, field_name="allow_bearer_auth"))  # AUDIT-FIX(#4)
         object.__setattr__(self, "timeout_s", _coerce_float(self.timeout_s, field_name="timeout_s", minimum=0.0, allow_zero=False))  # AUDIT-FIX(#3)
+        object.__setattr__(self, "max_response_bytes", _coerce_int(self.max_response_bytes, field_name="max_response_bytes", minimum=1024))  # AUDIT-FIX(#3)
 
 
 @dataclass(frozen=True, slots=True)

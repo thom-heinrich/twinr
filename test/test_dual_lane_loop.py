@@ -6,7 +6,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.contracts import AgentToolCall, ToolCallingTurnResponse
-from twinr.agent.tools.dual_lane_loop import DualLaneToolLoop, SpeechLaneDelta
+from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop, SpeechLaneDelta
 
 
 class FakeSupervisorProvider:

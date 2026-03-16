@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Lock, Thread
 import time
@@ -12,9 +13,9 @@ from twinr.agent.base_agent.contracts import (
     ToolCallingAgentProvider,
     StreamingSpeechToTextProvider,
 )
-from twinr.agent.base_agent.personality import load_supervisor_loop_instructions
-from twinr.agent.base_agent.turn_controller import _normalize_turn_text
-from twinr.agent.base_agent.turn_controller import ToolCallingTurnDecisionEvaluator
+from twinr.agent.base_agent.prompting.personality import load_supervisor_loop_instructions
+from twinr.agent.base_agent.conversation.turn_controller import _normalize_turn_text
+from twinr.agent.base_agent.conversation.turn_controller import ToolCallingTurnDecisionEvaluator
 from twinr.agent.tools import (
     DualLaneToolLoop,
     SpeechLaneDelta,
@@ -37,6 +38,7 @@ from twinr.providers.factory import build_streaming_provider_bundle
 from twinr.providers.openai import (
     OpenAIBackend,
     OpenAIFirstWordProvider,
+    OpenAIProviderBundle,
     OpenAISupervisorDecisionProvider,
     OpenAIToolCallingAgentProvider,
 )
@@ -54,8 +56,10 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         *,
         tool_agent_provider: ToolCallingAgentProvider | None = None,
         streaming_turn_loop: ToolCallingStreamingLoop | None = None,
+        verification_stt_provider=None,
         **kwargs,
     ) -> None:
+        verifier_provider = verification_stt_provider
         if (
             tool_agent_provider is None
             and kwargs.get("print_backend") is None
@@ -71,6 +75,17 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             kwargs.setdefault("agent_provider", provider_bundle.agent)
             kwargs.setdefault("tts_provider", provider_bundle.tts)
             tool_agent_provider = provider_bundle.tool_agent
+            if (
+                verifier_provider is None
+                and self._should_enable_streaming_transcript_verifier(config, kwargs.get("stt_provider"))
+            ):
+                verifier_backend = OpenAIBackend(
+                    config=replace(
+                        config,
+                        openai_stt_model=config.streaming_transcript_verifier_model,
+                    )
+                )
+                verifier_provider = OpenAIProviderBundle.from_backend(verifier_backend).stt
         if kwargs.get("recorder") is None and (config.stt_provider or "").strip().lower() == "deepgram":
             kwargs["recorder"] = SilenceDetectedRecorder(
                 device=config.audio_input_device,
@@ -103,6 +118,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 else None
             ),
             turn_tool_agent_provider=resolved_tool_agent,
+            verification_stt_provider=verifier_provider,
             **kwargs,
         )
         self.tool_agent_provider = resolved_tool_agent
@@ -136,6 +152,16 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         self._first_word_cache_prewarmed = False
         self._prime_supervisor_decision_cache()
         self._prime_first_word_cache()
+
+    @staticmethod
+    def _should_enable_streaming_transcript_verifier(config: TwinrConfig, stt_provider) -> bool:
+        if not bool(getattr(config, "streaming_transcript_verifier_enabled", True)):
+            return False
+        if not (config.openai_api_key or "").strip():
+            return False
+        if (config.stt_provider or "").strip().lower() != "deepgram":
+            return False
+        return isinstance(stt_provider, StreamingSpeechToTextProvider)
 
     def _build_streaming_turn_loop(
         self,
@@ -606,6 +632,8 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         turn_instructions: str | None,
     ):
         prefetched_decision = self._consume_speculative_supervisor_decision(transcript)
+        search_context = self.runtime.search_provider_conversation_context()
+        supervisor_context = self.runtime.supervisor_provider_conversation_context()
         if prefetched_decision is not None and getattr(prefetched_decision, "action", None) == "handoff":
             fast_result = self._consume_speculative_handoff_result(
                 transcript,
@@ -623,8 +651,8 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 return response
             return self.streaming_turn_loop.run_handoff_only(
                 transcript,
-                conversation=self.runtime.tool_provider_conversation_context(),
-                specialist_conversation=self.runtime.tool_provider_conversation_context(),
+                conversation=search_context,
+                specialist_conversation=search_context,
                 handoff=prefetched_decision,
                 instructions=turn_instructions,
                 allow_web_search=False,
@@ -632,10 +660,44 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 on_lane_text_delta=None,
                 emit_filler=False,
             )
+        if (
+            isinstance(self.streaming_turn_loop, DualLaneToolLoop)
+            and getattr(self.streaming_turn_loop, "supervisor_decision_provider", None) is not None
+        ):
+            resolved_decision = prefetched_decision or self.streaming_turn_loop.resolve_supervisor_decision(
+                transcript,
+                conversation=supervisor_context,
+                instructions=turn_instructions,
+            )
+            if resolved_decision is not None:
+                action = str(getattr(resolved_decision, "action", "") or "").strip().lower()
+                if action == "handoff" and str(getattr(resolved_decision, "kind", "") or "").strip().lower() == "search":
+                    return self.streaming_turn_loop.run_handoff_only(
+                        transcript,
+                        conversation=search_context,
+                        specialist_conversation=search_context,
+                        handoff=resolved_decision,
+                        instructions=turn_instructions,
+                        allow_web_search=False,
+                        on_text_delta=None,
+                        on_lane_text_delta=None,
+                        emit_filler=False,
+                    )
+                if action in {"direct", "end_conversation"}:
+                    return self.streaming_turn_loop.run(
+                        transcript,
+                        conversation=search_context,
+                        supervisor_conversation=supervisor_context,
+                        prefetched_decision=resolved_decision,
+                        instructions=turn_instructions,
+                        allow_web_search=False,
+                        on_text_delta=None,
+                        on_lane_text_delta=None,
+                    )
         return self.streaming_turn_loop.run(
             transcript,
             conversation=self.runtime.tool_provider_conversation_context(),
-            supervisor_conversation=self.runtime.supervisor_provider_conversation_context(),
+            supervisor_conversation=supervisor_context,
             prefetched_decision=prefetched_decision,
             instructions=turn_instructions,
             allow_web_search=False,
@@ -803,7 +865,15 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
     ) -> bool:
         self.runtime.submit_transcript(transcript)
         self._emit_status(force=True)
-        stop_processing_feedback = self._start_working_feedback_loop("processing")
+        stop_processing_feedback: Callable[[], None] = lambda: None
+        processing_feedback_started = False
+
+        def ensure_processing_feedback() -> None:
+            nonlocal stop_processing_feedback, processing_feedback_started
+            if processing_feedback_started:
+                return
+            stop_processing_feedback = self._start_working_feedback_loop("processing")
+            processing_feedback_started = True
 
         first_audio_at: list[float | None] = [None]
         answer_started = False
@@ -891,6 +961,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                             text=first_word_reply.spoken_text,
                             lane="direct" if first_word_reply.mode == "direct" else "filler",
                             replace_current=False,
+                            atomic=True,
                         )
                     )
                     wait_ms = max(0, int(self.config.streaming_first_word_final_lane_wait_ms))
@@ -912,6 +983,8 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                         used_web_search=False,
                     )
                 else:
+                    if first_word_reply is None:
+                        ensure_processing_feedback()
                     if not final_started.is_set():
                         final_worker.start()
 
@@ -933,6 +1006,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                             )
                         )
             else:
+                ensure_processing_feedback()
                 response = self.streaming_turn_loop.run(
                     transcript,
                     conversation=self.runtime.tool_provider_conversation_context(),
@@ -999,7 +1073,18 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         if first_audio_at[0] is not None:
             self.emit(f"timing_first_audio_ms={int((first_audio_at[0] - turn_started) * 1000)}")
         self.emit(f"timing_total_ms={int((time.monotonic() - turn_started) * 1000)}")
-        return not any(call.name == "end_conversation" for call in response.tool_calls)
+        end_conversation = any(call.name == "end_conversation" for call in response.tool_calls)
+        force_close = end_conversation or self._follow_up_vetoed_by_closure(
+            user_transcript=transcript,
+            assistant_response=answer,
+            request_source=listen_source,
+            proactive_trigger=proactive_trigger,
+        )
+        if end_conversation:
+            self.emit("conversation_ended=true")
+        elif force_close:
+            self.emit("conversation_follow_up_vetoed=closure")
+        return not force_close
 
     def _segment_boundary(self, text: str) -> int | None:
         clause_min_chars = max(16, int(self.config.streaming_tts_clause_min_chars))

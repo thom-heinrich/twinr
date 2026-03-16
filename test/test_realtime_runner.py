@@ -22,7 +22,7 @@ from twinr.agent.base_agent.contracts import (
 from twinr.config import TwinrConfig
 from twinr.hardware import VoiceAssessment
 from twinr.hardware.buttons import ButtonAction, ButtonEvent
-from twinr.memory.longterm.models import (
+from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,
@@ -36,7 +36,7 @@ from twinr.providers.openai.realtime import OpenAIRealtimeTurn
 from twinr.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.runtime import TwinrRuntime
 from twinr.state_machine import TwinrStatus
-from twinr.agent.base_agent.conversation_closure import ConversationClosureDecision
+from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
 from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample
 
 

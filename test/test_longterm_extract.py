@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from test.longterm_test_program import make_test_extractor
-from twinr.memory.longterm.extract import _turn_extraction_schema
+from twinr.memory.longterm.ingestion.extract import _turn_extraction_schema
 
 
 class LongTermTurnExtractorTests(unittest.TestCase):

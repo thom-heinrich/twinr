@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
+import threading
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
@@ -10,11 +13,11 @@ from zoneinfo import ZoneInfo
 
 from twinr.agent.tools import build_realtime_tool_schemas
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.language import memory_and_response_contract
-from twinr.agent.base_agent.simple_settings import (
+from twinr.agent.base_agent.conversation.language import memory_and_response_contract
+from twinr.agent.base_agent.settings.simple_settings import (
     adjustable_settings_context,
 )
-from twinr.agent.base_agent.personality import load_personality_instructions, merge_instructions
+from twinr.agent.base_agent.prompting.personality import load_personality_instructions, merge_instructions
 from twinr.ops.usage import TokenUsage, extract_model_name, extract_token_usage
 from twinr.providers.openai.backend import _should_send_project_header
 
@@ -92,9 +95,47 @@ def _default_async_client_factory(config: TwinrConfig) -> Any:
         ) from exc
 
     kwargs: dict[str, Any] = {"api_key": config.openai_api_key}
+    client_timeout_seconds = _coerce_optional_float(
+        getattr(config, "openai_realtime_client_timeout_seconds", None),
+        default=30.0,
+        minimum=0.1,
+    )
+    if client_timeout_seconds is not None:
+        kwargs["timeout"] = client_timeout_seconds
+    client_max_retries = _coerce_optional_int(
+        getattr(config, "openai_realtime_client_max_retries", None),
+        default=2,
+        minimum=0,
+    )
+    if client_max_retries is not None:
+        kwargs["max_retries"] = client_max_retries
     if _should_send_project_header(config):
         kwargs["project"] = config.openai_project_id
     return AsyncOpenAI(**kwargs)
+
+
+def _coerce_optional_float(value: Any, *, default: float | None, minimum: float) -> float | None:
+    if value is None:
+        return default
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        return default
+    if coerced < minimum:
+        return default
+    return coerced
+
+
+def _coerce_optional_int(value: Any, *, default: int | None, minimum: int) -> int | None:
+    if value is None:
+        return default
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return default
+    if coerced < minimum:
+        return default
+    return coerced
 
 
 class OpenAIRealtimeSession:
@@ -112,41 +153,36 @@ class OpenAIRealtimeSession:
         self._client = client or factory(config)
         self._base_instructions_override = base_instructions
         self._tool_handlers = dict(tool_handlers or {})
-        self._runner: asyncio.Runner | None = None
+        self._state_lock = threading.RLock()  # AUDIT-FIX(#1): serialize lifecycle/turn operations so the sync API is safe from concurrent callers.
+        self._loop: asyncio.AbstractEventLoop | None = None  # AUDIT-FIX(#1): use a dedicated background event loop instead of asyncio.Runner in the caller thread.
+        self._loop_thread: threading.Thread | None = None  # AUDIT-FIX(#1): keep realtime I/O off the uvicorn event loop thread.
+        self._loop_started = threading.Event()  # AUDIT-FIX(#1): wait until the background loop is ready before submitting work.
         self._manager = None
         self._connection = None
+        self._conversation_seeded = False  # AUDIT-FIX(#5): seed external conversation history at most once per live provider session.
+        self._turns_completed = 0  # AUDIT-FIX(#5): if external history is supplied after live turns, reconnect before reseeding to avoid duplicate history.
 
     def open(self) -> "OpenAIRealtimeSession":
-        if self._connection is not None:
+        with self._state_lock:
+            self._open_locked()
             return self
 
-        self._runner = asyncio.Runner()
-        self._manager = self._client.realtime.connect(model=self.config.openai_realtime_model)
-        try:
-            self._connection = self._runner.run(self._manager.__aenter__())
-            self._runner.run(self._configure_session())
-        except Exception:
-            self.close()
-            raise
-        return self
-
     def close(self) -> None:
-        if self._runner is not None and self._manager is not None:
-            try:
-                self._runner.run(self._manager.__aexit__(None, None, None))
-            except RuntimeError:
-                pass
-        self._connection = None
-        self._manager = None
-        if self._runner is not None:
-            self._runner.close()
-            self._runner = None
+        with self._state_lock:
+            self._close_locked()
 
     def __enter__(self) -> "OpenAIRealtimeSession":
         return self.open()
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+    def __del__(self) -> None:
+        # AUDIT-FIX(#6): best-effort cleanup for forgotten sessions; never let GC-time cleanup raise.
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def run_audio_turn(
         self,
@@ -158,16 +194,25 @@ class OpenAIRealtimeSession:
     ) -> OpenAIRealtimeTurn:
         if not audio_pcm:
             raise RuntimeError("Realtime turn requires non-empty PCM audio input")
-        if self._runner is None or self._connection is None:
-            self.open()
-        return self._runner.run(
-            self._run_audio_turn(
-                audio_pcm,
-                conversation=conversation,
-                on_audio_chunk=on_audio_chunk,
-                on_output_text_delta=on_output_text_delta,
-            )
-        )
+        normalized_conversation = self._normalize_conversation(conversation)  # AUDIT-FIX(#12): tolerate malformed persisted conversation entries instead of crashing on .strip().
+        with self._state_lock:
+            try:
+                self._prepare_for_turn_locked(normalized_conversation)  # AUDIT-FIX(#4): refresh session configuration every turn so dynamic time context stays current.
+                turn = self._run_on_session_loop_locked(
+                    self._run_audio_turn(
+                        audio_pcm,
+                        conversation=normalized_conversation,
+                        on_audio_chunk=on_audio_chunk,
+                        on_output_text_delta=on_output_text_delta,
+                    ),
+                    stage="running realtime audio turn",
+                    timeout=self._turn_timeout_seconds(),
+                )
+            except Exception:
+                self._close_locked()  # AUDIT-FIX(#6): any turn failure forces a clean reconnect path for the next turn.
+                raise
+            self._mark_turn_complete_locked(normalized_conversation)
+            return turn
 
     def run_text_turn(
         self,
@@ -177,23 +222,33 @@ class OpenAIRealtimeSession:
         on_audio_chunk: Callable[[bytes], None] | None = None,
         on_output_text_delta: Callable[[str], None] | None = None,
     ) -> OpenAIRealtimeTurn:
-        if not prompt.strip():
+        normalized_prompt = prompt.strip()
+        if not normalized_prompt:
             raise RuntimeError("Realtime turn requires a non-empty prompt")
-        if self._runner is None or self._connection is None:
-            self.open()
-        return self._runner.run(
-            self._run_text_turn(
-                prompt.strip(),
-                conversation=conversation,
-                on_audio_chunk=on_audio_chunk,
-                on_output_text_delta=on_output_text_delta,
-            )
-        )
+        normalized_conversation = self._normalize_conversation(conversation)  # AUDIT-FIX(#12): tolerate malformed persisted conversation entries instead of crashing on .strip().
+        with self._state_lock:
+            try:
+                self._prepare_for_turn_locked(normalized_conversation)  # AUDIT-FIX(#4): refresh session configuration every turn so dynamic time context stays current.
+                turn = self._run_on_session_loop_locked(
+                    self._run_text_turn(
+                        normalized_prompt,
+                        conversation=normalized_conversation,
+                        on_audio_chunk=on_audio_chunk,
+                        on_output_text_delta=on_output_text_delta,
+                    ),
+                    stage="running realtime text turn",
+                    timeout=self._turn_timeout_seconds(),
+                )
+            except Exception:
+                self._close_locked()  # AUDIT-FIX(#6): any turn failure forces a clean reconnect path for the next turn.
+                raise
+            self._mark_turn_complete_locked(normalized_conversation)
+            return turn
 
     async def _configure_session(self) -> None:
         session: dict[str, Any] = {
             "type": "realtime",
-            "output_modalities": ["audio"],
+            "output_modalities": ["audio", "text"],  # AUDIT-FIX(#8): request text explicitly because this class requires response_text on every successful turn.
             "instructions": self._session_instructions(),
             "audio": {
                 "input": {
@@ -224,7 +279,11 @@ class OpenAIRealtimeSession:
         if tools:
             session["tools"] = tools
             session["tool_choice"] = "auto"
-        await self._connection.session.update(session=session)
+        await self._await_provider(
+            self._connection.session.update(session=session),
+            stage="configuring realtime session",
+            timeout=self._connect_timeout_seconds(),
+        )
 
     async def _run_audio_turn(
         self,
@@ -236,9 +295,18 @@ class OpenAIRealtimeSession:
     ) -> OpenAIRealtimeTurn:
         await self._seed_conversation(conversation)
         for chunk in self._iter_audio_chunks(audio_pcm):
-            await self._connection.input_audio_buffer.append(audio=chunk)
-        await self._connection.input_audio_buffer.commit()
-        await self._connection.response.create(response={})
+            await self._await_provider(
+                self._connection.input_audio_buffer.append(audio=chunk),
+                stage="streaming audio to realtime input buffer",
+            )  # AUDIT-FIX(#2): every network write is bounded so intermittent Wi-Fi cannot hang the device forever.
+        await self._await_provider(
+            self._connection.input_audio_buffer.commit(),
+            stage="committing realtime audio input buffer",
+        )
+        await self._await_provider(
+            self._connection.response.create(response={}),
+            stage="creating realtime response",
+        )
         return await self._consume_turn_events(
             on_audio_chunk=on_audio_chunk,
             on_output_text_delta=on_output_text_delta,
@@ -253,14 +321,20 @@ class OpenAIRealtimeSession:
         on_output_text_delta: Callable[[str], None] | None,
     ) -> OpenAIRealtimeTurn:
         await self._seed_conversation(conversation)
-        await self._connection.conversation.item.create(
-            item={
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": prompt}],
-            }
+        await self._await_provider(
+            self._connection.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                }
+            ),
+            stage="creating realtime user message",
         )
-        await self._connection.response.create(response={})
+        await self._await_provider(
+            self._connection.response.create(response={}),
+            stage="creating realtime response",
+        )
         return await self._consume_turn_events(
             transcript_hint=prompt,
             on_audio_chunk=on_audio_chunk,
@@ -282,8 +356,11 @@ class OpenAIRealtimeSession:
         end_conversation = False
 
         while True:
-            event = await self._connection.recv()
-            event_type = getattr(event, "type", "")
+            event = await self._await_provider(
+                self._connection.recv(),
+                stage="waiting for realtime events",
+            )
+            event_type = str(getattr(event, "type", "")).strip()
 
             if event_type == "error":
                 raise RuntimeError(self._format_error(event))
@@ -307,8 +384,7 @@ class OpenAIRealtimeSession:
                 delta = str(getattr(event, "delta", ""))
                 if delta:
                     response_text_fragments.append(delta)
-                    if on_output_text_delta is not None:
-                        on_output_text_delta(delta)
+                    self._emit_output_text_delta(delta, on_output_text_delta)  # AUDIT-FIX(#7): callback failures are wrapped with context and trigger a clean session reset.
                 continue
 
             if event_type in {
@@ -320,13 +396,13 @@ class OpenAIRealtimeSession:
                 final_text = str(getattr(event, "transcript", "") or getattr(event, "text", "")).strip()
                 if final_text and not "".join(response_text_fragments).strip():
                     response_text_fragments.append(final_text)
-                    if on_output_text_delta is not None:
-                        on_output_text_delta(final_text)
+                    self._emit_output_text_delta(final_text, on_output_text_delta)  # AUDIT-FIX(#7): callback failures are wrapped with context and trigger a clean session reset.
                 continue
 
             if event_type in {"response.audio.delta", "response.output_audio.delta"}:
-                if on_audio_chunk is not None:
-                    on_audio_chunk(base64.b64decode(str(getattr(event, "delta", ""))))
+                audio_delta = str(getattr(event, "delta", ""))
+                if audio_delta:
+                    self._emit_audio_chunk(audio_delta, on_audio_chunk)  # AUDIT-FIX(#7): invalid base64/callback errors are surfaced cleanly and the session is recycled.
                 continue
 
             if event_type == "response.done":
@@ -343,15 +419,21 @@ class OpenAIRealtimeSession:
                         immediate_text = str(handled_tools.immediate_response_text or "").strip()
                         if immediate_text:
                             response_text_fragments.append(immediate_text)
-                            if on_output_text_delta is not None:
-                                on_output_text_delta(immediate_text)
+                            self._emit_output_text_delta(immediate_text, on_output_text_delta)
                         break
-                    await self._connection.response.create(response={})
+                    await self._await_provider(
+                        self._connection.response.create(response={}),
+                        stage="creating follow-up realtime response after tool execution",
+                    )
                     continue
                 if not "".join(response_text_fragments).strip():
                     extracted = self._extract_response_text(response)
                     if extracted:
                         response_text_fragments.append(extracted)
+                if not "".join(response_text_fragments).strip():
+                    incomplete_reason = self._response_incomplete_reason(response)
+                    if incomplete_reason:
+                        raise RuntimeError(incomplete_reason)
                 break
 
         transcript = transcript_hint or "".join(input_transcript_fragments).strip() or "[voice input]"
@@ -368,34 +450,34 @@ class OpenAIRealtimeSession:
         )
 
     async def _seed_conversation(self, conversation: tuple[tuple[str, str], ...] | None) -> None:
-        if not conversation:
+        if not conversation or self._conversation_seeded:
             return
         for role, content in conversation:
-            normalized_role = role.strip().lower()
-            normalized_content = content.strip()
-            if normalized_role not in {"system", "user", "assistant"} or not normalized_content:
-                continue
-            await self._connection.conversation.item.create(
-                item={
-                    "type": "message",
-                    "role": normalized_role,
-                    "content": [
-                        {
-                            "type": self._content_type_for_role(normalized_role),
-                            "text": normalized_content,
-                        }
-                    ],
-                }
+            await self._await_provider(
+                self._connection.conversation.item.create(
+                    item={
+                        "type": "message",
+                        "role": role,
+                        "content": [
+                            {
+                                "type": self._content_type_for_role(role),
+                                "text": content,
+                            }
+                        ],
+                    }
+                ),
+                stage="seeding realtime conversation history",
             )
+        self._conversation_seeded = True  # AUDIT-FIX(#5): once a provider session has seeded external history, do not replay it again into the same live conversation.
 
-    def _iter_audio_chunks(self, audio_pcm: bytes, *, chunk_size: int = 32_768) -> tuple[str, ...]:
-        chunks: list[str] = []
+    def _iter_audio_chunks(self, audio_pcm: bytes, *, chunk_size: int = 32_768):
+        if chunk_size <= 0:
+            raise RuntimeError("Audio chunk size must be a positive integer")
         for index in range(0, len(audio_pcm), chunk_size):
             chunk = audio_pcm[index : index + chunk_size]
             if not chunk:
                 continue
-            chunks.append(base64.b64encode(chunk).decode("ascii"))
-        return tuple(chunks)
+            yield base64.b64encode(chunk).decode("ascii")  # AUDIT-FIX(#11): stream chunks lazily to avoid a full in-memory base64 tuple on RPi 4.
 
     def _session_instructions(self) -> str:
         return merge_instructions(
@@ -473,30 +555,45 @@ class OpenAIRealtimeSession:
         continue_response = True
         for name, call_id, arguments_json in function_calls:
             handler = self._tool_handlers.get(name)
-            arguments = self._parse_tool_arguments(arguments_json)
-            if handler is None:
-                output = {"status": "error", "message": f"Unsupported tool: {name}"}
+            tool_succeeded = False
+            try:
+                arguments = self._parse_tool_arguments(arguments_json)
+            except RuntimeError as exc:
+                arguments = {}
+                output = {
+                    "status": "error",
+                    "message": "Tool arguments were invalid.",
+                    "error_type": type(exc).__name__,
+                }  # AUDIT-FIX(#9): malformed model-generated tool JSON should not abort the whole turn.
             else:
-                handled_names.append(name)
-                try:
-                    result = handler(arguments)
-                    output = result if result is not None else {"status": "ok"}
-                except Exception as exc:
-                    output = {"status": "error", "message": str(exc)}
-            if (
-                name == "end_conversation"
-                and len(function_calls) == 1
-            ):
+                if handler is None:
+                    output = {"status": "error", "message": f"Unsupported tool: {name}"}
+                else:
+                    try:
+                        result = await self._execute_tool_handler(handler, arguments)  # AUDIT-FIX(#3): support async handlers, awaitables, and bounded execution.
+                        output = result if result is not None else {"status": "ok"}
+                        tool_succeeded = True
+                        handled_names.append(name)
+                    except Exception as exc:
+                        output = {
+                            "status": "error",
+                            "message": "Tool execution failed.",
+                            "error_type": type(exc).__name__,
+                        }  # AUDIT-FIX(#10): do not leak raw exception text back into the model/user channel.
+            if name == "end_conversation" and len(function_calls) == 1 and tool_succeeded:
                 spoken_reply = str(arguments.get("spoken_reply", "") or "").strip()
                 if spoken_reply:
                     immediate_response_text = spoken_reply
                     continue_response = False
-            await self._connection.conversation.item.create(
-                item={
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": self._serialize_tool_output(output),
-                }
+            await self._await_provider(
+                self._connection.conversation.item.create(
+                    item={
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": self._serialize_tool_output(output),
+                    }
+                ),
+                stage=f"returning tool output for {name}",
             )
         return _HandledRealtimeTools(
             names=tuple(handled_names),
@@ -516,9 +613,302 @@ class OpenAIRealtimeSession:
     def _serialize_tool_output(self, output: Any) -> str:
         if isinstance(output, str):
             return output
-        return json.dumps(output, ensure_ascii=False)
+        try:
+            return json.dumps(output, ensure_ascii=False, default=self._json_default)
+        except (TypeError, ValueError):
+            fallback = {
+                "status": "error",
+                "message": "Tool output could not be serialized safely.",
+            }  # AUDIT-FIX(#3): non-JSON-safe tool results must degrade to a valid tool payload instead of crashing the turn.
+            return json.dumps(fallback, ensure_ascii=False)
 
     def _content_type_for_role(self, role: str) -> str:
         if role == "assistant":
             return "output_text"
         return "input_text"
+
+    async def _await_provider(self, awaitable: Any, *, stage: str, timeout: float | None = None) -> Any:
+        wait_timeout = self._event_timeout_seconds() if timeout is None else timeout
+        try:
+            return await asyncio.wait_for(awaitable, timeout=wait_timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Timed out while {stage}") from exc  # AUDIT-FIX(#2): convert unbounded provider waits into bounded failures with actionable context.
+
+    async def _execute_tool_handler(self, handler: Callable[[dict[str, Any]], Any], arguments: dict[str, Any]) -> Any:
+        tool_timeout = self._tool_timeout_seconds()
+        if self._is_async_handler(handler):
+            result = await asyncio.wait_for(handler(arguments), timeout=tool_timeout)
+        elif self._offload_sync_tool_handlers():
+            result = await asyncio.wait_for(
+                asyncio.to_thread(handler, arguments),
+                timeout=tool_timeout,
+            )
+        else:
+            result = handler(arguments)
+        if inspect.isawaitable(result):
+            return await asyncio.wait_for(result, timeout=tool_timeout)
+        return result
+
+    def _is_async_handler(self, handler: Callable[[dict[str, Any]], Any]) -> bool:
+        return inspect.iscoroutinefunction(handler) or inspect.iscoroutinefunction(getattr(handler, "__call__", None))
+
+    def _offload_sync_tool_handlers(self) -> bool:
+        raw_value = getattr(self.config, "openai_realtime_offload_sync_tool_handlers", True)  # AUDIT-FIX(#3): keep default behavior resilient, but allow opt-out if a legacy handler is thread-affine.
+        if isinstance(raw_value, str):
+            return raw_value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(raw_value)
+
+    def _json_default(self, value: Any) -> Any:
+        if isinstance(value, bytes):
+            return {"type": "bytes", "length": len(value)}
+        return {"type": type(value).__name__}
+
+    def _emit_output_text_delta(
+        self,
+        delta: str,
+        callback: Callable[[str], None] | None,
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback(delta)
+        except Exception as exc:
+            raise RuntimeError("Realtime text callback failed") from exc
+
+    def _emit_audio_chunk(
+        self,
+        audio_delta_base64: str,
+        callback: Callable[[bytes], None] | None,
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            decoded = base64.b64decode(audio_delta_base64, validate=True)
+        except Exception as exc:
+            raise RuntimeError("Realtime audio delta was not valid base64") from exc
+        try:
+            callback(decoded)
+        except Exception as exc:
+            raise RuntimeError("Realtime audio callback failed") from exc
+
+    def _response_incomplete_reason(self, response: Any) -> str | None:
+        status = str(getattr(response, "status", "") or "").strip().lower()
+        if not status or status == "completed":
+            return None
+        details = getattr(response, "status_details", None)
+        reason = str(getattr(details, "reason", "") or "").strip()
+        if reason:
+            return f"Realtime response ended with status {status}: {reason}"  # AUDIT-FIX(#8): surface provider-side incomplete/failure states instead of falling through to a misleading generic no-text error.
+        return f"Realtime response ended with status {status}"  # AUDIT-FIX(#8): surface provider-side incomplete/failure states instead of falling through to a misleading generic no-text error.
+
+    def _normalize_conversation(
+        self,
+        conversation: tuple[tuple[str, str], ...] | None,
+    ) -> tuple[tuple[str, str], ...] | None:
+        if not conversation:
+            return None
+        normalized: list[tuple[str, str]] = []  # AUDIT-FIX(#12): normalize persisted history defensively because file-backed state can contain malformed entries.
+        for item in conversation:
+            try:
+                role_raw, content_raw = item
+            except (TypeError, ValueError):
+                continue
+            role = str(role_raw).strip().lower()
+            content = str(content_raw).strip()
+            if role not in {"system", "user", "assistant"} or not content:
+                continue
+            normalized.append((role, content))
+        return tuple(normalized) or None
+
+    def _prepare_for_turn_locked(self, conversation: tuple[tuple[str, str], ...] | None) -> None:
+        self._open_locked()
+        if conversation is not None and self._turns_completed > 0:
+            self._close_locked()
+            self._open_locked()  # AUDIT-FIX(#5): a live provider session already contains prior turns, so reconnect before replaying external history to avoid duplicate context.
+        self._run_on_session_loop_locked(
+            self._configure_session(),
+            stage="refreshing realtime session configuration",
+            timeout=self._connect_timeout_seconds(),
+        )
+
+    def _mark_turn_complete_locked(self, conversation: tuple[tuple[str, str], ...] | None) -> None:
+        self._turns_completed += 1
+        if conversation is not None:
+            self._conversation_seeded = True
+
+    def _open_locked(self) -> None:
+        if self._connection is not None and self._loop is not None and self._loop.is_running():
+            return
+        self._start_loop_thread_locked()
+        try:
+            manager, connection = self._run_on_session_loop_locked(
+                self._open_connection(),
+                stage="opening realtime session",
+                timeout=self._connect_timeout_seconds(),
+            )
+            self._manager = manager
+            self._connection = connection
+            self._conversation_seeded = False
+            self._turns_completed = 0
+            self._run_on_session_loop_locked(
+                self._configure_session(),
+                stage="configuring realtime session",
+                timeout=self._connect_timeout_seconds(),
+            )
+        except Exception:
+            self._close_locked()
+            raise
+
+    def _close_locked(self) -> None:
+        manager = self._manager
+        loop = self._loop
+        loop_thread = self._loop_thread
+
+        self._manager = None
+        self._connection = None
+        self._conversation_seeded = False
+        self._turns_completed = 0
+
+        if manager is not None and loop is not None and loop.is_running():
+            try:
+                self._run_on_session_loop_locked(
+                    self._close_connection(manager),
+                    stage="closing realtime session",
+                    timeout=self._close_timeout_seconds(),
+                )
+            except Exception:
+                pass  # AUDIT-FIX(#6): cleanup must stay best-effort and must not mask the original failure.
+
+        if loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass
+
+        if loop_thread is not None:
+            loop_thread.join(timeout=self._loop_thread_join_timeout_seconds())
+
+        self._loop = None
+        self._loop_thread = None
+        self._loop_started.clear()
+
+    def _start_loop_thread_locked(self) -> None:
+        if self._loop_thread is not None and self._loop_thread.is_alive() and self._loop is not None and self._loop.is_running():
+            return
+
+        self._loop_started.clear()
+        loop_holder: dict[str, asyncio.AbstractEventLoop] = {}
+
+        def _thread_main() -> None:
+            loop = asyncio.new_event_loop()
+            loop_holder["loop"] = loop
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            self._loop_started.set()
+            try:
+                loop.run_forever()
+            finally:
+                pending = asyncio.all_tasks(loop=loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
+
+        self._loop_thread = threading.Thread(
+            target=_thread_main,
+            name="OpenAIRealtimeSessionLoop",
+            daemon=True,
+        )
+        self._loop_thread.start()
+        if not self._loop_started.wait(timeout=self._loop_thread_start_timeout_seconds()):
+            self._loop = None
+            self._loop_thread = None
+            raise RuntimeError("Timed out while starting the realtime event loop")  # AUDIT-FIX(#1): fail fast instead of deadlocking on a half-started loop.
+        self._loop = loop_holder.get("loop")
+
+    def _run_on_session_loop_locked(
+        self,
+        coro: Any,
+        *,
+        stage: str,
+        timeout: float | None,
+    ) -> Any:
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            if inspect.iscoroutine(coro):
+                coro.close()
+            raise RuntimeError("Realtime session event loop is not running")
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+        except RuntimeError as exc:
+            if inspect.iscoroutine(coro):
+                coro.close()
+            raise RuntimeError("Realtime session event loop is not available") from exc
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise RuntimeError(f"Timed out while {stage}") from exc  # AUDIT-FIX(#2): protect sync callers from indefinite waits on the background loop.
+        except Exception:
+            if not future.done():
+                future.cancel()
+            raise
+
+    async def _open_connection(self) -> tuple[Any, Any]:
+        manager = self._client.realtime.connect(model=self.config.openai_realtime_model)
+        connection = await manager.__aenter__()
+        return manager, connection
+
+    async def _close_connection(self, manager: Any) -> None:
+        await manager.__aexit__(None, None, None)
+
+    def _connect_timeout_seconds(self) -> float:
+        return _coerce_optional_float(
+            getattr(self.config, "openai_realtime_connect_timeout_seconds", None),
+            default=20.0,
+            minimum=0.1,
+        ) or 20.0
+
+    def _event_timeout_seconds(self) -> float:
+        return _coerce_optional_float(
+            getattr(self.config, "openai_realtime_event_timeout_seconds", None),
+            default=45.0,
+            minimum=0.1,
+        ) or 45.0
+
+    def _turn_timeout_seconds(self) -> float:
+        return _coerce_optional_float(
+            getattr(self.config, "openai_realtime_turn_timeout_seconds", None),
+            default=180.0,
+            minimum=0.1,
+        ) or 180.0
+
+    def _tool_timeout_seconds(self) -> float:
+        return _coerce_optional_float(
+            getattr(self.config, "openai_realtime_tool_timeout_seconds", None),
+            default=30.0,
+            minimum=0.1,
+        ) or 30.0
+
+    def _close_timeout_seconds(self) -> float:
+        return _coerce_optional_float(
+            getattr(self.config, "openai_realtime_close_timeout_seconds", None),
+            default=5.0,
+            minimum=0.1,
+        ) or 5.0
+
+    def _loop_thread_start_timeout_seconds(self) -> float:
+        return _coerce_optional_float(
+            getattr(self.config, "openai_realtime_loop_thread_start_timeout_seconds", None),
+            default=5.0,
+            minimum=0.1,
+        ) or 5.0
+
+    def _loop_thread_join_timeout_seconds(self) -> float:
+        return _coerce_optional_float(
+            getattr(self.config, "openai_realtime_loop_thread_join_timeout_seconds", None),
+            default=5.0,
+            minimum=0.1,
+        ) or 5.0

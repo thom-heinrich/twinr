@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import time
 import wave
+from threading import Lock
 
 from twinr.agent.base_agent.config import TwinrConfig
 
@@ -757,6 +758,8 @@ class WaveAudioPlayer:
     def __init__(self, *, device: str = "default") -> None:
         # AUDIT-FIX(#7): Normalize playback device names early so blank config values still resolve safely.
         self.device = _normalize_audio_device(device)
+        self._active_process_lock = Lock()
+        self._active_process: subprocess.Popen[bytes] | None = None
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "WaveAudioPlayer":
@@ -872,6 +875,8 @@ class WaveAudioPlayer:
             stderr=subprocess.PIPE,
             purpose="Audio playback",
         )
+        self._set_active_process(process)
+        stopped_early = False
         try:
             if process.stdin is None:
                 raise RuntimeError("aplay did not expose stdin")
@@ -880,12 +885,14 @@ class WaveAudioPlayer:
             # AUDIT-FIX(#4): Write to aplay with backpressure-aware, timeout-bounded non-blocking I/O.
             for chunk in chunks:
                 if should_stop is not None and should_stop():
+                    stopped_early = True
                     break
                 if not chunk:
                     continue
                 view = memoryview(chunk)
                 while view:
                     if should_stop is not None and should_stop():
+                        stopped_early = True
                         view = view[:0]
                         break
                     if process.poll() is not None:
@@ -907,6 +914,11 @@ class WaveAudioPlayer:
                     if written <= 0:
                         self._raise_stream_error(process)
                     view = view[written:]
+            if not stopped_early and should_stop is not None and should_stop():
+                stopped_early = True
+            if stopped_early:
+                self._stop_process(process)
+                return
             try:
                 process.stdin.close()
             except BrokenPipeError:
@@ -919,6 +931,7 @@ class WaveAudioPlayer:
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("Audio playback timed out while waiting for aplay to finish") from exc
         finally:
+            self._clear_active_process(process)
             self._stop_process(process)
 
     def play_file(self, path: str | Path) -> None:
@@ -949,6 +962,22 @@ class WaveAudioPlayer:
     def _raise_stream_error(self, process: subprocess.Popen[bytes]) -> None:
         message = _process_failure_message(process, default_action="Audio playback")
         raise RuntimeError(f"Audio playback failed: {message}")
+
+    def stop_playback(self) -> None:
+        with self._active_process_lock:
+            process = self._active_process
+        if process is None:
+            return
+        self._stop_process(process)
+
+    def _set_active_process(self, process: subprocess.Popen[bytes]) -> None:
+        with self._active_process_lock:
+            self._active_process = process
+
+    def _clear_active_process(self, process: subprocess.Popen[bytes]) -> None:
+        with self._active_process_lock:
+            if self._active_process is process:
+                self._active_process = None
 
     def _render_tone_pcm(
         self,

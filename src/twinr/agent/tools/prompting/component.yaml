@@ -1,0 +1,84 @@
+schema_version: 1
+name: prompting
+path: src/twinr/agent/tools/prompting
+kind: python-package
+visibility: internal
+summary: Assemble tool-lane instruction strings and small dynamic context overlays for Twinr agent tool calls.
+owned_concerns:
+  - Define canonical instruction constants for default, compact, supervisor, first-word, and specialist tool lanes
+  - Add local date/time and simple-setting context to instruction bundles at call time
+  - Export the public prompt-builder surface used by workflow, orchestrator, and package-level callers
+out_of_scope:
+  - Personality file loading or base-agent section ordering in src/twinr/agent/base_agent/prompting
+  - Tool schema definitions, handler binding, or tool execution
+  - Workflow-loop orchestration or provider transport/session logic
+files:
+  - path: __init__.py
+    role: Package export surface for tool prompting
+    exports:
+      - COMPACT_TOOL_AGENT_INSTRUCTIONS
+      - DEFAULT_TOOL_AGENT_INSTRUCTIONS
+      - FIRST_WORD_AGENT_INSTRUCTIONS
+      - SPECIALIST_TOOL_AGENT_INSTRUCTIONS
+      - SUPERVISOR_DECISION_AGENT_INSTRUCTIONS
+      - SUPERVISOR_FAST_ACK_PHRASES
+      - SUPERVISOR_TOOL_AGENT_INSTRUCTIONS
+      - build_compact_tool_agent_instructions
+      - build_first_word_instructions
+      - build_specialist_tool_agent_instructions
+      - build_supervisor_decision_instructions
+      - build_supervisor_tool_agent_instructions
+      - build_tool_agent_instructions
+      - tool_agent_time_context
+  - path: instructions.py
+    role: Canonical tool-lane instruction text and builders
+    exports:
+      - COMPACT_TOOL_AGENT_INSTRUCTIONS
+      - DEFAULT_TOOL_AGENT_INSTRUCTIONS
+      - FIRST_WORD_AGENT_INSTRUCTIONS
+      - SPECIALIST_TOOL_AGENT_INSTRUCTIONS
+      - SUPERVISOR_DECISION_AGENT_INSTRUCTIONS
+      - SUPERVISOR_FAST_ACK_PHRASES
+      - SUPERVISOR_TOOL_AGENT_INSTRUCTIONS
+      - build_compact_tool_agent_instructions
+      - build_first_word_instructions
+      - build_specialist_tool_agent_instructions
+      - build_supervisor_decision_instructions
+      - build_supervisor_tool_agent_instructions
+      - build_tool_agent_instructions
+      - tool_agent_time_context
+public_api:
+  module: twinr.agent.tools.prompting.instructions
+  callables:
+    - build_tool_agent_instructions
+    - build_compact_tool_agent_instructions
+    - build_supervisor_tool_agent_instructions
+    - build_supervisor_decision_instructions
+    - build_first_word_instructions
+    - build_specialist_tool_agent_instructions
+    - tool_agent_time_context
+compatibility_reexports:
+  - path: src/twinr/agent/tools/__init__.py
+    names:
+      - COMPACT_TOOL_AGENT_INSTRUCTIONS
+      - DEFAULT_TOOL_AGENT_INSTRUCTIONS
+      - FIRST_WORD_AGENT_INSTRUCTIONS
+      - SUPERVISOR_FAST_ACK_PHRASES
+      - build_compact_tool_agent_instructions
+      - build_first_word_instructions
+      - build_specialist_tool_agent_instructions
+      - build_supervisor_decision_instructions
+      - build_supervisor_tool_agent_instructions
+      - build_tool_agent_instructions
+      - tool_agent_time_context
+primary_callers:
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+  - path: src/twinr/orchestrator/session.py
+  - path: src/twinr/orchestrator/acks.py
+  - path: test/run_pi_tool_matrix.py
+tests:
+  - path: test/test_tool_instructions.py
+  - path: test/test_runner.py
+  - path: test/test_streaming_runner.py
+  - path: test/test_openai_realtime.py

@@ -6,7 +6,7 @@ from queue import Empty, Full
 import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from twinr.agent.tools.automations import normalize_delivery
+from twinr.agent.tools.handlers.automations import normalize_delivery
 from twinr.automations import AutomationAction, AutomationDefinition
 from twinr.memory.reminders import format_due_label
 from twinr.proactive import (

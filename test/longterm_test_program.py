@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Mapping
 
-from twinr.memory.longterm.extract import LongTermStructuredTurnProgram, LongTermTurnExtractor
+from twinr.memory.longterm.ingestion.extract import LongTermStructuredTurnProgram, LongTermTurnExtractor
 
 
 def _janina_full_payload(date_key: str) -> dict[str, object]:

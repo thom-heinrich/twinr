@@ -12,6 +12,13 @@ from twinr.state_machine import TwinrStatus
 
 
 class TwinrRuntimeTests(unittest.TestCase):
+    def test_runtime_uses_structured_snapshot_mixin(self) -> None:
+        self.assertEqual(TwinrRuntime._persist_snapshot.__module__, "twinr.agent.base_agent.runtime.snapshot")
+        self.assertEqual(
+            TwinrRuntime._restore_snapshot_context.__module__,
+            "twinr.agent.base_agent.runtime.snapshot",
+        )
+
     def test_happy_path_returns_to_waiting(self) -> None:
         runtime = TwinrRuntime(config=TwinrConfig())
 

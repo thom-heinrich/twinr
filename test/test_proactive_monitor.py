@@ -26,8 +26,8 @@ from twinr.proactive import (
     build_default_proactive_monitor,
     parse_vision_observation_text,
 )
+from twinr.proactive.social.vision_review import ProactiveVisionReview
 from twinr.runtime import TwinrRuntime
-from twinr.proactive.vision_review import ProactiveVisionReview
 
 
 class FakeVisionObserver:
@@ -278,7 +278,7 @@ class ProactiveMonitorTests(unittest.TestCase):
         )
         runtime = TwinrRuntime(config=config)
         clock = MutableClock(0.0)
-        pir_monitor = FakePirMonitor(level=False)
+        pir_monitor = FakePirMonitor(events=[True], level=True)
         handled: list[str] = []
         coordinator = ProactiveCoordinator(
             config=config,
@@ -288,6 +288,7 @@ class ProactiveMonitorTests(unittest.TestCase):
             vision_observer=FakeVisionObserver(
                 [
                     SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT),
+                    SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT),
                 ]
             ),
             pir_monitor=pir_monitor,
@@ -296,6 +297,11 @@ class ProactiveMonitorTests(unittest.TestCase):
         )
 
         coordinator.tick()
+        clock.now = 30.0
+        pir_monitor.level = False
+        absence_result = coordinator.tick()
+        self.assertFalse(absence_result.inspected)
+
         clock.now = 21.0 * 60.0
         pir_monitor.events = [True]
         pir_monitor.level = True
@@ -337,7 +343,7 @@ class ProactiveMonitorTests(unittest.TestCase):
 
         self.assertTrue(wakeword_stream.presence_snapshots)
         self.assertTrue(wakeword_stream.presence_snapshots[-1].armed)
-        self.assertEqual(wakeword_stream.presence_snapshots[-1].reason, "person_visible")
+        self.assertEqual(wakeword_stream.presence_snapshots[-1].reason, "pir_motion")
 
     def test_coordinator_handles_streaming_wakeword_detection(self) -> None:
         config = TwinrConfig(
@@ -575,7 +581,7 @@ class ProactiveMonitorTests(unittest.TestCase):
             )
             runtime = TwinrRuntime(config=config)
             clock = MutableClock(0.0)
-            pir_monitor = FakePirMonitor(level=False)
+            pir_monitor = FakePirMonitor(events=[True], level=True)
             handled: list[str] = []
             coordinator = ProactiveCoordinator(
                 config=config,
@@ -586,6 +592,7 @@ class ProactiveMonitorTests(unittest.TestCase):
                     [
                         SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT),
                         SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT),
+                        SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT),
                     ]
                 ),
                 pir_monitor=pir_monitor,
@@ -594,6 +601,9 @@ class ProactiveMonitorTests(unittest.TestCase):
                 clock=clock,
             )
 
+            coordinator.tick()
+            clock.now = 30.0
+            pir_monitor.level = False
             coordinator.tick()
             clock.now = 21.0 * 60.0
             pir_monitor.events = [True]
@@ -1077,7 +1087,7 @@ class ProactiveMonitorTests(unittest.TestCase):
         )
         runtime = TwinrRuntime(config=config)
 
-        with patch("twinr.proactive.service.configured_pir_monitor", return_value=FakePirMonitor()):
+        with patch("twinr.proactive.runtime.service.configured_pir_monitor", return_value=FakePirMonitor()):
             monitor = build_default_proactive_monitor(
                 config=config,
                 runtime=runtime,

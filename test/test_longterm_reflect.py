@@ -6,8 +6,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.memory.longterm.models import LongTermMemoryObjectV1, LongTermSourceRefV1
-from twinr.memory.longterm.reflect import LongTermMemoryReflector
+from twinr.memory.longterm.core.models import LongTermMemoryObjectV1, LongTermSourceRefV1
+from twinr.memory.longterm.reasoning.reflect import LongTermMemoryReflector
 
 
 def _source() -> LongTermSourceRefV1:

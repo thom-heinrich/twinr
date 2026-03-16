@@ -1,0 +1,81 @@
+schema_version: 1
+name: conversation
+path: src/twinr/agent/base_agent/conversation
+kind: python-package
+visibility: internal
+summary: Conversation timing, language, turn-boundary, and closure helpers for the base agent.
+owned_concerns:
+  - Adaptive listening-window state, learning, and persistence
+  - Language-normalized prompt contracts for user replies and memory text
+  - Tool-called streaming turn-boundary decisions
+  - Tool-called post-response closure decisions
+out_of_scope:
+  - Audio capture or playback orchestration
+  - Workflow orchestration in src/twinr/agent/workflows
+  - Provider bundle construction or transport adapters
+  - Personality instruction authoring
+files:
+  - path: __init__.py
+    role: Package marker
+  - path: adaptive_timing.py
+    role: Adaptive timing profile and bounded persistence
+    exports:
+      - AdaptiveListeningWindow
+      - AdaptiveTimingProfile
+      - AdaptiveTimingBounds
+      - AdaptiveTimingStore
+  - path: language.py
+    role: Spoken-language display and instruction helpers
+    exports:
+      - language_display_name
+      - canonical_memory_instruction
+      - user_response_language_instruction
+      - memory_and_response_contract
+  - path: turn_controller.py
+    role: Streaming turn-boundary evaluation and controller
+    exports:
+      - TurnEvaluationCandidate
+      - TurnDecision
+      - TurnDecisionEvaluator
+      - ToolCallingTurnDecisionEvaluator
+      - StreamingTurnController
+      - _normalize_turn_text
+  - path: closure.py
+    role: Post-response closure evaluation
+    exports:
+      - ConversationClosureDecision
+      - ToolCallingConversationClosureEvaluator
+legacy_wrappers:
+  - path: src/twinr/agent/base_agent/adaptive_timing.py
+    forwards_to: src/twinr/agent/base_agent/conversation/adaptive_timing.py
+  - path: src/twinr/agent/base_agent/language.py
+    forwards_to: src/twinr/agent/base_agent/conversation/language.py
+  - path: src/twinr/agent/base_agent/turn_controller.py
+    forwards_to: src/twinr/agent/base_agent/conversation/turn_controller.py
+  - path: src/twinr/agent/base_agent/conversation_closure.py
+    forwards_to: src/twinr/agent/base_agent/conversation/closure.py
+root_exports:
+  path: src/twinr/agent/base_agent/__init__.py
+  names:
+    - AdaptiveListeningWindow
+    - AdaptiveTimingProfile
+    - AdaptiveTimingStore
+    - StreamingTurnController
+    - ToolCallingTurnDecisionEvaluator
+    - TurnDecision
+    - TurnEvaluationCandidate
+tests:
+  - path: test/test_adaptive_timing.py
+  - path: test/test_turn_controller.py
+  - path: test/test_conversation_closure.py
+consumers:
+  - path: src/twinr/agent/base_agent/runtime/base.py
+  - path: src/twinr/agent/base_agent/runtime/context.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+  - path: src/twinr/agent/workflows/realtime_runner_support.py
+  - path: src/twinr/providers/openai/base.py
+  - path: src/twinr/providers/openai/adapters.py
+  - path: src/twinr/providers/openai/realtime.py
+  - path: src/twinr/providers/groq/adapters.py

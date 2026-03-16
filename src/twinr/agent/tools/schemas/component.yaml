@@ -1,0 +1,50 @@
+schema_version: 1
+name: schemas
+path: src/twinr/agent/tools/schemas
+kind: python-package
+visibility: internal
+summary: Build canonical, compact, and realtime-safe tool schemas for Twinr agent tool calls.
+owned_concerns:
+  - Define the canonical tool schema surface and shared schema-property helpers
+  - Normalize requested tool names before schema selection
+  - Derive compact schema variants for token-constrained callers
+  - Derive realtime-safe schema variants for provider APIs with stricter top-level limits
+out_of_scope:
+  - Tool handler execution or runtime-side side effects
+  - Prompt instruction authoring or tool selection policy
+  - Workflow orchestration or provider session management beyond schema serialization
+files:
+  - path: __init__.py
+    role: Package export surface for schema builders
+    exports:
+      - build_agent_tool_schemas
+      - build_compact_agent_tool_schemas
+      - build_realtime_tool_schemas
+  - path: contracts.py
+    role: Canonical schema definitions and schema adapters
+    exports:
+      - build_agent_tool_schemas
+      - build_compact_agent_tool_schemas
+      - build_realtime_tool_schemas
+public_api:
+  module: twinr.agent.tools.schemas.contracts
+  callables:
+    - build_agent_tool_schemas
+    - build_compact_agent_tool_schemas
+    - build_realtime_tool_schemas
+compatibility_reexports:
+  - path: src/twinr/agent/tools/__init__.py
+    names:
+      - build_agent_tool_schemas
+      - build_compact_agent_tool_schemas
+      - build_realtime_tool_schemas
+primary_callers:
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+  - path: src/twinr/orchestrator/session.py
+  - path: src/twinr/providers/openai/realtime.py
+tests:
+  - path: test/test_openai_realtime.py
+  - path: test/test_runner.py
+  - path: test/test_streaming_runner.py
+  - path: test/run_pi_tool_matrix.py

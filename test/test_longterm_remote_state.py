@@ -16,8 +16,8 @@ from test.longterm_test_program import make_test_extractor
 from twinr.config import TwinrConfig
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig
 from twinr.memory.context_store import PersistentMemoryMarkdownStore
-from twinr.memory.longterm.remote_state import LongTermRemoteStateStore
-from twinr.memory.longterm.service import LongTermMemoryService
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
+from twinr.memory.longterm.runtime.service import LongTermMemoryService
 
 
 class FakeHTTPResponse:

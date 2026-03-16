@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.base_agent.simple_settings import (
+from twinr.agent.base_agent.settings.simple_settings import (
     adjustable_settings_context,
     current_speech_speed,
     current_spoken_voice,

@@ -1,4 +1,5 @@
 .env
+.env.pi
 .venv/
 
 # Local workflow tooling.

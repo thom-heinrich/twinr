@@ -8,8 +8,8 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.memory.longterm.models import LongTermMemoryObjectV1, LongTermSourceRefV1
-from twinr.memory.longterm.planner import LongTermProactivePlanner
+from twinr.memory.longterm.core.models import LongTermMemoryObjectV1, LongTermSourceRefV1
+from twinr.memory.longterm.proactive.planner import LongTermProactivePlanner
 
 
 def _source() -> LongTermSourceRefV1:

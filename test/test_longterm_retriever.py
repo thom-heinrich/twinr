@@ -22,7 +22,7 @@ from twinr.memory.longterm import (
     LongTermSourceRefV1,
     LongTermStructuredStore,
 )
-from twinr.memory.longterm.subtext import LongTermSubtextBuilder
+from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder
 from twinr.memory.query_normalization import LongTermQueryProfile
 
 

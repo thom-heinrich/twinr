@@ -38,7 +38,7 @@ UrlopenLike = Callable[[Request, float], _ResponseLike]
 _ALLOWED_BASE_URL_SCHEMES = frozenset({"http", "https"})
 _DEFAULT_TIMEOUT_S = 10.0
 _MIN_TIMEOUT_S = 0.1
-_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+_DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 _READ_CHUNK_SIZE = 64 * 1024
 _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _MODEL_PARSE_EXCEPTIONS = (AssertionError, KeyError, TypeError, ValueError)
@@ -84,6 +84,7 @@ class ChonkyDBClient:
             api_key_header=_normalize_header_name(config.api_key_header or "x-api-key"),
             allow_bearer_auth=bool(config.allow_bearer_auth),
             timeout_s=timeout_s,
+            max_response_bytes=_normalize_max_response_bytes(config.max_response_bytes),
         )
         self._opener = opener or _default_urlopen
 
@@ -95,6 +96,7 @@ class ChonkyDBClient:
             api_key_header=config.chonkydb_api_key_header,
             allow_bearer_auth=config.chonkydb_allow_bearer_auth,
             timeout_s=config.chonkydb_timeout_s,
+            max_response_bytes=config.chonkydb_max_response_bytes,
         )
         return cls(connection, opener=opener)
 
@@ -178,6 +180,7 @@ class ChonkyDBClient:
         origin_uri: str | None = None,
         include_content: bool = True,
         max_content_chars: int = 4000,
+        max_response_bytes: int | None = None,
     ) -> JsonDict:
         # AUDIT-FIX(#7): Treat blank identifiers as absent and reject malformed inputs before issuing a request.
         document_id_value = _normalize_optional_request_string("document_id", document_id)
@@ -196,6 +199,7 @@ class ChonkyDBClient:
                 "include_content": str(include_content).lower(),
                 "max_content_chars": max_content_chars_value,
             },
+            max_response_bytes=max_response_bytes,
         )
 
     def store_record(self, request: ChonkyDBRecordRequest | Mapping[str, object]) -> JsonDict:
@@ -255,6 +259,7 @@ class ChonkyDBClient:
         *,
         query: Mapping[str, object] | None = None,
         body: Mapping[str, object] | None = None,
+        max_response_bytes: int | None = None,
     ) -> JsonDict:
         # AUDIT-FIX(#7): Validate method/path upfront so malformed internal calls fail deterministically.
         normalized_method = _require_non_empty_str("method", method).upper()
@@ -281,13 +286,14 @@ class ChonkyDBClient:
             data = _encode_json_body(body)
 
         request = Request(url, method=normalized_method, headers=headers, data=data)
+        response_limit = _normalize_max_response_bytes(max_response_bytes or self.config.max_response_bytes)
         try:
             with self._opener(request, self.config.timeout_s) as response:
                 # AUDIT-FIX(#6): Bound response size to protect the RPi process from memory exhaustion.
-                raw = _read_response_bytes(response)
+                raw = _read_response_bytes(response, max_response_bytes=response_limit)
         except HTTPError as exc:
             # AUDIT-FIX(#6): Bound error-body reads as well, otherwise large error pages can still exhaust memory.
-            response_text, response_json = _read_http_error_details(exc)
+            response_text, response_json = _read_http_error_details(exc, max_response_bytes=response_limit)
             raise ChonkyDBError(
                 f"ChonkyDB request failed for {normalized_method} {normalized_path}",
                 status_code=exc.code,
@@ -402,6 +408,15 @@ def _normalize_timeout_s(value: object) -> float:
         return _DEFAULT_TIMEOUT_S
     return max(_MIN_TIMEOUT_S, timeout_s)
 
+def _normalize_max_response_bytes(value: object) -> int:
+    try:
+        max_response_bytes = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return _DEFAULT_MAX_RESPONSE_BYTES
+    if max_response_bytes < 1024:
+        return _DEFAULT_MAX_RESPONSE_BYTES
+    return max_response_bytes
+
 def _require_non_empty_str(name: str, value: object) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a non-empty string.")
@@ -452,7 +467,7 @@ def _encode_json_body(body: Mapping[str, object]) -> bytes:
         raise ValueError("ChonkyDB request body must be JSON-serializable.") from exc
     return serialized.encode("utf-8")
 
-def _read_response_bytes(response: _ResponseLike) -> bytes:
+def _read_response_bytes(response: _ResponseLike, *, max_response_bytes: int) -> bytes:
     buffer = bytearray()
     try:
         chunk = response.read(_READ_CHUNK_SIZE)
@@ -461,9 +476,9 @@ def _read_response_bytes(response: _ResponseLike) -> bytes:
 
     while chunk:
         buffer.extend(chunk)
-        if len(buffer) > _MAX_RESPONSE_BYTES:
+        if len(buffer) > max_response_bytes:
             raise ChonkyDBError(
-                f"ChonkyDB response body exceeded {_MAX_RESPONSE_BYTES} bytes."
+                f"ChonkyDB response body exceeded {max_response_bytes} bytes."
             )
         try:
             chunk = response.read(_READ_CHUNK_SIZE)
@@ -472,11 +487,11 @@ def _read_response_bytes(response: _ResponseLike) -> bytes:
 
     return bytes(buffer)
 
-def _read_http_error_details(exc: HTTPError) -> tuple[str | None, JsonDict | None]:
+def _read_http_error_details(exc: HTTPError, *, max_response_bytes: int) -> tuple[str | None, JsonDict | None]:
     response_text: str | None = None
     response_json: JsonDict | None = None
     try:
-        raw = _read_response_bytes(exc)
+        raw = _read_response_bytes(exc, max_response_bytes=max_response_bytes)
     except ChonkyDBError as read_exc:
         response_text = str(read_exc)
     except OSError:

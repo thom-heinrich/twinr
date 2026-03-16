@@ -11,52 +11,29 @@ This layer keeps long-term memory responsibilities separated from:
 - `src/twinr/memory/on_device/` for short rolling conversation memory
 - `src/twinr/memory/context_store.py` for durable markdown/profile stores
 - `src/twinr/memory/chonkydb/` for ChonkyDB client, graph schema, and personal graph logic
-- `src/twinr/agent/base_agent/runtime.py` for turn orchestration
+- `src/twinr/agent/base_agent/runtime/` for turn orchestration
 
-## Module split
+## Package split
 
-- `models.py`
-  - immutable runtime and versioned long-term memory object models
-- `worker.py`
-  - bounded background writer thread so durable turn storage does not block the response path
-- `service.py`
-  - one orchestration surface for retrieval, explicit memory writes, and background episodic persistence
-- `remote_state.py`
-  - remote-primary ChonkyDB snapshot backend with migration hooks and strict degraded-mode semantics
-- `retriever.py`
-  - hybrid retrieval and bounded context assembly for silent personalization, explicit recall, and conflict prompts
-- `extract.py`
-  - cautious turn-to-memory decomposition that first extracts atomic propositions and then compiles them into episode, fact, event, observation, and graph-edge candidates
-- `propositions.py`
-  - structured proposition contract plus deterministic proposition-to-memory compilation for the live turn extractor
-- `multimodal.py`
-  - cautious device-event decomposition for PIR, camera, button, and printer signals into low-confidence multimodal memory candidates
-- `truth.py`
-  - truth-maintenance primitives for slot conflicts, activation, and clarification gating
-- `consolidator.py`
-  - promotion of extracted candidates into episodic vs durable memory plus conflict-aware graph emission
-- `store.py`
-  - structured persistence for durable objects, unresolved conflicts, and archive snapshots, with optional remote-primary backing
-- `midterm_store.py`
-  - separate near-term continuity store for compiled mid-term packets that sit between rolling dialogue and durable facts, locally cached and optionally remote-primary
-- `reflect.py`
-  - bounded reflection over stored objects for support-count promotion, compact thread summaries, and compiled mid-term packets
-- `midterm.py`
-  - structured reflection program contract for compiling recent memory windows into bounded mid-term packets
-- `planner.py`
-  - bounded proactive candidate generation from durable and reflected long-term memory
-- `proactive.py`
-  - configurable reservation, cooldown, sensitivity gating, and delivery-history state for live long-term proactive prompts
-- `conflicts.py`
-  - queued clarification items plus explicit conflict resolution that updates object validity instead of silently drifting
-- `retention.py`
-  - conservative hierarchical retention policy for expiring time-bound memory, archiving stale episodes/summaries, and pruning low-value ephemeral objects
-- `subtext.py`
-  - builds silent personalization context and, when enabled, compiles relevant memory into a bounded structured subtext program for the current turn
-- `subtext_eval.py`
-  - bounded live reply eval for subtle personalization quality
-- `multimodal_eval.py`
-  - deterministic seeded multimodal goldset for provider-context retrieval quality over PIR, camera, button, printer, and episodic context
+- package root:
+  - `__init__.py` provides the stable public API
+  - `MEMORY_ARCHITECTURE.md` documents the target-state design
+- `core/`
+  - immutable runtime and versioned long-term memory object models plus ontology helpers
+- `ingestion/`
+  - cautious turn, proposition, multimodal, and sensor-memory extraction paths
+- `reasoning/`
+  - truth maintenance, consolidation, reflection, conflicts, and retention policy
+- `retrieval/`
+  - hybrid retrieval, bounded provider context assembly, and silent subtext building
+- `storage/`
+  - structured persistence, mid-term packet storage, and remote-primary snapshot access
+- `proactive/`
+  - proactive planning plus reservation, cooldown, and delivery-history state
+- `runtime/`
+  - orchestration surface and bounded background writers
+- `evaluation/`
+  - synthetic, multimodal, and subtext-focused eval harnesses
 - `../query_normalization.py`
   - canonical retrieval query rewriting plus low-information token filtering for multilingual memory lookup
 
@@ -181,12 +158,12 @@ Covered case families:
 Repro:
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.eval
+PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.eval
 ```
 
 ## Response-level subtext eval
 
-Twinr also carries a bounded live response eval for the silent personalization layer under `src/twinr/memory/longterm/subtext_eval.py`.
+Twinr also carries a bounded live response eval for the silent personalization layer under `src/twinr/memory/longterm/evaluation/subtext_eval.py`.
 
 This eval uses real generated replies and checks whether hidden personal context is woven into answers naturally instead of being announced explicitly.
 It runs with isolated per-case base instructions so unrelated repo personality or user files do not pollute the measurement.
@@ -204,7 +181,7 @@ Current case families:
 Repro:
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.subtext_eval
+PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.subtext_eval
 ```
 
 Current validated run on 2026-03-15:
@@ -219,7 +196,7 @@ Current status:
 
 ## Multimodal goldset eval
 
-Twinr also carries a deterministic multimodal long-term eval under `src/twinr/memory/longterm/multimodal_eval.py`.
+Twinr also carries a deterministic multimodal long-term eval under `src/twinr/memory/longterm/evaluation/multimodal_eval.py`.
 
 This harness seeds a realistic mixed store with:
 
@@ -232,7 +209,7 @@ It exercises the full provider-context path with canonical-English retrieval que
 Repro:
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.multimodal_eval
+PYTHONPATH=src ./.venv/bin/python -m twinr.memory.longterm.evaluation.multimodal_eval
 ```
 
 Current validated run on 2026-03-14:
