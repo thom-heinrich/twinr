@@ -856,7 +856,7 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(tts_provider.stream_calls[-1], "Heute wird es sonnig.")
         self.assertEqual(runtime.last_response, "Heute wird es sonnig.")
 
-    def test_sync_first_word_direct_is_not_repeated_when_final_matches(self) -> None:
+    def test_sync_first_word_direct_skips_final_lane_and_returns_to_waiting(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 openai_api_key="test-key",
@@ -887,16 +887,10 @@ class StreamingRunnerTests(unittest.TestCase):
                 config,
                 reply=FirstWordReply(mode="direct", spoken_text="Ja, alles gut."),
             )
-            loop._run_dual_lane_final_response = lambda transcript, turn_instructions: SimpleNamespace(  # type: ignore[method-assign]
-                text="Ja, alles gut.",
-                response_id="resp_final",
-                request_id="req_final",
-                rounds=1,
-                tool_calls=(),
-                used_web_search=False,
-                model="gpt-4o-mini",
-                token_usage=None,
-            )
+            def _unexpected_final_lane(*args, **kwargs):
+                raise AssertionError("direct first-word replies must not invoke the final lane")
+
+            loop._run_dual_lane_final_response = _unexpected_final_lane  # type: ignore[method-assign]
 
             keep_listening = loop._run_single_text_turn(
                 transcript="Alles ok bei dir?",
@@ -907,6 +901,8 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertTrue(keep_listening)
         self.assertEqual(tts_provider.stream_calls, ["Ja, alles gut."])
         self.assertEqual(runtime.last_response, "Ja, alles gut.")
+        self.assertEqual(runtime.status.value, "waiting")
+        self.assertEqual(runtime.snapshot_store.load().status, "waiting")
 
     def test_final_lane_waits_for_first_audio_gate(self) -> None:
         with TemporaryDirectory() as temp_dir:

@@ -18,6 +18,7 @@ from twinr.agent.base_agent.turn_controller import ToolCallingTurnDecisionEvalua
 from twinr.agent.tools import (
     DualLaneToolLoop,
     SpeechLaneDelta,
+    StreamingToolLoopResult,
     ToolCallingStreamingLoop,
     build_agent_tool_schemas,
     build_first_word_instructions,
@@ -897,27 +898,40 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                         timeout_s=(wait_ms / 1000.0) if wait_ms > 0 else 0.0,
                     )
 
-                if not final_started.is_set():
-                    final_worker.start()
-
-                final_done.wait()
-                if final_error:
-                    raise final_error[0]
-                response = response_holder["response"]
-                response_text = str(getattr(response, "text", "") or "").strip()
                 first_word_text = first_word_reply.spoken_text if first_word_reply is not None else ""
-                if response_text and (
-                    not first_word_text
-                    or _normalize_turn_text(response_text) != _normalize_turn_text(first_word_text)
-                ):
-                    queue_lane_segments(
-                        SpeechLaneDelta(
-                            text=response_text,
-                            lane="final" if first_word_text else "direct",
-                            replace_current=bool(first_word_text),
-                            atomic=True,
-                        )
+                if first_word_reply is not None and first_word_reply.mode == "direct":
+                    response = StreamingToolLoopResult(
+                        text=first_word_text,
+                        rounds=0,
+                        tool_calls=(),
+                        tool_results=(),
+                        response_id=first_word_reply.response_id,
+                        request_id=first_word_reply.request_id,
+                        model=first_word_reply.model,
+                        token_usage=first_word_reply.token_usage,
+                        used_web_search=False,
                     )
+                else:
+                    if not final_started.is_set():
+                        final_worker.start()
+
+                    final_done.wait()
+                    if final_error:
+                        raise final_error[0]
+                    response = response_holder["response"]
+                    response_text = str(getattr(response, "text", "") or "").strip()
+                    if response_text and (
+                        not first_word_text
+                        or _normalize_turn_text(response_text) != _normalize_turn_text(first_word_text)
+                    ):
+                        queue_lane_segments(
+                            SpeechLaneDelta(
+                                text=response_text,
+                                lane="final" if first_word_text else "direct",
+                                replace_current=bool(first_word_text),
+                                atomic=True,
+                            )
+                        )
             else:
                 response = self.streaming_turn_loop.run(
                     transcript,

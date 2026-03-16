@@ -378,35 +378,96 @@ class WaveshareEPD4In2V2:
         canvas_width: int,
         canvas_height: int,
     ) -> None:
-        footer_font = self._font(18, bold=False)
-        lines = self._normalise_details(details)[:1]
-        if not lines:
+        rows = self._footer_rows(details)
+        if not rows:
             return
+        if len(rows) == 1 and len(rows[0]) == 1:
+            self._draw_single_footer_line(
+                draw,
+                line=rows[0][0],
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+            )
+            return
+        self._draw_footer_grid(
+            draw,
+            rows=rows,
+            canvas_width=canvas_width,
+            canvas_height=canvas_height,
+        )
 
+    def _draw_single_footer_line(
+        self,
+        draw: object,
+        *,
+        line: str,
+        canvas_width: int,
+        canvas_height: int,
+    ) -> None:
+        footer_font = self._font(18, bold=False)
         divider_y = canvas_height - 54
         draw.line((28, divider_y, canvas_width - 28, divider_y), fill=0, width=2)
         text_y = divider_y + 8
-        for line in lines:
-            left_text, right_text = self._split_footer_parts(line)
-            right_width = self._text_width(draw, right_text, font=footer_font)
-            right_margin = 24
-            right_x = max(canvas_width - right_width - right_margin, 24)
-            single_line_left_width = max(right_x - 36, 120)
-            left_lines = self._wrap_footer_left(
-                draw,
-                left_text,
-                font=footer_font,
-                full_width=canvas_width - 48,
-                final_width=single_line_left_width,
-            )
-            line_height = self._text_height(draw, font=footer_font)
-            for index, left_line in enumerate(left_lines):
-                line_y = text_y + (index * (line_height + 2))
-                max_width = single_line_left_width if index == (len(left_lines) - 1) else (canvas_width - 48)
-                trimmed = self._truncate_text(draw, left_line, max_width=max_width, font=footer_font)
-                draw.text((24, line_y), trimmed, fill=0, font=footer_font)
-                if right_text and index == (len(left_lines) - 1):
-                    draw.text((right_x, line_y), right_text, fill=0, font=footer_font)
+        left_text, right_text = self._split_footer_parts(line)
+        right_width = self._text_width(draw, right_text, font=footer_font)
+        right_margin = 24
+        right_x = max(canvas_width - right_width - right_margin, 24)
+        single_line_left_width = max(right_x - 36, 120)
+        left_lines = self._wrap_footer_left(
+            draw,
+            left_text,
+            font=footer_font,
+            full_width=canvas_width - 48,
+            final_width=single_line_left_width,
+        )
+        line_height = self._text_height(draw, font=footer_font)
+        for index, left_line in enumerate(left_lines):
+            line_y = text_y + (index * (line_height + 2))
+            max_width = single_line_left_width if index == (len(left_lines) - 1) else (canvas_width - 48)
+            trimmed = self._truncate_text(draw, left_line, max_width=max_width, font=footer_font)
+            draw.text((24, line_y), trimmed, fill=0, font=footer_font)
+            if right_text and index == (len(left_lines) - 1):
+                draw.text((right_x, line_y), right_text, fill=0, font=footer_font)
+
+    def _draw_footer_grid(
+        self,
+        draw: object,
+        *,
+        rows: tuple[tuple[str, ...], ...],
+        canvas_width: int,
+        canvas_height: int,
+    ) -> None:
+        footer_font = self._font(16, bold=False)
+        line_height = self._text_height(draw, font=footer_font)
+        row_gap = 4
+        padding_top = 8
+        padding_bottom = 8
+        footer_height = padding_top + (len(rows) * line_height) + (max(len(rows) - 1, 0) * row_gap) + padding_bottom
+        divider_y = canvas_height - footer_height
+        draw.line((28, divider_y, canvas_width - 28, divider_y), fill=0, width=2)
+        text_y = divider_y + padding_top
+        left_x = 24
+        column_gap = 16
+        content_width = canvas_width - (left_x * 2)
+        column_width = max((content_width - column_gap) // 2, 96)
+        right_x = left_x + column_width + column_gap
+
+        for row_index, row in enumerate(rows):
+            line_y = text_y + (row_index * (line_height + row_gap))
+            left_text = self._truncate_text(draw, row[0], max_width=content_width if len(row) == 1 else column_width, font=footer_font)
+            draw.text((left_x, line_y), left_text, fill=0, font=footer_font)
+            if len(row) > 1:
+                right_text = self._truncate_text(draw, row[1], max_width=column_width, font=footer_font)
+                draw.text((right_x, line_y), right_text, fill=0, font=footer_font)
+
+    def _footer_rows(self, details: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+        lines = self._normalise_details(details)
+        if not lines:
+            return ()
+        if len(lines) == 1:
+            return ((lines[0],),)
+        capped = lines[:4]
+        return tuple(tuple(capped[index : index + 2]) for index in range(0, len(capped), 2))
 
     def _draw_eye(
         self,
