@@ -185,7 +185,11 @@ def _read_cpu_temperature_c() -> float | None:
 def _collect_service_health() -> tuple[ServiceHealth, ...]:
     service_specs = (
         ("web", "Web UI", "--run-web"),
-        ("conversation_loop", "Conversation loop", "--run-realtime-loop|--run-hardware-loop"),
+        (
+            "conversation_loop",
+            "Conversation loop",
+            "--run-realtime-loop|--run-hardware-loop|--run-streaming-loop",
+        ),
         ("display", "Display loop", "--run-display-loop"),
     )
     rows: list[ServiceHealth] = []

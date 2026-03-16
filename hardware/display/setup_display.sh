@@ -120,19 +120,20 @@ driver_url = "https://raw.githubusercontent.com/waveshareteam/e-Paper/master/Ras
 epdconfig = urllib.request.urlopen(epdconfig_url, timeout=20).read().decode("utf-8", "ignore")
 driver = urllib.request.urlopen(driver_url, timeout=20).read().decode("utf-8", "ignore")
 
-pin_replacements = {
-    "RST_PIN": f"RST_PIN  = {os.environ['RESET_GPIO']}",
-    "DC_PIN": f"DC_PIN   = {os.environ['DC_GPIO']}",
-    "CS_PIN": f"CS_PIN   = {os.environ['CS_GPIO']}",
-    "BUSY_PIN": f"BUSY_PIN = {os.environ['BUSY_GPIO']}",
+pin_values = {
+    "RST_PIN": os.environ["RESET_GPIO"],
+    "DC_PIN": os.environ["DC_GPIO"],
+    "CS_PIN": os.environ["CS_GPIO"],
+    "BUSY_PIN": os.environ["BUSY_GPIO"],
 }
 patched_lines = []
 for line in epdconfig.splitlines():
     stripped = line.strip()
     left, separator, _right = stripped.partition("=")
     key = left.strip()
-    if separator and key in pin_replacements:
-        patched_lines.append(pin_replacements[key])
+    if separator and key in pin_values:
+        indent = line[: len(line) - len(line.lstrip())]
+        patched_lines.append(f"{indent}{key:<8} = {pin_values[key]}")
         continue
     patched_lines.append(line)
 epdconfig = "\n".join(patched_lines) + "\n"

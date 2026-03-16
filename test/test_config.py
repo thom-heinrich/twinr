@@ -24,15 +24,31 @@ class TwinrConfigTests(unittest.TestCase):
             config = TwinrConfig.from_env(env_path)
 
         self.assertEqual(config.openai_search_model, "gpt-4o-mini-search-preview")
-        self.assertEqual(config.streaming_first_word_model, "gpt-4.1-nano")
+        self.assertEqual(config.streaming_first_word_model, "gpt-4o-mini")
         self.assertEqual(config.streaming_first_word_context_turns, 1)
         self.assertEqual(config.streaming_first_word_max_output_tokens, 32)
         self.assertEqual(config.streaming_first_word_prefetch_min_chars, 4)
         self.assertEqual(config.streaming_first_word_prefetch_wait_ms, 40)
+        self.assertEqual(config.streaming_first_word_final_lane_wait_ms, 900)
         self.assertEqual(config.streaming_supervisor_prefetch_min_chars, 8)
         self.assertEqual(config.streaming_supervisor_prefetch_wait_ms, 80)
         self.assertEqual(config.streaming_specialist_model, "gpt-4o-mini")
         self.assertEqual(config.streaming_specialist_reasoning_effort, "low")
+
+    def test_display_gpio_conflicts_reports_button_overlap(self) -> None:
+        config = TwinrConfig(
+            green_button_gpio=23,
+            yellow_button_gpio=24,
+            display_cs_gpio=8,
+            display_dc_gpio=25,
+            display_reset_gpio=17,
+            display_busy_gpio=24,
+        )
+
+        self.assertEqual(
+            config.display_gpio_conflicts(),
+            ("Display BUSY GPIO 24 collides with yellow button GPIO 24.",),
+        )
 
     def test_reads_openai_button_and_printer_settings_from_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

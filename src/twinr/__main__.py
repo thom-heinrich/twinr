@@ -127,11 +127,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _assert_pi_runtime_root(env_file: str | Path, *, command_name: str) -> None:
+def _uses_pi_runtime_root(env_file: str | Path) -> bool:
     env_path = Path(env_file).resolve()
     pi_root = Path("/twinr").resolve()
-    if pi_root not in env_path.parents and env_path != pi_root / ".env":
+    return pi_root in env_path.parents or env_path == pi_root / ".env"
+
+
+def _is_raspberry_pi_host() -> bool:
+    model_path = Path("/proc/device-tree/model")
+    try:
+        return "Raspberry Pi" in model_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+
+def _should_enable_display_companion(env_file: str | Path) -> bool:
+    return _uses_pi_runtime_root(env_file) and _is_raspberry_pi_host()
+
+
+def _assert_pi_runtime_root(env_file: str | Path, *, command_name: str) -> None:
+    if not _uses_pi_runtime_root(env_file):
         return
+    pi_root = Path("/twinr").resolve()
     cwd = Path.cwd().resolve()
     if cwd != pi_root:
         raise RuntimeError(
@@ -261,6 +278,7 @@ def main() -> int:
         if args.run_realtime_loop:
             _assert_pi_runtime_root(args.env_file, command_name="run-realtime-loop")
             from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
+            from twinr.display.companion import optional_display_companion
             from twinr.ops import loop_instance_lock
 
             loop = TwinrRealtimeHardwareLoop(
@@ -269,11 +287,13 @@ def main() -> int:
                 print_backend=backend,
             )
             with loop_instance_lock(config, "realtime-loop"):
-                return loop.run(duration_s=args.loop_duration)
+                with optional_display_companion(config, enabled=_should_enable_display_companion(args.env_file)):
+                    return loop.run(duration_s=args.loop_duration)
 
         if args.run_streaming_loop:
             _assert_pi_runtime_root(args.env_file, command_name="run-streaming-loop")
             from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
+            from twinr.display.companion import optional_display_companion
             from twinr.ops import loop_instance_lock
             from twinr.providers import build_streaming_provider_bundle
 
@@ -290,7 +310,8 @@ def main() -> int:
                 tool_agent_provider=provider_bundle.tool_agent,
             )
             with loop_instance_lock(config, "streaming-loop"):
-                return loop.run(duration_s=args.loop_duration)
+                with optional_display_companion(config, enabled=_should_enable_display_companion(args.env_file)):
+                    return loop.run(duration_s=args.loop_duration)
 
         if args.orchestrator_probe_turn:
             _assert_pi_runtime_root(args.env_file, command_name="orchestrator-probe-turn")
@@ -342,6 +363,7 @@ def main() -> int:
         if args.run_hardware_loop and backend is not None:
             _assert_pi_runtime_root(args.env_file, command_name="run-hardware-loop")
             from twinr.agent.workflows.runner import TwinrHardwareLoop
+            from twinr.display.companion import optional_display_companion
             from twinr.ops import loop_instance_lock
 
             loop = TwinrHardwareLoop(
@@ -350,7 +372,8 @@ def main() -> int:
                 backend=backend,
             )
             with loop_instance_lock(config, "hardware-loop"):
-                return loop.run(duration_s=args.loop_duration)
+                with optional_display_companion(config, enabled=_should_enable_display_companion(args.env_file)):
+                    return loop.run(duration_s=args.loop_duration)
 
         if args.audio_file and backend is not None:
             transcript = backend.transcribe_path(args.audio_file)

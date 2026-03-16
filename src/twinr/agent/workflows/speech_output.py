@@ -61,6 +61,7 @@ class InterruptibleSpeechOutput:
         self._segment_lock = Lock()
         self._error_lock = Lock()
         self._first_audio_lock = Lock()
+        self._first_audio_event = Event()
         self._answer_started = False
         self._first_audio_emitted = False
         self._errors: list[Exception] = []
@@ -86,6 +87,11 @@ class InterruptibleSpeechOutput:
         self._worker.join(timeout=timeout_s)
         if self._worker.is_alive():
             raise RuntimeError("Text-to-speech playback worker did not exit before timeout")
+
+    def wait_for_first_audio(self, *, timeout_s: float | None = None) -> bool:
+        if self._first_audio_event.is_set():
+            return True
+        return self._first_audio_event.wait(timeout=timeout_s)
 
     def raise_if_error(self) -> None:
         with self._error_lock:
@@ -177,6 +183,7 @@ class InterruptibleSpeechOutput:
                 with self._first_audio_lock:
                     if not self._first_audio_emitted:
                         self._first_audio_emitted = True
+                        self._first_audio_event.set()
                         if self.on_first_audio is not None:
                             self.on_first_audio()
                 yield chunk

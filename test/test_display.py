@@ -1,3 +1,4 @@
+import builtins
 from pathlib import Path
 import sys
 import tempfile
@@ -10,6 +11,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.display import WaveshareEPD4In2V2
+from twinr.config import TwinrConfig
 
 
 def _prepared_image(width: int = 300, height: int = 400):
@@ -123,6 +125,88 @@ class WaveshareDisplayTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "do not match Twinr config"):
                 display._load_driver_module()
+
+    def test_from_config_rejects_display_gpio_collision(self) -> None:
+        config = TwinrConfig(
+            project_root=".",
+            green_button_gpio=23,
+            yellow_button_gpio=24,
+            display_busy_gpio=24,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Display BUSY GPIO 24 collides with yellow button GPIO 24.",
+        ):
+            WaveshareEPD4In2V2.from_config(config)
+
+    def test_load_driver_module_releases_failed_vendor_import_before_retry(self) -> None:
+        sentinel_name = "__twinr_display_vendor_pin_busy__"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            vendor_dir = Path(temp_dir) / "vendor" / "waveshare_epd"
+            vendor_dir.mkdir(parents=True)
+            (vendor_dir / "__init__.py").write_text("", encoding="utf-8")
+            (vendor_dir / "epdconfig.py").write_text(
+                textwrap.dedent(
+                    f"""
+                    import builtins
+
+                    _SENTINEL = "{sentinel_name}"
+                    if getattr(builtins, _SENTINEL, False):
+                        raise RuntimeError("pin busy")
+                    setattr(builtins, _SENTINEL, True)
+
+                    RST_PIN = 17
+                    DC_PIN = 25
+                    CS_PIN = 8
+                    BUSY_PIN = 24
+                    PWR_PIN = 18
+
+                    def module_exit(cleanup=False):
+                        setattr(builtins, _SENTINEL, False)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            driver_path = vendor_dir / "epd4in2_V2.py"
+            driver_path.write_text(
+                textwrap.dedent(
+                    """
+                    from . import epdconfig
+
+                    raise RuntimeError("driver import failed")
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            display = WaveshareEPD4In2V2(
+                project_root=Path(temp_dir),
+                vendor_dir=Path(temp_dir) / "vendor",
+            )
+
+            try:
+                with self.assertRaisesRegex(RuntimeError, "failed to import"):
+                    display._load_driver_module()
+
+                driver_path.write_text(
+                    textwrap.dedent(
+                        """
+                        from . import epdconfig
+
+                        class EPD:
+                            pass
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+
+                module = display._load_driver_module()
+
+                self.assertTrue(hasattr(module, "EPD"))
+            finally:
+                if hasattr(builtins, sentinel_name):
+                    delattr(builtins, sentinel_name)
 
     def test_show_image_calls_vendor_driver_methods(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

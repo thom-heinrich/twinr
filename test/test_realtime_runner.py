@@ -35,6 +35,7 @@ from twinr.providers.openai import OpenAITextResponse
 from twinr.providers.openai.realtime import OpenAIRealtimeTurn
 from twinr.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.runtime import TwinrRuntime
+from twinr.state_machine import TwinrStatus
 from twinr.agent.base_agent.conversation_closure import ConversationClosureDecision
 from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample
 
@@ -1109,6 +1110,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop.runtime.last_response = "Guten Tag"
 
         loop.handle_button_press("yellow")
+        loop.wait_for_print_lane_idle()
 
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(printer.printed, ["GUTEN TAG"])
@@ -1179,13 +1181,15 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop.runtime.last_response = "Guten Tag"
 
         loop.handle_button_press("yellow")
+        loop.wait_for_print_lane_idle()
 
         self.assertEqual(len(print_backend.calls), 1)
         self._assert_language_contract_only(print_backend.calls[0][0])
         self.assertEqual(print_backend.calls[0][1:], (None, "Guten Tag", "button"))
         self.assertEqual(printer.printed, ["GUTEN TAG"])
-        self.assertIn("status=printing", lines)
-        self.assertEqual(lines[-1], "status=waiting")
+        self.assertEqual(loop.runtime.status, TwinrStatus.WAITING)
+        self.assertIn("print_lane=queued", lines)
+        self.assertIn("print_lane=completed", lines)
 
     def test_yellow_button_uses_printing_feedback(self) -> None:
         loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
@@ -1199,8 +1203,112 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop._start_working_feedback_loop = fake_start  # type: ignore[method-assign]
 
         loop.handle_button_press("yellow")
+        loop.wait_for_print_lane_idle()
 
         self.assertEqual(feedback_kinds, ["printing"])
+
+    def test_yellow_button_print_lane_returns_before_slow_print_finishes(self) -> None:
+        from threading import Event, Thread
+
+        class SlowPrintBackend(FakePrintBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.entered = Event()
+                self.release = Event()
+
+            def compose_print_job_with_metadata(self, *, conversation=None, focus_hint=None, direct_text=None, request_source="button"):
+                self.calls.append((conversation, focus_hint, direct_text, request_source))
+                self.entered.set()
+                self.release.wait(1.0)
+                return OpenAITextResponse(text="GUTEN TAG")
+
+        backend = SlowPrintBackend()
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, printer = self.make_loop(
+            print_backend=backend,
+            stt_provider=backend,
+            agent_provider=backend,
+            tts_provider=backend,
+        )
+        loop.runtime.last_response = "Guten Tag"
+        completed = Event()
+
+        def press_button() -> None:
+            loop.handle_button_press("yellow")
+            completed.set()
+
+        caller = Thread(target=press_button, daemon=True)
+        caller.start()
+
+        self.assertTrue(backend.entered.wait(0.3))
+        self.assertTrue(completed.wait(0.3))
+        self.assertEqual(printer.printed, [])
+
+        backend.release.set()
+        self.assertTrue(loop.wait_for_print_lane_idle(timeout_s=1.0))
+        caller.join(timeout=1.0)
+        self.assertEqual(printer.printed, ["GUTEN TAG"])
+
+    def test_green_button_can_run_while_print_lane_is_busy(self) -> None:
+        from threading import Event, Thread
+
+        class SlowPrintBackend(FakePrintBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.entered = Event()
+                self.release = Event()
+
+            def compose_print_job_with_metadata(self, *, conversation=None, focus_hint=None, direct_text=None, request_source="button"):
+                self.calls.append((conversation, focus_hint, direct_text, request_source))
+                self.entered.set()
+                self.release.wait(1.0)
+                return OpenAITextResponse(text="GUTEN TAG")
+
+        backend = SlowPrintBackend()
+        loop, _lines, realtime_session, _print_backend, _recorder, _player, printer = self.make_loop(
+            print_backend=backend,
+        )
+        loop.runtime.last_response = "Guten Tag"
+
+        caller = Thread(target=lambda: loop.handle_button_press("yellow"), daemon=True)
+        caller.start()
+        self.assertTrue(backend.entered.wait(0.3))
+        self.assertTrue(loop.print_lane.is_busy())
+        self.assertEqual(loop.runtime.status, TwinrStatus.WAITING)
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
+        self.assertEqual(loop.runtime.status, TwinrStatus.WAITING)
+        backend.release.set()
+        self.assertTrue(loop.wait_for_print_lane_idle(timeout_s=1.0))
+        caller.join(timeout=1.0)
+        self.assertEqual(printer.printed, ["GUTEN TAG"])
+
+    def test_print_lane_failure_is_nonfatal(self) -> None:
+        class FailingPrintBackend(FakePrintBackend):
+            def compose_print_job_with_metadata(self, *, conversation=None, focus_hint=None, direct_text=None, request_source="button"):
+                self.calls.append((conversation, focus_hint, direct_text, request_source))
+                raise RuntimeError("printer compose failed")
+
+        backend = FailingPrintBackend()
+        loop, lines, realtime_session, _print_backend, _recorder, _player, printer = self.make_loop(
+            print_backend=backend,
+        )
+        loop.runtime.last_response = "Guten Tag"
+
+        loop.handle_button_press("yellow")
+        self.assertTrue(loop.wait_for_print_lane_idle(timeout_s=1.0))
+
+        self.assertEqual(printer.printed, [])
+        self.assertEqual(loop.runtime.status, TwinrStatus.WAITING)
+        self.assertIn("print_lane=failed", lines)
+        self.assertTrue(any(line.endswith("printer compose failed") for line in lines if line.startswith("print_error=")))
+        self.assertNotIn("status=error", lines)
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
+        self.assertEqual(loop.runtime.status, TwinrStatus.WAITING)
 
     def test_follow_up_turn_beeps_again_and_stops_on_timeout(self) -> None:
         config = TwinrConfig(

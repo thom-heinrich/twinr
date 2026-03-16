@@ -303,6 +303,35 @@ class TwinrRuntimeFlowMixin:
         )
         return last_response
 
+    def prepare_background_button_print_request(self) -> str:
+        with self._runtime_flow_lock():
+            last_response = getattr(self, "last_response", None)
+            if not isinstance(last_response, str) or not last_response.strip():
+                raise RuntimeError("No assistant response is available for printing")
+
+            event_data = {
+                "button": "yellow",
+                "request_source": "button",
+                "background": True,
+                "status": self.state_machine.status.value,
+                "response_preview": self._content_preview(last_response),
+                "response_chars": len(last_response),
+            }
+
+        self._append_ops_event(
+            event="print_started",
+            message="Yellow button queued a background print.",
+            data=event_data,
+        )
+        self._enqueue_multimodal_evidence_safe(
+            event_name="button_interaction",
+            modality="button",
+            source="runtime_button",
+            message="Yellow button queued a printed answer in the background.",
+            data={"button": "yellow", "action": "background_print_request"},
+        )
+        return last_response
+
     def begin_tool_print(self) -> TwinrStatus:
         with self._runtime_flow_lock():  # AUDIT-FIX(#5): Serialize print state with other runtime actions.
             status = self.state_machine.transition(TwinrEvent.PRINT_REQUESTED)

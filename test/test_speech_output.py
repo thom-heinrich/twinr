@@ -108,3 +108,25 @@ class InterruptibleSpeechOutputTests(unittest.TestCase):
         self.assertLess(len(player.played[0]), len(b"FILLER-1FILLER-2FILLER-3"))
         self.assertEqual(tts_provider.calls, ["Ich schaue kurz nach.", "Heute wird es trocken und kühl."])
         self.assertTrue(any(b"FINAL-1" in payload for payload in player.played))
+
+    def test_wait_for_first_audio_observes_first_chunk(self) -> None:
+        tts_provider = SlowTTSProvider()
+        player = InterruptiblePlayer()
+
+        output = InterruptibleSpeechOutput(
+            tts_provider=tts_provider,
+            player=player,
+            chunk_size=512,
+            segment_boundary=lambda text: len(text) if text.strip() else None,
+        )
+
+        output.submit_lane_delta(
+            SpeechLaneDelta(
+                text="Ich schaue kurz nach.",
+                lane="filler",
+            )
+        )
+
+        self.assertTrue(output.wait_for_first_audio(timeout_s=1.0))
+        output.close(timeout_s=2.0)
+        output.raise_if_error()

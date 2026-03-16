@@ -194,6 +194,19 @@ class OpsModuleTests(unittest.TestCase):
         by_key = {check.key: check for check in checks}
         self.assertEqual(by_key["pir"].status, "fail")
 
+    def test_run_config_checks_rejects_display_button_collision(self) -> None:
+        config = TwinrConfig(
+            green_button_gpio=23,
+            yellow_button_gpio=24,
+            display_busy_gpio=24,
+        )
+
+        checks = run_config_checks(config)
+
+        by_key = {check.key: check for check in checks}
+        self.assertEqual(by_key["display_gpio"].status, "fail")
+        self.assertIn("Display BUSY GPIO 24 collides with yellow button GPIO 24.", by_key["display_gpio"].detail)
+
     def test_pir_self_test_succeeds_with_motion_event(self) -> None:
         class FakePirMonitor:
             def __enter__(self):

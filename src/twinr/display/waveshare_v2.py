@@ -61,6 +61,11 @@ class WaveshareEPD4In2V2:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "WaveshareEPD4In2V2":
+        conflicts = config.display_gpio_conflicts()
+        if conflicts:
+            raise RuntimeError(
+                "Display GPIO configuration is invalid: " + "; ".join(conflicts)
+            )
         return cls(
             project_root=Path(config.project_root),
             # AUDIT-FIX(#1): Keep the raw configured vendor path and let __post_init__ resolve it safely against project_root.
@@ -241,24 +246,25 @@ class WaveshareEPD4In2V2:
         driver_path = package_dir / "epd4in2_V2.py"
 
         with _IMPORT_LOCK:
+            epdconfig_module = None
             self._load_exact_vendor_module(
                 module_name="waveshare_epd",
                 module_path=package_init,
                 is_package=True,
             )
-            self._load_exact_vendor_module(
+            epdconfig_module = self._load_exact_vendor_module(
                 module_name="waveshare_epd.epdconfig",
                 module_path=epdconfig_path,
             )
-            self._load_exact_vendor_module(
-                module_name="waveshare_epd.epd4in2_V2",
-                module_path=driver_path,
-            )
-
             try:
+                self._load_exact_vendor_module(
+                    module_name="waveshare_epd.epd4in2_V2",
+                    module_path=driver_path,
+                )
                 epdconfig = import_module("waveshare_epd.epdconfig")
                 module = import_module("waveshare_epd.epd4in2_V2")
             except Exception as exc:
+                self._cleanup_failed_vendor_import(epdconfig_module)
                 raise RuntimeError(
                     "Display vendor files are incomplete or failed to import. "
                     "Run `hardware/display/setup_display.sh` again."
@@ -269,6 +275,21 @@ class WaveshareEPD4In2V2:
         self._epdconfig_module = epdconfig
         self._driver_module = module
         return module
+
+    def _cleanup_failed_vendor_import(self, epdconfig_module: object | None) -> None:
+        cleanup = getattr(epdconfig_module, "module_exit", None)
+        if callable(cleanup):
+            with suppress(Exception):
+                cleanup(cleanup=True)
+        self._epdconfig_module = None
+        self._driver_module = None
+        self._epd = None
+        for module_name in (
+            "waveshare_epd.epd4in2_V2",
+            "waveshare_epd.epdconfig",
+            "waveshare_epd",
+        ):
+            sys.modules.pop(module_name, None)
 
     def _validate_vendor_config(self, epdconfig: object) -> None:
         expected = {

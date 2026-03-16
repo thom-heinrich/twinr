@@ -28,6 +28,7 @@ def run_config_checks(config: TwinrConfig) -> tuple[ConfigCheck, ...]:
         _printer_check(config),
         _camera_check(config),
         _gpio_check(config),
+        _display_gpio_check(config),
         _pir_check(config),
         _runtime_state_check(config),
     )
@@ -216,6 +217,27 @@ def _gpio_check(config: TwinrConfig) -> ConfigCheck:
             f"Only part of the button mapping is configured: {gpios}.",
         )
     return ConfigCheck("gpio", "GPIO buttons", "fail", "No green/yellow button GPIOs are configured.")
+
+
+def _display_gpio_check(config: TwinrConfig) -> ConfigCheck:
+    conflicts = config.display_gpio_conflicts()
+    if conflicts:
+        return ConfigCheck(
+            "display_gpio",
+            "Display GPIO",
+            "fail",
+            "; ".join(conflicts),
+        )
+    return ConfigCheck(
+        "display_gpio",
+        "Display GPIO",
+        "ok",
+        (
+            f"Display pins are configured as "
+            f"CS={config.display_cs_gpio}, DC={config.display_dc_gpio}, "
+            f"RESET={config.display_reset_gpio}, BUSY={config.display_busy_gpio}."
+        ),
+    )
 
 
 def _pir_check(config: TwinrConfig) -> ConfigCheck:
