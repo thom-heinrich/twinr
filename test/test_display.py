@@ -81,6 +81,61 @@ class WaveshareDisplayTests(unittest.TestCase):
 
         self.assertEqual(lines, ("Internet ok | AI ok", "System ok"))
 
+    def test_footer_rows_keep_all_health_details(self) -> None:
+        display = WaveshareEPD4In2V2(
+            project_root=Path("."),
+            vendor_dir=Path("hardware/display/vendor"),
+            width=400,
+            height=300,
+            rotation_degrees=270,
+        )
+
+        rows = display._footer_rows(("Internet ok", "AI ok", "System ok", "Zeit 12:34"))
+
+        self.assertEqual(
+            rows,
+            (
+                ("Internet ok", "AI ok"),
+                ("System ok", "Zeit 12:34"),
+            ),
+        )
+
+    def test_render_status_image_uses_second_footer_row_for_multiple_details(self) -> None:
+        display = WaveshareEPD4In2V2(
+            project_root=Path("."),
+            vendor_dir=Path("hardware/display/vendor"),
+            width=400,
+            height=300,
+            rotation_degrees=270,
+        )
+
+        one_line = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok",),
+            animation_frame=0,
+        )
+        multi_line = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok", "System ok", "Zeit 12:34"),
+            animation_frame=0,
+        )
+
+        one_line_lower = one_line.crop((24, 270, 376, 296))
+        multi_line_lower = multi_line.crop((24, 270, 376, 296))
+        one_line_right = one_line.crop((210, 248, 376, 296))
+        multi_line_right = multi_line.crop((210, 248, 376, 296))
+
+        self.assertGreater(
+            sum(1 for pixel in multi_line_lower.getdata() if pixel == 0),
+            sum(1 for pixel in one_line_lower.getdata() if pixel == 0),
+        )
+        self.assertGreater(
+            sum(1 for pixel in multi_line_right.getdata() if pixel == 0),
+            sum(1 for pixel in one_line_right.getdata() if pixel == 0),
+        )
+
     def test_prepare_image_applies_configured_rotation(self) -> None:
         display = WaveshareEPD4In2V2(
             project_root=Path("."),

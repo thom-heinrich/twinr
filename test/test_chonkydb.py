@@ -256,6 +256,19 @@ class ChonkyDBClientTests(unittest.TestCase):
         self.assertEqual(error.status_code, 400)
         self.assertEqual(error.response_json, {"type": "validation_error", "detail": "bad request"})
 
+    def test_fetch_full_document_accepts_large_snapshot_payload_within_8_mib_limit(self) -> None:
+        opener = FakeOpener()
+        opener.queue_json({"success": True, "content": "x" * (5 * 1024 * 1024)})
+        client = ChonkyDBClient(
+            ChonkyDBConnectionConfig(base_url="https://memory.test"),
+            opener=opener,
+        )
+
+        payload = client.fetch_full_document(document_id="doc-7")
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(len(payload["content"]), 5 * 1024 * 1024)
+
     def test_fetch_full_document_requires_identifier(self) -> None:
         client = ChonkyDBClient(ChonkyDBConnectionConfig(base_url="https://memory.test"), opener=FakeOpener())
 
