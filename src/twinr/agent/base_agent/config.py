@@ -183,13 +183,14 @@ class TwinrConfig:
     streaming_early_transcript_wait_ms: int = 250
     streaming_dual_lane_enabled: bool = True
     streaming_first_word_enabled: bool = True
-    streaming_first_word_model: str = "gpt-4.1-nano"
+    streaming_first_word_model: str = "gpt-4o-mini"
     streaming_first_word_reasoning_effort: str = ""
     streaming_first_word_context_turns: int = 1
     streaming_first_word_max_output_tokens: int = 32
     streaming_first_word_prefetch_enabled: bool = True
     streaming_first_word_prefetch_min_chars: int = 4
     streaming_first_word_prefetch_wait_ms: int = 40
+    streaming_first_word_final_lane_wait_ms: int = 900
     streaming_supervisor_model: str = "gpt-4o-mini"
     streaming_supervisor_reasoning_effort: str = "low"
     streaming_supervisor_context_turns: int = 4
@@ -460,6 +461,46 @@ class TwinrConfig:
         return mapping
 
     @property
+    def display_gpios(self) -> dict[str, int]:
+        return {
+            "Display CS": self.display_cs_gpio,
+            "Display DC": self.display_dc_gpio,
+            "Display RESET": self.display_reset_gpio,
+            "Display BUSY": self.display_busy_gpio,
+        }
+
+    def display_gpio_conflicts(self) -> tuple[str, ...]:
+        assignments: list[tuple[str, int]] = list(self.display_gpios.items())
+        if self.green_button_gpio is not None:
+            assignments.append(("green button", self.green_button_gpio))
+        if self.yellow_button_gpio is not None:
+            assignments.append(("yellow button", self.yellow_button_gpio))
+        if self.pir_motion_gpio is not None:
+            assignments.append(("PIR sensor", self.pir_motion_gpio))
+
+        labels_by_line: dict[int, list[str]] = {}
+        for label, line in assignments:
+            labels_by_line.setdefault(line, []).append(label)
+
+        conflicts: list[str] = []
+        for line, labels in sorted(labels_by_line.items()):
+            if len(labels) < 2:
+                continue
+            display_labels = [label for label in labels if label.startswith("Display ")]
+            other_labels = [label for label in labels if not label.startswith("Display ")]
+            if other_labels:
+                for display_label in display_labels:
+                    for other_label in other_labels:
+                        conflicts.append(
+                            f"{display_label} GPIO {line} collides with {other_label} GPIO {line}."
+                        )
+                continue
+            for index, left in enumerate(display_labels):
+                for right in display_labels[index + 1 :]:
+                    conflicts.append(f"{left} GPIO {line} collides with {right} GPIO {line}.")
+        return tuple(conflicts)
+
+    @property
     def pir_enabled(self) -> bool:
         return self.pir_motion_gpio is not None
 
@@ -608,7 +649,7 @@ class TwinrConfig:
                 True,
             ),
             streaming_first_word_model=(
-                get_value("TWINR_STREAMING_FIRST_WORD_MODEL", "gpt-4.1-nano") or "gpt-4.1-nano"
+                get_value("TWINR_STREAMING_FIRST_WORD_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
             ),
             streaming_first_word_reasoning_effort=(
                 get_value("TWINR_STREAMING_FIRST_WORD_REASONING_EFFORT", "") or ""
@@ -632,6 +673,10 @@ class TwinrConfig:
             streaming_first_word_prefetch_wait_ms=max(
                 0,
                 int(get_value("TWINR_STREAMING_FIRST_WORD_PREFETCH_WAIT_MS", "40") or "40"),
+            ),
+            streaming_first_word_final_lane_wait_ms=max(
+                0,
+                int(get_value("TWINR_STREAMING_FIRST_WORD_FINAL_LANE_WAIT_MS", "900") or "900"),
             ),
             streaming_supervisor_model=(
                 get_value("TWINR_STREAMING_SUPERVISOR_MODEL", "gpt-4o-mini") or "gpt-4o-mini"

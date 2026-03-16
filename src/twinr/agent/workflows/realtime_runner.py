@@ -46,6 +46,7 @@ from twinr.providers.openai import OpenAIProviderBundle
 from twinr.providers.factory import build_streaming_provider_bundle
 from twinr.providers.openai.realtime import OpenAIRealtimeSession
 from twinr.agent.workflows.realtime_runner_background import TwinrRealtimeBackgroundMixin
+from twinr.agent.workflows.print_lane import PrintLaneRequest, TwinrPrintLane
 from twinr.agent.workflows.realtime_runner_support import TwinrRealtimeSupportMixin, _default_emit
 from twinr.agent.workflows.realtime_runner_tools import TwinrRealtimeToolDelegatesMixin
 
@@ -180,6 +181,17 @@ class TwinrRealtimeHardwareLoop(
         self._wakeword_ack_wav_bytes: bytes | None = None
         self._wakeword_ack_prefetch_started = False
         self._wakeword_ack_prefetch_thread: Thread | None = None
+        self.print_lane = TwinrPrintLane(
+            backend=self.print_backend,
+            printer=self.printer,
+            emit=self.emit,
+            record_event=self._record_event,
+            record_usage=self._record_usage,
+            start_feedback_loop=lambda kind: self._start_working_feedback_loop(kind),
+            format_exception=self._safe_error_text,
+            on_print_submitted=self._mark_print_submitted,
+            enqueue_multimodal_evidence=self.runtime.long_term_memory.enqueue_multimodal_evidence,
+        )
         self.proactive_monitor = proactive_monitor or build_default_proactive_monitor(
             config=config,
             runtime=self.runtime,
@@ -258,6 +270,8 @@ class TwinrRealtimeHardwareLoop(
                 housekeeping_thread.join(timeout=max(0.5, safe_poll_timeout + 0.25))
 
     def _run_idle_housekeeping_cycle(self) -> bool:
+        if self.print_lane.is_busy():
+            return False
         if self._maybe_deliver_due_reminder():
             return True
         if self._maybe_run_due_automation():
@@ -286,6 +300,12 @@ class TwinrRealtimeHardwareLoop(
         thread = Thread(target=worker, daemon=True, name="twinr-realtime-housekeeping")
         thread.start()
         return stop_event, thread
+
+    def wait_for_print_lane_idle(self, timeout_s: float = 1.0) -> bool:
+        return self.print_lane.wait_for_idle(timeout_s=timeout_s)
+
+    def _mark_print_submitted(self) -> None:
+        self._last_print_request_at = time.monotonic()
 
     def handle_button_press(self, button_name: str) -> None:
         try:
@@ -1287,55 +1307,28 @@ class TwinrRealtimeHardwareLoop(
             self.emit("print_skipped=cooldown")
             self._record_event("print_skipped", "Print request ignored because cooldown is active.")
             return
-        stop_printing_feedback: Callable[[], None] = lambda: None
         try:
-            response_to_print = self.runtime.press_yellow_button()
-            self._emit_status(force=True)
-            stop_printing_feedback = self._start_working_feedback_loop("printing")
-            composed = self.agent_provider.compose_print_job_with_metadata(
-                conversation=self.runtime.provider_conversation_context(),
+            if self.print_lane.is_busy():
+                self.emit("print_skipped=busy")
+                self._record_event("print_skipped", "Print request ignored because another print job is already in progress.")
+                return
+            response_to_print = self.runtime.prepare_background_button_print_request()
+            conversation = self.runtime.provider_conversation_context()
+            request = PrintLaneRequest(
+                conversation=conversation,
                 focus_hint=self.runtime.last_transcript,
                 direct_text=response_to_print,
                 request_source="button",
+                usage_source="realtime_loop",
+                printer_queue=self.config.printer_queue,
+                multimodal_source="realtime_print",
             )
-            print_job = self.printer.print_text(composed.text)
-            self._last_print_request_at = time.monotonic()  # AUDIT-FIX(#6): Record cooldown immediately after a successful printer submission.
-            self.emit(f"print_text={composed.text}")
-            if composed.response_id:
-                self.emit(f"print_response_id={composed.response_id}")
-            self._record_usage(
-                request_kind="print",
-                source="realtime_loop",
-                model=composed.model,
-                response_id=composed.response_id,
-                request_id=composed.request_id,
-                used_web_search=False,
-                token_usage=composed.token_usage,
-                request_source="button",
-            )
-            if print_job:
-                self.emit(f"print_job={print_job}")
-            self._record_event(
-                "print_job_sent",
-                "Print job was sent to the configured printer.",
-                queue=self.config.printer_queue,
-                job=print_job,
-            )
-            try:
-                self.runtime.long_term_memory.enqueue_multimodal_evidence(
-                    event_name="print_completed",
-                    modality="printer",
-                    source="realtime_print",
-                    message="Printed Twinr output was delivered from the realtime loop.",
-                    data={
-                        "request_source": "button",
-                        "queue": self.config.printer_queue,
-                        "job": print_job or "",
-                    },
-                )
-            except Exception as exc:
-                self.emit(f"print_memory_enqueue_failed={type(exc).__name__}")  # AUDIT-FIX(#5): Memory backfill is secondary and must not turn a completed print into a user-visible failure.
-        finally:
-            stop_printing_feedback()
-            self.runtime.finish_printing()  # AUDIT-FIX(#6): Always clear the printing state, even when entering or sending the print job fails.
+            if not self.print_lane.submit(request):
+                self.emit("print_skipped=busy")
+                self._record_event("print_skipped", "Print request could not be queued because another print job won the race.")
+                return
+            self.emit("print_lane=queued")
             self._emit_status(force=True)
+        except Exception:
+            self._emit_status(force=True)
+            raise

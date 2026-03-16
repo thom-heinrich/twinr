@@ -139,12 +139,10 @@ def _encode_uri_path_segment(value: str) -> str:
     return quote(value, safe="")
 
 
-@dataclass(frozen=True, slots=True)
 class LongTermRemoteUnavailableError(RuntimeError):
-    message: str
-
-    def __post_init__(self) -> None:  # AUDIT-FIX(#10): Initialize RuntimeError.args for normal exception semantics.
-        RuntimeError.__init__(self, self.message)
+    def __init__(self, message: str) -> None:  # AUDIT-FIX(#10): Keep normal exception semantics so traceback chaining works.
+        self.message = str(message)
+        super().__init__(self.message)
 
     def __str__(self) -> str:
         return self.message

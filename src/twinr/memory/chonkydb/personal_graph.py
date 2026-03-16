@@ -51,6 +51,7 @@ _CONTACT_METHOD_QUERY_TOKENS = frozenset(
         "rufen",
         "sms",
         "telefon",
+        "telefonnummer",
         "text",
         "write",
     }

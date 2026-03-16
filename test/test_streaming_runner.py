@@ -23,7 +23,12 @@ from twinr.memory.longterm.models import (
     LongTermMemoryObjectV1,
     LongTermSourceRefV1,
 )
-from twinr.providers.openai import OpenAITextResponse
+from twinr.providers.openai import (
+    OpenAIBackend,
+    OpenAIFirstWordProvider,
+    OpenAIToolCallingAgentProvider,
+    OpenAITextResponse,
+)
 from twinr.runtime import TwinrRuntime
 
 
@@ -257,6 +262,16 @@ class FakeTextToSpeechProvider:
         yield b"FF"
 
 
+class TraceTextToSpeechProvider(FakeTextToSpeechProvider):
+    def __init__(self, config: TwinrConfig, trace: list[str]) -> None:
+        super().__init__(config)
+        self.trace = trace
+
+    def synthesize_stream(self, text: str, **kwargs):
+        self.trace.append(f"tts_start:{text}")
+        yield from super().synthesize_stream(text, **kwargs)
+
+
 class FakePlayer:
     def __init__(self) -> None:
         self.played: list[bytes] = []
@@ -373,6 +388,50 @@ class StubSupervisorDecision:
 
 
 class StreamingRunnerTests(unittest.TestCase):
+    def test_openai_dual_lane_uses_separate_backends_per_lane(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                llm_provider="openai",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            loop = object.__new__(TwinrStreamingHardwareLoop)
+            loop.config = config
+            loop.tool_agent_provider = OpenAIToolCallingAgentProvider(
+                OpenAIBackend(config=config, client=SimpleNamespace()),
+            )
+            loop._tool_handlers = {}
+            loop.first_word_provider = None
+            tool_schemas = ()
+            streaming_turn_loop = TwinrStreamingHardwareLoop._build_streaming_turn_loop(
+                loop,
+                tool_schemas=tool_schemas,
+            )
+
+        self.assertIsInstance(streaming_turn_loop, DualLaneToolLoop)
+        self.assertIsInstance(loop.first_word_provider, OpenAIFirstWordProvider)
+        self.assertIsInstance(streaming_turn_loop.supervisor_provider, OpenAIToolCallingAgentProvider)
+        self.assertIsInstance(streaming_turn_loop.specialist_provider, OpenAIToolCallingAgentProvider)
+        self.assertIsNot(
+            loop.first_word_provider.backend,
+            streaming_turn_loop.specialist_provider.backend,
+        )
+        self.assertIsNot(
+            loop.first_word_provider.backend,
+            streaming_turn_loop.supervisor_provider.backend,
+        )
+        self.assertIsNot(
+            streaming_turn_loop.supervisor_provider.backend,
+            streaming_turn_loop.specialist_provider.backend,
+        )
+        self.assertIsNotNone(streaming_turn_loop.supervisor_decision_provider)
+        self.assertIsNot(
+            streaming_turn_loop.supervisor_decision_provider.backend,
+            streaming_turn_loop.specialist_provider.backend,
+        )
+
     def test_text_turn_executes_tool_calls_and_streams_tts(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -848,6 +907,67 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertTrue(keep_listening)
         self.assertEqual(tts_provider.stream_calls, ["Ja, alles gut."])
         self.assertEqual(runtime.last_response, "Ja, alles gut.")
+
+    def test_final_lane_waits_for_first_audio_gate(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            trace: list[str] = []
+            tts_provider = TraceTextToSpeechProvider(config, trace)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=tts_provider,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            loop.first_word_provider = FakeFirstWordProvider(
+                config,
+                reply=FirstWordReply(mode="filler", spoken_text="Ich schaue kurz nach."),
+            )
+
+            def fake_final_response(transcript: str, *, turn_instructions: str | None):
+                del transcript, turn_instructions
+                trace.append("final_start")
+                return SimpleNamespace(
+                    text="Heute wird es sonnig.",
+                    response_id="resp_final",
+                    request_id="req_final",
+                    rounds=1,
+                    tool_calls=(),
+                    used_web_search=True,
+                    model="gpt-4o-mini",
+                    token_usage=None,
+                )
+
+            loop._run_dual_lane_final_response = fake_final_response  # type: ignore[method-assign]
+
+            keep_listening = loop._run_single_text_turn(
+                transcript="Wie ist das Wetter heute?",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertLess(
+            trace.index("tts_start:Ich schaue kurz nach."),
+            trace.index("final_start"),
+        )
 
     def test_dual_lane_streaming_runner_passes_slim_supervisor_context(self) -> None:
         with TemporaryDirectory() as temp_dir:

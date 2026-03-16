@@ -155,29 +155,32 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 if name in supervisor_tool_names
             }
             supervisor_tool_schemas = build_agent_tool_schemas(supervisor_tool_names)
-            backend = OpenAIBackend(config=self.config)
+            supervisor_backend = OpenAIBackend(config=self.config)
+            supervisor_decision_backend = OpenAIBackend(config=self.config)
+            specialist_backend = OpenAIBackend(config=self.config)
+            first_word_backend = OpenAIBackend(config=self.config)
             supervisor_provider = OpenAIToolCallingAgentProvider(
-                backend,
+                supervisor_backend,
                 model_override=self.config.streaming_supervisor_model,
                 reasoning_effort_override=self.config.streaming_supervisor_reasoning_effort,
                 base_instructions_override=load_supervisor_loop_instructions(self.config),
                 replace_base_instructions=True,
             )
             supervisor_decision_provider = OpenAISupervisorDecisionProvider(
-                backend,
+                supervisor_decision_backend,
                 model_override=self.config.streaming_supervisor_model,
                 reasoning_effort_override=self.config.streaming_supervisor_reasoning_effort,
                 base_instructions_override=load_supervisor_loop_instructions(self.config),
                 replace_base_instructions=True,
             )
             specialist_provider = OpenAIToolCallingAgentProvider(
-                backend,
+                specialist_backend,
                 model_override=self.config.streaming_specialist_model,
                 reasoning_effort_override=self.config.streaming_specialist_reasoning_effort,
             )
             if self.config.streaming_first_word_enabled:
                 self.first_word_provider = OpenAIFirstWordProvider(
-                    backend,
+                    first_word_backend,
                     model_override=self.config.streaming_first_word_model,
                     reasoning_effort_override=self.config.streaming_first_word_reasoning_effort,
                     base_instructions_override=build_first_word_instructions(
@@ -856,9 +859,11 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 response_holder: dict[str, object] = {}
                 final_error: list[Exception] = []
                 final_done = Event()
+                final_started = Event()
 
                 def _final_worker() -> None:
                     try:
+                        final_started.set()
                         response_holder["response"] = self._run_dual_lane_final_response(
                             transcript,
                             turn_instructions=turn_instructions,
@@ -869,7 +874,6 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                         final_done.set()
 
                 final_worker = Thread(target=_final_worker, daemon=True)
-                final_worker.start()
 
                 first_word_reply = self._consume_speculative_first_word(transcript)
                 if first_word_reply is not None:
@@ -888,6 +892,13 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                             replace_current=False,
                         )
                     )
+                    wait_ms = max(0, int(self.config.streaming_first_word_final_lane_wait_ms))
+                    speech_output.wait_for_first_audio(
+                        timeout_s=(wait_ms / 1000.0) if wait_ms > 0 else 0.0,
+                    )
+
+                if not final_started.is_set():
+                    final_worker.start()
 
                 final_done.wait()
                 if final_error:

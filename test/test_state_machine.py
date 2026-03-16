@@ -6,7 +6,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
-from twinr.memory import OnDeviceMemory
+from twinr.memory import ConversationTurn, OnDeviceMemory
 from twinr.runtime import TwinrRuntime
 from twinr.state_machine import TwinrStatus
 
@@ -36,6 +36,15 @@ class TwinrRuntimeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 runtime.press_yellow_button()
 
+    def test_background_print_request_does_not_change_runtime_state(self) -> None:
+        runtime = TwinrRuntime(config=TwinrConfig())
+        runtime.last_response = "Hallo"
+
+        printed = runtime.prepare_background_button_print_request()
+
+        self.assertEqual(printed, "Hallo")
+        self.assertEqual(runtime.status, TwinrStatus.WAITING)
+
     def test_memory_compacts_when_limit_is_exceeded(self) -> None:
         memory = OnDeviceMemory(max_turns=4, keep_recent=2)
         memory.remember("user", "one")
@@ -50,6 +59,25 @@ class TwinrRuntimeTests(unittest.TestCase):
         self.assertEqual(memory.turns[0].role, "system")
         self.assertIn("Twinr memory summary", memory.turns[0].content)
         self.assertLessEqual(len(memory.turns), 3)
+
+    def test_memory_restores_legacy_assistant_summary_snapshot(self) -> None:
+        memory = OnDeviceMemory(max_turns=4, keep_recent=2)
+        memory.restore(
+            (
+                ConversationTurn(
+                    role="assistant",
+                    content="Twinr memory summary:\n- Earlier context: User asked: eins | Twinr answered: zwei",
+                ),
+                ConversationTurn(role="user", content="drei"),
+                ConversationTurn(role="assistant", content="vier"),
+            )
+        )
+
+        self.assertEqual(memory.ledger[0].kind, "conversation_summary")
+        self.assertIn("Earlier context", memory.ledger[0].content)
+        self.assertEqual(tuple(turn.role for turn in memory.raw_tail), ("user", "assistant"))
+        self.assertEqual(memory.turns[0].role, "system")
+        self.assertIn("Twinr memory summary", memory.turns[0].content)
 
     def test_memory_stores_search_results_as_typed_entries(self) -> None:
         memory = OnDeviceMemory(max_turns=6, keep_recent=3)
