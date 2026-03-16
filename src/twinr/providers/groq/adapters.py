@@ -1,3 +1,10 @@
+"""Provide Groq-backed text and tool-calling adapters for Twinr.
+
+This module translates Twinr's agent-provider contracts into Groq chat
+completion requests. It also owns the continuation state required to resume
+tool-calling turns after Twinr executes the requested tools locally.
+"""
+
 from __future__ import annotations
 from dataclasses import dataclass
 from threading import Lock
@@ -32,12 +39,15 @@ _DEFAULT_CONTINUATION_TTL_SECONDS = 300.0
 _DEFAULT_MAX_CONTINUATIONS = 128
 @dataclass(slots=True)
 class _ContinuationState:
+    """Track the pending tool-calling state for one Groq continuation token."""
+
     messages: list[dict[str, Any]]
     expected_tool_call_ids: tuple[str, ...]
     created_monotonic: float
     last_access_monotonic: float
     in_flight: bool = False
 def _safe_int(value: object) -> int | None:
+    """Best-effort convert a value to ``int`` without raising."""
     if value is None:
         return None
     try:
@@ -45,11 +55,13 @@ def _safe_int(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
 def _non_negative_int(value: object, default: int) -> int:
+    """Return ``default`` when a value is missing or negative."""
     coerced = _safe_int(value)
     if coerced is None or coerced < 0:
         return default
     return coerced
 def _positive_float(value: object, default: float | None) -> float | None:
+    """Return ``default`` when a value is missing or not strictly positive."""
     if value is None:
         return default
     try:
@@ -60,51 +72,62 @@ def _positive_float(value: object, default: float | None) -> float | None:
         return default
     return coerced
 def _groq_request_timeout_seconds(config: TwinrConfig) -> float | None:
+    """Read the per-request Groq timeout override from config."""
     # AUDIT-FIX(#1): Use a bounded request timeout with a safe default, while remaining backward compatible with configs that omit the key.
     return _positive_float(
         getattr(config, "groq_request_timeout_seconds", _DEFAULT_GROQ_REQUEST_TIMEOUT_SECONDS),
         _DEFAULT_GROQ_REQUEST_TIMEOUT_SECONDS,
     )
 def _groq_total_attempts(config: TwinrConfig) -> int:
+    """Return the total number of Groq request attempts including retries."""
     # AUDIT-FIX(#1): Bound retries so intermittent Wi-Fi does not turn into an unbounded blocking loop.
     retries = _non_negative_int(getattr(config, "groq_max_retries", _DEFAULT_GROQ_MAX_RETRIES), _DEFAULT_GROQ_MAX_RETRIES)
     return retries + 1
 def _groq_retry_backoff_seconds(config: TwinrConfig) -> float:
+    """Read the retry backoff used between Groq request attempts."""
     # AUDIT-FIX(#1): Back off briefly between retries to avoid hammering a flaky network or provider edge.
     return _positive_float(
         getattr(config, "groq_retry_backoff_seconds", _DEFAULT_GROQ_RETRY_BACKOFF_SECONDS),
         _DEFAULT_GROQ_RETRY_BACKOFF_SECONDS,
     ) or _DEFAULT_GROQ_RETRY_BACKOFF_SECONDS
 def _continuation_ttl_seconds(config: TwinrConfig) -> float:
+    """Read the maximum idle age for stored continuation state."""
     # AUDIT-FIX(#3): Expire abandoned continuations so the long-running process does not leak memory indefinitely.
     return _positive_float(
         getattr(config, "groq_tool_continuation_ttl_seconds", _DEFAULT_CONTINUATION_TTL_SECONDS),
         _DEFAULT_CONTINUATION_TTL_SECONDS,
     ) or _DEFAULT_CONTINUATION_TTL_SECONDS
 def _max_continuations(config: TwinrConfig) -> int:
+    """Read the cap for simultaneously stored continuation states."""
     # AUDIT-FIX(#3): Cap in-memory continuations to stay within RPi 4 memory constraints during long uptimes.
     return max(1, _non_negative_int(getattr(config, "groq_tool_max_continuations", _DEFAULT_MAX_CONTINUATIONS), _DEFAULT_MAX_CONTINUATIONS))
 def _text_provider_error_text(config: TwinrConfig) -> str:
+    """Return the user-facing fallback text for Groq text failures."""
     # AUDIT-FIX(#4): Provide a simple, configurable fallback utterance instead of surfacing raw provider failures to the user.
     text = str(getattr(config, "groq_text_provider_error_text", "I am having trouble right now. Please try again.")).strip()
     return text or "I am having trouble right now. Please try again."
 def _tool_provider_error_text(config: TwinrConfig) -> str:
+    """Return the user-facing fallback text for Groq tool-call failures."""
     # AUDIT-FIX(#4): Keep tool-provider failures recoverable and senior-friendly instead of crashing the request path.
     text = str(getattr(config, "groq_tool_provider_error_text", "I could not finish that step. Please try again.")).strip()
     return text or "I could not finish that step. Please try again."
 def _tool_continuation_expired_text(config: TwinrConfig) -> str:
+    """Return the text used when a continuation token is no longer valid."""
     # AUDIT-FIX(#2): Return a controlled message when the continuation state is gone, rather than throwing a raw runtime exception.
     text = str(getattr(config, "groq_tool_continuation_expired_text", "I lost the previous step. Please try again.")).strip()
     return text or "I lost the previous step. Please try again."
 def _tool_continuation_busy_text(config: TwinrConfig) -> str:
+    """Return the text used when a continuation token is already in flight."""
     # AUDIT-FIX(#2): Reject concurrent reuse of the same continuation token deterministically.
     text = str(getattr(config, "groq_tool_continuation_busy_text", "That step is already being finished. Please try again in a moment.")).strip()
     return text or "That step is already being finished. Please try again in a moment."
 def _tool_result_error_text(config: TwinrConfig) -> str:
+    """Return the text used when tool results do not match expected calls."""
     # AUDIT-FIX(#2): Keep malformed or mismatched tool-result handoffs recoverable without corrupting conversation state.
     text = str(getattr(config, "groq_tool_result_error_text", "I could not verify the tool results. Please try again.")).strip()
     return text or "I could not verify the tool results. Please try again."
 def _safe_emit_text(on_text_delta: Callable[[str], None] | None, text: str) -> None:
+    """Emit streaming text to a callback without letting the callback raise."""
     if on_text_delta is None or not text:
         return
     try:
@@ -118,6 +141,7 @@ def _invoke_chat_completion(
     *,
     config: TwinrConfig,
 ) -> Any:
+    """Call Groq chat completions with bounded retries and optional timeout."""
     use_timeout = _groq_request_timeout_seconds(config) is not None
     timeout_seconds = _groq_request_timeout_seconds(config)
     total_attempts = _groq_total_attempts(config)
@@ -144,6 +168,7 @@ def _invoke_chat_completion(
             time.sleep(backoff_seconds * attempt)
     raise RuntimeError("Groq chat completion request failed") from last_error
 def _chat_usage(source: object) -> TokenUsage | None:
+    """Convert provider usage metadata into Twinr's ``TokenUsage`` contract."""
     usage = getattr(source, "usage", None)
     if usage is None:
         return None
@@ -160,6 +185,7 @@ def _chat_usage(source: object) -> TokenUsage | None:
     )
     return token_usage if token_usage.has_values else None
 def _extract_text_fragment(value: object) -> str:
+    """Normalize nested SDK content blocks into plain text."""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -195,19 +221,23 @@ def _extract_text_fragment(value: object) -> str:
         return _extract_text_fragment(getattr(value, "value"))
     return str(value).strip()
 def _message_text(message: object) -> str:
+    """Extract plain text from a Groq/OpenAI-style assistant message object."""
     # AUDIT-FIX(#7): Extract text recursively from typed SDK content blocks instead of dropping or repr()-stringifying them.
     content = getattr(message, "content", "")
     return _extract_text_fragment(content)
 def _message_attr(item: object, key: str) -> object:
+    """Read an attribute or mapping key from mixed SDK/message objects."""
     if isinstance(item, dict):
         return item.get(key)
     return getattr(item, key, None)
 def _normalize_role(role: object) -> str:
+    """Map message roles into the subset supported by Twinr and Groq."""
     normalized = str(role or "").strip().lower()
     if normalized in {"system", "user", "assistant", "tool"}:
         return normalized
     return "user"
 def _coerce_message(item: object) -> tuple[str, str]:
+    """Normalize one conversation entry into ``(role, content)`` form."""
     if isinstance(item, tuple) and len(item) == 2:
         role, content = item
         return _normalize_role(role), _extract_text_fragment(content)
@@ -215,6 +245,7 @@ def _coerce_message(item: object) -> tuple[str, str]:
     content = _extract_text_fragment(_message_attr(item, "content"))
     return role, content
 def _sanitize_assistant_tool_calls(raw_tool_calls: object) -> list[dict[str, Any]]:
+    """Convert prior assistant tool calls into protocol-safe dicts."""
     if not isinstance(raw_tool_calls, Sequence) or isinstance(raw_tool_calls, (str, bytes, bytearray)):
         return []
     sanitized: list[dict[str, Any]] = []
@@ -244,6 +275,7 @@ def _sanitize_assistant_tool_calls(raw_tool_calls: object) -> list[dict[str, Any
         )
     return sanitized
 def _merge_system_message(messages: list[dict[str, Any]], instructions: str | None) -> list[dict[str, Any]]:
+    """Merge extra system instructions into a copied message list."""
     merged = merge_instructions(instructions)
     if not merged:
         return copy.deepcopy(messages)
@@ -260,6 +292,7 @@ def _build_messages(
     conversation: ConversationLike | None = None,
     instructions: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Build a Groq-compatible message list from Twinr conversation state."""
     system_parts: list[str] = []
     base_instructions = merge_instructions(
         load_personality_instructions(config),
@@ -304,6 +337,7 @@ def _build_messages(
         messages.append({"role": "user", "content": prompt_text})
     return messages
 def _convert_tool_schemas(tool_schemas: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate Twinr tool schema definitions into Groq's request format."""
     converted: list[dict[str, Any]] = []
     for schema in tool_schemas:
         if not isinstance(schema, dict) or schema.get("type") != "function":
@@ -331,6 +365,7 @@ def _convert_tool_schemas(tool_schemas: Sequence[dict[str, Any]]) -> list[dict[s
         )
     return converted
 def _parse_tool_arguments(raw_arguments: str) -> dict[str, Any] | None:
+    """Parse model-emitted tool arguments and require a JSON object payload."""
     try:
         parsed = json.loads(raw_arguments)
     except json.JSONDecodeError:
@@ -339,6 +374,7 @@ def _parse_tool_arguments(raw_arguments: str) -> dict[str, Any] | None:
         return None
     return parsed
 def _serialize_tool_output(serialized_output: object) -> str:
+    """Serialize tool output into a protocol-safe string for continuation turns."""
     if isinstance(serialized_output, str):
         return serialized_output
     try:
@@ -347,10 +383,13 @@ def _serialize_tool_output(serialized_output: object) -> str:
         return str(serialized_output)
 @dataclass
 class GroqAgentTextProvider:
+    """Serve text turns through Groq with OpenAI-based fallback paths."""
+
     config: TwinrConfig
     support_provider: AgentTextProvider
     client: Any | None = None
     def __post_init__(self) -> None:
+        """Create a validated Groq client when tests did not inject one."""
         self._client = self.client or default_groq_client(self.config)
     def _fallback_streaming(
         self,
@@ -361,6 +400,7 @@ class GroqAgentTextProvider:
         allow_web_search: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
     ) -> TextResponse:
+        """Delegate a streaming turn to the support provider after Groq failure."""
         try:
             # AUDIT-FIX(#1): Fall back to the support provider when Groq is unavailable so the senior does not hit a dead end on transient outages.
             return self.support_provider.respond_streaming(
@@ -386,6 +426,7 @@ class GroqAgentTextProvider:
         instructions: str | None = None,
         allow_web_search: bool | None = None,
     ) -> TextResponse:
+        """Delegate a non-streaming text turn to the support provider."""
         try:
             # AUDIT-FIX(#1): Fall back to the support provider when Groq fails on non-streaming turns as well.
             return self.support_provider.respond_with_metadata(
@@ -409,6 +450,18 @@ class GroqAgentTextProvider:
         allow_web_search: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
     ) -> TextResponse:
+        """Stream a text response from Groq or fall back to the support provider.
+
+        Args:
+            prompt: User prompt for the current turn.
+            conversation: Optional prior conversation items for context.
+            instructions: Optional system-level instruction overrides.
+            allow_web_search: Whether the turn requires live search support.
+            on_text_delta: Optional callback for streamed text fragments.
+
+        Returns:
+            A normalized text response compatible with Twinr's provider contract.
+        """
         if allow_web_search:
             return self._fallback_streaming(
                 prompt,
@@ -488,6 +541,7 @@ class GroqAgentTextProvider:
         instructions: str | None = None,
         allow_web_search: bool | None = None,
     ) -> TextResponse:
+        """Run a non-streaming Groq text turn and preserve response metadata."""
         if allow_web_search:
             return self._fallback_with_metadata(
                 prompt,
@@ -537,6 +591,7 @@ class GroqAgentTextProvider:
         instructions: str | None = None,
         allow_web_search: bool | None = None,
     ) -> TextResponse:
+        """Delegate image turns to the support provider."""
         return self.support_provider.respond_to_images_with_metadata(
             prompt,
             images=images,
@@ -552,6 +607,7 @@ class GroqAgentTextProvider:
         location_hint: str | None = None,
         date_context: str | None = None,
     ) -> SearchResponse:
+        """Delegate live-search turns to the support provider."""
         return self.support_provider.search_live_info_with_metadata(
             question,
             conversation=conversation,
@@ -566,6 +622,7 @@ class GroqAgentTextProvider:
         direct_text: str | None = None,
         request_source: str = "button",
     ) -> TextResponse:
+        """Delegate print-job phrasing to the support provider."""
         return self.support_provider.compose_print_job_with_metadata(
             conversation=conversation,
             focus_hint=focus_hint,
@@ -573,6 +630,7 @@ class GroqAgentTextProvider:
             request_source=request_source,
         )
     def phrase_due_reminder_with_metadata(self, reminder: object, *, now=None) -> TextResponse:
+        """Delegate due-reminder phrasing to the support provider."""
         return self.support_provider.phrase_due_reminder_with_metadata(reminder, now=now)
     def phrase_proactive_prompt_with_metadata(
         self,
@@ -585,6 +643,7 @@ class GroqAgentTextProvider:
         recent_prompts: tuple[str, ...] = (),
         observation_facts: tuple[str, ...] = (),
     ) -> TextResponse:
+        """Delegate proactive prompt phrasing to the support provider."""
         return self.support_provider.phrase_proactive_prompt_with_metadata(
             trigger_id=trigger_id,
             reason=reason,
@@ -601,6 +660,7 @@ class GroqAgentTextProvider:
         allow_web_search: bool,
         delivery: str = "spoken",
     ) -> TextResponse:
+        """Delegate automation fulfillment phrasing to the support provider."""
         return self.support_provider.fulfill_automation_prompt_with_metadata(
             prompt,
             allow_web_search=allow_web_search,
@@ -608,9 +668,12 @@ class GroqAgentTextProvider:
         )
 @dataclass
 class GroqToolCallingAgentProvider:
+    """Run Groq tool-calling turns with bounded continuation state."""
+
     config: TwinrConfig
     client: Any | None = None
     def __post_init__(self) -> None:
+        """Create a validated Groq client and initialize continuation storage."""
         self._client = self.client or default_groq_client(self.config)
         self._continuations: dict[str, _ContinuationState] = {}
         self._lock = Lock()
@@ -620,6 +683,7 @@ class GroqToolCallingAgentProvider:
         *,
         continuation_token: str | None = None,
     ) -> ToolCallingTurnResponse:
+        """Build a normalized tool-calling error response."""
         return ToolCallingTurnResponse(
             text=text,
             tool_calls=tuple(),
@@ -631,6 +695,7 @@ class GroqToolCallingAgentProvider:
             continuation_token=continuation_token,
         )
     def _purge_continuations_locked(self, now: float | None = None) -> None:
+        """Drop expired or excess continuation entries while holding ``_lock``."""
         if now is None:
             now = time.monotonic()
         ttl_seconds = _continuation_ttl_seconds(self.config)
@@ -652,6 +717,7 @@ class GroqToolCallingAgentProvider:
             for token, _state in oldest_tokens:
                 self._continuations.pop(token, None)
     def _reserve_continuation(self, continuation_token: str) -> _ContinuationState | None:
+        """Reserve a continuation token for exclusive reuse by one caller."""
         with self._lock:
             self._purge_continuations_locked()
             state = self._continuations.get(continuation_token)
@@ -670,6 +736,7 @@ class GroqToolCallingAgentProvider:
             state.last_access_monotonic = time.monotonic()
             return copy.deepcopy(state)
     def _release_continuation(self, continuation_token: str, *, keep_state: bool, state: _ContinuationState | None = None) -> None:
+        """Release or replace a continuation entry after one continuation attempt."""
         with self._lock:
             current = self._continuations.get(continuation_token)
             if current is None:
@@ -688,6 +755,7 @@ class GroqToolCallingAgentProvider:
         tool_results: Sequence[AgentToolResult],
         expected_tool_call_ids: tuple[str, ...],
     ) -> tuple[list[AgentToolResult] | None, str | None]:
+        """Verify that returned tool results exactly match the expected call IDs."""
         if not expected_tool_call_ids:
             return None, "no expected tool calls"
         by_id: dict[str, AgentToolResult] = {}
@@ -713,6 +781,19 @@ class GroqToolCallingAgentProvider:
         allow_web_search: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
     ) -> ToolCallingTurnResponse:
+        """Start a Groq tool-calling turn and persist continuation state if needed.
+
+        Args:
+            prompt: User prompt for the current turn.
+            conversation: Optional prior conversation items for context.
+            instructions: Optional system-level instruction overrides.
+            tool_schemas: Available Twinr tool schemas for this turn.
+            allow_web_search: Whether the caller requested live search support.
+            on_text_delta: Optional callback for immediate spoken/UI output.
+
+        Returns:
+            A tool-calling response that may include tool calls and a continuation token.
+        """
         if allow_web_search:
             logger.debug("Groq tool provider received allow_web_search=True; native live search is not implemented in this provider")
         messages = _build_messages(
@@ -767,6 +848,7 @@ class GroqToolCallingAgentProvider:
         allow_web_search: bool | None = None,
         on_text_delta: Callable[[str], None] | None = None,
     ) -> ToolCallingTurnResponse:
+        """Resume a Groq tool-calling turn after Twinr executes the tool results."""
         if allow_web_search:
             logger.debug("Groq tool provider received allow_web_search=True during continuation; native live search is not implemented in this provider")
         reserved_state = self._reserve_continuation(continuation_token)
@@ -844,6 +926,7 @@ class GroqToolCallingAgentProvider:
         *,
         tool_schemas: Sequence[dict[str, Any]],
     ) -> tuple[ToolCallingTurnResponse, dict[str, Any]]:
+        """Execute one Groq tool-completion request and normalize its result."""
         request: dict[str, Any] = {
             "model": self.config.groq_model,
             "messages": messages,

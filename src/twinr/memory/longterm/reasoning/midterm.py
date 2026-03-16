@@ -1,3 +1,10 @@
+"""Compile structured midterm packets from recent long-term memory windows.
+
+This module defines the provider-facing reflection program protocol, the
+OpenAI-backed implementation, and the normalization helpers that keep
+optional midterm packets bounded and grounded in existing memories.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping as ABCMapping
@@ -39,6 +46,8 @@ _MAX_MODEL_NAME_LENGTH = 256
 
 
 class LongTermStructuredReflectionProgram(Protocol):
+    """Describe a compiler that turns recent memories into midterm packets."""
+
     def compile_reflection(
         self,
         *,
@@ -46,6 +55,19 @@ class LongTermStructuredReflectionProgram(Protocol):
         timezone_name: str,
         packet_limit: int,
     ) -> Mapping[str, object]:
+        """Compile a structured midterm reflection payload.
+
+        Args:
+            objects: Recent long-term memory objects that may ground the
+                midterm packets.
+            timezone_name: Local timezone name that should shape date/time
+                interpretation in summaries.
+            packet_limit: Maximum number of packets allowed in the result.
+
+        Returns:
+            A mapping shaped like the midterm reflection schema.
+        """
+
         ...
 
 
@@ -53,6 +75,15 @@ class LongTermStructuredReflectionProgram(Protocol):
 # and invalid token budgets do not create undefined backend behavior later in the request path.
 @dataclass(frozen=True, slots=True)
 class OpenAIStructuredReflectionProgram:
+    """Call OpenAI to compile bounded midterm packets from memory windows.
+
+    Attributes:
+        backend: OpenAI backend used for the structured JSON request.
+        model: Optional explicit model override. Falls back to the backend
+            default model when omitted.
+        max_output_tokens: Output-token budget for the structured response.
+    """
+
     backend: "OpenAIBackend"
     model: str | None = None
     max_output_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS
@@ -76,6 +107,18 @@ class OpenAIStructuredReflectionProgram:
         timezone_name: str,
         packet_limit: int,
     ) -> Mapping[str, object]:
+        """Compile midterm packets from a recent long-term memory window.
+
+        Args:
+            objects: Recent long-term memory objects that may ground packets.
+            timezone_name: Local timezone name for time-sensitive summaries.
+            packet_limit: Maximum number of packets the caller will accept.
+
+        Returns:
+            A normalized mapping with zero to ``packet_limit`` grounded
+            midterm packets.
+        """
+
         normalized_timezone_name = _normalize_timezone_name(timezone_name)
         effective_packet_limit = _normalize_packet_limit(packet_limit)
 
@@ -169,6 +212,17 @@ class OpenAIStructuredReflectionProgram:
 def structured_reflection_program_from_config(
     config: TwinrConfig,
 ) -> LongTermStructuredReflectionProgram | None:
+    """Build the optional structured reflection program from config.
+
+    Args:
+        config: Runtime configuration containing enablement flags, secrets,
+            model selection, and token budgets.
+
+    Returns:
+        An initialized structured reflection program when the feature is
+        enabled and configured, otherwise ``None``.
+    """
+
     if not config.long_term_memory_reflection_compiler_enabled:
         return None
     if not _has_non_blank_secret(getattr(config, "openai_api_key", None)):

@@ -1,3 +1,10 @@
+"""Render Twinr status cards on the Waveshare 4.2 V2 e-paper panel.
+
+This adapter validates Twinr's configured GPIO and vendor-driver layout before
+loading the vendor module. It owns image preparation, status-card rendering,
+and best-effort hardware cleanup for the panel.
+"""
+
 from __future__ import annotations
 
 from contextlib import suppress
@@ -21,6 +28,31 @@ _SUPPORTED_ROTATIONS = {0, 90, 180, 270}
 
 @dataclass(slots=True)
 class WaveshareEPD4In2V2:
+    """Render Twinr status frames on a Waveshare 4.2 V2 panel.
+
+    The adapter keeps hardware interaction serialized per instance and
+    validates vendor-driver expectations before importing the Waveshare
+    modules.
+
+    Attributes:
+        project_root: Twinr project root used to resolve vendor paths safely.
+        vendor_dir: Directory that contains the ``waveshare_epd`` vendor
+            package.
+        driver: Configured driver identifier. Only ``waveshare_4in2_v2`` is
+            supported.
+        spi_bus: SPI bus index expected by the installed vendor driver.
+        spi_device: SPI device index expected by the installed vendor driver.
+        cs_gpio: Chip-select GPIO number.
+        dc_gpio: Data/command GPIO number.
+        reset_gpio: Reset GPIO number.
+        busy_gpio: Busy GPIO number.
+        width: Logical display width before rotation.
+        height: Logical display height before rotation.
+        rotation_degrees: Rotation applied before panel upload.
+        full_refresh_interval: Number of partial renders between full
+            refreshes.
+    """
+
     project_root: Path
     vendor_dir: Path
     driver: str = "waveshare_4in2_v2"
@@ -61,6 +93,19 @@ class WaveshareEPD4In2V2:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "WaveshareEPD4In2V2":
+        """Build a display adapter from Twinr configuration.
+
+        Args:
+            config: Runtime configuration with display GPIO, SPI, and sizing
+                values.
+
+        Returns:
+            A validated ``WaveshareEPD4In2V2`` instance.
+
+        Raises:
+            RuntimeError: If the configured display GPIOs conflict with other
+                runtime GPIO assignments.
+        """
         conflicts = config.display_gpio_conflicts()
         if conflicts:
             raise RuntimeError(
@@ -85,20 +130,24 @@ class WaveshareEPD4In2V2:
 
     @property
     def vendor_package_dir(self) -> Path:
+        """Return the directory that should contain the vendor package."""
         return self.vendor_dir / "waveshare_epd"
 
     @property
     def canvas_size(self) -> tuple[int, int]:
+        """Return the logical canvas size before rotation."""
         return (self.width, self.height)
 
     @property
     def allowed_image_sizes(self) -> tuple[tuple[int, int], ...]:
+        """Return accepted logical and rotated image sizes."""
         sizes = {self.canvas_size}
         if self.rotation_degrees in (90, 270):
             sizes.add((self.height, self.width))
         return tuple(sorted(sizes))
 
     def show_test_pattern(self) -> None:
+        """Render and display the built-in hardware smoke-test card."""
         image = self.render_test_image()
         self.show_image(image, clear_first=True)
 
@@ -110,6 +159,14 @@ class WaveshareEPD4In2V2:
         details: tuple[str, ...] = (),
         animation_frame: int = 0,
     ) -> None:
+        """Render and display one runtime status frame.
+
+        Args:
+            status: Canonical runtime status key.
+            headline: Optional headline override shown in the top bar.
+            details: Up to four short footer/detail lines.
+            animation_frame: Precomputed animation frame index.
+        """
         image = self.render_status_image(
             status=status,
             headline=headline,
@@ -121,6 +178,16 @@ class WaveshareEPD4In2V2:
     # AUDIT-FIX(#3): Guard mutable driver state with a per-instance lock so concurrent callers cannot double-initialise the panel or corrupt render counters.
     # AUDIT-FIX(#4): Reset and retry once after display failures to recover from transient SPI/EPD faults.
     def show_image(self, image: object, *, clear_first: bool) -> None:
+        """Upload a prepared image to the panel with one recovery retry.
+
+        Args:
+            image: Pillow image or image-like object accepted by the adapter.
+            clear_first: Whether to clear the panel before rendering.
+
+        Raises:
+            RuntimeError: If the panel cannot render the image after one
+                recovery attempt.
+        """
         with self._lock:
             prepared_image = self._prepare_image(image)
             self._validate_prepared_image(prepared_image)
@@ -156,6 +223,7 @@ class WaveshareEPD4In2V2:
     # AUDIT-FIX(#3): Keep shutdown atomic relative to display calls.
     # AUDIT-FIX(#5): Perform best-effort hardware cleanup instead of only suppressing sleep() and leaking SPI/GPIO resources.
     def close(self) -> None:
+        """Release vendor-driver resources and reset local adapter state."""
         with self._lock:
             self._shutdown_hardware()
             self._driver_module = None
@@ -166,6 +234,7 @@ class WaveshareEPD4In2V2:
     # AUDIT-FIX(#3): Protect font-cache mutation and render helpers from concurrent access.
     # AUDIT-FIX(#7): Use an aware local datetime so the rendered test timestamp is unambiguous across DST/timezone changes.
     def render_test_image(self) -> object:
+        """Build the built-in black-and-white hardware smoke-test card."""
         with self._lock:
             image, draw = self._new_canvas()
             canvas_width, canvas_height = image.size
@@ -192,6 +261,17 @@ class WaveshareEPD4In2V2:
         details: tuple[str, ...],
         animation_frame: int = 0,
     ) -> object:
+        """Build a status card image without sending it to the panel.
+
+        Args:
+            status: Canonical runtime status key.
+            headline: Optional headline override shown in the top bar.
+            details: Footer/detail lines for health and time labels.
+            animation_frame: Precomputed animation frame index.
+
+        Returns:
+            A Pillow image object sized for the configured panel.
+        """
         with self._lock:
             safe_status = self._normalise_text(status, fallback="status")
             safe_headline = self._normalise_text(headline, fallback=safe_status)

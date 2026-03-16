@@ -44,7 +44,7 @@ class OpenAIPrintMixin:
             # AUDIT-FIX(#2): Route model calls through a best-effort timeout wrapper instead of making an unbounded blocking network call directly.
             response = self._responses_create(request)
             final_text = self._sanitize_print_text(self._extract_output_text(response))
-            return self._build_text_response(
+            return self._build_print_text_response(
                 text=final_text,
                 response=response,
                 request=request,
@@ -53,7 +53,7 @@ class OpenAIPrintMixin:
             # AUDIT-FIX(#2): Degrade gracefully to deterministic formatting when the model stack or metadata extraction fails.
             self._log_print_failure("format_for_print_with_metadata", exc)
             if fallback_text:
-                return self._build_text_response(
+                return self._build_print_text_response(
                     text=fallback_text,
                     response=None,
                     request=request,
@@ -95,7 +95,7 @@ class OpenAIPrintMixin:
             request_source=normalized_request_source,
         )
         if literal_tool_text is not None:
-            return self._build_text_response(
+            return self._build_print_text_response(
                 text=literal_tool_text,
                 response=None,
                 request=None,
@@ -133,7 +133,7 @@ class OpenAIPrintMixin:
             candidate_error = RuntimeError(self._PREPARE_PRINT_ERROR)
 
         if candidate_text and not self._should_use_print_fallback(candidate_text, fallback_source):
-            return self._build_text_response(
+            return self._build_print_text_response(
                 text=candidate_text,
                 response=response,
                 request=request,
@@ -146,14 +146,14 @@ class OpenAIPrintMixin:
                 return fallback_response
             except RuntimeError:
                 if candidate_text:
-                    return self._build_text_response(
+                    return self._build_print_text_response(
                         text=candidate_text,
                         response=response,
                         request=request,
                     )
 
         if candidate_text:
-            return self._build_text_response(
+            return self._build_print_text_response(
                 text=candidate_text,
                 response=response,
                 request=request,
@@ -252,7 +252,7 @@ class OpenAIPrintMixin:
         for item in conversation:
             try:
                 # AUDIT-FIX(#5): Skip malformed conversation items instead of letting one corrupt record break the entire print path.
-                role, content = self._coerce_message(item)
+                role, content, _phase = self._coerce_message(item)
             except Exception as exc:
                 self._log_print_failure("_latest_print_exchange", exc)
                 continue
@@ -322,7 +322,7 @@ class OpenAIPrintMixin:
             return self._client.responses.create(**request)
 
     # AUDIT-FIX(#3): Build metadata defensively so instrumentation failures do not block printing and returned metadata matches the actual text source.
-    def _build_text_response(
+    def _build_print_text_response(
         self,
         *,
         text: str,
@@ -339,11 +339,11 @@ class OpenAIPrintMixin:
             try:
                 model = extract_model_name(response, request_model)
             except Exception as exc:
-                self._log_print_failure("_build_text_response:model", exc)
+                self._log_print_failure("_build_print_text_response:model", exc)
             try:
                 token_usage = extract_token_usage(response)
             except Exception as exc:
-                self._log_print_failure("_build_text_response:token_usage", exc)
+                self._log_print_failure("_build_print_text_response:token_usage", exc)
 
         return OpenAITextResponse(
             text=text,

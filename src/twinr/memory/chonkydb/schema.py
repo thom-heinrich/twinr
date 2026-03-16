@@ -1,3 +1,9 @@
+"""Define the canonical Twinr personal-graph schema stored in ChonkyDB.
+
+This module owns the allowed edge taxonomy plus the typed node, edge, and
+document models used by Twinr's graph-memory and long-term-memory layers.
+"""
+
 from __future__ import annotations
 
 import math
@@ -64,6 +70,8 @@ def normalize_graph_edge_type(
     edge_type: str,
     attributes: Mapping[str, object] | None = None,
 ) -> tuple[str, dict[str, object]]:
+    """Map legacy edge types onto the canonical Twinr graph taxonomy."""
+
     clean_edge_type = str(edge_type or "").strip()
     normalized_attributes = dict(attributes or {})
     if clean_edge_type in _LEGACY_EDGE_TYPE_MAP:
@@ -75,12 +83,16 @@ def normalize_graph_edge_type(
 
 
 def graph_edge_namespace(edge_type: str) -> str:
+    """Return the namespace prefix for a graph edge type."""
+
     normalized_edge_type, _attributes = normalize_graph_edge_type(edge_type, None)
     prefix, _, _rest = normalized_edge_type.partition("_")
     return prefix
 
 
 def is_allowed_graph_edge_type(edge_type: str) -> bool:
+    """Report whether an edge type belongs to the Twinr graph schema."""
+
     normalized_edge_type, _attributes = normalize_graph_edge_type(edge_type, None)
     return normalized_edge_type in TWINR_GRAPH_ALLOWED_EDGE_TYPES
 
@@ -321,6 +333,8 @@ def _validate_status(status: str, *, allowed: frozenset[str], field_name: str) -
 
 @dataclass(frozen=True, slots=True)
 class TwinrGraphNodeV1:
+    """Represent one node in the Twinr personal graph."""
+
     node_id: str
     node_type: str
     label: str
@@ -354,6 +368,8 @@ class TwinrGraphNodeV1:
         object.__setattr__(self, "graph_ref", graph_ref)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the node into the persisted schema payload."""
+
         attributes_payload = _json_value_to_payload(self.attributes) if self.attributes is not None else None  # AUDIT-FIX(#3): Rehydrate immutable JSON values into standard payload containers.
         return _drop_none(
             {
@@ -369,6 +385,8 @@ class TwinrGraphNodeV1:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "TwinrGraphNodeV1":
+        """Parse a persisted node payload into the typed model."""
+
         payload = _require_mapping_payload(payload)  # AUDIT-FIX(#1): Reject malformed top-level payloads instead of letting AttributeError leak or silently skipping data.
         return cls(
             node_id=payload.get("id", ""),
@@ -383,6 +401,8 @@ class TwinrGraphNodeV1:
 
 @dataclass(frozen=True, slots=True)
 class TwinrGraphEdgeV1:
+    """Represent one typed edge in the Twinr personal graph."""
+
     source_node_id: str
     edge_type: str
     target_node_id: str
@@ -438,6 +458,8 @@ class TwinrGraphEdgeV1:
         object.__setattr__(self, "attributes", attributes)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the edge into the persisted schema payload."""
+
         normalized_edge_type, normalized_attributes = normalize_graph_edge_type(self.edge_type, self.attributes)
         attributes_payload = _json_value_to_payload(normalized_attributes) if normalized_attributes else None  # AUDIT-FIX(#3): Rehydrate immutable JSON values into standard payload containers.
         return _drop_none(
@@ -457,6 +479,8 @@ class TwinrGraphEdgeV1:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "TwinrGraphEdgeV1":
+        """Parse a persisted edge payload into the typed model."""
+
         payload = _require_mapping_payload(payload)  # AUDIT-FIX(#1): Reject malformed top-level payloads instead of letting AttributeError leak or silently skipping data.
         return cls(
             source_node_id=payload.get("source", ""),
@@ -474,6 +498,8 @@ class TwinrGraphEdgeV1:
 
 @dataclass(frozen=True, slots=True)
 class TwinrGraphDocumentV1:
+    """Represent the complete Twinr personal-graph document."""
+
     subject_node_id: str
     nodes: tuple[TwinrGraphNodeV1, ...]
     edges: tuple[TwinrGraphEdgeV1, ...]
@@ -523,19 +549,27 @@ class TwinrGraphDocumentV1:
 
     @property
     def schema_version(self) -> int:
+        """Return the schema version emitted by ``to_payload()``."""
+
         return TWINR_GRAPH_SCHEMA_VERSION
 
     @property
     def schema_name(self) -> str:
+        """Return the schema name emitted by ``to_payload()``."""
+
         return TWINR_GRAPH_SCHEMA_NAME
 
     def node(self, node_id: str) -> TwinrGraphNodeV1:
+        """Return the node with the given id or raise ``KeyError``."""
+
         for node in self.nodes:
             if node.node_id == node_id:
                 return node
         raise KeyError(node_id)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the graph document into the persisted schema payload."""
+
         metadata_payload = _json_value_to_payload(self.metadata) if self.metadata is not None else None  # AUDIT-FIX(#3): Rehydrate immutable JSON values into standard payload containers.
         return _drop_none(
             {
@@ -555,6 +589,8 @@ class TwinrGraphDocumentV1:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "TwinrGraphDocumentV1":
+        """Parse a persisted document payload into the typed graph model."""
+
         payload = _require_mapping_payload(payload)  # AUDIT-FIX(#1): Reject malformed top-level payloads instead of letting AttributeError leak or silently skipping data.
         nodes = payload.get("nodes", ())
         edges = payload.get("edges", ())

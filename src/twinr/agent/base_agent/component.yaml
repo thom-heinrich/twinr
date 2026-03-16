@@ -1,0 +1,99 @@
+schema_version: 1
+name: base_agent
+path: src/twinr/agent/base_agent
+kind: python-package
+visibility: internal
+summary: Canonical base-agent package surface for config, contracts, focused subpackages, and compatibility re-exports.
+owned_concerns:
+  - Expose the canonical import surface for base-agent config, runtime, state, prompting, and conversation helpers
+  - Define the immutable environment-backed TwinrConfig dataclass and env-loading path
+  - Define provider/runtime protocols, tool-call value objects, and composite provider helpers
+  - Preserve thin compatibility wrappers while behavior moves into focused subpackages
+out_of_scope:
+  - Workflow loops and hardware/audio orchestration in src/twinr/agent/workflows
+  - Provider transport implementations in src/twinr/providers
+  - Reminder, automation, context-store, and long-term-memory implementations outside imported types
+  - Operator web UI and settings forms in src/twinr/web
+files:
+  - path: __init__.py
+    role: Lazy root export surface and compatibility re-exports
+    exports:
+      - TwinrConfig
+      - ProviderBundle
+      - CompositeSpeechAgentProvider
+      - TwinrRuntime
+      - TwinrStateMachine
+      - RuntimeSnapshot
+      - load_personality_instructions
+      - merge_instructions
+  - path: config.py
+    role: Canonical environment-backed runtime configuration
+    exports:
+      - TwinrConfig
+  - path: contracts.py
+    role: Provider/runtime protocols and composite provider glue
+    exports:
+      - AgentToolCall
+      - AgentToolResult
+      - ToolCallingTurnResponse
+      - SupervisorDecision
+      - FirstWordReply
+      - StreamingTranscriptionResult
+      - StreamingSpeechEndpointEvent
+      - ProviderBundle
+      - CompositeSpeechAgentProvider
+      - CombinedSpeechAgentProvider
+  - path: adaptive_timing.py
+    role: Compatibility wrapper for conversation adaptive timing helpers
+  - path: language.py
+    role: Compatibility wrapper for conversation language helpers
+  - path: turn_controller.py
+    role: Compatibility wrapper for conversation turn-controller helpers
+  - path: conversation_closure.py
+    role: Compatibility wrapper for conversation closure helpers
+  - path: personality.py
+    role: Compatibility wrapper for prompting helpers
+subpackages:
+  - path: conversation
+    role: Conversation micro-policies and turn-boundary helpers
+  - path: prompting
+    role: Hidden instruction and personality assembly
+  - path: runtime
+    role: TwinrRuntime composition and lifecycle mixins
+  - path: settings
+    role: Bounded runtime-adjustable settings helpers
+  - path: state
+    role: State-machine and runtime snapshot primitives
+compatibility_wrappers:
+  - path: adaptive_timing.py
+    forwards_to: conversation/adaptive_timing.py
+  - path: language.py
+    forwards_to: conversation/language.py
+  - path: turn_controller.py
+    forwards_to: conversation/turn_controller.py
+  - path: conversation_closure.py
+    forwards_to: conversation/closure.py
+  - path: personality.py
+    forwards_to: prompting/personality.py
+reexports_from_other_packages:
+  - path: __init__.py
+    names:
+      - LongTermMemoryService
+      - ManagedContextEntry
+      - ManagedContextFileStore
+      - PersistentMemoryEntry
+      - PersistentMemoryMarkdownStore
+      - PromptContextStore
+      - ReminderEntry
+      - ReminderStore
+tests:
+  - path: test/test_config.py
+  - path: test/test_personality.py
+  - path: test/test_adaptive_timing.py
+  - path: test/test_turn_controller.py
+  - path: test/test_conversation_closure.py
+  - path: test/test_runtime_context.py
+  - path: test/test_state_machine.py
+  - path: test/test_audio.py
+  - path: test/test_openai_backend.py
+  - path: test/test_openai_realtime.py

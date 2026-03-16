@@ -1,3 +1,10 @@
+"""Capture and play bounded audio for Twinr hardware workflows.
+
+This module exposes microphone recording, ambient sampling, and WAV/PCM
+playback helpers that keep ALSA subprocesses bounded and configuration
+validation local to the hardware adapter layer.
+"""
+
 from __future__ import annotations
 
 import io
@@ -195,6 +202,8 @@ def _pcm16_rms(samples: bytes) -> int:
 
 @dataclass(frozen=True, slots=True)
 class AmbientAudioLevelSample:
+    """Represent aggregate loudness metrics for one ambient capture window."""
+
     duration_ms: int
     chunk_count: int
     active_chunk_count: int
@@ -205,6 +214,8 @@ class AmbientAudioLevelSample:
 
 @dataclass(frozen=True, slots=True)
 class AmbientAudioCaptureWindow:
+    """Represent ambient PCM bytes together with sampled loudness metadata."""
+
     sample: AmbientAudioLevelSample
     pcm_bytes: bytes
     sample_rate: int
@@ -213,6 +224,8 @@ class AmbientAudioCaptureWindow:
 
 @dataclass(frozen=True, slots=True)
 class SpeechCaptureResult:
+    """Represent captured PCM speech and pause-resume timing metadata."""
+
     pcm_bytes: bytes
     speech_started_after_ms: int
     resumed_after_pause_count: int
@@ -223,6 +236,8 @@ def resolve_pause_resume_confirmation(
     consecutive_resume_chunks: int,
     required_resume_chunks: int,
 ) -> tuple[bool, int]:
+    """Confirm whether resumed speech is stable enough to cancel a pause."""
+
     required_chunks = max(1, int(required_resume_chunks))
     next_chunks = max(0, int(consecutive_resume_chunks)) + 1
     if next_chunks >= required_chunks:
@@ -245,6 +260,8 @@ def resolve_dynamic_pause_thresholds(
     long_pause_penalty_ms: int,
     long_pause_grace_penalty_ms: int,
 ) -> tuple[int, int]:
+    """Adjust pause thresholds based on how long the utterance has lasted."""
+
     pause_ms = max(0, int(base_pause_ms))
     pause_grace_ms = max(0, int(base_pause_grace_ms))
     utterance_ms = max(0, int(speech_window_ms))
@@ -274,6 +291,8 @@ def pcm16_to_wav_bytes(
     sample_rate: int,
     channels: int,
 ) -> bytes:
+    """Wrap raw PCM16 audio bytes in an in-memory WAV container."""
+
     normalized_sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
     normalized_channels = _ensure_int("channels", channels, minimum=1)
     # AUDIT-FIX(#9): Drop incomplete trailing frames so emitted WAV data stays frame-aligned.
@@ -291,6 +310,8 @@ def pcm16_to_wav_bytes(
 
 
 class SilenceDetectedRecorder:
+    """Record microphone audio until speech pauses or capture limits fire."""
+
     def __init__(
         self,
         *,
@@ -346,6 +367,8 @@ class SilenceDetectedRecorder:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "SilenceDetectedRecorder":
+        """Build a recorder from ``TwinrConfig`` values."""
+
         return cls(
             device=config.audio_input_device,
             sample_rate=config.audio_sample_rate,
@@ -369,9 +392,13 @@ class SilenceDetectedRecorder:
         )
 
     def record_until_pause(self, *, pause_ms: int) -> bytes:
+        """Record speech and return the result as WAV bytes."""
+
         return self._pcm_to_wav(self.record_pcm_until_pause(pause_ms=pause_ms))
 
     def record_pcm_until_pause(self, *, pause_ms: int) -> bytes:
+        """Record speech and return the result as raw PCM16 bytes."""
+
         return self.record_pcm_until_pause_with_options(pause_ms=pause_ms)
 
     def capture_pcm_until_pause_with_options(
@@ -386,6 +413,26 @@ class SilenceDetectedRecorder:
         on_chunk: Callable[[bytes], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> SpeechCaptureResult:
+        """Record PCM16 speech until a confirmed pause and return timing data.
+
+        Args:
+            pause_ms: Base silence duration required to stop recording.
+            start_timeout_s: Optional override for how long to wait for speech.
+            max_record_seconds: Optional override for maximum speech length.
+            speech_start_chunks: Optional override for speech-start detection.
+            ignore_initial_ms: Milliseconds to ignore before speech detection.
+            pause_grace_ms: Extra grace time after a pause candidate.
+            on_chunk: Optional callback invoked for each captured chunk.
+            should_stop: Optional cancellation callback checked during capture.
+
+        Returns:
+            Captured PCM16 bytes plus speech-start and resume metadata.
+
+        Raises:
+            RuntimeError: If recording times out, stalls, is cancelled, or ends
+                without usable speech audio.
+        """
+
         normalized_pause_ms = max(0, int(pause_ms))
         normalized_ignore_initial_ms = max(0, int(ignore_initial_ms))
         normalized_pause_grace_ms = max(0, int(pause_grace_ms))
@@ -586,6 +633,8 @@ class SilenceDetectedRecorder:
         ignore_initial_ms: int = 0,
         pause_grace_ms: int = 0,
     ) -> bytes:
+        """Record PCM16 speech until pause detection stops the capture."""
+
         result = self.capture_pcm_until_pause_with_options(
             pause_ms=pause_ms,
             start_timeout_s=start_timeout_s,
@@ -614,6 +663,8 @@ class SilenceDetectedRecorder:
 
 
 class AmbientAudioSampler:
+    """Sample short ambient microphone windows for loudness analysis."""
+
     def __init__(
         self,
         *,
@@ -634,6 +685,8 @@ class AmbientAudioSampler:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "AmbientAudioSampler":
+        """Build an ambient sampler from ``TwinrConfig`` values."""
+
         # AUDIT-FIX(#7): Normalize config-provided device names before accessing ALSA.
         device = _normalize_audio_device(config.proactive_audio_input_device or config.audio_input_device)
         return cls(
@@ -646,9 +699,13 @@ class AmbientAudioSampler:
         )
 
     def sample_levels(self, *, duration_ms: int | None = None) -> AmbientAudioLevelSample:
+        """Sample ambient audio and return only the aggregate loudness metrics."""
+
         return self.sample_window(duration_ms=duration_ms).sample
 
     def sample_window(self, *, duration_ms: int | None = None) -> AmbientAudioCaptureWindow:
+        """Sample ambient audio and return both metrics and captured PCM bytes."""
+
         if duration_ms is None:
             normalized_duration_ms = self.default_duration_ms
         else:
@@ -755,6 +812,8 @@ class AmbientAudioSampler:
 
 
 class WaveAudioPlayer:
+    """Play Twinr WAV, PCM, and synthesized tone output through ALSA."""
+
     def __init__(self, *, device: str = "default") -> None:
         # AUDIT-FIX(#7): Normalize playback device names early so blank config values still resolve safely.
         self.device = _normalize_audio_device(device)
@@ -763,9 +822,13 @@ class WaveAudioPlayer:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "WaveAudioPlayer":
+        """Build a playback adapter from ``TwinrConfig`` values."""
+
         return cls(device=config.audio_output_device)
 
     def play_wav_bytes(self, audio_bytes: bytes) -> None:
+        """Play an in-memory WAV file through the configured output device."""
+
         # AUDIT-FIX(#1): Use a unique secure temp file instead of a fixed /tmp path to prevent symlink attacks and concurrent clobbering.
         with tempfile.NamedTemporaryFile(prefix="twinr-playback-", suffix=".wav", delete=False) as temp_file:
             temp_file.write(audio_bytes)
@@ -783,6 +846,8 @@ class WaveAudioPlayer:
         volume: float = 0.8,
         sample_rate: int = 24000,
     ) -> None:
+        """Play one synthesized confirmation tone."""
+
         self.play_pcm16_chunks(
             [
                 self._render_tone_pcm(
@@ -804,6 +869,8 @@ class WaveAudioPlayer:
         sample_rate: int = 24000,
         gap_ms: int = 34,
     ) -> None:
+        """Play a short sequence of synthesized tones."""
+
         pcm = bytearray()
         for index, (frequency_hz, duration_ms) in enumerate(tones):
             if index > 0 and gap_ms > 0:
@@ -826,6 +893,8 @@ class WaveAudioPlayer:
         *,
         should_stop: Callable[[], bool] | None = None,
     ) -> None:
+        """Stream WAV chunks to ``aplay`` until playback completes or stops."""
+
         self._play_stream(
             ["aplay", "-q", "-D", self.device, "-t", "wav", "-"],
             chunks,
@@ -840,6 +909,8 @@ class WaveAudioPlayer:
         channels: int = 1,
         should_stop: Callable[[], bool] | None = None,
     ) -> None:
+        """Stream raw PCM16 chunks to ``aplay`` with explicit format settings."""
+
         normalized_sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
         normalized_channels = _ensure_int("channels", channels, minimum=1)
         self._play_stream(
@@ -935,6 +1006,8 @@ class WaveAudioPlayer:
             self._stop_process(process)
 
     def play_file(self, path: str | Path) -> None:
+        """Play one existing audio file through ``aplay``."""
+
         path_obj = Path(path)
         if not path_obj.is_file():
             raise RuntimeError(f"Audio playback file not found: {path_obj}")
@@ -964,6 +1037,8 @@ class WaveAudioPlayer:
         raise RuntimeError(f"Audio playback failed: {message}")
 
     def stop_playback(self) -> None:
+        """Stop the currently active playback process, if any."""
+
         with self._active_process_lock:
             process = self._active_process
         if process is None:

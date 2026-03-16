@@ -1,3 +1,10 @@
+"""Evaluate proactive social triggers from normalized sensor observations.
+
+This module defines the social-trigger domain model, bounded threshold config,
+and the stateful engine that turns recent vision, audio, and PIR signals into
+one candidate proactive prompt.
+"""
+
 from __future__ import annotations
 
 import math  # AUDIT-FIX(#2,#4): Finite/monotonic timestamp checks and numeric threshold sanitisation require explicit numeric validation.
@@ -11,6 +18,8 @@ from .scoring import TriggerScoreEvidence, bool_score, hold_progress, recent_pro
 
 # AUDIT-FIX(#2,#4,#5): Normalize permissive upstream sensor/config payloads before they can corrupt state, crash enum access, or break scoring math.
 def _coerce_bool(value: object, *, default: bool = False) -> bool:
+    """Coerce one value to a boolean with fallback."""
+
     if isinstance(value, bool):
         return value
     if isinstance(value, int) and value in (0, 1):
@@ -25,6 +34,8 @@ def _coerce_bool(value: object, *, default: bool = False) -> bool:
 
 
 def _coerce_optional_bool(value: object) -> bool | None:
+    """Coerce one value to ``bool`` or ``None``."""
+
     if value is None:
         return None
     if isinstance(value, bool):
@@ -41,6 +52,8 @@ def _coerce_optional_bool(value: object) -> bool | None:
 
 
 def _coerce_timestamp(value: object) -> float | None:
+    """Coerce one value to a non-negative finite timestamp."""
+
     try:
         timestamp = float(value)
     except (TypeError, ValueError):
@@ -51,6 +64,8 @@ def _coerce_timestamp(value: object) -> float | None:
 
 
 def _normalize_positive_float(value: object, *, default: float) -> float:
+    """Coerce one value to a positive finite float."""
+
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -61,6 +76,8 @@ def _normalize_positive_float(value: object, *, default: float) -> float:
 
 
 def _normalize_non_negative_float(value: object, *, default: float = 0.0) -> float:
+    """Coerce one value to a non-negative finite float."""
+
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -71,6 +88,8 @@ def _normalize_non_negative_float(value: object, *, default: float = 0.0) -> flo
 
 
 def _normalize_unit_interval(value: object, *, default: float) -> float:
+    """Clamp one numeric value into ``[0.0, 1.0]`` with fallback."""
+
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -85,6 +104,8 @@ def _normalize_unit_interval(value: object, *, default: float) -> float:
 
 
 class SocialBodyPose(StrEnum):
+    """Describe the coarse body-pose classes used by trigger logic."""
+
     UNKNOWN = "unknown"
     UPRIGHT = "upright"
     SLUMPED = "slumped"
@@ -92,6 +113,8 @@ class SocialBodyPose(StrEnum):
 
 
 def _coerce_body_pose(value: object) -> SocialBodyPose:
+    """Coerce one value to a known body pose."""
+
     if isinstance(value, SocialBodyPose):
         return value
     if isinstance(value, str):
@@ -104,6 +127,8 @@ def _coerce_body_pose(value: object) -> SocialBodyPose:
 
 
 class SocialTriggerPriority(IntEnum):
+    """Order social triggers from least to most urgent."""
+
     POSITIVE_CONTACT = 10
     PERSON_RETURNED = 20
     SHOWING_INTENT = 30
@@ -116,6 +141,8 @@ class SocialTriggerPriority(IntEnum):
 
 @dataclass(frozen=True, slots=True)
 class SocialVisionObservation:
+    """Describe one normalized vision observation tick."""
+
     person_visible: bool = False
     looking_toward_device: bool = False
     body_pose: SocialBodyPose = SocialBodyPose.UNKNOWN
@@ -125,12 +152,16 @@ class SocialVisionObservation:
 
 @dataclass(frozen=True, slots=True)
 class SocialAudioObservation:
+    """Describe one normalized audio observation tick."""
+
     speech_detected: bool | None = None
     distress_detected: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class SocialObservation:
+    """Combine normalized sensor observations for one trigger-engine tick."""
+
     observed_at: float
     inspected: bool = False  # AUDIT-FIX(#1): Absent vision data must default to "unknown", not to an authoritative "no person visible".
     pir_motion_detected: bool = False
@@ -141,6 +172,8 @@ class SocialObservation:
 
 @dataclass(frozen=True, slots=True)
 class SocialTriggerDecision:
+    """Describe one emitted proactive social trigger."""
+
     trigger_id: str
     prompt: str
     reason: str
@@ -153,6 +186,8 @@ class SocialTriggerDecision:
 
 @dataclass(frozen=True, slots=True)
 class SocialTriggerEvaluation:
+    """Describe one scored trigger candidate before selection."""
+
     trigger_id: str
     prompt: str
     reason: str
@@ -167,6 +202,8 @@ class SocialTriggerEvaluation:
 
 @dataclass(frozen=True, slots=True)
 class SocialTriggerThresholds:
+    """Store hold windows and score thresholds for social triggers."""
+
     person_returned_absence_s: float = 20.0 * 60.0
     person_returned_recent_motion_s: float = 30.0
     attention_window_s: float = 6.0
@@ -190,6 +227,8 @@ class SocialTriggerThresholds:
     distress_possible_score_threshold: float = 0.85
 
     def __post_init__(self) -> None:
+        """Normalize duration and score thresholds after construction."""
+
         # AUDIT-FIX(#4): Reject non-finite/zero/negative timing inputs and clamp score thresholds to a valid unit interval before any scoring math runs.
         duration_defaults = {
             "person_returned_absence_s": 20.0 * 60.0,
@@ -223,6 +262,8 @@ class SocialTriggerThresholds:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "SocialTriggerThresholds":
+        """Build thresholds from ``TwinrConfig`` with safe defaults."""
+
         defaults = cls()
         # AUDIT-FIX(#3,#4): Fall back to baked-in defaults when older TwinrConfig objects or partial .env payloads lack new fields or provide malformed values.
         return cls(
@@ -295,12 +336,21 @@ class SocialTriggerThresholds:
 
 
 class SocialTriggerEngine:
+    """Track recent social signals and emit the strongest passing trigger.
+
+    The engine maintains bounded state across observation ticks so it can
+    reason about visibility gaps, holds, cooldowns, and fall-like transitions
+    without mixing hardware acquisition into the scoring logic.
+    """
+
     def __init__(
         self,
         *,
         user_name: str | None = None,
         thresholds: SocialTriggerThresholds | None = None,
     ) -> None:
+        """Initialize one stateful trigger engine."""
+
         # AUDIT-FIX(#5): Normalise potentially non-string display names coming from config instead of assuming .strip() exists.
         self.user_name = None if user_name is None else (str(user_name).strip() or None)
         self.thresholds = thresholds or SocialTriggerThresholds()
@@ -340,6 +390,8 @@ class SocialTriggerEngine:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "SocialTriggerEngine":
+        """Build one trigger engine from the canonical Twinr config."""
+
         return cls(
             user_name=getattr(config, "user_display_name", None),  # AUDIT-FIX(#3,#5): Preserve startup compatibility with older config objects.
             thresholds=SocialTriggerThresholds.from_config(config),
@@ -347,10 +399,14 @@ class SocialTriggerEngine:
 
     @property
     def last_evaluations(self) -> tuple[SocialTriggerEvaluation, ...]:
+        """Return the scored candidates from the latest observation tick."""
+
         return self._last_evaluations
 
     @property
     def best_evaluation(self) -> SocialTriggerEvaluation | None:
+        """Return the strongest latest candidate, including near misses."""
+
         if not self._last_evaluations:
             return None
         passed_candidates = tuple(item for item in self._last_evaluations if item.passed)
@@ -365,6 +421,16 @@ class SocialTriggerEngine:
         )
 
     def observe(self, observation: SocialObservation) -> SocialTriggerDecision | None:
+        """Update state from one observation tick and emit a trigger if ready.
+
+        Args:
+            observation: One normalized sensor observation for the current tick.
+
+        Returns:
+            The selected proactive trigger decision, or ``None`` when no
+            candidate passes validation, scoring, and cooldown checks.
+        """
+
         # AUDIT-FIX(#2,#5): Reject malformed or stale observations before mutating internal state; this prevents crashes and time-warped cooldown logic.
         if not isinstance(observation, SocialObservation):
             self._last_evaluations = ()
@@ -485,6 +551,8 @@ class SocialTriggerEngine:
         absence_duration: float | None,
         person_visible: bool,
     ) -> SocialTriggerEvaluation:
+        """Score whether a person recently returned after tracked absence."""
+
         evidence = (
             TriggerScoreEvidence(
                 key="absence_hold",
@@ -535,6 +603,8 @@ class SocialTriggerEngine:
         )
 
     def _candidate_attention_window(self, now: float) -> SocialTriggerEvaluation:
+        """Score whether the device has a short quiet attention window."""
+
         evidence = (
             TriggerScoreEvidence(
                 key="looking_hold",
@@ -568,6 +638,8 @@ class SocialTriggerEngine:
         )
 
     def _candidate_slumped_quiet(self, now: float) -> SocialTriggerEvaluation:
+        """Score whether a visible person remains slumped, quiet, and still."""
+
         evidence = (
             TriggerScoreEvidence(
                 key="slumped_hold",
@@ -617,6 +689,8 @@ class SocialTriggerEngine:
         )
 
     def _candidate_possible_fall(self, now: float) -> SocialTriggerEvaluation:
+        """Score whether recent state suggests a possible fall."""
+
         low_motion_since = self._possible_fall_post_transition_since(now, self._low_motion_since)
         quiet_since = self._possible_fall_post_transition_since(now, self._quiet_since)
         evidence = (
@@ -662,6 +736,8 @@ class SocialTriggerEngine:
         )
 
     def _candidate_floor_stillness(self, now: float) -> SocialTriggerEvaluation:
+        """Score whether a person remains low to the floor and still."""
+
         evidence = (
             TriggerScoreEvidence(
                 key="floor_hold",
@@ -715,6 +791,8 @@ class SocialTriggerEngine:
         now: float,
         vision: SocialVisionObservation,
     ) -> SocialTriggerEvaluation:
+        """Score whether the person seems to be showing something to the device."""
+
         evidence = (
             TriggerScoreEvidence(
                 key="showing_hold",
@@ -752,6 +830,8 @@ class SocialTriggerEngine:
         now: float,
         vision: SocialVisionObservation,
     ) -> SocialTriggerEvaluation:
+        """Score whether distress-like audio aligns with concerning posture."""
+
         evidence = (
             TriggerScoreEvidence(
                 key="distress_hold",
@@ -786,6 +866,8 @@ class SocialTriggerEngine:
         now: float,
         vision: SocialVisionObservation,
     ) -> SocialTriggerEvaluation:
+        """Score whether the person is positively engaged with the device."""
+
         evidence = (
             TriggerScoreEvidence(
                 key="smile_hold",
@@ -835,6 +917,8 @@ class SocialTriggerEngine:
         person_visible: bool,
         sensor_absence_signal: bool = False,
     ) -> float | None:
+        """Update tracked presence and return any completed absence duration."""
+
         # AUDIT-FIX(#1,#10): Uninspected ticks normally freeze presence state, except for the coordinator's explicit sensor-only absence path.
         if not inspected and not sensor_absence_signal:
             return None
@@ -869,6 +953,8 @@ class SocialTriggerEngine:
         pir_motion_detected: bool,
         vision: object,
     ) -> bool:
+        """Return whether sensor-only input should extend the absence state."""
+
         if inspected or pir_motion_detected:
             return False
         if not isinstance(vision, SocialVisionObservation):
@@ -885,6 +971,8 @@ class SocialTriggerEngine:
         person_visible: bool,
         body_pose: SocialBodyPose,
     ) -> None:
+        """Update tracked pose and fall-transition state."""
+
         # AUDIT-FIX(#1): Only inspected, person-present frames may mutate pose state; otherwise stale/unknown vision drops can fabricate transitions.
         if not inspected or not person_visible:
             return
@@ -905,6 +993,8 @@ class SocialTriggerEngine:
             self._possible_fall_candidate_at = None
 
     def _cooldown_active(self, trigger_id: str, now: float) -> bool:
+        """Return whether one trigger is still on cooldown."""
+
         last_at = self._last_triggered_at.get(trigger_id)
         if last_at is None:
             return False
@@ -922,6 +1012,8 @@ class SocialTriggerEngine:
         evidence: tuple[TriggerScoreEvidence, ...],
         blocked_reason: str | None = None,
     ) -> SocialTriggerEvaluation:
+        """Build one scored trigger evaluation from evidence."""
+
         # AUDIT-FIX(#4,#6): Clamp thresholds and renormalise evidence so bad config or overweighted evidence cannot skew or explode scoring.
         score_card = weighted_trigger_score(
             threshold=_normalize_unit_interval(threshold, default=1.0),
@@ -941,17 +1033,23 @@ class SocialTriggerEngine:
         )
 
     def _with_name(self, *, base: str, with_name: str) -> str:
+        """Format one prompt variant with the configured display name."""
+
         if self.user_name is None:
             return base
         return with_name.format(name=self.user_name)
 
     def _conjunction_since(self, *starts: float | None) -> float | None:
+        """Return the shared activation start when all inputs are active."""
+
         active_starts = [start for start in starts if start is not None]
         if len(active_starts) != len(starts):
             return None
         return max(active_starts)
 
     def _next_since(self, active: bool, current: float | None, now: float) -> float | None:
+        """Advance one hold start timestamp when its signal remains active."""
+
         if not active:
             return None
         if current is None:
@@ -959,11 +1057,15 @@ class SocialTriggerEngine:
         return current
 
     def _hold_detail(self, since: float | None, now: float, target_s: float) -> str:
+        """Render one human-readable hold-progress detail string."""
+
         if since is None:
             return f"active_for=0.0s target={target_s:.1f}s"
         return f"active_for={max(0.0, now - since):.1f}s target={target_s:.1f}s"  # AUDIT-FIX(#2): Never emit negative durations after rejected/stale time inputs.
 
     def _fell_out_of_view_after_fall_like_presence(self, now: float, *, visible_duration: float | None) -> bool:
+        """Return whether recent visibility loss looks fall-like."""
+
         if self._possible_fall_candidate_at is not None:
             return True
         if self._consecutive_visible_inspected_count < 2:
@@ -983,6 +1085,8 @@ class SocialTriggerEngine:
         return False
 
     def _possible_fall_transition_anchor(self) -> float | None:
+        """Return the newest recorded fall-transition anchor."""
+
         anchors = [
             anchor
             for anchor in (
@@ -1000,6 +1104,8 @@ class SocialTriggerEngine:
         now: float,
         signal_since: float | None,
     ) -> float | None:
+        """Clamp one hold start to the relevant fall-transition anchor."""
+
         transition_anchor = self._possible_fall_transition_anchor()
         if transition_anchor is None or signal_since is None:
             return None
@@ -1008,6 +1114,8 @@ class SocialTriggerEngine:
         return max(signal_since, transition_anchor)
 
     def _possible_fall_transition_signal(self) -> float:
+        """Return the weighted signal strength of the current fall transition."""
+
         if self._possible_fall_candidate_at is not None:
             return 1.0
         if self._possible_fall_loss_candidate_at is None:
@@ -1019,6 +1127,8 @@ class SocialTriggerEngine:
         return 0.55
 
     def _possible_fall_low_or_missing_hold(self, now: float) -> float:
+        """Return the stronger of floor hold and visibility-loss hold."""
+
         floor_hold = hold_progress(now, self._floor_since, self.thresholds.possible_fall_stillness_s)
         missing_hold = hold_progress(
             now,
@@ -1028,6 +1138,8 @@ class SocialTriggerEngine:
         return max(floor_hold, missing_hold)
 
     def _possible_fall_low_or_missing_detail(self, now: float) -> str:
+        """Render floor and visibility-loss hold details."""
+
         floor_detail = self._hold_detail(self._floor_since, now, self.thresholds.possible_fall_stillness_s)
         missing_detail = self._hold_detail(
             self._possible_fall_loss_candidate_at,
@@ -1037,6 +1149,8 @@ class SocialTriggerEngine:
         return f"floor={floor_detail}; missing={missing_detail}"
 
     def _possible_fall_visibility_loss_hold_complete(self, now: float) -> bool:
+        """Return whether the visibility-loss hold has fully armed."""
+
         if self._possible_fall_loss_candidate_at is None:
             return True
         return (
@@ -1049,6 +1163,8 @@ class SocialTriggerEngine:
         )
 
     def _possible_fall_transition_detail(self, now: float) -> str:
+        """Render one detail string for the active fall-transition signal."""
+
         if self._possible_fall_candidate_at is not None:
             return f"upright_to_floor_age={self._seconds(now - self._possible_fall_candidate_at)}"
         if self._possible_fall_loss_candidate_at is not None:
@@ -1060,17 +1176,25 @@ class SocialTriggerEngine:
         return "no recent fall-like transition"
 
     def _fall_visibility_loss_arming_s(self) -> float:
+        """Return the visibility-loss arming threshold in seconds."""
+
         return max(0.0, self.thresholds.possible_fall_visibility_loss_arming_s)
 
     def _fall_slumped_visibility_loss_arming_s(self) -> float:
+        """Return the slumped-loss arming threshold in seconds."""
+
         return max(0.0, self.thresholds.possible_fall_slumped_visibility_loss_arming_s)
 
     def _slumped_hold_before_visibility_loss(self, now: float) -> float:
+        """Return how long the person was slumped before visibility loss."""
+
         if self._slumped_since is None:
             return 0.0
         return max(0.0, now - self._slumped_since)
 
     def _update_confirmed_visibility_state(self, *, inspected: bool, person_visible: bool) -> None:
+        """Update the bounded consecutive-visible counter."""
+
         if not inspected:
             return
         if person_visible:
@@ -1082,11 +1206,15 @@ class SocialTriggerEngine:
         self._consecutive_visible_inspected_count = 0
 
     def _seconds(self, value: float | None) -> str:
+        """Format one optional duration in seconds."""
+
         if value is None:
             return "n/a"
         return f"{max(0.0, value):.1f}s"  # AUDIT-FIX(#2): Defensive formatting if upstream clocks jitter backward and the observation gets dropped.
 
     def _normalize_audio(self, audio: object) -> SocialAudioObservation:
+        """Normalize one audio payload to the strict internal type."""
+
         # AUDIT-FIX(#5): Coerce permissive payloads into the strict internal type expected by trigger logic.
         if not isinstance(audio, SocialAudioObservation):
             return SocialAudioObservation()
@@ -1101,6 +1229,8 @@ class SocialTriggerEngine:
         *,
         inspected: bool,
     ) -> SocialVisionObservation:
+        """Normalize one vision payload to the strict internal type."""
+
         # AUDIT-FIX(#1,#5): Treat "not inspected" as unknown vision and normalise malformed pose/bool payloads before they reach safety logic.
         if not inspected or not isinstance(vision, SocialVisionObservation):
             return SocialVisionObservation()
@@ -1121,6 +1251,8 @@ class SocialTriggerEngine:
         self,
         evidence: tuple[TriggerScoreEvidence, ...],
     ) -> tuple[TriggerScoreEvidence, ...]:
+        """Normalize evidence weights into one stable tuple."""
+
         sanitized: list[tuple[str, float, float, str]] = []
         total_weight = 0.0
         for item in evidence:

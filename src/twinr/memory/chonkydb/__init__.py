@@ -1,3 +1,9 @@
+"""Expose the public ChonkyDB integration surface for Twinr memory.
+
+Import from this package when callers need the supported client, schema, or
+personal-graph types without binding to a specific implementation module.
+"""
+
 from twinr.memory.chonkydb.client import ChonkyDBClient, ChonkyDBError, chonkydb_data_path
 from twinr.memory.chonkydb.models import (
     ChonkyDBAuthInfo,

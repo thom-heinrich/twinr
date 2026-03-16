@@ -1,3 +1,11 @@
+"""Provide Deepgram-backed speech-to-text adapters for Twinr.
+
+The module exposes a synchronous batch transcription helper and a bounded
+streaming session wrapper around Deepgram's websocket API. Runtime workflows
+use this provider through the higher-level contracts in
+``twinr.agent.base_agent.contracts``.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -27,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_transcript(payload: dict[str, object]) -> str:
+    """Extract the best transcript string from a batch Deepgram response."""
     # AUDIT-FIX(#5): Validate Deepgram payload structure defensively so malformed 2xx responses do not explode with AttributeError/IndexError.
     if not isinstance(payload, dict):
         raise RuntimeError("Deepgram response payload must be a JSON object")
@@ -58,6 +67,7 @@ def _extract_transcript(payload: dict[str, object]) -> str:
 
 
 def _extract_streaming_transcript(payload: dict[str, object]) -> str:
+    """Extract the latest transcript fragment from a streaming event payload."""
     channel = payload.get("channel", {})
     if not isinstance(channel, dict):
         return ""
@@ -72,6 +82,7 @@ def _extract_streaming_transcript(payload: dict[str, object]) -> str:
 
 
 def _extract_streaming_confidence(payload: dict[str, object]) -> float | None:
+    """Extract a confidence estimate from a streaming event payload."""
     channel = payload.get("channel", {})
     if not isinstance(channel, dict):
         return None
@@ -116,6 +127,7 @@ def _build_websocket_url(
     endpointing_ms: int,
     utterance_end_ms: int,
 ) -> str:
+    """Build the Deepgram websocket URL for a streaming transcription session."""
     # AUDIT-FIX(#1): Preserve secure ws/wss schemes and reject invalid base URLs instead of silently downgrading TLS or producing malformed URLs.
     normalized_base_url = base_url.strip()
     if not normalized_base_url:
@@ -153,6 +165,7 @@ def _build_websocket_url(
 
 
 def _require_positive_int(name: str, value: int) -> int:
+    """Return a validated positive integer for audio transport settings."""
     # AUDIT-FIX(#9): Fail fast on invalid audio transport settings locally instead of shipping broken parameters to Deepgram.
     if isinstance(value, bool) or int(value) <= 0:
         raise ValueError(f"{name} must be a positive integer")
@@ -160,6 +173,8 @@ def _require_positive_int(name: str, value: int) -> int:
 
 
 class _DeepgramStreamingSession(StreamingSpeechToTextSession):
+    """Manage a bounded Deepgram websocket session for live transcription."""
+
     def __init__(
         self,
         *,
@@ -171,6 +186,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
         on_interim: Callable[[str], None] | None = None,
         on_endpoint: Callable[[StreamingSpeechEndpointEvent], None] | None = None,
     ) -> None:
+        """Start sender, reader, and keepalive workers for one websocket stream."""
         self._connection = connection
         self._finalize_timeout_s = max(0.5, float(finalize_timeout_s))
         self._keepalive_interval_s = max(0.0, float(keepalive_interval_s))
@@ -203,6 +219,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
         self._keepalive.start()
 
     def send_pcm(self, pcm_bytes: bytes) -> None:
+        """Queue raw PCM bytes for delivery to the Deepgram websocket."""
         if not pcm_bytes:
             return
         # AUDIT-FIX(#6): Reject writes after shutdown or sender failure instead of silently queueing audio that can never be delivered.
@@ -210,6 +227,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
         self._enqueue(bytes(pcm_bytes))
 
     def finalize(self) -> StreamingTranscriptionResult:
+        """Request finalization and return the last stable transcription snapshot."""
         self._raise_if_unusable(allow_closed=False)
         self._finalize_requested.set()
 
@@ -230,9 +248,11 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
             self.close()
 
     def snapshot(self) -> StreamingTranscriptionResult:
+        """Return the current best-effort streaming transcription state."""
         return self._result_snapshot(transcript=self._current_transcript())
 
     def close(self) -> None:
+        """Shut down the websocket session and join background workers briefly."""
         if self._closed.is_set():
             return
 
@@ -261,6 +281,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
             self._reader.join(timeout=1.0)
 
     def _read_request_id(self) -> str | None:
+        """Read the request identifier exposed by the websocket handshake."""
         response = getattr(self._connection, "response", None)
         headers = getattr(response, "headers", None)
         if headers is None:
@@ -272,6 +293,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
         return None
 
     def _reader_loop(self) -> None:
+        """Consume Deepgram events and fold them into the session state."""
         try:
             for message in self._connection:
                 if isinstance(message, bytes):
@@ -370,6 +392,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
             self._done.set()
 
     def _result_snapshot(self, *, transcript: str) -> StreamingTranscriptionResult:
+        """Build the contract object exposed to Twinr runtime callers."""
         with self._state_lock:
             request_id = self._request_id
             saw_interim = self._saw_interim
@@ -386,6 +409,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
         )
 
     def _sender_loop(self) -> None:
+        """Drain queued audio and control frames to the websocket connection."""
         try:
             while True:
                 try:
@@ -424,6 +448,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
             self._done.set()
 
     def _keepalive_loop(self) -> None:
+        """Send Deepgram keepalives during long idle periods."""
         if self._keepalive_interval_s <= 0:
             return
 
@@ -453,6 +478,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
         allow_error: bool = False,
         allow_closed: bool = False,
     ) -> None:
+        """Queue outbound payloads while enforcing close and backpressure rules."""
         if not allow_closed and self._closed.is_set():
             raise RuntimeError("Streaming session is closed")
         if not allow_error:
@@ -468,6 +494,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
             raise RuntimeError("Streaming session outbound queue is full") from exc
 
     def _current_transcript(self) -> str:
+        """Return the best transcript assembled so far for the session."""
         with self._state_lock:
             transcript = " ".join(segment for segment in self._final_segments if segment).strip()
             if not transcript:
@@ -475,6 +502,7 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
             return transcript
 
     def _safe_invoke_callback(self, callback: Callable[[Any], None] | None, value: Any) -> None:
+        """Invoke a caller callback without letting callback failures break STT."""
         if callback is None:
             return
         try:
@@ -483,16 +511,19 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
             logger.exception("Deepgram streaming callback raised and was ignored")
 
     def _set_stream_error(self, exc: Exception) -> None:
+        """Store the first terminal stream error and wake blocked waiters."""
         with self._state_lock:
             if self._stream_error is None:
                 self._stream_error = exc
         self._done.set()
 
     def _get_stream_error(self) -> Exception | None:
+        """Return the stored terminal stream error, if one exists."""
         with self._state_lock:
             return self._stream_error
 
     def _raise_if_unusable(self, *, allow_closed: bool = False) -> None:
+        """Raise if the session has failed or is already closed."""
         error = self._get_stream_error()
         if error is not None:
             raise error
@@ -503,6 +534,8 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
 
 
 class DeepgramSpeechToTextProvider:
+    """Transcribe files or live PCM streams with the configured Deepgram account."""
+
     def __init__(
         self,
         config: TwinrConfig,
@@ -510,6 +543,7 @@ class DeepgramSpeechToTextProvider:
         client: httpx.Client | None = None,
         websocket_connector: Callable[..., Any] | None = None,
     ) -> None:
+        """Create the provider with optional HTTP and websocket test doubles."""
         self.config = config
         self._owns_client = client is None
         # AUDIT-FIX(#8): Track ownership and expose close() so provider-created HTTP clients can release pooled sockets cleanly at shutdown.
@@ -517,13 +551,16 @@ class DeepgramSpeechToTextProvider:
         self._websocket_connector = websocket_connector or websocket_connect
 
     def close(self) -> None:
+        """Close the provider-owned HTTP client if this instance created it."""
         if self._owns_client:
             self._client.close()
 
     def __enter__(self) -> DeepgramSpeechToTextProvider:
+        """Support ``with`` blocks around provider-owned HTTP resources."""
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        """Close provider-owned resources when leaving a context manager."""
         self.close()
 
     def transcribe(
@@ -535,6 +572,22 @@ class DeepgramSpeechToTextProvider:
         language: str | None = None,
         prompt: str | None = None,
     ) -> str:
+        """Transcribe an in-memory audio payload with Deepgram's REST API.
+
+        Args:
+            audio_bytes: Raw audio bytes to send to Deepgram.
+            filename: Unused compatibility parameter kept for provider parity.
+            content_type: MIME type describing ``audio_bytes``.
+            language: Optional override for the configured transcription language.
+            prompt: Unused compatibility parameter kept for provider parity.
+
+        Returns:
+            The best transcript string returned by Deepgram, or an empty string
+            when the provider produced no transcript text.
+
+        Raises:
+            RuntimeError: If configuration is incomplete or the request fails.
+        """
         del filename, prompt
         if not audio_bytes:
             return ""
@@ -577,6 +630,19 @@ class DeepgramSpeechToTextProvider:
         language: str | None = None,
         prompt: str | None = None,
     ) -> str:
+        """Safely read a regular audio file from disk and transcribe it.
+
+        Args:
+            path: Filesystem path to a regular audio file.
+            language: Optional override for the configured transcription language.
+            prompt: Unused compatibility parameter kept for provider parity.
+
+        Returns:
+            The transcript produced by :meth:`transcribe`.
+
+        Raises:
+            RuntimeError: If the file cannot be opened safely or transcription fails.
+        """
         audio_path = Path(path)
         content_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
 
@@ -626,6 +692,23 @@ class DeepgramSpeechToTextProvider:
         on_interim: Callable[[str], None] | None = None,
         on_endpoint: Callable[[StreamingSpeechEndpointEvent], None] | None = None,
     ) -> StreamingSpeechToTextSession:
+        """Open a bounded Deepgram websocket session for live PCM input.
+
+        Args:
+            sample_rate: PCM sample rate in Hz.
+            channels: Number of PCM channels sent through the stream.
+            language: Optional override for the configured transcription language.
+            prompt: Unused compatibility parameter kept for provider parity.
+            on_interim: Optional callback for interim transcript fragments.
+            on_endpoint: Optional callback for endpoint notifications.
+
+        Returns:
+            A live :class:`StreamingSpeechToTextSession` ready to receive PCM bytes.
+
+        Raises:
+            RuntimeError: If configuration is incomplete or the websocket cannot open.
+            ValueError: If ``sample_rate`` or ``channels`` are not positive integers.
+        """
         del prompt
         api_key = (self.config.deepgram_api_key or "").strip()
         if not api_key:

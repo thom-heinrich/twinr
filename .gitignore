@@ -4,6 +4,11 @@
 
 # Local workflow tooling.
 AGENTS.md
+!src/twinr/memory/longterm/runtime/AGENTS.md
+!src/twinr/proactive/governance/AGENTS.md
+!src/twinr/proactive/runtime/AGENTS.md
+!src/twinr/providers/deepgram/AGENTS.md
+!src/twinr/providers/groq/AGENTS.md
 .codex/
 agentic_tools/
 common/

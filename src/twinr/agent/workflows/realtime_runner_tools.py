@@ -1,7 +1,11 @@
+"""Delegate realtime tool callbacks to the shared tool executor."""
+
 from __future__ import annotations
 
 
 class TwinrRealtimeToolDelegatesMixin:
+    """Expose the `handle_*` methods expected by realtime tool bindings."""
+
     def _handle_print_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_print_receipt(arguments)
 
@@ -28,6 +32,12 @@ class TwinrRealtimeToolDelegatesMixin:
 
     def _handle_delete_automation_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_delete_automation(arguments)
+
+    def _handle_propose_skill_learning_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_propose_skill_learning(arguments)
+
+    def _handle_answer_skill_question_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_answer_skill_question(arguments)
 
     def _handle_remember_memory_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_remember_memory(arguments)

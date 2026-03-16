@@ -1,3 +1,11 @@
+"""Monitor live microphone PCM for wakeword detections with bounded lifecycle.
+
+This module runs a bounded ``arecord`` worker, feeds exact frames into the
+stream spotter, keeps short recent audio history for capture windows, and
+surfaces detections and errors without letting subprocess failures escape the
+runtime loop.
+"""
+
 from __future__ import annotations
 
 from collections import deque
@@ -21,12 +29,21 @@ from .spotter import WakewordOpenWakeWordFrameSpotter
 
 @dataclass(frozen=True, slots=True)
 class WakewordStreamDetection:
+    """Describe one streaming wakeword detection with presence context."""
+
     match: WakewordMatch
     presence_snapshot: PresenceSessionSnapshot
     capture_window: AmbientAudioCaptureWindow | None = None
 
 
 class OpenWakeWordStreamingMonitor:
+    """Monitor live microphone audio and emit wakeword stream detections.
+
+    The monitor owns exactly one worker thread plus one ``arecord``
+    subprocess, keeps bounded detection and error queues, and resets detector
+    state when the presence session disarms.
+    """
+
     _SELECT_TIMEOUT_S = 0.2
     _STOP_WAIT_TIMEOUT_S = 1.0
     _STOP_JOIN_TIMEOUT_S = 3.0
@@ -88,6 +105,8 @@ class OpenWakeWordStreamingMonitor:
         self._stderr_tail = bytearray()
 
     def open(self) -> "OpenWakeWordStreamingMonitor":
+        """Start the worker thread and reset runtime state if needed."""
+
         with self._lifecycle_lock:
             # AUDIT-FIX(#1): Recover from stale dead worker threads instead of treating the monitor as still running.
             if self._thread is not None and not self._thread.is_alive():
@@ -110,6 +129,8 @@ class OpenWakeWordStreamingMonitor:
         return self
 
     def close(self) -> None:
+        """Stop the worker thread and its child process."""
+
         with self._lifecycle_lock:
             thread = self._thread
             process = self._process
@@ -136,6 +157,8 @@ class OpenWakeWordStreamingMonitor:
         self.close()
 
     def update_presence(self, snapshot: PresenceSessionSnapshot) -> None:
+        """Update the current presence snapshot and reset on disarm."""
+
         should_reset = False
         with self._presence_lock:
             self._presence_snapshot = snapshot
@@ -153,18 +176,24 @@ class OpenWakeWordStreamingMonitor:
                 self._last_detection_at = None
 
     def poll_detection(self) -> WakewordStreamDetection | None:
+        """Return the next queued wakeword detection if available."""
+
         try:
             return self._detections.get_nowait()
         except Empty:
             return None
 
     def poll_error(self) -> str | None:
+        """Return the next queued streaming error if available."""
+
         try:
             return self._errors.get_nowait()
         except Empty:
             return None
 
     def sample_window(self, *, duration_ms: int | None = None) -> AmbientAudioCaptureWindow:
+        """Return a recent audio window assembled from buffered frames."""
+
         target_duration_ms = max(self.chunk_ms, duration_ms or self.chunk_ms)
         target_frames = max(1, math.ceil(target_duration_ms / self.chunk_ms))
         with self._history_lock:
@@ -190,6 +219,8 @@ class OpenWakeWordStreamingMonitor:
         )
 
     def sample_levels(self, *, duration_ms: int | None = None) -> AmbientAudioLevelSample:
+        """Return audio-level stats for the requested recent window."""
+
         return self.sample_window(duration_ms=duration_ms).sample
 
     def _run(self) -> None:

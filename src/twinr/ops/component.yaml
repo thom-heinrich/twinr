@@ -1,0 +1,158 @@
+schema_version: 1
+name: ops
+path: src/twinr/ops
+kind: python-package
+visibility: internal
+summary: Provide Twinr's operational support layer for config checks, health snapshots, device diagnostics, singleton loop locks, file-backed ops stores, self-tests, and support exports.
+owned_concerns:
+  - Resolve canonical filesystem paths for ops artifacts, stores, self-tests, and support bundles
+  - Persist sanitized operational events and provider usage telemetry as bounded JSONL stores
+  - Sample config, device, and host health for Twinr's local web UI and support workflows
+  - Coordinate singleton loop ownership through secure per-loop lock files
+  - Run bounded hardware self-tests and build redacted support bundles from local ops evidence
+out_of_scope:
+  - Runtime orchestration and state transitions in src/twinr/agent/workflows and src/twinr/agent/base_agent/runtime
+  - Hardware adapter implementations in src/twinr/hardware
+  - Web routing, templates, and view-model shaping in src/twinr/web
+  - Provider-specific request execution outside normalized usage extraction helpers
+files:
+  - path: __init__.py
+    role: Public ops package export surface
+    exports:
+      - DeviceFact
+      - DeviceOverview
+      - DeviceStatus
+      - ConfigCheck
+      - ServiceHealth
+      - SelfTestResult
+      - SupportBundleInfo
+      - TokenUsage
+      - TwinrInstanceLock
+      - TwinrOpsEventStore
+      - TwinrOpsPaths
+      - TwinrSystemHealth
+      - TwinrSelfTestRunner
+      - TwinrUsageStore
+      - UsageRecord
+      - UsageSummary
+      - build_support_bundle
+      - check_summary
+      - collect_device_overview
+      - collect_system_health
+      - compact_text
+      - extract_model_name
+      - extract_token_usage
+      - loop_instance_lock
+      - loop_lock_owner
+      - loop_lock_path
+      - redact_env_values
+      - resolve_ops_paths
+      - resolve_ops_paths_for_config
+      - run_config_checks
+  - path: paths.py
+    role: Canonical ops artifact and store path resolution
+    exports:
+      - TwinrOpsPaths
+      - resolve_ops_paths
+      - resolve_ops_paths_for_config
+  - path: locks.py
+    role: Secure single-instance loop locking and owner inspection
+    exports:
+      - TwinrInstanceLock
+      - loop_instance_lock
+      - loop_lock_owner
+      - loop_lock_path
+  - path: events.py
+    role: Secret-aware operational event store
+    exports:
+      - TwinrOpsEventStore
+      - compact_text
+  - path: usage.py
+    role: Provider usage telemetry store and extraction helpers
+    exports:
+      - TokenUsage
+      - TwinrUsageStore
+      - UsageRecord
+      - UsageSummary
+      - extract_model_name
+      - extract_token_usage
+  - path: checks.py
+    role: Config and environment audit checks for ops surfaces
+    exports:
+      - ConfigCheck
+      - check_summary
+      - run_config_checks
+  - path: health.py
+    role: Host and service health snapshot assembly
+    exports:
+      - ServiceHealth
+      - TwinrSystemHealth
+      - collect_system_health
+  - path: devices.py
+    role: Dashboard-ready device overview probes and summaries
+    exports:
+      - DeviceFact
+      - DeviceOverview
+      - DeviceStatus
+      - collect_device_overview
+  - path: self_test.py
+    role: Bounded hardware self-test execution and artifact capture
+    exports:
+      - SelfTestResult
+      - TwinrSelfTestRunner
+  - path: support.py
+    role: Redacted support bundle generation from local ops artifacts
+    exports:
+      - SupportBundleInfo
+      - build_support_bundle
+      - redact_env_values
+public_api:
+  module: twinr.ops
+  exports:
+    - DeviceFact
+    - DeviceOverview
+    - DeviceStatus
+    - ConfigCheck
+    - ServiceHealth
+    - SelfTestResult
+    - SupportBundleInfo
+    - TokenUsage
+    - TwinrInstanceLock
+    - TwinrOpsEventStore
+    - TwinrOpsPaths
+    - TwinrSystemHealth
+    - TwinrSelfTestRunner
+    - TwinrUsageStore
+    - UsageRecord
+    - UsageSummary
+    - build_support_bundle
+    - check_summary
+    - collect_device_overview
+    - collect_system_health
+    - compact_text
+    - extract_model_name
+    - extract_token_usage
+    - loop_instance_lock
+    - loop_lock_owner
+    - loop_lock_path
+    - redact_env_values
+    - resolve_ops_paths
+    - resolve_ops_paths_for_config
+    - run_config_checks
+primary_callers:
+  - path: src/twinr/__main__.py
+  - path: src/twinr/web/app.py
+  - path: src/twinr/web/context.py
+  - path: src/twinr/web/viewmodels_voice.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/display/service.py
+  - path: src/twinr/proactive/wakeword/evaluation.py
+tests:
+  - path: test/test_ops.py
+  - path: test/test_ops_health.py
+  - path: test/test_devices.py
+  - path: test/test_locks.py
+  - path: test/test_web_app.py
+  - path: test/test_main.py
+  - path: test/test_display_service.py

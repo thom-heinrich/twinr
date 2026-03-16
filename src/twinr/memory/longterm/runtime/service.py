@@ -1,3 +1,12 @@
+"""Assemble runtime-facing long-term memory operations.
+
+This module wires together extraction, consolidation, retrieval, retention,
+proactive planning, remote readiness checks, and bounded background writers
+behind one service used by Twinr runtime loops. Lower-level reasoning,
+ingestion, and storage logic stays in their dedicated packages; this module
+coordinates those pieces without owning their algorithms.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
@@ -46,11 +55,12 @@ from twinr.memory.longterm.proactive.state import LongTermProactivePolicy, LongT
 from twinr.memory.longterm.reasoning.reflect import LongTermMemoryReflector
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
 from twinr.memory.longterm.reasoning.retention import LongTermRetentionPolicy
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, LongTermRemoteUnavailableError
 from twinr.memory.longterm.ingestion.sensor_memory import LongTermSensorMemoryCompiler
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder, LongTermSubtextCompiler
 from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
+from twinr.memory.longterm.runtime.health import LongTermRemoteHealthProbe
 from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter, AsyncLongTermMultimodalWriter
 
 
@@ -70,6 +80,8 @@ _MAX_QUEUE_SIZE = 4096
 
 # AUDIT-FIX(#10): harden text normalization against zero/negative limits and silent off-by-one truncation.
 def _normalize_text(value: object, *, limit: int) -> str:
+    """Normalize arbitrary input into one bounded single-line string."""
+
     if limit <= 0:
         return ""
     text = " ".join(str(value or "").split()).strip()
@@ -84,6 +96,8 @@ def _normalize_text(value: object, *, limit: int) -> str:
 
 # AUDIT-FIX(#10): clamp queue sizes and review limits to sane positive values on misconfigured .env input.
 def _coerce_positive_int(value: object, *, default: int, maximum: int | None = None) -> int:
+    """Coerce config-like input to a positive integer within bounds."""
+
     try:
         result = int(value)
     except (TypeError, ValueError):
@@ -96,6 +110,8 @@ def _coerce_positive_int(value: object, *, default: int, maximum: int | None = N
 
 
 def _coerce_timeout_s(value: object, *, default: float) -> float:
+    """Coerce timeout input to finite non-negative seconds."""
+
     try:
         result = float(value)
     except (TypeError, ValueError):
@@ -107,6 +123,8 @@ def _coerce_timeout_s(value: object, *, default: float) -> float:
 
 @lru_cache(maxsize=16)
 def _load_timezone(timezone_name: str) -> ZoneInfo:
+    """Load and cache one timezone, falling back to UTC on unknown names."""
+
     try:
         return ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError:
@@ -116,6 +134,8 @@ def _load_timezone(timezone_name: str) -> ZoneInfo:
 
 # AUDIT-FIX(#9): convert public datetime inputs to timezone-aware local datetimes before scheduling or retention logic.
 def _normalize_datetime(value: datetime | None, *, timezone_name: str) -> datetime | None:
+    """Normalize a datetime into the configured local timezone."""
+
     if value is None:
         return None
     timezone = _load_timezone(timezone_name)
@@ -125,6 +145,8 @@ def _normalize_datetime(value: datetime | None, *, timezone_name: str) -> dateti
 
 
 def _serialize_datetime(value: datetime, *, timezone_name: str) -> str:
+    """Serialize one datetime after timezone normalization."""
+
     normalized = _normalize_datetime(value, timezone_name=timezone_name)
     if normalized is None:
         return ""
@@ -138,6 +160,8 @@ def _sanitize_jsonish(
     timezone_name: str,
     depth: int = 0,
 ) -> object:
+    """Convert nested sensor payloads into bounded JSON-safe values."""
+
     if depth >= _JSON_DEPTH_LIMIT:
         return _normalize_text(repr(value), limit=_JSON_STRING_LIMIT)
     if value is None or isinstance(value, bool):
@@ -183,6 +207,8 @@ def _sanitize_jsonish(
 
 # AUDIT-FIX(#7): reject unsafe config-backed file paths used for backfill and local fallback store recreation.
 def _validate_regular_file_path(path_value: object, *, allow_missing: bool) -> Path | None:
+    """Accept only regular, non-symlink file paths for local file access."""
+
     try:
         path = Path(path_value).expanduser()
     except (TypeError, ValueError):
@@ -203,15 +229,28 @@ def _validate_regular_file_path(path_value: object, *, allow_missing: bool) -> P
 
 
 def _sort_objects_by_memory_id(items: Iterable[Any]) -> tuple[Any, ...]:
+    """Return memory objects sorted by stable memory ID."""
+
     return tuple(sorted(items, key=lambda row: row.memory_id))
 
 
 def _sort_conflicts(items: Iterable[Any]) -> tuple[Any, ...]:
+    """Return conflict objects sorted by slot and candidate memory ID."""
+
     return tuple(sorted(items, key=lambda row: (row.slot_key, row.candidate_memory_id)))
 
 
 @dataclass(slots=True)
 class LongTermMemoryService:
+    """Coordinate Twinr long-term memory runtime flows.
+
+    Runtime loops should call this service to build provider context, persist
+    conversation turns and multimodal evidence, run maintenance jobs, and
+    mutate operator-facing long-term memory state. It centralizes orchestration
+    while keeping extraction, reasoning, proactive policy, and storage details
+    in their dedicated modules.
+    """
+
     config: TwinrConfig
     prompt_context_store: PromptContextStore
     graph_store: TwinrPersonalGraphStore
@@ -243,6 +282,19 @@ class LongTermMemoryService:
         prompt_context_store: PromptContextStore | None = None,
         extractor: LongTermTurnExtractor | None = None,
     ) -> "LongTermMemoryService":
+        """Build the runtime service and its bounded background writers.
+
+        Args:
+            config: Runtime configuration used for stores, policies, and
+                timezone handling.
+            graph_store: Optional prebuilt personal graph store.
+            prompt_context_store: Optional prebuilt prompt context store.
+            extractor: Optional prebuilt conversation-turn extractor.
+
+        Returns:
+            A fully wired long-term memory service ready for runtime use.
+        """
+
         store = prompt_context_store or PromptContextStore.from_config(config)
         graph = graph_store or TwinrPersonalGraphStore.from_config(config)
         object_store = LongTermStructuredStore.from_config(config)
@@ -348,6 +400,13 @@ class LongTermMemoryService:
         )
 
     def ensure_remote_ready(self) -> None:
+        """Prove required remote-primary long-term state is ready to use.
+
+        Raises:
+            LongTermRemoteUnavailableError: If required remote state or any
+                required snapshot is unavailable.
+        """
+
         remote_state = getattr(self.prompt_context_store.memory_store, "remote_state", None)
         if remote_state is None or not remote_state.enabled:
             return
@@ -363,8 +422,54 @@ class LongTermMemoryService:
             self.graph_store.ensure_remote_snapshot()
             self.object_store.ensure_remote_snapshots()
             self.midterm_store.ensure_remote_snapshot()
+            LongTermRemoteHealthProbe(
+                prompt_context_store=self.prompt_context_store,
+                object_store=self.object_store,
+                graph_store=self.graph_store,
+                midterm_store=self.midterm_store,
+            ).ensure_operational()
+
+    def remote_required(self) -> bool:
+        """Report whether runtime callers must hard-fail on remote loss."""
+
+        remote_state = getattr(self.prompt_context_store.memory_store, "remote_state", None)
+        if remote_state is None:
+            return bool(
+                self.config.long_term_memory_enabled
+                and self.config.long_term_memory_mode == "remote_primary"
+                and self.config.long_term_memory_remote_required
+            )
+        return bool(getattr(remote_state, "required", False))
+
+    def remote_status(self) -> LongTermRemoteStatus:
+        """Return the effective long-term remote-state status for runtime use."""
+
+        remote_state = getattr(self.prompt_context_store.memory_store, "remote_state", None)
+        if remote_state is None:
+            if self.config.long_term_memory_enabled and self.config.long_term_memory_mode == "remote_primary":
+                return LongTermRemoteStatus(
+                    mode="remote_primary",
+                    ready=False,
+                    detail="Remote long-term memory state is not configured.",
+                )
+            return LongTermRemoteStatus(mode="disabled", ready=False)
+        return remote_state.status()
 
     def build_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
+        """Build the normal long-term context injected into provider prompts.
+
+        Args:
+            query_text: User query text used for retrieval profiling.
+
+        Returns:
+            The best-effort long-term context for provider prompts. Returns an
+            empty context if non-remote retrieval fails unexpectedly.
+
+        Raises:
+            LongTermRemoteUnavailableError: If required remote-primary state is
+                unavailable.
+        """
+
         try:
             query = self.query_rewriter.profile(query_text)
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
@@ -379,6 +484,20 @@ class LongTermMemoryService:
             return LongTermMemoryContext()
 
     def build_tool_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
+        """Build a tool-facing context with sensitive details redacted.
+
+        Args:
+            query_text: User query text used for retrieval profiling.
+
+        Returns:
+            A best-effort context for tool-calling prompts with conflicting
+            memories and contact methods filtered out.
+
+        Raises:
+            LongTermRemoteUnavailableError: If required remote-primary state is
+                unavailable.
+        """
+
         try:
             query = self.query_rewriter.profile(query_text)
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
@@ -439,6 +558,19 @@ class LongTermMemoryService:
         response: str,
         source: str = "conversation",
     ) -> LongTermEnqueueResult | None:
+        """Queue one conversation turn for bounded long-term persistence.
+
+        Args:
+            transcript: Normalized user transcript to persist.
+            response: Assistant response paired with the transcript.
+            source: Source label recorded with the turn.
+
+        Returns:
+            Queue admission metadata when a background writer is enabled.
+            Returns None when the turn is empty, background writing is
+            disabled, or synchronous fallback persistence was required.
+        """
+
         clean_transcript = _normalize_text(transcript, limit=_TEXT_LIMIT)
         clean_response = _normalize_text(response, limit=_TEXT_LIMIT)
         clean_source = _normalize_text(source, limit=_SOURCE_LIMIT) or "conversation"
@@ -479,6 +611,8 @@ class LongTermMemoryService:
         transcript: str,
         response: str,
     ) -> LongTermConsolidationResultV1:
+        """Run extraction and consolidation without mutating stored state."""
+
         extraction = self.extractor.extract_conversation_turn(
             transcript=transcript,
             response=response,
@@ -499,6 +633,8 @@ class LongTermMemoryService:
         message: str | None = None,
         data: dict[str, object] | None = None,
     ) -> LongTermConsolidationResultV1:
+        """Run multimodal extraction and consolidation without persisting."""
+
         # AUDIT-FIX(#6): sanitize multimodal inputs before extraction so malformed payloads remain JSON-safe and bounded.
         evidence = self._build_multimodal_evidence(
             event_name=event_name,
@@ -524,6 +660,14 @@ class LongTermMemoryService:
         message: str | None = None,
         data: dict[str, object] | None = None,
     ) -> LongTermEnqueueResult | None:
+        """Queue one multimodal evidence item for bounded persistence.
+
+        Returns:
+            Queue admission metadata when a multimodal writer is enabled.
+            Returns None when background writing is disabled or synchronous
+            fallback persistence was required.
+        """
+
         if self.multimodal_writer is None:
             return None
         # AUDIT-FIX(#6): sanitize multimodal inputs before extraction so malformed payloads remain JSON-safe and bounded.
@@ -554,6 +698,17 @@ class LongTermMemoryService:
 
     # AUDIT-FIX(#4): persist sensor-memory midterm packets everywhere reflection results are applied.
     def run_reflection(self) -> LongTermReflectionResultV1:
+        """Run object reflection plus sensor-memory summaries over stored state.
+
+        Returns:
+            The combined reflection payload applied to object and midterm
+            stores. Returns an empty result on non-remote failures.
+
+        Raises:
+            LongTermRemoteUnavailableError: If required remote-primary state is
+                unavailable.
+        """
+
         try:
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
                 result = self.reflector.reflect(objects=self.object_store.load_objects())
@@ -578,6 +733,20 @@ class LongTermMemoryService:
 
     # AUDIT-FIX(#4): sensor-only reflections now update both object and midterm stores.
     def run_sensor_memory(self, *, now: datetime | None = None) -> LongTermReflectionResultV1:
+        """Compile sensor-memory summaries from current long-term objects.
+
+        Args:
+            now: Optional local-time reference for routine compilation.
+
+        Returns:
+            The applied sensor-memory reflection payload, or an empty result if
+            compilation failed without a remote-primary outage.
+
+        Raises:
+            LongTermRemoteUnavailableError: If required remote-primary state is
+                unavailable.
+        """
+
         normalized_now = _normalize_datetime(now, timezone_name=self.config.local_timezone_name)
         try:
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
@@ -599,6 +768,22 @@ class LongTermMemoryService:
         entries: Iterable[Mapping[str, object]] | None = None,
         now: datetime | None = None,
     ) -> LongTermOpsBackfillRunResult:
+        """Replay ops-event history into multimodal long-term evidence.
+
+        Args:
+            entries: Optional preloaded ops-event entries. When omitted, the
+                service loads entries from the configured ops-event store.
+            now: Optional local-time reference for sensor-memory compilation.
+
+        Returns:
+            Aggregate counters describing what the backfill scanned, generated,
+            applied, skipped, and reflected.
+
+        Raises:
+            LongTermRemoteUnavailableError: If required remote-primary state is
+                unavailable.
+        """
+
         normalized_now = _normalize_datetime(now, timezone_name=self.config.local_timezone_name)
         scanned_events = 0
         generated_evidence = 0
@@ -742,6 +927,17 @@ class LongTermMemoryService:
         now: datetime | None = None,
         live_facts: Mapping[str, object] | None = None,
     ) -> LongTermProactivePlanV1:
+        """Plan proactive candidates from stored memory and live facts.
+
+        Returns:
+            A bounded proactive plan. Returns an empty plan if proactive
+            planning fails without a remote-primary outage.
+
+        Raises:
+            LongTermRemoteUnavailableError: If required remote-primary state is
+                unavailable.
+        """
+
         normalized_now = _normalize_datetime(now, timezone_name=self.config.local_timezone_name)
         try:
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
@@ -762,6 +958,8 @@ class LongTermMemoryService:
         now: datetime | None = None,
         live_facts: Mapping[str, object] | None = None,
     ) -> LongTermProactiveReservationV1 | None:
+        """Plan and reserve the next eligible proactive candidate."""
+
         normalized_now = _normalize_datetime(now, timezone_name=self.config.local_timezone_name)
         try:
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
@@ -784,6 +982,8 @@ class LongTermMemoryService:
         *,
         now: datetime | None = None,
     ) -> LongTermProactiveReservationV1:
+        """Reserve one specific proactive candidate under policy control."""
+
         normalized_now = _normalize_datetime(now, timezone_name=self.config.local_timezone_name)
         with self._store_lock:
             return self.proactive_policy.reserve_specific_candidate(candidate, now=normalized_now)
@@ -794,6 +994,8 @@ class LongTermMemoryService:
         now: datetime | None = None,
         live_facts: Mapping[str, object] | None = None,
     ) -> LongTermProactiveCandidateV1 | None:
+        """Preview the next eligible proactive candidate without reserving it."""
+
         normalized_now = _normalize_datetime(now, timezone_name=self.config.local_timezone_name)
         try:
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
@@ -817,6 +1019,8 @@ class LongTermMemoryService:
         delivered_at: datetime | None = None,
         prompt_text: str | None = None,
     ) -> Any | None:
+        """Record that a reserved proactive candidate was delivered."""
+
         normalized_delivered_at = _normalize_datetime(delivered_at, timezone_name=self.config.local_timezone_name)
         try:
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
@@ -836,6 +1040,8 @@ class LongTermMemoryService:
         reason: str,
         skipped_at: datetime | None = None,
     ) -> Any | None:
+        """Record that a reserved proactive candidate was skipped."""
+
         normalized_skipped_at = _normalize_datetime(skipped_at, timezone_name=self.config.local_timezone_name)
         try:
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
@@ -849,6 +1055,17 @@ class LongTermMemoryService:
             return None
 
     def run_retention(self) -> LongTermRetentionResultV1:
+        """Apply retention and archive policy to stored long-term objects.
+
+        Returns:
+            The retention result applied to the object store. Returns a keep-all
+            result when retention fails without a remote-primary outage.
+
+        Raises:
+            LongTermRemoteUnavailableError: If required remote-primary state is
+                unavailable.
+        """
+
         try:
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
                 result = self.retention_policy.apply(objects=self.object_store.load_objects())
@@ -871,6 +1088,8 @@ class LongTermMemoryService:
         *,
         limit: int | None = None,
     ) -> tuple[LongTermConflictQueueItemV1, ...]:
+        """Select open memory conflicts relevant to one query."""
+
         try:
             query = self.query_rewriter.profile(query_text)
             normalized_limit = None if limit is None else _coerce_positive_int(limit, default=1, maximum=_MAX_REVIEW_LIMIT)
@@ -891,6 +1110,8 @@ class LongTermMemoryService:
         slot_key: str,
         selected_memory_id: str,
     ) -> LongTermConflictResolutionV1:
+        """Resolve one open conflict by selecting the surviving memory."""
+
         with self._store_lock:
             conflicts = self.object_store.load_conflicts()
             conflict = next((item for item in conflicts if item.slot_key == slot_key), None)
@@ -914,6 +1135,8 @@ class LongTermMemoryService:
         include_episodes: bool = False,
         limit: int = _DEFAULT_REVIEW_LIMIT,
     ) -> LongTermMemoryReviewResultV1:
+        """Review stored memories with optional query and status filters."""
+
         normalized_limit = _coerce_positive_int(limit, default=_DEFAULT_REVIEW_LIMIT, maximum=_MAX_REVIEW_LIMIT)
         with self._store_lock:
             return self.object_store.review_objects(
@@ -925,6 +1148,8 @@ class LongTermMemoryService:
             )
 
     def confirm_memory(self, *, memory_id: str) -> LongTermMemoryMutationResultV1 | LongTermConflictResolutionV1:
+        """Confirm one memory, or resolve its conflict if it is disputed."""
+
         with self._store_lock:
             conflicts = self.object_store.load_conflicts()
             conflict = next(
@@ -954,12 +1179,16 @@ class LongTermMemoryService:
         memory_id: str,
         reason: str | None = None,
     ) -> LongTermMemoryMutationResultV1:
+        """Mark one memory invalid and persist the resulting mutation."""
+
         with self._store_lock:
             result = self.object_store.invalidate_object(memory_id, reason=reason)
             self.object_store.apply_memory_mutation(result)
             return result
 
     def delete_memory(self, *, memory_id: str) -> LongTermMemoryMutationResultV1:
+        """Delete one memory and persist the resulting mutation."""
+
         with self._store_lock:
             result = self.object_store.delete_object(memory_id)
             self.object_store.apply_memory_mutation(result)
@@ -972,6 +1201,8 @@ class LongTermMemoryService:
         summary: str,
         details: str | None = None,
     ) -> PersistentMemoryEntry:
+        """Store an operator-requested explicit memory in prompt memory."""
+
         with self._store_lock:
             return self.prompt_context_store.memory_store.remember(
                 kind=kind,
@@ -985,6 +1216,8 @@ class LongTermMemoryService:
         category: str,
         instruction: str,
     ) -> ManagedContextEntry:
+        """Upsert one managed user-profile instruction entry."""
+
         with self._store_lock:
             return self.prompt_context_store.user_store.upsert(
                 category=category,
@@ -997,6 +1230,8 @@ class LongTermMemoryService:
         category: str,
         instruction: str,
     ) -> ManagedContextEntry:
+        """Upsert one managed personality instruction entry."""
+
         with self._store_lock:
             return self.prompt_context_store.personality_store.upsert(
                 category=category,
@@ -1004,6 +1239,8 @@ class LongTermMemoryService:
             )
 
     def flush(self, *, timeout_s: float = 2.0) -> bool:
+        """Flush both background writers within a bounded timeout."""
+
         resolved_timeout_s = _coerce_timeout_s(timeout_s, default=2.0)  # AUDIT-FIX(#11): harden lifecycle calls against invalid timeout input and writer exceptions.
         writer_ok = True
         multimodal_ok = True
@@ -1022,6 +1259,8 @@ class LongTermMemoryService:
         return writer_ok and multimodal_ok
 
     def shutdown(self, *, timeout_s: float = 2.0) -> None:
+        """Request bounded shutdown for all configured background writers."""
+
         resolved_timeout_s = _coerce_timeout_s(timeout_s, default=2.0)  # AUDIT-FIX(#11): harden lifecycle calls against invalid timeout input and writer exceptions.
         if self.writer is not None:
             try:
@@ -1053,6 +1292,18 @@ class LongTermMemoryService:
         timezone_name: str | None = None,
         item: LongTermConversationTurn,
     ) -> PersistentMemoryEntry | None:
+        """Persist one conversation turn through the full long-term pipeline.
+
+        Returns:
+            An episodic fallback entry when durable persistence degrades and the
+            configured mode allows it. Returns None after durable persistence
+            succeeds or when remote-primary mode suppresses local fallback.
+
+        Raises:
+            LongTermRemoteUnavailableError: If required remote-primary state is
+                unavailable during persistence.
+        """
+
         effective_store_lock = store_lock or threading.RLock()
         effective_timezone_name = timezone_name or config.local_timezone_name
         occurred_at = _normalize_datetime(item.created_at, timezone_name=effective_timezone_name) or item.created_at
@@ -1148,6 +1399,13 @@ class LongTermMemoryService:
         timezone_name: str | None = None,
         item: LongTermMultimodalEvidence,
     ) -> None:
+        """Persist one multimodal evidence item through the long-term pipeline.
+
+        Raises:
+            LongTermRemoteUnavailableError: If required remote-primary state is
+                unavailable during persistence.
+        """
+
         effective_store_lock = store_lock or threading.RLock()
         effective_timezone_name = timezone_name or "UTC"
         created_at = _normalize_datetime(item.created_at, timezone_name=effective_timezone_name) or item.created_at
@@ -1216,6 +1474,8 @@ class LongTermMemoryService:
     @staticmethod
     # AUDIT-FIX(#7): prefer the configured store, then fall back to a guarded local clone instead of blindly reconstructing it from an unsafe path.
     def _persist_episodic_turn(*, store: PromptContextStore, item: LongTermConversationTurn) -> PersistentMemoryEntry | None:
+        """Write an episodic fallback record into prompt memory."""
+
         quoted_transcript = json.dumps(item.transcript, ensure_ascii=False)
         quoted_response = json.dumps(item.response, ensure_ascii=False)
         summary = f"Conversation about {quoted_transcript}"
@@ -1254,6 +1514,8 @@ class LongTermMemoryService:
         existing_conflicts: tuple,
         result: LongTermConsolidationResultV1,
     ) -> tuple[tuple, tuple]:
+        """Merge newly consolidated objects and conflicts into current state."""
+
         merged_objects = {item.memory_id: item for item in existing_objects}
         for item in (*result.episodic_objects, *result.durable_objects, *result.deferred_objects):
             merged_objects[item.memory_id] = object_store._merge_object(
@@ -1276,6 +1538,8 @@ class LongTermMemoryService:
         current_objects: tuple,
         reflection: LongTermReflectionResultV1,
     ) -> tuple:
+        """Merge reflected objects and summaries into the current object set."""
+
         merged = {item.memory_id: item for item in current_objects}
         for item in (*reflection.reflected_objects, *reflection.created_summaries):
             merged[item.memory_id] = object_store._merge_object(
@@ -1287,10 +1551,14 @@ class LongTermMemoryService:
 
     @staticmethod
     def _empty_reflection_result() -> LongTermReflectionResultV1:
+        """Return an empty reflection payload for fail-closed callers."""
+
         return LongTermReflectionResultV1(reflected_objects=(), created_summaries=(), midterm_packets=())
 
     @staticmethod
     def _has_reflection_payload(result: LongTermReflectionResultV1) -> bool:
+        """Report whether a reflection payload contains any state updates."""
+
         return bool(result.reflected_objects or result.created_summaries or result.midterm_packets)
 
     @staticmethod
@@ -1300,6 +1568,8 @@ class LongTermMemoryService:
         retention_policy: LongTermRetentionPolicy,
         objects: tuple,
     ) -> LongTermRetentionResultV1:
+        """Apply retention, or keep current objects if retention fails."""
+
         try:
             return retention_policy.apply(objects=objects)
         except Exception:
@@ -1317,6 +1587,8 @@ class LongTermMemoryService:
         existing_archived: Iterable[Any],
         archived_updates: Iterable[Any],
     ) -> tuple[Any, ...]:
+        """Merge archived-object updates by memory ID."""
+
         archived = {item.memory_id: item for item in existing_archived}
         for archived_item in archived_updates:
             archived[archived_item.memory_id] = archived_item
@@ -1324,6 +1596,8 @@ class LongTermMemoryService:
 
     @staticmethod
     def _clone_local_memory_store(memory_store: Any) -> Any | None:
+        """Clone a local prompt-memory store when episodic fallback is needed."""
+
         path = _validate_regular_file_path(getattr(memory_store, "path", None), allow_missing=True)
         if path is None:
             return None
@@ -1335,6 +1609,8 @@ class LongTermMemoryService:
 
     # AUDIT-FIX(#7): only read ops-event history from validated regular files.
     def _load_backfill_entries(self) -> tuple[Mapping[str, object], ...]:
+        """Load validated ops-event entries for multimodal backfill."""
+
         try:
             from twinr.ops.events import TwinrOpsEventStore
         except Exception:
@@ -1362,6 +1638,8 @@ class LongTermMemoryService:
         message: str | None = None,
         data: Mapping[str, object] | None = None,
     ) -> LongTermMultimodalEvidence:
+        """Build a bounded multimodal evidence payload from device data."""
+
         sanitized_message = _normalize_text(message, limit=_MULTIMODAL_MESSAGE_LIMIT) or None
         sanitized_data = _sanitize_jsonish(
             dict(data or {}),

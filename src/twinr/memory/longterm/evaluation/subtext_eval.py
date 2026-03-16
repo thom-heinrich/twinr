@@ -1,3 +1,10 @@
+"""Run live subtext-response evaluations against the active OpenAI backend.
+
+This module seeds controlled personal-context fixtures, asks Twinr for real
+responses, and grades whether the assistant used hidden context naturally
+without explicitly announcing remembered information.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
@@ -42,12 +49,16 @@ _MAX_ERROR_TEXT_CHARS = 512
 
 @dataclass(frozen=True, slots=True)
 class SubtextSeedAction:
+    """Describe one memory-seeding action performed before a subtext case."""
+
     kind: Literal["preference", "contact", "plan", "episode"]
     args: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
 class SubtextEvalCase:
+    """Describe one live subtext evaluation case and its hidden context."""
+
     case_id: str
     category: str
     query_text: str
@@ -59,6 +70,8 @@ class SubtextEvalCase:
 
 @dataclass(frozen=True, slots=True)
 class SubtextJudgeResult:
+    """Capture the grader's verdict for one subtext response."""
+
     helpful_context_used: bool
     subtle_not_explicit: bool
     unforced: bool
@@ -70,6 +83,8 @@ class SubtextJudgeResult:
 
 @dataclass(frozen=True, slots=True)
 class SubtextEvalCaseResult:
+    """Capture one case's model response, grading, and request metadata."""
+
     case_id: str
     category: str
     query_text: str
@@ -85,6 +100,8 @@ class SubtextEvalCaseResult:
 
 @dataclass(frozen=True, slots=True)
 class SubtextEvalSummary:
+    """Summarize aggregate outcome metrics across subtext cases."""
+
     total_cases: int
     passed_cases: int
     accuracy: float
@@ -97,11 +114,15 @@ class SubtextEvalSummary:
 
 @dataclass(frozen=True, slots=True)
 class SubtextEvalResult:
+    """Bundle the subtext evaluation summary and per-case results."""
+
     summary: SubtextEvalSummary
     cases: tuple[SubtextEvalCaseResult, ...]
 
 
 def default_subtext_eval_cases() -> tuple[SubtextEvalCase, ...]:
+    """Return the canonical live subtext evaluation cases."""
+
     return (
         SubtextEvalCase(
             case_id="coffee_brand",
@@ -298,6 +319,17 @@ def run_subtext_response_eval(
     env_path: str | Path = ".env",
     cases: tuple[SubtextEvalCase, ...] | None = None,
 ) -> SubtextEvalResult:
+    """Run the live subtext response evaluation against the configured backend.
+
+    Args:
+        env_path: Environment file used to build the base Twinr/OpenAI config.
+        cases: Optional explicit case set. If omitted, the canonical cases are
+            used. An empty tuple is respected.
+
+    Returns:
+        A result bundle with summary metrics and per-case response details.
+    """
+
     base_config = TwinrConfig.from_env(env_path)
     if not base_config.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY is required for the live subtext response eval.")
@@ -331,6 +363,8 @@ def _run_case(
     base_config: TwinrConfig,
     judge_backend: OpenAIBackend,
 ) -> SubtextEvalCaseResult:
+    """Execute one live subtext case and convert failures into failed results."""
+
     response: Any | None = None
     runtime: TwinrRuntime | None = None
     backend: OpenAIBackend | None = None
@@ -416,6 +450,8 @@ def _run_case(
 
 
 def _build_case_config(*, base_config: TwinrConfig, temp_root: Path) -> TwinrConfig:
+    """Build an isolated runtime config for a single subtext case."""
+
     personality_dir = _resolve_personality_dir(base_config)
     state_dir = temp_root / "state"
     return replace(
@@ -436,6 +472,8 @@ def _build_case_config(*, base_config: TwinrConfig, temp_root: Path) -> TwinrCon
 
 
 def _resolve_personality_dir(base_config: TwinrConfig) -> Path:
+    """Resolve the real personality directory used by evaluation runs."""
+
     raw_personality_dir = Path(str(getattr(base_config, "personality_dir", "personality")))
     if raw_personality_dir.is_absolute():
         resolved = raw_personality_dir
@@ -448,6 +486,8 @@ def _resolve_personality_dir(base_config: TwinrConfig) -> Path:
 
 
 def _apply_seed_actions(runtime: TwinrRuntime, actions: tuple[SubtextSeedAction, ...]) -> None:
+    """Apply the requested memory-seeding actions to the temporary runtime."""
+
     for action in actions:
         if action.kind == "preference":
             runtime.remember_preference(**action.args)
@@ -464,6 +504,8 @@ def _apply_seed_actions(runtime: TwinrRuntime, actions: tuple[SubtextSeedAction,
 
 
 def _flush_seed_memory(runtime: TwinrRuntime) -> None:
+    """Force seeded long-term memory writes to complete before querying."""
+
     flush_result = runtime.flush_long_term_memory(timeout_s=_SEED_FLUSH_TIMEOUT_S)
     if flush_result is False:
         raise TimeoutError(
@@ -478,6 +520,8 @@ def _judge_case(
     explicit_memory_announcement: bool,
     judge_backend: OpenAIBackend,
 ) -> SubtextJudgeResult:
+    """Grade one response with a secondary OpenAI judge request."""
+
     prompt = _build_judge_prompt(
         case=case,
         response_text=response_text,
@@ -559,6 +603,8 @@ def _build_judge_prompt(
     response_text: str,
     explicit_memory_announcement: bool,
 ) -> str:
+    """Build the prompt used to grade one subtext response."""
+
     judge_input = {
         # AUDIT-FIX(#1): Serialize untrusted fields as JSON data so model output cannot easily break the prompt structure.
         "should_use_personal_context": case.should_use_personal_context,
@@ -586,6 +632,8 @@ def _build_judge_prompt(
 
 
 def _create_judge_response(*, judge_backend: OpenAIBackend, request: dict[str, Any]) -> Any:
+    """Send the judge request through the backend's underlying Responses client."""
+
     client = getattr(judge_backend, "_client", None)
     if client is None or not hasattr(client, "responses"):
         raise RuntimeError("Judge backend client is not available.")
@@ -598,11 +646,15 @@ def _create_judge_response(*, judge_backend: OpenAIBackend, request: dict[str, A
 
 
 def contains_explicit_memory_announcement(text: str) -> bool:
+    """Return whether a response explicitly announces remembered context."""
+
     normalized = f" {_normalize_lookup_text(text)} "
     return any(f" {phrase} " in normalized for phrase in _EXPLICIT_MEMORY_PHRASES_FOLDED)
 
 
 def _response_mentions_seed_context(*, case: SubtextEvalCase, response_text: str) -> bool:
+    """Return whether the reply visibly leaks seeded hidden context tokens."""
+
     normalized_response = f" {_normalize_lookup_text(response_text)} "
     for action in case.seed_actions:
         for key in ("value", "for_product", "given_name", "family_name", "role", "summary"):
@@ -616,10 +668,14 @@ def _response_mentions_seed_context(*, case: SubtextEvalCase, response_text: str
 
 
 def _normalize_lookup_text(text: Any) -> str:
+    """Fold and whitespace-normalize text for phrase matching."""
+
     return " ".join(folded_lookup_text(str(text or "")).split())
 
 
 def _coerce_bool(value: Any, *, default: bool) -> bool:
+    """Coerce judge-emitted booleans while falling back to a default."""
+
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -634,6 +690,8 @@ def _coerce_bool(value: Any, *, default: bool) -> bool:
 
 
 def _coerce_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    """Coerce and clamp an integer emitted by the judge model."""
+
     try:
         coerced = int(str(value).strip())
     except (TypeError, ValueError):
@@ -642,6 +700,8 @@ def _coerce_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
+    """Extract the first JSON object from judge output or raise clearly."""
+
     try:
         return extract_json_object(text)
     except ValueError as exc:
@@ -650,6 +710,8 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
 
 def _clip_text(text: Any, limit: int) -> str:
+    """Clip arbitrary text to a fixed character budget."""
+
     value = str(text or "")
     if len(value) <= limit:
         return value
@@ -657,12 +719,16 @@ def _clip_text(text: Any, limit: int) -> str:
 
 
 def _safe_response_text(response: Any) -> str:
+    """Extract response text from a provider result object safely."""
+
     if response is None:
         return ""
     return str(getattr(response, "text", "") or "")
 
 
 def _format_exception(exc: Exception | None) -> str:
+    """Format an exception into a short, bounded diagnostic string."""
+
     if exc is None:
         return "unknown error"
     return _clip_text(f"{type(exc).__name__}: {exc}", _MAX_ERROR_TEXT_CHARS)
@@ -679,6 +745,8 @@ def _failed_case_result(
     response_id: str | None,
     token_usage: Any,
 ) -> SubtextEvalCaseResult:
+    """Build a deterministic failed result for a case-level error."""
+
     return SubtextEvalCaseResult(
         case_id=case.case_id,
         category=case.category,
@@ -708,6 +776,8 @@ def _configure_openai_backend_client(
     timeout_s: float,
     max_retries: int,
 ) -> None:
+    """Best-effort replace the backend client with bounded request options."""
+
     client = getattr(backend, "_client", None)
     if client is None:
         return
@@ -723,6 +793,8 @@ def _configure_openai_backend_client(
 
 
 def _client_with_options(client: Any, *, timeout_s: float, max_retries: int) -> Any:
+    """Return a client clone with timeout/retry options when supported."""
+
     with_options = getattr(client, "with_options", None)
     if not callable(with_options):
         return client
@@ -736,6 +808,8 @@ def _client_with_options(client: Any, *, timeout_s: float, max_retries: int) -> 
 
 
 def _shutdown_runtime(runtime: TwinrRuntime | None) -> None:
+    """Shut down a temporary runtime without masking earlier failures."""
+
     if runtime is None:
         return
     try:
@@ -745,6 +819,8 @@ def _shutdown_runtime(runtime: TwinrRuntime | None) -> None:
 
 
 def _close_openai_backend(backend: OpenAIBackend | None) -> None:
+    """Close a backend client best-effort after an evaluation run."""
+
     if backend is None:
         return
     client = getattr(backend, "_client", None)
@@ -757,6 +833,8 @@ def _close_openai_backend(backend: OpenAIBackend | None) -> None:
 
 
 def _summarize(case_results: tuple[SubtextEvalCaseResult, ...]) -> SubtextEvalSummary:
+    """Aggregate per-case subtext outcomes into summary metrics."""
+
     total = len(case_results)
     passed = sum(1 for item in case_results if item.judge.passed)
     category_case_counts: dict[str, int] = {}
@@ -788,6 +866,8 @@ def _summarize(case_results: tuple[SubtextEvalCaseResult, ...]) -> SubtextEvalSu
 
 
 def _result_to_payload(result: SubtextEvalResult) -> dict[str, Any]:
+    """Convert a subtext evaluation result into the CLI JSON payload shape."""
+
     return {
         "summary": asdict(result.summary),
         "cases": [asdict(case) for case in result.cases],
@@ -795,6 +875,8 @@ def _result_to_payload(result: SubtextEvalResult) -> dict[str, Any]:
 
 
 def main() -> int:
+    """Run the subtext evaluation CLI and print JSON output."""
+
     result = run_subtext_response_eval()
     print(json.dumps(_result_to_payload(result), ensure_ascii=False, indent=2))
     return 0

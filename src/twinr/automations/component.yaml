@@ -1,0 +1,76 @@
+schema_version: 1
+name: automations
+path: src/twinr/automations
+kind: python-package
+visibility: internal
+summary: Define, evaluate, and persist Twinr time-based and sensor-based automations.
+owned_concerns:
+  - Define the canonical automation trigger, condition, action, and entry models
+  - Evaluate scheduled and fact-based automations with timezone-aware timing rules
+  - Persist automations safely to a bounded JSON store with backup recovery
+  - Map supported sensor trigger kinds to canonical if/then trigger shapes
+out_of_scope:
+  - Web form parsing and operator-page composition in src/twinr/web/automations.py
+  - Runtime execution of automation actions after a trigger matches
+  - Provider prompt wording and tool schema authoring outside this package
+files:
+  - path: __init__.py
+    role: Package export surface for automation models and helpers
+    exports:
+      - AutomationAction
+      - AutomationCondition
+      - AutomationDefinition
+      - AutomationEngine
+      - AutomationStore
+      - IfThenAutomationTrigger
+      - SensorTriggerSpec
+      - TimeAutomationTrigger
+      - build_sensor_trigger
+      - describe_sensor_trigger
+      - describe_sensor_trigger_text
+      - supported_sensor_trigger_kinds
+  - path: store.py
+    role: Canonical automation models, engine, and JSON-backed store
+    exports:
+      - AutomationAction
+      - AutomationCondition
+      - AutomationDefinition
+      - AutomationEngine
+      - AutomationStore
+      - IfThenAutomationTrigger
+      - TimeAutomationTrigger
+  - path: sensors.py
+    role: Supported sensor trigger mapping and round-trip description helpers
+    exports:
+      - SensorTriggerSpec
+      - build_sensor_trigger
+      - describe_sensor_trigger
+      - describe_sensor_trigger_text
+      - supported_sensor_trigger_kinds
+public_api:
+  module: twinr.automations
+  exports:
+    - AutomationAction
+    - AutomationCondition
+    - AutomationDefinition
+    - AutomationEngine
+    - AutomationStore
+    - IfThenAutomationTrigger
+    - SensorTriggerSpec
+    - TimeAutomationTrigger
+    - build_sensor_trigger
+    - describe_sensor_trigger
+    - describe_sensor_trigger_text
+    - supported_sensor_trigger_kinds
+primary_callers:
+  - path: src/twinr/web/automations.py
+  - path: src/twinr/web/context.py
+  - path: src/twinr/integrations/web_automation_families.py
+  - path: src/twinr/agent/tools/schemas/contracts.py
+  - path: src/twinr/agent/tools/prompting/instructions.py
+  - path: src/twinr/providers/openai/realtime.py
+tests:
+  - path: test/test_automations.py
+  - path: test/test_web_app.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_openai_realtime.py

@@ -1,3 +1,12 @@
+"""Coordinate proactive sensing, wakeword arming, and monitor lifecycle.
+
+This module assembles the runtime-facing proactive monitor used by Twinr
+workflows. It wires sensor observers, wakeword policy, presence-session
+tracking, buffered vision review, automation observation export, and the
+background worker lifecycle without owning the lower-level scoring or hardware
+adapters themselves.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -43,6 +52,8 @@ _MAX_CAPTURE_PHRASE_TOKEN_LEN = 64
 
 # AUDIT-FIX(#1): Isolate telemetry and log formatting so ops-event persistence or emit sinks cannot kill safety-critical monitoring.
 def _safe_emit(emit: Callable[[str], None] | None, line: str) -> None:
+    """Emit one telemetry line while suppressing sink failures."""
+
     if emit is None:
         return
     try:
@@ -53,6 +64,8 @@ def _safe_emit(emit: Callable[[str], None] | None, line: str) -> None:
 
 # AUDIT-FIX(#1): Sanitize exception text before logging to avoid multiline/log-injection issues and overlong payloads.
 def _exception_text(error: BaseException | object, *, limit: int = 240) -> str:
+    """Normalize one exception payload into bounded log-safe text."""
+
     raw = str(error) if not isinstance(error, BaseException) else (str(error) or error.__class__.__name__)
     text = " ".join(raw.split())
     if not text:
@@ -72,6 +85,8 @@ def _append_ops_event(
     emit: Callable[[str], None] | None = None,
     level: str | None = None,
 ) -> None:
+    """Append one ops event without letting persistence failures escape."""
+
     kwargs: dict[str, Any] = {
         "event": event,
         "message": message,
@@ -87,6 +102,8 @@ def _append_ops_event(
 
 # AUDIT-FIX(#8): Normalize optional config strings so None/whitespace values do not crash subsystem initialization.
 def _normalize_optional_text(*values: Any) -> str:
+    """Return the first non-blank text value from a config-like list."""
+
     for value in values:
         if value is None:
             continue
@@ -98,6 +115,8 @@ def _normalize_optional_text(*values: Any) -> str:
 
 # AUDIT-FIX(#8): Normalize sequence-like config inputs from older env schemas before using them.
 def _normalize_text_tuple(values: Any) -> tuple[str, ...]:
+    """Normalize sequence-like config input to one tuple of non-blank strings."""
+
     if values is None:
         return ()
     if isinstance(values, (str, Path)):
@@ -112,6 +131,8 @@ def _normalize_text_tuple(values: Any) -> tuple[str, ...]:
 
 # AUDIT-FIX(#7): Refuse obviously unsafe capture directories and require the final path to stay under artifacts_root.
 def _ensure_safe_capture_directory(artifacts_root: Path) -> Path:
+    """Create and validate the wakeword capture directory under artifacts root."""
+
     captures_dir = artifacts_root / "ops" / "wakeword_captures"
     captures_dir.mkdir(parents=True, exist_ok=True)
     for candidate in (artifacts_root, artifacts_root / "ops", captures_dir):
@@ -128,6 +149,8 @@ def _ensure_safe_capture_directory(artifacts_root: Path) -> Path:
 
 # AUDIT-FIX(#7): Write captures atomically so partial files or power loss do not leave corrupt artifacts behind.
 def _write_bytes_atomic(path: Path, payload: bytes) -> None:
+    """Persist bytes atomically to one existing directory."""
+
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -156,6 +179,8 @@ def _record_component_warning(
     reason: str,
     detail: str,
 ) -> None:
+    """Record one degraded-mode warning during proactive monitor setup."""
+
     _safe_emit(emit, f"proactive_component_warning={reason}")
     _append_ops_event(
         runtime,
@@ -172,6 +197,8 @@ def _record_component_warning(
 
 @dataclass(frozen=True, slots=True)
 class ProactiveTickResult:
+    """Describe the externally relevant outcome of one monitor tick."""
+
     decision: SocialTriggerDecision | None = None
     wakeword_match: WakewordMatch | None = None
     inspected: bool = False
@@ -180,13 +207,25 @@ class ProactiveTickResult:
 
 # AUDIT-FIX(#4): Provide a no-op trigger engine so wakeword/audio monitoring can still run when proactive triggers are disabled or engine setup fails.
 class _NullSocialTriggerEngine:
+    """Provide a no-op trigger engine when proactive triggers are disabled."""
+
     best_evaluation = None
 
     def observe(self, observation: SocialObservation) -> SocialTriggerDecision | None:
+        """Return no proactive decision for the given observation."""
+
         return None
 
 
 class ProactiveCoordinator:
+    """Coordinate one proactive monitor tick across sensors and policies.
+
+    The coordinator owns the runtime-facing orchestration for PIR, vision,
+    ambient audio, wakeword detection, presence sessions, trigger review, and
+    automation observation export. Lower-level trigger scoring and wakeword
+    matching remain in sibling packages.
+    """
+
     def __init__(
         self,
         *,
@@ -209,6 +248,8 @@ class ProactiveCoordinator:
         clock: Callable[[], float] = time.monotonic,
         audio_observer_fallback_factory: Callable[[], Any] | None = None,
     ) -> None:
+        """Initialize one coordinator from already-built dependencies."""
+
         self.config = config
         self.runtime = runtime
         self.engine = engine
@@ -247,6 +288,8 @@ class ProactiveCoordinator:
 
     # AUDIT-FIX(#1): Route all module-local emits through a non-throwing wrapper.
     def _emit(self, line: str) -> None:
+        """Emit one coordinator-local telemetry line safely."""
+
         _safe_emit(self.emit, line)
 
     # AUDIT-FIX(#1): Route all module-local ops events through a non-throwing wrapper.
@@ -258,6 +301,8 @@ class ProactiveCoordinator:
         data: dict[str, Any],
         level: str | None = None,
     ) -> None:
+        """Append one coordinator-local ops event safely."""
+
         _append_ops_event(
             self.runtime,
             event=event,
@@ -277,6 +322,8 @@ class ProactiveCoordinator:
         data: dict[str, Any] | None = None,
         level: str = "error",
     ) -> None:
+        """Record one recoverable coordinator fault in telemetry and ops events."""
+
         error_text = _exception_text(error)
         payload = dict(data or {})
         payload["error"] = error_text
@@ -290,6 +337,8 @@ class ProactiveCoordinator:
 
     # AUDIT-FIX(#6): Audio observation faults should degrade to a null snapshot instead of aborting the full monitoring cycle.
     def _observe_audio_safe(self):
+        """Collect one ambient-audio snapshot with null fallback on failure."""
+
         try:
             return self.audio_observer.observe()
         except Exception as exc:
@@ -310,6 +359,8 @@ class ProactiveCoordinator:
 
     # AUDIT-FIX(#6): Vision observation faults should fall back to an uninspected tick so wakeword/presence logic can continue.
     def _observe_vision_safe(self):
+        """Collect one vision snapshot or return None on failure/unavailability."""
+
         if self.vision_observer is None:
             return None
         try:
@@ -324,6 +375,8 @@ class ProactiveCoordinator:
 
     # AUDIT-FIX(#6): Snapshot buffering is optional; a buffer write failure must not suppress trigger evaluation.
     def _record_vision_snapshot_safe(self, snapshot) -> None:
+        """Buffer one vision snapshot for later review when available."""
+
         if self.vision_reviewer is None:
             return
         if getattr(snapshot, "image", None) is None:
@@ -339,10 +392,14 @@ class ProactiveCoordinator:
 
     # AUDIT-FIX(#5): Honor proactive_enabled as a hard privacy gate for camera-triggered proactive behavior.
     def _proactive_triggers_enabled(self) -> bool:
+        """Return whether camera-driven proactive triggers may run."""
+
         return bool(self.config.proactive_enabled)
 
     # AUDIT-FIX(#2): Safety-critical triggers must fail open when review is unavailable, otherwise the device can miss a fall/distress prompt.
     def _should_fail_open_without_vision_review(self, decision: SocialTriggerDecision) -> bool:
+        """Return whether missing review must not block this safety trigger."""
+
         return decision.trigger_id in _VISION_REVIEW_FAIL_OPEN_TRIGGERS
 
     # AUDIT-FIX(#6): Keep decision suppression logic centralized after wakeword/presence checks.
@@ -355,6 +412,8 @@ class ProactiveCoordinator:
         inspected: bool,
         presence_snapshot: PresenceSessionSnapshot,
     ) -> ProactiveTickResult:
+        """Apply final suppression, review, and dispatch to one trigger decision."""
+
         if decision is None:
             return ProactiveTickResult(
                 inspected=inspected,
@@ -410,6 +469,8 @@ class ProactiveCoordinator:
         audio_snapshot,
         proactive_enabled: bool,
     ) -> ProactiveTickResult:
+        """Run one proactive cycle when no fresh camera inspection is available."""
+
         observation, decision = self._feed_absence(
             now=now,
             motion_active=motion_active,
@@ -449,6 +510,8 @@ class ProactiveCoordinator:
         )
 
     def tick(self) -> ProactiveTickResult:
+        """Run one proactive monitor tick across idle, sensor, and trigger paths."""
+
         now = self.clock()
         if self.idle_predicate is not None:
             try:
@@ -559,6 +622,8 @@ class ProactiveCoordinator:
         audio_observation: SocialAudioObservation,
         evaluate_trigger: bool = True,
     ) -> tuple[SocialObservation, SocialTriggerDecision | None]:
+        """Build one observation for the no-camera path and optionally score it."""
+
         observation = SocialObservation(
             observed_at=now,
             inspected=False,
@@ -577,6 +642,8 @@ class ProactiveCoordinator:
         motion_active: bool,
         speech_detected: bool,
     ) -> PresenceSessionSnapshot:
+        """Update and publish the current wakeword presence-session snapshot."""
+
         if self.presence_session is None:
             snapshot = PresenceSessionSnapshot(
                 armed=False,
@@ -598,6 +665,8 @@ class ProactiveCoordinator:
         return snapshot
 
     def poll_wakeword_stream(self) -> WakewordMatch | None:
+        """Drain one wakeword stream detection when streaming is enabled."""
+
         if self.wakeword_stream is None or self.wakeword_handler is None:
             return None
         try:
@@ -619,6 +688,8 @@ class ProactiveCoordinator:
 
     # AUDIT-FIX(#6): Replace a failed streaming wakeword path with a secondary audio observer when available so the monitor degrades instead of repeatedly faulting.
     def _handle_wakeword_stream_failure(self, error: BaseException | object) -> None:
+        """Disable the broken wakeword stream and try to enable audio fallback."""
+
         failed_stream = self.wakeword_stream
         if failed_stream is None:
             return
@@ -665,6 +736,8 @@ class ProactiveCoordinator:
 
     # AUDIT-FIX(#6): Callback isolation for wakeword handlers prevents a bad downstream action from aborting wakeword detection.
     def _dispatch_wakeword_match(self, match: WakewordMatch, *, source: str) -> bool:
+        """Send one accepted wakeword match to the downstream handler safely."""
+
         if self.wakeword_handler is None:
             return False
         try:
@@ -692,6 +765,8 @@ class ProactiveCoordinator:
         audio_snapshot,
         presence_snapshot: PresenceSessionSnapshot,
     ) -> WakewordMatch | None:
+        """Run one ambient-audio wakeword attempt when the session is armed."""
+
         if self.wakeword_stream is not None:
             return None
         if self.wakeword_spotter is None or self.wakeword_handler is None:
@@ -727,6 +802,8 @@ class ProactiveCoordinator:
         )
 
     def _handle_stream_detection(self, detection: WakewordStreamDetection) -> WakewordMatch | None:
+        """Finalize one streaming wakeword detection through the normal policy path."""
+
         self._last_wakeword_attempt_at = self.clock()
         return self._handle_wakeword_decision(
             match=detection.match,
@@ -743,6 +820,8 @@ class ProactiveCoordinator:
         presence_snapshot: PresenceSessionSnapshot,
         source: str,
     ) -> WakewordMatch | None:
+        """Persist and dispatch one wakeword policy decision."""
+
         decision = self._decide_wakeword(match=match, capture_window=capture_window, source=source)
         capture_path = self._persist_wakeword_capture(
             decision.match,
@@ -773,6 +852,8 @@ class ProactiveCoordinator:
         capture_window: AmbientAudioCaptureWindow | None,
         source: str,
     ) -> WakewordDecision:
+        """Run the configured wakeword policy or a trivial pass-through fallback."""
+
         if self.wakeword_policy is None:
             return WakewordDecision(
                 detected=match.detected,
@@ -799,6 +880,8 @@ class ProactiveCoordinator:
         capture_window: AmbientAudioCaptureWindow,
         outcome: str,
     ) -> str | None:
+        """Persist one evaluated wakeword audio window and return its path."""
+
         if capture_window is None or not capture_window.pcm_bytes:
             return None
         try:
@@ -856,6 +939,8 @@ class ProactiveCoordinator:
         return str(path)
 
     def _wakeword_audio_candidate(self, audio_snapshot) -> bool:
+        """Return whether one audio snapshot is worth wakeword evaluation."""
+
         sample = getattr(audio_snapshot, "sample", None)
         if sample is None:
             return False
@@ -888,6 +973,8 @@ class ProactiveCoordinator:
         presence_snapshot: PresenceSessionSnapshot,
         review: ProactiveVisionReview | None = None,
     ) -> ProactiveTickResult:
+        """Dispatch one reviewed proactive trigger and update session-side state."""
+
         self._record_trigger_detected(decision, observation=observation, review=review)
         try:  # AUDIT-FIX(#6): downstream trigger actions are external code and must not crash the monitor loop.
             handled = bool(self.trigger_handler(decision))
@@ -921,6 +1008,8 @@ class ProactiveCoordinator:
         *,
         observation: SocialObservation,
     ) -> tuple[SocialTriggerDecision | None, ProactiveVisionReview | None]:
+        """Run buffered vision review for one trigger when configured."""
+
         if self.vision_reviewer is None:
             return decision, None
         if not is_reviewable_image_trigger(decision.trigger_id):
@@ -971,6 +1060,8 @@ class ProactiveCoordinator:
         now: float,
         decision: SocialTriggerDecision,
     ) -> float | None:
+        """Return the age of a recent wakeword attempt that should suppress prompts."""
+
         if decision.trigger_id in _WAKEWORD_SUPPRESSION_EXEMPT_TRIGGERS:
             return None
         if self._last_wakeword_attempt_at is None:
@@ -983,6 +1074,8 @@ class ProactiveCoordinator:
         return age_s
 
     def _update_motion(self, now: float) -> bool:
+        """Poll PIR state and return whether motion is currently active."""
+
         if self.pir_monitor is None:
             return False
         motion_active = False
@@ -1013,6 +1106,8 @@ class ProactiveCoordinator:
         return motion_active
 
     def _should_inspect(self, now: float, *, motion_active: bool) -> bool:
+        """Return whether the next tick should trigger a camera inspection."""
+
         if not self._proactive_triggers_enabled():
             return False
         if self.vision_observer is None:
@@ -1026,6 +1121,8 @@ class ProactiveCoordinator:
         return True
 
     def _is_low_motion(self, now: float, *, motion_active: bool) -> bool:
+        """Return whether recent PIR history qualifies as low motion."""
+
         if motion_active:
             return False
         if self._last_motion_at is None:
@@ -1041,6 +1138,8 @@ class ProactiveCoordinator:
         audio_snapshot=None,
         presence_snapshot: PresenceSessionSnapshot | None = None,
     ) -> None:
+        """Append one observation event only when the visible state changed."""
+
         presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
         observation_key = (
             inspected,
@@ -1120,6 +1219,8 @@ class ProactiveCoordinator:
         )
 
     def _record_presence_if_changed(self, snapshot: PresenceSessionSnapshot) -> None:
+        """Append one ops event when the presence-session state changes."""
+
         session_id = getattr(snapshot, "session_id", None)
         key = (snapshot.armed, snapshot.reason, session_id)
         if key == self._last_presence_key:
@@ -1146,6 +1247,8 @@ class ProactiveCoordinator:
         presence_snapshot: PresenceSessionSnapshot,
         decision: WakewordDecision | None = None,
     ) -> None:
+        """Record one wakeword attempt and optional policy outcome."""
+
         data = {
             "detected": match.detected,
             "matched_phrase": match.matched_phrase,
@@ -1188,6 +1291,8 @@ class ProactiveCoordinator:
         decision: WakewordDecision,
         presence_snapshot: PresenceSessionSnapshot,
     ) -> None:
+        """Record the final wakeword policy decision for one attempt."""
+
         self._append_ops_event(
             event="wakeword_decision",
             message="Wakeword policy decided whether Twinr should open a turn.",
@@ -1219,6 +1324,8 @@ class ProactiveCoordinator:
         observation: SocialObservation,
         review: ProactiveVisionReview | None = None,
     ) -> None:
+        """Record one proactive trigger that reached dispatch evaluation."""
+
         data = {
             "trigger": decision.trigger_id,
             "reason": decision.reason,
@@ -1258,6 +1365,8 @@ class ProactiveCoordinator:
         *,
         review: ProactiveVisionReview,
     ) -> None:
+        """Record one buffered vision review result."""
+
         self._append_ops_event(
             event="proactive_vision_reviewed",
             message="Buffered proactive camera frames were reviewed before speaking.",
@@ -1281,6 +1390,8 @@ class ProactiveCoordinator:
         *,
         review: ProactiveVisionReview,
     ) -> None:
+        """Record that buffered vision review rejected one trigger."""
+
         self._emit("social_trigger_skipped=vision_review_rejected")
         self._append_ops_event(
             event="social_trigger_skipped",
@@ -1306,6 +1417,8 @@ class ProactiveCoordinator:
         self,
         decision: SocialTriggerDecision,
     ) -> None:
+        """Record that buffered vision review was unavailable for one trigger."""
+
         self._emit("social_trigger_skipped=vision_review_unavailable")
         self._append_ops_event(
             event="social_trigger_skipped",
@@ -1325,6 +1438,8 @@ class ProactiveCoordinator:
         *,
         wakeword_attempt_age_s: float,
     ) -> None:
+        """Record that a recent wakeword attempt suppressed one trigger."""
+
         self._emit("social_trigger_skipped=recent_wakeword_attempt")
         self._append_ops_event(
             event="social_trigger_skipped",
@@ -1345,6 +1460,8 @@ class ProactiveCoordinator:
         *,
         presence_snapshot: PresenceSessionSnapshot,
     ) -> str | None:
+        """Return a presence-session block reason for one trigger if any."""
+
         session_id = getattr(presence_snapshot, "session_id", None)
         if decision.trigger_id != "possible_fall":
             return None
@@ -1363,6 +1480,8 @@ class ProactiveCoordinator:
         presence_snapshot: PresenceSessionSnapshot,
         reason: str,
     ) -> None:
+        """Record that a trigger was skipped by per-session suppression."""
+
         session_id = getattr(presence_snapshot, "session_id", None)
         self._emit(f"social_trigger_skipped={reason}")
         self._append_ops_event(
@@ -1380,6 +1499,8 @@ class ProactiveCoordinator:
         )
 
     def _dispatch_automation_observation(self, observation: SocialObservation, *, inspected: bool) -> None:
+        """Publish one normalized observation to the automation observer hook."""
+
         if self.observation_handler is None:
             return
         try:
@@ -1399,6 +1520,8 @@ class ProactiveCoordinator:
         *,
         inspected: bool,
     ) -> dict[str, Any]:
+        """Build the automation-facing fact payload for one observation."""
+
         now = observation.observed_at
         vision = observation.vision
         audio = observation.audio
@@ -1447,6 +1570,8 @@ class ProactiveCoordinator:
         }
 
     def _derive_sensor_events(self, facts: dict[str, Any]) -> tuple[str, ...]:
+        """Return rising-edge event names derived from the latest fact payload."""
+
         current_flags = {
             "pir.motion_detected": bool(facts["pir"]["motion_detected"]),
             "camera.person_visible": bool(facts["camera"]["person_visible"]),
@@ -1462,17 +1587,23 @@ class ProactiveCoordinator:
         return tuple(event_names)
 
     def _next_since(self, active: bool, since: float | None, now: float) -> float | None:
+        """Advance or clear one duration anchor depending on activity."""
+
         if active:
             return now if since is None else since
         return None
 
     def _duration_since(self, since: float | None, now: float) -> float:
+        """Return the elapsed duration for one optional activity anchor."""
+
         if since is None:
             return 0.0
         return max(0.0, now - since)
 
 
 class ProactiveMonitorService:
+    """Run the proactive coordinator in a bounded background worker."""
+
     def __init__(
         self,
         coordinator: ProactiveCoordinator,
@@ -1481,6 +1612,8 @@ class ProactiveMonitorService:
         wakeword_stream: OpenWakeWordStreamingMonitor | None = None,
         emit: Callable[[str], None] | None = None,
     ) -> None:
+        """Initialize one monitor service around a configured coordinator."""
+
         self.coordinator = coordinator
         self.poll_interval_s = max(0.2, poll_interval_s)
         self.wakeword_stream = wakeword_stream
@@ -1493,6 +1626,8 @@ class ProactiveMonitorService:
 
     # AUDIT-FIX(#1): Safe telemetry wrappers for service lifecycle and worker faults.
     def _emit(self, line: str) -> None:
+        """Emit one service-local telemetry line safely."""
+
         _safe_emit(self.emit, line)
 
     # AUDIT-FIX(#1): Safe telemetry wrappers for service lifecycle and worker faults.
@@ -1504,6 +1639,8 @@ class ProactiveMonitorService:
         data: dict[str, Any],
         level: str | None = None,
     ) -> None:
+        """Append one service-local ops event safely."""
+
         _append_ops_event(
             self.coordinator.runtime,
             event=event,
@@ -1515,6 +1652,8 @@ class ProactiveMonitorService:
 
     # AUDIT-FIX(#3): Close optional resources defensively because shutdown cleanup must not raise while handling a stop request.
     def _safe_close_resource(self, resource: Any, *, name: str) -> None:
+        """Close one optional resource while suppressing cleanup failures."""
+
         if resource is None:
             return
         close = getattr(resource, "close", None)
@@ -1535,6 +1674,8 @@ class ProactiveMonitorService:
 
     # AUDIT-FIX(#3): Open hardware resources under the lifecycle lock so partial startups are unwound immediately.
     def _open_resources_locked(self) -> None:
+        """Open hardware resources under the lifecycle lock."""
+
         if self._resources_open:
             return
         opened_pir = False
@@ -1563,6 +1704,8 @@ class ProactiveMonitorService:
 
     # AUDIT-FIX(#3): Closing resources before join helps unblock hardware/audio backends during shutdown.
     def _close_resources_locked(self) -> None:
+        """Close any opened hardware resources under the lifecycle lock."""
+
         if not self._resources_open:
             return
         self._safe_close_resource(self.coordinator.audio_observer, name="audio_observer")
@@ -1571,6 +1714,8 @@ class ProactiveMonitorService:
         self._resources_open = False
 
     def open(self) -> "ProactiveMonitorService":
+        """Open resources and start the background proactive worker."""
+
         with self._lifecycle_lock:
             if self._thread is not None and not self._thread.is_alive():
                 self._thread = None
@@ -1604,6 +1749,8 @@ class ProactiveMonitorService:
             return self
 
     def close(self) -> None:
+        """Request worker shutdown and close monitor resources."""
+
         thread_to_join: Thread | None = None
         with self._lifecycle_lock:
             thread = self._thread
@@ -1632,12 +1779,18 @@ class ProactiveMonitorService:
                 self._emit("proactive_monitor=stop_timeout")
 
     def __enter__(self) -> "ProactiveMonitorService":
+        """Enter the monitor context by starting the service."""
+
         return self.open()  # AUDIT-FIX(#3): centralize all startup/open logic in one path so resource handling stays consistent.
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        """Exit the monitor context by stopping the service."""
+
         self.close()
 
     def _run(self) -> None:
+        """Run the wakeword drain and proactive tick loop until stopped."""
+
         next_tick_at = 0.0
         try:
             while not self._stop_event.is_set():
@@ -1703,6 +1856,8 @@ def build_default_proactive_monitor(
     observation_handler: Callable[[dict[str, Any], tuple[str, ...]], None] | None = None,
     emit: Callable[[str], None] | None = None,
 ) -> ProactiveMonitorService | None:
+    """Build the default proactive monitor stack from Twinr runtime services."""
+
     config = _load_wakeword_runtime_config(config=config, runtime=runtime, emit=emit)
     if not config.proactive_enabled and not config.wakeword_enabled:
         return None
@@ -1923,6 +2078,8 @@ def _load_wakeword_runtime_config(
     runtime: TwinrRuntime,
     emit: Callable[[str], None] | None,
 ) -> TwinrConfig:
+    """Apply stored wakeword calibration to the runtime config when enabled."""
+
     if not config.wakeword_enabled:
         return config
     try:
@@ -1945,6 +2102,8 @@ def _build_wakeword_policy(
     config: TwinrConfig,
     backend: OpenAIBackend,
 ) -> WakewordDecisionPolicy:
+    """Build the runtime wakeword policy and optional STT verifier."""
+
     verifier = None
     if config.wakeword_verifier_mode != "disabled":
         verifier = SttWakewordVerifier(
@@ -1968,6 +2127,8 @@ def _build_openwakeword_stream(
     runtime: TwinrRuntime,
     emit: Callable[[str], None] | None,
 ) -> OpenWakeWordStreamingMonitor | None:
+    """Build the streaming openWakeWord monitor when runtime constraints match."""
+
     models = _normalize_text_tuple(config.wakeword_openwakeword_models)
     if config.audio_sample_rate != 16000 or config.audio_channels != 1:
         _record_wakeword_backend_warning(
@@ -2038,6 +2199,8 @@ def _build_wakeword_spotter(
     selected_backend: str | None = None,
     fallback_backend: str | None = None,
 ):
+    """Build the non-streaming wakeword spotter for the selected backend."""
+
     selected_backend = normalize_wakeword_backend(
         selected_backend or config.wakeword_primary_backend or config.wakeword_backend,
         default="openwakeword",
@@ -2102,6 +2265,8 @@ def _record_wakeword_backend_warning(
     detail: str,
     fallback_backend: str,
 ) -> None:
+    """Record one warning about falling back from the preferred wakeword backend."""
+
     _safe_emit(emit, f"wakeword_backend_warning={reason}")  # AUDIT-FIX(#1): backend fallback warnings must not fail open/close paths when emit sinks are broken.
     _append_ops_event(
         runtime,

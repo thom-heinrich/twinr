@@ -1,3 +1,10 @@
+"""Apply retention and archival policy to long-term memory objects.
+
+This module classifies long-term memories for keeping, expiration,
+archival, or pruning with explicit timezone-aware comparisons so runtime
+hosts do not silently change retention behavior.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -101,6 +108,20 @@ def _coerce_timezone_name(value: object, *, default: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class LongTermRetentionPolicy:
+    """Classify long-term memory objects for keep, expire, archive, or prune.
+
+    Attributes:
+        timezone_name: Local timezone used when normalizing naive datetimes.
+        mode: Named policy mode used by callers for configuration grouping.
+        archive_enabled: Whether archival is preferred over destructive prune
+            for supported object classes.
+        ephemeral_episode_days: Maximum age for transient episode objects.
+        ephemeral_observation_days: Maximum age for transient observations.
+        stale_status_archive_days: Maximum age before terminal-status objects
+            are archived.
+        summary_archive_days: Maximum age before summary objects are archived.
+    """
+
     timezone_name: str = "Europe/Berlin"
     mode: str = "conservative"
     archive_enabled: bool = True
@@ -211,6 +232,18 @@ class LongTermRetentionPolicy:
         objects: tuple[LongTermMemoryObjectV1, ...],
         now: datetime | None = None,
     ) -> LongTermRetentionResultV1:
+        """Apply the retention policy to the current memory snapshot.
+
+        Args:
+            objects: Current long-term memory objects to classify.
+            now: Optional reference timestamp. Defaults to the current time in
+                the configured timezone.
+
+        Returns:
+            A retention result containing kept objects plus any expired,
+            archived, or pruned outputs.
+        """
+
         reference = self._reference_now(now)
         reference_utc = reference.astimezone(timezone.utc)
         kept: list[LongTermMemoryObjectV1] = []

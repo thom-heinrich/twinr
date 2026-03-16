@@ -1,0 +1,36 @@
+schema_version: 1
+name: deepgram
+path: src/twinr/providers/deepgram
+kind: python-package
+visibility: internal
+summary: Provide Deepgram-backed batch and streaming speech-to-text adapters for Twinr runtime paths.
+owned_concerns:
+  - Validate and send Deepgram REST transcription requests
+  - Manage bounded websocket streaming sessions and endpoint callbacks
+  - Normalize Deepgram response payloads into Twinr speech-to-text contracts
+out_of_scope:
+  - Provider selection and fallback orchestration in src/twinr/providers/factory.py
+  - Audio capture or playback in src/twinr/hardware/audio.py
+  - LLM, tool-calling, or search behavior in src/twinr/providers/groq and src/twinr/providers/openai
+files:
+  - path: __init__.py
+    role: Export the public Deepgram STT provider
+    exports:
+      - DeepgramSpeechToTextProvider
+  - path: speech.py
+    role: Implement REST transcription and bounded websocket STT sessions
+    exports:
+      - DeepgramSpeechToTextProvider
+public_api:
+  module: twinr.providers.deepgram
+  exports:
+    - DeepgramSpeechToTextProvider
+primary_callers:
+  - path: src/twinr/providers/factory.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+tests:
+  - path: test/test_deepgram_provider.py
+  - path: test/test_provider_factory.py
+  - path: test/test_streaming_runner.py

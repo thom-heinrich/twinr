@@ -1,0 +1,84 @@
+schema_version: 1
+name: orchestrator
+path: src/twinr/orchestrator
+kind: python-package
+visibility: internal
+summary: Expose Twinr's provider-neutral websocket orchestrator surface for remote turns, ack events, and remote tool bridging.
+owned_concerns:
+  - Define websocket transport contracts for turn requests, ack events, tool exchange, text deltas, and turn completion
+  - Expose the websocket client, FastAPI server, and local session bridge used by edge-orchestrator deployments
+  - Correlate remote tool calls and results while keeping fast ack phrases mapped to stable transport IDs
+out_of_scope:
+  - Tool prompt authoring, schema construction, or concrete tool-side business logic in src/twinr/agent/tools
+  - Runtime loop selection or CLI orchestration in src/twinr/__main__.py and src/twinr/agent/workflows
+  - Provider-specific model, search, or transport implementations in src/twinr/providers/openai
+files:
+  - path: __init__.py
+    role: Stable package export surface
+    exports:
+      - ACK_ID_TO_TEXT
+      - EdgeOrchestratorServer
+      - EdgeOrchestratorSession
+      - OrchestratorAckEvent
+      - OrchestratorClientTurnResult
+      - OrchestratorToolRequest
+      - OrchestratorToolResponse
+      - OrchestratorTurnCompleteEvent
+      - OrchestratorTurnRequest
+      - OrchestratorWebSocketClient
+      - RemoteToolBridge
+      - ack_id_for_text
+      - ack_text_for_id
+      - create_app
+  - path: acks.py
+    role: Canonical ack ID and text mapping
+    exports:
+      - ACK_ID_TO_TEXT
+      - ack_id_for_text
+      - ack_text_for_id
+  - path: contracts.py
+    role: Websocket message dataclasses and payload coercion
+    exports:
+      - OrchestratorAckEvent
+      - OrchestratorClientTurnResult
+      - OrchestratorErrorEvent
+      - OrchestratorTextDeltaEvent
+      - OrchestratorToolRequest
+      - OrchestratorToolResponse
+      - OrchestratorTurnCompleteEvent
+      - OrchestratorTurnRequest
+  - path: client.py
+    role: Blocking and asyncio-safe websocket client
+    exports:
+      - OrchestratorWebSocketClient
+  - path: server.py
+    role: FastAPI websocket server and transport gatekeeping
+    exports:
+      - EdgeOrchestratorServer
+      - create_app
+  - path: session.py
+    role: Local tool-loop bridge and remote tool correlation
+    exports:
+      - EdgeOrchestratorSession
+      - RemoteToolBridge
+public_api:
+  module: twinr.orchestrator
+  exports:
+    - ACK_ID_TO_TEXT
+    - EdgeOrchestratorServer
+    - EdgeOrchestratorSession
+    - OrchestratorAckEvent
+    - OrchestratorClientTurnResult
+    - OrchestratorToolRequest
+    - OrchestratorToolResponse
+    - OrchestratorTurnCompleteEvent
+    - OrchestratorTurnRequest
+    - OrchestratorWebSocketClient
+    - RemoteToolBridge
+    - ack_id_for_text
+    - ack_text_for_id
+    - create_app
+primary_callers:
+  - path: src/twinr/__main__.py
+tests:
+  - path: test/test_orchestrator.py

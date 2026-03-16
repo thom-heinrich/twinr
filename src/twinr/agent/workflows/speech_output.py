@@ -1,3 +1,5 @@
+"""Stream interruptible text-to-speech playback for dual-lane workflows."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,11 +12,15 @@ from twinr.agent.tools.runtime.dual_lane_loop import SpeechLaneDelta
 
 
 class StreamingTextToSpeechProviderLike(Protocol):
+    """Describe the streaming TTS interface required by speech output."""
+
     def synthesize_stream(self, text: str, **kwargs) -> object:
         ...
 
 
 class WaveAudioPlayerLike(Protocol):
+    """Describe the chunked WAV playback interface required by speech output."""
+
     def play_wav_chunks(
         self,
         chunks: object,
@@ -26,6 +32,8 @@ class WaveAudioPlayerLike(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class _PlaybackItem:
+    """Capture one queued speech segment and its cancellation generation."""
+
     text: str
     generation: int
     cancel_event: Event
@@ -33,6 +41,12 @@ class _PlaybackItem:
 
 
 class InterruptibleSpeechOutput:
+    """Queue text segments and play them with preemption-aware streaming TTS.
+
+    Segments are emitted once a boundary callback marks them ready. Newer
+    generations cancel stale playback so filler speech can be replaced safely.
+    """
+
     def __init__(
         self,
         *,

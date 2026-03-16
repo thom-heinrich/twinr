@@ -1,0 +1,41 @@
+schema_version: 1
+name: display
+path: src/twinr/display
+kind: python-package
+visibility: internal
+summary: Render Twinr runtime state on the Waveshare 4.2 V2 e-paper panel and optionally keep the display loop running beside other hardware loops.
+owned_concerns:
+  - Translate runtime snapshots and health signals into bounded e-paper status frames
+  - Validate and load the configured Waveshare vendor driver with Twinr GPIO and SPI expectations
+  - Manage the optional companion display loop that shadows other runtime loops
+out_of_scope:
+  - Runtime snapshot persistence, health collection, or loop-lock implementations
+  - Hardware bootstrap and vendor installation scripts under hardware/display
+  - CLI argument parsing for top-level Twinr commands
+files:
+  - path: __init__.py
+    role: Public display package export surface
+    exports:
+      - TwinrStatusDisplayLoop
+      - WaveshareEPD4In2V2
+  - path: service.py
+    role: Snapshot-driven e-paper status loop orchestration
+    exports:
+      - TwinrStatusDisplayLoop
+  - path: waveshare_v2.py
+    role: Waveshare panel adapter, rendering, and driver loading
+    exports:
+      - WaveshareEPD4In2V2
+  - path: companion.py
+    role: Optional sidecar thread for the display loop
+    exports:
+      - optional_display_companion
+primary_callers:
+  - path: src/twinr/__main__.py
+  - path: hardware/display/display_test.py
+  - path: hardware/display/run_display_loop.py
+tests:
+  - path: test/test_display.py
+  - path: test/test_display_service.py
+  - path: test/test_display_companion.py
+  - path: test/test_main.py

@@ -1,3 +1,10 @@
+"""Build validated Groq SDK clients for Twinr provider adapters.
+
+This module owns the configuration-to-client boundary for Groq. It validates
+API keys, timeout values, and base URL overrides before constructing the SDK
+client that the higher-level adapters use.
+"""
+
 from __future__ import annotations
 
 import math  # AUDIT-FIX(#2): Needed for finite timeout validation.
@@ -21,6 +28,7 @@ _ALLOWED_GROQ_BASE_URL_HOSTS_ENV = (
 
 
 def default_groq_client(config: TwinrConfig) -> Any:
+    """Build a Groq-compatible OpenAI SDK client from validated config values."""
     if config is None:
         raise TypeError("config must not be None")  # AUDIT-FIX(#4): Fail fast with a clear error instead of AttributeError later.
 
@@ -48,6 +56,7 @@ def default_groq_client(config: TwinrConfig) -> Any:
 
 
 def _validated_groq_api_key(config: TwinrConfig) -> str:
+    """Return the configured Groq API key or raise a deterministic config error."""
     raw_api_key = getattr(config, "groq_api_key", None)  # AUDIT-FIX(#4): Tolerate incomplete config objects and validate explicitly.
     if raw_api_key is None:
         api_key = ""
@@ -62,6 +71,7 @@ def _validated_groq_api_key(config: TwinrConfig) -> str:
 
 
 def _validated_groq_timeout_s(config: TwinrConfig) -> float:
+    """Normalize the Groq request timeout to a finite positive float."""
     raw_timeout = getattr(config, "groq_timeout_s", None)  # AUDIT-FIX(#2): Read timeout defensively; older configs may omit it.
     if raw_timeout is None or raw_timeout == "":
         return _DEFAULT_GROQ_TIMEOUT_S
@@ -85,6 +95,7 @@ def _validated_groq_timeout_s(config: TwinrConfig) -> float:
 
 
 def _allowed_groq_base_url_hosts() -> set[str]:
+    """Return the audited host allow-list for Groq base URL overrides."""
     raw_hosts = os.getenv(_ALLOWED_GROQ_BASE_URL_HOSTS_ENV, "")  # AUDIT-FIX(#1): Optional env extension preserves backward compatibility for audited proxies.
     extra_hosts = {
         host.strip().lower()
@@ -95,6 +106,7 @@ def _allowed_groq_base_url_hosts() -> set[str]:
 
 
 def _default_groq_base_url(config: TwinrConfig) -> str:
+    """Validate and normalize the configured Groq base URL override."""
     raw_base_url = getattr(config, "groq_base_url", None)  # AUDIT-FIX(#1): Read base URL defensively instead of assuming a perfect config object.
     if raw_base_url is None:
         base_url = _DEFAULT_GROQ_BASE_URL

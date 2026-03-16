@@ -1,3 +1,10 @@
+"""Persist durable long-term memory objects, conflicts, and archives.
+
+This module provides ``LongTermStructuredStore``, the JSON-backed store for
+canonical long-term memory snapshots. Import ``LongTermStructuredStore`` from
+this module or via ``twinr.memory.longterm``.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping  # AUDIT-FIX(#10): Import Mapping explicitly for Python 3.11 type-introspection safety.
@@ -45,14 +52,20 @@ _LOG = logging.getLogger(__name__)
 
 
 def _normalize_text(value: str | None) -> str:
+    """Collapse arbitrary text-like input to normalized single-spaced text."""
+
     return " ".join(str(value or "").split()).strip()
 
 
 def _utcnow() -> datetime:
+    """Return the current time as an aware UTC datetime."""
+
     return datetime.now(timezone.utc)
 
 
 def _coerce_positive_int(value: object, *, default: int) -> int:
+    """Coerce a value to a positive integer or fall back to ``default``."""
+
     # AUDIT-FIX(#7): Guard integer coercions coming from persisted attributes / env-derived config.
     try:
         coerced = int(value)
@@ -62,6 +75,8 @@ def _coerce_positive_int(value: object, *, default: int) -> int:
 
 
 def _coerce_aware_utc(value: object) -> datetime:
+    """Normalize a datetime-like value into an aware UTC timestamp."""
+
     # AUDIT-FIX(#8): Normalize naive datetimes to aware UTC before comparing or sorting.
     if not isinstance(value, datetime):
         return _MIN_AWARE_DATETIME
@@ -71,6 +86,8 @@ def _coerce_aware_utc(value: object) -> datetime:
 
 
 def _parse_snapshot_written_at(payload: Mapping[str, object]) -> datetime:
+    """Parse the stored snapshot write time or return the minimum sentinel."""
+
     raw_value = payload.get(_SNAPSHOT_WRITTEN_AT_KEY)
     if not isinstance(raw_value, str) or not raw_value:
         return _MIN_AWARE_DATETIME
@@ -81,6 +98,8 @@ def _parse_snapshot_written_at(payload: Mapping[str, object]) -> datetime:
 
 
 def _fsync_directory(directory: Path) -> None:
+    """Flush a directory entry to disk after an atomic file replacement."""
+
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     directory_fd = os.open(directory, flags)
     try:
@@ -98,6 +117,8 @@ _NON_SEMANTIC_ATTRIBUTE_KEYS = frozenset(
 
 
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    """Write one JSON object atomically and durably within ``path.parent``."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
     temp_path: Path | None = None
@@ -124,16 +145,28 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
 
 @dataclass(slots=True)
 class LongTermStructuredStore:
+    """Read, mutate, and mirror durable long-term memory snapshots.
+
+    The store owns the file-backed JSON snapshots for active objects,
+    unresolved conflicts, and archived objects. Local writes stay
+    authoritative and can be mirrored to ``LongTermRemoteStateStore`` when
+    remote-primary mode is enabled.
+    """
+
     base_path: Path
     remote_state: LongTermRemoteStateStore | None = None
     _lock: Lock = field(default_factory=RLock, repr=False)  # AUDIT-FIX(#3): Reentrant lock allows read/write serialization without deadlocking nested calls.
 
     def __post_init__(self) -> None:
+        """Normalize the configured base path once during construction."""
+
         # AUDIT-FIX(#1): Canonicalize the store root once so subsequent path validation is stable and absolute.
         self.base_path = Path(self.base_path).expanduser().resolve(strict=False)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermStructuredStore":
+        """Build a structured store rooted at the configured memory path."""
+
         return cls(
             base_path=chonkydb_data_path(config),
             remote_state=LongTermRemoteStateStore.from_config(config),
@@ -141,17 +174,25 @@ class LongTermStructuredStore:
 
     @property
     def objects_path(self) -> Path:
+        """Return the local snapshot path for active object state."""
+
         return self.base_path / "twinr_memory_objects_v1.json"
 
     @property
     def conflicts_path(self) -> Path:
+        """Return the local snapshot path for unresolved conflicts."""
+
         return self.base_path / "twinr_memory_conflicts_v1.json"
 
     @property
     def archive_path(self) -> Path:
+        """Return the local snapshot path for archived object state."""
+
         return self.base_path / "twinr_memory_archive_v1.json"
 
     def ensure_remote_snapshots(self) -> tuple[str, ...]:
+        """Bootstrap any missing remote snapshots from local or empty state."""
+
         with self._lock:  # AUDIT-FIX(#3): Keep snapshot bootstrap serialized with readers/writers.
             if self.remote_state is None or not self.remote_state.enabled:
                 return ()
@@ -170,11 +211,15 @@ class LongTermStructuredStore:
             return tuple(ensured)
 
     def load_objects(self) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load long-term memory objects from the current object snapshot."""
+
         with self._lock:  # AUDIT-FIX(#3): Serialize reads with multi-file writes for consistent in-process snapshots.
             payload = self._load_snapshot_payload(snapshot_kind="objects", local_path=self.objects_path)
             return self._load_memory_objects_from_payload(payload, snapshot_kind="objects")
 
     def load_conflicts(self) -> tuple[LongTermMemoryConflictV1, ...]:
+        """Load unresolved long-term conflicts from the current snapshot."""
+
         with self._lock:  # AUDIT-FIX(#3): Serialize reads with multi-file writes for consistent in-process snapshots.
             payload = self._load_snapshot_payload(snapshot_kind="conflicts", local_path=self.conflicts_path)
             if payload is None:
@@ -212,11 +257,15 @@ class LongTermStructuredStore:
             return tuple(conflicts)
 
     def load_archived_objects(self) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load archived long-term memory objects from the archive snapshot."""
+
         with self._lock:  # AUDIT-FIX(#3): Serialize reads with multi-file writes for consistent in-process snapshots.
             payload = self._load_snapshot_payload(snapshot_kind="archive", local_path=self.archive_path)
             return self._load_memory_objects_from_payload(payload, snapshot_kind="archive")
 
     def get_object(self, memory_id: str) -> LongTermMemoryObjectV1 | None:
+        """Return one stored memory object by canonical memory ID."""
+
         with self._lock:  # AUDIT-FIX(#3): Keep object lookup consistent with concurrent mutation writes.
             normalized = _normalize_text(memory_id)
             if not normalized:
@@ -567,6 +616,21 @@ class LongTermStructuredStore:
         fallback_limit: int = 2,
         require_query_match: bool = False,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Select episodic memories relevant to one retrieval query.
+
+        Args:
+            query_text: Free-text retrieval query. Blank queries return recent
+                episodes unless ``require_query_match`` is true.
+            limit: Maximum number of episodes to return.
+            fallback_limit: Maximum number of recent episodes to return when
+                ranked query matches are empty and fallback is allowed.
+            require_query_match: If true, suppress fallback and return only
+                explicit query matches.
+
+        Returns:
+            A tuple of episodic objects ordered by selector rank or recency.
+        """
+
         with self._lock:  # AUDIT-FIX(#3): Keep retrieval consistent with concurrent writes.
             objects = tuple(
                 sorted(
@@ -612,6 +676,8 @@ class LongTermStructuredStore:
         local_path: Path,
         payload: dict[str, object],
     ) -> None:
+        """Persist one validated snapshot locally and mirror it remotely."""
+
         local_path = self._validated_local_path(local_path)
         if not self._is_valid_snapshot_payload(snapshot_kind=snapshot_kind, payload=payload):
             raise ValueError(f"Refusing to persist invalid structured snapshot {snapshot_kind!r}.")
@@ -620,6 +686,8 @@ class LongTermStructuredStore:
         self._persist_remote_snapshot_payload(snapshot_kind=snapshot_kind, payload=stamped_payload)
 
     def apply_consolidation(self, result: LongTermConsolidationResultV1) -> None:
+        """Persist a consolidation result into object and conflict snapshots."""
+
         with self._lock:
             existing_objects = {item.memory_id: item for item in self.load_objects()}
             for item in (*result.episodic_objects, *result.durable_objects, *result.deferred_objects):
@@ -657,6 +725,8 @@ class LongTermStructuredStore:
             )
 
     def apply_reflection(self, result: LongTermReflectionResultV1) -> None:
+        """Persist reflected objects and summaries into the object snapshot."""
+
         with self._lock:
             existing_objects = {item.memory_id: item for item in self.load_objects()}
             for item in (*result.reflected_objects, *result.created_summaries):
@@ -677,6 +747,8 @@ class LongTermStructuredStore:
             )
 
     def apply_retention(self, result: LongTermRetentionResultV1) -> None:
+        """Persist kept objects and archive retained-off objects."""
+
         with self._lock:
             objects = {item.memory_id: item for item in result.kept_objects}
             archived_objects = {item.memory_id: item for item in self.load_archived_objects()}
@@ -704,6 +776,8 @@ class LongTermStructuredStore:
             )
 
     def apply_conflict_resolution(self, result: LongTermConflictResolutionV1) -> None:
+        """Persist updated objects and the remaining conflict queue."""
+
         with self._lock:
             existing_objects = {item.memory_id: item for item in self.load_objects()}
             for item in result.updated_objects:
@@ -739,6 +813,14 @@ class LongTermStructuredStore:
         conflicts: tuple[LongTermMemoryConflictV1, ...] = (),
         archived_objects: tuple[LongTermMemoryObjectV1, ...] = (),
     ) -> None:
+        """Write complete object, conflict, and archive snapshots at once.
+
+        Args:
+            objects: Objects to store in the active object snapshot.
+            conflicts: Conflicts to store in the conflict snapshot.
+            archived_objects: Objects to store in the archive snapshot.
+        """
+
         with self._lock:
             objects_payload = {
                 "schema": _OBJECT_STORE_SCHEMA,
@@ -775,6 +857,8 @@ class LongTermStructuredStore:
             )
 
     def apply_memory_mutation(self, result: LongTermMemoryMutationResultV1) -> None:
+        """Persist a user-driven mutation result across all snapshots."""
+
         with self._lock:
             existing_objects = {item.memory_id: item for item in self.load_objects()}
             archived_objects = {item.memory_id: item for item in self.load_archived_objects()}
@@ -827,6 +911,20 @@ class LongTermStructuredStore:
         include_episodes: bool = False,
         limit: int = 12,
     ) -> LongTermMemoryReviewResultV1:
+        """Build a bounded review page over stored memory objects.
+
+        Args:
+            query_text: Optional free-text filter over stored objects.
+            status: Optional status filter such as ``active`` or ``candidate``.
+            kind: Optional memory-kind filter.
+            include_episodes: If true, include episodic objects in the review.
+            limit: Maximum number of review items to return.
+
+        Returns:
+            A review result containing the selected items plus the total match
+            count for the applied filters.
+        """
+
         with self._lock:  # AUDIT-FIX(#3): Keep review output consistent with concurrent mutation/write activity.
             bounded_limit = max(1, limit)  # AUDIT-FIX(#9): Normalize nonsensical limits to a safe minimum.
             objects = [
@@ -870,6 +968,18 @@ class LongTermStructuredStore:
             )
 
     def confirm_object(self, memory_id: str) -> LongTermMemoryMutationResultV1:
+        """Build a mutation result that confirms one stored object.
+
+        Args:
+            memory_id: Canonical ID of the object to confirm.
+
+        Returns:
+            A mutation result that marks the object active and user-confirmed.
+
+        Raises:
+            ValueError: If no stored object exists for ``memory_id``.
+        """
+
         with self._lock:  # AUDIT-FIX(#3): Build mutation results from a single consistent in-memory view.
             current = self.get_object(memory_id)
             if current is None:
@@ -898,6 +1008,20 @@ class LongTermStructuredStore:
         *,
         reason: str | None = None,
     ) -> LongTermMemoryMutationResultV1:
+        """Build a mutation result that invalidates one stored object.
+
+        Args:
+            memory_id: Canonical ID of the object to invalidate.
+            reason: Optional user-facing reason recorded in object attributes.
+
+        Returns:
+            A mutation result containing the invalidated object plus any
+            related reference cleanup updates.
+
+        Raises:
+            ValueError: If no stored object exists for ``memory_id``.
+        """
+
         with self._lock:  # AUDIT-FIX(#3): Build mutation results from a single consistent in-memory view.
             current = self.get_object(memory_id)
             if current is None:
@@ -929,6 +1053,18 @@ class LongTermStructuredStore:
             )
 
     def delete_object(self, memory_id: str) -> LongTermMemoryMutationResultV1:
+        """Build a mutation result that removes one stored object.
+
+        Args:
+            memory_id: Canonical ID of the object to delete.
+
+        Returns:
+            A mutation result describing the deletion and related cleanup.
+
+        Raises:
+            ValueError: If no stored object exists for ``memory_id``.
+        """
+
         with self._lock:  # AUDIT-FIX(#3): Build mutation results from a single consistent in-memory view.
             current = self.get_object(memory_id)
             if current is None:
@@ -952,6 +1088,17 @@ class LongTermStructuredStore:
         query_text: str | None,
         limit: int = 4,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Select durable non-episodic objects relevant to a query.
+
+        Args:
+            query_text: Free-text retrieval query. Blank queries return the
+                most recent eligible objects.
+            limit: Maximum number of objects to return.
+
+        Returns:
+            A tuple of active, candidate, or uncertain non-episodic objects.
+        """
+
         with self._lock:  # AUDIT-FIX(#3): Keep retrieval consistent with concurrent writes.
             bounded_limit = max(1, limit)  # AUDIT-FIX(#9): Prevent negative/zero slicing quirks.
             objects = tuple(
@@ -986,6 +1133,17 @@ class LongTermStructuredStore:
         query_text: str | None,
         limit: int = 3,
     ) -> tuple[LongTermMemoryConflictV1, ...]:
+        """Select unresolved conflicts relevant to a query.
+
+        Args:
+            query_text: Free-text retrieval query. Blank queries return the
+                earliest conflicts already loaded in storage order.
+            limit: Maximum number of conflicts to return.
+
+        Returns:
+            A tuple of unresolved conflict records.
+        """
+
         with self._lock:  # AUDIT-FIX(#3): Keep retrieval consistent with concurrent writes.
             conflicts = self.load_conflicts()
             if not conflicts:

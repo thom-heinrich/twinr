@@ -1,3 +1,9 @@
+"""Persist normalized model-usage telemetry for Twinr runtime paths.
+
+This module records request metadata and token usage from provider calls and
+offers bounded summaries for dashboards, support bundles, and runtime analysis.
+"""
+
 from __future__ import annotations
 
 from collections import deque
@@ -219,6 +225,8 @@ def _open_locked_read_text(path: Path):
 
 @dataclass(frozen=True, slots=True)
 class TokenUsage:
+    """Represent normalized token usage extracted from a provider response."""
+
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
@@ -260,6 +268,8 @@ class TokenUsage:
 
 @dataclass(frozen=True, slots=True)
 class UsageRecord:
+    """Represent one persisted Twinr usage telemetry record."""
+
     created_at: str
     source: str
     request_kind: str
@@ -293,6 +303,8 @@ class UsageRecord:
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> "UsageRecord":
+        """Build a normalized usage record from persisted JSON data."""
+
         usage_payload = payload.get("token_usage")
         token_usage = None
         if isinstance(usage_payload, Mapping):
@@ -320,6 +332,8 @@ class UsageRecord:
 
 @dataclass(frozen=True, slots=True)
 class UsageSummary:
+    """Aggregate persisted usage records for dashboards and support exports."""
+
     requests_total: int = 0
     requests_with_token_data: int = 0
     total_input_tokens: int = 0
@@ -351,15 +365,21 @@ class UsageSummary:
 
 
 class TwinrUsageStore:
+    """Persist and summarize Twinr usage telemetry in a JSONL file."""
+
     def __init__(self, path: str | Path) -> None:
         self.path = _normalize_store_path(path)  # AUDIT-FIX(#1): Normalize once and reject unsafe paths up front.
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "TwinrUsageStore":
+        """Build a usage store rooted in Twinr's configured project."""
+
         return cls(resolve_ops_paths_for_config(config).usage_path)
 
     @classmethod
     def from_project_root(cls, project_root: str | Path) -> "TwinrUsageStore":
+        """Build a usage store rooted in a given Twinr project tree."""
+
         return cls(resolve_ops_paths(project_root).usage_path)
 
     def _iter_records(self) -> Iterator[UsageRecord]:
@@ -400,6 +420,8 @@ class TwinrUsageStore:
         token_usage: TokenUsage | None = None,
         metadata: dict[str, object] | None = None,
     ) -> UsageRecord:
+        """Append one normalized usage record and return the stored entry."""
+
         record = UsageRecord(
             created_at=_utc_now_iso_z(),
             source=_normalize_optional_text(source, default="runtime") or "runtime",  # AUDIT-FIX(#2): Never trust runtime callers to respect type hints.
@@ -420,6 +442,8 @@ class TwinrUsageStore:
         return record
 
     def tail(self, *, limit: int = 100) -> list[UsageRecord]:
+        """Return the most recent usage records in chronological order."""
+
         if limit <= 0:
             return []
         records: deque[UsageRecord] = deque(maxlen=limit)  # AUDIT-FIX(#3): Stream the file instead of loading it all into memory.
@@ -428,6 +452,8 @@ class TwinrUsageStore:
         return list(records)
 
     def summary(self, *, within_hours: int | None = None) -> UsageSummary:
+        """Summarize stored usage records for the optional recent window."""
+
         cutoff = None
         if within_hours is not None and within_hours > 0:
             cutoff = datetime.now(timezone.utc) - timedelta(hours=within_hours)
@@ -492,6 +518,8 @@ class TwinrUsageStore:
 
 
 def extract_model_name(source: object, fallback: str | None = None) -> str | None:
+    """Extract a normalized model name from a provider object or mapping."""
+
     value = _field_value(source, "model")
     if value is None or not _normalize_optional_text(value):
         return _normalize_optional_text(fallback)
@@ -499,6 +527,8 @@ def extract_model_name(source: object, fallback: str | None = None) -> str | Non
 
 
 def extract_token_usage(source: object) -> TokenUsage | None:
+    """Extract normalized token usage from a provider object or mapping."""
+
     usage = _field_value(source, "usage")
     if usage is None and any(
         _field_value(source, field_name) is not None

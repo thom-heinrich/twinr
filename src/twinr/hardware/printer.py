@@ -1,3 +1,9 @@
+"""Format and submit bounded Twinr receipt print jobs.
+
+This module owns text normalization, payload limits, temp-file handling, and
+``lp`` execution for Twinr's small receipt printers.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -125,6 +131,8 @@ def _resolve_lp_binary(lp_binary: object) -> str:
 
 
 class RawReceiptPrinter:
+    """Print short Twinr receipts through a validated CUPS queue."""
+
     def __init__(
         self,
         *,
@@ -150,6 +158,8 @@ class RawReceiptPrinter:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "RawReceiptPrinter":
+        """Build a receipt printer from ``TwinrConfig`` values."""
+
         return cls(
             queue=config.printer_queue,
             header_text=config.printer_header_text,
@@ -163,20 +173,40 @@ class RawReceiptPrinter:
         )
 
     async def print_text_async(self, text: str) -> str:
+        """Print receipt text without blocking the caller's event loop."""
+
         # AUDIT-FIX(#1): Provide an async-safe entry point so uvicorn callers can offload blocking printer I/O from the event loop.
         return await asyncio.to_thread(self.print_text, text)
 
     async def print_bytes_async(self, payload: bytes) -> str:
+        """Print a raw receipt payload without blocking the event loop."""
+
         # AUDIT-FIX(#1): Provide an async-safe entry point so uvicorn callers can offload blocking printer I/O from the event loop.
         return await asyncio.to_thread(self.print_bytes, payload)
 
     def print_text(self, text: str) -> str:
+        """Normalize Twinr receipt text and submit it to the printer queue."""
+
         if not isinstance(text, str):
             logger.error("Receipt text must be str, got %s", type(text).__name__)
             raise PrinterError("The printer could not prepare the printout.")  # AUDIT-FIX(#10): Fail deterministically on invalid caller input instead of deep attribute errors.
         return self.print_bytes(self._build_text_payload(text))
 
     def print_bytes(self, payload: bytes) -> str:
+        """Submit a validated raw receipt payload to the printer queue.
+
+        Args:
+            payload: Raw document bytes accepted by the configured printer
+                backend.
+
+        Returns:
+            The ``lp`` stdout text for the accepted job.
+
+        Raises:
+            PrinterError: If payload validation, spooling, or queue submission
+                fails.
+        """
+
         payload_bytes = self._validate_payload(payload)
         spool_path: Path | None = None
         try:

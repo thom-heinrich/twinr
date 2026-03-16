@@ -1,3 +1,10 @@
+"""Manage wakeword calibration profiles and config application.
+
+This module stores per-device wakeword tuning overrides, validates persisted
+profile data, and applies the resulting overrides onto ``TwinrConfig`` without
+changing unrelated wakeword settings.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
@@ -80,6 +87,13 @@ def _resolve_profile_path(config: TwinrConfig, configured_path: str) -> Path:
 
 @dataclass(frozen=True, slots=True)
 class WakewordCalibrationProfile:
+    """Describe one persisted wakeword calibration profile.
+
+    Optional fields override the corresponding wakeword settings on top of the
+    base ``TwinrConfig``. Validation normalizes backend names,
+    probability-like values, and timestamps at construction time.
+    """
+
     primary_backend: str | None = None
     fallback_backend: str | None = None
     verifier_mode: str | None = None
@@ -136,6 +150,8 @@ class WakewordCalibrationProfile:
 
     @classmethod
     def from_payload(cls, payload: dict[str, object] | None) -> "WakewordCalibrationProfile":
+        """Build a validated profile from JSON-compatible payload data."""
+
         data = dict(payload or {})
         return cls(
             primary_backend=data.get("primary_backend"),
@@ -152,23 +168,33 @@ class WakewordCalibrationProfile:
         )
 
     def to_payload(self) -> dict[str, object]:
+        """Serialize the profile into a JSON-compatible mapping."""
+
         payload = asdict(self)
         return {key: value for key, value in payload.items() if value is not None}
 
 
 class WakewordCalibrationStore:
+    """Persist wakeword calibration profiles on disk."""
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser()
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "WakewordCalibrationStore":
+        """Build the primary calibration store from ``TwinrConfig``."""
+
         return cls(_resolve_profile_path(config, config.wakeword_calibration_profile_path))
 
     @classmethod
     def recommended_from_config(cls, config: TwinrConfig) -> "WakewordCalibrationStore":
+        """Build the recommendation store from ``TwinrConfig``."""
+
         return cls(_resolve_profile_path(config, config.wakeword_calibration_recommended_path))
 
     def load(self) -> WakewordCalibrationProfile | None:
+        """Load and validate one calibration profile from disk if present."""
+
         if not self.path.exists():
             return None
         payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -177,6 +203,8 @@ class WakewordCalibrationStore:
         return WakewordCalibrationProfile.from_payload(payload)
 
     def save(self, profile: WakewordCalibrationProfile) -> WakewordCalibrationProfile:
+        """Persist one calibration profile and refresh its update timestamp."""
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
         updated = replace(profile, updated_at=_utc_now_iso_z())
         self.path.write_text(
@@ -190,6 +218,18 @@ def apply_wakeword_calibration(
     config: TwinrConfig,
     profile: WakewordCalibrationProfile | None,
 ) -> TwinrConfig:
+    """Apply a calibration profile onto one base ``TwinrConfig``.
+
+    Args:
+        config: Base Twinr configuration to start from.
+        profile: Optional wakeword calibration overrides. When ``None``, the
+            original config is returned unchanged.
+
+    Returns:
+        A config copy whose wakeword settings reflect the supplied profile
+        while preserving unrelated configuration fields.
+    """
+
     if profile is None:
         return config
     primary_backend = profile.primary_backend or config.wakeword_primary_backend or config.wakeword_backend

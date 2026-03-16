@@ -1,3 +1,11 @@
+"""Define the canonical long-term memory schemas used across Twinr.
+
+The dataclasses in this module form the versioned payload contract shared by
+ingestion, reasoning, retrieval, storage, and evaluation code. Constructors
+validate and normalize input eagerly so persisted long-term memory state stays
+canonical and timezone-safe.
+"""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -59,21 +67,29 @@ _MISSING = object()
 
 
 def _utcnow() -> datetime:
+    """Return the current timezone-aware UTC timestamp."""
+
     return datetime.now(timezone.utc)
 
 
 def _normalize_text(value: object | None) -> str:
+    """Collapse arbitrary input into a normalized single-line string."""
+
     if value is None:
         return ""
     return " ".join(str(value).split()).strip()
 
 
 def _drop_none(payload: dict[str, object]) -> dict[str, object]:
+    """Return a payload copy without keys whose value is ``None``."""
+
     return {key: value for key, value in payload.items() if value is not None}
 
 
 # AUDIT-FIX(#3): Freeze nested JSON-like state so frozen dataclasses stay effectively immutable.
 def _freeze_jsonish(value: object) -> object:
+    """Freeze nested JSON-like structures into immutable equivalents."""
+
     if isinstance(value, Mapping):
         frozen: dict[str, object] = {}
         for key, item in value.items():
@@ -93,6 +109,8 @@ def _freeze_jsonish(value: object) -> object:
 
 
 def _thaw_jsonish(value: object) -> object:
+    """Convert frozen JSON-like structures back into plain Python containers."""
+
     if isinstance(value, Mapping):
         return {key: _thaw_jsonish(item) for key, item in value.items()}
     if isinstance(value, tuple):
@@ -103,6 +121,8 @@ def _thaw_jsonish(value: object) -> object:
 
 
 def _mapping_dict(value: Mapping[str, object] | None) -> dict[str, object] | None:
+    """Return a mutable dictionary copy from an optional mapping payload."""
+
     if value is None:
         return None
     if not isinstance(value, Mapping):
@@ -111,6 +131,8 @@ def _mapping_dict(value: Mapping[str, object] | None) -> dict[str, object] | Non
 
 
 def _freeze_mapping(value: Mapping[str, object] | None, *, field_name: str) -> Mapping[str, object] | None:
+    """Validate and freeze an optional mapping used by a frozen dataclass."""
+
     if value is None:
         return None
     if not isinstance(value, Mapping):
@@ -120,6 +142,8 @@ def _freeze_mapping(value: Mapping[str, object] | None, *, field_name: str) -> M
 
 # AUDIT-FIX(#4): Reject silent None/"None"/type coercions at the persistence boundary.
 def _require_str(value: object, *, field_name: str) -> str:
+    """Require a non-blank string field and return its original value."""
+
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string.")
     if not _normalize_text(value):
@@ -133,6 +157,8 @@ def _optional_str(
     field_name: str,
     blank_to_none: bool = False,
 ) -> str | None:
+    """Validate an optional string field and optionally collapse blanks to ``None``."""
+
     if value is None:
         return None
     if not isinstance(value, str):
@@ -145,12 +171,16 @@ def _optional_str(
 
 
 def _payload_value(payload: Mapping[str, object], key: str) -> object:
+    """Return a payload value or the module-level missing sentinel."""
+
     if key in payload:
         return payload[key]
     return _MISSING
 
 
 def _payload_required_str(payload: Mapping[str, object], key: str) -> str:
+    """Read a required string field from a payload, allowing missing to surface later."""
+
     value = _payload_value(payload, key)
     if value is _MISSING or value is None:
         return ""
@@ -166,6 +196,8 @@ def _payload_optional_str(
     default: str | None = None,
     blank_to_none: bool = False,
 ) -> str | None:
+    """Read and validate an optional string field from a payload mapping."""
+
     value = _payload_value(payload, key)
     if value is _MISSING or value is None:
         return default
@@ -174,6 +206,8 @@ def _payload_optional_str(
 
 # AUDIT-FIX(#1): Avoid bool("false") == True when hydrating persisted payloads.
 def _coerce_bool(value: object, *, field_name: str, default: bool = False) -> bool:
+    """Coerce persisted boolean-like values into a canonical ``bool``."""
+
     if value is _MISSING or value is None:
         return default
     if isinstance(value, bool):
@@ -190,6 +224,8 @@ def _coerce_bool(value: object, *, field_name: str, default: bool = False) -> bo
 
 
 def _coerce_float(value: object, *, field_name: str, default: float | None = None) -> float:
+    """Coerce persisted numeric input into a floating-point value."""
+
     if value is _MISSING or value is None:
         if default is not None:
             return default
@@ -212,6 +248,8 @@ def _coerce_float(value: object, *, field_name: str, default: float | None = Non
 
 
 def _coerce_int(value: object, *, field_name: str, default: int | None = None) -> int:
+    """Coerce persisted numeric input into an integer value."""
+
     if value is _MISSING or value is None:
         if default is not None:
             return default
@@ -235,6 +273,8 @@ def _coerce_int(value: object, *, field_name: str, default: int | None = None) -
 
 # AUDIT-FIX(#6): Guard negative or impossible count fields before they poison queue/review state.
 def _coerce_non_negative_int(value: object, *, field_name: str) -> int:
+    """Coerce an integer field and reject negative values."""
+
     coerced = _coerce_int(value, field_name=field_name)
     if coerced < 0:
         raise ValueError(f"{field_name} cannot be negative.")
@@ -248,6 +288,8 @@ def _coerce_datetime(
     field_name: str,
     default: datetime | None = None,
 ) -> datetime:
+    """Coerce a datetime field into a timezone-aware UTC timestamp."""
+
     if value is _MISSING or value is None:
         if default is not None:
             return default
@@ -278,6 +320,8 @@ def _coerce_str_tuple(
     field_name: str,
     allow_empty: bool = True,
 ) -> tuple[str, ...]:
+    """Coerce a list-like string field into an immutable tuple."""
+
     if value is None:
         result: tuple[str, ...] = ()
     elif isinstance(value, (list, tuple)):
@@ -297,6 +341,8 @@ def _coerce_str_tuple(
 
 
 def _coerce_instance(value: object, field_name: str, cls: type[_T]) -> _T:
+    """Require that a value already be an instance of the requested class."""
+
     if isinstance(value, cls):
         return value
     raise ValueError(f"{field_name} must be a {cls.__name__}.")
@@ -310,6 +356,8 @@ def _coerce_tuple(
     item_coercer: Callable[[object, str], _T],
     allow_empty: bool = True,
 ) -> tuple[_T, ...]:
+    """Coerce a sequence of nested payload items into a validated tuple."""
+
     if value is None:
         result: tuple[_T, ...] = ()
     elif isinstance(value, (list, tuple)):
@@ -329,6 +377,8 @@ def _validate_schema_version(
     version: object,
     expected_version: int,
 ) -> None:
+    """Validate the schema and version markers on a versioned payload."""
+
     if not isinstance(schema, str):
         raise ValueError("schema must be a string.")
     if schema != expected_schema:
@@ -340,6 +390,8 @@ def _validate_schema_version(
 
 
 def _coerce_source_ref(value: object, field_name: str) -> "LongTermSourceRefV1":
+    """Coerce a nested source reference from an object or payload mapping."""
+
     if isinstance(value, LongTermSourceRefV1):
         return value
     if isinstance(value, Mapping):
@@ -348,6 +400,8 @@ def _coerce_source_ref(value: object, field_name: str) -> "LongTermSourceRefV1":
 
 
 def _coerce_memory_object(value: object, field_name: str) -> "LongTermMemoryObjectV1":
+    """Coerce a nested memory object from an object or payload mapping."""
+
     if isinstance(value, LongTermMemoryObjectV1):
         return value
     if isinstance(value, Mapping):
@@ -356,14 +410,20 @@ def _coerce_memory_object(value: object, field_name: str) -> "LongTermMemoryObje
 
 
 def _coerce_graph_edge(value: object, field_name: str) -> "LongTermGraphEdgeCandidateV1":
+    """Require a graph-edge candidate instance."""
+
     return _coerce_instance(value, field_name, LongTermGraphEdgeCandidateV1)
 
 
 def _coerce_conflict(value: object, field_name: str) -> "LongTermMemoryConflictV1":
+    """Require a memory-conflict instance."""
+
     return _coerce_instance(value, field_name, LongTermMemoryConflictV1)
 
 
 def _coerce_midterm_packet(value: object, field_name: str) -> "LongTermMidtermPacketV1":
+    """Coerce a midterm packet from an object or payload mapping."""
+
     if isinstance(value, LongTermMidtermPacketV1):
         return value
     if isinstance(value, Mapping):
@@ -372,15 +432,21 @@ def _coerce_midterm_packet(value: object, field_name: str) -> "LongTermMidtermPa
 
 
 def _coerce_proactive_candidate(value: object, field_name: str) -> "LongTermProactiveCandidateV1":
+    """Require a proactive-candidate instance."""
+
     return _coerce_instance(value, field_name, LongTermProactiveCandidateV1)
 
 
 def _coerce_conflict_option(value: object, field_name: str) -> "LongTermConflictOptionV1":
+    """Require a conflict-option instance."""
+
     return _coerce_instance(value, field_name, LongTermConflictOptionV1)
 
 
 @dataclass(frozen=True, slots=True)
 class LongTermConversationTurn:
+    """Represent one conversation turn queued for long-term ingestion."""
+
     transcript: str
     response: str
     source: str = "conversation"
@@ -399,6 +465,8 @@ class LongTermConversationTurn:
 
 @dataclass(frozen=True, slots=True)
 class LongTermEnqueueResult:
+    """Report whether an async long-term write was accepted."""
+
     accepted: bool
     pending_count: int
     dropped_count: int = 0
@@ -412,6 +480,8 @@ class LongTermEnqueueResult:
 
 @dataclass(frozen=True, slots=True)
 class LongTermMultimodalEvidence:
+    """Represent one multimodal/device event queued for long-term ingestion."""
+
     event_name: str
     modality: str
     source: str = "device_event"
@@ -440,6 +510,8 @@ class LongTermMultimodalEvidence:
 
 @dataclass(frozen=True, slots=True)
 class LongTermMemoryContext:
+    """Hold memory-derived context fragments for provider prompting."""
+
     subtext_context: str | None = None
     midterm_context: str | None = None
     durable_context: str | None = None
@@ -448,6 +520,8 @@ class LongTermMemoryContext:
     conflict_context: str | None = None
 
     def system_messages(self) -> tuple[str, ...]:
+        """Return non-empty context fragments in provider injection order."""
+
         messages: list[str] = []
         if self.subtext_context:
             messages.append(self.subtext_context)
@@ -466,6 +540,8 @@ class LongTermMemoryContext:
 
 @dataclass(frozen=True, slots=True)
 class LongTermSourceRefV1:
+    """Describe the provenance metadata for a long-term memory object."""
+
     source_type: str
     event_ids: tuple[str, ...] = ()
     speaker: str | None = None
@@ -479,6 +555,8 @@ class LongTermSourceRefV1:
         object.__setattr__(self, "modality", _optional_str(self.modality, field_name="modality"))
 
     def to_payload(self) -> dict[str, object]:
+        """Serialize the source reference into a plain JSON-compatible payload."""
+
         return _drop_none(
             {
                 "type": self.source_type,
@@ -490,6 +568,8 @@ class LongTermSourceRefV1:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "LongTermSourceRefV1":
+        """Build a source reference from a persisted payload mapping."""
+
         # AUDIT-FIX(#4): Treat nulls as missing instead of stringifying them into the literal "None".
         return cls(
             source_type=_payload_required_str(payload, "type"),
@@ -501,6 +581,8 @@ class LongTermSourceRefV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermGraphEdgeCandidateV1:
+    """Represent a candidate graph edge derived from memory reasoning."""
+
     source_ref: str
     edge_type: str
     target_ref: str
@@ -524,6 +606,8 @@ class LongTermGraphEdgeCandidateV1:
             raise ValueError("confidence must be between 0.0 and 1.0.")
 
     def to_payload(self) -> dict[str, object]:
+        """Serialize the graph-edge candidate into a plain payload mapping."""
+
         return _drop_none(
             {
                 "source_ref": self.source_ref,
@@ -540,6 +624,8 @@ class LongTermGraphEdgeCandidateV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermMemoryObjectV1:
+    """Represent the canonical persisted long-term memory object."""
+
     memory_id: str
     kind: str
     summary: str
@@ -605,6 +691,8 @@ class LongTermMemoryObjectV1:
         )
 
     def to_payload(self) -> dict[str, object]:
+        """Serialize the memory object into its versioned payload form."""
+
         return _drop_none(
             {
                 "schema": self.schema,
@@ -634,6 +722,8 @@ class LongTermMemoryObjectV1:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "LongTermMemoryObjectV1":
+        """Build a memory object from a persisted payload mapping."""
+
         source_payload = payload.get("source")
         if not isinstance(source_payload, Mapping):
             raise ValueError("source payload is required.")
@@ -672,6 +762,8 @@ class LongTermMemoryObjectV1:
         )
 
     def with_updates(self, **changes: object) -> "LongTermMemoryObjectV1":
+        """Return a validated copy of the memory object with field overrides."""
+
         payload = self.to_payload()
         normalized_changes = dict(changes)
         # AUDIT-FIX(#5): Accept LongTermSourceRefV1 updates directly instead of silently discarding them.
@@ -691,6 +783,8 @@ class LongTermMemoryObjectV1:
         return LongTermMemoryObjectV1.from_payload(payload)
 
     def canonicalized(self) -> "LongTermMemoryObjectV1":
+        """Return a copy with kind and attributes normalized canonically."""
+
         normalized_kind, normalized_attributes = normalize_memory_kind(self.kind, _mapping_dict(self.attributes))
         current_attributes = _mapping_dict(self.attributes) or {}
         if normalized_kind == self.kind and normalized_attributes == current_attributes:
@@ -703,6 +797,8 @@ class LongTermMemoryObjectV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermMemoryConflictV1:
+    """Represent a slot conflict that requires clarification or resolution."""
+
     slot_key: str
     candidate_memory_id: str
     existing_memory_ids: tuple[str, ...]
@@ -726,6 +822,8 @@ class LongTermMemoryConflictV1:
         )
 
     def to_payload(self) -> dict[str, object]:
+        """Serialize the conflict into its versioned payload form."""
+
         return {
             "schema": self.schema,
             "version": self.version,
@@ -739,6 +837,8 @@ class LongTermMemoryConflictV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermTurnExtractionV1:
+    """Capture extraction output for one conversation turn."""
+
     turn_id: str
     occurred_at: datetime
     episode: LongTermMemoryObjectV1
@@ -783,11 +883,15 @@ class LongTermTurnExtractionV1:
         )
 
     def all_objects(self) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Return the episodic object plus all extracted candidate objects."""
+
         return (self.episode, *self.candidate_objects)
 
 
 @dataclass(frozen=True, slots=True)
 class LongTermConsolidationResultV1:
+    """Capture the consolidator output for one processed turn."""
+
     turn_id: str
     occurred_at: datetime
     episodic_objects: tuple[LongTermMemoryObjectV1, ...]
@@ -862,11 +966,15 @@ class LongTermConsolidationResultV1:
 
     @property
     def clarification_needed(self) -> bool:
+        """Return whether the consolidation result still contains conflicts."""
+
         return bool(self.conflicts)
 
 
 @dataclass(frozen=True, slots=True)
 class LongTermReflectionResultV1:
+    """Collect reflection outputs produced across stored memories."""
+
     reflected_objects: tuple[LongTermMemoryObjectV1, ...]
     created_summaries: tuple[LongTermMemoryObjectV1, ...]
     midterm_packets: tuple["LongTermMidtermPacketV1", ...] = ()
@@ -915,6 +1023,8 @@ class LongTermReflectionResultV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermMidtermPacketV1:
+    """Represent a synthesized mid-term packet derived from memories."""
+
     packet_id: str
     kind: str
     summary: str
@@ -958,6 +1068,8 @@ class LongTermMidtermPacketV1:
         )
 
     def to_payload(self) -> dict[str, object]:
+        """Serialize the midterm packet into its versioned payload form."""
+
         return _drop_none(
             {
                 "schema": self.schema,
@@ -979,6 +1091,8 @@ class LongTermMidtermPacketV1:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "LongTermMidtermPacketV1":
+        """Build a midterm packet from a persisted payload mapping."""
+
         attributes = payload.get("attributes")
         if attributes is not None and not isinstance(attributes, Mapping):
             raise ValueError("attributes must be a mapping when provided.")
@@ -1003,6 +1117,8 @@ class LongTermMidtermPacketV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermProactiveCandidateV1:
+    """Represent a candidate proactive follow-up derived from memory."""
+
     candidate_id: str
     kind: str
     summary: str
@@ -1027,6 +1143,8 @@ class LongTermProactiveCandidateV1:
             raise ValueError(f"sensitivity must be one of: {', '.join(sorted(LONGTERM_MEMORY_SENSITIVITY))}.")
 
     def to_payload(self) -> dict[str, object]:
+        """Serialize the proactive candidate into a plain payload mapping."""
+
         return _drop_none(
             {
                 "candidate_id": self.candidate_id,
@@ -1043,6 +1161,8 @@ class LongTermProactiveCandidateV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermProactivePlanV1:
+    """Hold the set of proactive candidates proposed for a cycle."""
+
     candidates: tuple[LongTermProactiveCandidateV1, ...]
     schema: str = LONGTERM_PROACTIVE_PLAN_SCHEMA
     version: int = LONGTERM_PROACTIVE_PLAN_VERSION
@@ -1069,6 +1189,8 @@ class LongTermProactivePlanV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermRetentionResultV1:
+    """Summarize retention outcomes after pruning or archiving memories."""
+
     kept_objects: tuple[LongTermMemoryObjectV1, ...]
     expired_objects: tuple[LongTermMemoryObjectV1, ...]
     pruned_memory_ids: tuple[str, ...]
@@ -1119,6 +1241,8 @@ class LongTermRetentionResultV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermConflictOptionV1:
+    """Represent one selectable option in a conflict-resolution prompt."""
+
     memory_id: str
     summary: str
     status: str
@@ -1135,6 +1259,8 @@ class LongTermConflictOptionV1:
             raise ValueError(f"status must be one of: {', '.join(sorted(LONGTERM_MEMORY_STATUSES))}.")
 
     def to_payload(self) -> dict[str, object]:
+        """Serialize the conflict option into a plain payload mapping."""
+
         return _drop_none(
             {
                 "memory_id": self.memory_id,
@@ -1148,6 +1274,8 @@ class LongTermConflictOptionV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermConflictQueueItemV1:
+    """Represent a queued conflict surfaced to retrieval or UI flows."""
+
     slot_key: str
     question: str
     reason: str
@@ -1181,6 +1309,8 @@ class LongTermConflictQueueItemV1:
         )
 
     def to_payload(self) -> dict[str, object]:
+        """Serialize the queued conflict into its versioned payload form."""
+
         return {
             "schema": self.schema,
             "version": self.version,
@@ -1194,6 +1324,8 @@ class LongTermConflictQueueItemV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermConflictResolutionV1:
+    """Capture the outcome of resolving one queued memory conflict."""
+
     slot_key: str
     selected_memory_id: str
     updated_objects: tuple[LongTermMemoryObjectV1, ...]
@@ -1236,6 +1368,8 @@ class LongTermConflictResolutionV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermMemoryReviewItemV1:
+    """Represent one memory item returned by review flows."""
+
     memory_id: str
     kind: str
     summary: str
@@ -1269,6 +1403,8 @@ class LongTermMemoryReviewItemV1:
             raise ValueError(f"sensitivity must be one of: {', '.join(sorted(LONGTERM_MEMORY_SENSITIVITY))}.")
 
     def to_payload(self) -> dict[str, object]:
+        """Serialize the review item into a plain payload mapping."""
+
         return _drop_none(
             {
                 "memory_id": self.memory_id,
@@ -1288,6 +1424,8 @@ class LongTermMemoryReviewItemV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermMemoryReviewResultV1:
+    """Represent a filtered review result set over long-term memories."""
+
     items: tuple[LongTermMemoryReviewItemV1, ...]
     total_count: int
     query_text: str | None = None
@@ -1329,6 +1467,8 @@ class LongTermMemoryReviewResultV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermMemoryMutationResultV1:
+    """Capture the result of confirming, invalidating, or deleting a memory."""
+
     action: str
     target_memory_id: str
     updated_objects: tuple[LongTermMemoryObjectV1, ...] = ()

@@ -1,3 +1,10 @@
+"""Maintain slot-level truth state for long-term memory objects.
+
+This module canonicalizes candidate and existing memories, detects live
+slot conflicts, and produces bounded clarification prompts when more than
+one plausible value remains active for the same slot.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -38,6 +45,13 @@ def _dedupe_memory_ids(memory_ids: tuple[str, ...]) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class LongTermTruthMaintainer:
+    """Coordinate slot-level conflict detection and clean activation.
+
+    Attributes:
+        active_statuses: Status values that still participate in conflict
+            detection for the same slot.
+    """
+
     active_statuses: frozenset[str] = frozenset({"active", "uncertain", "candidate"})
 
     def detect_conflicts(
@@ -46,6 +60,18 @@ class LongTermTruthMaintainer:
         existing_objects: tuple[LongTermMemoryObjectV1, ...],
         candidate: LongTermMemoryObjectV1,
     ) -> tuple[LongTermMemoryConflictV1, ...]:
+        """Detect slot conflicts for one candidate against existing objects.
+
+        Args:
+            existing_objects: Existing long-term memory objects to compare
+                against after canonicalization.
+            candidate: Candidate object that may be activated.
+
+        Returns:
+            Zero or more conflict records describing competing live values
+            for the candidate's slot.
+        """
+
         candidate = candidate.canonicalized()
         return self._detect_conflicts_for_canonical_candidate(
             existing_objects=existing_objects,
@@ -58,6 +84,18 @@ class LongTermTruthMaintainer:
         candidate: LongTermMemoryObjectV1,
         existing_objects: tuple[LongTermMemoryObjectV1, ...],
     ) -> LongTermMemoryObjectV1:
+        """Activate a clean candidate or preserve uncertainty when blocked.
+
+        Args:
+            candidate: Candidate object to normalize and evaluate.
+            existing_objects: Existing long-term memory objects that can
+                block activation through slot conflicts.
+
+        Returns:
+            The candidate with status and conflict metadata updated to match
+            the current slot truth state.
+        """
+
         candidate = candidate.canonicalized()
         conflicts = self._detect_conflicts_for_canonical_candidate(
             existing_objects=existing_objects,

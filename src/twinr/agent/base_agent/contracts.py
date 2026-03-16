@@ -1,3 +1,10 @@
+"""Define provider contracts and composition helpers for the base agent.
+
+This module is the structural contract layer between workflow/runtime code and
+provider implementations. It keeps protocol surfaces, tool-call value objects,
+and the composite provider glue in one import-stable place.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -20,11 +27,15 @@ ImageInputLike = object
 
 @runtime_checkable
 class ConfigurableProvider(Protocol):
+    """Protocol for provider objects that expose a mutable ``config`` field."""
+
     config: TwinrConfig
 
 
 @runtime_checkable
 class TextResponse(Protocol):
+    """Protocol for text-generation responses with shared metadata fields."""
+
     text: str
     response_id: str | None
     request_id: str | None
@@ -35,6 +46,8 @@ class TextResponse(Protocol):
 
 @runtime_checkable
 class SearchResponse(Protocol):
+    """Protocol for search responses that include an answer and sources."""
+
     answer: str
     sources: tuple[str, ...]
     response_id: str | None
@@ -46,6 +59,8 @@ class SearchResponse(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class AgentToolCall:
+    """Represent one requested tool invocation from a model turn."""
+
     name: str
     call_id: str
     arguments: dict[str, Any]
@@ -63,6 +78,8 @@ class AgentToolCall:
 
 @dataclass(frozen=True, slots=True)
 class AgentToolResult:
+    """Capture the serialized output returned to a tool-calling model."""
+
     call_id: str
     name: str
     output: Any
@@ -71,6 +88,8 @@ class AgentToolResult:
 
 @dataclass(frozen=True, slots=True)
 class ToolCallingTurnResponse:
+    """Store one tool-capable model turn and its continuation metadata."""
+
     text: str
     tool_calls: tuple[AgentToolCall, ...] = ()
     response_id: str | None = None
@@ -93,6 +112,8 @@ class ToolCallingTurnResponse:
 
 @dataclass(frozen=True, slots=True)
 class SupervisorDecision:
+    """Represent the supervisor model's decision for streaming orchestration."""
+
     action: str
     spoken_ack: str | None = None
     spoken_reply: str | None = None
@@ -113,6 +134,8 @@ class SupervisorDecision:
 
 @dataclass(frozen=True, slots=True)
 class FirstWordReply:
+    """Store the first-word lane reply chosen for low-latency speech output."""
+
     mode: str
     spoken_text: str
     response_id: str | None = None
@@ -133,6 +156,8 @@ class FirstWordReply:
 
 @dataclass(frozen=True, slots=True)
 class StreamingTranscriptionResult:
+    """Store the current streaming transcription snapshot for a session."""
+
     transcript: str
     request_id: str | None = None
     saw_interim: bool = False
@@ -143,6 +168,8 @@ class StreamingTranscriptionResult:
 
 @dataclass(frozen=True, slots=True)
 class StreamingSpeechEndpointEvent:
+    """Represent a streaming endpoint signal emitted by an STT backend."""
+
     transcript: str
     event_type: str
     request_id: str | None = None
@@ -153,6 +180,8 @@ class StreamingSpeechEndpointEvent:
 
 @runtime_checkable
 class SpeechToTextProvider(ConfigurableProvider, Protocol):
+    """Protocol for providers that transcribe complete audio payloads."""
+
     def transcribe(
         self,
         audio_bytes: bytes,
@@ -167,6 +196,8 @@ class SpeechToTextProvider(ConfigurableProvider, Protocol):
 
 @runtime_checkable
 class PathSpeechToTextProvider(SpeechToTextProvider, Protocol):
+    """Protocol for STT providers that can transcribe directly from a path."""
+
     def transcribe_path(
         self,
         path: str | Path,
@@ -179,6 +210,8 @@ class PathSpeechToTextProvider(SpeechToTextProvider, Protocol):
 
 @runtime_checkable
 class StreamingSpeechToTextSession(Protocol):
+    """Protocol for a live streaming transcription session instance."""
+
     def send_pcm(self, pcm_bytes: bytes) -> None:
         ...
 
@@ -194,6 +227,8 @@ class StreamingSpeechToTextSession(Protocol):
 
 @runtime_checkable
 class StreamingSpeechToTextProvider(PathSpeechToTextProvider, Protocol):
+    """Protocol for providers that open live streaming STT sessions."""
+
     def start_streaming_session(
         self,
         *,
@@ -209,6 +244,8 @@ class StreamingSpeechToTextProvider(PathSpeechToTextProvider, Protocol):
 
 @runtime_checkable
 class AgentTextProvider(ConfigurableProvider, Protocol):
+    """Protocol for text-generation providers used by the base agent."""
+
     def respond_streaming(
         self,
         prompt: str,
@@ -294,6 +331,8 @@ class AgentTextProvider(ConfigurableProvider, Protocol):
 
 @runtime_checkable
 class ToolCallingAgentProvider(ConfigurableProvider, Protocol):
+    """Protocol for agents that can emit tool calls and continue turns."""
+
     def start_turn_streaming(
         self,
         prompt: str,
@@ -321,6 +360,8 @@ class ToolCallingAgentProvider(ConfigurableProvider, Protocol):
 
 @runtime_checkable
 class SupervisorDecisionProvider(ConfigurableProvider, Protocol):
+    """Protocol for providers that return a ``SupervisorDecision``."""
+
     def decide(
         self,
         prompt: str,
@@ -333,6 +374,8 @@ class SupervisorDecisionProvider(ConfigurableProvider, Protocol):
 
 @runtime_checkable
 class FirstWordProvider(ConfigurableProvider, Protocol):
+    """Protocol for providers that produce a bounded first-word reply."""
+
     def reply(
         self,
         prompt: str,
@@ -345,6 +388,8 @@ class FirstWordProvider(ConfigurableProvider, Protocol):
 
 @runtime_checkable
 class TextToSpeechProvider(ConfigurableProvider, Protocol):
+    """Protocol for providers that synthesize spoken output."""
+
     def synthesize(
         self,
         text: str,
@@ -374,10 +419,14 @@ class CombinedSpeechAgentProvider(
     TextToSpeechProvider,
     Protocol,
 ):
+    """Protocol for a single provider implementing STT, text, and TTS."""
+
     pass
 
 
 def _ensure_runtime_protocol(name: str, provider: object, protocol: type[Any]) -> None:
+    """Raise early when a configured provider misses a required protocol."""
+
     # AUDIT-FIX(#2): Erzwingt Fail-Fast-Validierung der injizierten Provider gegen die Runtime-Protokolle.
     if not isinstance(provider, protocol):
         raise TypeError(
@@ -388,6 +437,8 @@ def _ensure_runtime_protocol(name: str, provider: object, protocol: type[Any]) -
 def _unique_configurable_providers(
     providers: Sequence[ConfigurableProvider],
 ) -> tuple[ConfigurableProvider, ...]:
+    """Deduplicate provider objects while preserving their original order."""
+
     unique_providers: list[ConfigurableProvider] = []
     seen: set[int] = set()
     for provider in providers:
@@ -403,6 +454,8 @@ def _apply_config_atomically(
     providers: Sequence[ConfigurableProvider],
     value: TwinrConfig,
 ) -> None:
+    """Apply one config object across providers with best-effort rollback."""
+
     # AUDIT-FIX(#3): Wendet Konfigurationsänderungen rollback-fähig an, damit der Composite nicht halb umkonfiguriert zurückbleibt.
     previous_configs: list[tuple[ConfigurableProvider, TwinrConfig]] = []
     try:
@@ -419,11 +472,15 @@ def _apply_config_atomically(
 
 
 def _guess_audio_content_type(path: str | Path) -> str:
+    """Infer an audio content type from a file path with a WAV fallback."""
+
     guessed_type, _ = mimetypes.guess_type(str(path), strict=False)
     return guessed_type or "audio/wav"
 
 
 def _read_audio_bytes_from_path(path: str | Path) -> bytes:
+    """Read audio bytes from a path and raise clearer path-type errors."""
+
     audio_path = Path(path)
     # AUDIT-FIX(#1): Liest den Pfad in einem Schritt ein und vermeidet damit blindes Attributrouting plus unnötige Check-then-use-Rennen.
     try:
@@ -436,6 +493,8 @@ def _read_audio_bytes_from_path(path: str | Path) -> bytes:
 
 @dataclass
 class ProviderBundle:
+    """Bundle the base agent's primary providers into one validated object."""
+
     stt: SpeechToTextProvider
     agent: AgentTextProvider
     tts: TextToSpeechProvider
@@ -450,6 +509,13 @@ class ProviderBundle:
 
 
 class CompositeSpeechAgentProvider:
+    """Delegate STT, text, and TTS calls to separate coordinated providers.
+
+    The composite exposes one provider-like surface while keeping the three
+    injected providers' configs synchronized and offering a path-based STT
+    fallback when the selected STT provider only accepts raw bytes.
+    """
+
     def __init__(
         self,
         *,
@@ -666,10 +732,14 @@ class CompositeSpeechAgentProvider:
 
 
 class FoundationModelProvider(Protocol):
+    """Protocol for simple prompt-in, text-out model adapters."""
+
     def respond(self, prompt: str) -> str:
         ...
 
 
 class PrintFormatter(Protocol):
+    """Protocol for formatters that adapt text to the printer surface."""
+
     def format_for_print(self, text: str) -> str:
         ...

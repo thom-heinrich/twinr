@@ -1,3 +1,10 @@
+"""Consolidate extracted turn memories into reasoning outputs.
+
+This module turns one ingestion result into episodic, durable, deferred,
+and conflicting long-term memory objects while keeping same-turn graph
+edges grounded only in accepted memory IDs.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -21,6 +28,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class LongTermMemoryConsolidator:
+    """Coordinate post-ingestion consolidation for one conversation turn.
+
+    Attributes:
+        truth_maintainer: Slot-level truth helper used for conflict
+            detection and clean activation.
+        promotion_confidence_threshold: Minimum durable-confidence required
+            before a non-confirmed candidate can activate automatically.
+    """
+
     truth_maintainer: LongTermTruthMaintainer
     promotion_confidence_threshold: float = 0.75
 
@@ -49,6 +65,24 @@ class LongTermMemoryConsolidator:
         extraction: LongTermTurnExtractionV1,
         existing_objects: tuple[LongTermMemoryObjectV1, ...] = (),
     ) -> LongTermConsolidationResultV1:
+        """Consolidate one extracted turn into persisted memory outcomes.
+
+        Args:
+            extraction: Turn-level ingestion output containing the episode,
+                candidate objects, and candidate graph edges.
+            existing_objects: Existing stored memory objects that influence
+                conflict detection and activation decisions.
+
+        Returns:
+            A consolidation result containing accepted episodic objects,
+            activated durable objects, deferred objects, surfaced conflicts,
+            and graph edges grounded in accepted memory IDs.
+
+        Raises:
+            ValueError: If the extraction or its required episode object is
+                missing.
+        """
+
         if extraction is None:
             raise ValueError("extraction must not be None")
         if extraction.episode is None:

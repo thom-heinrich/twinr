@@ -21,6 +21,8 @@ _REALTIME_TOOL_BINDINGS: tuple[tuple[str, str], ...] = (
     ("update_time_automation", "handle_update_time_automation"),
     ("update_sensor_automation", "handle_update_sensor_automation"),
     ("delete_automation", "handle_delete_automation"),
+    ("propose_skill_learning", "handle_propose_skill_learning"),
+    ("answer_skill_question", "handle_answer_skill_question"),
     ("remember_memory", "handle_remember_memory"),
     ("remember_contact", "handle_remember_contact"),
     ("lookup_contact", "handle_lookup_contact"),
@@ -36,6 +38,13 @@ _REALTIME_TOOL_BINDINGS: tuple[tuple[str, str], ...] = (
     ("reset_voice_profile", "handle_reset_voice_profile"),
     ("inspect_camera", "handle_inspect_camera"),
     ("end_conversation", "handle_end_conversation"),
+)
+_BACKGROUND_AUTOMATION_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "inspect_camera",
+        "print_receipt",
+        "search_live_info",
+    }
 )
 
 RealtimeToolHandler = Callable[[dict[str, Any]], Any]
@@ -93,6 +102,18 @@ _REALTIME_TOOL_NAMES: tuple[str, ...] = _validate_realtime_tool_bindings()  # AU
 def realtime_tool_names() -> tuple[str, ...]:
     """Return the validated canonical realtime tool names."""
     return _REALTIME_TOOL_NAMES
+
+
+def automation_safe_tool_names() -> tuple[str, ...]:
+    """Return the tool names that background automations may execute directly."""
+
+    return tuple(sorted(_BACKGROUND_AUTOMATION_SAFE_TOOL_NAMES))
+
+
+def is_automation_safe_tool_name(tool_name: str) -> bool:
+    """Return whether one tool may be executed from background automations."""
+
+    return str(tool_name or "").strip() in _BACKGROUND_AUTOMATION_SAFE_TOOL_NAMES
 
 
 def _handler_accepts_payload(handler: Callable[..., Any]) -> bool:

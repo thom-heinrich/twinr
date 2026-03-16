@@ -1,0 +1,57 @@
+schema_version: 1
+name: on_device
+path: src/twinr/memory/on_device
+kind: python-package
+visibility: internal
+summary: Provide Twinr's bounded on-device short-term memory records and in-memory store.
+owned_concerns:
+  - Define the canonical on-device short-term memory records for conversation turns, ledger items, search results, and derived state
+  - Keep recent conversation context bounded through compaction and summary-turn synthesis
+  - Sanitize legacy and structured snapshot payloads before rehydrating runtime memory
+  - Expose defensive copies of memory state to runtime callers
+out_of_scope:
+  - Snapshot file persistence or snapshot file loading
+  - Long-term memory extraction, remote memory, or graph-memory storage
+  - Web dashboard rendering and high-level runtime orchestration
+files:
+  - path: __init__.py
+    role: On-device memory records and bounded in-memory store
+    exports:
+      - ConversationTurn
+      - MemoryLedgerItem
+      - SearchMemoryEntry
+      - MemoryState
+      - OnDeviceMemory
+public_api:
+  module: twinr.memory.on_device
+  classes:
+    - ConversationTurn
+    - MemoryLedgerItem
+    - SearchMemoryEntry
+    - MemoryState
+    - OnDeviceMemory
+compatibility_reexports:
+  - path: src/twinr/memory/__init__.py
+    names:
+      - ConversationTurn
+      - MemoryLedgerItem
+      - SearchMemoryEntry
+      - MemoryState
+      - OnDeviceMemory
+  - path: src/twinr/__init__.py
+    names:
+      - OnDeviceMemory
+primary_callers:
+  - path: src/twinr/agent/base_agent/runtime/base.py
+  - path: src/twinr/agent/base_agent/runtime/flow.py
+  - path: src/twinr/agent/base_agent/runtime/memory.py
+  - path: src/twinr/agent/base_agent/runtime/snapshot.py
+  - path: src/twinr/agent/tools/handlers/memory.py
+  - path: src/twinr/agent/tools/handlers/output.py
+tests:
+  - path: test/test_state_machine.py
+  - path: test/test_web_app.py
+  - path: test/test_runtime_context.py
+  - path: test/test_runner.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_streaming_runner.py

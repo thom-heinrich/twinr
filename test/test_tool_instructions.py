@@ -43,6 +43,8 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("exact saved contact details", instructions)
         self.assertIn("lookup or list tool first", instructions)
         self.assertIn("switch from one supported trigger type to another", instructions)
+        self.assertIn("propose_skill_learning", instructions)
+        self.assertIn("answer_skill_question", instructions)
 
     def test_supervisor_instructions_do_not_embed_full_business_tool_rules(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

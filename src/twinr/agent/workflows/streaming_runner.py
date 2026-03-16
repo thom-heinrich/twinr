@@ -1,3 +1,5 @@
+"""Run the speculative streaming workflow with dual-lane tool orchestration."""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -45,11 +47,19 @@ from twinr.providers.openai import (
 
 
 class _StreamingSessionPlaceholder:
+    """Carry config for the realtime parent without opening a realtime session."""
+
     def __init__(self, config: TwinrConfig) -> None:
         self.config = config
 
 
 class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
+    """Extend the realtime loop with streaming STT and speculative speech.
+
+    The streaming loop adds dual-lane tool execution, interruptible speech
+    output, and speculative first-word and supervisor decision warmups.
+    """
+
     def __init__(
         self,
         config: TwinrConfig,

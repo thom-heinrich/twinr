@@ -1,0 +1,59 @@
+schema_version: 1
+name: governance
+path: src/twinr/proactive/governance
+kind: python-package
+visibility: internal
+summary: Gate proactive delivery reservations with bounded cooldowns, per-source repeat policy, and per-presence-session budgets.
+owned_concerns:
+  - Normalize proactive delivery candidates and reservation timestamps
+  - Issue at most one active reservation at a time
+  - Record delivered and skipped outcomes for bounded cooldown enforcement
+  - Read governor policy thresholds from TwinrConfig with safe coercion
+out_of_scope:
+  - Social trigger scoring, wakeword matching, or presence-session detection
+  - Sensor polling or background worker lifecycle orchestration
+  - Actual prompt delivery, printing, or speech output handling
+  - Long-term proactive planning or durable history persistence
+files:
+  - path: __init__.py
+    role: Package export surface for proactive governor types
+    exports:
+      - ProactiveGovernor
+      - ProactiveGovernorCandidate
+      - ProactiveGovernorDecision
+      - ProactiveGovernorHistoryEntry
+      - ProactiveGovernorReservation
+  - path: governor.py
+    role: Reservation, history, and cooldown policy implementation
+    exports:
+      - ProactiveGovernor
+      - ProactiveGovernorCandidate
+      - ProactiveGovernorDecision
+      - ProactiveGovernorHistoryEntry
+      - ProactiveGovernorReservation
+public_api:
+  module: twinr.proactive.governance
+  exports:
+    - ProactiveGovernor
+    - ProactiveGovernorCandidate
+    - ProactiveGovernorDecision
+    - ProactiveGovernorHistoryEntry
+    - ProactiveGovernorReservation
+compatibility_reexports:
+  - path: src/twinr/proactive/__init__.py
+    names:
+      - ProactiveGovernor
+      - ProactiveGovernorCandidate
+      - ProactiveGovernorDecision
+      - ProactiveGovernorHistoryEntry
+      - ProactiveGovernorReservation
+primary_callers:
+  - path: src/twinr/agent/base_agent/runtime/base.py
+  - path: src/twinr/agent/base_agent/runtime/context.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runner_background.py
+tests:
+  - path: test/test_proactive_governor.py
+  - path: test/test_runner.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_config.py

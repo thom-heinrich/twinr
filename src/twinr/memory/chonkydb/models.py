@@ -1,3 +1,9 @@
+"""Define validated request and response models for the ChonkyDB API.
+
+The dataclasses in this module normalize Twinr-side inputs before requests are
+sent and parse the JSON payloads returned by the ChonkyDB external API.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -344,6 +350,8 @@ def _copy_raw_payload(payload: Mapping[str, object]) -> JsonDict:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBConnectionConfig:
+    """Store validated connection settings for a ChonkyDB client."""
+
     base_url: str
     api_key: str | None = None
     api_key_header: str = "x-api-key"
@@ -362,6 +370,8 @@ class ChonkyDBConnectionConfig:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBInstanceInfo:
+    """Represent readiness and service metadata from ``/instance``."""
+
     success: bool
     service: str
     ready: bool
@@ -377,6 +387,8 @@ class ChonkyDBInstanceInfo:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "ChonkyDBInstanceInfo":
+        """Parse an instance-info response payload into the typed model."""
+
         raw = _copy_raw_payload(payload)  # AUDIT-FIX(#8)
         return cls(
             success=raw.get("success", False),
@@ -389,6 +401,8 @@ class ChonkyDBInstanceInfo:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBAuthInfo:
+    """Represent authentication metadata from ``/admin/auth``."""
+
     success: bool
     auth_enabled: bool
     scheme: str
@@ -410,6 +424,8 @@ class ChonkyDBAuthInfo:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "ChonkyDBAuthInfo":
+        """Parse an auth-info response payload into the typed model."""
+
         raw = _copy_raw_payload(payload)  # AUDIT-FIX(#8)
         return cls(
             success=raw.get("success", False),
@@ -425,6 +441,8 @@ class ChonkyDBAuthInfo:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBRecordItem:
+    """Describe one record item for ChonkyDB storage requests."""
+
     payload: Mapping[str, object] | None = None
     metadata: Mapping[str, object] | None = None
     content: str | None = None
@@ -461,6 +479,8 @@ class ChonkyDBRecordItem:
         object.__setattr__(self, "extra", _normalize_extra_mapping(self.extra) if self.extra is not None else None)  # AUDIT-FIX(#1)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the record item into a ChonkyDB request payload."""
+
         payload = _drop_none(
             {
                 "payload": dict(self.payload) if self.payload is not None else None,
@@ -485,6 +505,8 @@ class ChonkyDBRecordItem:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBRecordRequest(ChonkyDBRecordItem):
+    """Describe a single-record write request."""
+
     operation: str = "store_payload"
     execution_mode: str = "sync"
     client_request_id: str | None = None
@@ -496,6 +518,8 @@ class ChonkyDBRecordRequest(ChonkyDBRecordItem):
         object.__setattr__(self, "client_request_id", _coerce_optional_str(self.client_request_id, field_name="client_request_id", empty_as_none=True))  # AUDIT-FIX(#5)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the single-record request into ChonkyDB's payload shape."""
+
         payload = ChonkyDBRecordItem.to_payload(self)
         payload.update(
             {
@@ -510,6 +534,8 @@ class ChonkyDBRecordRequest(ChonkyDBRecordItem):
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBBulkRecordRequest:
+    """Bundle multiple record items for one ChonkyDB bulk write."""
+
     items: tuple[ChonkyDBRecordItem, ...]
     operation: str = "store_payload"
     execution_mode: str = "sync"
@@ -528,6 +554,8 @@ class ChonkyDBBulkRecordRequest:
         object.__setattr__(self, "extra", _normalize_extra_mapping(self.extra) if self.extra is not None else None)  # AUDIT-FIX(#1)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the bulk-write request into ChonkyDB's payload shape."""
+
         payload = _drop_none(
             {
                 "operation": self.operation,
@@ -543,6 +571,8 @@ class ChonkyDBBulkRecordRequest:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBRetrieveRequest:
+    """Describe a validated retrieval query against ChonkyDB indexes."""
+
     query_text: str | None = None
     mode: str = "advanced"
     result_limit: int = 10
@@ -585,6 +615,8 @@ class ChonkyDBRetrieveRequest:
         object.__setattr__(self, "extra", _normalize_extra_mapping(self.extra) if self.extra is not None else None)  # AUDIT-FIX(#1)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the retrieval request into ChonkyDB's payload shape."""
+
         payload = _drop_none(
             {
                 "mode": self.mode,
@@ -607,6 +639,8 @@ class ChonkyDBRetrieveRequest:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBGraphAddEdgeRequest:
+    """Describe a graph-edge write using numeric ChonkyDB node ids."""
+
     from_id: int
     to_id: int
     edge_type: str
@@ -621,6 +655,8 @@ class ChonkyDBGraphAddEdgeRequest:
         object.__setattr__(self, "extra", _normalize_extra_mapping(self.extra) if self.extra is not None else None)  # AUDIT-FIX(#1)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the graph-edge request into ChonkyDB's payload shape."""
+
         payload = _drop_none(
             {
                 "from_id": self.from_id,
@@ -634,6 +670,8 @@ class ChonkyDBGraphAddEdgeRequest:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBGraphAddEdgeSmartRequest:
+    """Describe a graph-edge write using graph references."""
+
     from_ref: str
     to_ref: str
     edge_type: str
@@ -646,6 +684,8 @@ class ChonkyDBGraphAddEdgeSmartRequest:
         object.__setattr__(self, "extra", _normalize_extra_mapping(self.extra) if self.extra is not None else None)  # AUDIT-FIX(#1)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the smart graph-edge request into ChonkyDB's payload shape."""
+
         payload = _drop_none(
             {
                 "from_ref": self.from_ref,
@@ -658,6 +698,8 @@ class ChonkyDBGraphAddEdgeSmartRequest:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBGraphNeighborsRequest:
+    """Describe a graph-neighbor query."""
+
     index_name: str | None = None
     label_or_id: str | None = None
     label: str | None = None
@@ -682,6 +724,8 @@ class ChonkyDBGraphNeighborsRequest:
         object.__setattr__(self, "extra", _normalize_extra_mapping(self.extra) if self.extra is not None else None)  # AUDIT-FIX(#1)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the neighbor-query request into ChonkyDB's payload shape."""
+
         payload = _drop_none(
             {
                 "index_name": self.index_name,
@@ -700,6 +744,8 @@ class ChonkyDBGraphNeighborsRequest:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBGraphPathRequest:
+    """Describe a graph-path query between two nodes."""
+
     index_name: str | None = None
     source_label: str | None = None
     source: str | None = None
@@ -720,6 +766,8 @@ class ChonkyDBGraphPathRequest:
         object.__setattr__(self, "extra", _normalize_extra_mapping(self.extra) if self.extra is not None else None)  # AUDIT-FIX(#1)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the graph-path request into ChonkyDB's payload shape."""
+
         payload = _drop_none(
             {
                 "index_name": self.index_name,
@@ -736,6 +784,8 @@ class ChonkyDBGraphPathRequest:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBGraphPatternsRequest:
+    """Describe a graph-pattern query."""
+
     patterns: tuple[Mapping[str, object], ...]
     index_name: str | None = None
     limit: int = 10
@@ -752,6 +802,8 @@ class ChonkyDBGraphPatternsRequest:
         object.__setattr__(self, "extra", _normalize_extra_mapping(self.extra) if self.extra is not None else None)  # AUDIT-FIX(#1)
 
     def to_payload(self) -> JsonDict:
+        """Serialize the graph-pattern request into ChonkyDB's payload shape."""
+
         payload = _drop_none(
             {
                 "index_name": self.index_name,
@@ -766,6 +818,8 @@ class ChonkyDBGraphPatternsRequest:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBRetrieveHit:
+    """Represent one retrieval hit returned by ChonkyDB."""
+
     payload_id: str | None
     doc_id_int: int | None
     score: float | None
@@ -787,6 +841,8 @@ class ChonkyDBRetrieveHit:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "ChonkyDBRetrieveHit":
+        """Parse a single retrieval-hit payload into the typed model."""
+
         raw = _copy_raw_payload(payload)  # AUDIT-FIX(#8)
         metadata = raw.get("metadata")
         return cls(
@@ -803,6 +859,8 @@ class ChonkyDBRetrieveHit:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBRetrieveResponse:
+    """Represent a parsed retrieval response and its hit list."""
+
     success: bool
     mode: str
     results: tuple[ChonkyDBRetrieveHit, ...]
@@ -827,6 +885,8 @@ class ChonkyDBRetrieveResponse:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "ChonkyDBRetrieveResponse":
+        """Parse a retrieval response payload into the typed model."""
+
         raw = _copy_raw_payload(payload)  # AUDIT-FIX(#8)
         raw_results = raw.get("results", ())
         if isinstance(raw_results, (str, bytes, bytearray)) or isinstance(raw_results, Mapping) or not isinstance(raw_results, Iterable):
@@ -848,6 +908,8 @@ class ChonkyDBRetrieveResponse:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBRecordSummary:
+    """Represent one record summary returned by list-records."""
+
     payload_id: str
     chonky_id: str | None
     metadata: Mapping[str, object] | None
@@ -861,6 +923,8 @@ class ChonkyDBRecordSummary:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "ChonkyDBRecordSummary":
+        """Parse a record-summary payload into the typed model."""
+
         raw = _copy_raw_payload(payload)  # AUDIT-FIX(#8)
         metadata = raw.get("metadata")
         payload_id = _coerce_stringish(raw.get("payload_id"), field_name="payload_id")
@@ -876,6 +940,8 @@ class ChonkyDBRecordSummary:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBRecordListResponse:
+    """Represent a paginated record-list response."""
+
     success: bool
     offset: int
     limit: int
@@ -906,6 +972,8 @@ class ChonkyDBRecordListResponse:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "ChonkyDBRecordListResponse":
+        """Parse a record-list response payload into the typed model."""
+
         raw = _copy_raw_payload(payload)  # AUDIT-FIX(#8)
         raw_payloads = raw.get("payloads", ())
         if isinstance(raw_payloads, (str, bytes, bytearray)) or isinstance(raw_payloads, Mapping) or not isinstance(raw_payloads, Iterable):

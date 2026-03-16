@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
@@ -118,6 +119,40 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
+    def test_provider_context_raises_when_required_remote_long_term_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(
+                config=TwinrConfig(
+                    project_root=temp_dir,
+                    long_term_memory_enabled=True,
+                    long_term_memory_mode="remote_primary",
+                    long_term_memory_remote_required=True,
+                    long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                    runtime_state_path=str(Path(temp_dir) / "state" / "runtime-state.json"),
+                )
+            )
+            try:
+                runtime.memory.remember("user", "Letzte Frage")
+                runtime.last_transcript = "Was haben wir heute besprochen?"
+
+                class _UnavailableLongTermMemory:
+                    def build_provider_context(self, query_text):
+                        raise LongTermRemoteUnavailableError("remote unavailable")
+
+                    def build_tool_provider_context(self, query_text):
+                        raise LongTermRemoteUnavailableError("remote unavailable")
+
+                runtime.long_term_memory = _UnavailableLongTermMemory()
+
+                with self.assertRaises(LongTermRemoteUnavailableError):
+                    runtime.provider_conversation_context()
+                with self.assertRaises(LongTermRemoteUnavailableError):
+                    runtime.tool_provider_conversation_context()
+                with self.assertRaises(LongTermRemoteUnavailableError):
+                    runtime.first_word_provider_conversation_context()
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
     def test_first_word_context_includes_one_relevant_memory_message(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = TwinrRuntime(config=self._config(temp_dir))
@@ -170,6 +205,69 @@ class RuntimeContextTests(unittest.TestCase):
                 self.assertEqual(runtime.status.value, "waiting")
             finally:
                 runtime.shutdown(timeout_s=1.0)
+
+    def test_runtime_startup_enters_error_when_required_remote_bootstrap_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                runtime_state_path=str(Path(temp_dir) / "state" / "runtime-state.json"),
+            )
+
+            class _FailingLongTermMemory:
+                def ensure_remote_ready(self):
+                    raise LongTermRemoteUnavailableError("remote unavailable at startup")
+
+                def remote_required(self):
+                    return True
+
+                def remote_status(self):
+                    raise AssertionError("startup error path should use ensure_remote_ready")
+
+                def shutdown(self, *, timeout_s: float = 0.0):
+                    return None
+
+                def close(self):
+                    return None
+
+            with patch(
+                "twinr.agent.base_agent.runtime.base.LongTermMemoryService.from_config",
+                return_value=_FailingLongTermMemory(),
+            ):
+                runtime = TwinrRuntime(config=config)
+            try:
+                self.assertEqual(runtime.status.value, "error")
+                snapshot = RuntimeSnapshotStore(config.runtime_state_path).load()
+                self.assertEqual(snapshot.status, "error")
+                self.assertEqual(snapshot.error_message, "remote unavailable at startup")
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_check_required_remote_dependency_uses_deep_ready_check(self) -> None:
+        runtime = TwinrRuntime.__new__(TwinrRuntime)
+        runtime.config = TwinrConfig(
+            long_term_memory_enabled=True,
+            long_term_memory_mode="remote_primary",
+            long_term_memory_remote_required=True,
+        )
+
+        class _FalsePositiveRemote:
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                raise LongTermRemoteUnavailableError("archive shard unavailable")
+
+            def remote_status(self):
+                return SimpleNamespace(ready=True, detail=None)
+
+        runtime.long_term_memory = _FalsePositiveRemote()
+
+        with self.assertRaises(LongTermRemoteUnavailableError):
+            runtime.check_required_remote_dependency()
 
 
 if __name__ == "__main__":

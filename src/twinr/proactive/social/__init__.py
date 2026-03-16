@@ -1,3 +1,10 @@
+"""Expose proactive social-trigger models, providers, and review helpers.
+
+Import from ``twinr.proactive.social`` or the package root
+``twinr.proactive`` when wiring trigger scoring, prompt routing, or vision
+review into Twinr runtime workflows.
+"""
+
 from twinr.proactive.social.engine import (
     SocialAudioObservation,
     SocialBodyPose,

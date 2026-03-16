@@ -1,3 +1,10 @@
+"""Resolve user-facing long-term memory conflicts at slot scope.
+
+This module expands stored conflict records into concrete choice queues and
+applies a user's selection by promoting the chosen memory and retiring the
+losing slot alternatives.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -44,6 +51,13 @@ def _dedupe_ids(*memory_ids: str) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class LongTermConflictResolver:
+    """Coordinate queue building and user-driven conflict resolution.
+
+    Attributes:
+        user_confirmed_confidence_floor: Minimum confidence applied to a
+            memory once the user explicitly confirms it.
+    """
+
     user_confirmed_confidence_floor: float = 0.99
 
     def __post_init__(self) -> None:
@@ -57,6 +71,21 @@ class LongTermConflictResolver:
         conflicts: tuple[LongTermMemoryConflictV1, ...],
         objects: tuple[LongTermMemoryObjectV1, ...],
     ) -> tuple[LongTermConflictQueueItemV1, ...]:
+        """Build concrete queue items for the current open conflicts.
+
+        Args:
+            conflicts: Stored conflict records that still need resolution.
+            objects: Current memory objects available as conflict options.
+
+        Returns:
+            Queue items containing a slot-scoped clarification question and
+            the concrete live options the user can choose from.
+
+        Raises:
+            ValueError: If duplicate memory IDs make the object snapshot
+                ambiguous.
+        """
+
         # AUDIT-FIX(#3): Validate memory_id uniqueness before any conflict processing.
         object_map = self._build_object_map(objects)
         queue: list[LongTermConflictQueueItemV1] = []
@@ -109,6 +138,26 @@ class LongTermConflictResolver:
         selected_memory_id: str,
         now: datetime | None = None,
     ) -> LongTermConflictResolutionV1:
+        """Apply a user selection to one slot conflict.
+
+        Args:
+            conflict: Conflict being resolved.
+            objects: Current object snapshot containing all conflict options.
+            remaining_conflicts: All currently stored conflicts.
+            selected_memory_id: Memory ID chosen by the user.
+            now: Optional resolution timestamp. Defaults to the current UTC
+                time when omitted.
+
+        Returns:
+            A resolution result containing updated objects for the slot and
+            the remaining unresolved conflicts.
+
+        Raises:
+            ValueError: If the object snapshot is ambiguous, the conflict
+                references invalid options, or the selected ID is not part of
+                the slot choice set.
+        """
+
         # AUDIT-FIX(#3): Validate memory_id uniqueness before resolving against a possibly corrupted snapshot.
         object_map = self._build_object_map(objects)
         # AUDIT-FIX(#1): Use the same live-option expansion in queueing and resolution.

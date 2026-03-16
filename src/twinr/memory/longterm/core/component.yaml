@@ -1,0 +1,90 @@
+schema_version: 1
+name: core
+path: src/twinr/memory/longterm/core
+kind: python-package
+visibility: internal
+summary: Define the canonical long-term memory schemas and taxonomy normalization helpers shared across Twinr ingestion, reasoning, retrieval, storage, and evaluation code.
+owned_concerns:
+  - Define immutable versioned long-term memory dataclasses and schema constants
+  - Normalize memory kinds, domains, and sensitivity labels into canonical forms
+  - Serialize and validate shared long-term memory payloads at module boundaries
+out_of_scope:
+  - Memory extraction, consolidation, retrieval, or runtime orchestration logic
+  - Store implementations, background writers, or persistence side effects
+  - Evaluation harnesses and benchmark case definitions
+files:
+  - path: __init__.py
+    role: Package marker and local summary
+  - path: models.py
+    role: Canonical versioned long-term memory schemas
+    exports:
+      - LongTermConversationTurn
+      - LongTermEnqueueResult
+      - LongTermMultimodalEvidence
+      - LongTermMemoryContext
+      - LongTermSourceRefV1
+      - LongTermGraphEdgeCandidateV1
+      - LongTermMemoryObjectV1
+      - LongTermMemoryConflictV1
+      - LongTermTurnExtractionV1
+      - LongTermConsolidationResultV1
+      - LongTermReflectionResultV1
+      - LongTermMidtermPacketV1
+      - LongTermProactiveCandidateV1
+      - LongTermProactivePlanV1
+      - LongTermRetentionResultV1
+      - LongTermConflictOptionV1
+      - LongTermConflictQueueItemV1
+      - LongTermConflictResolutionV1
+      - LongTermMemoryReviewItemV1
+      - LongTermMemoryReviewResultV1
+      - LongTermMemoryMutationResultV1
+  - path: ontology.py
+    role: Memory kind and sensitivity normalization helpers
+    exports:
+      - LONGTERM_GENERIC_KINDS
+      - LONGTERM_MEMORY_SENSITIVITIES
+      - normalize_memory_kind
+      - normalize_memory_sensitivity
+      - memory_kind_prefix
+      - kind_matches
+      - is_durable_kind
+      - is_episodic_kind
+      - is_thread_summary
+compatibility_reexports:
+  - path: src/twinr/memory/longterm/__init__.py
+    names:
+      - LongTermConversationTurn
+      - LongTermEnqueueResult
+      - LongTermMultimodalEvidence
+      - LongTermMemoryContext
+      - LongTermSourceRefV1
+      - LongTermGraphEdgeCandidateV1
+      - LongTermMemoryObjectV1
+      - LongTermMemoryConflictV1
+      - LongTermTurnExtractionV1
+      - LongTermConsolidationResultV1
+      - LongTermReflectionResultV1
+      - LongTermMidtermPacketV1
+      - LongTermProactiveCandidateV1
+      - LongTermProactivePlanV1
+      - LongTermRetentionResultV1
+      - LongTermConflictOptionV1
+      - LongTermConflictQueueItemV1
+      - LongTermConflictResolutionV1
+      - LongTermMemoryReviewItemV1
+      - LongTermMemoryReviewResultV1
+      - LongTermMemoryMutationResultV1
+primary_callers:
+  - path: src/twinr/memory/longterm/runtime/service.py
+  - path: src/twinr/memory/longterm/storage/store.py
+  - path: src/twinr/memory/longterm/reasoning/consolidator.py
+  - path: src/twinr/memory/longterm/retrieval/retriever.py
+  - path: src/twinr/memory/longterm/__init__.py
+tests:
+  - path: test/test_longterm_store.py
+  - path: test/test_longterm_consolidator.py
+  - path: test/test_longterm_conflicts.py
+  - path: test/test_longterm_retention.py
+  - path: test/test_runtime_context.py
+  - path: test/test_longterm_worker.py

@@ -1,3 +1,10 @@
+"""Capture bounded still photos from V4L2 cameras.
+
+This module wraps ``ffmpeg`` for Twinr's camera use cases, normalizes failures
+into user-safe exceptions, and optionally confines persisted photos to an
+allowed output tree.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,25 +27,35 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 class CameraError(RuntimeError):  # AUDIT-FIX(#6): Use structured camera exceptions so callers can recover differently from config, timeout, and capture failures.
+    """Represent a camera failure that is safe to surface upstream."""
+
     def __init__(self, message: str, *, user_safe_message: str | None = None) -> None:
         super().__init__(message)
         self.user_safe_message = user_safe_message or "The camera is currently unavailable. Please try again."
 
 
 class CameraConfigurationError(CameraError):
+    """Represent invalid local camera configuration or missing dependencies."""
+
     pass
 
 
 class CameraCaptureTimeoutError(CameraError):
+    """Represent a still capture that exceeded the configured timeout."""
+
     pass
 
 
 class CameraCaptureFailedError(CameraError):
+    """Represent a capture failure after the camera process started."""
+
     pass
 
 
 @dataclass(frozen=True, slots=True)
 class CapturedPhoto:
+    """Represent one captured still image and its provenance metadata."""
+
     data: bytes
     content_type: str
     filename: str
@@ -47,6 +64,8 @@ class CapturedPhoto:
 
 
 class V4L2StillCamera:
+    """Capture one still frame from a V4L2 device via ``ffmpeg``."""
+
     _device_locks: ClassVar[dict[str, threading.Lock]] = {}  # AUDIT-FIX(#2): Serialize access per device across all instances in this process to avoid V4L2 EBUSY races.
     _device_locks_guard: ClassVar[threading.Lock] = threading.Lock()  # AUDIT-FIX(#2): Protect lock creation so concurrent constructors do not race and create duplicate locks.
 
@@ -76,6 +95,8 @@ class V4L2StillCamera:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "V4L2StillCamera":
+        """Build a still camera from ``TwinrConfig`` values."""
+
         return cls(
             device=config.camera_device,
             width=config.camera_width,
@@ -95,6 +116,8 @@ class V4L2StillCamera:
         output_path: str | Path | None = None,
         filename: str = _DEFAULT_CAPTURE_FILENAME,
     ) -> CapturedPhoto:
+        """Capture one still photo without blocking the caller's event loop."""
+
         return await asyncio.to_thread(self.capture_photo, output_path=output_path, filename=filename)  # AUDIT-FIX(#5): Provide a non-blocking entrypoint for the single-process async stack.
 
     def capture_photo(
@@ -103,6 +126,24 @@ class V4L2StillCamera:
         output_path: str | Path | None = None,
         filename: str = _DEFAULT_CAPTURE_FILENAME,
     ) -> CapturedPhoto:
+        """Capture one still photo and optionally persist it to disk.
+
+        Args:
+            output_path: Optional file or directory path for persisting the
+                captured image.
+            filename: Returned filename, sanitized before reuse on disk.
+
+        Returns:
+            The captured PNG image and its source metadata.
+
+        Raises:
+            CameraConfigurationError: If ``ffmpeg`` is unavailable or the
+                configured paths are invalid.
+            CameraCaptureTimeoutError: If the device does not respond before the
+                configured timeout.
+            CameraCaptureFailedError: If capture or persistence fails.
+        """
+
         safe_filename = self._sanitize_filename(filename)  # AUDIT-FIX(#7): Strip path/control characters from returned filenames.
         ffmpeg_binary = shutil.which(self.ffmpeg_path)
         if ffmpeg_binary is None:

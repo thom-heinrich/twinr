@@ -1,3 +1,10 @@
+"""Persist and render Twinr reminders and timers.
+
+This module owns the file-backed reminder store used by runtime, prompt
+assembly, automations, and the web dashboard. It keeps reminder state bounded,
+timezone-aware, and safe across concurrent writers.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
@@ -21,14 +28,20 @@ _PATH_LOCKS_GUARD = threading.Lock()
 
 
 class ReminderStoreError(RuntimeError):
+    """Raise when the reminder store cannot be read or written safely."""
+
     pass
 
 
 class ReminderStoreCorruptionError(ReminderStoreError):
+    """Raise when reminder-store contents are structurally invalid."""
+
     pass
 
 
 class ReminderStoreSecurityError(ReminderStoreError):
+    """Raise when the reminder-store path or file is not safe to use."""
+
     pass
 
 
@@ -76,6 +89,8 @@ def _path_lock_for(path: Path) -> threading.RLock:
 
 
 def resolve_timezone(timezone_name: str | None) -> ZoneInfo:
+    """Resolve Twinr's configured timezone with a safe UTC fallback."""
+
     try:
         return ZoneInfo((timezone_name or "").strip() or "Europe/Berlin")
     except Exception:
@@ -111,10 +126,26 @@ def _coerce_datetime(value: datetime, *, timezone_name: str | None, field_name: 
 
 
 def now_in_timezone(timezone_name: str | None) -> datetime:
+    """Return the current aware datetime in the configured timezone."""
+
     return datetime.now(resolve_timezone(timezone_name))
 
 
 def parse_due_at(value: str, *, timezone_name: str | None) -> datetime:
+    """Parse one reminder due timestamp into the configured timezone.
+
+    Args:
+        value: ISO 8601 datetime text. Naive values are interpreted in the
+            configured timezone after DST validation.
+        timezone_name: Target timezone used for normalization.
+
+    Returns:
+        An aware ``datetime`` localized to the configured timezone.
+
+    Raises:
+        ValueError: If ``value`` is empty or not a valid ISO 8601 datetime.
+    """
+
     normalized = str(value or "").strip()
     if not normalized:
         raise ValueError("due_at must not be empty")
@@ -133,6 +164,8 @@ def parse_due_at(value: str, *, timezone_name: str | None) -> datetime:
 
 
 def format_due_label(value: datetime, *, timezone_name: str | None) -> str:
+    """Format one due timestamp for user-facing reminder context."""
+
     # AUDIT-FIX(#8): Accept only normalized aware timestamps for rendering to avoid hidden local-time drift.
     localized = _coerce_datetime(value, timezone_name=timezone_name, field_name="due_at")
     return localized.strftime("%A, %d.%m.%Y %H:%M")
@@ -140,6 +173,25 @@ def format_due_label(value: datetime, *, timezone_name: str | None) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ReminderEntry:
+    """Store one reminder or timer entry.
+
+    Attributes:
+        reminder_id: Stable identifier for updates and delivery tracking.
+        kind: Normalized reminder category such as ``reminder`` or ``timer``.
+        summary: Short user-facing reminder text.
+        due_at: Aware due timestamp in the configured timezone.
+        details: Optional extra detail shown in prompt context or UI.
+        created_at: Creation timestamp for persistence and ordering.
+        updated_at: Last mutation timestamp.
+        source: Provenance label for the entry.
+        original_request: Optional original user request text.
+        delivery_attempts: Number of delivery reservations attempted so far.
+        last_attempted_at: Timestamp of the latest delivery attempt.
+        next_attempt_at: Earliest time the reminder may be retried.
+        delivered_at: Timestamp when the reminder was confirmed delivered.
+        last_error: Last bounded delivery error message, if any.
+    """
+
     reminder_id: str
     kind: str
     summary: str
@@ -158,10 +210,25 @@ class ReminderEntry:
 
     @property
     def delivered(self) -> bool:
+        """Return whether this reminder has already been delivered."""
+
         return self.delivered_at is not None
 
 
 class ReminderStore:
+    """Manage Twinr's file-backed reminder and timer state.
+
+    The store keeps reminder entries bounded, serializes concurrent access with
+    thread and file locks, and renders short reminder context for prompt
+    assembly and dashboard consumers.
+
+    Args:
+        path: JSON file used for persisted reminder state.
+        timezone_name: Timezone used for parsing, ordering, and rendering.
+        retry_delay_s: Delay applied after failed delivery attempts.
+        max_entries: Maximum number of entries retained in the store.
+    """
+
     def __init__(
         self,
         path: str | Path,
@@ -185,6 +252,8 @@ class ReminderStore:
         self.max_entries = _safe_int(max_entries, default=48, minimum=8)
 
     def load_entries(self) -> tuple[ReminderEntry, ...]:
+        """Load all persisted reminder entries in normalized order."""
+
         with self._locked_store():
             return self._load_entries_locked()
 
@@ -198,6 +267,24 @@ class ReminderStore:
         source: str = "tool",
         original_request: str | None = None,
     ) -> ReminderEntry:
+        """Create or update one pending reminder entry.
+
+        Args:
+            due_at: ISO 8601 due timestamp.
+            summary: Short reminder text.
+            details: Optional longer reminder detail.
+            kind: Reminder category label.
+            source: Provenance label for the reminder request.
+            original_request: Optional original user request text.
+
+        Returns:
+            The created or updated ``ReminderEntry``.
+
+        Raises:
+            ValueError: If the summary is empty or the due timestamp is invalid
+                or already in the past.
+        """
+
         clean_summary = _normalize_text(summary, limit=220)
         clean_details = _normalize_text(details, limit=420) or None
         clean_kind = _slugify(kind, fallback="reminder")
@@ -252,6 +339,16 @@ class ReminderStore:
             return entry
 
     def reserve_due(self, *, now: datetime | None = None, limit: int = 1) -> tuple[ReminderEntry, ...]:
+        """Reserve due reminders for one delivery attempt.
+
+        Args:
+            now: Current time override used for tests or controlled delivery.
+            limit: Maximum number of reminders to reserve.
+
+        Returns:
+            A tuple of due reminders with delivery-attempt metadata updated.
+        """
+
         # AUDIT-FIX(#10): Respect zero and negative limits instead of silently reserving one reminder.
         effective_limit = _safe_int(limit, default=1, minimum=0)
         if effective_limit == 0:
@@ -290,6 +387,8 @@ class ReminderStore:
             return tuple(selected)
 
     def peek_due(self, *, now: datetime | None = None, limit: int = 1) -> tuple[ReminderEntry, ...]:
+        """Return due reminders without mutating delivery state."""
+
         # AUDIT-FIX(#10): Respect zero and negative limits instead of silently returning one reminder.
         effective_limit = _safe_int(limit, default=1, minimum=0)
         if effective_limit == 0:
@@ -314,6 +413,19 @@ class ReminderStore:
         return tuple(selected)
 
     def mark_delivered(self, reminder_id: str, *, delivered_at: datetime | None = None) -> ReminderEntry:
+        """Mark one reminder as successfully delivered.
+
+        Args:
+            reminder_id: Reminder identifier to update.
+            delivered_at: Delivery timestamp override.
+
+        Returns:
+            The updated ``ReminderEntry``.
+
+        Raises:
+            KeyError: If ``reminder_id`` is unknown.
+        """
+
         current_time = _coerce_datetime(
             delivered_at or now_in_timezone(self.timezone_name),
             timezone_name=self.timezone_name,
@@ -343,6 +455,20 @@ class ReminderStore:
         error: str,
         failed_at: datetime | None = None,
     ) -> ReminderEntry:
+        """Record one failed reminder delivery attempt.
+
+        Args:
+            reminder_id: Reminder identifier to update.
+            error: Short bounded delivery error message.
+            failed_at: Failure timestamp override.
+
+        Returns:
+            The updated ``ReminderEntry``.
+
+        Raises:
+            KeyError: If ``reminder_id`` is unknown.
+        """
+
         current_time = _coerce_datetime(
             failed_at or now_in_timezone(self.timezone_name),
             timezone_name=self.timezone_name,
@@ -365,6 +491,18 @@ class ReminderStore:
         raise KeyError(f"Unknown reminder_id: {reminder_id}")
 
     def delete(self, reminder_id: str) -> ReminderEntry:
+        """Delete one reminder entry by identifier.
+
+        Args:
+            reminder_id: Reminder identifier to remove.
+
+        Returns:
+            The removed ``ReminderEntry``.
+
+        Raises:
+            KeyError: If ``reminder_id`` is unknown.
+        """
+
         with self._locked_store():
             entries = list(self._load_entries_locked())
             for index, entry in enumerate(entries):
@@ -376,6 +514,16 @@ class ReminderStore:
         raise KeyError(f"Unknown reminder_id: {reminder_id}")
 
     def render_context(self, *, limit: int = 8) -> str | None:
+        """Render pending reminders into prompt-context text.
+
+        Args:
+            limit: Maximum number of pending reminders to include.
+
+        Returns:
+            A short reminder summary block, or ``None`` when nothing is
+            pending.
+        """
+
         effective_limit = _safe_int(limit, default=8, minimum=1)
         with self._locked_store():
             pending = [entry for entry in self._load_entries_locked() if not entry.delivered]

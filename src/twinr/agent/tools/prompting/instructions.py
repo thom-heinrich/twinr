@@ -62,6 +62,9 @@ DEFAULT_TOOL_AGENT_INSTRUCTIONS = (
     "When updating an existing sensor automation, you may replace its trigger kind, hold_seconds, delivery, and content in one update. "
     "If the user wants an existing automation to switch from one supported trigger type to another, treat that as a normal update_sensor_automation change, not as an impossible combined trigger request. "
     "When changing an existing automation and the user did not give new wording, keep the current wording instead of asking for replacement text. "
+    "If the user wants Twinr to learn a new repeatable behavior that the current tool surface cannot already fulfill, use propose_skill_learning instead of pretending it already exists. "
+    "After Twinr has started that learning flow and the user answers one of the short follow-up questions, use answer_skill_question to continue the structured requirements dialogue. "
+    "Do not claim that Twinr can learn or has learned the skill unless the self-coding tool result explicitly says so. "
     "If the user explicitly asks you to remember or update a contact with a phone number, email, relation, or role, use the remember_contact tool. "
     "If the user asks for the phone number, email, or contact details of a remembered person, use the lookup_contact tool. "
     "If the user asks what saved detail is ambiguous, what Twinr is unsure about, or which conflicting memory options exist, use the get_memory_conflicts tool. "
@@ -100,6 +103,7 @@ COMPACT_TOOL_AGENT_INSTRUCTIONS = (
     "For exact saved contact details, exact open memory conflicts, or the current automation list, call the explicit lookup or list tool first instead of answering from hidden context summaries. "
     "When updating an existing sensor automation, you may replace its trigger kind, hold_seconds, delivery, and content in one update. "
     "If the user did not give new wording for an existing automation, keep its current wording. "
+    "Use propose_skill_learning for genuinely new repeatable skills, and use answer_skill_question only to continue an active self-coding question flow. "
     "Use remember_memory, remember_contact, remember_preference, remember_plan, update_user_profile, and update_personality only after an explicit user request to remember or change something for future turns. "
     "Semantic memory/profile fields should be canonical English, but names, phone numbers, email addresses, IDs, codes, and direct quotes stay verbatim. "
     "Use update_simple_setting when the user explicitly asks to remember more or less, change your voice, or speak slower or faster. "
@@ -149,6 +153,15 @@ SPECIALIST_TOOL_AGENT_INSTRUCTIONS = (
 )
 
 def tool_agent_time_context(config: TwinrConfig) -> str:
+    """Build the current local time anchor for tool-capable prompt bundles.
+
+    Args:
+        config: Runtime config supplying the preferred local timezone name.
+
+    Returns:
+        One sentence that tells reminder and automation tools which local date
+        and time they should resolve relative expressions against.
+    """
     try:
         zone = ZoneInfo(config.local_timezone_name)
         timezone_name = config.local_timezone_name
@@ -167,6 +180,17 @@ def build_tool_agent_instructions(
     *,
     extra_instructions: str | None = None,
 ) -> str:
+    """Merge the default tool-lane instructions with live runtime context.
+
+    Args:
+        config: Runtime config supplying timezone and settings context.
+        extra_instructions: Optional caller-specific prompt text appended after
+            the canonical bundle.
+
+    Returns:
+        The merged instruction bundle, or the canonical default instructions if
+        merging yields an empty string.
+    """
     return (
         merge_instructions(
             DEFAULT_TOOL_AGENT_INSTRUCTIONS,
@@ -183,6 +207,17 @@ def build_compact_tool_agent_instructions(
     *,
     extra_instructions: str | None = None,
 ) -> str:
+    """Merge the compact tool-lane instructions with live time context.
+
+    Args:
+        config: Runtime config supplying the preferred local timezone.
+        extra_instructions: Optional caller-specific prompt text appended after
+            the compact base bundle.
+
+    Returns:
+        The merged compact instruction bundle, or the canonical compact
+        instructions if merging yields an empty string.
+    """
     return (
         merge_instructions(
             COMPACT_TOOL_AGENT_INSTRUCTIONS,
@@ -198,6 +233,17 @@ def build_supervisor_tool_agent_instructions(
     *,
     extra_instructions: str | None = None,
 ) -> str:
+    """Merge the supervisor tool prompt with live time context.
+
+    Args:
+        config: Runtime config supplying the preferred local timezone.
+        extra_instructions: Optional caller-specific prompt text appended after
+            the canonical supervisor instructions.
+
+    Returns:
+        The merged supervisor prompt bundle, or the canonical supervisor
+        instructions if merging yields an empty string.
+    """
     return (
         merge_instructions(
             SUPERVISOR_TOOL_AGENT_INSTRUCTIONS,
@@ -213,6 +259,17 @@ def build_supervisor_decision_instructions(
     *,
     extra_instructions: str | None = None,
 ) -> str:
+    """Merge the supervisor decision prompt with live time context.
+
+    Args:
+        config: Runtime config supplying the preferred local timezone.
+        extra_instructions: Optional caller-specific prompt text appended after
+            the canonical decision instructions.
+
+    Returns:
+        The merged decision prompt bundle, or the canonical decision
+        instructions if merging yields an empty string.
+    """
     return (
         merge_instructions(
             SUPERVISOR_DECISION_AGENT_INSTRUCTIONS,
@@ -228,6 +285,17 @@ def build_first_word_instructions(
     *,
     extra_instructions: str | None = None,
 ) -> str:
+    """Merge the first-word prompt with live time context.
+
+    Args:
+        config: Runtime config supplying the preferred local timezone.
+        extra_instructions: Optional caller-specific prompt text appended after
+            the canonical first-word instructions.
+
+    Returns:
+        The merged first-word prompt bundle, or the canonical first-word
+        instructions if merging yields an empty string.
+    """
     return (
         merge_instructions(
             FIRST_WORD_AGENT_INSTRUCTIONS,
@@ -243,6 +311,17 @@ def build_specialist_tool_agent_instructions(
     *,
     extra_instructions: str | None = None,
 ) -> str:
+    """Merge the specialist prompt with default tool and runtime context.
+
+    Args:
+        config: Runtime config supplying timezone and settings context.
+        extra_instructions: Optional caller-specific prompt text appended after
+            the canonical specialist bundle.
+
+    Returns:
+        The merged specialist prompt bundle, or the canonical default tool
+        instructions if merging yields an empty string.
+    """
     return (
         merge_instructions(
             DEFAULT_TOOL_AGENT_INSTRUCTIONS,

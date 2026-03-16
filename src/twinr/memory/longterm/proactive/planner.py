@@ -1,3 +1,11 @@
+"""Rank proactive memory candidates from stored objects and live facts.
+
+This module turns active long-term memory objects plus optional live sensor
+facts into a bounded ``LongTermProactivePlanV1`` for the runtime. Import
+``LongTermProactivePlanner`` from ``twinr.memory.longterm.proactive`` or
+``twinr.memory.longterm``.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
@@ -193,6 +201,19 @@ def _has_concerning_body_pose(live_facts: Mapping[str, object] | None) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class LongTermProactivePlanner:
+    """Rank bounded proactive candidates for the long-term memory runtime.
+
+    The planner combines durable same-day events, next-day reminders, thread
+    summaries, and sensor-routine memories into a deduplicated candidate list.
+    Live sensor facts are optional, but routine offers only surface when the
+    current context confirms that the suggestion fits.
+
+    Attributes:
+        timezone_name: IANA timezone used to derive today, tomorrow, and
+            current dayparts.
+        max_candidates: Maximum number of ranked candidates returned per plan.
+    """
+
     timezone_name: str = _DEFAULT_TIMEZONE_NAME
     max_candidates: int = _DEFAULT_MAX_CANDIDATES
 
@@ -203,6 +224,22 @@ class LongTermProactivePlanner:
         now: datetime | None = None,
         live_facts: Mapping[str, object] | None = None,
     ) -> LongTermProactivePlanV1:
+        """Build a bounded proactive plan for the current runtime context.
+
+        Args:
+            objects: Canonical or canonicalizable long-term memory objects to
+                inspect.
+            now: Reference time for day-sensitive planning. Defaults to the
+                current time in ``timezone_name``.
+            live_facts: Optional live sensor snapshot used for routine
+                check-ins, camera offers, and print offers.
+
+        Returns:
+            A ``LongTermProactivePlanV1`` ordered by descending confidence and
+            candidate stability. Malformed objects are skipped instead of
+            aborting the full plan.
+        """
+
         # AUDIT-FIX(#3): Derive all calendar buckets from a timezone-normalized reference instant.
         reference = _coerce_reference_datetime(now, timezone_name=self.timezone_name)
         today = reference.date().isoformat()

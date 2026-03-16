@@ -1,3 +1,10 @@
+"""Run deterministic multimodal long-term memory evaluations.
+
+The module seeds sensor-like evidence plus episodic turns, queries the regular
+retrieval stack, and snapshots the resulting workspace so multimodal failures
+can be inspected after the temporary run directory is cleaned up.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -31,6 +38,8 @@ _FALLBACK_TIMEZONE_NAME = "Europe/Berlin"
 
 @dataclass(frozen=True, slots=True)
 class MultimodalEvalCase:
+    """Describe one multimodal retrieval evaluation case."""
+
     case_id: str
     category: str
     query_text: str
@@ -45,6 +54,8 @@ class MultimodalEvalCase:
 
 @dataclass(frozen=True, slots=True)
 class MultimodalEvalCaseResult:
+    """Capture the outcome of one multimodal retrieval case."""
+
     case_id: str
     category: str
     passed: bool
@@ -59,6 +70,8 @@ class MultimodalEvalCaseResult:
 
 @dataclass(frozen=True, slots=True)
 class MultimodalEvalSeedStats:
+    """Count seeded multimodal and episodic fixtures for the eval run."""
+
     multimodal_events: int
     episodic_turns: int
     consolidated_object_count: int
@@ -66,11 +79,15 @@ class MultimodalEvalSeedStats:
 
     @property
     def total_seed_entries(self) -> int:
+        """Return the total number of seeded entries across both channels."""
+
         return self.multimodal_events + self.episodic_turns
 
 
 @dataclass(frozen=True, slots=True)
 class MultimodalEvalSummary:
+    """Summarize aggregate pass/fail counts for the multimodal eval."""
+
     total_cases: int
     passed_cases: int
     category_case_counts: dict[str, int]
@@ -78,6 +95,8 @@ class MultimodalEvalSummary:
 
     @property
     def accuracy(self) -> float:
+        """Return the overall pass rate across all multimodal cases."""
+
         if self.total_cases <= 0:
             return 0.0
         return self.passed_cases / self.total_cases
@@ -85,6 +104,8 @@ class MultimodalEvalSummary:
 
 @dataclass(frozen=True, slots=True)
 class MultimodalEvalResult:
+    """Bundle multimodal eval stats, case results, and artifact paths."""
+
     seed_stats: MultimodalEvalSeedStats
     summary: MultimodalEvalSummary
     cases: tuple[MultimodalEvalCaseResult, ...]
@@ -95,6 +116,8 @@ class MultimodalEvalResult:
 
 @dataclass(frozen=True, slots=True)
 class _TargetEpisode:
+    """Hold one targeted episodic fixture used in multimodal recall checks."""
+
     transcript: str
     response: str
     occurred_at: datetime
@@ -102,9 +125,13 @@ class _TargetEpisode:
 
 @dataclass(slots=True)
 class _StaticQueryRewriter:
+    """Provide deterministic canonical rewrites for multimodal eval cases."""
+
     canonical_queries: Mapping[str, str]
 
     def profile(self, query_text: str | None) -> LongTermQueryProfile:
+        """Build a query profile with the pre-seeded canonical English text."""
+
         original = " ".join(str(query_text or "").split()).strip()
         return LongTermQueryProfile.from_text(
             original,
@@ -118,6 +145,21 @@ def run_multimodal_longterm_eval(
     case_target: int = _FIXED_CASE_TARGET,
     project_root: str | Path | None = None,
 ) -> MultimodalEvalResult:
+    """Run the fixed multimodal long-term memory evaluation.
+
+    Args:
+        seed_target: Expected number of seeded multimodal and episodic entries.
+            The current fixture set only supports the canonical fixed target.
+        case_target: Expected number of multimodal evaluation cases. The
+            current fixture set only supports the canonical fixed target.
+        project_root: Optional directory under which workspaces and persisted
+            artifact snapshots are created.
+
+    Returns:
+        A result bundle with seed counts, per-case outcomes, summary metrics,
+        and stable paths to the copied artifact workspace.
+    """
+
     if seed_target != _FIXED_SEED_TARGET:
         raise ValueError(
             f"seed_target is fixed to {_FIXED_SEED_TARGET} for the current multimodal eval."
@@ -146,6 +188,8 @@ def run_multimodal_longterm_eval(
 
 
 def _resolve_project_root(project_root: str | Path | None) -> Path | None:
+    """Normalize and create the optional base directory for artifacts."""
+
     if project_root is None:
         return None
 
@@ -159,6 +203,8 @@ def _resolve_project_root(project_root: str | Path | None) -> Path | None:
 
 
 def _path_has_existing_symlink_component(path: Path) -> bool:
+    """Return whether any existing component in a path is a symlink."""
+
     current = path
     while True:
         if current.is_symlink():
@@ -175,6 +221,8 @@ def _run_multimodal_longterm_eval_in_root(
     seed_target: int,
     case_target: int,
 ) -> MultimodalEvalResult:
+    """Run the multimodal evaluation inside an already-created workspace."""
+
     state_dir = workspace_root / "state"
     personality_dir = workspace_root / "personality"
     state_dir.mkdir(parents=True, exist_ok=True)  # AUDIT-FIX(#2): Ensure file-backed state parents exist before store/service initialization.
@@ -255,6 +303,8 @@ def _snapshot_eval_result(
     result: MultimodalEvalResult,
     base_dir: Path | None,
 ) -> MultimodalEvalResult:
+    """Copy the transient workspace into a durable artifact snapshot."""
+
     snapshot_root = Path(
         mkdtemp(
             dir=str(base_dir) if base_dir is not None else None,
@@ -292,6 +342,8 @@ def _remap_snapshot_path(
     workspace_root: Path,
     snapshot_root: Path,
 ) -> str:
+    """Remap a workspace-local path into the copied snapshot tree."""
+
     original = Path(original_path)
     try:
         relative_path = original.resolve(strict=False).relative_to(workspace_root)
@@ -301,6 +353,8 @@ def _remap_snapshot_path(
 
 
 def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeedStats:
+    """Seed deterministic multimodal evidence and episodic turns."""
+
     timezone = _resolve_eval_timezone(service)
     total_multimodal = 0
     total_turns = 0
@@ -476,6 +530,8 @@ def _seed_multimodal_store(service: LongTermMemoryService) -> MultimodalEvalSeed
 
 
 def _resolve_eval_timezone(service: LongTermMemoryService) -> ZoneInfo:
+    """Resolve the timezone used for multimodal fixture timestamps."""
+
     timezone_name = getattr(service.config, "local_timezone_name", None) or _FALLBACK_TIMEZONE_NAME
     try:
         return ZoneInfo(timezone_name)
@@ -484,6 +540,8 @@ def _resolve_eval_timezone(service: LongTermMemoryService) -> ZoneInfo:
 
 
 def _count_loaded_items(items: object) -> int:
+    """Count objects loaded from stores that may return multiple container types."""
+
     try:
         return len(items)  # type: ignore[arg-type]
     except TypeError:
@@ -495,6 +553,8 @@ def _count_loaded_items(items: object) -> int:
 
 
 def _targeted_episodes(timezone: ZoneInfo) -> tuple[_TargetEpisode, ...]:
+    """Return the hand-authored episodic fixtures used in recall assertions."""
+
     return (
         _TargetEpisode(
             transcript="After breakfast I usually ask Twinr about the weather before I start my day.",
@@ -530,6 +590,8 @@ def _targeted_episodes(timezone: ZoneInfo) -> tuple[_TargetEpisode, ...]:
 
 
 def _build_multimodal_eval_cases() -> tuple[MultimodalEvalCase, ...]:
+    """Build the fixed set of multimodal retrieval cases."""
+
     cases: list[MultimodalEvalCase] = []
 
     for index in range(5):
@@ -657,6 +719,8 @@ def _build_multimodal_eval_cases() -> tuple[MultimodalEvalCase, ...]:
 
 
 def _persist_turn(service: LongTermMemoryService, item: LongTermConversationTurn) -> None:
+    """Persist one episodic turn fixture through the regular service boundary."""
+
     LongTermMemoryService._persist_longterm_turn(
         config=service.config,
         store=service.prompt_context_store,
@@ -673,6 +737,8 @@ def _persist_turn(service: LongTermMemoryService, item: LongTermConversationTurn
 
 
 def _persist_multimodal(service: LongTermMemoryService, item: LongTermMultimodalEvidence) -> None:
+    """Persist one multimodal evidence fixture through the regular service boundary."""
+
     LongTermMemoryService._persist_multimodal_evidence(
         object_store=service.object_store,
         midterm_store=service.midterm_store,
@@ -686,6 +752,8 @@ def _persist_multimodal(service: LongTermMemoryService, item: LongTermMultimodal
 
 
 def _run_case(service: LongTermMemoryService, case: MultimodalEvalCase) -> MultimodalEvalCaseResult:
+    """Execute one multimodal retrieval case against provider context building."""
+
     try:
         context = service.build_provider_context(case.query_text)
         if not isinstance(context, LongTermMemoryContext):
@@ -748,6 +816,8 @@ def _run_case(service: LongTermMemoryService, case: MultimodalEvalCase) -> Multi
 
 
 def _normalized_context_text(context: LongTermMemoryContext, attribute_name: str) -> str:
+    """Return a normalized context fragment for string-contains assertions."""
+
     raw_value = getattr(context, attribute_name, None)
     if raw_value is None:
         return ""
@@ -755,10 +825,14 @@ def _normalized_context_text(context: LongTermMemoryContext, attribute_name: str
 
 
 def _context_text_present(context: LongTermMemoryContext, attribute_name: str) -> bool:
+    """Return whether a named context fragment is non-empty after normalization."""
+
     return bool(_normalized_context_text(context, attribute_name))
 
 
 def _summarize(results: tuple[MultimodalEvalCaseResult, ...]) -> MultimodalEvalSummary:
+    """Aggregate per-case multimodal outcomes into summary counters."""
+
     category_case_counts: dict[str, int] = {}
     category_pass_counts: dict[str, int] = {}
     passed = 0
@@ -776,6 +850,8 @@ def _summarize(results: tuple[MultimodalEvalCaseResult, ...]) -> MultimodalEvalS
 
 
 def _result_to_payload(result: MultimodalEvalResult) -> dict[str, object]:
+    """Convert a multimodal result into the CLI JSON payload shape."""
+
     return {
         "seed_stats": {
             "multimodal_events": result.seed_stats.multimodal_events,
@@ -813,6 +889,8 @@ def _result_to_payload(result: MultimodalEvalResult) -> dict[str, object]:
 
 
 def _error_payload(exc: BaseException) -> dict[str, object]:
+    """Convert an exception into the CLI error payload shape."""
+
     return {
         "error": {
             "type": type(exc).__name__,
@@ -822,6 +900,8 @@ def _error_payload(exc: BaseException) -> dict[str, object]:
 
 
 def main() -> int:
+    """Run the multimodal evaluation CLI and print JSON output."""
+
     try:
         result = run_multimodal_longterm_eval()
     except Exception as exc:

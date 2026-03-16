@@ -1,0 +1,175 @@
+schema_version: 1
+name: wakeword
+path: src/twinr/proactive/wakeword
+kind: python-package
+visibility: internal
+summary: Provide wakeword matching, openWakeWord spotting, verification policy, calibration profiles, streaming detection, and offline evaluation helpers for proactive runtime.
+owned_concerns:
+  - Normalize wakeword transcripts, configured phrases, and detector labels
+  - Run local openWakeWord clip and frame spotting plus optional STT verification
+  - Persist and apply per-device wakeword calibration overrides
+  - Replay labeled captures for evaluation, operator labeling, and autotune recommendations
+  - Stream bounded PCM frames into wakeword detections for proactive runtime
+out_of_scope:
+  - Presence-session arming and proactive monitor orchestration in src/twinr/proactive/runtime
+  - Social trigger scoring or proactive governance policy
+  - Raw microphone capture implementations outside the wakeword streaming boundary
+  - Web/dashboard rendering of wakeword settings
+files:
+  - path: __init__.py
+    role: Package export surface for wakeword helpers
+    exports:
+      - DEFAULT_WAKEWORD_PHRASES
+      - OpenWakeWordPrediction
+      - OpenWakeWordStreamingMonitor
+      - SttWakewordVerifier
+      - WakewordAutotuneRecommendation
+      - WakewordCalibrationProfile
+      - WakewordCalibrationStore
+      - WakewordDecision
+      - WakewordDecisionPolicy
+      - WakewordEvalEntry
+      - WakewordEvalMetrics
+      - WakewordEvalReport
+      - WakewordMatch
+      - WakewordOpenWakeWordFrameSpotter
+      - WakewordOpenWakeWordSpotter
+      - WakewordPhraseSpotter
+      - WakewordStreamDetection
+      - WakewordVerification
+      - append_wakeword_capture_label
+      - apply_wakeword_calibration
+      - autotune_wakeword_profile
+      - load_eval_manifest
+      - load_labeled_ops_captures
+      - match_wakeword_transcript
+      - normalize_detector_label
+      - normalize_wakeword_backend
+      - normalize_wakeword_verifier_mode
+      - phrase_from_detector_label
+      - run_wakeword_eval
+      - wakeword_primary_prompt
+  - path: matching.py
+    role: Transcript normalization and phrase matching
+    exports:
+      - DEFAULT_WAKEWORD_PHRASES
+      - WakewordMatch
+      - WakewordPhraseSpotter
+      - match_wakeword_transcript
+      - normalize_detector_label
+      - phrase_from_detector_label
+      - wakeword_primary_prompt
+  - path: spotter.py
+    role: openWakeWord clip and frame spotters
+    exports:
+      - OpenWakeWordPrediction
+      - WakewordOpenWakeWordFrameSpotter
+      - WakewordOpenWakeWordSpotter
+  - path: policy.py
+    role: Detection decision policy and STT verification
+    exports:
+      - SttWakewordVerifier
+      - WakewordDecision
+      - WakewordDecisionPolicy
+      - WakewordVerification
+      - normalize_wakeword_backend
+      - normalize_wakeword_verifier_mode
+  - path: calibration.py
+    role: Calibration profile model and config application
+    exports:
+      - WakewordCalibrationProfile
+      - WakewordCalibrationStore
+      - apply_wakeword_calibration
+  - path: evaluation.py
+    role: Manifest replay, labeling, eval, and autotune helpers
+    exports:
+      - WakewordAutotuneRecommendation
+      - WakewordEvalEntry
+      - WakewordEvalMetrics
+      - WakewordEvalReport
+      - append_wakeword_capture_label
+      - autotune_wakeword_profile
+      - load_eval_manifest
+      - load_labeled_ops_captures
+      - run_wakeword_eval
+  - path: stream.py
+    role: Bounded arecord-based streaming monitor
+    exports:
+      - OpenWakeWordStreamingMonitor
+      - WakewordStreamDetection
+public_api:
+  module: twinr.proactive.wakeword
+  exports:
+    - DEFAULT_WAKEWORD_PHRASES
+    - OpenWakeWordPrediction
+    - OpenWakeWordStreamingMonitor
+    - SttWakewordVerifier
+    - WakewordAutotuneRecommendation
+    - WakewordCalibrationProfile
+    - WakewordCalibrationStore
+    - WakewordDecision
+    - WakewordDecisionPolicy
+    - WakewordEvalEntry
+    - WakewordEvalMetrics
+    - WakewordEvalReport
+    - WakewordMatch
+    - WakewordOpenWakeWordFrameSpotter
+    - WakewordOpenWakeWordSpotter
+    - WakewordPhraseSpotter
+    - WakewordStreamDetection
+    - WakewordVerification
+    - append_wakeword_capture_label
+    - apply_wakeword_calibration
+    - autotune_wakeword_profile
+    - load_eval_manifest
+    - load_labeled_ops_captures
+    - match_wakeword_transcript
+    - normalize_detector_label
+    - normalize_wakeword_backend
+    - normalize_wakeword_verifier_mode
+    - phrase_from_detector_label
+    - run_wakeword_eval
+    - wakeword_primary_prompt
+compatibility_reexports:
+  - path: src/twinr/proactive/__init__.py
+    names:
+      - DEFAULT_WAKEWORD_PHRASES
+      - OpenWakeWordPrediction
+      - OpenWakeWordStreamingMonitor
+      - SttWakewordVerifier
+      - WakewordAutotuneRecommendation
+      - WakewordCalibrationProfile
+      - WakewordCalibrationStore
+      - WakewordDecision
+      - WakewordDecisionPolicy
+      - WakewordEvalEntry
+      - WakewordEvalMetrics
+      - WakewordEvalReport
+      - WakewordMatch
+      - WakewordOpenWakeWordFrameSpotter
+      - WakewordOpenWakeWordSpotter
+      - WakewordPhraseSpotter
+      - WakewordStreamDetection
+      - WakewordVerification
+      - append_wakeword_capture_label
+      - apply_wakeword_calibration
+      - autotune_wakeword_profile
+      - load_eval_manifest
+      - load_labeled_ops_captures
+      - match_wakeword_transcript
+      - normalize_detector_label
+      - normalize_wakeword_backend
+      - normalize_wakeword_verifier_mode
+      - phrase_from_detector_label
+      - run_wakeword_eval
+      - wakeword_primary_prompt
+primary_callers:
+  - path: src/twinr/proactive/runtime/service.py
+  - path: src/twinr/__main__.py
+  - path: src/twinr/proactive/__init__.py
+tests:
+  - path: test/test_wakeword.py
+  - path: test/test_wakeword_policy.py
+  - path: test/test_wakeword_eval.py
+  - path: test/test_proactive_monitor.py
+  - path: test/test_main.py

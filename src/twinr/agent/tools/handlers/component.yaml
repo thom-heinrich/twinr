@@ -3,12 +3,13 @@ name: handlers
 path: src/twinr/agent/tools/handlers
 kind: python-package
 visibility: internal
-summary: Concrete realtime tool handlers and shared guard helpers for automation, memory, reminder, output, settings, and voice-profile tool calls.
+summary: Concrete realtime tool handlers and shared guard helpers for automation, memory, reminder, output, self-coding, settings, and voice-profile tool calls.
 owned_concerns:
   - Validate and normalize tool-call payloads at the handler boundary
   - Translate tool requests into bounded runtime reads and mutations
   - Keep handler-local telemetry, audit events, and follow-up side effects best-effort
   - Share live-audio, sensitive-action confirmation, and primitive coercion helpers across handler families
+  - Bridge the self-coding front-stage learning flow into deterministic ASE modules
 out_of_scope:
   - Tool registry, binding, schemas, or prompt instruction assembly
   - Runtime, store, provider, backend, or web-dashboard implementations
@@ -50,6 +51,11 @@ files:
     role: Reminder scheduling handler
     exports:
       - handle_schedule_reminder
+  - path: self_coding.py
+    role: Self-coding feasibility and requirements-dialogue handlers
+    exports:
+      - handle_propose_skill_learning
+      - handle_answer_skill_question
   - path: settings.py
     role: Bounded simple-setting mutation handler
     exports:
@@ -80,6 +86,7 @@ primary_callers:
   - path: src/twinr/__main__.py
 tests:
   - path: test/test_realtime_runner.py
+  - path: test/test_self_coding_dialogue.py
   - path: test/test_openai_realtime.py
   - path: test/test_automations.py
   - path: test/test_reminders.py

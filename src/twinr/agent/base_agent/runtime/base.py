@@ -56,6 +56,7 @@ class TwinrRuntimeBase:
 
     def __post_init__(self) -> None:
         long_term_startup_warning: str | None = None
+        long_term_startup_error: str | None = None
         try:
             # AUDIT-FIX(#3): Elternverzeichnisse der file-backed Stores vor Initialisierung sicherstellen.
             self._ensure_parent_directory(self.config.reminder_store_path)
@@ -73,13 +74,20 @@ class TwinrRuntimeBase:
                 graph_store=self.graph_memory,
             )
             try:
-                self.long_term_memory.ensure_remote_ready()
+                self.check_required_remote_dependency(force_sync=True)
             except LongTermRemoteUnavailableError as exc:
-                long_term_startup_warning = str(exc)
-                _LOGGER.warning(
-                    "Twinr runtime startup degraded because remote long-term memory is unavailable: %s",
-                    long_term_startup_warning,
-                )
+                if self.remote_dependency_required():
+                    long_term_startup_error = str(exc)
+                    _LOGGER.error(
+                        "Twinr runtime startup entered error because required remote long-term memory is unavailable: %s",
+                        long_term_startup_error,
+                    )
+                else:
+                    long_term_startup_warning = str(exc)
+                    _LOGGER.warning(
+                        "Twinr runtime startup degraded because remote long-term memory is unavailable: %s",
+                        long_term_startup_warning,
+                    )
             self.reminder_store = ReminderStore(
                 self.config.reminder_store_path,
                 timezone_name=self.config.local_timezone_name,
@@ -116,7 +124,10 @@ class TwinrRuntimeBase:
 
             if self.config.restore_runtime_state_on_startup:
                 self._restore_snapshot_context()  # AUDIT-FIX(#1,#5): Snapshot-Restore implementiert und fehlertolerant.
-            self._persist_snapshot()  # AUDIT-FIX(#1,#5): Snapshot-Persistierung implementiert und atomar.
+            if long_term_startup_error:
+                self.fail(long_term_startup_error)
+            else:
+                self._persist_snapshot()  # AUDIT-FIX(#1,#5): Snapshot-Persistierung implementiert und atomar.
         except Exception:
             _LOGGER.exception(
                 "Failed to initialize TwinrRuntimeBase; cleaning up partially initialized components.",
@@ -129,6 +140,28 @@ class TwinrRuntimeBase:
         """Return the current runtime status from the state machine."""
 
         return self.state_machine.status
+
+    def remote_dependency_required(self) -> bool:
+        long_term_memory = getattr(self, "long_term_memory", None)
+        remote_required = getattr(long_term_memory, "remote_required", None)
+        if callable(remote_required):
+            try:
+                return bool(remote_required())
+            except Exception:
+                _LOGGER.exception("Failed to determine whether remote long-term memory is required.")
+        return bool(
+            self.config.long_term_memory_enabled
+            and self.config.long_term_memory_mode == "remote_primary"
+            and self.config.long_term_memory_remote_required
+        )
+
+    def check_required_remote_dependency(self, *, force_sync: bool = False) -> None:
+        if not self.remote_dependency_required():
+            return
+        long_term_memory = getattr(self, "long_term_memory", None)
+        if long_term_memory is None:
+            raise LongTermRemoteUnavailableError("Required remote long-term memory is not initialized.")
+        long_term_memory.ensure_remote_ready()
 
     def shutdown(self, *, timeout_s: float = 2.0) -> None:
         """Persist runtime state and stop owned components best-effort."""

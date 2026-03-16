@@ -1,38 +1,59 @@
 # reasoning
 
-Apply consolidation, truth, retention, reflection, and conflict logic to long-term memories.
+Apply post-ingestion policy to long-term memory objects.
+
+This package turns extracted candidates into durable state by handling
+consolidation, truth maintenance, conflict resolution, reflection, midterm
+compilation, and retention.
 
 ## Responsibility
 
 `reasoning` owns:
-- Consolidate candidate memories into durable objects
-- Resolve conflicts and maintain truth state
-- Reflect, retain, and archive memory state
+- Consolidate extracted turn outputs into episodic, durable, deferred, and conflict results
+- Maintain slot-level truth and build user-facing conflict choices
+- Reflect over recent memory windows and compile bounded midterm packets
+- Apply retention, expiry, and archival policy to stored objects
 
 `reasoning` does **not** own:
-- Capture raw turn or sensor evidence
-- Store snapshots or archives directly
-- Run the top-level long-term service loop
+- Extract raw turns, propositions, or multimodal evidence
+- Persist object, conflict, or archive snapshots
+- Assemble retrieval context or proactive plans
+- Run the top-level long-term runtime loop
 
 ## Key files
 
 | File | Purpose |
 |---|---|
-| `conflicts.py` | Resolve contradictions |
-| `consolidator.py` | Promote candidate memories |
-| `midterm.py` | Build reflection prompts |
-| `reflect.py` | Generate reflections |
-| `retention.py` | Apply retention policy |
-| `truth.py` | Maintain truth state |
+| `consolidator.py` | Turn-level consolidation |
+| `truth.py` | Slot conflict detection |
+| `conflicts.py` | User conflict resolution |
+| `reflect.py` | Reflection orchestration |
+| `midterm.py` | Midterm compiler adapter |
+| `retention.py` | Retention classification |
+| `component.yaml` | Structural metadata |
 
 ## Usage
 
 ```python
-from twinr.memory.longterm.reasoning.consolidator import LongTermMemoryConsolidator
-from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
+from twinr.memory.longterm import (
+    LongTermConflictResolver,
+    LongTermMemoryConsolidator,
+    LongTermMemoryReflector,
+    LongTermRetentionPolicy,
+    LongTermTruthMaintainer,
+)
+
+truth = LongTermTruthMaintainer()
+consolidator = LongTermMemoryConsolidator(truth_maintainer=truth)
+resolver = LongTermConflictResolver()
+reflector = LongTermMemoryReflector.from_config(config)
+retention = LongTermRetentionPolicy(timezone_name=config.local_timezone_name)
 ```
 
 ## See also
 
-- [../MEMORY_ARCHITECTURE.md](../MEMORY_ARCHITECTURE.md)
 - [../ingestion/README.md](../ingestion/README.md)
+- [../runtime/README.md](../runtime/README.md)
+- [../storage/README.md](../storage/README.md)
+- [component.yaml](./component.yaml)
+- [AGENTS.md](./AGENTS.md)

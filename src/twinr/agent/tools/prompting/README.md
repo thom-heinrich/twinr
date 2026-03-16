@@ -20,9 +20,9 @@ default, compact, supervisor, first-word, and specialist instruction bundles.
 
 | File | Purpose |
 |---|---|
+| [__init__.py](./__init__.py) | Prompting export surface |
 | [instructions.py](./instructions.py) | Canonical tool-lane instruction builders |
 | [component.yaml](./component.yaml) | Structured package metadata |
-| [AGENTS.md](./AGENTS.md) | Local invariants and checks |
 
 ## Usage
 
@@ -35,6 +35,5 @@ instructions = build_tool_agent_instructions(config)
 ## See also
 
 - [component.yaml](./component.yaml)
-- [AGENTS.md](./AGENTS.md)
 - [base_agent/prompting](../../base_agent/prompting/README.md)
 - [schemas](../schemas/README.md)

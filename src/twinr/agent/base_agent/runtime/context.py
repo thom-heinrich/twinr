@@ -22,6 +22,14 @@ _LOCK_INIT_GUARD = threading.Lock()
 class TwinrRuntimeContextMixin:
     """Provide runtime context views and hot-swappable runtime dependencies."""
 
+    def _remote_long_term_failure_is_fatal(self) -> bool:
+        config = getattr(self, "config", None)
+        return bool(
+            getattr(config, "long_term_memory_enabled", False)
+            and str(getattr(config, "long_term_memory_mode", "") or "").strip().lower() == "remote_primary"
+            and getattr(config, "long_term_memory_remote_required", False)
+        )
+
     def _runtime_context_lock(self) -> threading.RLock:
         lock = getattr(self, "_twinr_runtime_context_lock", None)
         if lock is None:
@@ -258,6 +266,8 @@ class TwinrRuntimeContextMixin:
                 for context_message in context_builder.system_messages():
                     messages.append(("system", str(context_message)))
             except LongTermRemoteUnavailableError as exc:
+                if self._remote_long_term_failure_is_fatal():
+                    raise
                 self._safe_append_ops_event(
                     event="provider_context_memory_failed",
                     message="Twinr skipped remote long-term memory context for this turn because the remote snapshot is unavailable.",
@@ -367,6 +377,8 @@ class TwinrRuntimeContextMixin:
                         if normalized_memory_message:
                             messages.append(("system", normalized_memory_message))
                 except LongTermRemoteUnavailableError as exc:
+                    if self._remote_long_term_failure_is_fatal():
+                        raise
                     self._safe_append_ops_event(
                         event="first_word_context_memory_failed",
                         message="Twinr skipped relevant long-term memory context for the fast lane because the remote snapshot is unavailable.",

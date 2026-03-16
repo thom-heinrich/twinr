@@ -1,3 +1,11 @@
+"""Gate proactive delivery reservations with bounded cooldown policy.
+
+This module owns the in-memory governor used by Twinr runtime workflows to
+rate-limit proactive speech prompts, track one active reservation, and retain
+bounded delivery history for later policy checks. Import public types from
+``twinr.proactive.governance`` or ``twinr.proactive``.
+"""
+
 from __future__ import annotations
 
 import math  # AUDIT-FIX(#4): finite numeric validation for env-derived config values.
@@ -29,6 +37,8 @@ _HISTORY_BUFFER_MULTIPLIER = 2.0
 
 
 def _normalize_text(value: str | None) -> str:
+    """Normalize optional text into a single trimmed line."""
+
     if value is None:
         return ""
     if not isinstance(value, str):  # AUDIT-FIX(#1): reject silent non-string coercion in identifiers and reasons.
@@ -37,6 +47,8 @@ def _normalize_text(value: str | None) -> str:
 
 
 def _normalize_choice(value: str, *, field_name: str, allowed: frozenset[str]) -> str:
+    """Normalize and validate one bounded string enum value."""
+
     normalized = _normalize_text(value)
     if normalized not in allowed:
         raise ValueError(f"{field_name} must be one of: {', '.join(sorted(allowed))}.")
@@ -44,6 +56,8 @@ def _normalize_choice(value: str, *, field_name: str, allowed: frozenset[str]) -
 
 
 def _normalize_required_text(value: str, *, field_name: str) -> str:
+    """Normalize required text and reject blanks."""
+
     normalized = _normalize_text(value)
     if not normalized:
         raise ValueError(f"{field_name} is required.")
@@ -51,24 +65,32 @@ def _normalize_required_text(value: str, *, field_name: str) -> str:
 
 
 def _validate_bool(value: bool, *, field_name: str) -> bool:
+    """Require one real boolean value."""
+
     if isinstance(value, bool):
         return value
     raise TypeError(f"{field_name} must be a bool.")
 
 
 def _validate_int(value: int, *, field_name: str) -> int:
+    """Require one real integer value."""
+
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{field_name} must be an int.")
     return value
 
 
 def _validate_optional_int(value: int | None, *, field_name: str) -> int | None:
+    """Validate one optional integer field."""
+
     if value is None:
         return None
     return _validate_int(value, field_name=field_name)
 
 
 def _validate_aware_datetime(value: datetime, *, field_name: str, target_tz: ZoneInfo | None = None) -> datetime:
+    """Require one timezone-aware datetime and normalize it when requested."""
+
     if not isinstance(value, datetime):
         raise TypeError(f"{field_name} must be a datetime.")
     if value.tzinfo is None or value.utcoffset() is None:  # AUDIT-FIX(#3): fail fast on naive datetimes before comparisons explode.
@@ -79,6 +101,8 @@ def _validate_aware_datetime(value: datetime, *, field_name: str, target_tz: Zon
 
 
 def _coerce_config_bool(value: object, *, default: bool) -> bool:
+    """Coerce config-like input to a bounded boolean with fallback."""
+
     if isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -101,6 +125,8 @@ def _coerce_config_float(
     minimum: float | None = None,
     maximum: float | None = None,
 ) -> float:
+    """Coerce config-like input to one finite float within bounds."""
+
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -121,6 +147,8 @@ def _coerce_config_int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
+    """Coerce config-like input to one bounded integer."""
+
     if isinstance(value, bool):
         number = default
     else:
@@ -137,6 +165,20 @@ def _coerce_config_int(
 
 @dataclass(frozen=True, slots=True)
 class ProactiveGovernorCandidate:
+    """Describe one proactive delivery attempt before reservation.
+
+    Attributes:
+        source_kind: Candidate family such as ``social`` or ``longterm``.
+        source_id: Stable per-source identifier used for repeat cooldowns.
+        summary: Short operator-facing summary kept in governor history.
+        channel: Delivery channel currently supported by the governor.
+        priority: Higher-level caller priority for downstream orchestration.
+        presence_session_id: Optional wakeword/presence session identifier.
+        safety_exempt: Skip normal cooldown checks when True.
+        counts_toward_presence_budget: Include the candidate in per-session
+            prompt budgets when True.
+    """
+
     source_kind: str
     source_id: str
     summary: str
@@ -147,6 +189,8 @@ class ProactiveGovernorCandidate:
     counts_toward_presence_budget: bool = True
 
     def __post_init__(self) -> None:
+        """Normalize and validate candidate fields after construction."""
+
         object.__setattr__(
             self,
             "source_kind",
@@ -194,11 +238,20 @@ class ProactiveGovernorCandidate:
 
 @dataclass(frozen=True, slots=True)
 class ProactiveGovernorReservation:
+    """Represent one issued proactive reservation token.
+
+    The reservation token is the authoritative handle for cancellation and
+    finalization. Structural equality of the candidate alone is not enough to
+    finalize a reservation.
+    """
+
     candidate: ProactiveGovernorCandidate
     reserved_at: datetime
     reservation_token: str = field(default_factory=lambda: uuid4().hex, repr=False)  # AUDIT-FIX(#2): opaque token hardens reservation ownership.
 
     def __post_init__(self) -> None:
+        """Validate the reservation payload and its timestamp."""
+
         if not isinstance(self.candidate, ProactiveGovernorCandidate):
             raise TypeError("candidate must be a ProactiveGovernorCandidate.")
         object.__setattr__(
@@ -215,6 +268,8 @@ class ProactiveGovernorReservation:
 
 @dataclass(frozen=True, slots=True)
 class ProactiveGovernorHistoryEntry:
+    """Persist one finalized proactive outcome for future policy checks."""
+
     source_kind: str
     source_id: str
     summary: str
@@ -228,6 +283,8 @@ class ProactiveGovernorHistoryEntry:
     reason: str | None = None
 
     def __post_init__(self) -> None:
+        """Normalize and validate history fields after construction."""
+
         object.__setattr__(
             self,
             "source_kind",
@@ -291,6 +348,8 @@ class ProactiveGovernorHistoryEntry:
 
 @dataclass(slots=True)
 class ProactiveGovernorDecision:
+    """Return the result of one reservation attempt."""
+
     allowed: bool
     reason: str
     candidate: ProactiveGovernorCandidate
@@ -299,6 +358,14 @@ class ProactiveGovernorDecision:
 
 @dataclass(slots=True)
 class ProactiveGovernor:
+    """Enforce proactive speech cooldowns and one in-flight reservation.
+
+    The governor is a thin in-memory policy service shared by runtime
+    workflows. It normalizes config access, ensures at most one active
+    reservation exists, and records bounded delivery history so repeat,
+    window, and presence-session budgets stay deterministic.
+    """
+
     config: TwinrConfig
     _lock: Lock = field(default_factory=Lock, repr=False)
     _history: list[ProactiveGovernorHistoryEntry] = field(default_factory=list, repr=False)
@@ -310,6 +377,8 @@ class ProactiveGovernor:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "ProactiveGovernor":
+        """Build one governor from the canonical Twinr config object."""
+
         return cls(config=config)
 
     def try_reserve(
@@ -318,6 +387,19 @@ class ProactiveGovernor:
         *,
         now: datetime | None = None,
     ) -> ProactiveGovernorDecision:
+        """Attempt to reserve one proactive candidate.
+
+        Args:
+            candidate: Proposed proactive delivery to gate.
+            now: Optional explicit current time. When provided it must already
+                be timezone-aware.
+
+        Returns:
+            One decision describing whether the caller may proceed. Successful
+            decisions carry a reservation token that must later be cancelled or
+            finalized.
+        """
+
         current_time = self._resolve_current_time(now)
         with self._lock:
             self._drop_stale_active_reservation(current_time)
@@ -346,6 +428,8 @@ class ProactiveGovernor:
             )
 
     def cancel(self, reservation: ProactiveGovernorReservation) -> None:
+        """Release one active reservation without recording an outcome."""
+
         with self._lock:
             if (
                 self._active_reservation is not None
@@ -359,6 +443,8 @@ class ProactiveGovernor:
         *,
         now: datetime | None = None,
     ) -> ProactiveGovernorHistoryEntry:
+        """Finalize one reservation as delivered and append history."""
+
         return self._record_outcome(
             reservation,
             outcome="delivered",
@@ -373,6 +459,8 @@ class ProactiveGovernor:
         reason: str,
         now: datetime | None = None,
     ) -> ProactiveGovernorHistoryEntry:
+        """Finalize one reservation as skipped and append history."""
+
         return self._record_outcome(
             reservation,
             outcome="skipped",
@@ -381,6 +469,8 @@ class ProactiveGovernor:
         )
 
     def history(self) -> tuple[ProactiveGovernorHistoryEntry, ...]:
+        """Return the bounded finalized history snapshot."""
+
         with self._lock:
             self._trim_history(self._now())  # AUDIT-FIX(#5): history snapshots no longer retain expired bookkeeping indefinitely.
             return tuple(self._history)
@@ -393,6 +483,8 @@ class ProactiveGovernor:
         now: datetime | None,
         reason: str | None,
     ) -> ProactiveGovernorHistoryEntry:
+        """Finalize one active reservation and cache the resulting history entry."""
+
         current_time = self._resolve_current_time(now)
         with self._lock:
             self._drop_stale_active_reservation(current_time)
@@ -430,6 +522,8 @@ class ProactiveGovernor:
         *,
         current_time: datetime,
     ) -> str | None:
+        """Return the first blocking reason for one speech candidate."""
+
         if candidate.safety_exempt:
             return None
         if self._global_cooldown_active(current_time=current_time):
@@ -443,6 +537,8 @@ class ProactiveGovernor:
         return None
 
     def _global_cooldown_active(self, *, current_time: datetime) -> bool:
+        """Return whether the global proactive speech cooldown is active."""
+
         latest = self._latest_delivered_speech_entry()
         if latest is None:
             return False
@@ -459,6 +555,8 @@ class ProactiveGovernor:
         *,
         current_time: datetime,
     ) -> bool:
+        """Return whether the candidate's source-level repeat cooldown is active."""
+
         cooldown = self._config_float(
             "proactive_governor_source_repeat_cooldown_s",
             default=_DEFAULT_SOURCE_REPEAT_COOLDOWN_S,
@@ -483,6 +581,8 @@ class ProactiveGovernor:
         return current_time < latest.happened_at + timedelta(seconds=cooldown)
 
     def _window_budget_exhausted(self, *, current_time: datetime) -> bool:
+        """Return whether the rolling speech budget window is exhausted."""
+
         limit = self._config_int(
             "proactive_governor_window_prompt_limit",
             default=_DEFAULT_WINDOW_PROMPT_LIMIT,
@@ -510,6 +610,8 @@ class ProactiveGovernor:
         *,
         current_time: datetime,
     ) -> bool:
+        """Return whether the candidate already consumed the current session budget."""
+
         if not candidate.counts_toward_presence_budget:
             return False
         if candidate.presence_session_id is None:
@@ -538,6 +640,8 @@ class ProactiveGovernor:
         return count >= limit
 
     def _latest_delivered_speech_entry(self) -> ProactiveGovernorHistoryEntry | None:
+        """Return the newest non-exempt delivered speech entry."""
+
         return max(
             (
                 entry
@@ -549,6 +653,8 @@ class ProactiveGovernor:
         )  # AUDIT-FIX(#7): cooldowns now respect actual timestamps even after clock skew or test-injected times.
 
     def _drop_stale_active_reservation(self, current_time: datetime) -> None:
+        """Discard one expired in-flight reservation if its TTL elapsed."""
+
         if self._active_reservation is None:
             return
         ttl_s = self._config_float(
@@ -560,6 +666,8 @@ class ProactiveGovernor:
             self._active_reservation = None  # AUDIT-FIX(#2): expired reservations are invalidated before they can be finalized later.
 
     def _trim_history(self, current_time: datetime) -> None:
+        """Trim history and finalized-token caches to the active policy window."""
+
         enforcement_window_s = max(
             self._config_float(
                 "proactive_governor_window_s",
@@ -610,6 +718,8 @@ class ProactiveGovernor:
         }  # AUDIT-FIX(#2): finalized-token cache stays bounded to the same retention window.
 
     def _resolve_current_time(self, now: datetime | None) -> datetime:
+        """Resolve the effective current time in the governor timezone."""
+
         if now is None:
             return self._now()
         return _validate_aware_datetime(
@@ -619,6 +729,8 @@ class ProactiveGovernor:
         )  # AUDIT-FIX(#3): explicit times are normalized to one timezone before policy math.
 
     def _timezone(self) -> ZoneInfo:
+        """Load the configured local timezone with a safe fallback."""
+
         timezone_name = getattr(self.config, "local_timezone_name", _DEFAULT_TIMEZONE_NAME)
         normalized_name = _normalize_text(timezone_name) or _DEFAULT_TIMEZONE_NAME
         try:
@@ -627,6 +739,8 @@ class ProactiveGovernor:
             return ZoneInfo(_DEFAULT_TIMEZONE_NAME)  # AUDIT-FIX(#3): bad timezone config no longer crashes every call site.
 
     def _config_bool(self, name: str, *, default: bool) -> bool:
+        """Read one boolean governor config field safely."""
+
         return _coerce_config_bool(getattr(self.config, name, default), default=default)
 
     def _config_float(
@@ -637,6 +751,8 @@ class ProactiveGovernor:
         minimum: float | None = None,
         maximum: float | None = None,
     ) -> float:
+        """Read one float governor config field safely."""
+
         return _coerce_config_float(
             getattr(self.config, name, default),
             default=default,
@@ -652,6 +768,8 @@ class ProactiveGovernor:
         minimum: int | None = None,
         maximum: int | None = None,
     ) -> int:
+        """Read one integer governor config field safely."""
+
         return _coerce_config_int(
             getattr(self.config, name, default),
             default=default,
@@ -660,9 +778,13 @@ class ProactiveGovernor:
         )
 
     def _governor_enabled(self) -> bool:
+        """Return whether proactive speech governance is enabled."""
+
         return self._config_bool("proactive_governor_enabled", default=True)
 
     def _now(self) -> datetime:
+        """Return the current time in the governor timezone."""
+
         return datetime.now(self._timezone())  # AUDIT-FIX(#3): current time always uses a validated timezone.
 
 

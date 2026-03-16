@@ -1,3 +1,11 @@
+"""Build and describe canonical sensor-based automation triggers.
+
+This module translates operator-facing sensor trigger kinds into
+``IfThenAutomationTrigger`` objects and back again. The helpers here are the
+single source of truth for supported sensor-trigger shapes that the web UI and
+tooling may round-trip safely.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable  # AUDIT-FIX(#3): validate persisted condition containers without assuming a tuple payload.
@@ -52,16 +60,28 @@ _NO_VALUE_FINGERPRINT = "__NO_VALUE__"
 
 @dataclass(frozen=True, slots=True)
 class SensorTriggerSpec:
+    """Describe a supported sensor trigger in a UI-friendly form.
+
+    Attributes:
+        trigger_kind: Canonical sensor trigger identifier.
+        hold_seconds: Required duration threshold for sustained triggers.
+        cooldown_seconds: Minimum quiet period after a match fires again.
+    """
+
     trigger_kind: str
     hold_seconds: float = 0.0
     cooldown_seconds: float = 0.0
 
     @property
     def label(self) -> str:
+        """Return the human-readable label for this trigger kind."""
+
         return _SENSOR_LABELS.get(self.trigger_kind, self.trigger_kind.replace("_", " "))
 
 
 def supported_sensor_trigger_kinds() -> tuple[str, ...]:
+    """Return the canonical sensor trigger kinds accepted by this package."""
+
     return _SUPPORTED_SENSOR_TRIGGER_KINDS
 
 
@@ -72,6 +92,21 @@ def _parse_seconds(
     field_name: str,
     default: float = 0.0,
 ) -> float:
+    """Parse a non-negative finite duration value.
+
+    Args:
+        value: Raw duration candidate from UI or persisted state.
+        field_name: Field name used in validation errors.
+        default: Value to return for ``None`` or blank strings.
+
+    Returns:
+        A validated duration in seconds.
+
+    Raises:
+        ValueError: If ``value`` is negative, non-finite, boolean, or otherwise
+            not a number.
+    """
+
     if value is None:
         return default
 
@@ -99,6 +134,8 @@ def _parse_seconds(
 
 # AUDIT-FIX(#3): fail closed while describing corrupted persisted state instead of crashing on bad cooldown/threshold values.
 def _parse_optional_seconds(value: object, *, field_name: str) -> float | None:
+    """Parse seconds for best-effort reads from possibly corrupted state."""
+
     try:
         return _parse_seconds(value, field_name=field_name)
     except ValueError:
@@ -111,6 +148,22 @@ def build_sensor_trigger(
     hold_seconds: float = 0.0,
     cooldown_seconds: float = 0.0,
 ) -> IfThenAutomationTrigger:
+    """Build a canonical ``IfThenAutomationTrigger`` for a sensor trigger kind.
+
+    Args:
+        trigger_kind: Sensor trigger kind from the supported trigger catalog.
+        hold_seconds: Required sustained duration for duration-based triggers.
+        cooldown_seconds: Minimum delay before the trigger may match again.
+
+    Returns:
+        A normalized ``IfThenAutomationTrigger`` that matches Twinr runtime
+        facts and events for the requested sensor kind.
+
+    Raises:
+        ValueError: If the trigger kind is unsupported or the durations are
+            invalid for that kind.
+    """
+
     normalized_kind = str(trigger_kind or "").strip().lower()
     if normalized_kind not in _SUPPORTED_SENSOR_TRIGGER_KINDS:
         raise ValueError(f"Unsupported sensor trigger kind: {trigger_kind}")
@@ -137,6 +190,12 @@ def build_sensor_trigger(
 
 # AUDIT-FIX(#2,#3,#4): only describe exact, lossless trigger shapes and degrade safely when persisted state is malformed.
 def describe_sensor_trigger(trigger: object) -> SensorTriggerSpec | None:
+    """Recover a ``SensorTriggerSpec`` from a canonical if/then trigger.
+
+    Returns ``None`` whenever the trigger cannot be mapped back to one of the
+    supported sensor shapes without losing meaning.
+    """
+
     if not isinstance(trigger, IfThenAutomationTrigger):
         return None
 
@@ -186,6 +245,8 @@ def describe_sensor_trigger(trigger: object) -> SensorTriggerSpec | None:
 
 
 def describe_sensor_trigger_text(trigger: object) -> str | None:
+    """Render a supported sensor trigger as plain English text."""
+
     spec = describe_sensor_trigger(trigger)
     if spec is None:
         return None

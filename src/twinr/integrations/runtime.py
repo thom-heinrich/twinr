@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import errno
+import ipaddress
+import os
+import socket
+import stat
 from dataclasses import dataclass
 from email.utils import parseaddr
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 from zoneinfo import ZoneInfo
 
 from twinr.integrations.calendar import CalendarAdapterSettings, ICSCalendarSource, ReadOnlyCalendarAdapter
@@ -26,8 +32,12 @@ from twinr.integrations.store import ManagedIntegrationConfig, TwinrIntegrationS
 EMAIL_MAILBOX_INTEGRATION_ID = "email_mailbox"
 CALENDAR_AGENDA_INTEGRATION_ID = "calendar_agenda"
 EMAIL_APP_PASSWORD_ENV_KEY = "TWINR_INTEGRATION_EMAIL_APP_PASSWORD"
+CALENDAR_ALLOWED_ROOT_ENV_KEY = "TWINR_INTEGRATION_CALENDAR_ALLOWED_ROOT"  # AUDIT-FIX(#1): Optional allowlist root for local ICS files; defaults to the project root.
 _MAX_ICS_DOWNLOAD_BYTES = 2 * 1024 * 1024
+_MAX_ENV_FILE_BYTES = 64 * 1024  # AUDIT-FIX(#7): Bound .env reads so a damaged or wrong file cannot consume unbounded memory on RPi.
 _ICS_URL_FETCH_TIMEOUT_S = 10.0
+_MAX_ICS_URL_REDIRECTS = 3  # AUDIT-FIX(#2): Follow only a small number of validated redirects for remote ICS feeds.
+_ICS_HTTP_USER_AGENT = "Twinr/0.1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +67,12 @@ class ManagedIntegrationsRuntime:
         return None
 
 
+class _NoRedirectHandler(HTTPRedirectHandler):
+    # AUDIT-FIX(#2): Reject urllib's implicit redirect behavior so every hop is revalidated before any request is sent.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def build_managed_integrations(
     project_root: str | Path,
     *,
@@ -64,16 +80,45 @@ def build_managed_integrations(
     url_text_loader: Callable[[str], str] | None = None,
 ) -> ManagedIntegrationsRuntime:
     project_path = Path(project_root).resolve()
-    store = TwinrIntegrationStore.from_project_root(project_path)
     env_values = _read_env_values(_resolve_env_path(project_path, env_path))
 
-    email_adapter, email_readiness = _build_email_mailbox_runtime(
-        store.get(EMAIL_MAILBOX_INTEGRATION_ID),
+    try:
+        # AUDIT-FIX(#4): Do not let a damaged file-backed integration store crash the whole runtime during startup.
+        store = TwinrIntegrationStore.from_project_root(project_path)
+        email_record = store.get(EMAIL_MAILBOX_INTEGRATION_ID)
+        calendar_record = store.get(CALENDAR_AGENDA_INTEGRATION_ID)
+    except Exception:
+        detail = (
+            "Integration settings could not be loaded from disk. "
+            "Check file permissions and restore the project state if it was damaged."
+        )
+        return ManagedIntegrationsRuntime(
+            readiness=(
+                IntegrationReadiness(
+                    integration_id=EMAIL_MAILBOX_INTEGRATION_ID,
+                    label="Email",
+                    status="warn",
+                    summary="Unavailable",
+                    detail=detail,
+                ),
+                IntegrationReadiness(
+                    integration_id=CALENDAR_AGENDA_INTEGRATION_ID,
+                    label="Calendar",
+                    status="warn",
+                    summary="Unavailable",
+                    detail=detail,
+                ),
+            ),
+        )
+
+    email_adapter, email_readiness = _safe_build_email_mailbox_runtime(
+        email_record,
         env_values=env_values,
     )
-    calendar_adapter, calendar_readiness = _build_calendar_agenda_runtime(
+    calendar_adapter, calendar_readiness = _safe_build_calendar_agenda_runtime(
         project_path,
-        store.get(CALENDAR_AGENDA_INTEGRATION_ID),
+        calendar_record,
+        env_values=env_values,
         url_text_loader=url_text_loader or _fetch_ics_url,
     )
     return ManagedIntegrationsRuntime(
@@ -105,16 +150,56 @@ def build_calendar_agenda_adapter(
 
 
 def validate_calendar_source(*, source_kind: str, source_value: str) -> None:
-    if source_kind != "ics_url":
+    normalized_source_kind = _coerce_text(source_kind).strip().lower()  # AUDIT-FIX(#8): Normalize source kind so harmless casing differences do not bypass validation or produce inconsistent behavior.
+    if normalized_source_kind == "ics_file":
         return
+    if normalized_source_kind != "ics_url":
+        raise ValueError(f"Unsupported calendar source type: {source_kind}")
 
-    parts = urlsplit(source_value)
-    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
-        raise ValueError("Calendar URL must start with http:// or https://.")
-    if parts.username or parts.password or parts.query or parts.fragment:
-        raise ValueError(
-            "Calendar URL must not include embedded credentials, query tokens, or fragments. "
-            "Use a plain feed URL or a local ICS file."
+    text = _coerce_text(source_value).strip()
+    _validate_calendar_url_text(text)  # AUDIT-FIX(#2): Centralize strict URL validation before any remote fetch path is constructed.
+
+
+def _safe_build_email_mailbox_runtime(
+    record: ManagedIntegrationConfig,
+    *,
+    env_values: dict[str, str],
+) -> tuple[EmailMailboxAdapter | None, IntegrationReadiness]:
+    try:
+        # AUDIT-FIX(#4): Degrade this single integration cleanly if an unexpected constructor/runtime error occurs.
+        return _build_email_mailbox_runtime(record, env_values=env_values)
+    except Exception:
+        return None, IntegrationReadiness(
+            integration_id=EMAIL_MAILBOX_INTEGRATION_ID,
+            label="Email",
+            status="warn",
+            summary="Unavailable",
+            detail="Email integration could not be started. Check the mailbox settings and restore packaged files if needed.",
+        )
+
+
+def _safe_build_calendar_agenda_runtime(
+    project_root: Path,
+    record: ManagedIntegrationConfig,
+    *,
+    env_values: dict[str, str],
+    url_text_loader: Callable[[str], str],
+) -> tuple[ReadOnlyCalendarAdapter | None, IntegrationReadiness]:
+    try:
+        # AUDIT-FIX(#4): Keep calendar startup failures isolated so one broken source does not take down the process.
+        return _build_calendar_agenda_runtime(
+            project_root,
+            record,
+            env_values=env_values,
+            url_text_loader=url_text_loader,
+        )
+    except Exception:
+        return None, IntegrationReadiness(
+            integration_id=CALENDAR_AGENDA_INTEGRATION_ID,
+            label="Calendar",
+            status="warn",
+            summary="Unavailable",
+            detail="Calendar integration could not be started. Check the source path or URL and restore packaged files if needed.",
         )
 
 
@@ -132,12 +217,16 @@ def _build_email_mailbox_runtime(
             detail="No mailbox connection is active. Configure account data and enable it when ready.",
         )
 
-    profile = (record.value("profile", "gmail") or "gmail").strip()
-    account_email = record.value("account_email", "").strip()
-    from_address = record.value("from_address", "").strip() or account_email
-    imap_host = record.value("imap_host", "imap.gmail.com" if profile == "gmail" else "").strip()
-    smtp_host = record.value("smtp_host", "smtp.gmail.com" if profile == "gmail" else "").strip()
-    secret_value = env_values.get(EMAIL_APP_PASSWORD_ENV_KEY, "").strip()
+    profile = (_coerce_text(record.value("profile", "gmail"), default="gmail").strip().lower() or "gmail")  # AUDIT-FIX(#5): Coerce config values to text and normalize casing before calling string methods.
+    account_email = _coerce_text(record.value("account_email", "")).strip()  # AUDIT-FIX(#5): Avoid AttributeError when the config store returns None or non-string values.
+    from_address = _coerce_text(record.value("from_address", "")).strip() or account_email  # AUDIT-FIX(#5): Same guard for sender addresses.
+    imap_host = _coerce_text(
+        record.value("imap_host", "imap.gmail.com" if profile == "gmail" else "")
+    ).strip()  # AUDIT-FIX(#5): Same guard for IMAP host values.
+    smtp_host = _coerce_text(
+        record.value("smtp_host", "smtp.gmail.com" if profile == "gmail" else "")
+    ).strip()  # AUDIT-FIX(#5): Same guard for SMTP host values.
+    secret_value = _coerce_text(env_values.get(EMAIL_APP_PASSWORD_ENV_KEY, "")).strip()
 
     missing: list[str] = []
     if not account_email:
@@ -160,9 +249,24 @@ def _build_email_mailbox_runtime(
     try:
         normalized_account = _validate_email_address(account_email, label="Email account address")
         normalized_from = _validate_email_address(from_address, label="Email sender address")
-        imap_port = _parse_positive_int(record.value("imap_port", "993"), label="IMAP port")
-        smtp_port = _parse_positive_int(record.value("smtp_port", "587"), label="SMTP port")
-        contacts, contact_warnings = _parse_known_contacts(record.value("known_contacts_text", ""))
+        imap_port = _parse_positive_int(record.value("imap_port", "993"), label="IMAP port", max_value=65535)  # AUDIT-FIX(#6): Reject invalid TCP ports during config parsing instead of failing later at connection time.
+        smtp_port = _parse_positive_int(record.value("smtp_port", "587"), label="SMTP port", max_value=65535)  # AUDIT-FIX(#6): Same range check for SMTP.
+        contacts, contact_warnings = _parse_known_contacts(_coerce_text(record.value("known_contacts_text", "")))  # AUDIT-FIX(#5): Parse contacts from a safe text coercion path.
+        unread_only_default = _parse_bool(
+            record.value("unread_only_default", "true"),
+            default=True,
+            label="Unread-only default",
+        )  # AUDIT-FIX(#5): Parse booleans inside the guarded validation block so bad values return readiness warnings instead of crashing.
+        restrict_reads_to_known_senders = _parse_bool(
+            record.value("restrict_reads_to_known_senders", "false"),
+            default=False,
+            label="Restrict reads to known senders",
+        )  # AUDIT-FIX(#5): Same guarded boolean parsing for sender restrictions.
+        restrict_recipients_to_known_contacts = _parse_bool(
+            record.value("restrict_recipients_to_known_contacts", "true"),
+            default=True,
+            label="Restrict recipients to known contacts",
+        )  # AUDIT-FIX(#3): Default outbound mail to approved contacts only; this is the safer baseline for a senior voice agent.
     except ValueError as exc:
         return None, IntegrationReadiness(
             integration_id=EMAIL_MAILBOX_INTEGRATION_ID,
@@ -174,7 +278,27 @@ def _build_email_mailbox_runtime(
 
     manifest = manifest_for_id(EMAIL_MAILBOX_INTEGRATION_ID)
     if manifest is None:
-        raise RuntimeError("Built-in email integration manifest is missing.")
+        return None, IntegrationReadiness(
+            integration_id=EMAIL_MAILBOX_INTEGRATION_ID,
+            label="Email",
+            status="warn",
+            summary="Unavailable",
+            detail="Email integration files are incomplete. Restore the Twinr package before enabling mail access.",
+        )  # AUDIT-FIX(#4): Treat missing built-in manifests as a degraded runtime state instead of crashing startup.
+
+    warnings = list(contact_warnings)
+    if restrict_recipients_to_known_contacts and not contacts:
+        warnings.append(
+            "No approved contacts are configured. Outbound email will stay blocked until you add contacts."
+        )  # AUDIT-FIX(#3): Make the safer recipient restriction operationally visible so setup does not silently fail later.
+    if restrict_reads_to_known_senders and not contacts:
+        warnings.append(
+            "Known-sender restriction is enabled but no approved contacts are configured."
+        )  # AUDIT-FIX(#5): Surface contact-dependent read restrictions as a configuration warning instead of a confusing empty inbox.
+    if not restrict_recipients_to_known_contacts:
+        warnings.append(
+            "Outbound email is not restricted to approved contacts. This increases the risk of misaddressed or unsafe sends."
+        )  # AUDIT-FIX(#3): Surface an explicit safety warning when an operator opts out of the safer default.
 
     adapter = EmailMailboxAdapter(
         manifest=manifest,
@@ -185,7 +309,7 @@ def _build_email_mailbox_runtime(
                 port=imap_port,
                 username=normalized_account,
                 password=secret_value,
-                mailbox=record.value("imap_mailbox", "INBOX").strip() or "INBOX",
+                mailbox=_coerce_text(record.value("imap_mailbox", "INBOX"), default="INBOX").strip() or "INBOX",  # AUDIT-FIX(#5): Guard mailbox name parsing the same way as the rest of the config surface.
                 use_ssl=True,
             )
         ),
@@ -200,33 +324,28 @@ def _build_email_mailbox_runtime(
             )
         ),
         settings=EmailAdapterSettings(
-            unread_only_default=_parse_bool(record.value("unread_only_default", "true"), default=True),
-            restrict_reads_to_known_senders=_parse_bool(
-                record.value("restrict_reads_to_known_senders", "false"),
-                default=False,
-            ),
-            restrict_recipients_to_known_contacts=_parse_bool(
-                record.value("restrict_recipients_to_known_contacts", "false"),
-                default=False,
-            ),
+            unread_only_default=unread_only_default,
+            restrict_reads_to_known_senders=restrict_reads_to_known_senders,
+            restrict_recipients_to_known_contacts=restrict_recipients_to_known_contacts,
         ),
     )
-    status = "warn" if contact_warnings else "ok"
-    summary = "Ready with warnings" if contact_warnings else "Ready"
+    warning_items = tuple(warnings)
+    status = "warn" if warning_items else "ok"
+    summary = "Ready with warnings" if warning_items else "Ready"
     detail = (
         f"{normalized_account} via {profile.replace('_', ' ')} · "
         f"IMAP {imap_host}:{imap_port} · SMTP {smtp_host}:{smtp_port} · "
         "credential stored separately in .env"
     )
-    if contact_warnings:
-        detail = f"{detail} · {contact_warnings[0]}"
+    if warning_items:
+        detail = f"{detail} · {warning_items[0]}"
     return adapter, IntegrationReadiness(
         integration_id=EMAIL_MAILBOX_INTEGRATION_ID,
         label="Email",
         status=status,
         summary=summary,
         detail=detail,
-        warnings=contact_warnings,
+        warnings=warning_items,
     )
 
 
@@ -234,6 +353,7 @@ def _build_calendar_agenda_runtime(
     project_root: Path,
     record: ManagedIntegrationConfig,
     *,
+    env_values: dict[str, str],
     url_text_loader: Callable[[str], str],
 ) -> tuple[ReadOnlyCalendarAdapter | None, IntegrationReadiness]:
     if not record.enabled:
@@ -245,8 +365,8 @@ def _build_calendar_agenda_runtime(
             detail="No agenda source is active. Configure an ICS file or feed when ready.",
         )
 
-    source_kind = (record.value("source_kind", "ics_file") or "ics_file").strip()
-    source_value = record.value("source_value", "").strip()
+    source_kind = (_coerce_text(record.value("source_kind", "ics_file"), default="ics_file").strip().lower() or "ics_file")  # AUDIT-FIX(#8): Normalize source kind consistently across validation and runtime construction.
+    source_value = _coerce_text(record.value("source_value", "")).strip()  # AUDIT-FIX(#5): Avoid AttributeError on mis-typed or missing source values.
     if not source_value:
         return None, IntegrationReadiness(
             integration_id=CALENDAR_AGENDA_INTEGRATION_ID,
@@ -265,10 +385,12 @@ def _build_calendar_agenda_runtime(
                 30,
             ),
         )
+        allowed_calendar_root = _resolve_allowed_calendar_root(project_root, env_values)  # AUDIT-FIX(#1): Constrain local ICS reads to an explicit allowlist root, defaulting to the project root.
         reader, detail, warnings = _build_calendar_reader(
             project_root,
             source_kind=source_kind,
             source_value=source_value,
+            allowed_calendar_root=allowed_calendar_root,
             default_timezone=default_timezone,
             url_text_loader=url_text_loader,
         )
@@ -283,7 +405,13 @@ def _build_calendar_agenda_runtime(
 
     manifest = manifest_for_id(CALENDAR_AGENDA_INTEGRATION_ID)
     if manifest is None:
-        raise RuntimeError("Built-in calendar integration manifest is missing.")
+        return None, IntegrationReadiness(
+            integration_id=CALENDAR_AGENDA_INTEGRATION_ID,
+            label="Calendar",
+            status="warn",
+            summary="Unavailable",
+            detail="Calendar integration files are incomplete. Restore the Twinr package before enabling agenda access.",
+        )  # AUDIT-FIX(#4): Treat missing built-in manifests as a degraded runtime state instead of crashing startup.
 
     adapter = ReadOnlyCalendarAdapter(
         manifest=manifest,
@@ -309,17 +437,21 @@ def _build_calendar_reader(
     *,
     source_kind: str,
     source_value: str,
-    default_timezone,
+    allowed_calendar_root: Path,
+    default_timezone: ZoneInfo,
     url_text_loader: Callable[[str], str],
 ) -> tuple[ICSCalendarSource, str, tuple[str, ...]]:
     if source_kind == "ics_file":
-        resolved_path = Path(source_value)
-        if not resolved_path.is_absolute():
-            resolved_path = (project_root / resolved_path).resolve()
-        if not resolved_path.exists():
-            raise ValueError(f"Configured ICS file does not exist: {resolved_path}")
+        resolved_path, relative_parts = _resolve_local_calendar_file(
+            project_root,
+            source_value=source_value,
+            allowed_calendar_root=allowed_calendar_root,
+        )  # AUDIT-FIX(#1): Resolve the local ICS file once under the allowed root and keep a relative component path for safe reopen.
         return (
-            ICSCalendarSource.from_path(resolved_path, default_timezone=default_timezone),
+            ICSCalendarSource(
+                loader=lambda root=allowed_calendar_root, parts=relative_parts: _read_local_ics_text(root, parts),  # AUDIT-FIX(#1): Reopen local ICS files through a no-symlink path traversal routine on every load.
+                default_timezone=default_timezone,
+            ),
             f"ICS file {resolved_path} · timezone {_timezone_label(default_timezone)}",
             (),
         )
@@ -345,6 +477,7 @@ def _build_calendar_reader(
 def _parse_known_contacts(text: str) -> tuple[ApprovedEmailContacts, tuple[str, ...]]:
     contacts: list[EmailContact] = []
     warnings: list[str] = []
+    seen_emails: set[str] = set()  # AUDIT-FIX(#5): Deduplicate approved contacts to keep recipient matching deterministic.
     for index, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
@@ -354,51 +487,60 @@ def _parse_known_contacts(text: str) -> tuple[ApprovedEmailContacts, tuple[str, 
         if not normalized or "@" not in normalized:
             warnings.append(f"Ignored malformed contact line {index}.")
             continue
+        if normalized in seen_emails:
+            warnings.append(f"Ignored duplicate contact line {index}.")
+            continue
+        seen_emails.add(normalized)
         contacts.append(
             EmailContact(
                 email=normalized,
-                display_name=display_name.strip() or normalized,
+                display_name=_single_line_text(display_name.strip()) or normalized,  # AUDIT-FIX(#5): Collapse control whitespace in display names before surfacing them in UI/readiness text.
             )
         )
     return ApprovedEmailContacts(tuple(contacts)), tuple(warnings)
 
 
-def _validate_email_address(value: str, *, label: str) -> str:
-    normalized = normalize_email(value)
+def _validate_email_address(value: object, *, label: str) -> str:
+    normalized = normalize_email(_coerce_text(value).strip())  # AUDIT-FIX(#5): Accept None/non-string config values and fail with a clean validation error instead of AttributeError.
     if not normalized or "@" not in normalized:
         raise ValueError(f"{label} must be a valid email address.")
     return normalized
 
 
-def _parse_positive_int(value: str, *, label: str) -> int:
+def _parse_positive_int(value: object, *, label: str, max_value: int | None = None) -> int:
+    text = _coerce_text(value).strip()  # AUDIT-FIX(#5): Parse integers from normalized text so invalid types do not crash the validator.
+    if not text:
+        raise ValueError(f"{label} must be a whole number.")
     try:
-        parsed = int(value.strip())
+        parsed = int(text)
     except (TypeError, ValueError):
         raise ValueError(f"{label} must be a whole number.") from None
     if parsed <= 0:
         raise ValueError(f"{label} must be greater than zero.")
+    if max_value is not None and parsed > max_value:
+        raise ValueError(f"{label} must be at most {max_value}.")  # AUDIT-FIX(#6): Enforce valid port ranges and other bounded integer settings during config validation.
     return parsed
 
 
-def _parse_bool(value: str, *, default: bool) -> bool:
-    normalized = value.strip().lower()
+def _parse_bool(value: object, *, default: bool, label: str = "Boolean value") -> bool:
+    normalized = _coerce_text(value).strip().lower()  # AUDIT-FIX(#5): Parse booleans from a tolerant text conversion path.
     if not normalized:
         return default
     if normalized in {"1", "true", "yes", "on"}:
         return True
     if normalized in {"0", "false", "no", "off"}:
         return False
-    raise ValueError(f"Boolean value is invalid: {value}")
+    raise ValueError(f"{label} is invalid: {value}")
 
 
-def _resolve_timezone(value: str):
+def _resolve_timezone(value: object) -> ZoneInfo:
     try:
-        return ZoneInfo(value.strip())
+        return ZoneInfo(_coerce_text(value).strip())
     except Exception:
         raise ValueError(f"Timezone is invalid: {value}") from None
 
 
-def _timezone_label(value) -> str:
+def _timezone_label(value: ZoneInfo) -> str:
     return getattr(value, "key", str(value))
 
 
@@ -412,27 +554,242 @@ def _resolve_env_path(project_root: Path, env_path: str | Path | None) -> Path:
 
 
 def _read_env_values(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
+    try:
+        if not path.exists():
+            return {}
+        if not path.is_file():
+            return {}
+        if path.stat().st_size > _MAX_ENV_FILE_BYTES:
+            return {}
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return {}  # AUDIT-FIX(#7): Fail closed to an empty env mapping if .env is missing, unreadable, or not a regular file.
 
     values: dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
             continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip('"').strip("'")
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()  # AUDIT-FIX(#7): Accept common dotenv syntax without introducing an extra dependency.
+        if "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        values[key] = _parse_env_value(raw_value)  # AUDIT-FIX(#7): Parse quotes and inline comments more safely than naive strip calls.
     return values
 
 
-def _fetch_ics_url(url: str) -> str:
-    request = Request(url, headers={"User-Agent": "Twinr/0.1"})
-    with urlopen(request, timeout=_ICS_URL_FETCH_TIMEOUT_S) as response:
-        payload = response.read(_MAX_ICS_DOWNLOAD_BYTES + 1)
+def _parse_env_value(raw_value: str) -> str:
+    value = raw_value.strip()
+    if not value:
+        return ""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    if " #" in value:
+        value = value.split(" #", 1)[0].rstrip()
+    return value
+
+
+def _resolve_allowed_calendar_root(project_root: Path, env_values: dict[str, str]) -> Path:
+    configured_root = _coerce_text(env_values.get(CALENDAR_ALLOWED_ROOT_ENV_KEY, "")).strip()
+    root_path = Path(configured_root) if configured_root else project_root
+    if not root_path.is_absolute():
+        root_path = (project_root / root_path).resolve()
+    else:
+        root_path = root_path.resolve()
+    if not root_path.exists():
+        raise ValueError(f"Configured calendar root does not exist: {root_path}")
+    if not root_path.is_dir():
+        raise ValueError(f"Configured calendar root must be a directory: {root_path}")
+    return root_path
+
+
+def _resolve_local_calendar_file(
+    project_root: Path,
+    *,
+    source_value: str,
+    allowed_calendar_root: Path,
+) -> tuple[Path, tuple[str, ...]]:
+    raw_path = Path(source_value)
+    candidate_path = raw_path if raw_path.is_absolute() else (project_root / raw_path)
+    try:
+        resolved_path = candidate_path.resolve(strict=True)
+    except FileNotFoundError:
+        raise ValueError(f"Configured ICS file does not exist: {candidate_path}") from None
+    except OSError:
+        raise ValueError(f"Configured ICS file is not readable: {candidate_path}") from None
+
+    if not resolved_path.is_file():
+        raise ValueError(f"Configured ICS file must be a regular file: {resolved_path}")  # AUDIT-FIX(#1): Reject directories and device nodes early.
+    try:
+        relative_path = resolved_path.relative_to(allowed_calendar_root)
+    except ValueError:
+        raise ValueError(
+            f"Configured ICS file must stay inside {allowed_calendar_root}."
+        ) from None  # AUDIT-FIX(#1): Block traversal and arbitrary absolute-path reads outside the configured allowlist root.
+
+    size_bytes = resolved_path.stat().st_size
+    if size_bytes > _MAX_ICS_DOWNLOAD_BYTES:
+        raise ValueError(
+            f"Configured ICS file is too large ({size_bytes} bytes)."
+        )  # AUDIT-FIX(#1): Apply the same size cap to local calendar files that already exists for remote feeds.
+    return resolved_path, relative_path.parts
+
+
+def _read_local_ics_text(allowed_calendar_root: Path, relative_parts: tuple[str, ...]) -> str:
+    root_fd = None
+    current_fd = None
+    file_fd = None
+    try:
+        root_fd = os.open(
+            allowed_calendar_root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        current_fd = root_fd
+        for part in relative_parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current_fd,
+            )
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+
+        file_fd = os.open(
+            relative_parts[-1],
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=current_fd,
+        )  # AUDIT-FIX(#1): Traverse every path component from the allowlisted root with O_NOFOLLOW to block symlink swaps at load time.
+        file_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise RuntimeError("Configured ICS file is not a regular file.")
+        if file_stat.st_size > _MAX_ICS_DOWNLOAD_BYTES:
+            raise RuntimeError("Configured ICS file is too large.")
+
+        with os.fdopen(file_fd, "rb", closefd=True) as handle:
+            file_fd = None
+            payload = handle.read(_MAX_ICS_DOWNLOAD_BYTES + 1)
         if len(payload) > _MAX_ICS_DOWNLOAD_BYTES:
-            raise RuntimeError("Calendar feed is too large.")
-        charset = response.headers.get_content_charset() or "utf-8"
-    return payload.decode(charset, errors="replace")
+            raise RuntimeError("Configured ICS file is too large.")
+        return payload.decode("utf-8", errors="replace")
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RuntimeError("Configured ICS file path contains a symlink.") from None
+        raise RuntimeError("Configured ICS file could not be read.") from exc
+    finally:
+        for fd in {fd for fd in (file_fd, current_fd, root_fd) if fd is not None}:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _fetch_ics_url(url: str) -> str:
+    opener = build_opener(_NoRedirectHandler())
+    current_url = url
+    for _ in range(_MAX_ICS_URL_REDIRECTS + 1):
+        current_url = _validate_remote_calendar_url(current_url)  # AUDIT-FIX(#2): Revalidate every URL hop before any outbound request is sent.
+        request = Request(
+            current_url,
+            headers={
+                "User-Agent": _ICS_HTTP_USER_AGENT,
+                "Accept": "text/calendar, text/plain;q=0.9, */*;q=0.1",
+            },
+        )
+        try:
+            with opener.open(request, timeout=_ICS_URL_FETCH_TIMEOUT_S) as response:
+                content_length = response.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        declared_size = int(content_length.strip())
+                    except ValueError:
+                        raise RuntimeError("Calendar feed size header is invalid.") from None
+                    if declared_size < 0:
+                        raise RuntimeError("Calendar feed size header is invalid.")
+                    if declared_size > _MAX_ICS_DOWNLOAD_BYTES:
+                        raise RuntimeError("Calendar feed is too large.")  # AUDIT-FIX(#2): Reject oversized responses before reading them into memory.
+                payload = response.read(_MAX_ICS_DOWNLOAD_BYTES + 1)
+                if len(payload) > _MAX_ICS_DOWNLOAD_BYTES:
+                    raise RuntimeError("Calendar feed is too large.")
+                charset = response.headers.get_content_charset() or "utf-8"
+                try:
+                    return payload.decode(charset, errors="replace")
+                except LookupError:
+                    return payload.decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            if exc.code not in {301, 302, 303, 307, 308}:
+                raise RuntimeError("Calendar feed could not be downloaded.") from exc
+            location = exc.headers.get("Location", "").strip()
+            if not location:
+                raise RuntimeError("Calendar feed redirect is missing a target URL.") from exc
+            current_url = urljoin(current_url, location)
+        except (URLError, OSError):
+            raise RuntimeError("Calendar feed could not be downloaded.") from None
+    raise RuntimeError("Calendar feed redirected too many times.")
+
+
+def _validate_remote_calendar_url(url: str) -> str:
+    text = _coerce_text(url).strip()
+    _validate_calendar_url_text(text)
+    hostname = urlsplit(text).hostname or ""
+    if not hostname:
+        raise RuntimeError("Calendar URL hostname is invalid.")
+    _assert_public_remote_host(hostname)  # AUDIT-FIX(#2): Block loopback, link-local, and RFC1918/private targets to close the SSRF hole.
+    return text
+
+
+def _validate_calendar_url_text(url: str) -> None:
+    if not url:
+        raise ValueError("Calendar URL is required.")
+    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in url):
+        raise ValueError("Calendar URL must not contain whitespace or control characters.")  # AUDIT-FIX(#8): Reject malformed URLs with embedded whitespace/control characters early.
+    parts = urlsplit(url)
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc:
+        raise ValueError("Calendar URL must start with http:// or https://.")
+    try:
+        _ = parts.port
+    except ValueError:
+        raise ValueError("Calendar URL port is invalid.") from None
+    if parts.username or parts.password or parts.query or parts.fragment:
+        raise ValueError(
+            "Calendar URL must not include embedded credentials, query tokens, or fragments. "
+            "Use a plain feed URL or a local ICS file."
+        )
+
+
+def _assert_public_remote_host(hostname: str) -> None:
+    literal_ip = _parse_ip_address(hostname)
+    if literal_ip is not None:
+        if not literal_ip.is_global:
+            raise RuntimeError("Calendar URL must point to a public internet host.")
+        return
+
+    try:
+        address_info = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise RuntimeError("Calendar URL hostname could not be resolved.") from None
+
+    if not address_info:
+        raise RuntimeError("Calendar URL hostname could not be resolved.")
+
+    for _, _, _, _, sockaddr in address_info:
+        candidate_ip = _parse_ip_address(sockaddr[0])
+        if candidate_ip is None or not candidate_ip.is_global:
+            raise RuntimeError("Calendar URL must point to a public internet host.")
+
+
+def _parse_ip_address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(value)
+    except ValueError:
+        return None
 
 
 def _display_url(url: str) -> str:
@@ -442,3 +799,15 @@ def _display_url(url: str) -> str:
     if parts.port is not None:
         netloc = f"{hostname}:{parts.port}"
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def _coerce_text(value: object | None, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _single_line_text(value: str) -> str:
+    return " ".join(value.split())

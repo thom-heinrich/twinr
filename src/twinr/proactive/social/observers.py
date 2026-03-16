@@ -1,3 +1,9 @@
+"""Collect bounded audio and vision observations for social triggers.
+
+This module wraps Twinr camera and ambient-audio adapters, normalizes their
+outputs, and returns conservative snapshots when capture or model calls fail.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -44,6 +50,8 @@ _REQUIRED_VISION_KEYS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class ProactiveVisionSnapshot:
+    """Capture one normalized vision observation and its response metadata."""
+
     observation: SocialVisionObservation
     response_text: str
     captured_at: float | None = None
@@ -57,6 +65,8 @@ class ProactiveVisionSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class ProactiveAudioSnapshot:
+    """Capture one normalized audio observation and optional sample data."""
+
     observation: SocialAudioObservation
     sample: AmbientAudioLevelSample | None = None
     pcm_bytes: bytes | None = None
@@ -65,7 +75,11 @@ class ProactiveAudioSnapshot:
 
 
 class NullAudioObservationProvider:
+    """Return a conservative silent audio observation."""
+
     def observe(self) -> ProactiveAudioSnapshot:
+        """Return one silent audio snapshot when audio sensing is disabled."""
+
         return ProactiveAudioSnapshot(
             observation=SocialAudioObservation(  # AUDIT-FIX(#3): return an explicit conservative null observation.
                 speech_detected=False,
@@ -75,6 +89,8 @@ class NullAudioObservationProvider:
 
 
 class AmbientAudioObservationProvider:
+    """Sample ambient audio and derive bounded speech and distress observations."""
+
     def __init__(
         self,
         *,
@@ -87,6 +103,8 @@ class AmbientAudioObservationProvider:
         distress_peak_threshold: int | None = None,
         lock_timeout_s: float = _DEFAULT_AUDIO_LOCK_TIMEOUT_S,
     ) -> None:
+        """Initialize one audio observer from a sampler and detection thresholds."""
+
         self.sampler = sampler
         self.audio_lock = audio_lock or Lock()
         chunk_ms = _coerce_positive_int(getattr(sampler, "chunk_ms", 20), default=20)
@@ -99,6 +117,8 @@ class AmbientAudioObservationProvider:
         self.lock_timeout_s = _coerce_non_negative_float(lock_timeout_s, default=_DEFAULT_AUDIO_LOCK_TIMEOUT_S, minimum=0.05)
 
     def observe(self) -> ProactiveAudioSnapshot:
+        """Capture one audio window and convert it into one observation snapshot."""
+
         if not self.audio_lock.acquire(timeout=self.lock_timeout_s):  # AUDIT-FIX(#3): bound lock wait so one stalled reader does not wedge the device indefinitely.
             logger.warning(
                 "Audio observation skipped because the audio lock could not be acquired within %.2fs.",
@@ -168,6 +188,8 @@ class AmbientAudioObservationProvider:
 
 
 class OpenAIVisionObservationProvider:
+    """Capture one still frame and classify it for social-trigger use."""
+
     def __init__(
         self,
         *,
@@ -181,6 +203,8 @@ class OpenAIVisionObservationProvider:
         circuit_breaker_threshold: int = _DEFAULT_VISION_CIRCUIT_BREAKER_THRESHOLD,
         circuit_breaker_cooldown_s: float = _DEFAULT_VISION_CIRCUIT_BREAKER_COOLDOWN_S,
     ) -> None:
+        """Initialize one vision observer with bounded lock, timeout, and retry policy."""
+
         self.backend = backend
         self.camera = camera
         self.camera_lock = camera_lock or Lock()
@@ -221,6 +245,8 @@ class OpenAIVisionObservationProvider:
         self._circuit_open_until = 0.0
 
     def observe(self) -> ProactiveVisionSnapshot:
+        """Capture and classify one frame, falling back to unknown on failure."""
+
         if self._is_circuit_open():  # AUDIT-FIX(#2): short-circuit repeated backend failures instead of hammering a dead dependency.
             logger.warning("Vision observation skipped because the circuit breaker is open.")
             return self._fallback_snapshot(response_text=_VISION_OBSERVATION_SKIPPED_TEXT)
@@ -273,6 +299,8 @@ class OpenAIVisionObservationProvider:
         )
 
     def _capture_image(self) -> tuple[OpenAIImageInput, str | None, str | None, float]:
+        """Capture one still frame and package it for the backend."""
+
         with tempfile.TemporaryDirectory(prefix="twinr-proactive-") as temp_dir:  # AUDIT-FIX(#1): capture into a private temporary directory to avoid filename collisions and symlink clobbering.
             capture_path = os.path.join(temp_dir, _SANITIZED_CAPTURE_FILENAME)
             if not self.camera_lock.acquire(timeout=self.lock_timeout_s):
@@ -301,6 +329,8 @@ class OpenAIVisionObservationProvider:
             )
 
     def _call_backend_with_retries(self, image: OpenAIImageInput):
+        """Call the vision backend with bounded retries."""
+
         backend_method = self.backend.respond_to_images_with_metadata
         backend_kwargs = _supported_backend_kwargs(
             backend_method,
@@ -336,16 +366,22 @@ class OpenAIVisionObservationProvider:
         raise last_error
 
     def _is_circuit_open(self) -> bool:
+        """Return whether the vision circuit breaker is currently open."""
+
         now = time.monotonic()
         with self._failure_state_lock:
             return now < self._circuit_open_until
 
     def _record_success(self) -> None:
+        """Reset failure state after one successful vision call."""
+
         with self._failure_state_lock:
             self._consecutive_failures = 0
             self._circuit_open_until = 0.0
 
     def _record_failure(self) -> None:
+        """Record one failed vision attempt and open the circuit if needed."""
+
         now = time.monotonic()
         with self._failure_state_lock:
             self._consecutive_failures += 1
@@ -367,6 +403,8 @@ class OpenAIVisionObservationProvider:
         request_id: str | None = None,
         model: str | None = None,
     ) -> ProactiveVisionSnapshot:
+        """Build one conservative unknown-vision snapshot."""
+
         return ProactiveVisionSnapshot(
             observation=_unknown_vision_observation(),
             response_text=response_text,
@@ -381,6 +419,8 @@ class OpenAIVisionObservationProvider:
 
 
 def parse_vision_observation_text(text: str) -> SocialVisionObservation:
+    """Parse one structured vision-classifier response into an observation."""
+
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Vision classifier response must be a non-empty string.")
 
@@ -415,6 +455,8 @@ def parse_vision_observation_text(text: str) -> SocialVisionObservation:
 
 
 def _parse_bool(value: str | None) -> bool:
+    """Parse one ``yes`` or ``no`` style token from classifier output."""
+
     normalized_value = _normalize_token(value)
     if normalized_value in _TRUE_BOOL_TOKENS:
         return True
@@ -426,6 +468,8 @@ def _parse_bool(value: str | None) -> bool:
 
 
 def _parse_pose(value: str | None) -> SocialBodyPose:
+    """Parse one classifier pose token into ``SocialBodyPose``."""
+
     normalized_value = _normalize_token(value)
     if normalized_value == "upright":
         return SocialBodyPose.UPRIGHT
@@ -442,6 +486,8 @@ def _parse_pose(value: str | None) -> SocialBodyPose:
 
 # AUDIT-FIX(#5): shared coercion helpers keep provider thresholds predictable under bad config or driver metadata.
 def _coerce_positive_int(value: object, *, default: int) -> int:
+    """Coerce one value to a positive integer with fallback."""
+
     try:
         coerced = int(value)
     except (TypeError, ValueError):
@@ -450,6 +496,8 @@ def _coerce_positive_int(value: object, *, default: int) -> int:
 
 
 def _coerce_non_negative_int(value: object, *, default: int) -> int:
+    """Coerce one value to a non-negative integer with fallback."""
+
     try:
         coerced = int(value)
     except (TypeError, ValueError):
@@ -458,6 +506,8 @@ def _coerce_non_negative_int(value: object, *, default: int) -> int:
 
 
 def _coerce_optional_non_negative_int(value: object | None) -> int | None:
+    """Coerce one optional value to a non-negative integer."""
+
     if value is None:
         return None
     try:
@@ -468,6 +518,8 @@ def _coerce_optional_non_negative_int(value: object | None) -> int | None:
 
 
 def _coerce_optional_positive_int(value: object | None) -> int | None:
+    """Coerce one optional value to a positive integer."""
+
     if value is None:
         return None
     try:
@@ -478,6 +530,8 @@ def _coerce_optional_positive_int(value: object | None) -> int | None:
 
 
 def _coerce_non_negative_float(value: object, *, default: float, minimum: float = 0.0) -> float:
+    """Coerce one value to a finite non-negative float."""
+
     try:
         coerced = float(value)
     except (TypeError, ValueError):
@@ -488,11 +542,15 @@ def _coerce_non_negative_float(value: object, *, default: float, minimum: float 
 
 
 def _clamp_ratio(value: object, *, default: float = 0.0) -> float:
+    """Clamp one ratio-like value into ``[0.0, 1.0]``."""
+
     coerced = _coerce_non_negative_float(value, default=default, minimum=0.0)
     return min(1.0, coerced)
 
 
 def _normalize_token(value: str | None) -> str:
+    """Normalize one classifier token for parsing."""
+
     if value is None:
         return ""
     normalized = value.strip().strip("`").strip().strip('"').strip("'").strip().lower()
@@ -505,6 +563,8 @@ def _supported_backend_kwargs(
     timeout_s: float | None,
     disable_inner_retries: bool,
 ) -> dict[str, float | int]:
+    """Detect timeout and retry kwargs supported by one backend method."""
+
     try:
         parameters = inspect.signature(method).parameters
     except (TypeError, ValueError):
@@ -525,6 +585,8 @@ def _supported_backend_kwargs(
 
 
 def _unknown_vision_observation() -> SocialVisionObservation:
+    """Return the conservative unknown vision observation."""
+
     return SocialVisionObservation(
         person_visible=False,
         looking_toward_device=False,
@@ -535,6 +597,8 @@ def _unknown_vision_observation() -> SocialVisionObservation:
 
 
 def _unavailable_audio_snapshot() -> ProactiveAudioSnapshot:
+    """Return the conservative unavailable-audio snapshot."""
+
     return ProactiveAudioSnapshot(
         observation=SocialAudioObservation(
             speech_detected=False,

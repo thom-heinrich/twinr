@@ -1,3 +1,10 @@
+"""Match wakeword transcripts and detector labels against configured phrases.
+
+This module normalizes phrase lists, generates transcription prompts, filters
+prompt contamination, and returns structured match results that preserve any
+spoken text remaining after the wakeword.
+"""
+
 from __future__ import annotations
 
 import math
@@ -65,6 +72,8 @@ _FALLBACK_PROMPT_NAMES = (
 
 @dataclass(frozen=True, slots=True)
 class WakewordMatch:
+    """Describe one wakeword detection or rejection result."""
+
     detected: bool
     transcript: str
     matched_phrase: str | None = None
@@ -76,6 +85,8 @@ class WakewordMatch:
 
 
 class WakewordPhraseSpotter:
+    """Transcribe short audio windows and match configured wakeword phrases."""
+
     def __init__(
         self,
         *,
@@ -90,6 +101,8 @@ class WakewordPhraseSpotter:
         self.min_prefix_ratio = _coerce_min_prefix_ratio(min_prefix_ratio)  # AUDIT-FIX(#3): Parse malformed, NaN, and infinite config safely.
 
     def detect(self, capture: AmbientAudioCaptureWindow) -> WakewordMatch:
+        """Transcribe one capture and return the best wakeword match."""
+
         if not self.phrases:  # AUDIT-FIX(#6): Short-circuit invalid configuration instead of making STT calls that can never match.
             return WakewordMatch(detected=False, transcript="", normalized_transcript="", backend="stt")
         primary_prompt = wakeword_primary_prompt(self.phrases)
@@ -109,6 +122,8 @@ class WakewordPhraseSpotter:
         return self.match_transcript(transcript)
 
     def match_transcript(self, transcript: str) -> WakewordMatch:
+        """Match a transcript against the configured wakeword phrases."""
+
         return match_wakeword_transcript(
             transcript,
             phrases=self.phrases,
@@ -154,6 +169,8 @@ class WakewordPhraseSpotter:
 
 
 def wakeword_primary_prompt(phrases: tuple[str, ...] | list[str]) -> str | None:
+    """Build a transcription prompt from the configured wakeword names."""
+
     prompt_words: list[str] = []
     seen_phrases: set[str] = set()
     seen_words: set[str] = set()
@@ -184,6 +201,8 @@ def match_wakeword_transcript(
     detector_label: str | None = None,
     score: float | None = None,
 ) -> WakewordMatch:
+    """Match a transcript prefix against configured wakeword phrases."""
+
     normalized_phrases = _normalize_phrases(phrases)  # AUDIT-FIX(#6): Use the same canonical phrase preparation everywhere.
     cleaned_transcript = _clean_text(transcript)
     original_words, normalized_words = _normalized_word_lists(
@@ -235,6 +254,8 @@ def phrase_from_detector_label(
     *,
     phrases: tuple[str, ...] | list[str],
 ) -> str | None:
+    """Resolve one detector label back to a configured wakeword phrase."""
+
     normalized_label = normalize_detector_label(label)
     if not normalized_label:
         return None
@@ -245,6 +266,8 @@ def phrase_from_detector_label(
 
 
 def normalize_detector_label(label: str | None) -> str:
+    """Normalize an openWakeWord detector label into phrase form."""
+
     raw_label = _clean_text(label)
     if not raw_label:
         return ""

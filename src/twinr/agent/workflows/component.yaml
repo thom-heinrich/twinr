@@ -1,0 +1,88 @@
+schema_version: 1
+name: workflows
+path: src/twinr/agent/workflows
+kind: python-package
+visibility: internal
+summary: Orchestrate the classic, realtime, and streaming Twinr hardware loops plus their bounded speech, print, and feedback helpers.
+owned_concerns:
+  - Orchestrate button, wakeword, and proactive entry points for Twinr hardware loops
+  - Coordinate live conversation sessions, print delivery, and bounded speech output
+  - Share workflow-local support helpers for feedback tones, reference images, and background delivery
+  - Expose compatibility workflow entry points for top-level imports and older proactive-trigger paths
+out_of_scope:
+  - Runtime state, memory, reminder, or automation store implementations
+  - Provider transport adapters, prompt authoring, or tool schema definitions
+  - Hardware driver implementations for audio, camera, printer, buttons, or display
+  - Web dashboard flows or operator-facing setup scripts
+files:
+  - path: __init__.py
+    role: Lazy workflow package export surface
+    exports:
+      - SocialTriggerDecision
+      - SocialTriggerEngine
+      - TwinrHardwareLoop
+      - TwinrRealtimeHardwareLoop
+      - TwinrStreamingHardwareLoop
+  - path: runner.py
+    role: Classic press-to-talk hardware loop orchestration
+    exports:
+      - TwinrHardwareLoop
+  - path: realtime_runner.py
+    role: Realtime session loop with wakeword and print-lane orchestration
+    exports:
+      - TwinrRealtimeHardwareLoop
+  - path: streaming_runner.py
+    role: Streaming loop with dual-lane tools and speculative speech
+    exports:
+      - TwinrStreamingHardwareLoop
+  - path: realtime_runner_background.py
+    role: Reminder, automation, and proactive background-delivery mixin
+    exports:
+      - TwinrRealtimeBackgroundMixin
+  - path: realtime_runner_support.py
+    role: Shared emit, media, config, and feedback helpers
+    exports:
+      - TwinrRealtimeSupportMixin
+  - path: realtime_runner_tools.py
+    role: Thin realtime tool-callback delegate mixin
+    exports:
+      - TwinrRealtimeToolDelegatesMixin
+  - path: speech_output.py
+    role: Interruptible streamed TTS playback queue
+    exports:
+      - InterruptibleSpeechOutput
+      - StreamingTextToSpeechProviderLike
+      - WaveAudioPlayerLike
+  - path: print_lane.py
+    role: Single-job background print lane
+    exports:
+      - PrintLaneRequest
+      - TwinrPrintLane
+  - path: working_feedback.py
+    role: Bounded processing, answering, and printing tone loops
+    exports:
+      - WorkingFeedbackKind
+      - WorkingFeedbackProfile
+      - start_working_feedback_loop
+  - path: social_triggers.py
+    role: Compatibility wrapper for proactive trigger imports
+compatibility_reexports:
+  - path: src/twinr/runner.py
+    mode: star
+  - path: src/twinr/realtime_runner.py
+    mode: star
+primary_callers:
+  - path: src/twinr/__main__.py
+  - path: src/twinr/runner.py
+  - path: src/twinr/realtime_runner.py
+  - path: src/twinr/agent/tools/handlers/output.py
+  - path: src/twinr/agent/tools/runtime/dual_lane_loop.py
+tests:
+  - path: test/test_main.py
+  - path: test/test_runner.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_streaming_runner.py
+  - path: test/test_speech_output.py
+  - path: test/test_openai_realtime.py
+  - path: test/test_longterm_multimodal.py
+  - path: test/run_pi_tool_matrix.py

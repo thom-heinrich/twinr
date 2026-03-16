@@ -1,3 +1,10 @@
+"""Reflect over recent long-term memory state.
+
+This module promotes repeated candidate facts, creates bounded person-thread
+summaries, and optionally compiles midterm packets from the most recent
+memory window without blocking the main memory pipeline.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable  # AUDIT-FIX(#5): Robustly coerce list-like payload fields without exploding strings into character-tuples.
@@ -157,6 +164,20 @@ def _normalize_midterm_attributes(value: object) -> dict[str, str] | None:
 
 @dataclass(frozen=True, slots=True)
 class LongTermMemoryReflector:
+    """Coordinate post-consolidation reflection and optional midterm output.
+
+    Attributes:
+        min_support_count_for_promotion: Support count required before a
+            repeated candidate or uncertain memory can auto-promote.
+        min_support_count_for_thread_summary: Evidence count required before
+            a person-thread summary can be created.
+        program: Optional provider-backed midterm reflection compiler.
+        midterm_packet_limit: Maximum number of midterm packets to accept.
+        reflection_window_size: Maximum number of recent memories to include
+            when compiling midterm packets.
+        timezone_name: Local timezone used to normalize naive datetimes.
+    """
+
     min_support_count_for_promotion: int = 2
     min_support_count_for_thread_summary: int = 2
     program: LongTermStructuredReflectionProgram | None = None
@@ -190,6 +211,17 @@ class LongTermMemoryReflector:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermMemoryReflector":
+        """Build a reflector from Twinr configuration.
+
+        Args:
+            config: Runtime configuration containing reflection thresholds,
+                timezone settings, and optional midterm compiler settings.
+
+        Returns:
+            A configured reflector with bounded numeric settings and an
+            optional midterm program when that feature initializes cleanly.
+        """
+
         program: LongTermStructuredReflectionProgram | None = None
         if config.long_term_memory_midterm_enabled:
             try:
@@ -220,6 +252,17 @@ class LongTermMemoryReflector:
         *,
         objects: tuple[LongTermMemoryObjectV1, ...],
     ) -> LongTermReflectionResultV1:
+        """Reflect over the current long-term memory snapshot.
+
+        Args:
+            objects: Current long-term memory objects to canonicalize and
+                inspect for promotions, summaries, and midterm compilation.
+
+        Returns:
+            A reflection result containing promoted objects, newly created
+            summaries, and any accepted midterm packets.
+        """
+
         reflected: list[LongTermMemoryObjectV1] = []
         created_summaries: list[LongTermMemoryObjectV1] = []
         midterm_packets: list[LongTermMidtermPacketV1] = []

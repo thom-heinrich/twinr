@@ -1,3 +1,5 @@
+"""Define response value objects returned by the Groq provider adapters."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,6 +9,8 @@ from twinr.ops.usage import TokenUsage
 
 @dataclass(frozen=True, slots=True)
 class GroqTextResponse:
+    """Carry normalized Groq text output and request metadata for callers."""
+
     text: str
     response_id: str | None = None
     request_id: str | None = None

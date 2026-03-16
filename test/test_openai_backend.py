@@ -226,7 +226,9 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(request["model"], "gpt-5.2")
         self.assertEqual(request["reasoning"], {"effort": "medium"})
         self.assertFalse(request["store"])
-        self.assertEqual(request["prompt_cache_key"], "twinr:response:gpt-5.2:de")
+        self.assertTrue(request["prompt_cache_key"].startswith("twinr:response:"))
+        self.assertLessEqual(len(request["prompt_cache_key"]), 64)
+        self.assertNotIn("gpt-5.2:de", request["prompt_cache_key"])
         self.assertIn(
             "All user-facing spoken and written replies for this turn must be in German.",
             request["instructions"],
@@ -237,7 +239,7 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(request["input"][0]["role"], "system")
         self.assertEqual(request["input"][0]["content"][0]["type"], "input_text")
         self.assertEqual(request["input"][1]["role"], "assistant")
-        self.assertEqual(request["input"][1]["content"][0]["type"], "output_text")
+        self.assertEqual(request["input"][1]["content"][0]["type"], "input_text")
         self.assertEqual(request["input"][2]["role"], "user")
         self.assertEqual(request["input"][2]["content"][0]["type"], "input_text")
 
@@ -435,8 +437,8 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(request["model"], "gpt-5.2")
         self.assertEqual(request["reasoning"], {"effort": "low"})
         self.assertIn("A stored Twinr reminder is due now.", request["input"][0]["content"][0]["text"])
-        self.assertIn("Reminder summary: Arzttermin", request["input"][0]["content"][0]["text"])
-        self.assertIn("Reminder details: Bei Dr. Meyer", request["input"][0]["content"][0]["text"])
+        self.assertIn('Reminder summary: "Arzttermin"', request["input"][0]["content"][0]["text"])
+        self.assertIn('Reminder details: "Bei Dr. Meyer"', request["input"][0]["content"][0]["text"])
         self.assertIn("speaking a due reminder", request["instructions"])
         self.assertIn("All user-facing spoken and written replies for this turn must be in German.", request["instructions"])
 
@@ -458,7 +460,7 @@ class OpenAIBackendTests(unittest.TestCase):
         request = self.responses.calls[-1]
         self.assertEqual(request["model"], "gpt-5.2")
         self.assertIn("short proactive sentence", request["instructions"])
-        self.assertIn("Trigger id: showing_intent", request["input"][-1]["content"][0]["text"])
+        self.assertIn('Trigger id: "showing_intent"', request["input"][-1]["content"][0]["text"])
         self.assertIn(
             "Recent proactive wording to avoid repeating too closely",
             request["input"][-1]["content"][0]["text"],
@@ -483,7 +485,8 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(response.request_id, "req_stream")
         self.assertFalse(response.used_web_search)
         self.assertEqual(self.responses.stream_calls[0]["model"], "gpt-5.2")
-        self.assertEqual(self.responses.stream_calls[0]["prompt_cache_key"], "twinr:response_stream:gpt-5.2:de")
+        self.assertTrue(self.responses.stream_calls[0]["prompt_cache_key"].startswith("twinr:response_stream:"))
+        self.assertLessEqual(len(self.responses.stream_calls[0]["prompt_cache_key"]), 64)
 
     def test_search_live_info_uses_web_search_and_extracts_sources(self) -> None:
         self.responses.output_text = "Morgen in Schwarzenbek 11 Grad, leichter Regen."
@@ -524,10 +527,8 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(request["include"], ["web_search_call.action.sources"])
         self.assertEqual(request["tools"][0]["type"], "web_search")
         self.assertEqual(request["tools"][0]["search_context_size"], "medium")
-        self.assertEqual(
-            request["prompt_cache_key"],
-            "twinr:search:gpt-5.2-chat-latest:de",
-        )
+        self.assertTrue(request["prompt_cache_key"].startswith("twinr:search:"))
+        self.assertLessEqual(len(request["prompt_cache_key"]), 64)
         self.assertEqual(request["reasoning"], {"effort": "low"})
         self.assertEqual(request["max_output_tokens"], 160)
         self.assertIn("Location hint: Schwarzenbek", request["input"][-1]["content"][0]["text"])
@@ -651,7 +652,20 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(result.model, "gpt-4o-mini-search-preview")
         self.assertEqual(result.token_usage.total_tokens, 76)
         self.assertEqual(self.client.chat.completions.calls[0]["model"], "gpt-4o-mini-search-preview")
-        self.assertEqual(self.client.chat.completions.calls[0]["web_search_options"], {})
+        self.assertEqual(
+            self.client.chat.completions.calls[0]["web_search_options"],
+            {
+                "search_context_size": "medium",
+                "user_location": {
+                    "type": "approximate",
+                    "approximate": {
+                        "city": "Schwarzenbek",
+                        "country": "DE",
+                        "timezone": "Europe/Berlin",
+                    },
+                },
+            },
+        )
         self.assertEqual(self.client.chat.completions.calls[0]["messages"][0]["role"], "system")
         prompt = self.client.chat.completions.calls[0]["messages"][-1]["content"]
         self.assertIn("Target date (must match): 2026-03-16", prompt)
@@ -659,7 +673,7 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertIn("2026-03-16", prompt)
         self.assertEqual(self.responses.calls, [])
 
-    def test_search_live_info_adds_iso_target_query_for_explicit_date_questions(self) -> None:
+    def test_search_live_info_keeps_target_date_for_explicit_date_questions(self) -> None:
         backend = OpenAIBackend(
             config=replace(self.config, openai_search_model="gpt-4o-mini-search-preview"),
             client=self.client,
@@ -673,8 +687,7 @@ class OpenAIBackendTests(unittest.TestCase):
 
         prompt = self.client.chat.completions.calls[-1]["messages"][-1]["content"]
         self.assertIn("Target date (must match): 2026-03-16", prompt)
-        self.assertIn("Equivalent explicit-date query:", prompt)
-        self.assertIn("target date 2026-03-16", prompt)
+        self.assertNotIn("Equivalent explicit-date query:", prompt)
 
     def test_compose_print_job_uses_context_and_request_source(self) -> None:
         self.responses.output_text = "TERMINE\nMontag 14 Uhr\nAdresse Praxis"
@@ -735,8 +748,8 @@ class OpenAIBackendTests(unittest.TestCase):
             request_source="button",
         )
 
-        self.assertEqual(response.text, "Montag 14 Uhr\nDr. Meyer, Hamburg")
-        self.assertEqual(len(self.responses.calls), 2)
+        self.assertEqual(response.text, "Montag 14 Uhr")
+        self.assertEqual(len(self.responses.calls), 1)
 
     def test_compose_print_job_falls_back_when_composer_returns_empty_output(self) -> None:
         self.responses.queued_output_texts = ["", "Zahnarzt Montag 14 Uhr"]
@@ -782,7 +795,10 @@ class OpenAIBackendTests(unittest.TestCase):
             else:
                 sys.modules["openai"] = original_module
 
-        self.assertEqual(captured_kwargs, {"api_key": "sk-proj-example"})
+        self.assertEqual(
+            captured_kwargs,
+            {"api_key": "sk-proj-example", "timeout": 45.0, "max_retries": 1},
+        )
 
     def test_format_for_print_uses_low_reasoning_without_web_search(self) -> None:
         self.backend.format_for_print("This is a longer answer that should be compressed.")

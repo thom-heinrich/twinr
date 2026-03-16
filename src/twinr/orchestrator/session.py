@@ -1,3 +1,10 @@
+"""Bridge Twinr's dual-lane tool loop into the edge-orchestrator transport.
+
+This module turns websocket requests into local tool-loop turns, emits ack/text
+deltas back to the client, and correlates remote tool calls with returned
+results.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -38,6 +45,8 @@ _DEFAULT_TURN_FAILURE_TEXT = "Sorry, I had trouble finishing that. Please try ag
 
 
 def _read_positive_float_env(name: str, default: float) -> float:
+    """Read a positive float from the environment or fall back to ``default``."""
+
     raw_value = os.getenv(name)
     if raw_value is None:
         return default
@@ -53,11 +62,15 @@ def _read_positive_float_env(name: str, default: float) -> float:
 
 
 def _read_turn_failure_text() -> str:
+    """Read the senior-facing fallback phrase for orchestrator failures."""
+
     text = os.getenv(_TURN_FAILURE_TEXT_ENV, _DEFAULT_TURN_FAILURE_TEXT).strip()  # AUDIT-FIX(#6): Allow deployment-specific, senior-safe fallback phrasing.
     return text or _DEFAULT_TURN_FAILURE_TEXT
 
 
 def _normalize_tool_names(tool_names: Sequence[str] | None) -> tuple[str, ...]:
+    """Normalize and deduplicate the tool names exposed to the remote client."""
+
     raw_tool_names = realtime_tool_names() if tool_names is None else tuple(tool_names)  # AUDIT-FIX(#2): Preserve an explicit empty tool list instead of re-enabling defaults.
     normalized: list[str] = []
     seen: set[str] = set()
@@ -72,6 +85,8 @@ def _normalize_tool_names(tool_names: Sequence[str] | None) -> tuple[str, ...]:
 
 
 def _assert_not_running_on_event_loop_thread() -> None:
+    """Refuse blocking bridge execution on an active asyncio event-loop thread."""
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -82,6 +97,8 @@ def _assert_not_running_on_event_loop_thread() -> None:
 
 
 def _compose_failure_text(streamed_chunks: Sequence[str], fallback_text: str) -> str:
+    """Append the fallback phrase to any already-streamed partial text."""
+
     streamed_text = "".join(streamed_chunks)
     if not streamed_text:
         return fallback_text
@@ -91,6 +108,8 @@ def _compose_failure_text(streamed_chunks: Sequence[str], fallback_text: str) ->
 
 
 def _build_error_turn_complete_event(text: str) -> OrchestratorTurnCompleteEvent:
+    """Build a well-formed completion event for a failed turn."""
+
     return OrchestratorTurnCompleteEvent(
         text=text,
         rounds=0,
@@ -105,15 +124,23 @@ def _build_error_turn_complete_event(text: str) -> OrchestratorTurnCompleteEvent
 
 
 class _UnusedSupervisorProvider:
+    """Guard the dual-lane loop from calling the wrong supervisor API."""
+
     def start_turn_streaming(self, *args, **kwargs):  # pragma: no cover - should not run
+        """Reject streaming supervisor calls on the structured decision path."""
+
         raise RuntimeError("Structured supervisor decision path should not call the tool-loop supervisor provider")
 
     def continue_turn_streaming(self, *args, **kwargs):  # pragma: no cover - should not run
+        """Reject continued supervisor streaming on the structured decision path."""
+
         raise RuntimeError("Structured supervisor decision path should not call the tool-loop supervisor provider")
 
 
 @dataclass
 class _PendingToolCall:
+    """Track one in-flight remote tool request awaiting a result."""
+
     request: OrchestratorToolRequest
     done: Event
     output: dict[str, Any] | None = None
@@ -121,6 +148,8 @@ class _PendingToolCall:
 
 
 class RemoteToolBridge:
+    """Correlate local tool calls with remote websocket tool results."""
+
     def __init__(
         self,
         emit_event: Callable[[dict[str, Any]], None],
@@ -134,6 +163,8 @@ class RemoteToolBridge:
 
     @staticmethod
     def _resolve_tool_result_timeout(timeout_seconds: float | None) -> float:
+        """Resolve the blocking wait budget for remote tool results."""
+
         if timeout_seconds is None:
             return _read_positive_float_env(_REMOTE_TOOL_TIMEOUT_ENV, _DEFAULT_REMOTE_TOOL_TIMEOUT_SECONDS)
         if timeout_seconds <= 0:
@@ -142,6 +173,8 @@ class RemoteToolBridge:
 
     @staticmethod
     def _normalize_tool_arguments(arguments: Any) -> dict[str, Any]:
+        """Normalize tool-call arguments into a plain mapping."""
+
         if arguments is None:
             return {}
         if not isinstance(arguments, Mapping):
@@ -150,6 +183,8 @@ class RemoteToolBridge:
 
     @staticmethod
     def _normalize_tool_output(output: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Normalize remote tool output into a plain mapping."""
+
         if output is None:
             return None
         if not isinstance(output, Mapping):
@@ -158,14 +193,20 @@ class RemoteToolBridge:
 
     @staticmethod
     def _normalize_call_id(call_id: Any) -> str:
+        """Validate and normalize the transport correlation identifier."""
+
         if not isinstance(call_id, str) or not call_id.strip():
             raise TypeError("Remote tool call_id must be a non-empty string")
         return call_id
 
     def build_handlers(self, tool_names: Sequence[str]) -> dict[str, Callable[[AgentToolCall], Any]]:
+        """Build local tool handlers that forward work to the remote client."""
+
         return {name: self._make_handler(name) for name in tool_names}
 
     def submit_result(self, call_id: str, *, output: dict[str, Any] | None, error: str | None) -> None:
+        """Apply one returned tool result to the matching pending request."""
+
         try:
             normalized_call_id = self._normalize_call_id(call_id)
         except TypeError as exc:
@@ -191,6 +232,8 @@ class RemoteToolBridge:
             pending.done.set()
 
     def _make_handler(self, name: str) -> Callable[[AgentToolCall], Any]:
+        """Build one forwarding handler for a named remote tool."""
+
         def _handler(tool_call: AgentToolCall) -> dict[str, Any]:
             call_id = self._normalize_call_id(tool_call.call_id)  # AUDIT-FIX(#7): Guard against malformed provider output before it reaches bridge state.
             request = OrchestratorToolRequest(
@@ -223,6 +266,8 @@ class RemoteToolBridge:
 
 
 class EdgeOrchestratorSession:
+    """Run one Twinr tool-loop turn behind the websocket orchestrator server."""
+
     def __init__(
         self,
         config: TwinrConfig,
@@ -257,6 +302,8 @@ class EdgeOrchestratorSession:
         emit_event: Callable[[dict[str, Any]], None],
         tool_bridge: RemoteToolBridge,
     ) -> OrchestratorTurnCompleteEvent:
+        """Run one orchestrated tool-loop turn and stream events to the caller."""
+
         streamed_chunks: list[str] = []
         first_delta = True
 

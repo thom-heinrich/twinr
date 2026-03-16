@@ -1,0 +1,171 @@
+schema_version: 1
+name: social
+path: src/twinr/proactive/social
+kind: python-package
+visibility: internal
+summary: Evaluate proactive social triggers from normalized audio, vision, and motion observations, with optional buffered vision review.
+owned_concerns:
+  - Define social-trigger domain models, priorities, and configurable thresholds
+  - Score stateful trigger candidates from normalized observation ticks
+  - Capture bounded audio and vision observations for proactive monitoring
+  - Route prompt mode and render bounded evidence facts for proactive prompting
+  - Buffer recent frames and request conservative visual second opinions
+out_of_scope:
+  - Proactive monitor orchestration and worker lifecycle
+  - Delivery-governance cooldown policy after candidate emission
+  - Raw hardware adapter implementations outside runtime-facing wrappers
+  - Speech delivery, printing, and long-term proactive planning
+files:
+  - path: __init__.py
+    role: Package export surface for social-trigger helpers
+    exports:
+      - AmbientAudioObservationProvider
+      - NullAudioObservationProvider
+      - OpenAIProactiveVisionReviewer
+      - OpenAIVisionObservationProvider
+      - ProactiveAudioSnapshot
+      - ProactiveVisionFrameBuffer
+      - ProactiveVisionReview
+      - ProactiveVisionSnapshot
+      - SocialAudioObservation
+      - SocialBodyPose
+      - SocialObservation
+      - SocialTriggerDecision
+      - SocialTriggerEngine
+      - SocialTriggerEvaluation
+      - SocialTriggerPriority
+      - SocialTriggerThresholds
+      - SocialVisionObservation
+      - TriggerScoreEvidence
+      - WeightedTriggerScore
+      - bool_score
+      - hold_progress
+      - is_reviewable_image_trigger
+      - is_safety_trigger
+      - parse_proactive_vision_review_text
+      - parse_vision_observation_text
+      - proactive_observation_facts
+      - proactive_prompt_mode
+      - recent_progress
+      - weighted_trigger_score
+  - path: engine.py
+    role: Stateful social-trigger models, thresholds, and selection logic
+    exports:
+      - SocialAudioObservation
+      - SocialBodyPose
+      - SocialObservation
+      - SocialTriggerDecision
+      - SocialTriggerEngine
+      - SocialTriggerEvaluation
+      - SocialTriggerPriority
+      - SocialTriggerThresholds
+      - SocialVisionObservation
+  - path: observers.py
+    role: Ambient-audio and still-camera observation providers
+    exports:
+      - AmbientAudioObservationProvider
+      - NullAudioObservationProvider
+      - OpenAIVisionObservationProvider
+      - ProactiveAudioSnapshot
+      - ProactiveVisionSnapshot
+      - parse_vision_observation_text
+  - path: prompting.py
+    role: Prompt-mode routing and bounded evidence rendering
+    exports:
+      - is_safety_trigger
+      - proactive_observation_facts
+      - proactive_prompt_mode
+  - path: scoring.py
+    role: Weighted score, hold-progress, and evidence helpers
+    exports:
+      - TriggerScoreEvidence
+      - WeightedTriggerScore
+      - bool_score
+      - clamp_unit
+      - hold_progress
+      - recent_progress
+      - weighted_trigger_score
+  - path: vision_review.py
+    role: Buffered vision review policy and structured response parsing
+    exports:
+      - OpenAIProactiveVisionReviewer
+      - ProactiveVisionFrameBuffer
+      - ProactiveVisionReview
+      - is_reviewable_image_trigger
+      - parse_proactive_vision_review_text
+public_api:
+  module: twinr.proactive.social
+  exports:
+    - AmbientAudioObservationProvider
+    - NullAudioObservationProvider
+    - OpenAIProactiveVisionReviewer
+    - OpenAIVisionObservationProvider
+    - ProactiveAudioSnapshot
+    - ProactiveVisionFrameBuffer
+    - ProactiveVisionReview
+    - ProactiveVisionSnapshot
+    - SocialAudioObservation
+    - SocialBodyPose
+    - SocialObservation
+    - SocialTriggerDecision
+    - SocialTriggerEngine
+    - SocialTriggerEvaluation
+    - SocialTriggerPriority
+    - SocialTriggerThresholds
+    - SocialVisionObservation
+    - TriggerScoreEvidence
+    - WeightedTriggerScore
+    - bool_score
+    - hold_progress
+    - is_reviewable_image_trigger
+    - is_safety_trigger
+    - parse_proactive_vision_review_text
+    - parse_vision_observation_text
+    - proactive_observation_facts
+    - proactive_prompt_mode
+    - recent_progress
+    - weighted_trigger_score
+compatibility_reexports:
+  - path: src/twinr/proactive/__init__.py
+    names:
+      - AmbientAudioObservationProvider
+      - NullAudioObservationProvider
+      - OpenAIProactiveVisionReviewer
+      - OpenAIVisionObservationProvider
+      - ProactiveAudioSnapshot
+      - ProactiveVisionFrameBuffer
+      - ProactiveVisionReview
+      - ProactiveVisionSnapshot
+      - SocialAudioObservation
+      - SocialBodyPose
+      - SocialObservation
+      - SocialTriggerDecision
+      - SocialTriggerEngine
+      - SocialTriggerEvaluation
+      - SocialTriggerPriority
+      - SocialTriggerThresholds
+      - SocialVisionObservation
+      - TriggerScoreEvidence
+      - WeightedTriggerScore
+      - bool_score
+      - hold_progress
+      - is_reviewable_image_trigger
+      - is_safety_trigger
+      - parse_proactive_vision_review_text
+      - parse_vision_observation_text
+      - proactive_observation_facts
+      - proactive_prompt_mode
+      - recent_progress
+      - weighted_trigger_score
+primary_callers:
+  - path: src/twinr/proactive/runtime/service.py
+  - path: src/twinr/agent/workflows/social_triggers.py
+  - path: src/twinr/agent/workflows/__init__.py
+  - path: src/twinr/__main__.py
+  - path: src/twinr/proactive/__init__.py
+tests:
+  - path: test/test_social_triggers.py
+  - path: test/test_proactive_vision_review.py
+  - path: test/test_proactive_monitor.py
+  - path: test/test_runner.py
+  - path: test/test_realtime_runner.py

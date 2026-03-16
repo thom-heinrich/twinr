@@ -1,37 +1,45 @@
 # ingestion
 
-Extract candidate long-term memories from conversations, sensors, and multimodal evidence.
+Normalize conversation turns, multimodal evidence, and replayed ops history into
+candidate long-term memory inputs.
 
 ## Responsibility
 
 `ingestion` owns:
-- Parse turns into structured propositions
-- Compile sensor and multimodal evidence
-- Backfill ops events into memory inputs
+- Extract an episode plus candidate objects and graph edges from one turn
+- Normalize multimodal sensor, button, printer, and camera evidence
+- Replay persisted ops history into multimodal evidence for backfill
+- Compile sensor-derived routines and deviations from pattern history
 
 `ingestion` does **not** own:
-- Persist durable objects or archives
-- Resolve conflicts or truth state
-- Build retrieval context for prompts
+- Persist long-term objects, archives, or remote state
+- Resolve conflicts, truth state, retention, or reflection policy
+- Orchestrate runtime queues, workers, or service lifecycles
+- Build retrieval context for downstream prompts
 
 ## Key files
 
 | File | Purpose |
 |---|---|
-| `backfill.py` | Replay ops events |
-| `extract.py` | Extract turn memories |
-| `multimodal.py` | Compile multimodal evidence |
-| `propositions.py` | Build proposition bundles |
-| `sensor_memory.py` | Compile sensor routines |
+| `extract.py` | Turn extraction entrypoint |
+| `propositions.py` | Structured proposition compiler |
+| `multimodal.py` | Multimodal event extractor |
+| `sensor_memory.py` | Sensor routine compiler |
+| `backfill.py` | Ops history replay |
 
 ## Usage
 
 ```python
+from twinr.memory.longterm.ingestion.backfill import LongTermOpsEventBackfiller
 from twinr.memory.longterm.ingestion.extract import LongTermTurnExtractor
 from twinr.memory.longterm.ingestion.multimodal import LongTermMultimodalExtractor
+from twinr.memory.longterm.ingestion.sensor_memory import LongTermSensorMemoryCompiler
 ```
 
 ## See also
 
 - [../MEMORY_ARCHITECTURE.md](../MEMORY_ARCHITECTURE.md)
+- [../runtime/README.md](../runtime/README.md)
 - [../reasoning/README.md](../reasoning/README.md)
+- [AGENTS.md](./AGENTS.md)
+- [component.yaml](./component.yaml)

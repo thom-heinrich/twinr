@@ -1,3 +1,10 @@
+"""Extract long-term memory candidates from multimodal device evidence.
+
+This module turns normalized sensor, button, printer, and camera events into
+an episode plus low-confidence observation and pattern candidates that the
+long-term memory runtime can consolidate later.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -44,6 +51,7 @@ _SENSITIVE_KEY_PARTS = (
 
 
 def _to_text(value: object | None) -> str:
+    """Convert an arbitrary value into text, preserving byte payloads."""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -54,6 +62,7 @@ def _to_text(value: object | None) -> str:
 
 
 def _normalize_text(value: object | None, *, limit: int | None = None) -> str:
+    """Normalize arbitrary values into bounded, display-safe text."""
     raw_text = _CONTROL_CHAR_RE.sub(" ", _to_text(value))
     text = collapse_whitespace(raw_text)
     if limit is None or len(text) <= limit:
@@ -62,6 +71,7 @@ def _normalize_text(value: object | None, *, limit: int | None = None) -> str:
 
 
 def _slugify(value: str, *, fallback: str) -> str:
+    """Slugify text with the shared Twinr identifier rules."""
     return slugify_identifier(value, fallback=fallback)
 
 
@@ -72,6 +82,7 @@ def _safe_key_component(
     fallback: str,
     limit: int = _MAX_KEY_COMPONENT_LENGTH,
 ) -> str:
+    """Build a bounded storage-safe key component from free text."""
     text = _normalize_text(value, limit=limit).lower()
     if not text:
         return fallback
@@ -84,6 +95,7 @@ def _safe_key_component(
 
 # AUDIT-FIX(#3): Coerce heterogeneous payloads into mappings without throwing on malformed evidence.
 def _mapping_or_empty(value: object | None) -> dict[str, object]:
+    """Coerce heterogeneous payload-like values into a mapping."""
     if value is None:
         return {}
 
@@ -122,6 +134,7 @@ def _string_tuple(
     item_limit: int = 8,
     text_limit: int = 64,
 ) -> tuple[str, ...]:
+    """Normalize a scalar or sequence into a bounded text tuple."""
     if value is None:
         return ()
 
@@ -144,6 +157,7 @@ def _string_tuple(
 
 # AUDIT-FIX(#4): Parse sensor booleans explicitly so values like "false" or "0" stay false.
 def _coerce_bool(value: object | None) -> bool:
+    """Parse multimodal boolean-like values conservatively."""
     if isinstance(value, bool):
         return value
     if value is None:
@@ -162,6 +176,7 @@ def _coerce_bool(value: object | None) -> bool:
 
 
 def _is_sensitive_key(key: str) -> bool:
+    """Return whether a payload key name likely contains secrets."""
     lowered = key.lower()
     return any(part in lowered for part in _SENSITIVE_KEY_PARTS)
 
@@ -177,6 +192,7 @@ def _json_safe(
     _depth: int = 0,
     _seen: set[int] | None = None,
 ) -> object:
+    """Convert nested payloads into bounded JSON-safe structures."""
     if _seen is None:
         _seen = set()
 
@@ -285,6 +301,7 @@ def _json_safe(
 
 
 def _safe_json(value: object) -> str:
+    """Serialize a payload through the bounded JSON normalizer."""
     try:
         return json.dumps(
             _json_safe(value),
@@ -299,6 +316,7 @@ def _safe_json(value: object) -> str:
 
 
 def _payload_for_details(value: object | None) -> object:
+    """Build a detail payload for episode snapshots."""
     payload = _mapping_or_empty(value)
     if payload:
         return payload
@@ -310,6 +328,7 @@ def _payload_for_details(value: object | None) -> object:
 # AUDIT-FIX(#1): Resolve configured time zones defensively and fall back deterministically on bad config or missing tzdata.
 @lru_cache(maxsize=32)
 def _resolve_timezone(name: str) -> tzinfo:
+    """Resolve an IANA timezone name with bounded fallback behavior."""
     zone_name = _normalize_text(name, limit=128) or _DEFAULT_TIMEZONE_NAME
     try:
         return ZoneInfo(zone_name)
@@ -324,6 +343,7 @@ def _resolve_timezone(name: str) -> tzinfo:
 
 # AUDIT-FIX(#1): Naive device timestamps are treated as local wall-clock times in the configured timezone, not as host-local time.
 def _localize_datetime(value: datetime, *, target_tz: tzinfo) -> datetime:
+    """Normalize a timestamp into the target timezone."""
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=target_tz)
     return value.astimezone(target_tz)
@@ -335,6 +355,7 @@ def _event_fingerprint(
     *,
     occurred_at: datetime,
 ) -> str:
+    """Build a stable fingerprint for one multimodal evidence item."""
     fingerprint_payload = {
         "created_at": occurred_at.isoformat(timespec="microseconds"),
         "event_name": _normalize_text(evidence.event_name, limit=128),
@@ -348,12 +369,27 @@ def _event_fingerprint(
 
 @dataclass(frozen=True, slots=True)
 class LongTermMultimodalExtractor:
+    """Convert multimodal evidence into turn-shaped memory extractions.
+
+    Attributes:
+        timezone_name: IANA timezone used for localizing evidence timestamps.
+    """
+
     timezone_name: str = _DEFAULT_TIMEZONE_NAME
 
     def extract_evidence(
         self,
         evidence: LongTermMultimodalEvidence,
     ) -> LongTermTurnExtractionV1:
+        """Extract an episode and candidates from one evidence item.
+
+        Args:
+            evidence: Normalized multimodal evidence emitted by runtime flows.
+
+        Returns:
+            A turn-shaped extraction whose episode records the raw event and
+            whose candidates contain any derived observations or patterns.
+        """
         # AUDIT-FIX(#1): Resolve and apply timezone explicitly to avoid host-local drift and ZoneInfo crashes.
         target_tz = _resolve_timezone(self.timezone_name)
         occurred_at = _localize_datetime(evidence.created_at, target_tz=target_tz)
@@ -451,6 +487,7 @@ class LongTermMultimodalExtractor:
         )
 
     def _episode_details(self, evidence: LongTermMultimodalEvidence) -> str:
+        """Render a bounded, redacted detail snapshot for the episode object."""
         # AUDIT-FIX(#8): Persist a bounded/redacted payload snapshot rather than raw multimodal internals.
         payload = {
             "event_name": _normalize_text(evidence.event_name, limit=128),
@@ -468,6 +505,7 @@ class LongTermMultimodalExtractor:
         date_key: str,
         daypart: str,
     ) -> list[LongTermMemoryObjectV1]:
+        """Derive observation and pattern candidates from sensor evidence."""
         # AUDIT-FIX(#3): Parse payloads through safe coercion so malformed evidence does not raise here.
         payload = _mapping_or_empty(evidence.data)
         facts = _mapping_or_empty(payload.get("facts"))
@@ -583,6 +621,7 @@ class LongTermMultimodalExtractor:
         date_key: str,
         daypart: str,
     ) -> LongTermMemoryObjectV1 | None:
+        """Derive one interaction pattern from a button event."""
         # AUDIT-FIX(#3): Parse payloads through safe coercion so malformed evidence does not raise here.
         payload = _mapping_or_empty(evidence.data)
         button_display = _normalize_text(payload.get("button"), limit=48).lower()
@@ -626,6 +665,7 @@ class LongTermMultimodalExtractor:
         date_key: str,
         daypart: str,
     ) -> LongTermMemoryObjectV1 | None:
+        """Derive one interaction pattern from a print-completion event."""
         # AUDIT-FIX(#3): Parse payloads through safe coercion so malformed evidence does not raise here.
         payload = _mapping_or_empty(evidence.data)
         request_source_display = _normalize_text(payload.get("request_source"), limit=48).lower() or "unknown"
@@ -662,6 +702,7 @@ class LongTermMultimodalExtractor:
         date_key: str,
         daypart: str,
     ) -> LongTermMemoryObjectV1 | None:
+        """Derive one interaction pattern from a camera-capture event."""
         # AUDIT-FIX(#3): Parse payloads through safe coercion so malformed evidence does not raise here.
         payload = _mapping_or_empty(evidence.data)
         purpose_display = _normalize_text(payload.get("purpose"), limit=48).lower() or "camera use"
@@ -691,6 +732,7 @@ class LongTermMultimodalExtractor:
         )
 
     def _daypart(self, occurred_at: datetime) -> str:
+        """Map a localized timestamp into the shared daypart buckets."""
         hour = occurred_at.hour
         if 5 <= hour < 11:
             return "morning"

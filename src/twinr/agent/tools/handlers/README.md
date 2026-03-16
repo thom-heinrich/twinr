@@ -2,8 +2,8 @@
 
 `handlers` owns the concrete realtime tool handlers used during live turns. It
 translates tool payloads into bounded runtime reads or mutations for automations,
-memory, reminders, output, settings, and voice-profile flows, and keeps shared
-voice/argument guards close to that boundary.
+memory, reminders, output, self-coding, settings, and voice-profile flows, and
+keeps shared voice/argument guards close to that boundary.
 
 ## Responsibility
 
@@ -12,6 +12,7 @@ voice/argument guards close to that boundary.
 - validate and normalize tool arguments before they reach runtime methods
 - keep handler-local telemetry and audit side effects best-effort
 - share sensitive-action confirmation and live-audio guard helpers
+- bridge the self-coding front-stage flow into deterministic ASE modules
 
 `handlers` does **not** own:
 - tool registry, binding, schemas, or prompt instruction assembly
@@ -27,6 +28,7 @@ voice/argument guards close to that boundary.
 | [memory.py](./memory.py) | Durable-memory tool handlers |
 | [output.py](./output.py) | Print, search, and camera handlers |
 | [reminders.py](./reminders.py) | Reminder scheduling handler |
+| [self_coding.py](./self_coding.py) | Self-coding feasibility and dialogue handlers |
 | [settings.py](./settings.py) | Simple setting mutation handler |
 | [support.py](./support.py) | Shared voice and argument guards |
 | [voice_profile.py](./voice_profile.py) | Voice-profile tool handlers |
@@ -44,14 +46,16 @@ result = executor.handle_schedule_reminder(
 ```
 
 ```python
-from twinr.agent.tools.handlers.automations import normalize_delivery
+from twinr.agent.tools.handlers.self_coding import handle_propose_skill_learning
 
-delivery = normalize_delivery(payload.get("delivery"))
+result = handle_propose_skill_learning(
+    owner,
+    {"name": "Daily Check-In", "action": "Ask how the user feels", "capabilities": ["speaker", "rules"]},
+)
 ```
 
 ## See also
 
 - [component.yaml](./component.yaml)
-- [AGENTS.md](./AGENTS.md)
 - [runtime](../runtime/README.md)
 - [base-agent runtime](../../base_agent/runtime/README.md)

@@ -1,3 +1,10 @@
+"""Define websocket transport contracts for the Twinr orchestrator.
+
+This module owns the dataclasses that cross the edge-orchestrator websocket
+boundary plus the defensive coercion helpers that keep malformed payloads from
+crashing turn handling.
+"""
+
 from __future__ import annotations
 
 import math
@@ -19,11 +26,15 @@ _FALSE_STRINGS = frozenset({"0", "false", "f", "no", "n", "off", ""})
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorTurnRequest:
+    """Represent one remote request to run an orchestrated turn."""
+
     prompt: str
     conversation: tuple[tuple[str, str], ...] = ()
     supervisor_conversation: tuple[tuple[str, str], ...] = ()
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the turn request into a websocket payload."""
+
         return {
             "type": "run_turn",
             "prompt": self.prompt,
@@ -33,6 +44,8 @@ class OrchestratorTurnRequest:
 
     @classmethod
     def from_payload(cls, payload: Any) -> OrchestratorTurnRequest:
+        """Build a turn request from an incoming websocket payload."""
+
         payload_dict = _coerce_dict(payload)  # AUDIT-FIX(#3): Tolerate malformed transport frames instead of assuming a dict and crashing.
         return cls(
             prompt=str(payload_dict.get("prompt", "") or "").strip(),
@@ -43,6 +56,8 @@ class OrchestratorTurnRequest:
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorToolRequest:
+    """Represent one remote tool execution request."""
+
     call_id: str
     name: str
     arguments: dict[str, Any]
@@ -51,6 +66,8 @@ class OrchestratorToolRequest:
         object.__setattr__(self, "arguments", _coerce_dict(self.arguments))  # AUDIT-FIX(#8): Freeze a defensive copy so callers cannot mutate request state after construction.
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the tool request into a websocket payload."""
+
         return {
             "type": "tool_request",
             "call_id": self.call_id,
@@ -60,6 +77,8 @@ class OrchestratorToolRequest:
 
     @classmethod
     def from_payload(cls, payload: Any) -> OrchestratorToolRequest:
+        """Build a tool request from an incoming websocket payload."""
+
         payload_dict = _coerce_dict(payload)  # AUDIT-FIX(#3): Tolerate malformed transport frames instead of assuming a dict and crashing.
         return cls(
             call_id=str(payload_dict.get("call_id", "") or "").strip(),
@@ -70,12 +89,16 @@ class OrchestratorToolRequest:
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorToolResponse:
+    """Represent the result of a remotely executed tool call."""
+
     call_id: str
     ok: bool
     output: Any | None = None  # AUDIT-FIX(#4): Preserve non-dict tool outputs such as lists, strings, and numbers instead of silently dropping them.
     error: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the tool response into a websocket payload."""
+
         payload = {
             "type": "tool_result",
             "call_id": self.call_id,
@@ -89,6 +112,8 @@ class OrchestratorToolResponse:
 
     @classmethod
     def from_payload(cls, payload: Any) -> OrchestratorToolResponse:
+        """Build a tool response from an incoming websocket payload."""
+
         payload_dict = _coerce_dict(payload)  # AUDIT-FIX(#3): Tolerate malformed transport frames instead of assuming a dict and crashing.
         return cls(
             call_id=str(payload_dict.get("call_id", "") or "").strip(),
@@ -100,31 +125,45 @@ class OrchestratorToolResponse:
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorAckEvent:
+    """Represent a normalized fast-ack event for the client."""
+
     ack_id: str
     text: str
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the ack event into a websocket payload."""
+
         return {"type": "ack", "ack_id": self.ack_id, "text": self.text}
 
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorTextDeltaEvent:
+    """Represent one streamed text delta from the orchestrator."""
+
     delta: str
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the text delta into a websocket payload."""
+
         return {"type": "text_delta", "delta": self.delta}
 
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorErrorEvent:
+    """Represent a sanitized turn-level transport failure."""
+
     error: str
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the error event into a websocket payload."""
+
         return {"type": "turn_error", "error": self.error}
 
 
 @dataclass(frozen=True, slots=True)
 class OrchestratorTurnCompleteEvent:
+    """Represent the final result of one orchestrated turn."""
+
     text: str
     rounds: int
     used_web_search: bool
@@ -136,6 +175,8 @@ class OrchestratorTurnCompleteEvent:
     tool_results: tuple[AgentToolResult, ...] = ()
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the completed turn into a websocket payload."""
+
         return {
             "type": "turn_complete",
             "text": self.text,
@@ -151,6 +192,8 @@ class OrchestratorTurnCompleteEvent:
 
     @classmethod
     def from_payload(cls, payload: Any) -> OrchestratorTurnCompleteEvent:
+        """Build a completed-turn event from an incoming websocket payload."""
+
         payload_dict = _coerce_dict(payload)  # AUDIT-FIX(#3): Tolerate malformed transport frames instead of assuming a dict and crashing.
         return cls(
             text=str(payload_dict.get("text", "") or ""),
@@ -167,6 +210,8 @@ class OrchestratorTurnCompleteEvent:
 
 @dataclass(slots=True)
 class OrchestratorClientTurnResult:
+    """Collect the decoded result of one client-managed orchestrator turn."""
+
     text: str
     rounds: int
     used_web_search: bool
@@ -180,6 +225,8 @@ class OrchestratorClientTurnResult:
 
 
 def _coerce_optional_text(value: Any) -> str | None:
+    """Convert a scalar payload field into stripped text or ``None``."""
+
     if value is None:
         return None
     text = str(value).strip()
@@ -187,12 +234,16 @@ def _coerce_optional_text(value: Any) -> str | None:
 
 
 def _coerce_optional_json_value(value: Any) -> Any | None:
+    """Normalize an optional JSON-like payload value."""
+
     if value is None:
         return None
     return _json_safe(value)  # AUDIT-FIX(#4): Keep arbitrary JSON-like outputs instead of narrowing everything to dict-only payloads.
 
 
 def _coerce_dict(value: Any) -> dict[str, Any]:
+    """Convert mapping-like payload values into plain dictionaries."""
+
     if isinstance(value, Mapping):  # AUDIT-FIX(#7): Accept mapping-like payloads instead of silently rejecting non-literal dict implementations.
         try:
             return dict(value)
@@ -202,6 +253,8 @@ def _coerce_dict(value: Any) -> dict[str, Any]:
 
 
 def _coerce_optional_dict(value: Any) -> dict[str, Any] | None:
+    """Convert an optional mapping-like payload value into a plain dictionary."""
+
     if value is None:
         return None
     if isinstance(value, Mapping):  # AUDIT-FIX(#7): Accept mapping-like payloads instead of silently rejecting non-literal dict implementations.
@@ -213,10 +266,14 @@ def _coerce_optional_dict(value: Any) -> dict[str, Any] | None:
 
 
 def _is_non_string_sequence(value: Any) -> bool:
+    """Return whether ``value`` is a sequence that is not string-like."""
+
     return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
 
 
 def _coerce_bool(value: Any) -> bool:
+    """Parse transport booleans while failing closed on unknown tokens."""
+
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -233,6 +290,8 @@ def _coerce_bool(value: Any) -> bool:
 
 
 def _coerce_non_negative_int(value: Any) -> int:
+    """Parse a non-negative integer field from transport data."""
+
     if value is None:
         return 0
     if isinstance(value, bool):
@@ -256,6 +315,8 @@ def _coerce_non_negative_int(value: Any) -> int:
 
 
 def _coerce_conversation(value: Any) -> tuple[tuple[str, str], ...]:
+    """Convert serialized conversation pairs into normalized tuples."""
+
     if not _is_non_string_sequence(value):  # AUDIT-FIX(#7): Accept tuples from in-process callers while rejecting scalar strings/bytes.
         return ()
     items: list[tuple[str, str]] = []
@@ -269,6 +330,8 @@ def _coerce_conversation(value: Any) -> tuple[tuple[str, str], ...]:
 
 
 def _coerce_tool_calls(value: Any) -> list[AgentToolCall]:
+    """Decode serialized tool-call records into ``AgentToolCall`` objects."""
+
     if not _is_non_string_sequence(value):  # AUDIT-FIX(#7): Accept tuples from in-process callers while rejecting scalar strings/bytes.
         return []
     items: list[AgentToolCall] = []
@@ -290,6 +353,8 @@ def _coerce_tool_calls(value: Any) -> list[AgentToolCall]:
 
 
 def _coerce_tool_results(value: Any) -> list[AgentToolResult]:
+    """Decode serialized tool-result records into ``AgentToolResult`` objects."""
+
     if not _is_non_string_sequence(value):  # AUDIT-FIX(#7): Accept tuples from in-process callers while rejecting scalar strings/bytes.
         return []
     items: list[AgentToolResult] = []
@@ -311,6 +376,8 @@ def _coerce_tool_results(value: Any) -> list[AgentToolResult]:
 
 
 def _safe_stringify(value: Any) -> str:
+    """Stringify arbitrary values without letting ``str()`` raise."""
+
     try:
         return str(value)
     except Exception:
@@ -318,6 +385,8 @@ def _safe_stringify(value: Any) -> str:
 
 
 def _json_safe_record(value: Any) -> dict[str, Any]:
+    """Convert an arbitrary record-like object into a JSON-safe dictionary."""
+
     if is_dataclass(value) and not isinstance(value, type):
         try:
             safe_value = _json_safe(asdict(value))  # AUDIT-FIX(#1): Fast-path simple dataclass contract objects while retaining safe fallback below.
@@ -332,6 +401,12 @@ def _json_safe_record(value: Any) -> dict[str, Any]:
 
 
 def _json_safe(value: Any, *, _seen: set[int] | None = None, _depth: int = 0) -> Any:
+    """Convert nested transport data into JSON-safe values.
+
+    Normalizes dates, paths, dataclasses, and model-like objects while bounding
+    recursion and breaking cycles.
+    """
+
     if _depth >= _MAX_JSON_DEPTH:
         return _MAX_DEPTH_SENTINEL  # AUDIT-FIX(#1): Hard-stop pathological nesting instead of crashing with RecursionError.
     if value is None or isinstance(value, (str, int, bool)):

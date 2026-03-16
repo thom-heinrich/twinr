@@ -1,3 +1,9 @@
+"""Expose the FastAPI websocket server for Twinr's edge orchestrator.
+
+This module accepts websocket turn requests, bridges remote tool results into a
+session object, and keeps transport auth, queueing, and teardown bounded.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -25,12 +31,16 @@ logger = logging.getLogger(__name__)
 
 
 class _TurnGate:
+    """Serialize turn execution so one websocket has at most one live turn."""
+
     # AUDIT-FIX(#1): Serialize run_turn handling per websocket so one session/bridge cannot be mutated by overlapping turns.
     def __init__(self) -> None:
         self._lock = Lock()
         self._active = False
 
     def try_start(self) -> bool:
+        """Mark the gate active if no turn is currently running."""
+
         with self._lock:
             if self._active:
                 return False
@@ -38,15 +48,21 @@ class _TurnGate:
             return True
 
     def finish(self) -> None:
+        """Release the active-turn marker."""
+
         with self._lock:
             self._active = False
 
     def is_active(self) -> bool:
+        """Return whether the gate currently tracks an active turn."""
+
         with self._lock:
             return self._active
 
 
 class EdgeOrchestratorServer:
+    """Serve Twinr orchestrator turns over a websocket endpoint."""
+
     def __init__(
         self,
         config: TwinrConfig,
@@ -57,6 +73,8 @@ class EdgeOrchestratorServer:
         self._session_factory = session_factory or EdgeOrchestratorSession
 
     def create_app(self) -> FastAPI:
+        """Build the FastAPI application that exposes the orchestrator socket."""
+
         app = FastAPI(title="Twinr Orchestrator", version="0.1.0")
         server = self
 
@@ -187,6 +205,8 @@ class EdgeOrchestratorServer:
         return app
 
     def _authorize(self, websocket: WebSocket) -> bool:
+        """Authorize one websocket based on shared-secret or loopback policy."""
+
         expected = str(getattr(self.config, "orchestrator_shared_secret", "") or "").strip()
         actual = (websocket.headers.get("x-twinr-secret") or "").strip()
         if expected:
@@ -206,6 +226,8 @@ def _run_turn_thread(
     closed_event: Event,
     turn_gate: _TurnGate,
 ) -> None:
+    """Run one blocking orchestrator turn on a worker thread."""
+
     def emit(payload: dict[str, Any]) -> None:
         _enqueue_payload(event_loop, outgoing, payload, closed_event, None)  # AUDIT-FIX(#5): Drop thread emissions once the connection has closed.
 
@@ -235,6 +257,8 @@ async def _sender_loop(
     outgoing: asyncio.Queue[dict[str, Any]],
     closed_event: Event,
 ) -> None:
+    """Forward queued payloads from the session thread to the websocket."""
+
     try:
         while not closed_event.is_set():
             payload = await outgoing.get()
@@ -249,6 +273,8 @@ async def _sender_loop(
 
 
 def create_app(env_file: str | Path) -> FastAPI:
+    """Load Twinr config from disk and build the orchestrator FastAPI app."""
+
     config = TwinrConfig.from_env(Path(env_file))
     return EdgeOrchestratorServer(config).create_app()
 
@@ -260,6 +286,8 @@ def _enqueue_payload(
     closed_event: Event,
     websocket: WebSocket | None,
 ) -> None:
+    """Schedule one outgoing payload onto the websocket event loop."""
+
     if closed_event.is_set():
         return
 
@@ -281,6 +309,8 @@ def _enqueue_payload_nowait(
     closed_event: Event,
     websocket: WebSocket | None,
 ) -> None:
+    """Push one payload into the bounded outgoing queue without blocking."""
+
     if closed_event.is_set():
         return
 
@@ -294,6 +324,8 @@ def _enqueue_payload_nowait(
 
 
 async def _cancel_task(task: asyncio.Task[Any] | None) -> None:
+    """Cancel and await a background task if it still exists."""
+
     if task is None:
         return
 
@@ -309,6 +341,8 @@ async def _cancel_task(task: asyncio.Task[Any] | None) -> None:
 
 
 async def _best_effort_close(resource: Any | None, *, label: str) -> None:
+    """Call the first supported close-like method on a resource."""
+
     if resource is None:
         return
 
@@ -327,15 +361,21 @@ async def _best_effort_close(resource: Any | None, *, label: str) -> None:
 
 
 async def _close_websocket_quietly(websocket: WebSocket, *, code: int, reason: str) -> None:
+    """Close a websocket while suppressing teardown noise."""
+
     with contextlib.suppress(RuntimeError, WebSocketDisconnect):
         await websocket.close(code=code, reason=reason)
 
 
 def _error_payload(message: str) -> dict[str, Any]:
+    """Build a normalized websocket error payload."""
+
     return OrchestratorErrorEvent(error=message).to_payload()
 
 
 def _get_outgoing_queue_maxsize(config: TwinrConfig) -> int:
+    """Resolve the bounded outgoing queue size for one websocket."""
+
     raw = getattr(config, "orchestrator_outgoing_queue_maxsize", None)
     if raw is None:
         raw = os.getenv("ORCHESTRATOR_OUTGOING_QUEUE_MAXSIZE", "256")
@@ -343,6 +383,8 @@ def _get_outgoing_queue_maxsize(config: TwinrConfig) -> int:
 
 
 def _allow_insecure_loopback(config: TwinrConfig) -> bool:
+    """Return whether plaintext loopback websocket auth is explicitly allowed."""
+
     raw = getattr(config, "orchestrator_allow_insecure_loopback", None)
     if raw is None:
         raw = os.getenv("ORCHESTRATOR_ALLOW_INSECURE_LOOPBACK", "0")
@@ -350,6 +392,8 @@ def _allow_insecure_loopback(config: TwinrConfig) -> bool:
 
 
 def _coerce_non_negative_int(value: Any, *, default: int) -> int:
+    """Parse a non-negative integer or fall back to a safe default."""
+
     try:
         number = int(value)
     except (TypeError, ValueError):
@@ -358,6 +402,8 @@ def _coerce_non_negative_int(value: Any, *, default: int) -> int:
 
 
 def _coerce_bool(value: Any) -> bool:
+    """Parse a transport-style boolean token."""
+
     if isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -366,12 +412,16 @@ def _coerce_bool(value: Any) -> bool:
 
 
 def _client_host(websocket: WebSocket) -> str:
+    """Extract the client host string from a websocket connection."""
+
     if websocket.client is None or websocket.client.host is None:
         return ""
     return websocket.client.host
 
 
 def _is_loopback_host(host: str) -> bool:
+    """Return whether a host string refers to loopback."""
+
     if not host:
         return False
 

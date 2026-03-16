@@ -1,3 +1,5 @@
+"""Run the realtime hardware workflow for live Twinr conversations."""
+
 from __future__ import annotations
 
 from contextlib import ExitStack
@@ -57,6 +59,12 @@ class TwinrRealtimeHardwareLoop(
     TwinrRealtimeToolDelegatesMixin,
     TwinrRealtimeSupportMixin,
 ):
+    """Coordinate realtime sessions, wakeword entry, and background delivery.
+
+    This loop owns the live conversation session lifecycle, print-lane handoff,
+    and the wakeword/button entry points for the realtime runtime path.
+    """
+
     def __init__(
         self,
         config: TwinrConfig,
@@ -235,6 +243,7 @@ class TwinrRealtimeHardwareLoop(
 
     def run(self, *, duration_s: float | None = None, poll_timeout: float = 0.25) -> int:
         started_at = time.monotonic()
+        self._refresh_required_remote_dependency(force=True, force_sync=True)
         self._emit_status(force=True)
         self._ensure_wakeword_ack_prefetch_started()
         try:
@@ -253,6 +262,9 @@ class TwinrRealtimeHardwareLoop(
                     try:  # AUDIT-FIX(#4): Keep the hardware loop alive when button polling or button handling raises.
                         if duration_s is not None and time.monotonic() - started_at >= duration_s:
                             return 0
+                        if not self._refresh_required_remote_dependency():
+                            self.sleep(min(0.25, safe_poll_timeout or 0.25))
+                            continue
                         event = monitor.poll(timeout=safe_poll_timeout)
                         if event is None:
                             continue
@@ -273,6 +285,8 @@ class TwinrRealtimeHardwareLoop(
                 housekeeping_thread.join(timeout=max(0.5, safe_poll_timeout + 0.25))
 
     def _run_idle_housekeeping_cycle(self) -> bool:
+        if not self._refresh_required_remote_dependency():
+            return False
         if self.print_lane.is_busy():
             return False
         if self._maybe_deliver_due_reminder():
@@ -312,6 +326,8 @@ class TwinrRealtimeHardwareLoop(
 
     def handle_button_press(self, button_name: str) -> None:
         try:
+            if not self._refresh_required_remote_dependency(force=True, force_sync=True):
+                return
             if button_name == "green":
                 self._handle_green_turn()
                 return
@@ -324,6 +340,8 @@ class TwinrRealtimeHardwareLoop(
 
     def handle_wakeword_match(self, match: WakewordMatch) -> bool:
         try:  # AUDIT-FIX(#4): Prevent background wakeword handlers from dying on transient runtime or provider failures.
+            if not self._refresh_required_remote_dependency(force=True, force_sync=True):
+                return False
             if not self._background_work_allowed():
                 skip_reason = "busy" if self.runtime.status.value != "waiting" else "conversation_active"
                 self.emit(f"wakeword_skipped={skip_reason}")
@@ -440,6 +458,8 @@ class TwinrRealtimeHardwareLoop(
         seed_transcript: str | None = None,
         play_initial_beep: bool = True,
     ) -> bool:
+        if not self._refresh_required_remote_dependency(force=True, force_sync=True):
+            return False
         if not self._conversation_session_lock.acquire(blocking=False):
             self.emit("conversation_session_skipped=busy")
             self._record_event(
@@ -572,19 +592,28 @@ class TwinrRealtimeHardwareLoop(
         saw_interim: bool,
         capture_ms: int,
     ) -> str:
+        """Retry short or empty streaming transcripts against the full capture.
+
+        Streaming endpoint events can occasionally mark a turn complete before a
+        usable transcript arrives. In that case we preserve the captured audio
+        and run one bounded file-style transcription pass instead of surfacing an
+        empty turn back to the workflow.
+        """
+
         cleaned = str(transcript or "").strip()
-        if not cleaned:
-            return cleaned
         if capture_result is None or not capture_result.pcm_bytes:
             return cleaned
 
-        word_count = len(cleaned.split())
-        min_chars = max(8, int(self.config.streaming_early_transcript_min_chars))
-        looks_complete = len(cleaned) >= min_chars and word_count >= 3
-        if looks_complete:
-            return cleaned
-        if saw_interim and capture_ms < 1200 and word_count >= 2:
-            return cleaned
+        if cleaned:
+            word_count = len(cleaned.split())
+            min_chars = max(8, int(self.config.streaming_early_transcript_min_chars))
+            looks_complete = len(cleaned) >= min_chars and word_count >= 3
+            if looks_complete:
+                return cleaned
+            if saw_interim and capture_ms < 1200 and word_count >= 2:
+                return cleaned
+        else:
+            word_count = 0
 
         try:
             audio_bytes = pcm16_to_wav_bytes(
@@ -604,6 +633,9 @@ class TwinrRealtimeHardwareLoop(
 
         if not recovered:
             return cleaned
+        if not cleaned:
+            self.emit("stt_streaming_recovered_via_batch=true")
+            return recovered
         recovered_words = len(recovered.split())
         if len(recovered) <= len(cleaned) and recovered_words <= word_count:
             return cleaned

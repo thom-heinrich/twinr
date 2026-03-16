@@ -1,3 +1,9 @@
+"""Persist and tail Twinr operational events as sanitized JSON lines.
+
+The file-backed store keeps event payloads JSON-safe, secret-aware, and
+bounded for dashboards, support bundles, and runtime audit trails.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -38,6 +44,8 @@ def _utc_now_iso_z() -> str:
 
 
 def compact_text(value: str | None, *, limit: int = 160) -> str:
+    """Collapse whitespace and truncate text to a bounded single line."""
+
     text = " ".join((value or "").split())  # AUDIT-FIX(#7): Preserve whitespace compaction while fixing small-limit truncation semantics.
     try:
         normalized_limit = max(int(limit), 0)  # AUDIT-FIX(#7): Clamp negative or malformed limits instead of returning strings longer than requested.
@@ -189,15 +197,21 @@ def _iter_lines_reversed(fd: int):
 
 
 class TwinrOpsEventStore:
+    """Store sanitized Twinr ops events in a JSONL file."""
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser()  # AUDIT-FIX(#1): Normalize user-home paths once so all subsequent file checks target the same location.
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "TwinrOpsEventStore":
+        """Build an ops event store rooted in Twinr's configured project."""
+
         return cls(resolve_ops_paths_for_config(config).events_path)
 
     @classmethod
     def from_project_root(cls, project_root: str | Path) -> "TwinrOpsEventStore":
+        """Build an ops event store rooted in a given Twinr project tree."""
+
         return cls(resolve_ops_paths(project_root).events_path)
 
     def _open_fd(self, *, write: bool) -> int:
@@ -233,6 +247,8 @@ class TwinrOpsEventStore:
         level: str = "info",
         data: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        """Append one sanitized event record and return the stored payload."""
+
         normalized_event = _safe_text(event, fallback="unknown")  # AUDIT-FIX(#8): Normalize runtime-non-str event values without raising AttributeError.
         entry = {
             "created_at": _utc_now_iso_z(),
@@ -253,6 +269,8 @@ class TwinrOpsEventStore:
         return entry
 
     def tail(self, *, limit: int = 100) -> list[dict[str, object]]:
+        """Return the most recent event records in chronological order."""
+
         normalized_limit = _normalize_limit(limit)  # AUDIT-FIX(#5,#6): Clamp bad inputs before filesystem work.
         if normalized_limit <= 0:
             return []

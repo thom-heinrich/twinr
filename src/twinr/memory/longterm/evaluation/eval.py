@@ -1,3 +1,10 @@
+"""Run a fixed synthetic recall evaluation for long-term memory.
+
+The module seeds deterministic graph and episodic fixtures, executes recall and
+contact-lookup cases against the regular long-term memory service, and can emit
+the result as JSON through its CLI entrypoint.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -28,6 +35,8 @@ _EPISODIC_TARGET_INDICES = (5, 15, 25, 35, 45, 55, 65, 75, 85, 95)
 
 @dataclass(frozen=True, slots=True)
 class LongTermEvalCase:
+    """Describe one synthetic provider-context or contact-lookup case."""
+
     case_id: str
     category: str
     query_text: str
@@ -43,6 +52,8 @@ class LongTermEvalCase:
 
 @dataclass(frozen=True, slots=True)
 class LongTermEvalCaseResult:
+    """Capture the outcome of one synthetic evaluation case."""
+
     case_id: str
     category: str
     kind: EvalKind
@@ -57,6 +68,8 @@ class LongTermEvalCaseResult:
 
 @dataclass(frozen=True, slots=True)
 class LongTermEvalSeedStats:
+    """Count the seeded fixture families used by the synthetic evaluation."""
+
     contacts: int
     preferences: int
     plans: int
@@ -64,11 +77,15 @@ class LongTermEvalSeedStats:
 
     @property
     def total_memories(self) -> int:
+        """Return the total number of seeded long-term memory entries."""
+
         return self.contacts + self.preferences + self.plans + self.episodic_turns
 
 
 @dataclass(frozen=True, slots=True)
 class LongTermEvalSummary:
+    """Summarize aggregate pass/fail counts for a synthetic eval run."""
+
     total_cases: int
     passed_cases: int
     category_pass_counts: dict[str, int]
@@ -76,11 +93,15 @@ class LongTermEvalSummary:
 
     @property
     def accuracy(self) -> float:
+        """Return the overall pass rate across all synthetic cases."""
+
         if self.total_cases <= 0:
             return 0.0
         return self.passed_cases / self.total_cases
 
     def category_accuracy(self) -> dict[str, float]:
+        """Return per-category pass rates derived from the summary counts."""
+
         metrics: dict[str, float] = {}
         for category, total in self.category_case_counts.items():
             metrics[category] = (self.category_pass_counts.get(category, 0) / total) if total else 0.0
@@ -89,6 +110,8 @@ class LongTermEvalSummary:
 
 @dataclass(frozen=True, slots=True)
 class LongTermEvalResult:
+    """Bundle seeded fixture stats, case results, and persisted artifact paths."""
+
     seed_stats: LongTermEvalSeedStats
     summary: LongTermEvalSummary
     cases: tuple[LongTermEvalCaseResult, ...]
@@ -99,6 +122,8 @@ class LongTermEvalResult:
 
 @dataclass(frozen=True, slots=True)
 class _ContactSeed:
+    """Hold seeded contact data reused across graph setup and case generation."""
+
     given_name: str
     family_name: str
     role: str
@@ -108,11 +133,15 @@ class _ContactSeed:
 
     @property
     def label(self) -> str:
+        """Return the full contact label used in graph nodes and expectations."""
+
         return f"{self.given_name} {self.family_name}"
 
 
 @dataclass(frozen=True, slots=True)
 class _PreferenceSeed:
+    """Hold one seeded product preference tuple for synthetic recall cases."""
+
     product: str
     brand: str
     store: str
@@ -120,6 +149,8 @@ class _PreferenceSeed:
 
 @dataclass(frozen=True, slots=True)
 class _PlanSeed:
+    """Hold one seeded plan fixture and its linked contact label."""
+
     summary: str
     when_text: str
     contact_label: str
@@ -127,6 +158,8 @@ class _PlanSeed:
 
 @dataclass(frozen=True, slots=True)
 class _EpisodeSeed:
+    """Hold one seeded episodic conversation used in recall cases."""
+
     topic: str
     transcript: str
     response: str
@@ -134,9 +167,13 @@ class _EpisodeSeed:
 
 @dataclass(slots=True)
 class _StaticQueryRewriter:
+    """Provide deterministic canonical queries for synthetic evaluation cases."""
+
     canonical_queries: dict[str, str]
 
     def profile(self, query_text: str | None) -> LongTermQueryProfile:
+        """Build a query profile with the pre-seeded canonical English rewrite."""
+
         original = " ".join(str(query_text or "").split()).strip()
         return LongTermQueryProfile.from_text(
             original,
@@ -150,6 +187,21 @@ def run_synthetic_longterm_eval(
     case_target: int = _EXACT_CASE_TARGET,
     project_root: str | Path | None = None,
 ) -> LongTermEvalResult:
+    """Run the fixed synthetic long-term memory evaluation.
+
+    Args:
+        memory_target: Expected number of seeded memory entries. The current
+            fixture set only supports the canonical fixed target.
+        case_target: Expected number of evaluation cases. The current fixture
+            set only supports the canonical fixed target.
+        project_root: Optional directory under which temporary workspaces and
+            persisted artifact snapshots are created.
+
+    Returns:
+        A result bundle with fixture counts, per-case outcomes, summary
+        statistics, and paths to the persisted evaluation artifacts.
+    """
+
     _validate_eval_targets(memory_target=memory_target, case_target=case_target)  # AUDIT-FIX(#2): Fail fast on unsupported target sizes instead of failing later via hard-coded assertions.
     project_root_path = _resolve_project_root(project_root)  # AUDIT-FIX(#6): Normalize and create the optional root directory before any filesystem writes.
 
@@ -288,6 +340,8 @@ def run_synthetic_longterm_eval(
 
 
 def _validate_eval_targets(*, memory_target: int, case_target: int) -> None:
+    """Reject target sizes that do not match the fixed synthetic fixture set."""
+
     if memory_target != _EXACT_MEMORY_TARGET:
         raise ValueError(
             f"memory_target must be exactly {_EXACT_MEMORY_TARGET} for the current synthetic eval, got {memory_target}."
@@ -299,6 +353,8 @@ def _validate_eval_targets(*, memory_target: int, case_target: int) -> None:
 
 
 def _resolve_project_root(project_root: str | Path | None) -> Path | None:
+    """Normalize and create the optional root used for eval artifacts."""
+
     if project_root is None:
         return None
     root = Path(project_root).expanduser()
@@ -312,6 +368,8 @@ def _resolve_project_root(project_root: str | Path | None) -> Path | None:
 
 
 def _materialize_workspace(*, root: Path, project_root: Path | None) -> tuple[Path, Path, Path]:
+    """Copy the ephemeral workspace to a durable artifact directory."""
+
     artifact_root = Path(
         mkdtemp(
             prefix="twinr-synthetic-longterm-eval-",
@@ -329,6 +387,8 @@ def _materialize_workspace(*, root: Path, project_root: Path | None) -> tuple[Pa
 
 
 def _seed_contacts(graph_store: TwinrPersonalGraphStore) -> list[_ContactSeed]:
+    """Seed deterministic contact fixtures into the personal graph store."""
+
     ambiguous_names = (
         ("Alex", ("Meyer", "Klein", "Wolf")),
         ("Chris", ("Becker", "Jung", "Lorenz")),
@@ -413,6 +473,8 @@ def _seed_contacts(graph_store: TwinrPersonalGraphStore) -> list[_ContactSeed]:
 
 
 def _seed_preferences(graph_store: TwinrPersonalGraphStore) -> tuple[list[_PreferenceSeed], int]:
+    """Seed shopping preference fixtures and return the created memory count."""
+
     preferences: list[_PreferenceSeed] = []
     memory_count = 0
     for index in range(50):
@@ -461,6 +523,8 @@ def _seed_preferences(graph_store: TwinrPersonalGraphStore) -> tuple[list[_Prefe
 
 
 def _seed_plans(graph_store: TwinrPersonalGraphStore, contacts: list[_ContactSeed]) -> list[_PlanSeed]:
+    """Seed plan fixtures and link them to the relevant contact nodes."""
+
     plans: list[_PlanSeed] = []
     linked_contacts = [
         contact for contact in contacts if contact.role in {"physiotherapist", "doctor", "gardener", "friend"}
@@ -501,6 +565,8 @@ def _seed_plans(graph_store: TwinrPersonalGraphStore, contacts: list[_ContactSee
 
 
 def _seed_episodes(service: LongTermMemoryService) -> list[_EpisodeSeed]:
+    """Seed episodic conversation turns through the long-term memory service."""
+
     episodes: list[_EpisodeSeed] = []
     for index in range(100):
         topic = f"topic {index:03d}"
@@ -520,6 +586,8 @@ def _build_eval_cases(
     plans: list[_PlanSeed],
     episodes: list[_EpisodeSeed],
 ) -> list[LongTermEvalCase]:
+    """Build the fixed suite of synthetic recall and lookup cases."""
+
     cases: list[LongTermEvalCase] = []
 
     exact_contacts = [contact for contact in contacts if not contact.ambiguous][:10]
@@ -611,6 +679,8 @@ def _run_eval_case_safely(
     graph_store: TwinrPersonalGraphStore,
     case: LongTermEvalCase,
 ) -> LongTermEvalCaseResult:
+    """Run one case and convert unexpected failures into failed case results."""
+
     try:
         return _run_eval_case(service=service, graph_store=graph_store, case=case)
     except Exception as exc:
@@ -627,6 +697,8 @@ def _run_eval_case_safely(
 
 
 def _coerce_tuple(value: object) -> tuple[object, ...]:
+    """Coerce a loose value into a tuple for tolerant fixture inspection."""
+
     if value is None:
         return ()
     if isinstance(value, tuple):
@@ -647,6 +719,8 @@ def _run_eval_case(
     graph_store: TwinrPersonalGraphStore,
     case: LongTermEvalCase,
 ) -> LongTermEvalCaseResult:
+    """Execute one synthetic case against either lookup or provider context."""
+
     if case.kind == "contact_lookup":
         result = graph_store.lookup_contact(
             name=case.query_text,
@@ -705,6 +779,8 @@ def _run_eval_case(
 
 
 def _summarize_results(case_results: tuple[LongTermEvalCaseResult, ...]) -> LongTermEvalSummary:
+    """Aggregate per-case outcomes into summary counters."""
+
     pass_counts: dict[str, int] = {}
     case_counts: dict[str, int] = {}
     passed_cases = 0
@@ -722,6 +798,8 @@ def _summarize_results(case_results: tuple[LongTermEvalCaseResult, ...]) -> Long
 
 
 def _enrich_store_multihop(graph_store: TwinrPersonalGraphStore, *, store_label: str, brand_label: str) -> None:
+    """Inject extra graph edges so shopping cases can require multihop recall."""
+
     document = graph_store.load_document()
     nodes = {node.node_id: node for node in document.nodes}
     edges = list(document.edges)
@@ -755,6 +833,8 @@ def _link_plan_to_contact(
     plan_node_id: str,
     contact_label: str,
 ) -> None:
+    """Link a seeded plan node to the contact it references."""
+
     document = graph_store.load_document()
     nodes = {node.node_id: node for node in document.nodes}
     edges = list(document.edges)
@@ -778,6 +858,8 @@ def _link_plan_to_contact(
 
 
 def _result_to_payload(result: LongTermEvalResult) -> dict[str, object]:
+    """Convert an evaluation result into the CLI JSON payload shape."""
+
     return {
         "temp_root": result.temp_root,  # AUDIT-FIX(#10): Expose persisted artifact locations in the CLI payload so callers can inspect the generated files.
         "memory_path": result.memory_path,
@@ -816,6 +898,8 @@ def _result_to_payload(result: LongTermEvalResult) -> dict[str, object]:
 
 
 def main() -> int:
+    """Run the synthetic evaluation CLI and print JSON output."""
+
     try:
         payload = _result_to_payload(run_synthetic_longterm_eval())
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))  # AUDIT-FIX(#11): Emit deterministic JSON to make CI snapshots and diffs stable.

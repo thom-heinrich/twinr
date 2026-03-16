@@ -1,0 +1,184 @@
+schema_version: 1
+name: memory
+path: src/twinr/memory
+kind: python-package
+visibility: internal
+summary: Coordinate Twinr's memory package surface for short-term memory, prompt-context stores, reminders, shared retrieval helpers, ChonkyDB integration, and long-term memory subsystems.
+owned_concerns:
+  - Expose the canonical `twinr.memory` import surface across short-term, durable, graph, and long-term memory primitives
+  - Provide file-backed prompt-context, managed-context, and reminder stores used by runtime, prompt assembly, and web flows
+  - Provide shared retrieval helpers for bounded full-text selection and optional canonical query rewriting
+  - Host the `on_device`, `chonkydb`, and `longterm` subpackages as the memory subsystem root
+out_of_scope:
+  - Top-level runtime loops, prompt assembly policy, or tool routing outside memory-specific stores
+  - Web routes, forms, and dashboard rendering in `src/twinr/web`
+  - Hardware capture, playback, display, or printer orchestration
+files:
+  - path: __init__.py
+    role: Public memory package export surface
+    exports:
+      - ConversationTurn
+      - ChonkyDBAuthInfo
+      - ChonkyDBBulkRecordRequest
+      - ChonkyDBClient
+      - ChonkyDBConnectionConfig
+      - ChonkyDBError
+      - ChonkyDBGraphAddEdgeRequest
+      - ChonkyDBGraphAddEdgeSmartRequest
+      - ChonkyDBGraphNeighborsRequest
+      - ChonkyDBGraphPathRequest
+      - ChonkyDBGraphPatternsRequest
+      - ChonkyDBInstanceInfo
+      - ChonkyDBRecordItem
+      - ChonkyDBRecordListResponse
+      - ChonkyDBRecordRequest
+      - ChonkyDBRecordSummary
+      - ChonkyDBRetrieveHit
+      - ChonkyDBRetrieveRequest
+      - ChonkyDBRetrieveResponse
+      - ManagedContextEntry
+      - ManagedContextFileStore
+      - LongTermConversationTurn
+      - LongTermEnqueueResult
+      - LongTermMemoryContext
+      - LongTermMemoryService
+      - LongTermMultimodalEvidence
+      - LongTermMultimodalExtractor
+      - LongTermSubtextBuilder
+      - AsyncLongTermMemoryWriter
+      - AsyncLongTermMultimodalWriter
+      - MemoryLedgerItem
+      - PersistentMemoryEntry
+      - PersistentMemoryMarkdownStore
+      - MemoryState
+      - OnDeviceMemory
+      - PromptContextStore
+      - ReminderEntry
+      - ReminderStore
+      - SearchMemoryEntry
+      - TwinrGraphContactOption
+      - TwinrGraphLookupResult
+      - TWINR_GRAPH_ALLOWED_EDGE_TYPES
+      - TWINR_GRAPH_EDGE_TYPES_BY_NAMESPACE
+      - TwinrGraphWriteResult
+      - TWINR_GRAPH_SCHEMA_NAME
+      - TWINR_GRAPH_SCHEMA_VERSION
+      - TwinrGraphDocumentV1
+      - TwinrGraphEdgeV1
+      - TwinrGraphNodeV1
+      - TwinrPersonalGraphStore
+      - chonkydb_data_path
+      - format_due_label
+      - graph_edge_namespace
+      - is_allowed_graph_edge_type
+      - now_in_timezone
+      - parse_due_at
+  - path: context_store.py
+    role: Prompt-memory and managed-context stores with remote snapshot support
+    exports:
+      - ManagedContextEntry
+      - ManagedContextFileStore
+      - PersistentMemoryEntry
+      - PersistentMemoryMarkdownStore
+      - PromptContextStore
+  - path: reminders.py
+    role: Reminder persistence, scheduling state, and prompt rendering helpers
+    exports:
+      - ReminderEntry
+      - ReminderStore
+      - format_due_label
+      - now_in_timezone
+      - parse_due_at
+      - resolve_timezone
+  - path: query_normalization.py
+    role: Retrieval-query normalization and optional rewrite caching
+    exports:
+      - LongTermQueryProfile
+      - LongTermQueryRewriter
+      - tokenize_retrieval_text
+  - path: fulltext.py
+    role: In-memory SQLite FTS selector for bounded ranking
+    exports:
+      - FullTextDocument
+      - FullTextSelector
+subpackages:
+  - path: on_device
+    role: Bounded on-device short-term memory package
+  - path: chonkydb
+    role: ChonkyDB client, schema, and personal-graph package
+  - path: longterm
+    role: Long-term memory ingestion, storage, retrieval, reasoning, and runtime package
+public_api:
+  module: twinr.memory
+  exports:
+    - ConversationTurn
+    - ChonkyDBAuthInfo
+    - ChonkyDBBulkRecordRequest
+    - ChonkyDBClient
+    - ChonkyDBConnectionConfig
+    - ChonkyDBError
+    - ChonkyDBGraphAddEdgeRequest
+    - ChonkyDBGraphAddEdgeSmartRequest
+    - ChonkyDBGraphNeighborsRequest
+    - ChonkyDBGraphPathRequest
+    - ChonkyDBGraphPatternsRequest
+    - ChonkyDBInstanceInfo
+    - ChonkyDBRecordItem
+    - ChonkyDBRecordListResponse
+    - ChonkyDBRecordRequest
+    - ChonkyDBRecordSummary
+    - ChonkyDBRetrieveHit
+    - ChonkyDBRetrieveRequest
+    - ChonkyDBRetrieveResponse
+    - ManagedContextEntry
+    - ManagedContextFileStore
+    - LongTermConversationTurn
+    - LongTermEnqueueResult
+    - LongTermMemoryContext
+    - LongTermMemoryService
+    - LongTermMultimodalEvidence
+    - LongTermMultimodalExtractor
+    - LongTermSubtextBuilder
+    - AsyncLongTermMemoryWriter
+    - AsyncLongTermMultimodalWriter
+    - MemoryLedgerItem
+    - PersistentMemoryEntry
+    - PersistentMemoryMarkdownStore
+    - MemoryState
+    - OnDeviceMemory
+    - PromptContextStore
+    - ReminderEntry
+    - ReminderStore
+    - SearchMemoryEntry
+    - TwinrGraphContactOption
+    - TwinrGraphLookupResult
+    - TWINR_GRAPH_ALLOWED_EDGE_TYPES
+    - TWINR_GRAPH_EDGE_TYPES_BY_NAMESPACE
+    - TwinrGraphWriteResult
+    - TWINR_GRAPH_SCHEMA_NAME
+    - TWINR_GRAPH_SCHEMA_VERSION
+    - TwinrGraphDocumentV1
+    - TwinrGraphEdgeV1
+    - TwinrGraphNodeV1
+    - TwinrPersonalGraphStore
+    - chonkydb_data_path
+    - format_due_label
+    - graph_edge_namespace
+    - is_allowed_graph_edge_type
+    - now_in_timezone
+    - parse_due_at
+primary_callers:
+  - path: src/twinr/__init__.py
+  - path: src/twinr/agent/base_agent/runtime/base.py
+  - path: src/twinr/agent/base_agent/prompting/personality.py
+  - path: src/twinr/memory/longterm/runtime/service.py
+  - path: src/twinr/web/context.py
+  - path: src/twinr/web/app.py
+  - path: src/twinr/automations/store.py
+tests:
+  - path: test/test_context_store.py
+  - path: test/test_reminders.py
+  - path: test/test_longterm_memory.py
+  - path: test/test_longterm_remote_state.py
+  - path: test/test_state_machine.py
+  - path: test/test_web_app.py

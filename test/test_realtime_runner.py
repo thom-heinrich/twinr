@@ -4,10 +4,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 import math
+import shutil
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -29,6 +31,7 @@ from twinr.memory.longterm.core.models import (
     LongTermReflectionResultV1,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, LongTermRemoteUnavailableError
 from twinr.memory.reminders import now_in_timezone
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority, WakewordMatch
 from twinr.providers.openai import OpenAITextResponse
@@ -807,6 +810,25 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(conversation), 1)
         self.assertEqual(conversation[0][0], "system")
         self.assertIn(self._LANGUAGE_CONTRACT, conversation[0][1])
+
+    def test_make_loop_registers_tempdir_cleanup(self) -> None:
+        class _FakeTempDir:
+            def __init__(self, path: str) -> None:
+                self.name = path
+                self.cleaned = False
+
+            def cleanup(self) -> None:
+                self.cleaned = True
+                shutil.rmtree(self.name, ignore_errors=True)
+
+        fake_temp_dir = _FakeTempDir(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, fake_temp_dir.name, True)
+
+        with mock.patch("test.test_realtime_runner.tempfile.TemporaryDirectory", return_value=fake_temp_dir):
+            self.make_loop()
+
+        cleanup_functions = [cleanup[0] for cleanup in self._cleanups]
+        self.assertIn(fake_temp_dir.cleanup, cleanup_functions)
 
     def test_green_button_runs_realtime_audio_turn(self) -> None:
         loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
@@ -1597,6 +1619,66 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("status=printing", lines)
         self.assertIn("print_tool_call=true", lines)
 
+    def test_self_coding_tool_calls_create_and_advance_dialogue(self) -> None:
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+
+        proposed = loop._handle_propose_skill_learning_tool_call(
+            {
+                "name": "Announce Family Updates",
+                "action": "Read new family updates aloud",
+                "request_summary": "Read out new family updates.",
+                "capabilities": ["speaker", "safety", "rules"],
+                "trigger_mode": "push",
+                "trigger_conditions": ["new_message"],
+                "scope": {"channel": "messages"},
+                "constraints": ["not_during_night_mode"],
+            }
+        )
+
+        self.assertEqual(proposed["status"], "questioning")
+        self.assertEqual(proposed["outcome"], "green")
+        self.assertEqual(proposed["dialogue_status"], "questioning")
+        self.assertIn("session_id", proposed)
+        self.assertEqual(
+            proposed["prompt"],
+            "Should I do that automatically, or only when you ask me?",
+        )
+
+        when_answer = loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "trigger_conditions": ["user_visible"],
+            }
+        )
+        what_answer = loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "scope": {"contacts": ["family"]},
+            }
+        )
+        how_answer = loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "action": "Ask first, then read the update aloud",
+                "constraints": ["ask_first"],
+            }
+        )
+        final = loop._handle_answer_skill_question_tool_call(
+            {
+                "session_id": proposed["session_id"],
+                "confirmed": True,
+            }
+        )
+
+        self.assertEqual(when_answer["status"], "questioning")
+        self.assertEqual(what_answer["status"], "questioning")
+        self.assertEqual(how_answer["status"], "confirming")
+        self.assertEqual(final["status"], "ready_for_compile")
+        self.assertEqual(final["skill_spec"]["scope"]["contacts"], ["family"])
+        self.assertIn("ask_first", final["skill_spec"]["constraints"])
+        self.assertIn("user_visible", final["skill_spec"]["trigger"]["conditions"])
+        self.assertIn("self_coding_tool_call=true", lines)
+
     def test_remember_memory_tool_call_writes_memory_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -1902,9 +1984,72 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertTrue(executed)
         self.assertEqual(print_backend.automation_calls, [("Print the main headlines of the day.", True, "printed")])
         self.assertEqual(printer.printed, ["GUTEN TAG"])
+
+    def test_idle_loop_executes_allowed_tool_call_automation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                automation_poll_interval_s=0.0,
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop(config=config)
+            entry = loop.runtime.create_time_automation(
+                name="Tool print",
+                schedule="daily",
+                time_of_day=now_in_timezone(config.local_timezone_name).strftime("%H:%M"),
+                actions=(
+                    AutomationAction(
+                        kind="tool_call",
+                        tool_name="print_receipt",
+                        payload={"text": "Bitte ausdrucken"},
+                        enabled=True,
+                    ),
+                ),
+                source="test",
+            )
+
+            executed = loop._maybe_run_due_automation()
+            stored = loop.runtime.automation_store.get(entry.automation_id)
+
+        self.assertTrue(executed)
+        self.assertEqual(print_backend.calls[-1][1:], (None, "Bitte ausdrucken", "tool"))
+        self.assertEqual(printer.printed, ["GUTEN TAG"])
         assert stored is not None
         self.assertIsNotNone(stored.last_triggered_at)
-        self.assertIn("automation_print_job=request id is Test-2 (1 file(s))", lines)
+        self.assertIn("automation_tool_call=print_receipt", lines)
+
+    def test_idle_loop_rejects_unsafe_tool_call_automation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                automation_poll_interval_s=0.0,
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+            entry = loop.runtime.create_time_automation(
+                name="Unsafe tool",
+                schedule="daily",
+                time_of_day=now_in_timezone(config.local_timezone_name).strftime("%H:%M"),
+                actions=(
+                    AutomationAction(
+                        kind="tool_call",
+                        tool_name="update_simple_setting",
+                        payload={"setting": "memory_capacity", "value": 4, "action": "set"},
+                        enabled=True,
+                    ),
+                ),
+                source="test",
+            )
+
+            executed = loop._maybe_run_due_automation()
+            stored = loop.runtime.automation_store.get(entry.automation_id)
+
+        self.assertFalse(executed)
+        assert stored is not None
+        self.assertIsNone(stored.last_triggered_at)
+        self.assertTrue(any("Automation tool_call is not allowed" in line for line in lines))
 
     def test_idle_loop_printed_automation_uses_processing_and_printing_feedback(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3052,6 +3197,118 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertTrue(button_monitor.exited)
         self.assertTrue(proactive_monitor.entered)
         self.assertTrue(proactive_monitor.exited)
+
+    def test_run_holds_error_when_required_remote_dependency_is_unavailable(self) -> None:
+        button_monitor = FakeIdleButtonMonitor()
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=TwinrConfig(
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_keepalive_interval_s=0.01,
+            ),
+            button_monitor=button_monitor,
+        )
+
+        class _FailingRequiredRemote:
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                raise LongTermRemoteUnavailableError("remote unavailable")
+
+            def remote_status(self):
+                return LongTermRemoteStatus(
+                    mode="remote_primary",
+                    ready=False,
+                    detail="remote unavailable",
+                )
+
+        loop.runtime.long_term_memory = _FailingRequiredRemote()
+
+        result = loop.run(duration_s=0.03, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(loop.runtime.status.value, "error")
+        self.assertIn("status=error", lines)
+        self.assertNotIn("status=listening", lines)
+        self.assertEqual(button_monitor.poll_calls, 0)
+
+    def test_run_recovers_after_required_remote_dependency_returns(self) -> None:
+        button_monitor = FakeIdleButtonMonitor()
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=TwinrConfig(
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_keepalive_interval_s=0.01,
+            ),
+            button_monitor=button_monitor,
+        )
+
+        ready_after = time.monotonic() + 0.02
+
+        class _RecoveringRequiredRemote:
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                if time.monotonic() < ready_after:
+                    raise LongTermRemoteUnavailableError("remote unavailable")
+
+            def remote_status(self):
+                if time.monotonic() < ready_after:
+                    return LongTermRemoteStatus(
+                        mode="remote_primary",
+                        ready=False,
+                        detail="remote unavailable",
+                    )
+                return LongTermRemoteStatus(mode="remote_primary", ready=True)
+
+        loop.runtime.long_term_memory = _RecoveringRequiredRemote()
+
+        result = loop.run(duration_s=0.25, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        self.assertIn("status=error", lines)
+        self.assertIn("status=waiting", lines)
+        self.assertIn("required_remote_dependency_restored=true", lines)
+        self.assertEqual(loop.runtime.status.value, "waiting")
+
+    def test_run_does_not_restore_when_deep_remote_check_still_fails(self) -> None:
+        button_monitor = FakeIdleButtonMonitor()
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=TwinrConfig(
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_keepalive_interval_s=0.01,
+            ),
+            button_monitor=button_monitor,
+        )
+
+        class _FalsePositiveRecoveringRemote:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                self.calls += 1
+                raise LongTermRemoteUnavailableError("archive shard unavailable")
+
+            def remote_status(self):
+                return LongTermRemoteStatus(mode="remote_primary", ready=True)
+
+        loop.runtime.long_term_memory = _FalsePositiveRecoveringRemote()
+
+        result = loop.run(duration_s=0.05, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(loop.runtime.status.value, "error")
+        self.assertIn("status=error", lines)
+        self.assertNotIn("required_remote_dependency_restored=true", lines)
 
     def test_run_handles_button_press_while_housekeeping_blocks(self) -> None:
         button_monitor = FakeScheduledButtonMonitor(event_after_s=0.02, name="yellow")

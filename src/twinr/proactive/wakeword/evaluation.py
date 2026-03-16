@@ -1,3 +1,10 @@
+"""Evaluate and label wakeword captures against current policy settings.
+
+This module turns manifest or ops-labeled recordings into deterministic
+evaluation metrics, writes the latest eval report, and searches for candidate
+calibration overrides that improve wakeword precision and recall.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -85,6 +92,8 @@ def _capture_from_wav(path: Path) -> AmbientAudioCaptureWindow:
 
 @dataclass(frozen=True, slots=True)
 class WakewordEvalEntry:
+    """Describe one labeled audio clip used for wakeword evaluation."""
+
     audio_path: Path
     label: str
     source: str = "manifest"
@@ -93,6 +102,8 @@ class WakewordEvalEntry:
 
 @dataclass(frozen=True, slots=True)
 class WakewordEvalMetrics:
+    """Report aggregate wakeword evaluation counts and ratios."""
+
     total: int
     true_positive: int
     false_positive: int
@@ -106,6 +117,8 @@ class WakewordEvalMetrics:
 
 @dataclass(frozen=True, slots=True)
 class WakewordEvalReport:
+    """Describe one evaluation run and its persisted report path."""
+
     metrics: WakewordEvalMetrics
     evaluated_entries: int
     report_path: Path | None = None
@@ -113,6 +126,8 @@ class WakewordEvalReport:
 
 @dataclass(frozen=True, slots=True)
 class WakewordAutotuneRecommendation:
+    """Describe the best calibration profile found during autotune."""
+
     profile: WakewordCalibrationProfile
     metrics: WakewordEvalMetrics
     score: float
@@ -120,6 +135,8 @@ class WakewordAutotuneRecommendation:
 
 
 def load_eval_manifest(manifest_path: str | Path) -> list[WakewordEvalEntry]:
+    """Load labeled wakeword clips from a JSONL manifest."""
+
     path = Path(manifest_path).expanduser().resolve(strict=False)
     if not path.exists():
         raise FileNotFoundError(path)
@@ -156,6 +173,8 @@ def append_wakeword_capture_label(
     label: str,
     notes: str | None = None,
 ) -> dict[str, object]:
+    """Append or update an operator label for one stored wakeword capture."""
+
     normalized_label = _normalize_label(label)
     if _expected_detected(normalized_label) is None:
         raise ValueError(f"Unsupported wakeword label: {label}")
@@ -172,6 +191,8 @@ def append_wakeword_capture_label(
 
 
 def load_labeled_ops_captures(config: TwinrConfig) -> list[WakewordEvalEntry]:
+    """Load labeled wakeword captures from Twinr ops events."""
+
     events_path = resolve_ops_paths_for_config(config).events_path
     if not events_path.exists():
         return []
@@ -244,6 +265,8 @@ def evaluate_wakeword_entries(
     backend=None,
     model_factory=None,
 ) -> WakewordEvalReport:
+    """Evaluate labeled wakeword clips against the configured policy."""
+
     verifier = (
         None
         if backend is None or config.wakeword_verifier_mode == "disabled"
@@ -311,6 +334,8 @@ def run_wakeword_eval(
     backend=None,
     model_factory=None,
 ) -> WakewordEvalReport:
+    """Run wakeword evaluation and persist the latest JSON report."""
+
     entries = (
         load_eval_manifest(manifest_path)
         if manifest_path is not None
@@ -362,6 +387,8 @@ def autotune_wakeword_profile(
     backend=None,
     model_factory=None,
 ) -> WakewordAutotuneRecommendation:
+    """Search calibration candidates and persist the best recommendation."""
+
     entries = (
         load_eval_manifest(manifest_path)
         if manifest_path is not None

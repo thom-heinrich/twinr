@@ -1,3 +1,10 @@
+"""Normalize retrieval queries for Twinr's long-term memory flows.
+
+This module builds canonical query profiles, tokenizes retrieval text, and
+optionally rewrites non-English requests into concise English through a bounded
+LLM-backed cache.
+"""
+
 from __future__ import annotations
 
 import json
@@ -93,6 +100,15 @@ def _build_canonicalization_prompt(query_text: str) -> str:
 
 
 def tokenize_retrieval_text(value: str | None) -> tuple[str, ...]:
+    """Tokenize normalized retrieval text for memory search helpers.
+
+    Args:
+        value: Raw query text to normalize and split into retrieval terms.
+
+    Returns:
+        A tuple of normalized retrieval tokens.
+    """
+
     # AUDIT-FIX(#4): Tokenize the normalized text so retrieval term generation matches cache and
     # profile normalization behavior.
     return retrieval_terms(_normalize_text(value))
@@ -100,6 +116,14 @@ def tokenize_retrieval_text(value: str | None) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class LongTermQueryProfile:
+    """Store normalized text variants for one long-term retrieval query.
+
+    Attributes:
+        original_text: Normalized user text before optional rewriting.
+        canonical_english_text: Optional English rewrite used for retrieval.
+        retrieval_text: Effective retrieval text after fallback resolution.
+    """
+
     original_text: str
     canonical_english_text: str | None
     retrieval_text: str
@@ -111,6 +135,17 @@ class LongTermQueryProfile:
         *,
         canonical_english_text: str | None = None,
     ) -> "LongTermQueryProfile":
+        """Build a normalized query profile from raw and rewritten text.
+
+        Args:
+            query_text: Raw user query text.
+            canonical_english_text: Optional rewritten English variant.
+
+        Returns:
+            A normalized ``LongTermQueryProfile`` with an effective retrieval
+            text selected from the canonical or original query.
+        """
+
         original = _normalize_text(query_text)
         canonical = _normalize_text(canonical_english_text)
         retrieval_text = canonical or original
@@ -123,6 +158,13 @@ class LongTermQueryProfile:
 
 @dataclass(slots=True)
 class LongTermQueryRewriter:
+    """Rewrite retrieval queries into a bounded canonical profile.
+
+    The rewriter keeps a small in-process LRU cache and can call the OpenAI
+    backend only when rewrite support is enabled and the configured language is
+    not already English.
+    """
+
     config: TwinrConfig
     backend: "OpenAIBackend | None" = None
     # AUDIT-FIX(#1): Use a bounded LRU-style cache instead of an unbounded dict so the long-lived
@@ -161,6 +203,18 @@ class LongTermQueryRewriter:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermQueryRewriter":
+        """Build a rewriter from Twinr config and optional backend settings.
+
+        Args:
+            config: Runtime configuration that controls rewrite enablement,
+                cache sizing, language, and provider credentials.
+
+        Returns:
+            A configured ``LongTermQueryRewriter``. The returned instance may
+            have ``backend=None`` when rewrite support is disabled or
+            unavailable.
+        """
+
         backend: OpenAIBackend | None = None
         # AUDIT-FIX(#5): Use normalized primary language detection so English locale variants do
         # not pay an avoidable network and latency penalty.
@@ -194,6 +248,16 @@ class LongTermQueryRewriter:
         return cls(config=config, backend=backend)
 
     def profile(self, query_text: str | None) -> LongTermQueryProfile:
+        """Return the normalized retrieval profile for one query string.
+
+        Args:
+            query_text: Raw user query text.
+
+        Returns:
+            A ``LongTermQueryProfile`` containing the original text and, when
+            available, a canonical English rewrite.
+        """
+
         clean_query = _normalize_text(query_text)
         if not clean_query:
             return LongTermQueryProfile.from_text("")

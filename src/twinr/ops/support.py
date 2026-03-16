@@ -1,3 +1,9 @@
+"""Build redacted Twinr support bundles from local ops artifacts.
+
+This module gathers config checks, ops events, runtime snapshots, usage data,
+health snapshots, and recent self-test artifacts into a bounded ZIP export.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
@@ -82,6 +88,8 @@ def _utc_stamp() -> str:
 
 @dataclass(frozen=True, slots=True)
 class SupportBundleInfo:
+    """Describe one generated Twinr support bundle archive."""
+
     bundle_name: str
     bundle_path: str
     created_at: str
@@ -98,6 +106,19 @@ def build_support_bundle(
     env_path: str | Path,
     event_limit: int = 100,
 ) -> SupportBundleInfo:
+    """Build a redacted support bundle from local Twinr ops evidence.
+
+    Args:
+        config: Twinr runtime configuration that points at the local ops
+            stores and runtime snapshot.
+        env_path: Path to the environment file whose relevant values should be
+            redacted into the bundle.
+        event_limit: Maximum number of recent ops events to include.
+
+    Returns:
+        Metadata describing the created support bundle archive.
+    """
+
     paths = resolve_ops_paths_for_config(config)
     paths.bundles_root.mkdir(parents=True, exist_ok=True)
 
@@ -257,6 +278,8 @@ def build_support_bundle(
 
 
 def redact_env_values(values: dict[str, str]) -> dict[str, str]:
+    """Redact secret-like environment values before export."""
+
     redacted: dict[str, str] = {}
     for key, value in sorted(values.items()):
         if not _is_relevant_key(key):

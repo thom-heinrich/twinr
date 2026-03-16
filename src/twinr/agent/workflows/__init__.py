@@ -1,3 +1,5 @@
+"""Expose the canonical workflow loop entry points for Twinr."""
+
 from twinr.proactive import SocialTriggerDecision, SocialTriggerEngine
 from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.agent.workflows.runner import TwinrHardwareLoop
@@ -12,6 +14,7 @@ __all__ = [
 
 
 def __getattr__(name: str):
+    """Resolve lazy workflow exports without importing optional modules eagerly."""
     if name == "TwinrStreamingHardwareLoop":
         from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
 

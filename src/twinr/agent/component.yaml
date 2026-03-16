@@ -1,0 +1,44 @@
+schema_version: 1
+name: agent
+path: src/twinr/agent
+kind: python-package
+visibility: internal
+summary: Top-level package boundary for Twinr's core agent stack and the thin `twinr.agent` compatibility imports.
+owned_concerns:
+  - Expose the minimal `twinr.agent` import surface for `TwinrConfig`, `TwinrRuntime`, and `TwinrStatus`
+  - Define the package boundary between the core runtime, tool, and workflow child packages
+  - Keep root imports lazy so callers do not eagerly load runtime-heavy dependencies
+out_of_scope:
+  - Base-agent implementation details inside src/twinr/agent/base_agent
+  - Tool prompting, schema, handler, and runtime execution details inside src/twinr/agent/tools
+  - Workflow-loop orchestration details inside src/twinr/agent/workflows
+  - Detailed self-coding contracts, persistence, and capability readiness logic inside src/twinr/agent/self_coding
+files:
+  - path: __init__.py
+    role: Lazy root compatibility export surface
+    exports:
+      - TwinrConfig
+      - TwinrRuntime
+      - TwinrStatus
+subpackages:
+  - path: base_agent
+    role: Core runtime config, contracts, state, prompting, and runtime composition
+  - path: tools
+    role: Tool prompting, schemas, handlers, and runtime tool orchestration
+  - path: workflows
+    role: Classic, realtime, and streaming workflow loops
+  - path: self_coding
+    role: Adaptive Skill Engine core contracts, persistence, and capability readiness
+public_api:
+  module: twinr.agent
+  exports:
+    - TwinrConfig
+    - TwinrRuntime
+    - TwinrStatus
+tests:
+  - path: test/test_config.py
+  - path: test/test_tool_instructions.py
+  - path: test/test_runner.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_streaming_runner.py
+  - path: test/test_main.py

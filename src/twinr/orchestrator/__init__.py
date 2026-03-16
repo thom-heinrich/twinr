@@ -1,3 +1,9 @@
+"""Expose Twinr's edge-orchestrator package surface.
+
+Import transport contracts, ack helpers, the websocket client, the FastAPI
+server factory, and the remote-tool session bridge from this package root.
+"""
+
 from twinr.orchestrator.acks import ACK_ID_TO_TEXT, ack_id_for_text, ack_text_for_id
 from twinr.orchestrator.client import OrchestratorWebSocketClient
 from twinr.orchestrator.contracts import (

@@ -1,3 +1,10 @@
+"""Expose the wakeword package surface for proactive runtime integrations.
+
+Import from ``twinr.proactive.wakeword`` when callers need transcript
+matching, openWakeWord spotters, decision policy helpers, calibration stores,
+evaluation tools, or the streaming monitor as one coherent package boundary.
+"""
+
 from twinr.proactive.wakeword.calibration import (
     WakewordCalibrationProfile,
     WakewordCalibrationStore,

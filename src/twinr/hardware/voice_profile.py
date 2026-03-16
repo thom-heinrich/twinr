@@ -1,3 +1,10 @@
+"""Persist and assess Twinr's local on-device voice profiles.
+
+This module owns lightweight speaker embeddings, the bounded file-backed store,
+and the user-facing enrollment and verification helpers used by runtime and web
+flows.
+"""
+
 from __future__ import annotations
 
 from array import array
@@ -137,6 +144,8 @@ def _normalize_thresholds(likely_threshold: object, uncertain_threshold: object)
 
 # AUDIT-FIX(#1): Constrain the store to project_root by default and require an explicit opt-in for external absolute paths.
 def voice_profile_store_path(config: TwinrConfig) -> Path:
+    """Resolve the configured voice-profile JSON path inside ``project_root``."""
+
     project_root = Path(config.project_root).expanduser().resolve(strict=False)
     configured_raw = str(config.voice_profile_store_path or "").strip()
     if not configured_raw:
@@ -160,6 +169,8 @@ def voice_profile_store_path(config: TwinrConfig) -> Path:
 
 @dataclass(frozen=True, slots=True)
 class VoiceProfileTemplate:
+    """Represent the persisted on-device voice-profile template."""
+
     embedding: tuple[float, ...]
     sample_count: int
     updated_at: str
@@ -167,12 +178,16 @@ class VoiceProfileTemplate:
     average_duration_ms: int = 0
 
     def to_dict(self) -> dict[str, object]:
+        """Serialize the template to the JSON payload written on disk."""
+
         payload = asdict(self)
         payload["embedding"] = list(self.embedding)
         return payload
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> "VoiceProfileTemplate | None":
+        """Parse a persisted JSON payload into a validated template."""
+
         embedding = payload.get("embedding", ())
         if not isinstance(embedding, list) or not embedding:
             return None
@@ -207,6 +222,8 @@ class VoiceProfileTemplate:
 
 @dataclass(frozen=True, slots=True)
 class VoiceProfileSummary:
+    """Summarize the current enrollment state for UI and runtime callers."""
+
     enrolled: bool
     sample_count: int = 0
     updated_at: str | None = None
@@ -216,6 +233,8 @@ class VoiceProfileSummary:
 
 @dataclass(frozen=True, slots=True)
 class VoiceAssessment:
+    """Describe one voice-verification result in user-facing terms."""
+
     status: str
     label: str
     detail: str
@@ -224,10 +243,14 @@ class VoiceAssessment:
 
     @property
     def should_persist(self) -> bool:
+        """Return whether this assessment should enter conversation memory."""
+
         # AUDIT-FIX(#4): Invalid audio must not be persisted as if it were a real speaker verification result.
         return self.status not in {"disabled", "not_enrolled", "invalid_sample"}
 
     def confidence_percent(self) -> str:
+        """Format the confidence score as a rounded percentage string."""
+
         if self.confidence is None:
             return "—"
         return f"{self.confidence * 100:.0f}%"
@@ -241,6 +264,8 @@ class _VoiceEmbedding:
 
 # AUDIT-FIX(#2): Serialize every file-store mutation under a process lock plus a Linux file lock.
 class VoiceProfileStore:
+    """Persist voice-profile templates in a small atomic JSON store."""
+
     def __init__(self, path: str | Path) -> None:
         # AUDIT-FIX(#1): Canonicalize to an absolute path without resolving the final filesystem entry through symlinks.
         self.path = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
@@ -248,9 +273,13 @@ class VoiceProfileStore:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "VoiceProfileStore":
+        """Build a voice-profile store from ``TwinrConfig``."""
+
         return cls(voice_profile_store_path(config))
 
     def load(self) -> VoiceProfileTemplate | None:
+        """Load the current voice-profile template, if one exists."""
+
         parent = self.path.parent
         if not parent.exists():
             return None
@@ -261,12 +290,16 @@ class VoiceProfileStore:
             return None
 
     def save(self, template: VoiceProfileTemplate) -> VoiceProfileTemplate:
+        """Validate and persist the provided voice-profile template."""
+
         self._validate_template(template)
         with self._exclusive_lock(create_parent=True):
             self._write_unlocked(template)
         return template
 
     def clear(self) -> None:
+        """Delete the persisted voice-profile template if it exists."""
+
         parent = self.path.parent
         if not parent.exists():
             return
@@ -278,6 +311,8 @@ class VoiceProfileStore:
 
     # AUDIT-FIX(#2): Provide an atomic read-modify-write transaction so concurrent enrollments do not lose samples.
     def update(self, updater: Callable[[VoiceProfileTemplate | None], VoiceProfileTemplate]) -> VoiceProfileTemplate:
+        """Apply an atomic read-modify-write update to the stored template."""
+
         with self._exclusive_lock(create_parent=True):
             current = self._load_unlocked()
             updated = updater(current)
@@ -431,6 +466,8 @@ class VoiceProfileStore:
 
 
 class VoiceProfileMonitor:
+    """Enroll and assess local voice profiles against bounded embeddings."""
+
     def __init__(
         self,
         *,
@@ -454,6 +491,8 @@ class VoiceProfileMonitor:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "VoiceProfileMonitor":
+        """Build a voice-profile monitor from ``TwinrConfig``."""
+
         return cls(
             store=VoiceProfileStore.from_config(config),
             likely_threshold=config.voice_profile_likely_threshold,
@@ -464,6 +503,8 @@ class VoiceProfileMonitor:
         )
 
     def summary(self) -> VoiceProfileSummary:
+        """Return the current enrollment summary for UI and runtime callers."""
+
         template = self.store.load()
         if template is None:
             return VoiceProfileSummary(enrolled=False, store_path=str(self.store.path))
@@ -476,10 +517,14 @@ class VoiceProfileMonitor:
         )
 
     def reset(self) -> VoiceProfileSummary:
+        """Delete the stored voice profile and return the new summary."""
+
         self.store.clear()
         return self.summary()
 
     def enroll_wav_bytes(self, wav_bytes: bytes) -> VoiceProfileTemplate:
+        """Extract an embedding from WAV bytes and merge it into the template."""
+
         embedding = extract_voice_embedding_from_wav_bytes(
             wav_bytes,
             min_sample_ms=self.min_sample_ms,
@@ -488,6 +533,8 @@ class VoiceProfileMonitor:
         return self._merge_embedding(embedding)
 
     def enroll_pcm16(self, pcm_bytes: bytes, *, sample_rate: int, channels: int) -> VoiceProfileTemplate:
+        """Extract an embedding from PCM16 audio and merge it into the template."""
+
         embedding = extract_voice_embedding_from_pcm16(
             pcm_bytes,
             sample_rate=sample_rate,
@@ -499,6 +546,8 @@ class VoiceProfileMonitor:
 
     # AUDIT-FIX(#4): Invalid assessment audio now degrades to a retryable assessment instead of bubbling a 500.
     def assess_wav_bytes(self, wav_bytes: bytes) -> VoiceAssessment:
+        """Assess one WAV recording against the stored voice profile."""
+
         template = self.store.load()
         if template is None:
             return VoiceAssessment(
@@ -517,6 +566,8 @@ class VoiceProfileMonitor:
         return self._assessment_for_embedding(template, embedding)
 
     def assess_pcm16(self, pcm_bytes: bytes, *, sample_rate: int, channels: int) -> VoiceAssessment:
+        """Assess one PCM16 recording against the stored voice profile."""
+
         template = self.store.load()
         if template is None:
             return VoiceAssessment(
@@ -627,6 +678,8 @@ def extract_voice_embedding_from_wav_bytes(
     min_sample_ms: int,
     max_sample_ms: int = _DEFAULT_MAX_SAMPLE_MS,
 ) -> _VoiceEmbedding:
+    """Extract a bounded voice embedding from a WAV recording."""
+
     try:
         with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
             sample_rate = wav_file.getframerate()
@@ -665,6 +718,8 @@ def extract_voice_embedding_from_pcm16(
     min_sample_ms: int,
     max_sample_ms: int = _DEFAULT_MAX_SAMPLE_MS,
 ) -> _VoiceEmbedding:
+    """Extract a bounded voice embedding from raw PCM16 audio."""
+
     sample_rate_value = _coerce_int_like(sample_rate, minimum=1, default=None)
     if sample_rate_value is None:
         raise ValueError("Sample rate must be greater than zero.")

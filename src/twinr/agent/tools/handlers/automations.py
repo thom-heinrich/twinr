@@ -391,6 +391,22 @@ def build_automation_action(
     *,
     fallback: AutomationAction | None = None,
 ) -> AutomationAction:
+    """Build one normalized automation action from a tool payload.
+
+    Args:
+        owner: Tool executor owner exposing runtime config for validation.
+        arguments: Tool payload containing delivery, content mode, text, and
+            optional web-search flags.
+        fallback: Existing action whose delivery and payload should be reused
+            when the update payload omits them.
+
+    Returns:
+        The normalized automation action ready for runtime persistence.
+
+    Raises:
+        RuntimeError: If required content is missing or the delivery/content
+            mode is unsupported.
+    """
     fallback_delivery = "spoken"
     fallback_payload = action_payload_dict(fallback)  # AUDIT-FIX(#7): Legacy/non-LLM actions may have payload=None or a non-dict payload.
     if fallback is not None:
@@ -439,6 +455,22 @@ def build_updated_time_trigger(
     entry: AutomationDefinition,
     arguments: dict[str, object],
 ) -> TimeAutomationTrigger | None:
+    """Build a replacement time trigger when update fields are present.
+
+    Args:
+        owner: Tool executor owner exposing timezone defaults through config.
+        entry: Existing automation definition that must already be time-based.
+        arguments: Tool payload that may override schedule, due time, weekday,
+            or timezone fields.
+
+    Returns:
+        A replacement ``TimeAutomationTrigger`` when any trigger field changed,
+        otherwise ``None``.
+
+    Raises:
+        RuntimeError: If the existing automation is not time-based or the new
+            trigger fields are invalid.
+    """
     existing = entry.trigger
     if not isinstance(existing, TimeAutomationTrigger):
         raise RuntimeError("Only time-based automations can be updated")
@@ -468,6 +500,21 @@ def build_updated_automation_actions(
     entry: AutomationDefinition,
     arguments: dict[str, object],
 ) -> tuple[AutomationAction, ...] | None:
+    """Build replacement automation actions when action fields changed.
+
+    Args:
+        owner: Tool executor owner exposing runtime config for validation.
+        entry: Existing automation definition providing the fallback action.
+        arguments: Tool payload that may override delivery, content mode,
+            content, or web-search flags.
+
+    Returns:
+        A one-item tuple with the replacement action when any action field
+        changed, otherwise ``None``.
+
+    Raises:
+        RuntimeError: If the automation has no existing action to update.
+    """
     action_fields = {"delivery", "content_mode", "content", "allow_web_search"}
     if not any(field in arguments for field in action_fields):
         return None
@@ -482,6 +529,22 @@ def build_sensor_automation_trigger(
     *,
     fallback: AutomationDefinition | None = None,
 ) -> Any:
+    """Build a sensor trigger from tool arguments and optional defaults.
+
+    Args:
+        arguments: Tool payload containing the trigger kind and optional timing
+            overrides.
+        fallback: Existing automation definition whose trigger timing and kind
+            should provide defaults when update payloads omit them.
+
+    Returns:
+        The concrete runtime trigger object returned by
+        ``twinr.automations.build_sensor_trigger``.
+
+    Raises:
+        RuntimeError: If the trigger kind is missing or any timing field is
+            invalid for the requested sensor trigger.
+    """
     fallback_spec = describe_sensor_trigger(fallback.trigger) if fallback is not None else None
     trigger_kind = (
         _lower_text_or_empty(arguments.get("trigger_kind"))
@@ -511,6 +574,7 @@ def build_sensor_automation_trigger(
 
 
 def build_updated_sensor_trigger(entry: AutomationDefinition, arguments: dict[str, object]) -> Any:
+    """Build a replacement sensor trigger when sensor fields changed."""
     sensor_fields = {"trigger_kind", "hold_seconds", "cooldown_seconds"}
     if not any(field in arguments for field in sensor_fields):
         return None
@@ -518,6 +582,7 @@ def build_updated_sensor_trigger(entry: AutomationDefinition, arguments: dict[st
 
 
 def build_sensor_automation_tags(trigger_kind: str, tags: tuple[str, ...]) -> tuple[str, ...]:
+    """Append the canonical reserved tags for a sensor automation."""
     normalized_tags = list(tags)
     normalized_tags.extend(("sensor", trigger_kind))
     return tuple(dict.fromkeys(tag for tag in normalized_tags if tag))
@@ -529,6 +594,19 @@ def build_updated_sensor_tags(
     *,
     next_trigger: Any = None,
 ) -> tuple[str, ...] | None:
+    """Rebuild sensor tags after trigger or tag updates.
+
+    Args:
+        entry: Existing automation definition whose current trigger and tags
+            provide the default reserved-tag context.
+        arguments: Tool payload that may override ``tags`` or ``trigger_kind``.
+        next_trigger: Replacement trigger object when the caller already built
+            one during the current update flow.
+
+    Returns:
+        The rebuilt tag tuple when sensor tags should change, otherwise
+        ``None``.
+    """
     current_spec = describe_sensor_trigger(entry.trigger)
     if current_spec is None:
         return None
@@ -551,6 +629,21 @@ def resolve_automation_reference(
     *,
     allow_partial_match: bool = True,
 ) -> AutomationDefinition:
+    """Resolve an automation ID or name to one concrete definition.
+
+    Args:
+        owner: Tool executor owner exposing the runtime automation store.
+        automation_ref: Automation ID or user-facing automation name.
+        allow_partial_match: Whether a unique partial name match is acceptable
+            after exact ID and exact-name lookups fail.
+
+    Returns:
+        The single matching automation definition.
+
+    Raises:
+        RuntimeError: If the reference is empty, ambiguous, or no automation
+            matches under the requested lookup policy.
+    """
     normalized_input = _text_or_empty(automation_ref)  # AUDIT-FIX(#10): Treat None-like values and surrounding whitespace consistently before lookup.
     if not normalized_input:
         raise RuntimeError("Automation reference must not be empty")
@@ -581,6 +674,15 @@ def resolve_automation_reference(
 
 
 def serialize_automation_response(owner: Any, entry: AutomationDefinition) -> dict[str, object]:
+    """Serialize a committed automation with guarded fallbacks.
+
+    Args:
+        owner: Tool executor owner exposing the runtime automation store.
+        entry: Automation definition that was just created or updated.
+
+    Returns:
+        A JSON-safe automation record even when the preferred serializer fails.
+    """
     try:
         record = owner.runtime.automation_store.engine.tool_record(entry)
     except Exception:
@@ -592,6 +694,15 @@ def serialize_automation_response(owner: Any, entry: AutomationDefinition) -> di
 
 
 def automation_definition_to_record(entry: AutomationDefinition) -> dict[str, object]:
+    """Convert an automation definition into the stable record shape.
+
+    Args:
+        entry: Automation definition returned by the runtime store.
+
+    Returns:
+        A JSON-safe record covering time triggers, supported sensor triggers,
+        and action payloads.
+    """
     trigger = getattr(entry, "trigger", None)
     record: dict[str, object] = {
         "automation_id": getattr(entry, "automation_id", None),
@@ -632,6 +743,7 @@ def automation_definition_to_record(entry: AutomationDefinition) -> dict[str, ob
 
 
 def action_to_record(action: AutomationAction) -> dict[str, object]:
+    """Serialize one automation action into a JSON-safe record."""
     return {
         "kind": getattr(action, "kind", None),
         "text": getattr(action, "text", None),
@@ -640,6 +752,7 @@ def action_to_record(action: AutomationAction) -> dict[str, object]:
 
 
 def action_payload_dict(action: AutomationAction | None) -> dict[str, object]:
+    """Return a dictionary payload for an automation action."""
     if action is None:
         return {}
     payload = getattr(action, "payload", None)
@@ -682,6 +795,7 @@ def _safe_record_event(owner: Any, event_name: str, description: str, **payload:
 
 
 def sanitize_telemetry_value(raw_value: object) -> str:
+    """Normalize telemetry values into one bounded log-safe string."""
     value = _text_or_empty(raw_value)
     cleaned = "".join(" " if char in {"\x00", "\r", "\n"} else char for char in value)
     cleaned = " ".join(cleaned.split())
@@ -694,6 +808,18 @@ def ensure_unique_automation_name(
     *,
     excluding_automation_id: str | None = None,
 ) -> None:
+    """Reject duplicate automation names before a state mutation.
+
+    Args:
+        owner: Tool executor owner exposing the runtime automation store.
+        name: Proposed automation name from the current tool payload.
+        excluding_automation_id: Existing automation ID to ignore during
+            rename flows.
+
+    Raises:
+        RuntimeError: If the name is empty or another automation already uses
+            the same case-insensitive name.
+    """
     normalized_name = automation_name_key(name)
     if not normalized_name:
         raise RuntimeError("Automation name must not be empty")
@@ -709,10 +835,24 @@ def ensure_unique_automation_name(
 
 
 def automation_name_key(raw_value: object) -> str:
+    """Normalize an automation name for case-insensitive comparisons."""
     return _text_or_empty(raw_value).lower()
 
 
 def resolve_timezone_name(owner: Any, raw_value: object, *, fallback: str | None = None) -> str:
+    """Validate and resolve a timezone name for automation scheduling.
+
+    Args:
+        owner: Tool executor owner exposing the configured local timezone.
+        raw_value: Candidate timezone name from the current tool payload.
+        fallback: Existing timezone name to reuse when the payload omits one.
+
+    Returns:
+        A valid IANA timezone name.
+
+    Raises:
+        RuntimeError: If the resolved timezone name is unknown.
+    """
     candidate = _text_or_empty(raw_value) or _text_or_empty(fallback) or _text_or_empty(getattr(owner.config, "local_timezone_name", "")) or "UTC"
     try:
         ZoneInfo(candidate)
@@ -722,6 +862,7 @@ def resolve_timezone_name(owner: Any, raw_value: object, *, fallback: str | None
 
 
 def validate_non_negative_finite(field_name: str, raw_value: object) -> float:
+    """Coerce a numeric field and reject negative or non-finite values."""
     value = float(raw_value)
     if not isfinite(value):
         raise RuntimeError(f"{field_name} must be a finite number")
@@ -731,6 +872,7 @@ def validate_non_negative_finite(field_name: str, raw_value: object) -> float:
 
 
 def parse_delivery(raw_value: object, *, default: str) -> str:
+    """Normalize a spoken or printed delivery selector."""
     normalized = _lower_text_or_empty(raw_value)
     if not normalized:
         return default
@@ -742,6 +884,7 @@ def parse_delivery(raw_value: object, *, default: str) -> str:
 
 
 def parse_content_mode(raw_value: object, *, default: str) -> str:
+    """Normalize the automation content-mode selector."""
     normalized = _lower_text_or_empty(raw_value)
     if not normalized:
         return default
@@ -786,6 +929,15 @@ def _lower_text_or_empty(raw_value: object) -> str:
 
 
 def serialize_automation_record(record: dict[str, object]) -> dict[str, object]:
+    """Project a raw automation record into the tool response shape.
+
+    Args:
+        record: Runtime or fallback automation record containing trigger and
+            action data.
+
+    Returns:
+        The stable JSON-safe response payload returned to the model.
+    """
     actions = tuple(record.get("actions", ()) or ())
     primary_action = actions[0] if actions else {}
     if not isinstance(primary_action, dict):
@@ -827,6 +979,7 @@ def serialize_automation_record(record: dict[str, object]) -> dict[str, object]:
 
 
 def normalize_delivery(raw_value: object) -> str:
+    """Best-effort normalize a delivery alias for existing action payloads."""
     normalized = _lower_text_or_empty(raw_value)
     if normalized in _PRINT_DELIVERY_ALIASES:
         return "printed"
@@ -836,6 +989,7 @@ def normalize_delivery(raw_value: object) -> str:
 
 
 def parse_weekdays(raw_value: object) -> tuple[int, ...]:
+    """Parse weekday values into a unique sorted tuple of integers."""
     if raw_value is None or raw_value == "":
         return ()
     if not isinstance(raw_value, (list, tuple)):
@@ -860,6 +1014,7 @@ def parse_weekdays(raw_value: object) -> tuple[int, ...]:
 
 
 def parse_tags(raw_value: object) -> tuple[str, ...]:
+    """Parse user-provided automation tags into a bounded unique tuple."""
     if raw_value is None or raw_value == "":
         return ()
     if not isinstance(raw_value, (list, tuple)):

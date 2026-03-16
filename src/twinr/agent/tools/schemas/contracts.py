@@ -293,6 +293,16 @@ def _simple_setting_rules(spoken_voices: Sequence[str]) -> list[dict[str, Any]]:
 
 
 def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray | None) -> list[dict[str, Any]]:
+    """Build the canonical JSON schemas for the requested tool names.
+
+    Args:
+        tool_names: Tool names to include. Accepts iterables plus single string
+            or bytes inputs and ignores duplicates and empty values.
+
+    Returns:
+        A list of OpenAI-style function tool schema dictionaries ordered by the
+        canonical tool registry in this module.
+    """
     normalized_tool_names = _normalize_tool_names(tool_names)
     available = set(normalized_tool_names)
 
@@ -707,6 +717,119 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                         ),
                     },
                     "required": ["automation_ref"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "propose_skill_learning" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "propose_skill_learning",
+                "description": (
+                    "Start Twinr's self-coding learning flow for a new persistent capability the current tool surface cannot already satisfy. "
+                    "Use this only for new repeatable behaviors, not for one-off answers."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": _string_property(
+                            "Short human-readable name for the skill Twinr should learn.",
+                            min_length=1,
+                        ),
+                        "action": _string_property(
+                            "Plain-language summary of what the learned skill should do.",
+                            min_length=1,
+                        ),
+                        "request_summary": _string_property(
+                            "Optional short paraphrase of the user's request in user-facing language.",
+                            min_length=1,
+                        ),
+                        "skill_id": _string_property(
+                            "Optional stable identifier if one is already known.",
+                            min_length=1,
+                        ),
+                        "trigger_mode": _string_property(
+                            "Optional preliminary trigger mode.",
+                            enum=["push", "pull"],
+                        ),
+                        "trigger_conditions": _array_property(
+                            "Optional preliminary trigger conditions as stable identifiers.",
+                            _string_property("Trigger condition identifier.", min_length=1),
+                            unique_items=True,
+                        ),
+                        "scope": {
+                            "type": "object",
+                            "description": "Optional preliminary structured scope object.",
+                            "additionalProperties": True,
+                        },
+                        "constraints": _array_property(
+                            "Optional preliminary constraints in plain language.",
+                            _string_property("Constraint.", min_length=1),
+                            unique_items=True,
+                        ),
+                        "capabilities": _array_property(
+                            "Required ASE capabilities such as camera, pir, speaker, llm_call, memory, scheduler, rules, safety, email, or calendar.",
+                            _string_property("Capability identifier.", min_length=1),
+                            min_items=1,
+                            unique_items=True,
+                        ),
+                    },
+                    "required": ["name", "action", "capabilities"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "answer_skill_question" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "answer_skill_question",
+                "description": (
+                    "Continue an active self-coding requirements dialogue after Twinr has already asked one of its short follow-up questions."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": _string_property(
+                            "Dialogue session identifier previously returned by propose_skill_learning.",
+                            min_length=1,
+                        ),
+                        "use_default": _boolean_property(
+                            "Set true when the user explicitly says to do whatever makes sense or to use the default."
+                        ),
+                        "trigger_mode": _string_property(
+                            "Optional updated trigger mode for the current answer.",
+                            enum=["push", "pull"],
+                        ),
+                        "trigger_conditions": _array_property(
+                            "Optional extra trigger conditions to merge into the draft skill.",
+                            _string_property("Trigger condition identifier.", min_length=1),
+                            unique_items=True,
+                        ),
+                        "scope": {
+                            "type": "object",
+                            "description": "Optional shallow scope patch to merge into the draft skill scope.",
+                            "additionalProperties": True,
+                        },
+                        "constraints": _array_property(
+                            "Optional extra constraints to merge into the draft skill.",
+                            _string_property("Constraint.", min_length=1),
+                            unique_items=True,
+                        ),
+                        "action": _string_property(
+                            "Optional refined action wording for how the skill should behave.",
+                            min_length=1,
+                        ),
+                        "answer_summary": _string_property(
+                            "Optional short summary of the user's answer for auditability.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true or false only when Twinr is at the final confirmation step."
+                        ),
+                    },
+                    "required": ["session_id"],
                     "additionalProperties": False,
                 },
             }
@@ -1164,6 +1287,15 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
 
 
 def build_compact_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray | None) -> list[dict[str, Any]]:
+    """Build compact tool schemas with shortened descriptions.
+
+    Args:
+        tool_names: Tool names to include in the compact schema set.
+
+    Returns:
+        The canonical schemas with descriptions and nested nodes compacted for
+        smaller prompt payloads.
+    """
     return [_compact_tool_schema(schema) for schema in build_agent_tool_schemas(tool_names)]
 
 
@@ -1253,4 +1385,14 @@ def _build_realtime_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_realtime_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray | None) -> list[dict[str, Any]]:
+    """Build realtime-safe tool schemas for providers with reduced support.
+
+    Args:
+        tool_names: Tool names to include in the realtime schema set.
+
+    Returns:
+        The canonical schemas with unsupported top-level JSON Schema keywords
+        stripped from their parameter blocks and explanatory notes appended
+        where Twinr must enforce remaining validation at execution time.
+    """
     return [_build_realtime_tool_schema(schema) for schema in build_agent_tool_schemas(tool_names)]

@@ -1,3 +1,9 @@
+"""Sample bounded Twinr host and service health for ops surfaces.
+
+This module reads runtime snapshot data, host metrics, process presence, and
+recent ops errors to produce dashboard-friendly health snapshots.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -22,6 +28,8 @@ _ERROR_LEVELS = frozenset({"error", "critical", "fatal"})  # AUDIT-FIX(#7): Coun
 
 @dataclass(frozen=True, slots=True)
 class ServiceHealth:
+    """Represent the observed state of one Twinr background service."""
+
     key: str
     label: str
     running: bool
@@ -34,6 +42,8 @@ class ServiceHealth:
 
 @dataclass(frozen=True, slots=True)
 class TwinrSystemHealth:
+    """Collect one bounded snapshot of Twinr host and runtime health."""
+
     status: str
     captured_at: str
     hostname: str
@@ -72,6 +82,19 @@ def collect_system_health(
     snapshot: RuntimeSnapshot | None = None,
     event_store: TwinrOpsEventStore | None = None,
 ) -> TwinrSystemHealth:
+    """Collect a bounded Twinr host and service health snapshot.
+
+    Args:
+        config: Twinr runtime configuration.
+        snapshot: Optional already-loaded runtime snapshot to fold into the
+            returned health state.
+        event_store: Optional ops event store override for recent error counts.
+
+    Returns:
+        A ``TwinrSystemHealth`` payload suitable for the web UI or support
+        export paths.
+    """
+
     captured_at = _captured_at()  # AUDIT-FIX(#1): Capture once so partial failures still return a coherent snapshot.
     recent_error_count, recent_errors_ok = _read_recent_error_count(
         config,

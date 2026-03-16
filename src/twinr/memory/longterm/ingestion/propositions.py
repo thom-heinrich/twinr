@@ -1,3 +1,10 @@
+"""Run structured turn proposition extraction and compilation.
+
+This module defines the schema, normalization helpers, provider-backed
+structured extraction program, and proposition compiler used to turn one
+conversation exchange into canonical long-term memory candidates.
+"""
+
 from __future__ import annotations
 
 import json
@@ -35,6 +42,7 @@ _MAX_PROMPT_FIELD_CHARS = 120
 
 
 def _normalize_text(value: str | None, *, limit: int | None = None) -> str:
+    """Normalize free text into bounded single-line content."""
     # AUDIT-FIX(#6): Collapse hidden whitespace before truncation so refs/keys/ids do not diverge only by control characters.
     if value is None:
         return ""
@@ -42,11 +50,13 @@ def _normalize_text(value: str | None, *, limit: int | None = None) -> str:
 
 
 def _quoted(value: str) -> str:
+    """Quote prompt text as a JSON string literal."""
     # AUDIT-FIX(#4): Use JSON string encoding instead of ad-hoc quote replacement so control characters and newlines stay safely delimited in the prompt.
     return json.dumps(value, ensure_ascii=False)
 
 
 def _empty_turn_payload() -> dict[str, object]:
+    """Return the empty structured payload shape for turn extraction."""
     return {
         "propositions": [],
         "graph_edges": [],
@@ -54,11 +64,13 @@ def _empty_turn_payload() -> dict[str, object]:
 
 
 def _normalize_prompt_text(value: str | None, *, limit: int = _MAX_PROMPT_TEXT_CHARS) -> str:
+    """Bound and normalize text before sending it to the model."""
     # AUDIT-FIX(#4): Bound and normalize prompt payloads so accidental long turns or malformed transcripts do not explode token usage or prompt structure.
     return truncate_text(collapse_whitespace(value or ""), limit=limit)
 
 
 def _normalize_positive_int(value: object, *, default: int) -> int:
+    """Coerce a positive integer config value with a safe minimum."""
     # AUDIT-FIX(#7): Coerce token budgets defensively so None/strings/invalid env-derived values cannot crash max() or pass nonsense downstream.
     if isinstance(value, int) and not isinstance(value, bool):
         return max(1, value)
@@ -69,6 +81,7 @@ def _normalize_positive_int(value: object, *, default: int) -> int:
 
 
 def _normalize_confidence(value: object, *, default: float = _DEFAULT_CONFIDENCE) -> float:
+    """Clamp a confidence value into the supported range."""
     # AUDIT-FIX(#5): Clamp to a finite probability-like range so malformed model payloads cannot inject NaN/inf/out-of-range scores into ranking logic.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
@@ -83,6 +96,7 @@ def _normalize_confidence(value: object, *, default: float = _DEFAULT_CONFIDENCE
 
 
 def _normalize_bool(value: object, *, default: bool = False) -> bool:
+    """Parse boolean-like payload values without truthy string pitfalls."""
     # AUDIT-FIX(#5): Avoid bool("false") == True, which would silently mark unconfirmed graph edges as confirmed.
     if isinstance(value, bool):
         return value
@@ -105,6 +119,7 @@ def _normalize_enum_text(
     default: str | None,
     limit: int,
 ) -> str | None:
+    """Normalize text and keep it only when it matches the allowed set."""
     normalized = _normalize_text(None if value is None else str(value), limit=limit)
     if not normalized:
         return default
@@ -114,11 +129,13 @@ def _normalize_enum_text(
 
 
 def _normalize_identifier_text(value: object, *, limit: int) -> str | None:
+    """Normalize identifier-like text and drop empty values."""
     normalized = _normalize_text(None if value is None else str(value), limit=limit)
     return normalized or None
 
 
 def _normalize_iso_temporal_text(value: object) -> str | None:
+    """Normalize supported ISO date and datetime strings."""
     # AUDIT-FIX(#2): Reject non-ISO or timezone-naive datetime payloads so stored temporal ranges are canonical and not host-timezone dependent.
     normalized = _normalize_identifier_text(value, limit=64)
     if normalized is None:
@@ -139,6 +156,7 @@ def _normalize_iso_temporal_text(value: object) -> str | None:
 
 
 def _temporal_sort_key(value: str | None) -> tuple[int, str] | None:
+    """Build a comparable sort key for supported temporal strings."""
     if value is None:
         return None
     try:
@@ -157,6 +175,7 @@ def _temporal_sort_key(value: str | None) -> tuple[int, str] | None:
 
 
 def _normalize_valid_window(valid_from: str | None, valid_to: str | None) -> tuple[str | None, str | None]:
+    """Normalize and order a temporal validity window."""
     # AUDIT-FIX(#5): Normalize reversed ranges instead of storing logically impossible intervals.
     from_key = _temporal_sort_key(valid_from)
     to_key = _temporal_sort_key(valid_to)
@@ -166,6 +185,7 @@ def _normalize_valid_window(valid_from: str | None, valid_to: str | None) -> tup
 
 
 def _nullable_string_schema() -> dict[str, object]:
+    """Return the shared nullable-string schema fragment."""
     return {
         "anyOf": [
             {"type": "string"},
@@ -175,6 +195,7 @@ def _nullable_string_schema() -> dict[str, object]:
 
 
 def _attribute_entries_schema() -> dict[str, object]:
+    """Return the schema for canonical attribute entry arrays."""
     return {
         "type": "array",
         "items": {
@@ -190,6 +211,7 @@ def _attribute_entries_schema() -> dict[str, object]:
 
 
 def _normalize_attribute_entries(value: object) -> dict[str, str]:
+    """Normalize attribute payloads into a string mapping."""
     if isinstance(value, list):
         normalized: dict[str, str] = {}
         for item in value:
@@ -212,6 +234,7 @@ def _normalize_attribute_entries(value: object) -> dict[str, str]:
 
 
 def _normalize_optional_text(value: object) -> str | None:
+    """Return normalized text or ``None`` when empty."""
     if value is None:
         return None
     clean_value = _normalize_text(str(value), limit=160)
@@ -219,6 +242,7 @@ def _normalize_optional_text(value: object) -> str | None:
 
 
 def _resolve_timezone(timezone_name: str) -> tuple[str, tzinfo]:
+    """Resolve the requested timezone or fall back to UTC."""
     # AUDIT-FIX(#2): Invalid zone keys or missing zoneinfo data must not abort extraction; fall back to UTC deterministically.
     normalized = _normalize_text(timezone_name, limit=64) or _DEFAULT_TIMEZONE_NAME
     try:
@@ -233,6 +257,7 @@ def _resolve_timezone(timezone_name: str) -> tuple[str, tzinfo]:
 
 
 def _ensure_aware_datetime(value: datetime) -> datetime:
+    """Return a timezone-aware datetime for prompt construction."""
     # AUDIT-FIX(#2): astimezone() treats naive datetimes as system-local time; attach UTC explicitly so RPi host settings cannot skew memory timestamps.
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=timezone.utc)
@@ -240,6 +265,8 @@ def _ensure_aware_datetime(value: datetime) -> datetime:
 
 
 class LongTermStructuredTurnProgram(Protocol):
+    """Protocol for structured turn extractors used by the turn pipeline."""
+
     def extract_turn(
         self,
         *,
@@ -249,11 +276,20 @@ class LongTermStructuredTurnProgram(Protocol):
         turn_id: str,
         timezone_name: str,
     ) -> Mapping[str, object]:
+        """Extract a structured payload for one conversation turn."""
         ...
 
 
 @dataclass(frozen=True, slots=True)
 class OpenAIStructuredTurnProgram:
+    """Run structured turn extraction through the active OpenAI backend.
+
+    Attributes:
+        backend: Backend used for JSON-schema constrained generation.
+        model: Optional model override for the extraction request.
+        max_output_tokens: Upper token budget for the structured response.
+    """
+
     backend: "OpenAIBackend"
     model: str | None = None
     max_output_tokens: int = 2200
@@ -267,6 +303,19 @@ class OpenAIStructuredTurnProgram:
         turn_id: str,
         timezone_name: str,
     ) -> Mapping[str, object]:
+        """Request one structured proposition payload for a conversation turn.
+
+        Args:
+            transcript: Normalized user transcript.
+            response: Normalized assistant response.
+            occurred_at: Turn timestamp.
+            turn_id: Stable turn identifier.
+            timezone_name: IANA timezone for prompt-localized timestamps.
+
+        Returns:
+            A mapping with ``propositions`` and ``graph_edges`` arrays. Failures
+            degrade to the empty payload shape.
+        """
         # AUDIT-FIX(#2): Normalize temporal context before prompt construction so invalid timezones or naive datetimes do not raise or silently depend on host locale.
         resolved_timezone_name, resolved_timezone = _resolve_timezone(timezone_name)
         resolved_occurred_at = _ensure_aware_datetime(occurred_at).astimezone(resolved_timezone)
@@ -330,6 +379,8 @@ class OpenAIStructuredTurnProgram:
 
 @dataclass(frozen=True, slots=True)
 class LongTermTurnPropositionV1:
+    """Canonical structured proposition emitted for one turn claim."""
+
     proposition_id: str
     kind: str
     summary: str
@@ -347,6 +398,16 @@ class LongTermTurnPropositionV1:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object], *, index: int) -> "LongTermTurnPropositionV1 | None":
+        """Build a proposition from a model payload item.
+
+        Args:
+            payload: Raw proposition item from structured extraction.
+            index: Zero-based fallback index used for default identifiers.
+
+        Returns:
+            A validated proposition instance, or ``None`` when required fields
+            are missing or invalid.
+        """
         # AUDIT-FIX(#5): Validate model-produced proposition fields before they reach durable memory candidate objects.
         kind = _normalize_enum_text(payload.get("kind"), allowed=_PROPOSITION_KINDS, default=None, limit=64)
         summary = _normalize_text(str(payload.get("summary", "")), limit=220)
@@ -390,11 +451,14 @@ class LongTermTurnPropositionV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermTurnPropositionBundleV1:
+    """Bundle structured propositions with their grounded graph edges."""
+
     propositions: tuple[LongTermTurnPropositionV1, ...]
     graph_edges: tuple[LongTermGraphEdgeCandidateV1, ...]
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "LongTermTurnPropositionBundleV1":
+        """Build a validated bundle from a structured payload mapping."""
         # AUDIT-FIX(#5): Apply the same defensive coercion to graph-edge payloads because structured outputs do not guarantee semantic correctness.
         raw_propositions = payload.get("propositions")
         propositions: list[LongTermTurnPropositionV1] = []
@@ -446,12 +510,24 @@ class LongTermTurnPropositionBundleV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermTurnPropositionCompiler:
+    """Compile propositions into memory candidates and grounded graph edges."""
+
     def compile(
         self,
         *,
         bundle: LongTermTurnPropositionBundleV1,
         source_ref: LongTermSourceRefV1,
     ) -> tuple[tuple[LongTermMemoryObjectV1, ...], tuple[LongTermGraphEdgeCandidateV1, ...]]:
+        """Compile a proposition bundle into memory objects and edges.
+
+        Args:
+            bundle: Validated proposition bundle for one turn.
+            source_ref: Source reference attached to generated memory objects.
+
+        Returns:
+            A tuple containing the compiled memory objects and the grounded
+            graph edges that survived validation.
+        """
         objects: list[LongTermMemoryObjectV1] = []
         accepted_proposition_ids: set[str] = set()
         accepted_refs: set[str] = set()
@@ -526,6 +602,7 @@ class LongTermTurnPropositionCompiler:
         kind: str,
         proposition: LongTermTurnPropositionV1,
     ) -> str:
+        """Build the canonical slot key for one proposition."""
         parts = [kind]
         if proposition.subject_ref:
             parts.append(proposition.subject_ref)
@@ -537,6 +614,7 @@ class LongTermTurnPropositionCompiler:
         return ":".join(part for part in parts if part)
 
     def _build_value_key(self, proposition: LongTermTurnPropositionV1) -> str:
+        """Build the canonical value key for one proposition."""
         if proposition.object_ref:
             return proposition.object_ref
         if proposition.value_text:
@@ -551,6 +629,7 @@ class LongTermTurnPropositionCompiler:
         value_key: str,
         fallback_index: int,
     ) -> str:
+        """Build the durable memory ID for one compiled proposition."""
         prefix = memory_kind_prefix(kind)
         stable_basis = f"{slot_key}:{value_key}"
         return f"{prefix}:{slugify_identifier(stable_basis, fallback=f'item_{fallback_index + 1}')}"
@@ -562,6 +641,7 @@ class LongTermTurnPropositionCompiler:
         accepted_proposition_ids: set[str],
         accepted_refs: set[str],
     ) -> bool:
+        """Return whether a graph edge is grounded by accepted propositions."""
         # AUDIT-FIX(#3): Only persist graph edges that are explicitly grounded by an accepted proposition; otherwise hallucinated relations can leak into long-term memory.
         if not accepted_proposition_ids:
             return False
@@ -576,6 +656,7 @@ class LongTermTurnPropositionCompiler:
 def structured_turn_program_from_config(
     config: TwinrConfig,
 ) -> LongTermStructuredTurnProgram | None:
+    """Create the configured structured turn program when available."""
     # AUDIT-FIX(#7): Normalize env-derived config before constructing the extractor so blank keys or invalid token budgets do not fail at runtime.
     if not _normalize_text(config.openai_api_key, limit=512):
         return None
@@ -599,6 +680,7 @@ def structured_turn_program_from_config(
 
 
 def _turn_proposition_schema() -> dict[str, object]:
+    """Return the strict JSON schema for structured turn extraction."""
     nullable_string = _nullable_string_schema()
     attributes_schema = _attribute_entries_schema()
     return {

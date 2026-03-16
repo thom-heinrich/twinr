@@ -1,3 +1,10 @@
+"""Expose Twinr's public memory package surface.
+
+Import from this package when callers need the supported short-term, prompt-
+context, reminder, graph-memory, or long-term memory types without binding to
+the internal submodule layout.
+"""
+
 from twinr.memory.context_store import (
     ManagedContextEntry,
     ManagedContextFileStore,

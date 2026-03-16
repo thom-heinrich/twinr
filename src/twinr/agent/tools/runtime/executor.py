@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..handlers import automations, memory, output, reminders, settings, voice_profile
+from ..handlers import automations, memory, output, reminders, self_coding, settings, voice_profile
 
 
 class RealtimeToolExecutor:
@@ -55,6 +55,12 @@ class RealtimeToolExecutor:
 
     def handle_delete_automation(self, arguments: dict[str, object]) -> dict[str, object]:
         return automations.handle_delete_automation(self.owner, arguments)
+
+    def handle_propose_skill_learning(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self_coding.handle_propose_skill_learning(self.owner, arguments)
+
+    def handle_answer_skill_question(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self_coding.handle_answer_skill_question(self.owner, arguments)
 
     def handle_remember_memory(self, arguments: dict[str, object]) -> dict[str, object]:
         return memory.handle_remember_memory(self.owner, arguments)

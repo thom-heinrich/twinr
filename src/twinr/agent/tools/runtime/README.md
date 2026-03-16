@@ -12,6 +12,7 @@ streaming APIs.
 - validate the canonical tool-name to handler binding registry
 - run the generic streaming tool loop and the supervisor/specialist handoff loop
 - emit speech-lane deltas and serialize tool results safely
+- expose the explicit allowlist for background automation `tool_call` execution
 
 `runtime` does **not** own:
 - concrete tool business logic or payload normalization in `../handlers`
@@ -58,7 +59,6 @@ loop = DualLaneToolLoop(
 ## See also
 
 - [component.yaml](./component.yaml)
-- [AGENTS.md](./AGENTS.md)
 - [handlers](../handlers/README.md)
 - [schemas](../schemas/README.md)
 - [streaming runner](../../workflows/streaming_runner.py)

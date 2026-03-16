@@ -1,3 +1,10 @@
+"""Provide bounded in-memory full-text selection for Twinr memory stores.
+
+This module wraps a transient SQLite FTS5 table so memory stores can rank
+documents without creating persistent database files or keeping mutable global
+state around the process.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,12 +16,26 @@ from twinr.text_utils import fts_match_query
 
 @dataclass(frozen=True, slots=True)
 class FullTextDocument:
+    """Store one searchable document for ``FullTextSelector``.
+
+    Attributes:
+        doc_id: Stable identifier returned by search results.
+        category: Optional grouping label used for filtered searches.
+        content: Full text indexed for matching and ranking.
+    """
+
     doc_id: str
     category: str
     content: str
 
 
 class FullTextSelector:
+    """Rank memory documents with a transient in-memory FTS index.
+
+    Initialize this selector with the already-available document set for one
+    retrieval pass, then call ``search`` for ranked identifier selection.
+    """
+
     _CREATE_TABLE_SQL = (
         "CREATE VIRTUAL TABLE memory_search USING fts5("
         "doc_id UNINDEXED, category UNINDEXED, content, "
@@ -44,6 +65,20 @@ class FullTextSelector:
         category: str | None = None,
         allow_fallback: bool = False,
     ) -> tuple[str, ...]:
+        """Return ranked document identifiers for one retrieval query.
+
+        Args:
+            query_text: Raw user or system query text to normalize for FTS.
+            limit: Maximum number of identifiers to return. Non-positive values
+                return no results.
+            category: Optional category filter applied before ranking.
+            allow_fallback: If True, fall back to first-match document order
+                when FTS is unavailable or returns no hits.
+
+        Returns:
+            A tuple of document identifiers in relevance order.
+        """
+
         # AUDIT-FIX(#6): non-positive or invalid limits now mean "no results", instead of silently forcing one hit.
         resolved_limit = self._normalize_limit(limit)
         if resolved_limit == 0:

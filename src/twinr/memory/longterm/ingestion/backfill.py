@@ -1,3 +1,11 @@
+"""Replay ops-event history into multimodal long-term memory evidence.
+
+This module converts persisted ops log entries into the normalized
+``LongTermMultimodalEvidence`` records consumed by the long-term memory
+runtime. It is used for bounded historical backfill and recovery, not for
+live hardware ingestion.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
@@ -18,10 +26,12 @@ _FALSE_TEXT_VALUES = frozenset({"0", "false", "f", "no", "n", "off", "", "none",
 
 
 def _normalize_text(value: object) -> str:
+    """Collapse an arbitrary value into single-line text."""
     return " ".join(str(value or "").split()).strip()
 
 
 def _coerce_bool(value: object) -> bool:  # AUDIT-FIX(#5): Parse common serialized boolean spellings instead of relying on bool("false")==True.
+    """Parse common serialized boolean spellings."""
     if isinstance(value, bool):
         return value
     if isinstance(value, int):
@@ -37,6 +47,7 @@ def _coerce_bool(value: object) -> bool:  # AUDIT-FIX(#5): Parse common serializ
 
 
 def _parse_created_at(value: object) -> datetime | None:
+    """Parse an ops-event timestamp into a UTC-aware datetime."""
     text = _normalize_text(value)
     if not text:
         return None
@@ -50,6 +61,7 @@ def _parse_created_at(value: object) -> datetime | None:
 
 
 def _merge_payloads(*payloads: Mapping[str, object]) -> dict[str, object]:  # AUDIT-FIX(#1): Preserve the best available print metadata by merging start and completion payloads.
+    """Merge later payload fragments over earlier metadata."""
     merged: dict[str, object] = {}
     for payload in payloads:
         merged.update(dict(payload))
@@ -58,6 +70,8 @@ def _merge_payloads(*payloads: Mapping[str, object]) -> dict[str, object]:  # AU
 
 @dataclass(frozen=True, slots=True)
 class LongTermOpsBackfillBuildResult:
+    """Summarize evidence produced from replaying raw ops entries."""
+
     evidence: tuple[LongTermMultimodalEvidence, ...]
     scanned_events: int
     generated_evidence: int
@@ -68,6 +82,8 @@ class LongTermOpsBackfillBuildResult:
 
 @dataclass(frozen=True, slots=True)
 class LongTermOpsBackfillRunResult:
+    """Summarize a full backfill pass after persistence and reflection."""
+
     scanned_events: int
     generated_evidence: int
     applied_evidence: int
@@ -82,6 +98,8 @@ class LongTermOpsBackfillRunResult:
 
 @dataclass(slots=True)
 class _ReplayState:
+    """Track replay-only sensor edges and pending print metadata."""
+
     last_sensor_flags: dict[str, bool] = field(default_factory=dict)
     pending_print_request_source: str | None = None
     pending_print_started_at: datetime | None = None
@@ -89,6 +107,7 @@ class _ReplayState:
 
 
 def _reset_pending_print(state: _ReplayState) -> None:  # AUDIT-FIX(#1): Centralize pending-print cleanup so stale metadata cannot bleed into the next job.
+    """Clear pending print state after completion or drop."""
     state.pending_print_request_source = None
     state.pending_print_started_at = None
     state.pending_print_payload = {}
@@ -96,7 +115,18 @@ def _reset_pending_print(state: _ReplayState) -> None:  # AUDIT-FIX(#1): Central
 
 @dataclass(frozen=True, slots=True)
 class LongTermOpsEventBackfiller:
+    """Convert ops history entries into multimodal evidence records."""
+
     def load_entries(self, path: str | Path) -> tuple[dict[str, object], ...]:
+        """Load raw JSONL-style ops entries from disk.
+
+        Args:
+            path: Local ops-history path to read.
+
+        Returns:
+            A tuple of parsed object entries. Missing files and unreadable paths
+            return an empty tuple.
+        """
         source = Path(path)
         open_flags = os.O_RDONLY  # AUDIT-FIX(#3): Avoid Path.exists()/read_text() TOCTOU and open the file exactly once.
         if hasattr(os, "O_NOFOLLOW"):
@@ -147,6 +177,15 @@ class LongTermOpsEventBackfiller:
         self,
         entries: Iterable[Mapping[str, object]],
     ) -> LongTermOpsBackfillBuildResult:
+        """Translate raw ops entries into normalized multimodal evidence.
+
+        Args:
+            entries: Parsed ops-history payloads in chronological order.
+
+        Returns:
+            Replay results containing the generated evidence tuple and bounded
+            counters for the derived event types.
+        """
         state = _ReplayState()
         generated: list[LongTermMultimodalEvidence] = []
         scanned_events = 0
@@ -254,6 +293,7 @@ class LongTermOpsEventBackfiller:
         payload: Mapping[str, object],
         state: _ReplayState,
     ) -> LongTermMultimodalEvidence:
+        """Build one sensor-observation evidence item from an ops payload."""
         speech_detected = _coerce_bool(payload.get("speech_detected"))  # AUDIT-FIX(#5): Parse serialized booleans once so quiet/distress logic stays internally consistent.
         facts = {
             "sensor": {
@@ -311,6 +351,7 @@ class LongTermOpsEventBackfiller:
         inferred: bool,
         source_event: str,
     ) -> LongTermMultimodalEvidence:
+        """Build one print-completion evidence item from replay state."""
         queue = _normalize_text(payload.get("queue"))
         job = _normalize_text(payload.get("job"))
         source = _normalize_text(request_source).lower()

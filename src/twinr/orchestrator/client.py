@@ -1,3 +1,9 @@
+"""Run websocket turns against a remote Twinr orchestrator.
+
+This module provides a blocking websocket client plus an asyncio-friendly
+wrapper that can execute remote tool requests while enforcing transport bounds.
+"""
+
 from __future__ import annotations
 
 import asyncio  # AUDIT-FIX(#7): Provide an async-safe wrapper for use from the uvicorn event loop.
@@ -23,6 +29,8 @@ from twinr.orchestrator.contracts import (
 
 
 class OrchestratorWebSocketClient:
+    """Run one Twinr turn through the edge-orchestrator websocket protocol."""
+
     _DEFAULT_OPEN_TIMEOUT_SECONDS = 10.0
     _DEFAULT_RECV_TIMEOUT_SECONDS = 90.0
     _DEFAULT_TURN_TIMEOUT_SECONDS = 300.0
@@ -77,6 +85,8 @@ class OrchestratorWebSocketClient:
         on_text_delta: Callable[[str], None] | None = None,
         on_ack: Callable[[OrchestratorAckEvent], None] | None = None,
     ) -> OrchestratorClientTurnResult:
+        """Run one orchestrator turn without blocking the active event loop."""
+
         loop = asyncio.get_running_loop()
 
         def _threadsafe_text_delta(delta: str) -> None:
@@ -105,6 +115,8 @@ class OrchestratorWebSocketClient:
         on_text_delta: Callable[[str], None] | None = None,
         on_ack: Callable[[OrchestratorAckEvent], None] | None = None,
     ) -> OrchestratorClientTurnResult:
+        """Run one blocking websocket turn against the orchestrator server."""
+
         handlers = self._snapshot_tool_handlers(tool_handlers)  # AUDIT-FIX(#6): Snapshot handler mappings once per turn to avoid mid-turn races from external mutation.
         headers = None
         if self.shared_secret is not None:
@@ -176,6 +188,8 @@ class OrchestratorWebSocketClient:
         payload: dict[str, Any],
         tool_handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]],
     ) -> OrchestratorToolResponse:
+        """Execute one remote tool request through the local handler map."""
+
         raw_call_id = self._sanitize_text(payload.get("call_id", ""), limit=256)
         try:
             request_event = OrchestratorToolRequest.from_payload(payload)
@@ -237,6 +251,8 @@ class OrchestratorWebSocketClient:
         )
 
     def _build_connector_kwargs(self, headers: dict[str, str] | None) -> dict[str, Any]:
+        """Build the subset of websocket connector kwargs this client uses."""
+
         candidate_kwargs: dict[str, Any] = {
             "additional_headers": headers,
             "open_timeout": self.open_timeout_seconds,
@@ -250,6 +266,8 @@ class OrchestratorWebSocketClient:
 
     @staticmethod
     def _filter_supported_kwargs(func: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Drop connector kwargs that the injected connector does not accept."""
+
         try:
             signature = inspect.signature(func)
         except (TypeError, ValueError):
@@ -270,6 +288,8 @@ class OrchestratorWebSocketClient:
         return {name: value for name, value in kwargs.items() if name in supported_names}
 
     def _recv_payload(self, websocket: Any, *, deadline: float | None) -> dict[str, Any]:
+        """Receive one JSON object payload from the websocket transport."""
+
         timeout = self.recv_timeout_seconds
         if deadline is not None:
             remaining = deadline - monotonic()
@@ -297,6 +317,8 @@ class OrchestratorWebSocketClient:
 
     @staticmethod
     def _send_json(websocket: Any, payload: Any, *, context: str) -> None:
+        """Serialize and send one JSON payload over the websocket."""
+
         try:
             message = json.dumps(payload, ensure_ascii=False)
         except (TypeError, ValueError) as exc:
@@ -304,6 +326,8 @@ class OrchestratorWebSocketClient:
         websocket.send(message)
 
     def _compute_deadline(self) -> float | None:
+        """Compute the absolute deadline for the current turn, if bounded."""
+
         if self.turn_timeout_seconds is None:
             return None
         return monotonic() + self.turn_timeout_seconds
@@ -312,6 +336,8 @@ class OrchestratorWebSocketClient:
     def _snapshot_tool_handlers(
         tool_handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]],
     ) -> dict[str, Callable[[dict[str, Any]], dict[str, Any]]]:
+        """Copy and validate the per-turn local tool handler mapping."""
+
         handlers = dict(tool_handlers)
         for name, handler in handlers.items():
             if not callable(handler):
@@ -320,6 +346,8 @@ class OrchestratorWebSocketClient:
 
     @staticmethod
     def _sanitize_text(value: Any, *, limit: int) -> str:
+        """Strip control characters and bound transport text length."""
+
         text = "" if value is None else str(value)
         cleaned = "".join(character if character.isprintable() else " " for character in text).strip()
         if len(cleaned) <= limit:
@@ -328,6 +356,8 @@ class OrchestratorWebSocketClient:
 
     @staticmethod
     def _normalize_shared_secret(shared_secret: str | None) -> str | None:
+        """Normalize the shared secret used for websocket authentication."""
+
         secret = (shared_secret or "").strip()
         if not secret:
             return None
@@ -337,6 +367,8 @@ class OrchestratorWebSocketClient:
 
     @classmethod
     def _validate_url(cls, url: str, *, require_tls: bool) -> str:
+        """Normalize and validate the orchestrator websocket URL."""
+
         normalized_url = url.strip()
         if not normalized_url:
             raise ValueError("url must not be empty")  # AUDIT-FIX(#1): Fail fast on missing websocket endpoints.
@@ -354,6 +386,8 @@ class OrchestratorWebSocketClient:
 
     @staticmethod
     def _is_loopback_host(host: str) -> bool:
+        """Return whether the host resolves to a loopback endpoint."""
+
         normalized_host = host.strip().rstrip(".").lower()
         if normalized_host == "localhost":
             return True
@@ -364,12 +398,16 @@ class OrchestratorWebSocketClient:
 
     @staticmethod
     def _validate_positive_float(value: float, name: str) -> float:
+        """Validate a required positive floating-point setting."""
+
         if value <= 0:
             raise ValueError(f"{name} must be > 0")
         return float(value)
 
     @staticmethod
     def _validate_optional_positive_float(value: float | None, name: str) -> float | None:
+        """Validate an optional positive floating-point setting."""
+
         if value is None:
             return None
         if value <= 0:
@@ -378,6 +416,8 @@ class OrchestratorWebSocketClient:
 
     @staticmethod
     def _validate_positive_int(value: int, name: str) -> int:
+        """Validate a required positive integer setting."""
+
         if value <= 0:
             raise ValueError(f"{name} must be > 0")
         return int(value)

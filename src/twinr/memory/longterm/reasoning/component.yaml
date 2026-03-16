@@ -1,0 +1,75 @@
+schema_version: 1
+name: reasoning
+path: src/twinr/memory/longterm/reasoning
+kind: python-package
+visibility: internal
+summary: Apply consolidation, truth maintenance, conflict resolution, reflection, midterm compilation, and retention policy to long-term memory objects after ingestion.
+owned_concerns:
+  - Consolidate one extracted turn into episodic, durable, deferred, conflict, and graph-edge outputs
+  - Detect slot-level truth conflicts and apply user-driven resolution updates
+  - Reflect over recent long-term memory windows to promote repeated facts and create thread summaries
+  - Compile bounded midterm packets from recent memory windows through an optional provider adapter
+  - Apply retention, expiry, archival, and pruning policy to stored long-term memory objects
+out_of_scope:
+  - Extract candidate memories from raw turns, propositions, or multimodal evidence
+  - Persist active objects, conflicts, archived snapshots, or remote state
+  - Assemble retrieval context, subtext, or proactive suggestions
+  - Orchestrate runtime queues, worker loops, or top-level long-term service flow
+files:
+  - path: __init__.py
+    role: Package marker and local summary
+  - path: consolidator.py
+    role: Turn-level consolidation orchestration
+    exports:
+      - LongTermMemoryConsolidator
+  - path: truth.py
+    role: Slot-level truth and conflict detection
+    exports:
+      - LongTermTruthMaintainer
+  - path: conflicts.py
+    role: User-driven conflict queue and resolution
+    exports:
+      - LongTermConflictResolver
+  - path: reflect.py
+    role: Reflection and thread-summary orchestration
+    exports:
+      - LongTermMemoryReflector
+  - path: midterm.py
+    role: Structured midterm reflection provider adapter
+    exports:
+      - LongTermStructuredReflectionProgram
+      - OpenAIStructuredReflectionProgram
+      - structured_reflection_program_from_config
+  - path: retention.py
+    role: Retention and archival classification
+    exports:
+      - LongTermRetentionPolicy
+public_api:
+  module: twinr.memory.longterm
+  exports:
+    - LongTermMemoryConsolidator
+    - LongTermConflictResolver
+    - LongTermStructuredReflectionProgram
+    - OpenAIStructuredReflectionProgram
+    - structured_reflection_program_from_config
+    - LongTermMemoryReflector
+    - LongTermRetentionPolicy
+    - LongTermTruthMaintainer
+primary_callers:
+  - path: src/twinr/memory/longterm/runtime/service.py
+  - path: src/twinr/memory/longterm/storage/store.py
+  - path: src/twinr/memory/longterm/storage/midterm_store.py
+  - path: src/twinr/memory/longterm/retrieval/retriever.py
+  - path: src/twinr/memory/longterm/retrieval/subtext.py
+  - path: src/twinr/memory/longterm/__init__.py
+tests:
+  - path: test/test_longterm_consolidator.py
+  - path: test/test_longterm_truth.py
+  - path: test/test_longterm_conflicts.py
+  - path: test/test_longterm_reflect.py
+  - path: test/test_longterm_midterm.py
+  - path: test/test_longterm_retention.py
+  - path: test/test_longterm_memory.py
+  - path: test/test_longterm_store.py
+  - path: test/test_longterm_retriever.py
+  - path: test/test_longterm_subtext.py

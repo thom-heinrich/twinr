@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.agent.base_agent import AdaptiveTimingStore, TwinrConfig
 from twinr.web.contracts import AdaptiveTimingView, DetailMetric, SettingsSection
@@ -22,24 +23,194 @@ from twinr.web.viewmodels_common import (
     _format_seconds_label,
 )
 
+def _csv_display(values: object, *, separator: str = ", ") -> str:
+    # AUDIT-FIX(#4): Normalize optional iterables so missing list-based config does not crash the settings page.
+    if values is None:
+        return ""
+    if isinstance(values, str):
+        return values
+    try:
+        return separator.join(str(value) for value in values if value is not None)
+    except TypeError:
+        return str(values)
+
+
+def _int_or_default(value: object, default: int = 0) -> int:
+    # AUDIT-FIX(#1): Build a safe fallback profile when adaptive timing state cannot be loaded.
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_or_default(value: object, default: float = 0.0) -> float:
+    # AUDIT-FIX(#1): Build a safe fallback profile when adaptive timing state cannot be loaded.
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fallback_pause_grace_ms(config: TwinrConfig) -> int:
+    # AUDIT-FIX(#1): Infer a baseline pause-grace value from config without assuming one exact TwinrConfig field name.
+    for attr_name in (
+        "pause_grace_ms",
+        "conversation_pause_grace_ms",
+        "audio_pause_grace_ms",
+        "adaptive_timing_pause_grace_ms",
+    ):
+        value = getattr(config, attr_name, None)
+        if value is not None:
+            return _int_or_default(value, 0)
+    return 0
+
+
+def _fallback_timing_profile(config: TwinrConfig) -> SimpleNamespace:
+    # AUDIT-FIX(#1): Keep the dashboard renderable even when the learned timing store is missing or unreadable.
+    return SimpleNamespace(
+        button_start_timeout_s=_float_or_default(getattr(config, "audio_start_timeout_s", 0.0), 0.0),
+        follow_up_start_timeout_s=_float_or_default(getattr(config, "conversation_follow_up_timeout_s", 0.0), 0.0),
+        speech_pause_ms=_int_or_default(getattr(config, "speech_pause_ms", 0), 0),
+        pause_grace_ms=_fallback_pause_grace_ms(config),
+        button_success_count=0,
+        button_timeout_count=0,
+        follow_up_success_count=0,
+        follow_up_timeout_count=0,
+        pause_resume_count=0,
+        clean_pause_streak=0,
+    )
+
+
+def _coerce_timing_profile(profile: object, fallback: object) -> SimpleNamespace:
+    # AUDIT-FIX(#1): Normalize partially populated timing snapshots so attribute drift does not crash the dashboard.
+    return SimpleNamespace(
+        button_start_timeout_s=_float_or_default(
+            getattr(profile, "button_start_timeout_s", getattr(fallback, "button_start_timeout_s", 0.0)),
+            _float_or_default(getattr(fallback, "button_start_timeout_s", 0.0), 0.0),
+        ),
+        follow_up_start_timeout_s=_float_or_default(
+            getattr(profile, "follow_up_start_timeout_s", getattr(fallback, "follow_up_start_timeout_s", 0.0)),
+            _float_or_default(getattr(fallback, "follow_up_start_timeout_s", 0.0), 0.0),
+        ),
+        speech_pause_ms=_int_or_default(
+            getattr(profile, "speech_pause_ms", getattr(fallback, "speech_pause_ms", 0)),
+            _int_or_default(getattr(fallback, "speech_pause_ms", 0), 0),
+        ),
+        pause_grace_ms=_int_or_default(
+            getattr(profile, "pause_grace_ms", getattr(fallback, "pause_grace_ms", 0)),
+            _int_or_default(getattr(fallback, "pause_grace_ms", 0), 0),
+        ),
+        button_success_count=_int_or_default(
+            getattr(profile, "button_success_count", getattr(fallback, "button_success_count", 0)),
+            _int_or_default(getattr(fallback, "button_success_count", 0), 0),
+        ),
+        button_timeout_count=_int_or_default(
+            getattr(profile, "button_timeout_count", getattr(fallback, "button_timeout_count", 0)),
+            _int_or_default(getattr(fallback, "button_timeout_count", 0), 0),
+        ),
+        follow_up_success_count=_int_or_default(
+            getattr(profile, "follow_up_success_count", getattr(fallback, "follow_up_success_count", 0)),
+            _int_or_default(getattr(fallback, "follow_up_success_count", 0), 0),
+        ),
+        follow_up_timeout_count=_int_or_default(
+            getattr(profile, "follow_up_timeout_count", getattr(fallback, "follow_up_timeout_count", 0)),
+            _int_or_default(getattr(fallback, "follow_up_timeout_count", 0), 0),
+        ),
+        pause_resume_count=_int_or_default(
+            getattr(profile, "pause_resume_count", getattr(fallback, "pause_resume_count", 0)),
+            _int_or_default(getattr(fallback, "pause_resume_count", 0), 0),
+        ),
+        clean_pause_streak=_int_or_default(
+            getattr(profile, "clean_pause_streak", getattr(fallback, "clean_pause_streak", 0)),
+            _int_or_default(getattr(fallback, "clean_pause_streak", 0), 0),
+        ),
+    )
+
+
+def _safe_store_path(path_value: object) -> Path | None:
+    # AUDIT-FIX(#1): Avoid crashing the view model when the adaptive timing store path is unset.
+    if path_value in (None, ""):
+        return None
+    return Path(str(path_value))
+
+
+def _safe_local_timezone(timezone_name: object) -> tuple[object, str | None]:
+    # AUDIT-FIX(#2): Fall back to UTC when the configured IANA timezone is missing or invalid.
+    if not timezone_name:
+        return timezone.utc, "Local timezone is not configured; displaying UTC"
+    try:
+        return ZoneInfo(str(timezone_name)), None
+    except (ZoneInfoNotFoundError, ValueError):
+        return timezone.utc, "Local timezone is invalid; displaying UTC"
+
+
+def _adaptive_timing_last_updated_label(
+    store_path: Path | None,
+    timezone_name: object,
+) -> tuple[str, str | None]:
+    # AUDIT-FIX(#2): Replace exists()+stat() TOCTOU logic with one stat() call and handle filesystem/time conversion failures.
+    if store_path is None:
+        return "Adaptive timing store path is not configured", None
+    try:
+        stat_result = store_path.stat()
+    except FileNotFoundError:
+        return "No learned timing saved yet", None
+    except OSError:
+        return "Learned timing file exists, but its metadata is unavailable", None
+
+    tzinfo, timezone_note = _safe_local_timezone(timezone_name)
+    try:
+        updated = datetime.fromtimestamp(stat_result.st_mtime, tz=tzinfo)
+    except (OverflowError, OSError, ValueError):
+        return "Learned timing file exists, but its last-updated time is unavailable", timezone_note
+
+    return updated.strftime("%Y-%m-%d %H:%M:%S %Z"), timezone_note
+
+
+def _load_adaptive_timing_profiles(config: TwinrConfig) -> tuple[object, object, str | None]:
+    # AUDIT-FIX(#1): Guard all adaptive timing store reads so a corrupt/partial file does not 500 the dashboard.
+    fallback_profile = _fallback_timing_profile(config)
+    store_path_value = getattr(config, "adaptive_timing_store_path", None)
+    if not store_path_value:
+        return fallback_profile, fallback_profile, "Showing configured defaults because no adaptive timing store path is configured"
+
+    try:
+        store = AdaptiveTimingStore(store_path_value, config=config)
+    except Exception:
+        return fallback_profile, fallback_profile, "Showing configured defaults because the adaptive timing store is unavailable"
+
+    status_notes: list[str] = []
+    try:
+        baseline = store.default_profile()
+    except Exception:
+        baseline = fallback_profile
+        status_notes.append("Baseline defaults were inferred from config")
+    baseline = _coerce_timing_profile(baseline, fallback_profile)  # AUDIT-FIX(#1): Guarantee a complete baseline snapshot before rendering.
+
+    try:
+        current = store.current()
+    except Exception:
+        current = baseline
+        status_notes.append("Learned timing could not be read; showing configured defaults")
+    current = _coerce_timing_profile(current, baseline)  # AUDIT-FIX(#1): Guarantee a complete current snapshot before rendering.
+
+    return current, baseline, "; ".join(status_notes) or None
+
 
 
 def _adaptive_timing_view(config: TwinrConfig) -> AdaptiveTimingView:
-    store = AdaptiveTimingStore(config.adaptive_timing_store_path, config=config)
-    current = store.current()
-    baseline = store.default_profile()
-    store_path = Path(config.adaptive_timing_store_path)
-    if store_path.exists():
-        updated = datetime.fromtimestamp(
-            store_path.stat().st_mtime,
-            tz=ZoneInfo(config.local_timezone_name),
-        )
-        last_updated_label = updated.strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        last_updated_label = "No learned timing saved yet"
+    current, baseline, status_note = _load_adaptive_timing_profiles(config)  # AUDIT-FIX(#1): Fail closed to defaults instead of crashing on store read errors.
+    store_path = _safe_store_path(getattr(config, "adaptive_timing_store_path", None))  # AUDIT-FIX(#1): Handle unset store paths without raising TypeError.
+    last_updated_label, timezone_note = _adaptive_timing_last_updated_label(
+        store_path,
+        getattr(config, "local_timezone_name", None),
+    )  # AUDIT-FIX(#2): Make file metadata and timezone conversion resilient.
+    status_notes = [note for note in (timezone_note, status_note) if note]
+    if status_notes:
+        last_updated_label = f"{last_updated_label}; {'; '.join(status_notes)}"  # AUDIT-FIX(#3): Surface degraded-state information to the operator instead of failing silently.
     return AdaptiveTimingView(
         enabled=config.adaptive_timing_enabled,
-        path=str(store_path),
+        path="" if store_path is None else str(store_path),  # AUDIT-FIX(#1): Keep the view model valid when the store path is unset.
         last_updated_label=last_updated_label,
         current_metrics=(
             DetailMetric(
@@ -114,7 +285,7 @@ def _settings_sections(config: TwinrConfig, env_values: dict[str, str]) -> tuple
     green_button_gpio = "" if config.green_button_gpio is None else str(config.green_button_gpio)
     yellow_button_gpio = "" if config.yellow_button_gpio is None else str(config.yellow_button_gpio)
     pir_motion_gpio = "" if config.pir_motion_gpio is None else str(config.pir_motion_gpio)
-    button_probe_lines = ",".join(str(line) for line in config.button_probe_lines)
+    button_probe_lines = _csv_display(getattr(config, "button_probe_lines", None), separator=",")  # AUDIT-FIX(#4): Optional GPIO probe lists must not crash the settings UI.
     return (
         SettingsSection(
             title="Models and voices",
@@ -641,7 +812,7 @@ def _settings_sections(config: TwinrConfig, env_values: dict[str, str]) -> tuple
                     "TWINR_WAKEWORD_PHRASES",
                     "Wakeword phrases",
                     env_values,
-                    ", ".join(config.wakeword_phrases),
+                    _csv_display(getattr(config, "wakeword_phrases", None)),  # AUDIT-FIX(#4): Optional wakeword phrases must render as an empty field, not raise TypeError.
                     placeholder="hey twinr, hey twinna, twinr",
                     wide=True,
                     tooltip_text="Comma-separated wakeword aliases that Twinr treats as valid starts for a hands-free turn.",
@@ -650,7 +821,7 @@ def _settings_sections(config: TwinrConfig, env_values: dict[str, str]) -> tuple
                     "TWINR_WAKEWORD_OPENWAKEWORD_MODELS",
                     "openWakeWord models",
                     env_values,
-                    ", ".join(config.wakeword_openwakeword_models),
+                    _csv_display(getattr(config, "wakeword_openwakeword_models", None)),  # AUDIT-FIX(#4): Optional wakeword model lists must render as an empty field, not raise TypeError.
                     placeholder="state/wakeword_models/hey_twinr.tflite",
                     wide=True,
                     tooltip_text="Comma-separated local model paths used by openWakeWord.",

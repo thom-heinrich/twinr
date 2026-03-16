@@ -1,3 +1,5 @@
+"""Provide shared support helpers for realtime-style workflow loops."""
+
 from __future__ import annotations
 
 import mimetypes
@@ -12,6 +14,7 @@ from typing import Callable
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.conversation.closure import ToolCallingConversationClosureEvaluator
 from twinr.agent.base_agent.conversation.turn_controller import ToolCallingTurnDecisionEvaluator
+from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.agent.workflows.working_feedback import WorkingFeedbackKind, start_working_feedback_loop
 from twinr.providers.openai import OpenAIImageInput
 
@@ -29,6 +32,7 @@ _DEFAULT_TTS_QUEUE_MAX_CHUNKS = 16
 _DEFAULT_TTS_FIRST_CHUNK_TIMEOUT_SECONDS = 20.0
 _DEFAULT_TTS_STREAM_CHUNK_TIMEOUT_SECONDS = 15.0
 _DEFAULT_STOP_JOIN_TIMEOUT_SECONDS = 2.0
+_DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS = 5.0
 _NO_SPEECH_TIMEOUT_MARKERS: tuple[str, ...] = (
     "no speech detected before timeout",
     "no speech detected",
@@ -40,10 +44,17 @@ _NO_SPEECH_TIMEOUT_MARKERS: tuple[str, ...] = (
 
 
 def _default_emit(line: str) -> None:
+    """Print one workflow telemetry line to stdout."""
     print(line, flush=True)
 
 
 class TwinrRealtimeSupportMixin:
+    """Share guarded emit, media, config, and feedback helpers.
+
+    These helpers are reused by the realtime and streaming workflow loops so
+    the session classes can stay focused on orchestration.
+    """
+
     # AUDIT-FIX(#4,#5,#10): Lazily create missing locks so mixin methods stay safe under concurrent use.
     def _get_lock(self, name: str) -> RLock:
         lock = getattr(self, name, None)
@@ -68,6 +79,99 @@ class TwinrRealtimeSupportMixin:
         if message == exc.__class__.__name__:
             return message
         return f"{exc.__class__.__name__}: {message}"
+
+    def _required_remote_dependency_interval_seconds(self) -> float:
+        raw_value = getattr(
+            getattr(self, "config", None),
+            "long_term_memory_remote_keepalive_interval_s",
+            _DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS,
+        )
+        try:
+            return max(0.1, float(raw_value))
+        except (TypeError, ValueError):
+            return _DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS
+
+    def _remote_dependency_is_required(self) -> bool:
+        runtime = getattr(self, "runtime", None)
+        checker = getattr(runtime, "remote_dependency_required", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        config = getattr(self, "config", None)
+        return bool(
+            getattr(config, "long_term_memory_enabled", False)
+            and str(getattr(config, "long_term_memory_mode", "") or "").strip().lower() == "remote_primary"
+            and getattr(config, "long_term_memory_remote_required", False)
+        )
+
+    def _best_effort_stop_player(self) -> None:
+        player = getattr(self, "player", None)
+        stop_fn = getattr(player, "stop", None)
+        if not callable(stop_fn):
+            return
+        try:
+            stop_fn()
+        except Exception:
+            return
+
+    def _enter_required_remote_error(self, exc: BaseException | str) -> bool:
+        if not self._remote_dependency_is_required():
+            return False
+        message = self._safe_error_text(exc) if isinstance(exc, BaseException) else str(exc or "").strip()
+        if not message:
+            message = "Required remote long-term memory is unavailable."
+        active = bool(getattr(self, "_required_remote_dependency_error_active", False))
+        self._required_remote_dependency_cached_ready = False
+        self._required_remote_dependency_next_check_at = (
+            time.monotonic() + self._required_remote_dependency_interval_seconds()
+        )
+        self._required_remote_dependency_error_active = True
+        if active and getattr(getattr(self.runtime, "status", None), "value", None) == "error":
+            return True
+        self._best_effort_stop_player()
+        self.runtime.fail(message)
+        self._emit_status(force=True)
+        self._try_emit(f"error={message}")
+        self._try_emit("required_remote_dependency=false")
+        return True
+
+    def _refresh_required_remote_dependency(self, *, force: bool = False, force_sync: bool = False) -> bool:
+        with self._get_lock("_required_remote_dependency_lock"):
+            if not self._remote_dependency_is_required():
+                self._required_remote_dependency_error_active = False
+                self._required_remote_dependency_cached_ready = True
+                self._required_remote_dependency_next_check_at = 0.0
+                return True
+            now = time.monotonic()
+            next_check_at = float(getattr(self, "_required_remote_dependency_next_check_at", 0.0) or 0.0)
+            cached_ready = getattr(self, "_required_remote_dependency_cached_ready", None)
+            if not force and now < next_check_at and cached_ready is not None:
+                return bool(cached_ready)
+            checker = getattr(getattr(self, "runtime", None), "check_required_remote_dependency", None)
+            if not callable(checker):
+                return True
+            try:
+                checker(force_sync=force_sync)
+            except LongTermRemoteUnavailableError as exc:
+                self._enter_required_remote_error(exc)
+                return False
+            except Exception as exc:
+                self._enter_required_remote_error(exc)
+                return False
+
+            self._required_remote_dependency_cached_ready = True
+            self._required_remote_dependency_next_check_at = now + self._required_remote_dependency_interval_seconds()
+            if (
+                getattr(self, "_required_remote_dependency_error_active", False)
+                and getattr(getattr(self.runtime, "status", None), "value", None) == "error"
+            ):
+                self.runtime.reset_error()
+                self._emit_status(force=True)
+                self._try_emit("required_remote_dependency_restored=true")
+            self._required_remote_dependency_error_active = False
+            return True
 
     # AUDIT-FIX(#4): Error reporting must not throw while handling another failure.
     def _try_emit(self, line: str) -> None:
@@ -207,6 +311,8 @@ class TwinrRealtimeSupportMixin:
         )
 
     def _handle_error(self, exc: Exception) -> None:
+        if isinstance(exc, LongTermRemoteUnavailableError) and self._enter_required_remote_error(exc):
+            return
         safe_error = self._safe_error_text(exc)  # AUDIT-FIX(#4): Never emit unsanitized exception text.
         try:
             self.runtime.fail(safe_error)

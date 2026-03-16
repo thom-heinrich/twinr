@@ -1,0 +1,69 @@
+schema_version: 1
+name: evaluation
+path: src/twinr/memory/longterm/evaluation
+kind: python-package
+visibility: internal
+summary: Run isolated long-term memory evaluations covering synthetic recall, multimodal retrieval, and live subtext-response behavior without changing production runtime paths.
+owned_concerns:
+  - Seed deterministic evaluation fixtures and build fixed evaluation case sets
+  - Execute recall, multimodal, and live subtext evaluations against the real Twinr services/backends
+  - Snapshot evaluation artifacts and expose structured result payloads for inspection
+out_of_scope:
+  - Production runtime serving or permanent memory mutations outside temporary workspaces
+  - Core long-term memory schema and taxonomy definitions
+  - Top-level test assertions or benchmarking dashboards outside this package
+files:
+  - path: __init__.py
+    role: Package marker and local summary
+  - path: eval.py
+    role: Synthetic graph and episodic recall evaluation
+    exports:
+      - LongTermEvalCase
+      - LongTermEvalCaseResult
+      - LongTermEvalSeedStats
+      - LongTermEvalSummary
+      - LongTermEvalResult
+      - run_synthetic_longterm_eval
+  - path: multimodal_eval.py
+    role: Multimodal evidence retrieval evaluation
+    exports:
+      - MultimodalEvalCase
+      - MultimodalEvalCaseResult
+      - MultimodalEvalSeedStats
+      - MultimodalEvalSummary
+      - MultimodalEvalResult
+      - run_multimodal_longterm_eval
+  - path: subtext_eval.py
+    role: Live subtext-response evaluation and grading helpers
+    exports:
+      - SubtextEvalCase
+      - SubtextEvalCaseResult
+      - SubtextEvalSummary
+      - SubtextEvalResult
+      - default_subtext_eval_cases
+      - contains_explicit_memory_announcement
+      - run_subtext_response_eval
+compatibility_reexports:
+  - path: src/twinr/memory/longterm/__init__.py
+    names:
+      - LongTermEvalCase
+      - LongTermEvalCaseResult
+      - LongTermEvalSeedStats
+      - LongTermEvalSummary
+      - LongTermEvalResult
+      - MultimodalEvalCase
+      - MultimodalEvalCaseResult
+      - MultimodalEvalSeedStats
+      - MultimodalEvalSummary
+      - MultimodalEvalResult
+      - run_synthetic_longterm_eval
+      - run_multimodal_longterm_eval
+primary_callers:
+  - path: src/twinr/memory/longterm/__init__.py
+  - path: test/test_longterm_memory_eval.py
+  - path: test/test_longterm_multimodal_eval.py
+  - path: test/test_subtext_response_eval.py
+tests:
+  - path: test/test_longterm_memory_eval.py
+  - path: test/test_longterm_multimodal_eval.py
+  - path: test/test_subtext_response_eval.py

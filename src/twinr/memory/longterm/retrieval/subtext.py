@@ -1,3 +1,11 @@
+"""Compile silent personalization guidance from long-term memory cues.
+
+This module sanitizes graph and episodic memory payloads, optionally calls an
+LLM-backed compiler, and renders internal-only subtext for prompt assembly.
+Import ``LongTermSubtextBuilder`` from this module or via
+``twinr.memory.longterm``.
+"""
+
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -38,6 +46,8 @@ def _get_config_int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
+    """Coerce a config attribute to a bounded integer."""
+
     raw_value = getattr(config, name, default)
     try:
         value = int(raw_value)
@@ -51,6 +61,8 @@ def _get_config_int(
 
 
 def _truncate_text(value: str, max_chars: int) -> str:
+    """Trim text to ``max_chars`` while preserving a short ellipsis."""
+
     if max_chars <= 0:
         return ""
     if len(value) <= max_chars:
@@ -61,6 +73,8 @@ def _truncate_text(value: str, max_chars: int) -> str:
 
 
 def _normalize_free_text(value: object, *, max_chars: int) -> str:
+    """Normalize arbitrary input into bounded prompt-safe text."""
+
     # AUDIT-FIX(#12): Normalize locally instead of depending on imported helpers accepting None or arbitrary objects.
     text = "" if value is None else str(value)
     text = sanitize_text_fragment(text)
@@ -70,6 +84,8 @@ def _normalize_free_text(value: object, *, max_chars: int) -> str:
 
 
 def _normalize_query_text(value: str | None) -> str:
+    """Normalize a subtext query string to the default prompt limit."""
+
     return _normalize_free_text(value, max_chars=_DEFAULT_PROMPT_STRING_MAX_CHARS)
 
 
@@ -81,6 +97,8 @@ def _sanitize_structured_value(
     depth: int = 0,
     max_depth: int = _DEFAULT_MAX_SANITIZE_DEPTH,
 ) -> object:
+    """Coerce nested payloads into bounded JSON-safe primitives."""
+
     # AUDIT-FIX(#3): Coerce nested payloads to JSON-safe primitives before any json.dumps() so non-serializable graph data cannot crash request handling.
     # AUDIT-FIX(#8): Bound recursion depth, collection size, and string length to keep prompt payloads operationally safe on constrained hardware.
     if depth >= max_depth:
@@ -138,6 +156,8 @@ def _sanitize_structured_dict(
     string_max_chars: int = _DEFAULT_PROMPT_STRING_MAX_CHARS,
     collection_max_items: int = _DEFAULT_COLLECTION_MAX_ITEMS,
 ) -> dict[str, object] | None:
+    """Return a sanitized dict payload or ``None`` for non-mappings."""
+
     sanitized = _sanitize_structured_value(
         value,
         string_max_chars=string_max_chars,
@@ -156,6 +176,8 @@ def _safe_json_dumps(
     string_max_chars: int = _DEFAULT_PROMPT_STRING_MAX_CHARS,
     collection_max_items: int = _DEFAULT_COLLECTION_MAX_ITEMS,
 ) -> str:
+    """Serialize memory payloads through the bounded sanitizer."""
+
     # AUDIT-FIX(#3): All user-memory payload serialization goes through one hardened path so malformed graph objects fail closed instead of throwing.
     sanitized = _sanitize_structured_value(
         value,
@@ -166,12 +188,16 @@ def _safe_json_dumps(
 
 
 def _normalize_program_text(value: object, *, max_chars: int) -> str:
+    """Normalize compiler-produced string fields."""
+
     if not isinstance(value, str):
         return ""
     return _normalize_free_text(value, max_chars=max_chars)
 
 
 def _normalize_string_list(value: object, *, max_items: int, max_chars: int) -> list[str]:
+    """Normalize, deduplicate, and bound a list of short strings."""
+
     if not isinstance(value, list):
         return []
     cleaned: list[str] = []
@@ -185,6 +211,8 @@ def _normalize_string_list(value: object, *, max_items: int, max_chars: int) -> 
 
 
 def _normalize_known_people(value: object) -> list[dict[str, object]]:
+    """Normalize compiler-produced known-person payload entries."""
+
     if not isinstance(value, list):
         return []
     normalized: list[dict[str, object]] = []
@@ -206,6 +234,8 @@ def _normalize_known_people(value: object) -> list[dict[str, object]]:
 
 
 def _normalize_compiled_program(value: object) -> dict[str, object] | None:
+    """Validate and normalize the compiler's structured JSON response."""
+
     # AUDIT-FIX(#5): Validate and coerce the model output locally instead of trusting remote schema adherence; fail closed on type drift.
     if not isinstance(value, dict):
         return None
@@ -224,21 +254,33 @@ def _normalize_compiled_program(value: object) -> dict[str, object] | None:
 
 
 def _deepcopy_program(value: dict[str, object]) -> dict[str, object]:
+    """Detach a compiled program before caching or returning it."""
+
     return deepcopy(value)
 
 
 @dataclass(slots=True)
 class LongTermSubtextCompiler:
+    """Compile a silent personalization program from sanitized memory cues.
+
+    The compiler wraps an optional backend and a bounded in-memory cache so the
+    runtime can reuse stable personalization plans without mutating shared state.
+    """
+
     config: TwinrConfig
     backend: Any | None = None
     _cache: OrderedDict[str, dict[str, object]] | None = None
 
     def __post_init__(self) -> None:
+        """Normalize externally supplied cache mappings into ``OrderedDict``."""
+
         if self._cache is not None and not isinstance(self._cache, OrderedDict):
             self._cache = OrderedDict(self._cache)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermSubtextCompiler":
+        """Build a compiler from runtime config and optional provider access."""
+
         backend: Any | None = None
         if config.long_term_memory_subtext_compiler_enabled and config.openai_api_key:
             try:
@@ -267,6 +309,20 @@ class LongTermSubtextCompiler:
         graph_payload: dict[str, object] | None,
         recent_threads: Sequence[dict[str, str]],
     ) -> dict[str, object] | None:
+        """Compile a silent personalization program for one user turn.
+
+        Args:
+            query_text: Raw user-facing query text for prompt grounding.
+            retrieval_query_text: Canonical retrieval text used for memory lookups.
+            graph_payload: Sanitized graph cues relevant to the current turn.
+            recent_threads: Sanitized episodic continuity cues from recent memory.
+
+        Returns:
+            A normalized compiled program dictionary, or ``None`` when the
+            compiler is disabled, there is no usable payload, or compilation
+            fails validation.
+        """
+
         if self.backend is None:
             return None
 
@@ -427,6 +483,8 @@ class LongTermSubtextCompiler:
         return _deepcopy_program(normalized_compiled)
 
     def _cache_get(self, cache_key: str) -> dict[str, object] | None:
+        """Return a detached cached program and refresh its LRU position."""
+
         if self._cache is None:
             return None
         cached = self._cache.get(cache_key)
@@ -437,6 +495,8 @@ class LongTermSubtextCompiler:
         return _deepcopy_program(cached)
 
     def _cache_set(self, cache_key: str, value: dict[str, object]) -> None:
+        """Store a detached compiled program in the bounded LRU cache."""
+
         if self._cache is None:
             return
         max_items = _get_config_int(
@@ -457,6 +517,8 @@ class LongTermSubtextCompiler:
 
 @dataclass(frozen=True, slots=True)
 class LongTermSubtextBuilder:
+    """Render silent personalization context from graph and episodic memory."""
+
     config: TwinrConfig
     graph_store: TwinrPersonalGraphStore
     compiler: LongTermSubtextCompiler | None = None
@@ -468,6 +530,19 @@ class LongTermSubtextBuilder:
         retrieval_query_text: str | None,
         episodic_entries: Sequence[PersistentMemoryEntry],
     ) -> str | None:
+        """Build the subtext prompt section for a single user turn.
+
+        Args:
+            query_text: Raw user text for the current turn.
+            retrieval_query_text: Canonical retrieval text for memory lookups.
+            episodic_entries: Recent episodic memories already selected for recall.
+
+        Returns:
+            A prompt section containing either compiled directives or fallback
+            subtext guidance. Returns ``None`` when no relevant cues are
+            available.
+        """
+
         safe_query_text = _normalize_query_text(query_text)
         effective_retrieval_query = _normalize_query_text(retrieval_query_text) or safe_query_text
 
@@ -571,6 +646,8 @@ class LongTermSubtextBuilder:
         )
 
     def _render_compiled_directives(self, compiled_program: dict[str, object]) -> list[str]:
+        """Convert a compiled program into short operator-style directives."""
+
         if compiled_program.get("use_personalization") is not True:
             return []
         lines: list[str] = []
@@ -609,6 +686,8 @@ class LongTermSubtextBuilder:
         return lines
 
     def _clean_compiled_list(self, value: object) -> list[str]:
+        """Normalize and deduplicate short compiled string lists."""
+
         if not isinstance(value, list):
             return []
         cleaned: list[str] = []
@@ -619,12 +698,16 @@ class LongTermSubtextBuilder:
         return cleaned
 
     def _clean_compiled_text(self, value: object) -> str:
+        """Normalize a compiled text fragment for directive rendering."""
+
         text = _normalize_free_text(value, max_chars=_DEFAULT_PROMPT_STRING_MAX_CHARS)
         if not text:
             return ""
         return collapse_whitespace(text)
 
     def _episodic_threads(self, entries: Sequence[PersistentMemoryEntry]) -> list[dict[str, str]]:
+        """Convert episodic entries into recent-thread cues for subtext."""
+
         threads: list[dict[str, str]] = []
         recall_limit = _get_config_int(
             self.config,
@@ -667,6 +750,8 @@ class LongTermSubtextBuilder:
         *,
         max_chars: int,
     ) -> tuple[str | None, str | None]:
+        """Extract normalized user and assistant text from an episodic entry."""
+
         # AUDIT-FIX(#6): Coerce malformed persisted fields to text so corrupted memory rows do not crash subtext building.
         summary_raw = "" if entry.summary is None else str(entry.summary)
         details = "" if entry.details is None else str(entry.details)
@@ -688,6 +773,8 @@ class LongTermSubtextBuilder:
         start_at: int = 0,
         max_chars: int = _DEFAULT_THREAD_TEXT_MAX_CHARS,
     ) -> str | None:
+        """Decode a quoted JSON string embedded after a known prefix marker."""
+
         index = value.find(prefix, max(0, start_at))
         if index < 0:
             return None

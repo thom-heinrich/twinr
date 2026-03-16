@@ -1,3 +1,10 @@
+"""Track wakeword presence sessions from recent sensor activity.
+
+This module owns the bounded presence-session controller used by the proactive
+runtime to decide whether wakeword listening should remain armed after recent
+visual, PIR, or qualifying speech activity.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,6 +18,8 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class PresenceSessionSnapshot:
+    """Describe the current armed state of the presence session."""
+
     armed: bool
     reason: str | None = None
     person_visible: bool = False
@@ -36,6 +45,8 @@ class PresenceSessionController:
         motion_grace_s: float,
         speech_grace_s: float,
     ) -> None:
+        """Initialize one controller with per-signal grace windows."""
+
         # AUDIT-FIX(#1): Reject non-finite/boolean grace values so misconfig cannot create broken or never-ending sessions.
         self.presence_grace_s = _validate_non_negative_seconds(
             presence_grace_s,
@@ -72,6 +83,19 @@ class PresenceSessionController:
         motion_active: bool,
         speech_detected: bool,
     ) -> PresenceSessionSnapshot:
+        """Update session state from one sensor tick and return a snapshot.
+
+        Args:
+            now: Monotonic-like seconds for the current observation tick.
+            person_visible: Latest camera presence flag, or None when unknown.
+            motion_active: Latest PIR motion state for this tick.
+            speech_detected: Whether ambient audio detected speech this tick.
+
+        Returns:
+            One snapshot describing whether wakeword listening should remain
+            armed and why.
+        """
+
         # AUDIT-FIX(#3): Guard the entire read-update-decide sequence so session ids and timestamps cannot race.
         with self._lock:
             # AUDIT-FIX(#1): Normalize time into a finite, non-regressing internal timeline.
@@ -193,6 +217,8 @@ class PresenceSessionController:
         last_motion_age_s: float | None,
         last_speech_age_s: float | None,
     ) -> PresenceSessionSnapshot:
+        """Build one snapshot and advance the session counter on re-arming."""
+
         if armed and not self._armed:
             self._current_session_id += 1
         self._armed = armed
@@ -209,6 +235,8 @@ class PresenceSessionController:
 
 # AUDIT-FIX(#1): Centralize strict seconds validation for constructor inputs.
 def _validate_non_negative_seconds(value: float, *, field_name: str) -> float:
+    """Validate one non-negative finite seconds value."""
+
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(
             f"{field_name} must be a finite int or float number of seconds, got {value!r}",
@@ -226,6 +254,8 @@ def _normalize_now(
     previous: float | None,
     offset: float,
 ) -> tuple[float, float]:
+    """Repair regressing or malformed timestamps into a monotonic timeline."""
+
     fallback_now = previous if previous is not None else 0.0
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         LOGGER.warning(
@@ -260,6 +290,8 @@ def _normalize_now(
 
 # AUDIT-FIX(#4): Narrow runtime normalization to explicit booleans and legacy 0/1 ints.
 def _normalize_bool(value: bool, *, field_name: str) -> bool:
+    """Normalize one required runtime flag to a fail-closed boolean."""
+
     if isinstance(value, bool):
         return value
     if isinstance(value, int) and value in (0, 1):
@@ -270,6 +302,8 @@ def _normalize_bool(value: bool, *, field_name: str) -> bool:
 
 # AUDIT-FIX(#4): Treat malformed optional booleans as unknown instead of letting truthiness leak through.
 def _normalize_optional_bool(value: bool | None, *, field_name: str) -> bool | None:
+    """Normalize one optional runtime flag to bool-or-unknown."""
+
     if value is None:
         return None
     if isinstance(value, bool):
@@ -282,6 +316,8 @@ def _normalize_optional_bool(value: bool | None, *, field_name: str) -> bool | N
 
 # AUDIT-FIX(#1): Clamp impossible negative ages defensively and surface the anomaly in logs.
 def _age(now: float, since: float | None) -> float | None:
+    """Return the non-negative age of one timestamp in seconds."""
+
     if since is None:
         return None
     age = now - since

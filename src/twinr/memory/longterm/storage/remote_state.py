@@ -1,3 +1,11 @@
+"""Mirror long-term memory snapshots to the remote-primary backend.
+
+This module provides ``LongTermRemoteStateStore``, the ChonkyDB-backed remote
+snapshot adapter used when long-term memory runs in remote-primary mode. It
+validates snapshot identifiers, bounds remote I/O, and exposes required-mode
+failures through ``LongTermRemoteUnavailableError``.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field  # AUDIT-FIX(#10): Field support is needed for stable exception/internal state handling.
@@ -36,28 +44,40 @@ _MAX_SNAPSHOT_KIND_LENGTH = 255
 
 
 def _utcnow_iso() -> str:
+    """Return the current UTC time encoded as ISO 8601 text."""
+
     return datetime.now(timezone.utc).isoformat()
 
 
 def _normalize_text(value: str | None) -> str:
+    """Collapse arbitrary text-like input to normalized single-spaced text."""
+
     return " ".join(str(value or "").split()).strip()
 
 
 def _strip_text(value: str | None) -> str:
+    """Return trimmed string content for optional text input."""
+
     return str(value or "").strip()
 
 
 def _mapping_dict(value: Mapping[str, object] | None) -> dict[str, object] | None:
+    """Copy a mapping into a plain ``dict`` when one is present."""
+
     if value is None:
         return None
     return dict(value)
 
 
 def _reject_non_finite_json_constant(value: str) -> object:  # AUDIT-FIX(#12): Reject NaN/Infinity so remote snapshots stay standards-compliant.
+    """Reject non-finite JSON constants during strict snapshot parsing."""
+
     raise ValueError(f"Unsupported JSON constant {value!r}.")
 
 
 def _safe_json_text(payload: Mapping[str, object]) -> str:
+    """Serialize a mapping to strict JSON text for remote transport."""
+
     return json.dumps(
         dict(payload),
         ensure_ascii=False,
@@ -67,6 +87,8 @@ def _safe_json_text(payload: Mapping[str, object]) -> str:
 
 
 def _redact_secrets(text: str, *, secrets: Iterable[str]) -> str:
+    """Replace configured secret values in log-bound text."""
+
     redacted = " ".join(str(text).split())
     for secret in secrets:
         cleaned = _strip_text(secret)
@@ -82,6 +104,8 @@ def _coerce_int(
     minimum: int,
     maximum: int | None = None,
 ) -> int:
+    """Coerce numeric config to an integer inside inclusive bounds."""
+
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -100,6 +124,8 @@ def _coerce_float(
     minimum: float,
     maximum: float | None = None,
 ) -> float:
+    """Coerce numeric config to a finite float inside inclusive bounds."""
+
     try:
         parsed = float(value)
     except (TypeError, ValueError):
@@ -114,10 +140,14 @@ def _coerce_float(
 
 
 def _coerce_timeout_s(value: object, *, default: float) -> float:
+    """Coerce timeout configuration to a safe bounded float."""
+
     return _coerce_float(value, default=default, minimum=0.1, maximum=300.0)
 
 
 def _safe_resolve_path(path: Path) -> Path:
+    """Resolve a path defensively without propagating odd filesystem errors."""
+
     try:
         return path.resolve()
     except (OSError, RuntimeError):  # pragma: no cover - defensive path hardening
@@ -125,6 +155,8 @@ def _safe_resolve_path(path: Path) -> Path:
 
 
 def _normalize_storage_token(value: str, *, field_name: str, max_length: int) -> str:
+    """Validate namespace or snapshot tokens used in remote storage keys."""
+
     normalized = _normalize_text(value)
     if not normalized:
         raise ValueError(f"{field_name} must not be empty.")
@@ -136,10 +168,14 @@ def _normalize_storage_token(value: str, *, field_name: str, max_length: int) ->
 
 
 def _encode_uri_path_segment(value: str) -> str:
+    """Percent-encode one remote URI path segment."""
+
     return quote(value, safe="")
 
 
 class LongTermRemoteUnavailableError(RuntimeError):
+    """Signal that required remote long-term snapshot state is unavailable."""
+
     def __init__(self, message: str) -> None:  # AUDIT-FIX(#10): Keep normal exception semantics so traceback chaining works.
         self.message = str(message)
         super().__init__(self.message)
@@ -150,6 +186,8 @@ class LongTermRemoteUnavailableError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class LongTermRemoteStatus:
+    """Describe whether the remote snapshot backend is ready for use."""
+
     mode: str
     ready: bool
     detail: str | None = None
@@ -157,6 +195,8 @@ class LongTermRemoteStatus:
 
 @dataclass(frozen=True, slots=True)
 class _RemoteSnapshotFetchResult:
+    """Capture the outcome of one remote snapshot fetch attempt."""
+
     status: str
     payload: dict[str, object] | None = None
     detail: str | None = None
@@ -164,6 +204,12 @@ class _RemoteSnapshotFetchResult:
 
 @dataclass(slots=True)
 class LongTermRemoteStateStore:
+    """Load and save remote snapshot state for long-term memory.
+
+    This adapter owns ChonkyDB URI construction, retry/backoff, a lightweight
+    circuit breaker, and safe optional local fallback reads.
+    """
+
     config: TwinrConfig
     read_client: ChonkyDBClient | None = None
     write_client: ChonkyDBClient | None = None
@@ -173,6 +219,8 @@ class LongTermRemoteStateStore:
     _consecutive_failures: int = field(init=False, repr=False, default=0)
 
     def __post_init__(self) -> None:
+        """Normalize the remote namespace once during construction."""
+
         namespace = self.namespace or _remote_namespace_for_config(self.config)
         self.namespace = _normalize_storage_token(  # AUDIT-FIX(#6): Normalize namespace once so URIs stay stable and safe.
             namespace,
@@ -182,6 +230,8 @@ class LongTermRemoteStateStore:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermRemoteStateStore":
+        """Build a remote snapshot adapter from Twinr configuration."""
+
         namespace = _remote_namespace_for_config(config)
         if not (
             config.long_term_memory_enabled and config.long_term_memory_mode == "remote_primary"
@@ -233,13 +283,24 @@ class LongTermRemoteStateStore:
 
     @property
     def enabled(self) -> bool:
+        """Return whether remote-primary long-term memory is active."""
+
         return self.config.long_term_memory_enabled and self.config.long_term_memory_mode == "remote_primary"
 
     @property
     def required(self) -> bool:
+        """Return whether remote-primary failures must fail closed."""
+
         return self.enabled and self.config.long_term_memory_remote_required
 
     def status(self) -> LongTermRemoteStatus:
+        """Probe whether the remote snapshot backend is ready for use.
+
+        Returns:
+            A status record containing the backend mode, readiness, and any
+            operator-safe detail string.
+        """
+
         if not self.enabled:
             return LongTermRemoteStatus(mode="disabled", ready=False)
         if self._circuit_is_open():  # AUDIT-FIX(#5): Short-circuit repeated failures so the device recovers faster under bad Wi-Fi.
@@ -270,6 +331,23 @@ class LongTermRemoteStateStore:
         return LongTermRemoteStatus(mode="remote_primary", ready=True)
 
     def load_snapshot(self, *, snapshot_kind: str, local_path: Path | None = None) -> dict[str, object] | None:
+        """Load one snapshot from remote storage or a safe local fallback.
+
+        Args:
+            snapshot_kind: Logical snapshot name such as ``objects`` or
+                ``midterm``.
+            local_path: Optional local recovery snapshot path used in
+                non-required mode when the remote backend is missing or flaky.
+
+        Returns:
+            The loaded snapshot payload, or ``None`` when no usable payload is
+            available.
+
+        Raises:
+            LongTermRemoteUnavailableError: If the remote backend is required
+                and the snapshot cannot be read.
+        """
+
         normalized_snapshot_kind = self._normalize_snapshot_kind(snapshot_kind)  # AUDIT-FIX(#6): Validate snapshot IDs before they become remote keys.
         if not self.enabled:
             return None
@@ -342,6 +420,20 @@ class LongTermRemoteStateStore:
         return None
 
     def ensure_snapshot(self, *, snapshot_kind: str, payload: Mapping[str, object]) -> bool:
+        """Ensure one snapshot exists remotely, writing it if missing.
+
+        Args:
+            snapshot_kind: Logical snapshot name to check remotely.
+            payload: Payload to persist if the snapshot is currently missing.
+
+        Returns:
+            ``True`` when the payload had to be written, otherwise ``False``.
+
+        Raises:
+            LongTermRemoteUnavailableError: If required remote state cannot be
+                queried or written.
+        """
+
         normalized_snapshot_kind = self._normalize_snapshot_kind(snapshot_kind)  # AUDIT-FIX(#6): Keep snapshot identity validation consistent across operations.
         if not self.enabled:
             return False
@@ -358,6 +450,18 @@ class LongTermRemoteStateStore:
         return True
 
     def save_snapshot(self, *, snapshot_kind: str, payload: Mapping[str, object]) -> None:
+        """Persist one snapshot payload to the remote backend.
+
+        Args:
+            snapshot_kind: Logical snapshot name to store remotely.
+            payload: JSON-serializable snapshot body.
+
+        Raises:
+            LongTermRemoteUnavailableError: If the remote backend is enabled
+                but unavailable for writes.
+            ValueError: If ``payload`` is not JSON-safe.
+        """
+
         normalized_snapshot_kind = self._normalize_snapshot_kind(snapshot_kind)  # AUDIT-FIX(#6): Prevent malformed snapshot kinds from becoming URIs.
         if not self.enabled:
             return
@@ -794,6 +898,8 @@ class LongTermRemoteStateStore:
         return dict(payload)
 
 def _remote_namespace_for_config(config: TwinrConfig) -> str:
+    """Derive the stable remote namespace for one Twinr configuration."""
+
     override = _normalize_text(config.long_term_memory_remote_namespace)
     if override:
         return _normalize_storage_token(

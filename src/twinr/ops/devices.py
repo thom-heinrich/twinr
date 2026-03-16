@@ -1,3 +1,9 @@
+"""Collect a bounded operational overview of Twinr's local devices.
+
+This module combines live system probes with recent ops and self-test events
+to build dashboard-friendly device status snapshots.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -20,6 +26,8 @@ _OPS_HISTORY_UNAVAILABLE = "ops history unavailable"
 
 @dataclass(frozen=True, slots=True)
 class DeviceFact:
+    """Represent one short key/value fact shown for a device probe."""
+
     label: str
     value: str
 
@@ -29,6 +37,8 @@ class DeviceFact:
 
 @dataclass(frozen=True, slots=True)
 class DeviceStatus:
+    """Represent the current ops-facing state of one device category."""
+
     key: str
     label: str
     status: str
@@ -44,6 +54,8 @@ class DeviceStatus:
 
 @dataclass(frozen=True, slots=True)
 class DeviceOverview:
+    """Collect the device statuses captured for one ops snapshot."""
+
     captured_at: str
     devices: tuple[DeviceStatus, ...]
 
@@ -74,6 +86,18 @@ def collect_device_overview(
     *,
     event_store: TwinrOpsEventStore | None = None,
 ) -> DeviceOverview:
+    """Collect a dashboard-ready overview of Twinr device health.
+
+    Args:
+        config: Twinr runtime configuration to probe against.
+        event_store: Optional event store override used to enrich the overview
+            with recent motion and self-test evidence.
+
+    Returns:
+        A ``DeviceOverview`` containing bounded statuses for printer, camera,
+        audio, PIR, and button hardware.
+    """
+
     latest_self_tests: dict[str, _SelfTestSnapshot] | None
     last_motion_at: str | None
     try:

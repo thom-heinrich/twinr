@@ -1,0 +1,63 @@
+schema_version: 1
+name: proactive
+path: src/twinr/memory/longterm/proactive
+kind: python-package
+visibility: internal
+summary: Rank long-term proactive candidates from stored memory, persist candidate history, and apply sensitivity, confidence, and cooldown policy before delivery.
+owned_concerns:
+  - Rank bounded proactive candidates from active long-term memory objects
+  - Combine durable memory cues with live sensor facts for sensor-routine offers
+  - Persist reservation, delivery, and skip history in a bounded JSON state file
+  - Apply sensitivity, confidence, and cooldown policy before runtime reservation
+out_of_scope:
+  - Extract, consolidate, or store general long-term memory objects
+  - Orchestrate runtime polling, governor coordination, or spoken delivery loops
+  - Handle non-long-term proactive or social-trigger features under src/twinr/proactive
+  - Manage ChonkyDB transport or generic filesystem utilities outside proactive state
+files:
+  - path: __init__.py
+    role: Package export surface for proactive memory helpers
+    exports:
+      - LongTermProactiveHistoryEntryV1
+      - LongTermProactivePlanner
+      - LongTermProactivePolicy
+      - LongTermProactiveReservationV1
+      - LongTermProactiveStateStore
+      - _write_json_atomic
+  - path: planner.py
+    role: Candidate planning from durable memory and live facts
+    exports:
+      - LongTermProactivePlanner
+  - path: state.py
+    role: History persistence, reservations, and eligibility policy
+    exports:
+      - LongTermProactiveHistoryEntryV1
+      - LongTermProactivePolicy
+      - LongTermProactiveReservationV1
+      - LongTermProactiveStateStore
+      - _write_json_atomic
+public_api:
+  module: twinr.memory.longterm.proactive
+  exports:
+    - LongTermProactiveHistoryEntryV1
+    - LongTermProactivePlanner
+    - LongTermProactivePolicy
+    - LongTermProactiveReservationV1
+    - LongTermProactiveStateStore
+    - _write_json_atomic
+compatibility_reexports:
+  - path: src/twinr/memory/longterm/__init__.py
+    names:
+      - LongTermProactiveHistoryEntryV1
+      - LongTermProactivePlanner
+      - LongTermProactivePolicy
+      - LongTermProactiveReservationV1
+      - LongTermProactiveStateStore
+primary_callers:
+  - path: src/twinr/memory/longterm/runtime/service.py
+  - path: src/twinr/memory/longterm/__init__.py
+tests:
+  - path: test/test_longterm_planner.py
+  - path: test/test_longterm_proactive.py
+  - path: test/test_longterm_memory.py
+  - path: test/test_runner.py

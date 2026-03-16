@@ -1,0 +1,64 @@
+schema_version: 1
+name: runtime
+path: src/twinr/memory/longterm/runtime
+kind: python-package
+visibility: internal
+summary: Wire long-term memory stores, reasoning helpers, remote readiness checks, and bounded background writers into one runtime-facing service.
+owned_concerns:
+  - Assemble the runtime-facing LongTermMemoryService from config and subsystem dependencies
+  - Build provider and tool-facing long-term memory context for runtime prompts
+  - Persist conversation turns and multimodal evidence through bounded workers and synchronous fallback paths
+  - Verify remote-primary snapshot readiness before runtime loops depend on long-term memory state
+  - Expose runtime entry points for reflection, retention, proactive policy, review, and operator memory mutation
+out_of_scope:
+  - Define canonical long-term schemas or ontology normalization
+  - Implement extraction, consolidation, retrieval, reflection, or retention algorithms themselves
+  - Implement low-level object, graph, midterm, or remote-state storage backends
+  - Own top-level agent runtime loops, web flows, or hardware orchestration
+files:
+  - path: __init__.py
+    role: Package marker and local summary
+  - path: service.py
+    role: Runtime-facing long-term memory orchestration service
+    exports:
+      - LongTermMemoryService
+  - path: worker.py
+    role: Bounded background persistence workers
+    exports:
+      - AsyncLongTermMemoryWriter
+      - AsyncLongTermMultimodalWriter
+  - path: health.py
+    role: Remote snapshot readiness probe for runtime startup
+    exports:
+      - LongTermRemoteWarmResult
+      - LongTermRemoteHealthProbe
+public_api:
+  module: twinr.memory.longterm
+  exports:
+    - LongTermMemoryService
+    - AsyncLongTermMemoryWriter
+    - AsyncLongTermMultimodalWriter
+compatibility_reexports:
+  - path: src/twinr/memory/longterm/__init__.py
+    names:
+      - LongTermMemoryService
+      - AsyncLongTermMemoryWriter
+      - AsyncLongTermMultimodalWriter
+  - path: src/twinr/memory/__init__.py
+    names:
+      - LongTermMemoryService
+      - AsyncLongTermMemoryWriter
+      - AsyncLongTermMultimodalWriter
+primary_callers:
+  - path: src/twinr/agent/base_agent/runtime/base.py
+  - path: src/twinr/agent/base_agent/runtime/context.py
+  - path: src/twinr/memory/longterm/evaluation/eval.py
+  - path: src/twinr/memory/longterm/evaluation/multimodal_eval.py
+  - path: src/twinr/memory/__init__.py
+tests:
+  - path: test/test_longterm_runtime_health.py
+  - path: test/test_longterm_worker.py
+  - path: test/test_longterm_memory.py
+  - path: test/test_longterm_multimodal.py
+  - path: test/test_longterm_proactive.py
+  - path: test/test_longterm_remote_state.py

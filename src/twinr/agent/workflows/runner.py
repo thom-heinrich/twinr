@@ -1,3 +1,4 @@
+"""Run the classic press-to-talk hardware workflow loop."""
 
 from __future__ import annotations
 
@@ -62,10 +63,17 @@ _ALLOWED_REFERENCE_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp"}
 
 
 def _default_emit(line: str) -> None:
+    """Print one workflow telemetry line to stdout."""
     print(line, flush=True)
 
 
 class TwinrHardwareLoop:
+    """Coordinate the non-realtime Twinr hardware loop.
+
+    This loop owns button-driven turn capture, proactive prompting, print
+    requests, and the classic request/response provider path.
+    """
+
     def __init__(
         self,
         config: TwinrConfig,

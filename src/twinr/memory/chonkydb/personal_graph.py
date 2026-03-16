@@ -1,3 +1,8 @@
+"""Persist and query Twinr's local personal-memory graph.
+
+This module owns the on-device graph store that backs contact lookup,
+preferences, plans, and prompt-context extraction for long-term memory.
+"""
 
 from __future__ import annotations
 
@@ -110,6 +115,8 @@ def _infer_day_key(when_text: str | None, *, timezone_name: str) -> str | None:
 
 @dataclass(frozen=True, slots=True)
 class TwinrGraphContactOption:
+    """Describe one contact option shown during lookup clarification."""
+
     person_node_id: str
     label: str
     role: str | None = None
@@ -118,6 +125,8 @@ class TwinrGraphContactOption:
 
     @property
     def detail(self) -> str:
+        """Summarize the role and available contact methods for display."""
+
         parts: list[str] = []
         if self.role:
             parts.append(self.role)
@@ -132,6 +141,8 @@ class TwinrGraphContactOption:
 
 @dataclass(frozen=True, slots=True)
 class TwinrGraphLookupResult:
+    """Represent the outcome of a contact lookup attempt."""
+
     status: str
     match: TwinrGraphContactOption | None = None
     options: tuple[TwinrGraphContactOption, ...] = ()
@@ -140,6 +151,8 @@ class TwinrGraphLookupResult:
 
 @dataclass(frozen=True, slots=True)
 class TwinrGraphWriteResult:
+    """Represent the outcome of a graph write operation."""
+
     status: str
     label: str
     node_id: str
@@ -149,6 +162,8 @@ class TwinrGraphWriteResult:
 
 
 class TwinrPersonalGraphStore:
+    """Manage the persisted Twinr personal graph and prompt-memory extracts."""
+
     def __init__(
         self,
         path: str | Path,
@@ -170,6 +185,8 @@ class TwinrPersonalGraphStore:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "TwinrPersonalGraphStore":
+        """Build a graph store from the active Twinr runtime configuration."""
+
         base = chonkydb_data_path(config)
         path = base / "twinr_graph_v1.json"
         return cls(
@@ -180,6 +197,8 @@ class TwinrPersonalGraphStore:
         )
 
     def load_document(self) -> TwinrGraphDocumentV1:
+        """Load the current graph document from local or remote state."""
+
         with self._document_lock():
             local_document = self._load_local_document_locked()
             if local_document is not None:
@@ -192,6 +211,8 @@ class TwinrPersonalGraphStore:
             return self._empty_document()
 
     def ensure_remote_snapshot(self) -> bool:
+        """Seed remote state with the current graph if no snapshot exists."""
+
         if self.remote_state is None or not self.remote_state.enabled:
             return False
         with self._document_lock():
@@ -206,6 +227,8 @@ class TwinrPersonalGraphStore:
         self,
         graph_edges: tuple[LongTermGraphEdgeCandidateV1, ...] | list[LongTermGraphEdgeCandidateV1],
     ) -> None:
+        """Merge extracted long-term-memory edge candidates into the graph."""
+
         if not graph_edges:
             return
         with self._document_lock():
@@ -248,6 +271,8 @@ class TwinrPersonalGraphStore:
         notes: str | None = None,
         confirmed_by_user: bool = True,
     ) -> TwinrGraphWriteResult:
+        """Create or update a person node plus its contact-method edges."""
+
         clean_given = _normalize_text(given_name, limit=80)
         clean_family = _normalize_text(family_name or "", limit=80) or None
         clean_role = _normalize_text(role or "", limit=80) or None
@@ -398,6 +423,8 @@ class TwinrPersonalGraphStore:
         family_name: str | None = None,
         role: str | None = None,
     ) -> TwinrGraphLookupResult:
+        """Find a remembered contact and request clarification when needed."""
+
         clean_name = _normalize_text(name, limit=80)
         clean_family = _normalize_text(family_name or "", limit=80) or None
         clean_role = _normalize_text(role or "", limit=80) or None
@@ -441,6 +468,8 @@ class TwinrPersonalGraphStore:
         details: str | None = None,
         confirmed_by_user: bool = True,
     ) -> TwinrGraphWriteResult:
+        """Store or update a user preference edge in the graph."""
+
         clean_category = _slugify(category, fallback="thing")
         clean_value = _normalize_text(value, limit=100)
         clean_product = _normalize_text(for_product or "", limit=80) or None
@@ -506,6 +535,8 @@ class TwinrPersonalGraphStore:
         details: str | None = None,
         confirmed_by_user: bool = True,
     ) -> TwinrGraphWriteResult:
+        """Store or update a user plan and its temporal edges."""
+
         clean_summary = _normalize_text(summary, limit=120)
         clean_when = _normalize_text(when_text or "", limit=80) or None
         clean_details = _normalize_text(details or "", limit=140) or None
@@ -587,6 +618,8 @@ class TwinrPersonalGraphStore:
         *,
         include_contact_methods: bool = True,
     ) -> str | None:
+        """Build the serialized prompt-memory context for one user turn."""
+
         try:
             document = self.load_document()
         except Exception:
@@ -628,6 +661,8 @@ class TwinrPersonalGraphStore:
         )
 
     def build_subtext_payload(self, query_text: str | None) -> dict[str, object] | None:
+        """Build a compact relevance-filtered memory payload for subtext cues."""
+
         clean_query = _normalize_text(query_text or "", limit=220)
         if not clean_query:
             return None

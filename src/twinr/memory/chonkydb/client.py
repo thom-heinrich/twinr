@@ -1,3 +1,10 @@
+"""Call the ChonkyDB external API from Twinr memory components.
+
+This module owns the HTTP client, filesystem path resolution for on-device
+ChonkyDB state, and the request/response parsing boundary used by Twinr's
+remote long-term memory code.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -57,6 +64,8 @@ def _default_urlopen(request: Request, timeout_s: float) -> _ResponseLike:
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBError(RuntimeError):
+    """Represent a ChonkyDB request or payload failure."""
+
     message: str
     status_code: int | None = None
     response_text: str | None = None
@@ -68,6 +77,8 @@ class ChonkyDBError(RuntimeError):
         return f"{self.message} (status={self.status_code})"
 
 class ChonkyDBClient:
+    """Wrap the ChonkyDB external API with Twinr-specific validation."""
+
     def __init__(
         self,
         config: ChonkyDBConnectionConfig,
@@ -90,6 +101,8 @@ class ChonkyDBClient:
 
     @classmethod
     def from_twinr_config(cls, config: TwinrConfig, *, opener: UrlopenLike | None = None) -> "ChonkyDBClient":
+        """Build a client from the active Twinr runtime configuration."""
+
         connection = ChonkyDBConnectionConfig(
             base_url=_normalize_config_string(config.chonkydb_base_url) or "",
             api_key=config.chonkydb_api_key,
@@ -101,11 +114,15 @@ class ChonkyDBClient:
         return cls(connection, opener=opener)
 
     def instance(self) -> ChonkyDBInstanceInfo:
+        """Fetch ChonkyDB instance readiness and service metadata."""
+
         payload = self._request_json("GET", "/v1/external/instance")
         # AUDIT-FIX(#4): Wrap schema/shape mismatches from from_payload() so callers always receive a ChonkyDBError.
         return self._parse_model("instance()", ChonkyDBInstanceInfo.from_payload, payload)
 
     def auth_info(self) -> ChonkyDBAuthInfo:
+        """Fetch the server-side authentication configuration summary."""
+
         payload = self._request_json("GET", "/v1/external/admin/auth")
         # AUDIT-FIX(#4): Wrap schema/shape mismatches from from_payload() so callers always receive a ChonkyDBError.
         return self._parse_model("auth_info()", ChonkyDBAuthInfo.from_payload, payload)
@@ -117,6 +134,8 @@ class ChonkyDBClient:
         limit: int = 100,
         include_metadata: bool = True,
     ) -> ChonkyDBRecordListResponse:
+        """List stored ChonkyDB records with validated pagination."""
+
         # AUDIT-FIX(#7): Reject invalid pagination values locally instead of sending malformed requests upstream.
         offset_value = _coerce_int("offset", offset, minimum=0)
         # AUDIT-FIX(#7): Reject invalid pagination values locally instead of sending malformed requests upstream.
@@ -144,6 +163,8 @@ class ChonkyDBClient:
         include_content: bool = True,
         max_content_chars: int = 4000,
     ) -> JsonDict:
+        """Fetch a stored record by payload id or ChonkyDB record id."""
+
         # AUDIT-FIX(#5): Percent-encode record IDs before interpolating them into the URL path.
         # AUDIT-FIX(#7): Reject blank/non-string selector values and invalid max_content_chars locally.
         safe_record_path = _record_path(record_id)
@@ -163,6 +184,8 @@ class ChonkyDBClient:
         )
 
     def delete_record(self, record_id: str, *, by: str = "payload") -> JsonDict:
+        """Delete a stored record by payload id or ChonkyDB record id."""
+
         # AUDIT-FIX(#5): Percent-encode record IDs before interpolating them into the URL path.
         # AUDIT-FIX(#7): Reject blank/non-string selector values locally.
         safe_record_path = _record_path(record_id)
@@ -182,6 +205,8 @@ class ChonkyDBClient:
         max_content_chars: int = 4000,
         max_response_bytes: int | None = None,
     ) -> JsonDict:
+        """Fetch the full stored document envelope for one document selector."""
+
         # AUDIT-FIX(#7): Treat blank identifiers as absent and reject malformed inputs before issuing a request.
         document_id_value = _normalize_optional_request_string("document_id", document_id)
         # AUDIT-FIX(#7): Treat blank identifiers as absent and reject malformed inputs before issuing a request.
@@ -203,6 +228,8 @@ class ChonkyDBClient:
         )
 
     def store_record(self, request: ChonkyDBRecordRequest | Mapping[str, object]) -> JsonDict:
+        """Store one record through ChonkyDB's bulk-write endpoint."""
+
         body = request.to_payload() if isinstance(request, ChonkyDBRecordRequest) else dict(request)
         operation = str(body.pop("operation", "store_payload") or "store_payload").strip() or "store_payload"
         execution_mode = str(body.pop("execution_mode", "sync") or "sync").strip() or "sync"
@@ -223,32 +250,46 @@ class ChonkyDBClient:
         return self._request_json("POST", "/v1/external/records/bulk", body=bulk_body)
 
     def store_records_bulk(self, request: ChonkyDBBulkRecordRequest | Mapping[str, object]) -> JsonDict:
+        """Store multiple records in one ChonkyDB bulk-write call."""
+
         body = request.to_payload() if isinstance(request, ChonkyDBBulkRecordRequest) else dict(request)
         return self._request_json("POST", "/v1/external/records/bulk", body=body)
 
     def retrieve(self, request: ChonkyDBRetrieveRequest | Mapping[str, object]) -> ChonkyDBRetrieveResponse:
+        """Run a validated retrieval request against ChonkyDB indexes."""
+
         body = request.to_payload() if isinstance(request, ChonkyDBRetrieveRequest) else dict(request)
         payload = self._request_json("POST", "/v1/external/retrieve", body=body)
         # AUDIT-FIX(#4): Wrap schema/shape mismatches from from_payload() so callers always receive a ChonkyDBError.
         return self._parse_model("retrieve()", ChonkyDBRetrieveResponse.from_payload, payload)
 
     def add_graph_edge(self, request: ChonkyDBGraphAddEdgeRequest | Mapping[str, object]) -> JsonDict:
+        """Create a graph edge using numeric ChonkyDB node identifiers."""
+
         body = request.to_payload() if isinstance(request, ChonkyDBGraphAddEdgeRequest) else dict(request)
         return self._request_json("POST", "/v1/external/graph/edges", body=body)
 
     def add_graph_edge_smart(self, request: ChonkyDBGraphAddEdgeSmartRequest | Mapping[str, object]) -> JsonDict:
+        """Create a graph edge using graph references instead of numeric ids."""
+
         body = request.to_payload() if isinstance(request, ChonkyDBGraphAddEdgeSmartRequest) else dict(request)
         return self._request_json("POST", "/v1/external/graph/edges/smart", body=body)
 
     def graph_neighbors(self, request: ChonkyDBGraphNeighborsRequest | Mapping[str, object]) -> JsonDict:
+        """Query neighboring graph nodes for a label or identifier."""
+
         body = request.to_payload() if isinstance(request, ChonkyDBGraphNeighborsRequest) else dict(request)
         return self._request_json("POST", "/v1/external/graph/neighbors", body=body)
 
     def graph_path(self, request: ChonkyDBGraphPathRequest | Mapping[str, object]) -> JsonDict:
+        """Query graph paths between two graph nodes."""
+
         body = request.to_payload() if isinstance(request, ChonkyDBGraphPathRequest) else dict(request)
         return self._request_json("POST", "/v1/external/graph/path", body=body)
 
     def graph_patterns(self, request: ChonkyDBGraphPatternsRequest | Mapping[str, object]) -> JsonDict:
+        """Query graph pattern matches from ChonkyDB."""
+
         body = request.to_payload() if isinstance(request, ChonkyDBGraphPatternsRequest) else dict(request)
         return self._request_json("POST", "/v1/external/graph/patterns", body=body)
 
@@ -330,6 +371,12 @@ class ChonkyDBClient:
             ) from exc
 
 def chonkydb_data_path(config: TwinrConfig) -> Path:
+    """Resolve the on-device directory used for ChonkyDB-backed state.
+
+    Relative paths are normalized against ``config.project_root`` and rejected
+    if they escape that tree.
+    """
+
     # AUDIT-FIX(#2): Validate configured filesystem paths before normalization to avoid TypeError crashes on bad config.
     configured = _coerce_path_config("long_term_memory_path", config.long_term_memory_path)
     # AUDIT-FIX(#2): Resolve the configured path so symlinks and ".." are normalized before containment checks.

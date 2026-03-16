@@ -1,3 +1,11 @@
+"""Define the canonical environment-backed runtime configuration for Twinr.
+
+``TwinrConfig`` is the single source of truth for provider selection, runtime
+timing, hardware wiring, memory settings, and operator-facing service ports.
+Load it through ``TwinrConfig.from_env()`` instead of duplicating `.env`
+parsing in adjacent modules.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -51,6 +59,8 @@ MIN_SAFE_OPENWAKEWORD_THRESHOLD = 0.0
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
+    """Read simple ``KEY=VALUE`` pairs from a dotenv-style file."""
+
     if not path.exists():
         return {}
 
@@ -65,6 +75,8 @@ def _read_dotenv(path: Path) -> dict[str, str]:
 
 
 def _parse_bool(value: str | None, default: bool) -> bool:
+    """Parse a Twinr boolean env value with a fallback default."""
+
     if value is None:
         return default
     normalized = value.strip().lower()
@@ -76,12 +88,16 @@ def _parse_bool(value: str | None, default: bool) -> bool:
 
 
 def _parse_optional_bool(value: str | None) -> bool | None:
+    """Parse an optional boolean env value or return ``None``."""
+
     if value is None or not value.strip():
         return None
     return _parse_bool(value, False)
 
 
 def _parse_optional_int(value: str | None) -> int | None:
+    """Parse an optional integer env value or return ``None``."""
+
     if value is None or not value.strip():
         return None
     return int(value)
@@ -94,6 +110,8 @@ def _parse_float(
     minimum: float | None = None,
     maximum: float | None = None,
 ) -> float:
+    """Parse a float env value and clamp it to optional bounds."""
+
     if value is None or not value.strip():
         parsed = default
     else:
@@ -106,16 +124,22 @@ def _parse_float(
 
 
 def _parse_clamped_float(value: str | None, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    """Parse a float env value through the shared clamp-aware helper."""
+
     return _parse_float(value, default, minimum=minimum, maximum=maximum)
 
 
 def _parse_csv_ints(value: str | None, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Parse a comma-separated integer list or return the default tuple."""
+
     if value is None or not value.strip():
         return default
     return tuple(int(part.strip()) for part in value.split(",") if part.strip())
 
 
 def _parse_csv_strings(value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Parse a comma-separated string list or return the default tuple."""
+
     if value is None or not value.strip():
         return default
     parsed = tuple(part.strip() for part in value.split(",") if part.strip())
@@ -124,6 +148,13 @@ def _parse_csv_strings(value: str | None, default: tuple[str, ...]) -> tuple[str
 
 @dataclass(frozen=True, slots=True)
 class TwinrConfig:
+    """Store the immutable runtime settings snapshot for the base agent.
+
+    The dataclass groups provider selection, streaming and wakeword tuning,
+    hardware wiring, memory durability paths, proactive sensing thresholds,
+    and operator service endpoints into one canonical object.
+    """
+
     openai_api_key: str | None = None
     openai_project_id: str | None = None
     openai_send_project_header: bool | None = None
@@ -367,6 +398,7 @@ class TwinrConfig:
     long_term_memory_query_rewrite_enabled: bool = True
     long_term_memory_remote_read_timeout_s: float = 8.0
     long_term_memory_remote_write_timeout_s: float = 15.0
+    long_term_memory_remote_keepalive_interval_s: float = 5.0
     long_term_memory_remote_max_content_chars: int = 2_000_000
     long_term_memory_remote_shard_max_content_chars: int = 1_000_000
     long_term_memory_remote_retry_attempts: int = 3
@@ -456,6 +488,8 @@ class TwinrConfig:
     print_context_turns: int = 6
 
     def __post_init__(self) -> None:
+        """Normalize derived long-term-memory mode fields after construction."""
+
         normalized_mode = str(self.long_term_memory_mode or "local_first").strip().lower() or "local_first"
         object.__setattr__(self, "long_term_memory_mode", normalized_mode)
         object.__setattr__(
@@ -466,6 +500,8 @@ class TwinrConfig:
 
     @property
     def button_gpios(self) -> dict[str, int]:
+        """Return the configured button GPIO mapping keyed by button name."""
+
         mapping: dict[str, int] = {}
         if self.green_button_gpio is not None:
             mapping["green"] = self.green_button_gpio
@@ -475,6 +511,8 @@ class TwinrConfig:
 
     @property
     def display_gpios(self) -> dict[str, int]:
+        """Return the configured display GPIO assignments with operator labels."""
+
         return {
             "Display CS": self.display_cs_gpio,
             "Display DC": self.display_dc_gpio,
@@ -483,6 +521,8 @@ class TwinrConfig:
         }
 
     def display_gpio_conflicts(self) -> tuple[str, ...]:
+        """Report detected GPIO collisions between display and other inputs."""
+
         assignments: list[tuple[str, int]] = list(self.display_gpios.items())
         if self.green_button_gpio is not None:
             assignments.append(("green button", self.green_button_gpio))
@@ -515,14 +555,31 @@ class TwinrConfig:
 
     @property
     def pir_enabled(self) -> bool:
+        """Return whether PIR motion sensing is configured."""
+
         return self.pir_motion_gpio is not None
 
     @property
     def local_timezone_name(self) -> str:
+        """Return the configured local timezone name with a stable fallback."""
+
         return (self.openai_web_search_timezone or "Europe/Berlin").strip() or "Europe/Berlin"
 
     @classmethod
     def from_env(cls, env_path: str | Path = ".env") -> "TwinrConfig":
+        """Build a config snapshot from process env and a dotenv file.
+
+        Environment variables override values from ``env_path``. Missing values
+        fall back to the defaults defined on ``TwinrConfig``.
+
+        Args:
+            env_path: Dotenv path to read before applying process-environment
+                overrides. Defaults to ``.env``.
+
+        Returns:
+            A fully populated immutable ``TwinrConfig`` instance.
+        """
+
         path = Path(env_path)
         file_values = _read_dotenv(path)
         project_root = path.parent.resolve()
@@ -1217,6 +1274,11 @@ class TwinrConfig:
             long_term_memory_remote_write_timeout_s=_parse_float(
                 get_value("TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S"),
                 15.0,
+            ),
+            long_term_memory_remote_keepalive_interval_s=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_REMOTE_KEEPALIVE_INTERVAL_S"),
+                5.0,
+                minimum=0.1,
             ),
             long_term_memory_remote_max_content_chars=int(
                 get_value("TWINR_LONG_TERM_MEMORY_REMOTE_MAX_CONTENT_CHARS", "2000000") or "2000000"

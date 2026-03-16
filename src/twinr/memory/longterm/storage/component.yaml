@@ -1,0 +1,60 @@
+schema_version: 1
+name: storage
+path: src/twinr/memory/longterm/storage
+kind: python-package
+visibility: internal
+summary: Persist long-term object, conflict, archive, and midterm snapshots locally and mirror validated state through the remote-primary snapshot adapter.
+owned_concerns:
+  - Persist canonical long-term object, conflict, and archive snapshots under the configured memory path
+  - Persist midterm reflection packets and expose bounded midterm lookup helpers
+  - Mirror validated snapshots to the remote ChonkyDB namespace and load safe local fallbacks when optional remote reads fail
+  - Expose store-level mutation and review helpers used by long-term runtime, retrieval, and operator flows
+out_of_scope:
+  - Define canonical long-term schemas or ontology normalization
+  - Implement extraction, consolidation, reflection, retention, or conflict-resolution policy
+  - Assemble runtime prompt context or top-level long-term memory orchestration
+files:
+  - path: __init__.py
+    role: Package marker and local summary
+  - path: store.py
+    role: Durable object, conflict, and archive snapshot store
+    exports:
+      - LongTermStructuredStore
+  - path: midterm_store.py
+    role: Midterm packet snapshot store
+    exports:
+      - LongTermMidtermStore
+  - path: remote_state.py
+    role: Remote snapshot adapter and status types
+    exports:
+      - LongTermRemoteStateStore
+      - LongTermRemoteStatus
+      - LongTermRemoteUnavailableError
+public_api:
+  module: twinr.memory.longterm
+  exports:
+    - LongTermStructuredStore
+    - LongTermMidtermStore
+compatibility_reexports:
+  - path: src/twinr/memory/longterm/__init__.py
+    names:
+      - LongTermStructuredStore
+      - LongTermMidtermStore
+primary_callers:
+  - path: src/twinr/memory/longterm/runtime/service.py
+  - path: src/twinr/memory/longterm/runtime/health.py
+  - path: src/twinr/memory/longterm/retrieval/retriever.py
+  - path: src/twinr/memory/context_store.py
+  - path: src/twinr/memory/chonkydb/personal_graph.py
+  - path: src/twinr/agent/base_agent/prompting/personality.py
+tests:
+  - path: test/test_longterm_store.py
+  - path: test/test_longterm_midterm.py
+  - path: test/test_longterm_retriever.py
+  - path: test/test_longterm_subtext.py
+  - path: test/test_longterm_conflicts.py
+  - path: test/test_longterm_retention.py
+  - path: test/test_longterm_runtime_health.py
+  - path: test/test_runtime_context.py
+  - path: test/test_context_store.py
+  - path: test/test_personality.py

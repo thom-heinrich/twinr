@@ -272,7 +272,7 @@ class OpenAISearchMixin:
             messages.append({"role": "system", "content": instructions.strip()})
         if conversation:
             for item in conversation:
-                role, content = self._coerce_message(item)
+                role, content, _phase = self._coerce_message(item)
                 normalized_role = role.strip().lower()
                 if normalized_role not in {"user", "assistant"}:
                     continue
@@ -460,7 +460,7 @@ class OpenAISearchMixin:
             return None
         filtered: list[tuple[str, str]] = []
         for item in conversation:
-            role, content = self._coerce_message(item)
+            role, content, _phase = self._coerce_message(item)
             normalized_role = role.strip().lower()
             if normalized_role not in {"user", "assistant"}:
                 continue

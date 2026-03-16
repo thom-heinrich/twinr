@@ -1,3 +1,11 @@
+"""Persist proactive planning history and apply reservation policy gates.
+
+This module owns the bounded JSON state file used for proactive history and the
+policy checks that decide whether a candidate may be reserved, delivered, or
+skipped. Import public types from ``twinr.memory.longterm.proactive`` or
+``twinr.memory.longterm``.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -205,6 +213,18 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    """Write proactive state JSON atomically to a vetted file path.
+
+    Args:
+        path: Destination file for the proactive state payload.
+        payload: JSON-serializable mapping to persist.
+
+    Raises:
+        ValueError: If the destination path or one of its parents is unsafe.
+        OSError: If the temporary write, rename, or fsync fails.
+        TypeError: If ``payload`` is not JSON serializable.
+    """
+
     # AUDIT-FIX(#5): Harden writes against unsafe paths and incomplete persistence on sudden power loss.
     safe_path = _assert_safe_state_file_path(path)
     _ensure_safe_directory(safe_path.parent)
@@ -254,6 +274,25 @@ def _quarantine_corrupt_state_file(path: Path, *, reason: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class LongTermProactiveHistoryEntryV1:
+    """Persist one proactive candidate's reservation and delivery history.
+
+    Attributes:
+        candidate_id: Stable candidate identifier used as the history key.
+        kind: Candidate kind, such as ``same_day_reminder``.
+        summary: User-facing summary associated with the candidate.
+        sensitivity: Normalized memory sensitivity label for policy gating.
+        source_memory_ids: Backing long-term memory object ids.
+        first_seen_at: First time the candidate entered state history.
+        last_seen_at: Most recent time the candidate was observed or updated.
+        last_reserved_at: Most recent reservation time, if any.
+        last_delivered_at: Most recent delivery time, if any.
+        last_skipped_at: Most recent skip time, if any.
+        last_skip_reason: Bounded audit reason for the last skip.
+        last_prompt_text: Bounded prompt text used for the last delivery.
+        delivery_count: Number of successful deliveries recorded.
+        skip_count: Number of recorded skips.
+    """
+
     candidate_id: str
     kind: str
     summary: str
@@ -327,6 +366,13 @@ class LongTermProactiveHistoryEntryV1:
             raise ValueError("skip_count must be non-negative.")
 
     def to_payload(self) -> dict[str, object]:
+        """Serialize the history entry into the on-disk JSON payload shape.
+
+        Returns:
+            A JSON-serializable dictionary for persistence in the proactive
+            state file.
+        """
+
         payload: dict[str, object] = {
             "candidate_id": self.candidate_id,
             "kind": self.kind,
@@ -352,6 +398,18 @@ class LongTermProactiveHistoryEntryV1:
 
     @classmethod
     def from_payload(cls, payload: dict[str, object]) -> "LongTermProactiveHistoryEntryV1":
+        """Build a normalized history entry from persisted JSON data.
+
+        Args:
+            payload: One decoded JSON object from the proactive state file.
+
+        Returns:
+            A normalized ``LongTermProactiveHistoryEntryV1`` instance.
+
+        Raises:
+            ValueError: If required fields are missing after normalization.
+        """
+
         # AUDIT-FIX(#2): Parse legacy/malformed state defensively.
         # AUDIT-FIX(#4): Normalize persisted timestamps during load.
         # AUDIT-FIX(#7): Reject malformed source_memory_ids shapes.
@@ -385,6 +443,8 @@ class LongTermProactiveHistoryEntryV1:
 
 @dataclass(frozen=True, slots=True)
 class LongTermProactiveReservationV1:
+    """Represent one in-flight reservation for a proactive candidate."""
+
     candidate: LongTermProactiveCandidateV1
     reserved_at: datetime
 
@@ -395,12 +455,34 @@ class LongTermProactiveReservationV1:
 
 @dataclass(slots=True)
 class LongTermProactiveStateStore:
+    """Persist proactive history in a bounded, path-safe JSON file.
+
+    The store serializes reads and writes with an in-process lock, repairs
+    partially invalid payloads when possible, and trims history using
+    normalized UTC timestamps so cooldown behavior stays deterministic.
+
+    Attributes:
+        path: JSON file used for proactive history persistence.
+        history_limit: Maximum number of entries retained on disk.
+    """
+
     path: Path
     history_limit: int = _DEFAULT_HISTORY_LIMIT
     _lock: Lock = field(default_factory=Lock, repr=False)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermProactiveStateStore":
+        """Build a state store from Twinr's configured data directory.
+
+        Args:
+            config: Runtime configuration that provides the ChonkyDB data path
+                and the proactive history limit.
+
+        Returns:
+            A ``LongTermProactiveStateStore`` rooted under the configured
+            long-term memory data directory.
+        """
+
         return cls(
             path=chonkydb_data_path(config) / "twinr_memory_proactive_state_v1.json",
             # AUDIT-FIX(#8): Malformed .env values should fall back to sane bounds, not crash the module at startup.
@@ -410,6 +492,13 @@ class LongTermProactiveStateStore:
         )
 
     def load_entries(self) -> tuple[LongTermProactiveHistoryEntryV1, ...]:
+        """Load persisted proactive history entries from disk.
+
+        Returns:
+            A newest-first tuple of normalized history entries. Corrupt or
+            unsafe state degrades to an empty tuple instead of raising.
+        """
+
         with self._lock:
             return self._load_entries_unlocked()
 
@@ -509,6 +598,17 @@ class LongTermProactiveStateStore:
         *,
         reserved_at: datetime,
     ) -> LongTermProactiveReservationV1:
+        """Reserve one explicit proactive candidate and persist the update.
+
+        Args:
+            candidate: Candidate to reserve.
+            reserved_at: Reservation timestamp.
+
+        Returns:
+            A reservation record for the candidate at the normalized
+            reservation time.
+        """
+
         safe_reserved_at = _coerce_datetime(reserved_at)
         with self._lock:
             entries = {entry.candidate_id: entry for entry in self._load_entries_unlocked()}
@@ -534,6 +634,19 @@ class LongTermProactiveStateStore:
             bool,
         ],
     ) -> LongTermProactiveReservationV1 | None:
+        """Reserve the first eligible candidate under a single lock.
+
+        Args:
+            candidates: Ranked candidates to inspect in order.
+            reserved_at: Reservation timestamp.
+            is_eligible: Callback that decides whether a candidate may be
+                reserved given its current persisted history entry.
+
+        Returns:
+            A reservation for the first eligible candidate, or ``None`` when
+            all candidates are blocked.
+        """
+
         safe_reserved_at = _coerce_datetime(reserved_at)
         with self._lock:
             entries = {entry.candidate_id: entry for entry in self._load_entries_unlocked()}
@@ -561,6 +674,17 @@ class LongTermProactiveStateStore:
         delivered_at: datetime,
         prompt_text: str | None = None,
     ) -> LongTermProactiveHistoryEntryV1:
+        """Record a delivered proactive prompt in persisted history.
+
+        Args:
+            candidate: Candidate that was delivered.
+            delivered_at: Delivery timestamp.
+            prompt_text: Optional prompt text shown or spoken to the user.
+
+        Returns:
+            The updated persisted history entry for the candidate.
+        """
+
         safe_delivered_at = _coerce_datetime(delivered_at)
         with self._lock:
             entries = {entry.candidate_id: entry for entry in self._load_entries_unlocked()}
@@ -594,6 +718,17 @@ class LongTermProactiveStateStore:
         skipped_at: datetime,
         reason: str,
     ) -> LongTermProactiveHistoryEntryV1:
+        """Record a skipped proactive candidate in persisted history.
+
+        Args:
+            candidate: Candidate that was skipped.
+            skipped_at: Skip timestamp.
+            reason: Short audit reason for the skip.
+
+        Returns:
+            The updated persisted history entry for the candidate.
+        """
+
         # AUDIT-FIX(#9): Bound skip reasons so storage remains predictable even if upstream passes large strings.
         clean_reason = _truncate_text(reason, max_chars=_MAX_AUDIT_TEXT_CHARS) or "unknown"
         safe_skipped_at = _coerce_datetime(skipped_at)
@@ -676,6 +811,20 @@ class LongTermProactiveStateStore:
 
 @dataclass(slots=True)
 class LongTermProactivePolicy:
+    """Apply config-driven eligibility and cooldown checks to proactive plans.
+
+    This policy layer keeps privacy gating, confidence thresholds, cooldowns,
+    and state-store interaction out of the runtime loop. It fails closed for
+    invalid candidate metadata and only falls back to in-memory history entries
+    when persistence fails after a delivery or skip already happened.
+
+    Attributes:
+        config: Runtime configuration backing proactive thresholds and toggles.
+        state_store: Persistent store for reservation and delivery history.
+        blocked_sensitivities: Sensitivity labels blocked unless sensitive
+            proactive prompts are explicitly allowed.
+    """
+
     config: TwinrConfig
     state_store: LongTermProactiveStateStore
     blocked_sensitivities: frozenset[str] = frozenset({"private", "sensitive", "critical"})
@@ -686,6 +835,18 @@ class LongTermProactivePolicy:
         plan: LongTermProactivePlanV1,
         now: datetime | None = None,
     ) -> LongTermProactiveReservationV1 | None:
+        """Reserve the first eligible candidate from a ranked proactive plan.
+
+        Args:
+            plan: Ranked proactive plan to inspect.
+            now: Optional reference time for cooldown checks.
+
+        Returns:
+            A reservation for the first eligible candidate, or ``None`` if the
+            feature is disabled, all candidates are blocked, or persistence
+            fails.
+        """
+
         if not self.config.long_term_memory_proactive_enabled:
             return None
         current_time = self._current_time(now)
@@ -710,6 +871,20 @@ class LongTermProactivePolicy:
         *,
         now: datetime | None = None,
     ) -> LongTermProactiveReservationV1:
+        """Reserve one explicit candidate after applying policy gates.
+
+        Args:
+            candidate: Candidate to validate and reserve.
+            now: Optional reference time for cooldown checks.
+
+        Returns:
+            A reservation for the candidate.
+
+        Raises:
+            ValueError: If proactive planning is disabled or the candidate is
+                currently ineligible.
+        """
+
         if not self.config.long_term_memory_proactive_enabled:
             raise ValueError("Proactive long-term memory is disabled.")
         current_time = self._current_time(now)
@@ -733,6 +908,17 @@ class LongTermProactivePolicy:
         plan: LongTermProactivePlanV1,
         now: datetime | None = None,
     ) -> LongTermProactiveCandidateV1 | None:
+        """Preview the first eligible candidate without reserving it.
+
+        Args:
+            plan: Ranked proactive plan to inspect.
+            now: Optional reference time for cooldown checks.
+
+        Returns:
+            The first eligible candidate, or ``None`` if none may currently be
+            surfaced.
+        """
+
         if not self.config.long_term_memory_proactive_enabled:
             return None
         current_time = self._current_time(now)
@@ -746,6 +932,18 @@ class LongTermProactivePolicy:
         delivered_at: datetime | None = None,
         prompt_text: str | None = None,
     ) -> LongTermProactiveHistoryEntryV1:
+        """Record a delivered reservation in persistent or fallback history.
+
+        Args:
+            reservation: Reservation returned by the policy or state store.
+            delivered_at: Optional delivery timestamp. Defaults to ``now``.
+            prompt_text: Optional prompt text shown or spoken to the user.
+
+        Returns:
+            The persisted history entry when storage succeeds, otherwise a
+            best-effort in-memory fallback entry.
+        """
+
         current_time = self._current_time(delivered_at)
         try:
             return self.state_store.mark_delivered(
@@ -775,6 +973,18 @@ class LongTermProactivePolicy:
         reason: str,
         skipped_at: datetime | None = None,
     ) -> LongTermProactiveHistoryEntryV1:
+        """Record a skipped reservation in persistent or fallback history.
+
+        Args:
+            reservation: Reservation returned by the policy or state store.
+            reason: Short audit reason for the skip.
+            skipped_at: Optional skip timestamp. Defaults to ``now``.
+
+        Returns:
+            The persisted history entry when storage succeeds, otherwise a
+            best-effort in-memory fallback entry.
+        """
+
         current_time = self._current_time(skipped_at)
         try:
             return self.state_store.mark_skipped(

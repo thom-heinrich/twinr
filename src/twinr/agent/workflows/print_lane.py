@@ -1,3 +1,5 @@
+"""Run the bounded background print lane used by realtime workflow loops."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,6 +12,8 @@ from twinr.hardware.printer import RawReceiptPrinter
 
 @dataclass(frozen=True)
 class PrintLaneRequest:
+    """Describe one queued background print request."""
+
     conversation: ConversationLike | None
     focus_hint: str | None
     direct_text: str | None
@@ -20,6 +24,8 @@ class PrintLaneRequest:
 
 
 class TwinrPrintLane:
+    """Serialize print composition, printer delivery, and print telemetry."""
+
     def __init__(
         self,
         *,

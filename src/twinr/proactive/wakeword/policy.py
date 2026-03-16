@@ -1,3 +1,10 @@
+"""Decide whether wakeword detections should be accepted or verified.
+
+This module normalizes backend selection, optionally rechecks borderline hits
+with STT, and returns structured decisions that the proactive runtime can log
+and act on consistently.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -9,6 +16,8 @@ from .matching import WakewordMatch, match_wakeword_transcript, wakeword_primary
 
 
 class WakewordTranscriber(Protocol):
+    """Describe the transcription contract required by wakeword verification."""
+
     def transcribe(
         self,
         audio_bytes: bytes,
@@ -17,10 +26,14 @@ class WakewordTranscriber(Protocol):
         content_type: str = "audio/wav",
         language: str | None = None,
         prompt: str | None = None,
-    ) -> str: ...
+    ) -> str:
+        """Transcribe the supplied audio bytes into text."""
+        ...
 
 
 def normalize_wakeword_backend(value: object | None, *, default: str) -> str:
+    """Normalize one wakeword backend name with a safe default."""
+
     normalized = str(value or default).strip().lower()
     if normalized not in {"openwakeword", "stt", "disabled"}:
         return default
@@ -28,6 +41,8 @@ def normalize_wakeword_backend(value: object | None, *, default: str) -> str:
 
 
 def normalize_wakeword_verifier_mode(value: object | None, *, default: str = "ambiguity_only") -> str:
+    """Normalize one verifier mode with a safe default."""
+
     normalized = str(value or default).strip().lower()
     if normalized not in {"disabled", "ambiguity_only", "always"}:
         return default
@@ -36,6 +51,8 @@ def normalize_wakeword_verifier_mode(value: object | None, *, default: str = "am
 
 @dataclass(frozen=True, slots=True)
 class WakewordVerification:
+    """Describe the result of STT wakeword verification."""
+
     status: str
     transcript: str = ""
     normalized_transcript: str = ""
@@ -47,6 +64,8 @@ class WakewordVerification:
 
 @dataclass(frozen=True, slots=True)
 class WakewordDecision:
+    """Describe the final wakeword decision returned to runtime callers."""
+
     detected: bool
     outcome: str
     match: WakewordMatch
@@ -62,6 +81,8 @@ class WakewordDecision:
 
 
 class SttWakewordVerifier:
+    """Recheck one wakeword capture with STT transcript matching."""
+
     def __init__(
         self,
         *,
@@ -76,6 +97,8 @@ class SttWakewordVerifier:
         self.min_prefix_ratio = float(min_prefix_ratio)
 
     def verify(self, capture: AmbientAudioCaptureWindow, *, detector_match: WakewordMatch) -> WakewordVerification:
+        """Verify one detector hit against the configured wakeword phrases."""
+
         try:
             audio_bytes = pcm16_to_wav_bytes(
                 capture.pcm_bytes,
@@ -122,6 +145,8 @@ class SttWakewordVerifier:
 
 
 class WakewordDecisionPolicy:
+    """Apply fallback and verifier rules to one wakeword match."""
+
     def __init__(
         self,
         *,
@@ -151,6 +176,8 @@ class WakewordDecisionPolicy:
         capture: AmbientAudioCaptureWindow | None,
         source: str,
     ) -> WakewordDecision:
+        """Convert one wakeword match into the final runtime decision."""
+
         backend_used = normalize_wakeword_backend(match.backend, default=self.primary_backend)
         if not match.detected:
             return WakewordDecision(

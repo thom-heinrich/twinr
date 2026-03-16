@@ -1,0 +1,95 @@
+schema_version: 1
+name: self_coding
+path: src/twinr/agent/self_coding
+kind: python-package
+visibility: internal
+summary: Adaptive Skill Engine core package for contracts, runtime persistence, deterministic capability readiness, feasibility checks, and requirements dialogue.
+owned_concerns:
+  - Define the stable internal contract objects used across future ASE layers
+  - Persist compile jobs and compile artifacts under the Twinr runtime state tree
+  - Resolve the deterministic MVP capability readiness view for self-coding feasibility checks
+  - Decide whether a draft skill request fits the current automation-first or later skill-package envelope
+  - Persist and advance the deterministic requirements-dialogue state machine for self-coding
+out_of_scope:
+  - Workflow-loop orchestration and live conversation hooks
+  - Provider-specific Codex/OpenAI driver execution
+  - Compile prompting, test generation, and artifact production logic
+  - Sandboxed skill execution and brokered effect enforcement
+files:
+  - path: __init__.py
+    role: Package export surface for ASE core entrypoints
+    exports:
+      - ActivationRecord
+      - ArtifactKind
+      - CapabilityAvailability
+      - CapabilityDefinition
+      - CapabilityRiskClass
+      - CapabilityStatus
+      - CompileArtifactRecord
+      - CompileJobRecord
+      - CompileJobStatus
+      - CompileTarget
+      - FeasibilityOutcome
+      - FeasibilityResult
+      - LearnedSkillStatus
+      - RequirementsDialogueSession
+      - RequirementsDialogueStatus
+      - SelfCodingCapabilityRegistry
+      - SelfCodingFeasibilityChecker
+      - SelfCodingLearningFlow
+      - SelfCodingLearningUpdate
+      - SelfCodingRequirementsDialogue
+      - SelfCodingStore
+      - SkillSpec
+      - SkillTriggerSpec
+      - self_coding_store_root
+  - path: contracts.py
+    role: Versioned ASE contract dataclasses and payload round-trips
+  - path: status.py
+    role: Shared ASE lifecycle enums
+  - path: store.py
+    role: File-backed self-coding persistence layer
+  - path: capability_registry.py
+    role: Deterministic MVP capability readiness resolver
+  - path: feasibility.py
+    role: Deterministic Phase-1 feasibility policy
+  - path: requirements_dialogue.py
+    role: Deterministic Phase-2 dialogue state machine
+  - path: learning_flow.py
+    role: Thin application service coordinating feasibility and dialogue persistence
+public_api:
+  module: twinr.agent.self_coding
+  exports:
+    - ActivationRecord
+    - ArtifactKind
+    - CapabilityAvailability
+    - CapabilityDefinition
+    - CapabilityRiskClass
+    - CapabilityStatus
+    - CompileArtifactRecord
+    - CompileJobRecord
+    - CompileJobStatus
+    - CompileTarget
+    - FeasibilityOutcome
+    - FeasibilityResult
+    - LearnedSkillStatus
+    - RequirementsDialogueSession
+    - RequirementsDialogueStatus
+    - SelfCodingCapabilityRegistry
+    - SelfCodingFeasibilityChecker
+    - SelfCodingLearningFlow
+    - SelfCodingLearningUpdate
+    - SelfCodingRequirementsDialogue
+    - SelfCodingStore
+    - SkillSpec
+    - SkillTriggerSpec
+    - self_coding_store_root
+primary_callers:
+  - path: src/twinr/agent/self_coding/IMPLEMENTATION_PLAN.md
+  - path: src/twinr/agent/tools/handlers/self_coding.py
+tests:
+  - path: test/test_self_coding_contracts.py
+  - path: test/test_self_coding_store.py
+  - path: test/test_self_coding_registry.py
+  - path: test/test_self_coding_feasibility.py
+  - path: test/test_self_coding_dialogue.py

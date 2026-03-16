@@ -1,0 +1,116 @@
+schema_version: 1
+name: chonkydb
+path: src/twinr/memory/chonkydb
+kind: python-package
+visibility: internal
+summary: Provide Twinr's ChonkyDB HTTP client, validated API models, and personal-graph store for long-term memory.
+owned_concerns:
+  - Validate and issue ChonkyDB external API requests for remote memory state
+  - Define typed request and response models for ChonkyDB record, retrieve, and graph endpoints
+  - Define the canonical Twinr personal-graph schema and the on-device graph store
+  - Build prompt-context and subtext payloads from persisted graph memory
+out_of_scope:
+  - ChonkyDB server implementation, deployment, or upstream API design
+  - Long-term memory extraction and retrieval orchestration outside the graph store boundary
+  - Top-level agent memory policy, provider selection, or web-dashboard workflows
+files:
+  - path: __init__.py
+    role: Public ChonkyDB package export surface
+    exports:
+      - ChonkyDBClient
+      - ChonkyDBConnectionConfig
+      - ChonkyDBError
+      - TwinrPersonalGraphStore
+      - TwinrGraphDocumentV1
+  - path: client.py
+    role: ChonkyDB HTTP client and local data-path resolution
+    exports:
+      - ChonkyDBClient
+      - ChonkyDBError
+      - chonkydb_data_path
+  - path: models.py
+    role: Validated ChonkyDB request and response dataclasses
+    exports:
+      - ChonkyDBAuthInfo
+      - ChonkyDBBulkRecordRequest
+      - ChonkyDBConnectionConfig
+      - ChonkyDBGraphAddEdgeRequest
+      - ChonkyDBGraphAddEdgeSmartRequest
+      - ChonkyDBGraphNeighborsRequest
+      - ChonkyDBGraphPathRequest
+      - ChonkyDBGraphPatternsRequest
+      - ChonkyDBInstanceInfo
+      - ChonkyDBRecordItem
+      - ChonkyDBRecordListResponse
+      - ChonkyDBRecordRequest
+      - ChonkyDBRecordSummary
+      - ChonkyDBRetrieveHit
+      - ChonkyDBRetrieveRequest
+      - ChonkyDBRetrieveResponse
+  - path: schema.py
+    role: Twinr personal-graph schema taxonomy and typed document models
+    exports:
+      - TWINR_GRAPH_ALLOWED_EDGE_TYPES
+      - TWINR_GRAPH_EDGE_TYPES_BY_NAMESPACE
+      - TWINR_GRAPH_SCHEMA_NAME
+      - TWINR_GRAPH_SCHEMA_VERSION
+      - TwinrGraphDocumentV1
+      - TwinrGraphEdgeV1
+      - TwinrGraphNodeV1
+      - graph_edge_namespace
+      - is_allowed_graph_edge_type
+      - normalize_graph_edge_type
+  - path: personal_graph.py
+    role: On-device personal-graph persistence and prompt extraction
+    exports:
+      - TwinrGraphContactOption
+      - TwinrGraphLookupResult
+      - TwinrGraphWriteResult
+      - TwinrPersonalGraphStore
+public_api:
+  module: twinr.memory.chonkydb
+  classes:
+    - ChonkyDBClient
+    - ChonkyDBConnectionConfig
+    - ChonkyDBError
+    - ChonkyDBRecordRequest
+    - ChonkyDBBulkRecordRequest
+    - ChonkyDBRetrieveRequest
+    - TwinrPersonalGraphStore
+    - TwinrGraphDocumentV1
+    - TwinrGraphEdgeV1
+    - TwinrGraphNodeV1
+  functions:
+    - chonkydb_data_path
+    - graph_edge_namespace
+    - is_allowed_graph_edge_type
+    - normalize_graph_edge_type
+compatibility_reexports:
+  - path: src/twinr/memory/__init__.py
+    names:
+      - ChonkyDBClient
+      - ChonkyDBConnectionConfig
+      - ChonkyDBError
+      - ChonkyDBRecordRequest
+      - ChonkyDBBulkRecordRequest
+      - ChonkyDBRetrieveRequest
+      - TwinrPersonalGraphStore
+      - TwinrGraphDocumentV1
+      - TwinrGraphEdgeV1
+      - TwinrGraphNodeV1
+primary_callers:
+  - path: src/twinr/memory/longterm/storage/remote_state.py
+  - path: src/twinr/memory/longterm/runtime/service.py
+  - path: src/twinr/memory/longterm/retrieval/retriever.py
+  - path: src/twinr/memory/longterm/retrieval/subtext.py
+  - path: src/twinr/agent/base_agent/runtime/base.py
+  - path: src/twinr/agent/base_agent/runtime/context.py
+tests:
+  - path: test/test_chonkydb.py
+  - path: test/test_chonkydb_graph_schema.py
+  - path: test/test_chonkydb_personal_graph.py
+  - path: test/test_chonkydb_personal_graph_goldsets.py
+  - path: test/test_longterm_memory.py
+  - path: test/test_longterm_remote_state.py
+  - path: test/test_longterm_retriever.py
+  - path: test/test_longterm_subtext.py

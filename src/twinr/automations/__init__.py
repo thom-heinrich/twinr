@@ -1,3 +1,5 @@
+"""Expose Twinr automation models, storage, and sensor-trigger helpers."""
+
 from twinr.automations.sensors import (
     SensorTriggerSpec,
     build_sensor_trigger,

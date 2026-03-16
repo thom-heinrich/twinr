@@ -20,9 +20,9 @@ realtime-safe schema variants.
 
 | File | Purpose |
 |---|---|
+| [__init__.py](./__init__.py) | Schema export surface |
 | [contracts.py](./contracts.py) | Canonical schema builders |
 | [component.yaml](./component.yaml) | Structured package metadata |
-| [AGENTS.md](./AGENTS.md) | Local invariants and checks |
 
 ## Usage
 
@@ -35,6 +35,5 @@ schemas = build_agent_tool_schemas(tool_names)
 ## See also
 
 - [component.yaml](./component.yaml)
-- [AGENTS.md](./AGENTS.md)
 - [handlers](../handlers/README.md)
 - [prompting](../prompting/README.md)

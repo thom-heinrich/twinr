@@ -1,3 +1,10 @@
+"""Monitor Twinr GPIO buttons across libgpiod and CLI fallback backends.
+
+This module owns low-level button edge normalization and raw state snapshots.
+PIR motion wraps this backend instead of duplicating GPIO access and debounce
+logic.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -34,12 +41,16 @@ _SAMPLE_INTERVAL_S = 0.01
 
 
 class ButtonAction(StrEnum):
+    """Describe the normalized logical action for a button transition."""
+
     PRESSED = "pressed"
     RELEASED = "released"
 
 
 @dataclass(frozen=True, slots=True)
 class ButtonBinding:
+    """Bind a logical button name to one GPIO line offset."""
+
     name: str
     line_offset: int
 
@@ -51,6 +62,8 @@ class ButtonBinding:
 
 @dataclass(frozen=True, slots=True)
 class ButtonEvent:
+    """Represent one normalized button event."""
+
     name: str
     line_offset: int
     action: ButtonAction
@@ -232,6 +245,8 @@ def _cli_bias_arg(bias: str) -> str | None:
 
 
 def edge_name(event_type: object) -> str:
+    """Return a stable rising/falling label for a raw GPIO edge value."""
+
     normalized = _normalize_edge_type(event_type)
     if normalized == 1:
         return "rising"
@@ -241,6 +256,8 @@ def edge_name(event_type: object) -> str:
 
 
 def edge_to_action(event_type: object, active_low: bool) -> ButtonAction:
+    """Convert a raw GPIO edge into a normalized button action."""
+
     is_rising = _normalize_edge_type(event_type) == 1
     if active_low:
         return ButtonAction.RELEASED if is_rising else ButtonAction.PRESSED
@@ -248,6 +265,8 @@ def edge_to_action(event_type: object, active_low: bool) -> ButtonAction:
 
 
 def build_button_bindings(config: TwinrConfig) -> tuple[ButtonBinding, ...]:
+    """Build configured Twinr button bindings from ``TwinrConfig``."""
+
     # AUDIT-FIX(#3): Reject invalid/negative GPIO offsets before the monitor touches hardware.
     bindings: list[ButtonBinding] = []
     if config.green_button_gpio is not None:
@@ -278,6 +297,8 @@ def build_button_bindings(config: TwinrConfig) -> tuple[ButtonBinding, ...]:
 
 
 def build_probe_bindings(lines: tuple[int, ...] | list[int]) -> tuple[ButtonBinding, ...]:
+    """Build synthetic button bindings for GPIO probe utilities."""
+
     # AUDIT-FIX(#3): Probe bindings use the same offset validation as production bindings.
     validated_lines = sorted(
         {_validate_line_offset(line, field_name="Probe GPIO") for line in lines}
@@ -286,6 +307,8 @@ def build_probe_bindings(lines: tuple[int, ...] | list[int]) -> tuple[ButtonBind
 
 
 class GpioButtonMonitor:
+    """Monitor Twinr button GPIO lines across supported Linux backends."""
+
     def __init__(
         self,
         chip_name: str,
@@ -336,6 +359,8 @@ class GpioButtonMonitor:
         )
 
     def open(self) -> "GpioButtonMonitor":
+        """Open the configured GPIO backend and prime button state."""
+
         if self._is_open():
             return self
 
@@ -440,6 +465,8 @@ class GpioButtonMonitor:
         self._last_values = last_values
 
     def close(self) -> None:
+        """Release any open GPIO handles and stop background sampling."""
+
         # AUDIT-FIX(#6): Cleanup is best-effort and clears internal state even if one release call fails, so exception paths do not leak hardware handles.
         request = self._request
         line_by_offset = self._line_by_offset
@@ -651,6 +678,8 @@ class GpioButtonMonitor:
             self._background_poll_error = exc
 
     def poll(self, timeout: float | None = None) -> ButtonEvent | None:
+        """Return the next button event or ``None`` after the timeout."""
+
         if not self._is_open():
             self.open()
 
@@ -778,6 +807,8 @@ class GpioButtonMonitor:
         duration_s: float | None = None,
         poll_timeout: float = 0.5,
     ) -> Iterator[ButtonEvent]:
+        """Yield button events until the optional duration expires."""
+
         normalized_duration = None if duration_s is None else max(0.0, float(duration_s))
         # AUDIT-FIX(#10): Clamp non-positive poll timeouts so callers cannot accidentally create a hot spin-loop.
         normalized_poll_timeout = max(0.01, float(poll_timeout))
@@ -795,6 +826,8 @@ class GpioButtonMonitor:
                 yield event
 
     def snapshot_values(self) -> dict[int, int]:
+        """Return the latest raw GPIO values keyed by line offset."""
+
         if not self._is_open():
             self.open()
         values = self._read_current_values()
@@ -803,6 +836,8 @@ class GpioButtonMonitor:
 
 
 def configured_button_monitor(config: TwinrConfig) -> GpioButtonMonitor:
+    """Build a button monitor from ``TwinrConfig``."""
+
     bindings = build_button_bindings(config)
     if not bindings:
         raise ValueError("Set TWINR_GREEN_BUTTON_GPIO and TWINR_YELLOW_BUTTON_GPIO before watching buttons")

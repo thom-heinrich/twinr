@@ -9,6 +9,7 @@ owned_concerns:
   - Validate the canonical realtime tool-name to handler binding map before live turns start
   - Run the generic streaming tool loop that alternates provider turns and tool execution
   - Run the dual-lane supervisor and specialist handoff loop with speech-lane events
+  - Define the explicit allowlist for background automation `tool_call` execution
 out_of_scope:
   - Concrete tool-side business logic or runtime mutations inside src/twinr/agent/tools/handlers
   - Tool schema authoring and prompt instruction assembly in sibling packages
@@ -31,7 +32,7 @@ files:
     exports:
       - RealtimeToolExecutor
   - path: registry.py
-    role: Canonical realtime tool binding registry and bootstrap validation
+    role: Canonical realtime tool binding registry, bootstrap validation, and background automation tool-call allowlist
     exports:
       - RealtimeToolBindingError
       - bind_realtime_tool_handlers

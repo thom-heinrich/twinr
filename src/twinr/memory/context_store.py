@@ -1,3 +1,11 @@
+"""Persist Twinr prompt context and durable explicit memories.
+
+This module owns the markdown-backed prompt-memory and managed-context stores
+used by prompt assembly, the web dashboard, and long-term memory runtime
+services. The stores support local file persistence plus remote-primary
+snapshot migration when Twinr's remote memory backend is enabled.
+"""
+
 from __future__ import annotations
 
 from contextlib import contextmanager, suppress
@@ -240,6 +248,14 @@ def _is_remote_unavailable_error(exc: Exception) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class ManagedContextEntry:
+    """Store one Twinr-managed user or personality context update.
+
+    Attributes:
+        key: Stable normalized category identifier.
+        instruction: Short bounded instruction injected into prompt context.
+        updated_at: UTC timestamp used for ordering and snapshot persistence.
+    """
+
     key: str
     instruction: str
     updated_at: datetime = field(default_factory=_utcnow)
@@ -247,6 +263,17 @@ class ManagedContextEntry:
 
 @dataclass(frozen=True, slots=True)
 class PersistentMemoryEntry:
+    """Store one explicit durable memory item saved for later turns.
+
+    Attributes:
+        entry_id: Stable identifier for persistence and deduplication.
+        kind: Normalized memory category label.
+        summary: Short bounded summary text.
+        details: Optional longer detail text.
+        created_at: UTC timestamp when the memory was first stored.
+        updated_at: UTC timestamp of the latest update.
+    """
+
     entry_id: str
     kind: str
     summary: str
@@ -256,6 +283,13 @@ class PersistentMemoryEntry:
 
 
 class ManagedContextFileStore:
+    """Manage a markdown-backed prompt-context section with optional remote sync.
+
+    The store keeps the human-authored base markdown text separate from the
+    Twinr-managed updates section so operators can edit the base content while
+    Twinr appends or migrates structured updates safely.
+    """
+
     def __init__(
         self,
         path: str | Path,
@@ -288,11 +322,19 @@ class ManagedContextFileStore:
         return bool(config is not None and getattr(config, "long_term_memory_migration_enabled", False))
 
     def load_base_text(self) -> str:
+        """Return the human-authored markdown outside the managed block."""
+
         with self._locked():
             prefix, _managed_entries, _suffix = self._split_document()
             return prefix.strip()
 
     def load_entries(self) -> tuple[ManagedContextEntry, ...]:
+        """Load managed context entries from remote or local storage.
+
+        Returns:
+            A tuple of normalized ``ManagedContextEntry`` objects.
+        """
+
         with self._locked():
             if self._remote_enabled():
                 # AUDIT-FIX(#2): Treat valid-empty, missing, invalid, and unavailable remote snapshots as different states.
@@ -307,6 +349,20 @@ class ManagedContextFileStore:
             return self._load_local_entries()
 
     def upsert(self, *, category: str, instruction: str) -> ManagedContextEntry:
+        """Create or replace one managed context instruction.
+
+        Args:
+            category: Stable category name such as ``response_style``.
+            instruction: Short bounded instruction text to persist.
+
+        Returns:
+            The stored ``ManagedContextEntry``.
+
+        Raises:
+            ValueError: If the instruction is empty after normalization.
+            RuntimeError: If the updated entry cannot be persisted.
+        """
+
         key = _slugify(category, fallback="update")
         clean_instruction = _normalize_text(instruction, limit=220)
         if not clean_instruction:
@@ -328,6 +384,8 @@ class ManagedContextFileStore:
             return updated
 
     def replace_base_text(self, content: str) -> None:
+        """Replace the human-authored markdown outside the managed block."""
+
         with self._locked():
             _prefix, _managed_entries, suffix = self._split_document()
             normalized = content.replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -338,6 +396,8 @@ class ManagedContextFileStore:
             self._write_document(prefix=safe_prefix, entries=managed_entries, suffix=suffix)
 
     def render_context(self) -> str | None:
+        """Render base markdown and managed entries for prompt assembly."""
+
         with self._locked():
             base_text = self.load_base_text()
             entries = self.load_entries()
@@ -353,6 +413,13 @@ class ManagedContextFileStore:
             return rendered or None
 
     def ensure_remote_snapshot(self) -> bool:
+        """Seed the remote snapshot when remote-primary storage is enabled.
+
+        Returns:
+            ``True`` when a previously missing or invalid remote snapshot was
+            created, otherwise ``False``.
+        """
+
         with self._locked():
             if not self._remote_enabled():
                 return False
@@ -546,6 +613,13 @@ class ManagedContextFileStore:
 
 
 class PersistentMemoryMarkdownStore:
+    """Manage Twinr's durable explicit-memory markdown store.
+
+    This store persists only user-approved durable memories, keeps entries
+    bounded, and can switch between local markdown persistence and remote-
+    primary snapshots without changing the caller interface.
+    """
+
     def __init__(
         self,
         path: str | Path,
@@ -582,6 +656,8 @@ class PersistentMemoryMarkdownStore:
         *,
         remote_state: "LongTermRemoteStateStore | None" = None,
     ) -> "PersistentMemoryMarkdownStore":
+        """Build the durable memory store from Twinr config."""
+
         from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
         if remote_state is None:
@@ -594,6 +670,8 @@ class PersistentMemoryMarkdownStore:
         )
 
     def load_entries(self) -> tuple[PersistentMemoryEntry, ...]:
+        """Load durable memory entries from remote or local storage."""
+
         with self._locked():
             if self._remote_enabled():
                 # AUDIT-FIX(#2): Valid empty remote memory snapshots must stay empty instead of silently rehydrating local data.
@@ -608,6 +686,8 @@ class PersistentMemoryMarkdownStore:
             return self._load_local_entries()
 
     def ensure_remote_snapshot(self) -> bool:
+        """Seed the remote durable-memory snapshot when needed."""
+
         with self._locked():
             if not self._remote_enabled():
                 return False
@@ -656,6 +736,21 @@ class PersistentMemoryMarkdownStore:
         summary: str,
         details: str | None = None,
     ) -> PersistentMemoryEntry:
+        """Create or update one durable explicit-memory entry.
+
+        Args:
+            kind: Memory category label such as ``contact`` or ``appointment``.
+            summary: Short durable summary text.
+            details: Optional longer durable detail text.
+
+        Returns:
+            The stored ``PersistentMemoryEntry``.
+
+        Raises:
+            ValueError: If the summary is empty after normalization.
+            RuntimeError: If the entry cannot be persisted.
+        """
+
         clean_kind = _slugify(kind, fallback="memory")
         clean_summary = _normalize_text(summary, limit=220)
         clean_details = _normalize_text(details, limit=420) if details is not None else None
@@ -701,6 +796,16 @@ class PersistentMemoryMarkdownStore:
             return entry
 
     def render_context(self, *, limit: int = 12) -> str | None:
+        """Render durable memory entries into prompt-context text.
+
+        Args:
+            limit: Maximum number of durable entries to include.
+
+        Returns:
+            A short durable-memory summary block, or ``None`` when no durable
+            entries exist.
+        """
+
         with self._locked():
             entries = self.load_entries()
             if not entries:
@@ -867,12 +972,22 @@ class PersistentMemoryMarkdownStore:
 
 @dataclass(frozen=True, slots=True)
 class PromptContextStore:
+    """Group the stores that feed Twinr prompt-context assembly.
+
+    Attributes:
+        memory_store: Durable explicit-memory store.
+        user_store: Managed user-context store.
+        personality_store: Managed personality-context store.
+    """
+
     memory_store: PersistentMemoryMarkdownStore
     user_store: ManagedContextFileStore
     personality_store: ManagedContextFileStore
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "PromptContextStore":
+        """Build all prompt-context stores from one Twinr config."""
+
         from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
 
         # AUDIT-FIX(#1): Resolve the personality directory under project_root so .env paths cannot escape the project tree.
@@ -902,6 +1017,8 @@ class PromptContextStore:
         )
 
     def ensure_remote_snapshots(self) -> tuple[str, ...]:
+        """Seed any missing remote snapshots used by prompt-context stores."""
+
         ensured: list[str] = []
         if self.memory_store.ensure_remote_snapshot():
             ensured.append(self.memory_store.remote_snapshot_kind)

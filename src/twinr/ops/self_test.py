@@ -1,3 +1,10 @@
+"""Run bounded self-tests for Twinr peripherals and operator workflows.
+
+This module executes one-at-a-time diagnostics for microphone, speaker,
+printer, camera, buttons, and PIR hardware and stores short-lived artifacts
+when a test needs evidence.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -32,6 +39,8 @@ def _utc_now_iso() -> str:
 
 @dataclass(frozen=True, slots=True)
 class SelfTestResult:
+    """Represent the outcome of one bounded Twinr self-test."""
+
     test_name: str
     status: str
     summary: str
@@ -44,10 +53,14 @@ class SelfTestResult:
 
 
 class SelfTestBlockedError(RuntimeError):
+    """Raised when a self-test cannot run because the hardware path is busy."""
+
     pass
 
 
 class TwinrSelfTestRunner:
+    """Run Twinr hardware self-tests with bounded concurrency and artifacts."""
+
     # AUDIT-FIX(#1): Serialize self-tests across all runner instances in-process so parallel requests
     # do not contend for the same GPIO/audio/video devices or overwrite same-test artifacts.
     _RUN_LOCK = threading.Lock()
@@ -78,6 +91,8 @@ class TwinrSelfTestRunner:
 
     @staticmethod
     def available_tests() -> tuple[tuple[str, str, str], ...]:
+        """Return the supported self-test identifiers and operator labels."""
+
         return (
             ("mic", "Mic aufnehmen", "Record a short speech sample and store the WAV artifact."),
             (
@@ -97,6 +112,15 @@ class TwinrSelfTestRunner:
         )
 
     def run(self, test_name: str) -> SelfTestResult:
+        """Execute one supported self-test and return its normalized result.
+
+        Args:
+            test_name: Requested self-test identifier.
+
+        Returns:
+            A ``SelfTestResult`` with ``ok``, ``fail``, or ``blocked`` status.
+        """
+
         normalized = self._normalize_test_name(test_name)
         finished_at = _utc_now_iso()
         available_tests = {name for name, _, _ in self.available_tests()}

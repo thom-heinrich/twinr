@@ -1,0 +1,128 @@
+schema_version: 1
+name: hardware
+path: src/twinr/hardware
+kind: python-package
+visibility: internal
+summary: Provide bounded audio, GPIO, camera, printer, and voice-profile adapters for Twinr runtime paths.
+owned_concerns:
+  - Capture and play bounded audio for conversation, ambient sensing, and wakeword flows
+  - Monitor GPIO buttons and PIR motion across supported Pi backends
+  - Capture still photos via ffmpeg-backed V4L2 integration
+  - Format and submit bounded receipt print jobs
+  - Persist and assess local on-device voice profiles
+out_of_scope:
+  - Hardware-loop orchestration in src/twinr/agent/workflows
+  - Display rendering and e-paper control in src/twinr/display
+  - OS/bootstrap setup scripts under hardware/
+  - Provider STT/TTS/model logic above raw device I/O
+files:
+  - path: __init__.py
+    role: Narrow package export surface for camera, PIR, and voice profile helpers
+    exports:
+      - CapturedPhoto
+      - GpioPirMonitor
+      - PirBinding
+      - PirMotionEvent
+      - V4L2StillCamera
+      - VoiceAssessment
+      - VoiceProfileMonitor
+      - VoiceProfileStore
+      - VoiceProfileSummary
+      - VoiceProfileTemplate
+      - build_pir_binding
+      - configured_pir_monitor
+      - voice_profile_store_path
+  - path: audio.py
+    role: Bounded microphone capture, ambient sampling, and playback helpers
+    exports:
+      - AmbientAudioCaptureWindow
+      - AmbientAudioLevelSample
+      - SpeechCaptureResult
+      - SilenceDetectedRecorder
+      - AmbientAudioSampler
+      - WaveAudioPlayer
+      - pcm16_to_wav_bytes
+      - resolve_dynamic_pause_thresholds
+      - resolve_pause_resume_confirmation
+  - path: buttons.py
+    role: GPIO button monitoring across libgpiod and CLI fallbacks
+    exports:
+      - ButtonAction
+      - ButtonBinding
+      - ButtonEvent
+      - GpioButtonMonitor
+      - build_button_bindings
+      - build_probe_bindings
+      - configured_button_monitor
+      - edge_name
+      - edge_to_action
+  - path: camera.py
+    role: ffmpeg-backed still camera adapter with bounded persistence
+    exports:
+      - CameraError
+      - CameraConfigurationError
+      - CameraCaptureTimeoutError
+      - CameraCaptureFailedError
+      - CapturedPhoto
+      - V4L2StillCamera
+  - path: pir.py
+    role: PIR motion adapter layered on the button monitor backend
+    exports:
+      - PirMonitorError
+      - PirBinding
+      - PirMotionEvent
+      - GpioPirMonitor
+      - build_pir_binding
+      - configured_pir_monitor
+  - path: printer.py
+    role: Receipt formatting and CUPS submission adapter
+    exports:
+      - PrinterError
+      - RawReceiptPrinter
+  - path: voice_profile.py
+    role: Local voice profile store, enrollment, and assessment helpers
+    exports:
+      - VoiceAssessment
+      - VoiceProfileMonitor
+      - VoiceProfileStore
+      - VoiceProfileSummary
+      - VoiceProfileTemplate
+      - extract_voice_embedding_from_pcm16
+      - extract_voice_embedding_from_wav_bytes
+      - voice_profile_store_path
+public_api:
+  module: twinr.hardware
+  exports:
+    - CapturedPhoto
+    - GpioPirMonitor
+    - PirBinding
+    - PirMotionEvent
+    - V4L2StillCamera
+    - VoiceAssessment
+    - VoiceProfileMonitor
+    - VoiceProfileStore
+    - VoiceProfileSummary
+    - VoiceProfileTemplate
+    - build_pir_binding
+    - configured_pir_monitor
+    - voice_profile_store_path
+primary_callers:
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+  - path: src/twinr/proactive/runtime/service.py
+  - path: src/twinr/proactive/social/observers.py
+  - path: src/twinr/proactive/wakeword/spotter.py
+  - path: src/twinr/web/app.py
+  - path: src/twinr/web/viewmodels_voice.py
+  - path: src/twinr/ops/self_test.py
+tests:
+  - path: test/test_audio.py
+  - path: test/test_button_helpers.py
+  - path: test/test_camera.py
+  - path: test/test_pir.py
+  - path: test/test_printer.py
+  - path: test/test_voice_profile.py
+  - path: test/test_runner.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_streaming_runner.py

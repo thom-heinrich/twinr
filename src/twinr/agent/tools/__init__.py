@@ -1,3 +1,12 @@
+"""Expose the public Twinr tool package surface.
+
+This package is the stable import layer for tool-lane prompting helpers,
+tool-schema builders, and runtime tool orchestration used by workflows,
+orchestrators, and provider adapters. Concrete handler implementations remain
+internal to ``twinr.agent.tools.handlers`` and are intentionally not
+re-exported here.
+"""
+
 from twinr.agent.tools.prompting.instructions import (
     COMPACT_TOOL_AGENT_INSTRUCTIONS,
     DEFAULT_TOOL_AGENT_INSTRUCTIONS,

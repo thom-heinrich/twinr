@@ -136,7 +136,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertTrue(manager.entered)
         self.assertTrue(manager.exited)
         self.assertEqual(connection.session.calls[0]["type"], "realtime")
-        self.assertEqual(connection.session.calls[0]["output_modalities"], ["audio"])
+        self.assertEqual(connection.session.calls[0]["output_modalities"], ["audio", "text"])
         self.assertEqual(connection.session.calls[0]["audio"]["output"]["voice"], "sage")
         self.assertEqual(connection.session.calls[0]["audio"]["input"]["format"]["type"], "audio/pcm")
         self.assertEqual(connection.session.calls[0]["audio"]["input"]["format"]["rate"], 24000)

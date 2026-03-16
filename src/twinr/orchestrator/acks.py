@@ -1,3 +1,9 @@
+"""Define canonical ack phrase IDs for the orchestrator protocol.
+
+This module keeps the short spoken acknowledgements used by the supervisor and
+the websocket transport in one stable mapping.
+"""
+
 from __future__ import annotations
 
 from twinr.agent.tools import SUPERVISOR_FAST_ACK_PHRASES
@@ -14,8 +20,12 @@ ACK_TEXT_TO_ID: dict[str, str] = {text: ack_id for ack_id, text in _ACK_PAIRS}
 
 
 def ack_id_for_text(text: str) -> str | None:
+    """Look up the stable ack identifier for a spoken phrase."""
+
     return ACK_TEXT_TO_ID.get(text.strip())
 
 
 def ack_text_for_id(ack_id: str) -> str | None:
+    """Look up the spoken phrase for a stable ack identifier."""
+
     return ACK_ID_TO_TEXT.get(ack_id.strip())

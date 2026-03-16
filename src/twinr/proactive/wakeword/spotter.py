@@ -1,3 +1,10 @@
+"""Run openWakeWord clip and stream spotting for Twinr wakeword detection.
+
+This module wraps openWakeWord model initialization, clip-level and frame-level
+inference, optional STT confirmation, and resilient audio preprocessing so the
+proactive runtime can fail closed instead of crashing on model or audio errors.
+"""
+
 from __future__ import annotations
 
 from collections import defaultdict, deque
@@ -18,11 +25,20 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class OpenWakeWordPrediction:
+    """Describe one openWakeWord label and score pair."""
+
     label: str | None
     score: float
 
 
 class WakewordOpenWakeWordFrameSpotter:
+    """Detect wakeword hits from exact openWakeWord-sized PCM frames.
+
+    This stateful spotter smooths frame scores across a live stream, latches
+    active labels until deactivation, and returns ``WakewordMatch`` objects
+    without transcribing the audio.
+    """
+
     _FRAME_SAMPLES = 1280
 
     def __init__(
@@ -80,11 +96,15 @@ class WakewordOpenWakeWordFrameSpotter:
 
     @property
     def frame_bytes(self) -> int:
+        """Return the frame size in bytes for the active channel mode."""
+
         # AUDIT-FIX(#2): Rueckgabe orientiert sich am zuletzt gesehenen Kanalmodus statt immer Mono anzunehmen.
         return self._frame_bytes_for_channels(self._buffer_channels or 1)
 
     # AUDIT-FIX(#2): Oeffentliche Hilfe fuer call sites, die die korrekte Frame-Groesse pro Kanal brauchen.
     def frame_bytes_for_channels(self, channels: int) -> int:
+        """Return the frame size in bytes for a specific channel count."""
+
         validated_channels = _validate_positive_int(channels)
         if validated_channels is None:
             raise ValueError(f"channels must be a positive integer, got {channels!r}")
@@ -94,6 +114,8 @@ class WakewordOpenWakeWordFrameSpotter:
         return self._FRAME_SAMPLES * 2 * channels
 
     def reset(self) -> None:
+        """Clear buffered state and reset the underlying model if supported."""
+
         with self._lock:
             self._frame_buffer.clear()
             self._consecutive_frames.clear()
@@ -111,6 +133,8 @@ class WakewordOpenWakeWordFrameSpotter:
                 LOGGER.exception("openWakeWord frame model reset failed.")
 
     def process_pcm_bytes(self, pcm_bytes: bytes, *, channels: int = 1) -> WakewordMatch | None:
+        """Feed arbitrary PCM bytes and emit the latest detected wakeword match."""
+
         if not pcm_bytes:
             return None
         validated_channels = _validate_positive_int(channels)
@@ -140,6 +164,8 @@ class WakewordOpenWakeWordFrameSpotter:
             return detected_match
 
     def process_pcm_frame(self, pcm_frame: bytes, *, channels: int = 1) -> WakewordMatch | None:
+        """Run wakeword inference on one exact PCM frame."""
+
         if not pcm_frame:
             return None
         validated_channels = _validate_positive_int(channels)
@@ -219,6 +245,13 @@ class WakewordOpenWakeWordFrameSpotter:
 
 
 class WakewordOpenWakeWordSpotter:
+    """Detect wakewords from buffered captures with optional confirmation.
+
+    This spotter resamples audio to 16 kHz for openWakeWord inference and can
+    optionally transcribe successful detector hits to confirm that one of the
+    configured wakeword phrases was actually spoken.
+    """
+
     _TARGET_SAMPLE_RATE = 16000
     _CLIP_PADDING_S = 1
     _CHUNK_SIZE_SAMPLES = 1280
@@ -288,6 +321,8 @@ class WakewordOpenWakeWordSpotter:
         self._lock = RLock()
 
     def detect(self, capture: AmbientAudioCaptureWindow) -> WakewordMatch:
+        """Detect a wakeword in one captured audio window."""
+
         pcm_bytes = capture.pcm_bytes or b""
         if not pcm_bytes:
             return WakewordMatch(detected=False, transcript="", backend="openwakeword")
@@ -441,6 +476,8 @@ class WakewordOpenWakeWordSpotter:
 
 
 def _default_model_factory(**kwargs):
+    """Build one openWakeWord model, downloading named models when needed."""
+
     import os
 
     import openwakeword.utils

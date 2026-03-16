@@ -1,0 +1,83 @@
+schema_version: 1
+name: tools
+path: src/twinr/agent/tools
+kind: python-package
+visibility: internal
+summary: Expose the stable Twinr tool package surface for prompt builders, schema builders, and runtime tool orchestration.
+owned_concerns:
+  - Re-export the stable tool-package entrypoints consumed by workflows, orchestrators, providers, and targeted tests
+  - Keep prompting, schema, and runtime packages reachable through one package-level import surface
+  - Preserve the package boundary that keeps concrete tool handlers internal to the runtime execution path
+out_of_scope:
+  - Concrete tool business logic or guard helpers inside src/twinr/agent/tools/handlers
+  - Tool-lane instruction authoring details inside src/twinr/agent/tools/prompting
+  - Tool schema construction details inside src/twinr/agent/tools/schemas
+  - Runtime loop implementation details inside src/twinr/agent/tools/runtime
+files:
+  - path: __init__.py
+    role: Package export surface for public tool imports
+    exports:
+      - COMPACT_TOOL_AGENT_INSTRUCTIONS
+      - DEFAULT_TOOL_AGENT_INSTRUCTIONS
+      - FIRST_WORD_AGENT_INSTRUCTIONS
+      - SUPERVISOR_FAST_ACK_PHRASES
+      - RealtimeToolExecutor
+      - StreamingToolLoopResult
+      - ToolCallingStreamingLoop
+      - build_agent_tool_schemas
+      - build_first_word_instructions
+      - build_compact_agent_tool_schemas
+      - build_compact_tool_agent_instructions
+      - build_specialist_tool_agent_instructions
+      - build_supervisor_decision_instructions
+      - build_supervisor_tool_agent_instructions
+      - build_tool_agent_instructions
+      - DualLaneToolLoop
+      - SpeechLaneDelta
+      - bind_realtime_tool_handlers
+      - build_realtime_tool_schemas
+      - realtime_tool_names
+      - tool_agent_time_context
+public_api:
+  module: twinr.agent.tools
+  exports:
+    - COMPACT_TOOL_AGENT_INSTRUCTIONS
+    - DEFAULT_TOOL_AGENT_INSTRUCTIONS
+    - FIRST_WORD_AGENT_INSTRUCTIONS
+    - SUPERVISOR_FAST_ACK_PHRASES
+    - RealtimeToolExecutor
+    - StreamingToolLoopResult
+    - ToolCallingStreamingLoop
+    - build_agent_tool_schemas
+    - build_first_word_instructions
+    - build_compact_agent_tool_schemas
+    - build_compact_tool_agent_instructions
+    - build_specialist_tool_agent_instructions
+    - build_supervisor_decision_instructions
+    - build_supervisor_tool_agent_instructions
+    - build_tool_agent_instructions
+    - DualLaneToolLoop
+    - SpeechLaneDelta
+    - bind_realtime_tool_handlers
+    - build_realtime_tool_schemas
+    - realtime_tool_names
+    - tool_agent_time_context
+primary_callers:
+  - path: src/twinr/__main__.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+  - path: src/twinr/orchestrator/acks.py
+  - path: src/twinr/orchestrator/session.py
+  - path: src/twinr/providers/openai/realtime.py
+  - path: test/run_pi_tool_matrix.py
+  - path: test/test_speech_output.py
+tests:
+  - path: test/test_tool_instructions.py
+  - path: test/test_streaming_tool_loop.py
+  - path: test/test_dual_lane_loop.py
+  - path: test/test_runner.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_streaming_runner.py
+  - path: test/test_openai_realtime.py
+  - path: test/test_speech_output.py

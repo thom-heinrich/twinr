@@ -1,0 +1,63 @@
+schema_version: 1
+name: runtime
+path: src/twinr/proactive/runtime
+kind: python-package
+visibility: internal
+summary: Coordinate proactive monitor ticks, wakeword presence sessions, and bounded monitor lifecycle for Twinr runtime workflows.
+owned_concerns:
+  - Maintain wakeword presence-session state from camera, PIR, and speech activity
+  - Coordinate proactive monitor ticks across vision, PIR, ambient audio, and wakeword policy paths
+  - Export normalized observation facts and ops telemetry from runtime monitoring
+  - Open and close monitor resources and the bounded worker thread safely
+out_of_scope:
+  - Social trigger scoring thresholds, evidence rules, or prompt content
+  - Wakeword calibration, matching, and evaluation algorithms
+  - Raw hardware adapter implementations outside the runtime-facing orchestration
+  - Delivery-governance cooldown policy in src/twinr/proactive/governance
+files:
+  - path: __init__.py
+    role: Package export surface for proactive runtime helpers
+    exports:
+      - PresenceSessionController
+      - PresenceSessionSnapshot
+      - ProactiveCoordinator
+      - ProactiveMonitorService
+      - build_default_proactive_monitor
+  - path: presence.py
+    role: Wakeword presence-session controller and snapshot model
+    exports:
+      - PresenceSessionController
+      - PresenceSessionSnapshot
+  - path: service.py
+    role: Proactive monitor orchestration, lifecycle, and assembly
+    exports:
+      - ProactiveCoordinator
+      - ProactiveMonitorService
+      - ProactiveTickResult
+      - build_default_proactive_monitor
+public_api:
+  module: twinr.proactive.runtime
+  exports:
+    - PresenceSessionController
+    - PresenceSessionSnapshot
+    - ProactiveCoordinator
+    - ProactiveMonitorService
+    - build_default_proactive_monitor
+compatibility_reexports:
+  - path: src/twinr/proactive/__init__.py
+    names:
+      - PresenceSessionController
+      - PresenceSessionSnapshot
+      - ProactiveCoordinator
+      - ProactiveMonitorService
+      - build_default_proactive_monitor
+primary_callers:
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/proactive/wakeword/stream.py
+  - path: src/twinr/proactive/__init__.py
+tests:
+  - path: test/test_proactive_monitor.py
+  - path: test/test_runner.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_config.py

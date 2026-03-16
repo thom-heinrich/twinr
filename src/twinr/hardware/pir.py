@@ -1,3 +1,10 @@
+"""Adapt PIR motion sensing onto Twinr's button-monitor GPIO backend.
+
+This module keeps PIR handling thin by reusing ``twinr.hardware.buttons`` for
+GPIO access, edge normalization, and backend selection while exposing PIR-
+specific motion semantics to callers.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -44,12 +51,16 @@ def _validate_non_negative_timeout(name: str, value: float | None) -> float | No
 
 @dataclass(frozen=True, slots=True)
 class PirBinding:
+    """Bind the logical PIR sensor name to one GPIO line offset."""
+
     name: str
     line_offset: int
 
 
 @dataclass(frozen=True, slots=True)
 class PirMotionEvent:
+    """Represent one normalized PIR motion event."""
+
     name: str
     line_offset: int
     motion_detected: bool
@@ -58,6 +69,8 @@ class PirMotionEvent:
 
 
 def build_pir_binding(config: TwinrConfig) -> PirBinding:
+    """Build the configured PIR binding from ``TwinrConfig``."""
+
     if config.pir_motion_gpio is None:
         raise ValueError("Set TWINR_PIR_MOTION_GPIO before watching PIR motion")
     line_offset = _validate_non_negative_int(  # AUDIT-FIX(#1): Fail early on invalid GPIO line offsets.
@@ -68,6 +81,8 @@ def build_pir_binding(config: TwinrConfig) -> PirBinding:
 
 
 class GpioPirMonitor:
+    """Monitor PIR motion through the shared GPIO button backend."""
+
     def __init__(
         self,
         chip_name: str,
@@ -136,6 +151,8 @@ class GpioPirMonitor:
         )
 
     def open(self) -> "GpioPirMonitor":
+        """Open the PIR monitor and prime its GPIO backend."""
+
         if self._is_open:
             return self
         if not self._manage_monitor_lifecycle:
@@ -149,6 +166,8 @@ class GpioPirMonitor:
         return self
 
     def close(self) -> None:
+        """Close the PIR monitor and release owned GPIO resources."""
+
         if not self._is_open:
             return
         try:
@@ -173,6 +192,8 @@ class GpioPirMonitor:
                 exc.add_note(f"Failed to close PIR monitor cleanly: {close_exc!r}")
 
     def poll(self, timeout: float | None = None) -> PirMotionEvent | None:
+        """Return the next PIR event or ``None`` after the timeout."""
+
         self._ensure_open()  # AUDIT-FIX(#4): Enforce a clear lifecycle contract for read calls.
         timeout = _validate_non_negative_timeout("timeout", timeout)  # AUDIT-FIX(#1): Reject invalid poll timeouts early.
         try:
@@ -189,6 +210,8 @@ class GpioPirMonitor:
         duration_s: float | None = None,
         poll_timeout: float = 0.5,
     ) -> Iterator[PirMotionEvent]:
+        """Yield PIR motion events until the optional duration expires."""
+
         self._ensure_open()  # AUDIT-FIX(#4): Enforce a clear lifecycle contract for streaming reads.
         duration_s = _validate_non_negative_timeout("duration_s", duration_s)  # AUDIT-FIX(#1): Reject invalid durations early.
         poll_timeout = _validate_non_negative_timeout("poll_timeout", poll_timeout)  # AUDIT-FIX(#1): Reject invalid poll timeouts early.
@@ -199,6 +222,8 @@ class GpioPirMonitor:
             raise PirMonitorError(f"Failed while iterating PIR events on {self.chip_name!r}") from exc
 
     def snapshot_value(self) -> int:
+        """Return the current raw PIR GPIO level as ``0`` or ``1``."""
+
         self._ensure_open()  # AUDIT-FIX(#4): Enforce a clear lifecycle contract for snapshot reads.
         try:
             values = self._monitor.snapshot_values()
@@ -218,6 +243,8 @@ class GpioPirMonitor:
         )
 
     def motion_detected(self) -> bool:
+        """Return whether the current PIR level indicates active motion."""
+
         value = self.snapshot_value()
         return bool(value) if self.active_high else not bool(value)
 
@@ -227,6 +254,8 @@ class GpioPirMonitor:
         duration_s: float = 12.0,
         poll_timeout: float = 0.25,
     ) -> PirMotionEvent | None:
+        """Wait for the next motion event, including already-active motion."""
+
         duration_s = _validate_non_negative_timeout("duration_s", duration_s)  # AUDIT-FIX(#1): Reject invalid wait durations early.
         poll_timeout = _validate_non_negative_timeout("poll_timeout", poll_timeout)  # AUDIT-FIX(#1): Reject invalid wait poll timeouts early.
         if self.motion_detected():
@@ -249,6 +278,8 @@ def configured_pir_monitor(
     monitor: GpioButtonMonitor | None = None,
     close_injected_monitor: bool = False,
 ) -> GpioPirMonitor:
+    """Build a PIR monitor from ``TwinrConfig`` and an optional injected monitor."""
+
     binding = build_pir_binding(config)
     return GpioPirMonitor(
         chip_name=config.gpio_chip,

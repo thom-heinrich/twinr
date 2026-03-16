@@ -1,3 +1,10 @@
+"""Drive the Twinr status display loop from runtime snapshots.
+
+This module polls the runtime snapshot store, samples bounded health and
+connectivity signals, and translates them into short status frames for the
+e-paper adapter. Hardware-specific rendering lives in ``waveshare_v2.py``.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -32,15 +39,18 @@ _ERROR_LOG_THROTTLE_S = 30.0
 
 
 def _default_emit(line: str) -> None:
+    """Print a bounded telemetry line."""
     print(line, flush=True)
 
 
 def _default_clock() -> datetime:
+    """Return the current local wall clock as an aware datetime."""
     # AUDIT-FIX(#7): Use an aware local datetime to avoid ambiguous naive-time semantics around DST and injected clocks.
     return datetime.now().astimezone()
 
 
 def _default_internet_probe() -> bool:
+    """Probe internet reachability with bounded numeric endpoints."""
     # AUDIT-FIX(#4): Use numeric endpoints only so the probe remains bounded even when DNS resolution is unhealthy.
     endpoints = (
         ("1.1.1.1", 443),
@@ -58,6 +68,25 @@ def _default_internet_probe() -> bool:
 
 @dataclass(slots=True)
 class TwinrStatusDisplayLoop:
+    """Drive the status panel from runtime snapshots and health signals.
+
+    The loop keeps the rendered state bounded and resilient: snapshot, health,
+    or display faults degrade to last-known-good or unknown labels instead of
+    terminating the loop.
+
+    Attributes:
+        config: Runtime configuration including display timings and API-key
+            state.
+        display: Display adapter that renders and uploads status images.
+        snapshot_store: File-backed runtime snapshot source.
+        emit: Best-effort telemetry sink for bounded status/error lines.
+        sleep: Sleep primitive used between polling cycles.
+        health_collector: Callable that samples system health for footer
+            labels.
+        clock: Callable that returns the current local time.
+        internet_probe: Callable that samples outbound connectivity.
+    """
+
     config: TwinrConfig
     display: WaveshareEPD4In2V2
     snapshot_store: RuntimeSnapshotStore
@@ -86,6 +115,16 @@ class TwinrStatusDisplayLoop:
         emit: Callable[[str], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> "TwinrStatusDisplayLoop":
+        """Build a display loop from Twinr configuration.
+
+        Args:
+            config: Runtime configuration with display and snapshot settings.
+            emit: Optional telemetry sink for bounded status/error lines.
+            sleep: Sleep primitive used between polling cycles.
+
+        Returns:
+            A configured ``TwinrStatusDisplayLoop`` instance.
+        """
         return cls(
             config=config,
             display=WaveshareEPD4In2V2.from_config(config),
@@ -95,6 +134,15 @@ class TwinrStatusDisplayLoop:
         )
 
     def run(self, *, duration_s: float | None = None, max_cycles: int | None = None) -> int:
+        """Run the display loop until a duration or cycle limit is reached.
+
+        Args:
+            duration_s: Optional maximum runtime in seconds.
+            max_cycles: Optional maximum number of polling cycles.
+
+        Returns:
+            ``0`` when the loop exits cleanly.
+        """
         started_at = time.monotonic()
         # AUDIT-FIX(#8): Track the full display signature with the correct tuple shape so static checks match runtime behavior.
         last_signature: tuple[str, str, tuple[str, ...], int] | None = None

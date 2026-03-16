@@ -1,3 +1,9 @@
+"""Route social-trigger prompts and render bounded evidence facts.
+
+This module keeps safety-routing decisions and LLM-facing evidence summaries
+small, deterministic, and resilient to malformed trigger payloads.
+"""
+
 from __future__ import annotations
 
 # AUDIT-FIX(#1): Add lightweight diagnostics for conservative fallbacks.
@@ -39,6 +45,8 @@ _MAX_FACT_DETAIL_CHARS: Final[int] = 160
 
 # AUDIT-FIX(#1): Read fields defensively from objects or mappings and never let malformed models raise here.
 def _get_field(source: object, field_name: str) -> Any:
+    """Read one named field from an object or mapping."""
+
     if isinstance(source, Mapping):
         return source.get(field_name)
     try:
@@ -49,6 +57,8 @@ def _get_field(source: object, field_name: str) -> Any:
 
 # AUDIT-FIX(#3): Invalid trigger IDs normalize to an empty sentinel instead of crashing .strip().lower().
 def _normalize_trigger_id(trigger_id: object) -> str:
+    """Normalize one trigger identifier to a lowercase key."""
+
     if not isinstance(trigger_id, str):
         return ""
     return trigger_id.strip().lower()
@@ -56,6 +66,8 @@ def _normalize_trigger_id(trigger_id: object) -> str:
 
 # AUDIT-FIX(#2): Invalid, missing, or non-finite numeric evidence must not break prompt construction.
 def _format_number(value: object) -> str:
+    """Format one numeric evidence value for prompt text."""
+
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -69,6 +81,8 @@ def _format_number(value: object) -> str:
 # AUDIT-FIX(#2): Handle malformed or missing text fields without raising.
 # AUDIT-FIX(#4): Collapse whitespace, drop control characters, and cap lengths for prompt safety.
 def _sanitize_fact_text(value: object, *, placeholder: str, max_length: int) -> str:
+    """Collapse and bound one evidence text fragment."""
+
     try:
         raw_text = value if isinstance(value, str) else "" if value is None else str(value)
     except Exception:
@@ -87,6 +101,8 @@ def _sanitize_fact_text(value: object, *, placeholder: str, max_length: int) -> 
 
 # AUDIT-FIX(#5): Reject surprising negative/non-int limits that would otherwise slice incorrectly or raise.
 def _validated_max_items(max_items: int) -> int:
+    """Validate the public evidence-item limit."""
+
     if isinstance(max_items, bool) or not isinstance(max_items, int):
         logger.warning(
             "proactive_observation_facts received invalid max_items; using default %d",
@@ -101,6 +117,8 @@ def _validated_max_items(max_items: int) -> int:
 
 # AUDIT-FIX(#2): Support lists, tuples, generators, and mapping-style singleton evidence without slicing.
 def _iter_evidence_items(trigger: object, *, limit: int) -> Iterable[object]:
+    """Yield up to ``limit`` evidence items from one trigger."""
+
     evidence = _get_field(trigger, "evidence")
     if evidence is None:
         return ()
@@ -118,11 +136,15 @@ def _iter_evidence_items(trigger: object, *, limit: int) -> Iterable[object]:
 
 
 def is_safety_trigger(trigger_id: str) -> bool:
+    """Return whether one trigger id uses the direct safety path."""
+
     # AUDIT-FIX(#3): Normalize untrusted trigger IDs safely.
     return _normalize_trigger_id(trigger_id) in _SAFETY_TRIGGER_IDS
 
 
 def proactive_prompt_mode(trigger: SocialTriggerDecision) -> str:
+    """Return the prompt-generation mode for one trigger."""
+
     # AUDIT-FIX(#1): Avoid AttributeError on malformed triggers and fail safe for seniors.
     normalized_trigger_id = _normalize_trigger_id(_get_field(trigger, "trigger_id"))
     if not normalized_trigger_id:
@@ -140,6 +162,8 @@ def proactive_observation_facts(
     *,
     max_items: int = _DEFAULT_MAX_ITEMS,
 ) -> tuple[str, ...]:
+    """Render bounded evidence facts for one trigger."""
+
     # AUDIT-FIX(#5): Clamp and validate limits before iteration.
     limit = _validated_max_items(max_items)
     if limit == 0:

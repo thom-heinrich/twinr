@@ -1,3 +1,10 @@
+"""Expose the base-agent package surface and compatibility re-exports.
+
+Import commonly used config, runtime, state, prompting, and conversation
+helpers from this package root. The module stays lazy so importing
+``twinr.agent.base_agent`` does not eagerly pull runtime-heavy dependencies.
+"""
+
 from __future__ import annotations
 
 from importlib import import_module
@@ -88,6 +95,8 @@ _EXPORTS = {
 
 
 def __getattr__(name: str) -> object:
+    """Resolve exported symbols lazily from their owning modules."""
+
     module_name = _EXPORTS.get(name)
     if module_name is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -96,4 +105,6 @@ def __getattr__(name: str) -> object:
 
 
 def __dir__() -> list[str]:
+    """Return the combined static and lazy export names for introspection."""
+
     return sorted(set(globals()) | set(__all__))

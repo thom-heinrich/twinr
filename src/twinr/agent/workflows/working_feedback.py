@@ -1,3 +1,5 @@
+"""Play bounded audio cues while Twinr is processing, answering, or printing."""
+
 from __future__ import annotations
 
 import math
@@ -13,6 +15,8 @@ WorkingFeedbackKind = Literal["processing", "answering", "printing"]
 
 @dataclass(frozen=True, slots=True)
 class WorkingFeedbackProfile:
+    """Describe the tone timing and patterns for one feedback kind."""
+
     delay_ms: int
     pause_ms: int
     volume: float
@@ -65,6 +69,8 @@ _VALID_WORKING_FEEDBACK_KINDS = tuple(_DEFAULT_WORKING_FEEDBACK_PROFILES)
 
 @dataclass(slots=True)
 class _PlayerRuntimeState:
+    """Track per-player locks and the currently active feedback generation."""
+
     playback_lock: Lock
     lifecycle_lock: Lock
     active_stop_event: Event | None = None
@@ -79,6 +85,7 @@ _PLAYER_STATES_FALLBACK: dict[int, _PlayerRuntimeState] = {}
 
 # AUDIT-FIX(#5): Keep background-thread telemetry best-effort and sanitized.
 def _safe_emit(emit: Callable[[str], None] | None, message: str) -> None:
+    """Emit a telemetry line best-effort from a worker thread."""
     if emit is None:
         return
     try:
@@ -89,6 +96,7 @@ def _safe_emit(emit: Callable[[str], None] | None, message: str) -> None:
 
 # AUDIT-FIX(#4): Reject invalid/bool coercions up front instead of failing later in the worker thread.
 def _coerce_non_negative_int(value: object, *, field_name: str) -> int:
+    """Coerce a runtime value to a non-negative integer."""
     if isinstance(value, bool):
         raise TypeError(f"{field_name} must not be bool")
     if isinstance(value, float):
@@ -102,6 +110,7 @@ def _coerce_non_negative_int(value: object, *, field_name: str) -> int:
 
 # AUDIT-FIX(#4): Audio parameters must stay within a safe range for speaker output.
 def _coerce_positive_int(value: object, *, field_name: str) -> int:
+    """Coerce a runtime value to a strictly positive integer."""
     coerced = _coerce_non_negative_int(value, field_name=field_name)
     if coerced <= 0:
         raise ValueError(f"{field_name} must be > 0")
@@ -110,6 +119,7 @@ def _coerce_positive_int(value: object, *, field_name: str) -> int:
 
 # AUDIT-FIX(#4): Clamp/sanitize volume before playback so invalid config cannot produce unsafe output.
 def _coerce_volume(value: object, *, field_name: str) -> float:
+    """Coerce a runtime value to a bounded playback volume."""
     if isinstance(value, bool):
         raise TypeError(f"{field_name} must not be bool")
     coerced = float(value)
@@ -126,6 +136,7 @@ def _normalize_patterns(
     *,
     field_name: str,
 ) -> tuple[tuple[tuple[int, int], ...], ...]:
+    """Validate and normalize tone-pattern tuples for playback."""
     normalized_patterns: list[tuple[tuple[int, int], ...]] = []
     for pattern_index, sequence in enumerate(patterns):
         normalized_sequence: list[tuple[int, int]] = []
@@ -158,6 +169,7 @@ def _normalize_patterns(
 
 # AUDIT-FIX(#4): Normalize runtime-provided profiles before starting the thread.
 def _normalize_profile(profile: WorkingFeedbackProfile) -> WorkingFeedbackProfile:
+    """Validate a working-feedback profile before worker startup."""
     return WorkingFeedbackProfile(
         delay_ms=_coerce_non_negative_int(profile.delay_ms, field_name="delay_ms"),
         pause_ms=_coerce_non_negative_int(profile.pause_ms, field_name="pause_ms"),
@@ -174,6 +186,7 @@ def _resolve_profile(
     delay_override_ms: int | None,
     emit: Callable[[str], None] | None,
 ) -> WorkingFeedbackProfile:
+    """Resolve the effective feedback profile with safe fallbacks."""
     default_profile = _normalize_profile(_DEFAULT_WORKING_FEEDBACK_PROFILES[kind])
     candidate_profile = default_profile
 
@@ -212,6 +225,7 @@ def _resolve_profile(
 
 # AUDIT-FIX(#1): Shared player instances need per-player state; WeakKeyDictionary avoids leaking normal objects.
 def _get_player_runtime_state(player) -> _PlayerRuntimeState:
+    """Return or create the shared runtime state for a player instance."""
     with _PLAYER_STATES_LOCK:
         try:
             state = _PLAYER_STATES.get(player)
@@ -238,6 +252,7 @@ def _activate_player_loop(
     state: _PlayerRuntimeState,
     stop_event: Event,
 ) -> tuple[int, Event | None]:
+    """Register a new active loop and return the superseded stop event."""
     with state.lifecycle_lock:
         previous_stop_event = state.active_stop_event
         state.active_stop_event = stop_event
@@ -252,6 +267,7 @@ def _is_active_player_loop(
     generation: int,
     stop_event: Event,
 ) -> bool:
+    """Report whether a worker generation still owns the player."""
     with state.lifecycle_lock:
         return state.generation == generation and state.active_stop_event is stop_event
 
@@ -262,6 +278,7 @@ def _release_player_loop(
     generation: int,
     stop_event: Event,
 ) -> None:
+    """Clear the active loop marker if this worker still owns it."""
     with state.lifecycle_lock:
         if state.generation == generation and state.active_stop_event is stop_event:
             state.active_stop_event = None
@@ -269,6 +286,7 @@ def _release_player_loop(
 
 # AUDIT-FIX(#2): Best-effort backend stop hooks reduce the chance of lingering tones after cancellation.
 def _stop_player_playback(player) -> None:
+    """Stop tone playback best-effort on the configured player."""
     for method_name in ("stop_tone_sequence", "stop_tone", "stop_playback"):
         method = getattr(player, method_name, None)
         if callable(method):
@@ -280,6 +298,7 @@ def _stop_player_playback(player) -> None:
 
 # AUDIT-FIX(#4): Fail closed if the player cannot actually render tones.
 def _player_supports_playback(player) -> bool:
+    """Report whether the player exposes a supported tone playback API."""
     return callable(getattr(player, "play_tone_sequence", None)) or callable(
         getattr(player, "play_tone", None)
     )
@@ -294,6 +313,7 @@ def _play_sequence(
     gap_ms: int,
     stop_event: Event,
 ) -> None:
+    """Play one normalized tone sequence through the configured player."""
     play_tone_sequence = getattr(player, "play_tone_sequence", None)
     if callable(play_tone_sequence):
         play_tone_sequence(
@@ -334,6 +354,19 @@ def start_working_feedback_loop(
     profiles: Mapping[WorkingFeedbackKind, WorkingFeedbackProfile] | None = None,
     delay_override_ms: int | None = None,
 ) -> Callable[[], None]:
+    """Start a bounded feedback loop and return its stop callback.
+
+    Args:
+        player: Audio player exposing ``play_tone_sequence()`` or ``play_tone()``.
+        kind: Feedback profile family to use.
+        sample_rate: Playback sample rate in hertz.
+        emit: Optional telemetry sink for fallback and timeout notices.
+        profiles: Optional profile overrides keyed by feedback kind.
+        delay_override_ms: Optional replacement startup delay in milliseconds.
+
+    Returns:
+        A no-argument callback that stops the active feedback worker.
+    """
     # AUDIT-FIX(#4): Runtime values can still be invalid even if typing says otherwise.
     if kind not in _VALID_WORKING_FEEDBACK_KINDS:
         _safe_emit(emit, "working_feedback_disabled=invalid_kind")

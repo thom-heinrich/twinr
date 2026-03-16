@@ -1,3 +1,11 @@
+"""Run bounded background writers for long-term runtime persistence.
+
+These workers queue conversation turns and multimodal evidence behind a single
+consumer thread, expose exact drain state, and fail closed once shutdown
+starts. They are used by the runtime service to keep persistence off the hot
+path without allowing unbounded queue growth.
+"""
+
 from __future__ import annotations
 
 from typing import Callable, Generic, TypeVar
@@ -15,6 +23,8 @@ TLongTermItem = TypeVar("TLongTermItem")
 
 
 class _AsyncLongTermWriter(Generic[TLongTermItem]):
+    """Persist one long-term item type through a bounded background thread."""
+
     def __init__(
         self,
         *,
@@ -23,6 +33,19 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
         poll_interval_s: float = 0.1,
         worker_name: str = "twinr-longterm-memory",
     ) -> None:
+        """Start a bounded writer thread for one long-term item type.
+
+        Args:
+            write_callback: Callback that persists one queued item.
+            max_queue_size: Maximum number of accepted pending items.
+            poll_interval_s: Worker poll interval while waiting for new items.
+            worker_name: Thread name used in logs and diagnostics.
+
+        Raises:
+            TypeError: If the callback or timing arguments are invalid.
+            ValueError: If queue or timeout settings are non-finite or <= 0.
+        """
+
         # AUDIT-FIX(#3): Validate config eagerly so bad values cannot create an unbounded
         # queue or non-finite timing behavior on a memory-constrained RPi.
         if not callable(write_callback):
@@ -63,6 +86,8 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
 
     @staticmethod
     def _normalize_timeout(timeout_s: float) -> float:
+        """Normalize a caller timeout into finite non-negative seconds."""
+
         # AUDIT-FIX(#3): Reject NaN/inf timeouts instead of letting them corrupt flush/shutdown behavior.
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
             raise TypeError("timeout_s must be a real number")
@@ -73,20 +98,36 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
 
     @property
     def dropped_count(self) -> int:
+        """Return how many accepted or attempted writes were ultimately dropped."""
+
         with self._drain_lock:
             return self._dropped_count
 
     def pending_count(self) -> int:
+        """Return the exact number of queued or in-flight items."""
+
         with self._drain_lock:
             # AUDIT-FIX(#4): Return an exact pending count instead of Queue.qsize().
             return self._pending
 
     @property
     def last_error_message(self) -> str | None:
+        """Return the most recent terminal or callback error, if any."""
+
         with self._drain_lock:
             return self._last_error_message
 
     def enqueue(self, item: TLongTermItem) -> LongTermEnqueueResult:
+        """Try to enqueue one item without blocking the caller thread.
+
+        Args:
+            item: Item to persist asynchronously.
+
+        Returns:
+            Queue admission metadata including acceptance, pending, and drop
+            counts after the enqueue attempt.
+        """
+
         accepted = False
         with self._drain_condition:
             if not self._accepting:
@@ -120,6 +161,17 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
         )
 
     def flush(self, *, timeout_s: float = 2.0) -> bool:
+        """Wait for accepted items to drain from the queue.
+
+        Args:
+            timeout_s: Maximum number of seconds to wait for the queue to
+                become empty.
+
+        Returns:
+            True if all pending items drained without a latched error.
+            False if the timeout expired, the worker died, or a write failed.
+        """
+
         timeout_s = self._normalize_timeout(timeout_s)
         if current_thread() is self._worker:
             # AUDIT-FIX(#7): A worker thread cannot wait for its own in-flight item to finish.
@@ -141,6 +193,12 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
             return drained and self._pending == 0 and self._last_error_message is None
 
     def shutdown(self, *, timeout_s: float = 2.0) -> None:
+        """Stop accepting new items and request worker shutdown.
+
+        Args:
+            timeout_s: Maximum number of seconds to wait for drain and join.
+        """
+
         timeout_s = self._normalize_timeout(timeout_s)
         shutdown_started_at = time.monotonic()
         with self._drain_condition:
@@ -173,6 +231,8 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
             )
 
     def _run(self) -> None:
+        """Consume queued items until shutdown is requested and drained."""
+
         try:
             while True:
                 with self._drain_condition:
@@ -225,6 +285,8 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
 
 
 class AsyncLongTermMemoryWriter(_AsyncLongTermWriter[LongTermConversationTurn]):
+    """Persist conversation turns through the bounded runtime worker."""
+
     def __init__(
         self,
         *,
@@ -241,6 +303,8 @@ class AsyncLongTermMemoryWriter(_AsyncLongTermWriter[LongTermConversationTurn]):
 
 
 class AsyncLongTermMultimodalWriter(_AsyncLongTermWriter[LongTermMultimodalEvidence]):
+    """Persist multimodal evidence through the bounded runtime worker."""
+
     def __init__(
         self,
         *,

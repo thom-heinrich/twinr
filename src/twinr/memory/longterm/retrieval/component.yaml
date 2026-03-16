@@ -1,0 +1,39 @@
+schema_version: 1
+name: retrieval
+path: src/twinr/memory/longterm/retrieval
+kind: python-package
+visibility: internal
+summary: Assemble prompt-ready long-term memory recall context and silent personalization cues from durable, episodic, mid-term, graph, and conflict state.
+owned_concerns:
+  - Assemble `LongTermMemoryContext` sections from long-term memory stores
+  - Render bounded durable, episodic, mid-term, graph, and conflict prompt payloads
+  - Compile and render silent personalization subtext from graph and episodic cues
+  - Sanitize retrieved memory payloads before JSON serialization or optional LLM compilation
+out_of_scope:
+  - Persist or mutate long-term memory state
+  - Extract, consolidate, or resolve new memory objects
+  - Runtime orchestration, provider bootstrapping, or generic prompt assembly outside retrieval-specific helpers
+files:
+  - path: __init__.py
+    role: Package marker and local summary
+  - path: retriever.py
+    role: Context assembly across long-term memory stores
+    exports:
+      - LongTermRetriever
+  - path: subtext.py
+    role: Silent personalization compiler and subtext renderer
+    exports:
+      - LongTermSubtextBuilder
+      - LongTermSubtextCompiler
+compatibility_reexports:
+  - path: src/twinr/memory/longterm/__init__.py
+    names:
+      - LongTermRetriever
+      - LongTermSubtextBuilder
+primary_callers:
+  - path: src/twinr/memory/longterm/runtime/service.py
+  - path: src/twinr/memory/longterm/__init__.py
+tests:
+  - path: test/test_longterm_retriever.py
+  - path: test/test_longterm_subtext.py
+  - path: test/test_longterm_midterm.py

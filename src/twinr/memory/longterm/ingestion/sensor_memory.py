@@ -1,3 +1,10 @@
+"""Compile sensor-derived routines and deviations for long-term memory.
+
+This module consumes previously consolidated multimodal pattern objects and
+derives bounded routine summaries plus absence deviations for presence and
+interaction behavior around the device.
+"""
+
 from __future__ import annotations
 
 import logging  # AUDIT-FIX(#5): Add logging so malformed records and unexpected failures degrade gracefully instead of failing silently.
@@ -26,10 +33,12 @@ _DEFAULT_DEVIATION_MIN_DAYPART_PROGRESS = 0.75  # AUDIT-FIX(#2): Wait until most
 
 
 def _normalize_text(value: object | None) -> str:
+    """Collapse an arbitrary value into single-line text."""
     return " ".join(str(value or "").split()).strip()
 
 
 def _coerce_bool(value: object, *, default: bool) -> bool:
+    """Parse common boolean-like config and attribute values."""
     if isinstance(value, bool):
         return value
     normalized = _normalize_text(value).lower()
@@ -41,6 +50,7 @@ def _coerce_bool(value: object, *, default: bool) -> bool:
 
 
 def _coerce_positive_int(value: object, *, default: int, minimum: int = 1) -> int:
+    """Coerce a positive integer with a lower bound."""
     try:
         return max(minimum, int(value))
     except (TypeError, ValueError):
@@ -48,6 +58,7 @@ def _coerce_positive_int(value: object, *, default: int, minimum: int = 1) -> in
 
 
 def _coerce_ratio(value: object, *, default: float) -> float:
+    """Coerce a bounded ratio in the inclusive range ``[0, 1]``."""
     try:
         numeric = float(value)
     except (TypeError, ValueError):
@@ -60,6 +71,7 @@ def _coerce_ratio(value: object, *, default: float) -> float:
 
 
 def _coerce_attributes(value: object) -> dict[str, object]:
+    """Coerce arbitrary attribute payloads into a plain mapping."""
     if value is None:
         return {}
     try:
@@ -69,6 +81,7 @@ def _coerce_attributes(value: object) -> dict[str, object]:
 
 
 def _daypart_for_datetime(value: datetime) -> str:
+    """Map a localized timestamp into the shared daypart buckets."""
     hour = value.hour
     if 5 <= hour < 11:
         return "morning"
@@ -80,6 +93,7 @@ def _daypart_for_datetime(value: datetime) -> str:
 
 
 def _routine_day_for_datetime(value: datetime, *, daypart: str) -> date:
+    """Map a timestamp into the routine day used for daypart analytics."""
     routine_day = value.date()
     if daypart == "night" and value.hour < 5:
         return routine_day - timedelta(days=1)  # AUDIT-FIX(#1): Treat post-midnight hours as part of the prior night so overnight routines remain consistent.
@@ -87,6 +101,7 @@ def _routine_day_for_datetime(value: datetime, *, daypart: str) -> date:
 
 
 def _daypart_bounds(value: datetime, *, daypart: str) -> tuple[datetime, datetime]:
+    """Return the localized start and end bounds for one daypart."""
     if daypart == "morning":
         start = value.replace(hour=5, minute=0, second=0, microsecond=0)
         end = value.replace(hour=11, minute=0, second=0, microsecond=0)
@@ -109,6 +124,7 @@ def _daypart_bounds(value: datetime, *, daypart: str) -> tuple[datetime, datetim
 
 
 def _daypart_progress(value: datetime, *, daypart: str) -> float:
+    """Return how far the given timestamp is through its daypart."""
     start, end = _daypart_bounds(value, daypart=daypart)
     total_seconds = max(1.0, (end - start).total_seconds())
     elapsed_seconds = (value - start).total_seconds()
@@ -120,14 +136,17 @@ def _daypart_progress(value: datetime, *, daypart: str) -> float:
 
 
 def _weekday_class(value: date) -> str:
+    """Classify a date as ``weekday`` or ``weekend``."""
     return "weekend" if value.weekday() >= 5 else "weekday"
 
 
 def _weekday_label(value: str) -> str:
+    """Return the human-readable label for a weekday class."""
     return _WEEKDAY_LABELS.get(value, value.replace("_", " "))
 
 
 def _eligible_dates(*, reference_day: date, baseline_days: int, weekday_class: str) -> tuple[date, ...]:
+    """Return baseline dates eligible for one weekday class."""
     days: list[date] = []
     for offset in range(1, baseline_days + 1):
         candidate = reference_day - timedelta(days=offset)
@@ -138,6 +157,7 @@ def _eligible_dates(*, reference_day: date, baseline_days: int, weekday_class: s
 
 
 def _parse_event_datetime(event_id: str) -> datetime | None:
+    """Extract the timestamp component from a stored event ID."""
     clean = _normalize_text(event_id)
     if not clean:
         return None
@@ -155,6 +175,8 @@ def _parse_event_datetime(event_id: str) -> datetime | None:
 
 @dataclass(frozen=True, slots=True)
 class _RawPatternSignal:
+    """Normalized signal used by routine-compilation helpers."""
+
     routine_type: str
     interaction_type: str | None
     daypart: str
@@ -165,6 +187,19 @@ class _RawPatternSignal:
 
 @dataclass(frozen=True, slots=True)
 class LongTermSensorMemoryCompiler:
+    """Derive routine and deviation summaries from multimodal patterns.
+
+    Attributes:
+        timezone_name: IANA timezone used for daypart and date bucketing.
+        enabled: Whether sensor-memory compilation should emit summaries.
+        baseline_days: Lookback window used to estimate typical behavior.
+        min_days_observed: Minimum eligible baseline days required per bucket.
+        min_routine_ratio: Minimum support ratio required to emit a routine.
+        deviation_min_delta: Minimum expected presence ratio for deviations.
+        deviation_min_daypart_progress: Minimum elapsed portion of the current
+            daypart before emitting a missing-presence deviation.
+    """
+
     timezone_name: str = _DEFAULT_TIMEZONE_NAME
     enabled: bool = False
     baseline_days: int = _DEFAULT_BASELINE_DAYS
@@ -174,6 +209,7 @@ class LongTermSensorMemoryCompiler:
     deviation_min_daypart_progress: float = _DEFAULT_DEVIATION_MIN_DAYPART_PROGRESS
 
     def __post_init__(self) -> None:
+        """Normalize configuration values into safe runtime defaults."""
         object.__setattr__(
             self,
             "timezone_name",
@@ -212,6 +248,7 @@ class LongTermSensorMemoryCompiler:
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermSensorMemoryCompiler":
+        """Build a compiler from Twinr configuration."""
         return cls(
             timezone_name=getattr(config, "local_timezone_name", _DEFAULT_TIMEZONE_NAME),
             enabled=getattr(config, "long_term_memory_sensor_memory_enabled", False),
@@ -232,6 +269,16 @@ class LongTermSensorMemoryCompiler:
         objects: tuple[LongTermMemoryObjectV1, ...],
         now: datetime | None = None,
     ) -> LongTermReflectionResultV1:
+        """Compile sensor-derived routines and deviations from raw patterns.
+
+        Args:
+            objects: Consolidated long-term memory objects to inspect.
+            now: Optional reference time for daypart and baseline calculations.
+
+        Returns:
+            A reflection result whose ``created_summaries`` contain the derived
+            routines and deviations. Failures degrade to an empty result.
+        """
         empty_result = LongTermReflectionResultV1(reflected_objects=(), created_summaries=())
         if not self.enabled:
             return empty_result
@@ -285,6 +332,7 @@ class LongTermSensorMemoryCompiler:
             return empty_result
 
     def _resolve_timezone(self) -> tzinfo:
+        """Resolve the configured timezone or fall back safely."""
         normalized_name = _normalize_text(self.timezone_name) or _DEFAULT_TIMEZONE_NAME
         try:
             return ZoneInfo(normalized_name)
@@ -305,6 +353,7 @@ class LongTermSensorMemoryCompiler:
             return datetime.UTC
 
     def _normalize_reference_datetime(self, *, now: datetime | None, timezone: tzinfo) -> datetime:
+        """Normalize the optional reference time into the target timezone."""
         if now is None:
             return datetime.now(timezone)
         if now.tzinfo is None or now.utcoffset() is None:
@@ -317,6 +366,7 @@ class LongTermSensorMemoryCompiler:
         item: LongTermMemoryObjectV1,
         timezone: tzinfo,
     ) -> _RawPatternSignal | None:
+        """Classify one raw pattern while shielding the compile pass from errors."""
         try:
             return self._classify_raw_signal(item=item, timezone=timezone)
         except Exception:
@@ -333,6 +383,7 @@ class LongTermSensorMemoryCompiler:
         item: LongTermMemoryObjectV1,
         timezone: tzinfo,
     ) -> _RawPatternSignal | None:
+        """Classify one memory object into a normalized routine signal."""
         item = item.canonicalized()
         if item.kind != "pattern" or item.status not in {"active", "candidate", "uncertain"}:
             return None
@@ -390,6 +441,7 @@ class LongTermSensorMemoryCompiler:
         daypart: str,
         timezone: tzinfo,
     ) -> tuple[tuple[str, date], ...]:
+        """Map source event IDs to routine days in the configured timezone."""
         try:
             iterable = tuple(raw_event_values or ())
         except TypeError:
@@ -418,6 +470,7 @@ class LongTermSensorMemoryCompiler:
         daypart: str,
         reference_day: date,
     ) -> LongTermMemoryObjectV1 | None:
+        """Build a presence routine object for one weekday/daypart bucket."""
         relevant = tuple(
             signal
             for signal in signals
@@ -489,6 +542,7 @@ class LongTermSensorMemoryCompiler:
         daypart: str,
         reference_day: date,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Build interaction routine objects for one weekday/daypart bucket."""
         observed_days = set(
             _eligible_dates(
                 reference_day=reference_day,
@@ -568,6 +622,7 @@ class LongTermSensorMemoryCompiler:
         reference_day: date,
         current_daypart: str,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Build missing-presence deviations for the current daypart."""
         if _daypart_progress(reference, daypart=current_daypart) < self.deviation_min_daypart_progress:
             return ()  # AUDIT-FIX(#2): Do not treat "no presence yet" as abnormal until most of the current daypart has elapsed.
 
@@ -650,6 +705,7 @@ class LongTermSensorMemoryCompiler:
         signals: tuple[_RawPatternSignal, ...],
         observed_days: set[date],
     ) -> tuple[str, ...]:
+        """Collect bounded supporting event IDs for emitted summaries."""
         event_ids: list[str] = []
         seen_event_ids: set[str] = set()
         for signal in signals:

@@ -1,3 +1,9 @@
+"""Normalize long-term memory taxonomy labels and sensitivity levels.
+
+This module defines the canonical kind and sensitivity vocabulary used across
+long-term ingestion, reasoning, retrieval, and persistence layers.
+"""
+
 from __future__ import annotations
 
 import re  # AUDIT-FIX(#2): Canonicalize externally supplied kinds/attribute tokens into stable, safe identifiers.
@@ -144,6 +150,8 @@ _MULTI_UNDERSCORE_RE = re.compile(r"_+", re.UNICODE)
 
 
 def _normalize_text(value: object | None) -> str:
+    """Collapse arbitrary input into normalized display text."""
+
     # AUDIT-FIX(#2): Apply NFKC + whitespace collapsing so STT/copy-paste variants do not fragment canonical kinds.
     if value is None:
         return ""
@@ -156,6 +164,8 @@ def _normalize_text(value: object | None) -> str:
 
 
 def _normalize_token(value: object | None) -> str:
+    """Canonicalize a free-form label into a lowercase underscore token."""
+
     # AUDIT-FIX(#2): Canonicalize user/model-provided classifier tokens to lowercase underscore form.
     clean_value = _normalize_text(value).casefold()
     if not clean_value:
@@ -166,6 +176,8 @@ def _normalize_token(value: object | None) -> str:
 
 
 def _normalize_attributes(attributes: Mapping[str, object] | None) -> dict[str, object]:
+    """Normalize taxonomy-control attributes while preserving unrelated data."""
+
     # AUDIT-FIX(#3): Ignore malformed/non-mapping attribute payloads instead of raising in hot paths over corrupted state.
     if attributes is None or not isinstance(attributes, Mapping):
         return {}
@@ -194,6 +206,8 @@ def normalize_memory_kind(
     kind: str,
     attributes: Mapping[str, object] | None = None,
 ) -> tuple[str, dict[str, object]]:
+    """Normalize a raw memory kind and seed canonical classifier attributes."""
+
     clean_kind = _normalize_token(kind)  # AUDIT-FIX(#2): Canonicalize kind tokens before legacy/generic lookup.
     normalized_attributes = _normalize_attributes(attributes)  # AUDIT-FIX(#3): Sanitize classifier fields and tolerate malformed payloads.
     if clean_kind in _LEGACY_KIND_DEFAULTS:
@@ -211,6 +225,8 @@ def normalize_memory_kind(
 
 
 def normalize_memory_sensitivity(value: str | None) -> str:
+    """Normalize a sensitivity label and fail closed for unknown values."""
+
     clean_value = _normalize_token(value)  # AUDIT-FIX(#1): Normalize case/separators before applying the sensitivity policy.
     if not clean_value:
         return "normal"
@@ -222,16 +238,22 @@ def normalize_memory_sensitivity(value: str | None) -> str:
 
 
 def memory_kind_prefix(kind: str) -> str:
+    """Return the canonical identifier prefix for a memory kind."""
+
     canonical_kind, _attributes = normalize_memory_kind(kind, None)
     return canonical_kind or "memory"  # AUDIT-FIX(#5): Prefix generation now uses sanitized canonical kinds, not raw caller-controlled text.
 
 
 def is_durable_kind(kind: str) -> bool:
+    """Return whether a kind belongs to the durable-memory bucket."""
+
     canonical_kind, _attributes = normalize_memory_kind(kind, None)
     return canonical_kind in _DURABLE_KINDS
 
 
 def is_episodic_kind(kind: str) -> bool:
+    """Return whether a kind belongs to the episodic-memory bucket."""
+
     canonical_kind, _attributes = normalize_memory_kind(kind, None)
     return canonical_kind in _EPISODIC_KINDS
 
@@ -244,6 +266,8 @@ def kind_matches(
     attr_key: str | None = None,
     attr_value: str | None = None,
 ) -> bool:
+    """Compare a kind and optional classifier attribute against an expectation."""
+
     canonical_kind, normalized_attributes = normalize_memory_kind(kind, attributes)
     expected_canonical_kind, _expected_attributes = normalize_memory_kind(
         expected_kind,
@@ -265,6 +289,8 @@ def kind_matches(
 
 
 def is_thread_summary(kind: str, attributes: Mapping[str, object] | None = None) -> bool:
+    """Return whether the given kind describes a thread summary."""
+
     return kind_matches(kind, "summary", attributes, attr_key="summary_type", attr_value="thread")
 
 
@@ -273,6 +299,8 @@ def _infer_memory_domain(
     canonical_kind: str,
     attributes: Mapping[str, object],
 ) -> str | None:
+    """Infer the memory domain from classifier attributes or generic kinds."""
+
     for key in _DOMAIN_INFERENCE_KEYS:
         raw_value = attributes.get(key)
         clean_value = _normalize_token(raw_value)  # AUDIT-FIX(#3): Infer only from sanitized non-blank classifier values.

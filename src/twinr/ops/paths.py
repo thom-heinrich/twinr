@@ -1,3 +1,9 @@
+"""Resolve canonical filesystem paths for Twinr ops artifacts and stores.
+
+This module centralizes the artifact layout used by ops events, usage logs,
+self-tests, and support bundles so runtime and web callers share one policy.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,6 +14,8 @@ from twinr.agent.base_agent.config import TwinrConfig
 
 @dataclass(frozen=True, slots=True)
 class TwinrOpsPaths:
+    """Collect the resolved filesystem paths used by Twinr ops features."""
+
     project_root: Path
     artifacts_root: Path
     stores_root: Path
@@ -63,6 +71,20 @@ def _resolve_descendant(root: Path, *parts: str) -> Path:
 
 
 def resolve_ops_paths(project_root: str | Path) -> TwinrOpsPaths:
+    """Resolve canonical ops paths for a Twinr project root.
+
+    Args:
+        project_root: Project root from which the ops artifact layout is
+            derived.
+
+    Returns:
+        A ``TwinrOpsPaths`` bundle rooted under ``project_root``.
+
+    Raises:
+        ValueError: If the supplied root or any derived descendant path is
+            invalid.
+    """
+
     root = _normalize_path(project_root, field_name="project_root")
     # AUDIT-FIX(#2): Reject existing files used as project_root; descendant directory creation would otherwise fail later and less clearly.
     if root.exists() and not root.is_dir():
@@ -108,6 +130,19 @@ def resolve_ops_paths(project_root: str | Path) -> TwinrOpsPaths:
 
 
 def resolve_ops_paths_for_config(config: TwinrConfig) -> TwinrOpsPaths:
+    """Resolve canonical ops paths from Twinr configuration values.
+
+    Prefers ``config.project_root`` when set, otherwise derives the project
+    root from ``config.runtime_state_path`` and finally the current working
+    directory.
+
+    Args:
+        config: Twinr runtime configuration.
+
+    Returns:
+        A ``TwinrOpsPaths`` bundle for the configured Twinr project.
+    """
+
     cwd = _normalize_path(Path.cwd(), field_name="cwd")
     raw_project_root = config.project_root
     if not _is_blank_config_path(raw_project_root):

@@ -1,3 +1,10 @@
+"""Extract long-term memory candidates from a single conversation turn.
+
+This module normalizes a user transcript and assistant response, optionally
+asks a structured turn program for proposition output, and emits the episode,
+candidate objects, and graph edges expected by the long-term memory runtime.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -49,10 +56,12 @@ _ALLOWED_IDENTIFIER_CHARS = frozenset(
 
 
 def _strip_control_chars(value: str) -> str:
+    """Replace non-printable characters with spaces."""
     return "".join(char if char.isprintable() else " " for char in value)
 
 
 def _normalize_text(value: object | None, *, limit: int | None = None) -> str:
+    """Normalize text for durable turn-memory storage."""
     # AUDIT-FIX(#7): Collapse whitespace and strip control characters so blank/dirty payloads do not create junk memories.
     clean_value = collapse_whitespace(_strip_control_chars("" if value is None else str(value)))
     truncated_value = truncate_text(clean_value, limit=limit)
@@ -60,6 +69,7 @@ def _normalize_text(value: object | None, *, limit: int | None = None) -> str:
 
 
 def _normalize_identifier(value: object | None, *, limit: int, fallback: str) -> str:
+    """Normalize externally supplied identifiers into bounded safe text."""
     # AUDIT-FIX(#8): Sanitize externally supplied identifiers before they enter persisted state and logs.
     text = _normalize_text(value, limit=limit)
     if not text:
@@ -72,21 +82,25 @@ def _normalize_identifier(value: object | None, *, limit: int, fallback: str) ->
 
 
 def _quoted(value: str) -> str:
+    """Quote text for human-readable episode details."""
     # AUDIT-FIX(#6): Escape backslashes before quotes so stored details remain parseable after text sanitation.
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _stable_digest(value: str, *, length: int = 12) -> str:
+    """Return a short stable digest for deterministic IDs."""
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:length]
 
 
 def _stable_memory_id(prefix: str, stable_basis: str, *, fallback: str) -> str:
+    """Build a collision-resistant memory ID from stable input text."""
     # AUDIT-FIX(#5): Append a stable digest so slug collisions do not overwrite unrelated memories.
     slug = slugify_identifier(stable_basis, fallback=fallback)
     return f"{prefix}:{slug}:{_stable_digest(stable_basis)}"
 
 
 def _normalize_confidence(value: object, *, default: float = 0.5) -> float:
+    """Clamp a payload confidence score into the supported range."""
     # AUDIT-FIX(#4): Reject bool/NaN/inf and clamp out-of-range scores to keep ranking/persistence stable.
     if isinstance(value, bool):
         return default
@@ -109,6 +123,7 @@ def _normalize_confidence(value: object, *, default: float = 0.5) -> float:
 
 
 def _normalize_bool(value: object, *, default: bool = False) -> bool:
+    """Parse common boolean-like payload values."""
     # AUDIT-FIX(#1): Parse boolean-like payload values explicitly so "false" does not become True.
     if isinstance(value, bool):
         return value
@@ -127,6 +142,7 @@ def _normalize_bool(value: object, *, default: bool = False) -> bool:
 
 
 def _resolve_timezone(timezone_name: str | None) -> tuple[str, ZoneInfo]:
+    """Resolve the configured timezone or fall back deterministically."""
     normalized_name = _normalize_text(timezone_name, limit=128) or _DEFAULT_TIMEZONE_NAME
     try:
         return normalized_name, ZoneInfo(normalized_name)
@@ -142,12 +158,21 @@ def _resolve_timezone(timezone_name: str | None) -> tuple[str, ZoneInfo]:
 
 @dataclass(frozen=True, slots=True)
 class LongTermTurnExtractor:
+    """Turn one conversation exchange into long-term memory inputs.
+
+    Attributes:
+        timezone_name: IANA timezone used for localizing timestamps.
+        program: Optional structured extractor that enriches the raw turn.
+        proposition_compiler: Compiler for proposition payloads and graph edges.
+    """
+
     timezone_name: str = "Europe/Berlin"
     program: LongTermStructuredTurnProgram | None = None
     proposition_compiler: LongTermTurnPropositionCompiler = field(default_factory=LongTermTurnPropositionCompiler)
     _timezone: ZoneInfo = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        """Validate and cache the configured timezone once."""
         normalized_timezone_name, timezone = _resolve_timezone(self.timezone_name)
         object.__setattr__(self, "timezone_name", normalized_timezone_name)  # AUDIT-FIX(#2): Cache a validated timezone once.
         object.__setattr__(self, "_timezone", timezone)  # AUDIT-FIX(#2): Avoid repeated runtime ZoneInfo lookups and failures.
@@ -159,6 +184,15 @@ class LongTermTurnExtractor:
         *,
         program: LongTermStructuredTurnProgram | None = None,
     ) -> "LongTermTurnExtractor":
+        """Build an extractor from Twinr configuration.
+
+        Args:
+            config: Runtime configuration carrying timezone and provider settings.
+            program: Optional prebuilt structured turn program override.
+
+        Returns:
+            A configured turn extractor ready for runtime use.
+        """
         if program is not None:
             return cls(
                 timezone_name=config.local_timezone_name,
@@ -179,6 +213,23 @@ class LongTermTurnExtractor:
         turn_id: str | None = None,
         source: str = "conversation_turn",
     ) -> LongTermTurnExtractionV1:
+        """Extract the episode and candidate memories for one turn.
+
+        Args:
+            transcript: User transcript text for the turn.
+            response: Assistant response paired with the transcript.
+            occurred_at: Optional event time. Naive datetimes are interpreted in
+                the configured local timezone.
+            turn_id: Optional stable turn identifier override.
+            source: Source label stored on the generated source reference.
+
+        Returns:
+            A normalized turn extraction containing the episode object plus any
+            candidate objects and graph edges.
+
+        Raises:
+            ValueError: If ``transcript`` is empty after normalization.
+        """
         clean_transcript = _normalize_text(transcript, limit=500)  # AUDIT-FIX(#7): Reject whitespace-only transcript input.
         clean_response = _normalize_text(response, limit=500)
         if not clean_transcript:
@@ -268,6 +319,7 @@ class LongTermTurnExtractor:
         )
 
     def _resolve_occurred_at(self, occurred_at: datetime | None) -> datetime:
+        """Resolve an optional timestamp into the configured timezone."""
         if occurred_at is None:
             return datetime.now(self._timezone)
         if occurred_at.tzinfo is None or occurred_at.tzinfo.utcoffset(occurred_at) is None:
@@ -283,6 +335,7 @@ class LongTermTurnExtractor:
         source: str,
         occurred_at: datetime,
     ) -> str:
+        """Build a deterministic turn ID from the normalized turn payload."""
         stable_basis = "\n".join((transcript, response, source, occurred_at.isoformat()))
         stable_suffix = _stable_digest(stable_basis, length=10)
         return "turn:" + occurred_at.strftime("%Y%m%dT%H%M%S%f%z") + f":{stable_suffix}"
@@ -293,6 +346,7 @@ class LongTermTurnExtractor:
         payload: Mapping[str, object],
         source_ref: LongTermSourceRefV1,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Convert object payload items into deduplicated memory candidates."""
         objects_payload = payload.get("objects")
         if not isinstance(objects_payload, list):
             return ()
@@ -339,6 +393,7 @@ class LongTermTurnExtractor:
         self,
         payload: Mapping[str, object],
     ) -> tuple[LongTermGraphEdgeCandidateV1, ...]:
+        """Convert edge payload items into deduplicated graph candidates."""
         edges_payload = payload.get("graph_edges")
         if not isinstance(edges_payload, list):
             return ()
@@ -393,6 +448,7 @@ class LongTermTurnExtractor:
         return tuple(edges_by_key.values())
 
     def _normalize_attributes(self, value: object) -> dict[str, str]:
+        """Normalize bounded attribute mappings from model payloads."""
         if isinstance(value, list):
             normalized: dict[str, str] = {}
             for item in islice(value, _MAX_ATTRIBUTES):
@@ -416,6 +472,7 @@ class LongTermTurnExtractor:
         return normalized
 
     def _optional_text(self, value: object) -> str | None:
+        """Return normalized text or ``None`` when empty."""
         if value is None:
             return None
         clean_value = _normalize_text(value, limit=160)
@@ -423,6 +480,7 @@ class LongTermTurnExtractor:
 
 
 def _turn_extraction_schema() -> dict[str, object]:
+    """Expose the structured schema used for turn extraction payloads."""
     return _turn_proposition_schema()
 
 

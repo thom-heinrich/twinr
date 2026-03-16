@@ -1,3 +1,10 @@
+"""Define Twinr automation models, scheduling logic, and file-backed storage.
+
+This module owns the canonical automation data model used across the runtime,
+web UI, and tool handlers. It validates operator-managed automations, evaluates
+time and fact-based triggers, and persists them to a bounded JSON store.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
@@ -314,6 +321,14 @@ def _safe_describe_sensor_trigger_text(trigger: AutomationTrigger) -> str | None
 
 @dataclass(frozen=True, slots=True)
 class AutomationCondition:
+    """Represent one fact comparison inside an if/then trigger.
+
+    Attributes:
+        key: Dot-separated fact path to read from runtime facts.
+        operator: Comparison operator to apply to the fact value.
+        value: Optional comparison value. ``truthy`` and ``falsy`` ignore it.
+    """
+
     key: str
     operator: ConditionOperator
     value: str | int | float | bool | None = None
@@ -331,6 +346,8 @@ class AutomationCondition:
             object.__setattr__(self, "value", None)
 
     def matches(self, facts: dict[str, Any]) -> bool:
+        """Return whether the provided facts satisfy this condition."""
+
         return _values_match(
             operator=self.operator,
             actual=_fact_value(facts, self.key),
@@ -338,6 +355,8 @@ class AutomationCondition:
         )
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the condition into the persisted JSON shape."""
+
         return {
             "key": self.key,
             "operator": self.operator,
@@ -347,6 +366,13 @@ class AutomationCondition:
 
 @dataclass(frozen=True, slots=True)
 class TimeAutomationTrigger:
+    """Describe a scheduled automation trigger.
+
+    ``once`` triggers persist a concrete ``due_at`` timestamp. ``daily`` and
+    ``weekly`` triggers persist a local wall-clock ``time_of_day`` plus the
+    timezone used to resolve that schedule.
+    """
+
     kind: Literal["time"] = "time"
     schedule: TimeSchedule = "once"
     due_at: str | None = None
@@ -388,6 +414,8 @@ class TimeAutomationTrigger:
             raise ValueError("weekdays are required for weekly schedules")
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the trigger into the persisted JSON shape."""
+
         return {
             "kind": self.kind,
             "schedule": self.schedule,
@@ -400,6 +428,16 @@ class TimeAutomationTrigger:
 
 @dataclass(frozen=True, slots=True)
 class IfThenAutomationTrigger:
+    """Describe an event- and fact-driven automation trigger.
+
+    Attributes:
+        kind: Trigger discriminator for persisted payloads.
+        event_name: Optional event gate that must match before conditions run.
+        all_conditions: Conditions that must all evaluate to true.
+        any_conditions: Conditions where at least one must evaluate to true.
+        cooldown_seconds: Minimum time between repeated matches.
+    """
+
     kind: Literal["if_then"] = "if_then"
     event_name: str | None = None
     all_conditions: tuple[AutomationCondition, ...] = ()
@@ -428,6 +466,8 @@ class IfThenAutomationTrigger:
         object.__setattr__(self, "cooldown_seconds", cooldown_seconds)
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the trigger into the persisted JSON shape."""
+
         return {
             "kind": self.kind,
             "event_name": self.event_name,
@@ -442,6 +482,16 @@ AutomationTrigger = TimeAutomationTrigger | IfThenAutomationTrigger
 
 @dataclass(frozen=True, slots=True)
 class AutomationAction:
+    """Describe the work Twinr performs when an automation fires.
+
+    Attributes:
+        kind: Action type executed by the runtime.
+        text: Spoken, printed, or prompt text for text-based actions.
+        tool_name: Tool identifier for ``tool_call`` actions.
+        payload: JSON-safe action metadata passed to the runtime.
+        enabled: Whether this action participates when the automation fires.
+    """
+
     kind: ActionKind
     text: str | None = None
     tool_name: str | None = None
@@ -469,6 +519,8 @@ class AutomationAction:
             raise ValueError("tool_name is required for action kind: tool_call")
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the action into the persisted JSON shape."""
+
         return {
             "kind": self.kind,
             "text": self.text,
@@ -480,6 +532,13 @@ class AutomationAction:
 
 @dataclass(frozen=True, slots=True)
 class AutomationDefinition:
+    """Represent one stored automation entry.
+
+    Each definition combines a validated trigger with one or more actions plus
+    timestamps and metadata used for persistence, operator tooling, and runtime
+    cooldown handling.
+    """
+
     automation_id: str
     name: str
     trigger: AutomationTrigger
@@ -526,6 +585,8 @@ class AutomationDefinition:
         object.__setattr__(self, "tags", clean_tags)
 
     def to_payload(self) -> dict[str, Any]:
+        """Serialize the automation definition into the persisted JSON shape."""
+
         return {
             "automation_id": self.automation_id,
             "name": self.name,
@@ -542,12 +603,16 @@ class AutomationDefinition:
 
 
 class AutomationEngine:
+    """Evaluate automation triggers without owning persistence."""
+
     def due_time_automations(
         self,
         entries: tuple[AutomationDefinition, ...] | list[AutomationDefinition],
         *,
         now: datetime | None = None,
     ) -> tuple[AutomationDefinition, ...]:
+        """Return enabled scheduled automations that are due at ``now``."""
+
         current_time = _ensure_aware_datetime(now or now_in_timezone("UTC"), timezone_name="UTC")
         due: list[AutomationDefinition] = []
         for entry in entries:
@@ -565,6 +630,8 @@ class AutomationEngine:
         event_name: str | None = None,
         now: datetime | None = None,
     ) -> tuple[AutomationDefinition, ...]:
+        """Return enabled if/then automations that match the current facts."""
+
         current_time = _ensure_aware_datetime(now or now_in_timezone("UTC"), timezone_name="UTC")
         matches: list[AutomationDefinition] = []
         for entry in entries:
@@ -580,6 +647,8 @@ class AutomationEngine:
         *,
         now: datetime | None = None,
     ) -> datetime | None:
+        """Return the next scheduled run time for a time-based automation."""
+
         current_time = _ensure_aware_datetime(now or now_in_timezone("UTC"), timezone_name="UTC")
         if isinstance(entry.trigger, TimeAutomationTrigger):
             return self._next_time_run(entry.trigger, last_triggered_at=entry.last_triggered_at, now=current_time)
@@ -591,6 +660,8 @@ class AutomationEngine:
         *,
         now: datetime | None = None,
     ) -> dict[str, Any]:
+        """Build a tooling-friendly record for inspection and UI rendering."""
+
         current_time = _ensure_aware_datetime(now or now_in_timezone("UTC"), timezone_name="UTC")
         next_run = self.next_run_at(entry, now=current_time)
         due_now = False
@@ -725,6 +796,12 @@ class AutomationEngine:
 
 
 class AutomationStore:
+    """Persist and query Twinr automations in a bounded JSON file.
+
+    The store keeps one lock per path, writes updates atomically, and maintains
+    a backup file so runtime-facing automation state survives interrupted writes.
+    """
+
     _LOCKS: ClassVar[dict[str, RLock]] = {}
     _LOCKS_GUARD: ClassVar[RLock] = RLock()
 
@@ -757,15 +834,21 @@ class AutomationStore:
             return lock
 
     def load_entries(self) -> tuple[AutomationDefinition, ...]:
+        """Load and cache all valid automation entries from disk."""
+
         with self._lock:
             entries = self._load_entries_unlocked()
             self._cached_entries = entries
             return entries
 
     def list_tool_records(self, *, now: datetime | None = None) -> tuple[dict[str, Any], ...]:
+        """Return all stored automations as tooling-oriented inspection records."""
+
         return tuple(self.engine.tool_record(entry, now=now) for entry in self.load_entries())
 
     def render_context(self, *, limit: int = 8, now: datetime | None = None) -> str | None:
+        """Render a short natural-language summary of enabled automations."""
+
         current_time = _ensure_aware_datetime(now or now_in_timezone(self.timezone_name), timezone_name=self.timezone_name)
         enabled_entries = [entry for entry in self.load_entries() if entry.enabled]
         if not enabled_entries:
@@ -779,6 +862,8 @@ class AutomationStore:
         return "\n".join(lines).strip()
 
     def get(self, automation_id: str) -> AutomationDefinition | None:
+        """Return a stored automation by id, or ``None`` if it is missing."""
+
         lookup = _normalize_text(automation_id, limit=64)
         with self._lock:
             for entry in self._load_entries_unlocked():
@@ -801,6 +886,8 @@ class AutomationStore:
         source: str = "manual",
         tags: tuple[str, ...] | list[str] = (),
     ) -> AutomationDefinition:
+        """Create, validate, persist, and return a scheduled automation."""
+
         now = _ensure_aware_datetime(now_in_timezone(self.timezone_name), timezone_name=self.timezone_name)
         trigger = TimeAutomationTrigger(
             schedule=schedule,
@@ -839,6 +926,8 @@ class AutomationStore:
         source: str = "manual",
         tags: tuple[str, ...] | list[str] = (),
     ) -> AutomationDefinition:
+        """Create, validate, persist, and return an if/then automation."""
+
         now = _ensure_aware_datetime(now_in_timezone(self.timezone_name), timezone_name=self.timezone_name)
         trigger = IfThenAutomationTrigger(
             event_name=event_name,
@@ -862,6 +951,8 @@ class AutomationStore:
         return self.upsert(entry)
 
     def upsert(self, entry: AutomationDefinition) -> AutomationDefinition:
+        """Insert or replace one automation entry and persist the change."""
+
         with self._lock:
             entries = list(self._load_entries_unlocked())
             normalized = replace(
@@ -893,6 +984,8 @@ class AutomationStore:
         source: str | None = None,
         tags: tuple[str, ...] | list[str] | None = None,
     ) -> AutomationDefinition:
+        """Update selected fields on an existing automation and persist them."""
+
         with self._lock:
             existing = self.get(automation_id)
             if existing is None:
@@ -911,6 +1004,8 @@ class AutomationStore:
             return self.upsert(updated)
 
     def delete(self, automation_id: str) -> AutomationDefinition:
+        """Delete and return a stored automation by id."""
+
         with self._lock:
             entries = list(self._load_entries_unlocked())
             lookup = _normalize_text(automation_id, limit=64)
@@ -923,6 +1018,8 @@ class AutomationStore:
         raise KeyError(f"Unknown automation_id: {automation_id}")
 
     def mark_triggered(self, automation_id: str, *, triggered_at: datetime | None = None) -> AutomationDefinition:
+        """Record that an automation fired and persist the trigger timestamp."""
+
         with self._lock:
             existing = self.get(automation_id)
             if existing is None:
@@ -941,6 +1038,8 @@ class AutomationStore:
             )
 
     def due_time_automations(self, *, now: datetime | None = None) -> tuple[AutomationDefinition, ...]:
+        """Return stored scheduled automations that are due at ``now``."""
+
         return self.engine.due_time_automations(self.load_entries(), now=now)
 
     def matching_if_then_automations(
@@ -950,6 +1049,8 @@ class AutomationStore:
         event_name: str | None = None,
         now: datetime | None = None,
     ) -> tuple[AutomationDefinition, ...]:
+        """Return stored if/then automations matching the current facts."""
+
         return self.engine.matching_if_then_automations(
             self.load_entries(),
             facts=facts,

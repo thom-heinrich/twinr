@@ -1,0 +1,66 @@
+schema_version: 1
+name: ingestion
+path: src/twinr/memory/longterm/ingestion
+kind: python-package
+visibility: internal
+summary: Normalize conversation turns, multimodal evidence, and replayed ops history into candidate long-term memory inputs and sensor-derived summaries.
+owned_concerns:
+  - Extract an episode plus candidate objects and graph edges from one conversation turn
+  - Normalize multimodal evidence from sensor, button, printer, and camera events into candidate memories
+  - Replay persisted ops history into multimodal evidence for bounded backfill and recovery
+  - Compile sensor-derived routines and deviations from previously consolidated pattern objects
+out_of_scope:
+  - Persist or archive long-term memory objects and remote state
+  - Resolve conflicts, truth state, retention, or reflection policy
+  - Orchestrate runtime queues, workers, or top-level long-term service flows
+  - Build retrieval context for prompt assembly or answer generation
+files:
+  - path: __init__.py
+    role: Package marker for long-term ingestion helpers
+  - path: extract.py
+    role: Conversation-turn extraction orchestration
+    exports:
+      - LongTermStructuredTurnProgram
+      - LongTermTurnExtractor
+      - OpenAIStructuredTurnProgram
+  - path: propositions.py
+    role: Structured proposition schema and compilation
+    exports:
+      - LongTermStructuredTurnProgram
+      - LongTermTurnPropositionBundleV1
+      - LongTermTurnPropositionCompiler
+      - OpenAIStructuredTurnProgram
+      - _turn_proposition_schema
+      - structured_turn_program_from_config
+  - path: multimodal.py
+    role: Multimodal evidence extraction into candidate memories
+    exports:
+      - LongTermMultimodalExtractor
+  - path: sensor_memory.py
+    role: Routine and deviation compilation from multimodal patterns
+    exports:
+      - LongTermSensorMemoryCompiler
+  - path: backfill.py
+    role: Ops-history replay into multimodal evidence
+    exports:
+      - LongTermOpsBackfillBuildResult
+      - LongTermOpsBackfillRunResult
+      - LongTermOpsEventBackfiller
+public_api:
+  module: twinr.memory.longterm
+  exports:
+    - LongTermMultimodalExtractor
+    - LongTermSensorMemoryCompiler
+    - LongTermTurnExtractor
+    - LongTermTurnPropositionBundleV1
+    - LongTermTurnPropositionCompiler
+primary_callers:
+  - path: src/twinr/memory/longterm/runtime/service.py
+  - path: src/twinr/memory/longterm/__init__.py
+  - path: src/twinr/memory/__init__.py
+tests:
+  - path: test/test_longterm_extract.py
+  - path: test/test_longterm_propositions.py
+  - path: test/test_longterm_multimodal.py
+  - path: test/test_sensor_memory.py
+  - path: test/test_longterm_memory.py

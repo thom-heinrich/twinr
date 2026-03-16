@@ -1,3 +1,10 @@
+"""Build long-term memory context blocks for a single response turn.
+
+This module coordinates durable, episodic, mid-term, graph, conflict, and
+subtext retrieval into ``LongTermMemoryContext``. Import
+``LongTermRetriever`` from this module or via ``twinr.memory.longterm``.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
@@ -34,6 +41,13 @@ _MAX_COLLECTION_ITEMS = 64  # AUDIT-FIX(#3): Prevent pathological iterables from
 
 @dataclass(frozen=True, slots=True)
 class LongTermRetriever:
+    """Assemble prompt-ready long-term memory context for one query.
+
+    The retriever keeps store access read-only, bounds prompt payload sizes,
+    and degrades gracefully on partial data corruption. Remote-memory
+    unavailability is surfaced to callers so runtime policy can fail closed.
+    """
+
     config: TwinrConfig
     prompt_context_store: PromptContextStore  # AUDIT-FIX(#6): Retained for interface parity; intentionally unused in this retriever.
     graph_store: TwinrPersonalGraphStore
@@ -48,6 +62,23 @@ class LongTermRetriever:
         query: LongTermQueryProfile,
         original_query_text: str | None = None,
     ) -> LongTermMemoryContext:
+        """Build the complete long-term memory context for a user turn.
+
+        Args:
+            query: Normalized retrieval profile for the current user turn.
+            original_query_text: Raw user text to reuse when the normalized
+                profile has no retrieval text.
+
+        Returns:
+            A ``LongTermMemoryContext`` containing every available retrieval
+            section. Blank queries or non-remote failures yield an empty or
+            partial context instead of crashing the turn.
+
+        Raises:
+            LongTermRemoteUnavailableError: If the remote long-term memory
+                backend is unavailable and runtime policy must fail closed.
+        """
+
         retrieval_text = self._normalize_query_text(
             query,
             fallback_text=original_query_text,
@@ -96,6 +127,16 @@ class LongTermRetriever:
         query: LongTermQueryProfile,
         limit: int | None = None,
     ) -> tuple[LongTermConflictQueueItemV1, ...]:
+        """Select unresolved long-term conflicts relevant to a query.
+
+        Args:
+            query: Normalized retrieval profile for the current user turn.
+            limit: Optional override for the number of conflicts to return.
+
+        Returns:
+            A tuple of conflict queue items ordered by the underlying store.
+        """
+
         return self._select_conflict_queue_for_text(
             self._normalize_query_text(query),
             limit=limit,
@@ -107,6 +148,8 @@ class LongTermRetriever:
         *,
         limit: int | None = None,
     ) -> tuple[LongTermConflictQueueItemV1, ...]:
+        """Load conflict queue items for normalized retrieval text."""
+
         if not retrieval_text:
             return ()
         if limit is not None and self._coerce_limit(limit, default=0, minimum=0) == 0:
@@ -152,6 +195,8 @@ class LongTermRetriever:
         fallback_limit: int = 2,
         require_query_match: bool = False,
     ) -> list[PersistentMemoryEntry]:
+        """Load and normalize episodic memories into prompt entries."""
+
         retrieval_text = self._normalize_query_text(query)
         if not retrieval_text:
             return []  # AUDIT-FIX(#2): Do not recall arbitrary episodic memory for empty queries.
@@ -186,6 +231,8 @@ class LongTermRetriever:
         return entries
 
     def _select_midterm_packets(self, retrieval_text: str) -> tuple[object, ...]:
+        """Load bounded mid-term packets for normalized retrieval text."""
+
         if not retrieval_text:
             return ()
         try:  # AUDIT-FIX(#1): Mid-term retrieval failures should not abort the response turn.
@@ -205,6 +252,8 @@ class LongTermRetriever:
         return tuple(self._coerce_iterable(packets))
 
     def _select_durable_objects(self, retrieval_text: str) -> tuple[object, ...]:
+        """Load bounded durable memory objects for normalized retrieval text."""
+
         if not retrieval_text:
             return ()
         try:  # AUDIT-FIX(#1): Durable-memory retrieval failures should not abort the response turn.
@@ -224,6 +273,8 @@ class LongTermRetriever:
         return tuple(self._coerce_iterable(objects))
 
     def _build_graph_context(self, retrieval_text: str) -> str | None:
+        """Render graph-derived prompt context for normalized retrieval text."""
+
         if not retrieval_text:
             return None
         try:  # AUDIT-FIX(#1): Graph retrieval failures should degrade to no graph context, not a failed turn.
@@ -244,6 +295,8 @@ class LongTermRetriever:
         retrieval_query_text: str,
         episodic_entries: list[PersistentMemoryEntry],
     ) -> str | None:
+        """Build silent personalization context from retrieved memory cues."""
+
         try:  # AUDIT-FIX(#1): Subtext generation is optional and must fail closed.
             return self.subtext_builder.build(
                 query_text=query_text,
@@ -255,6 +308,8 @@ class LongTermRetriever:
             return None
 
     def _episodic_entry_from_object(self, item: object) -> PersistentMemoryEntry | None:
+        """Convert a stored episodic object into ``PersistentMemoryEntry``."""
+
         raw_summary = self._normalize_text(
             getattr(item, "summary", None),
             limit=_MAX_SUMMARY_CHARS,
@@ -309,6 +364,8 @@ class LongTermRetriever:
             return None
 
     def _render_episodic_context(self, entries: list[PersistentMemoryEntry]) -> str | None:
+        """Render episodic entries into the structured prompt section."""
+
         if not entries:
             return None
         recent_episodes: list[dict[str, object]] = []
@@ -351,6 +408,8 @@ class LongTermRetriever:
         )
 
     def _render_durable_context(self, objects: tuple[object, ...]) -> str | None:
+        """Render durable memory objects into the structured prompt section."""
+
         if not objects:
             return None
         facts: list[dict[str, object]] = []
@@ -391,6 +450,8 @@ class LongTermRetriever:
         )
 
     def _render_midterm_context(self, packets: tuple[object, ...]) -> str | None:
+        """Render mid-term packets into the structured prompt section."""
+
         if not packets:
             return None
         rendered_packets: list[dict[str, object]] = []
@@ -439,6 +500,8 @@ class LongTermRetriever:
 
 
     def _serialize_conflict_options(self, options: object | None) -> list[object]:
+        """Serialize conflict options through ``to_payload()`` when available."""
+
         serialized_options: list[object] = []
         for option in self._coerce_iterable(options):
             to_payload = getattr(option, "to_payload", None)
@@ -453,6 +516,8 @@ class LongTermRetriever:
         return serialized_options
 
     def _render_conflict_context(self, conflicts: tuple[LongTermConflictQueueItemV1, ...]) -> str | None:
+        """Render unresolved conflicts into the structured prompt section."""
+
         if not conflicts:
             return None
         open_conflicts: list[dict[str, object]] = []
@@ -497,6 +562,8 @@ class LongTermRetriever:
         instruction: str,
         payload: Mapping[str, object],
     ) -> str | None:
+        """Serialize a structured memory payload with an instruction header."""
+
         try:  # AUDIT-FIX(#3): Sanitize before JSON encoding so uncommon runtime types cannot crash prompt rendering.
             serialized_payload = self._serialize_json_value(payload)
             if not isinstance(serialized_payload, dict):
@@ -507,6 +574,8 @@ class LongTermRetriever:
             return None
 
     def _serialize_json_value(self, value: object, *, depth: int = 0) -> object:
+        """Coerce runtime values into bounded JSON-safe prompt payloads."""
+
         if depth > 4:
             return self._normalize_text(value, limit=_MAX_GENERIC_VALUE_CHARS)
         if value is None or isinstance(value, (bool, int)):
@@ -556,9 +625,13 @@ class LongTermRetriever:
         return self._normalize_text(value, limit=_MAX_GENERIC_VALUE_CHARS)
 
     def _serialize_mapping_key(self, value: object) -> str:
+        """Normalize a mapping key for structured prompt payloads."""
+
         return self._normalize_text(value, limit=128) or "unknown"
 
     def _coerce_iterable(self, value: object | None) -> tuple[object, ...]:
+        """Convert runtime values into a bounded tuple for iteration."""
+
         if value is None:
             return ()
         if isinstance(value, Mapping):
@@ -571,6 +644,8 @@ class LongTermRetriever:
             return (value,)
 
     def _coerce_datetime(self, value: object) -> datetime | None:
+        """Coerce supported timestamp representations to ``datetime``."""
+
         if isinstance(value, datetime):
             return value
         if isinstance(value, date):
@@ -593,6 +668,8 @@ class LongTermRetriever:
         return None
 
     def _format_timestamp(self, value: object) -> str | None:
+        """Render timestamps and mark naive values explicitly."""
+
         timestamp = self._coerce_datetime(value)
         if timestamp is None:
             return None
@@ -606,6 +683,8 @@ class LongTermRetriever:
         *,
         fallback_text: str | None = None,
     ) -> str:
+        """Prefer canonical retrieval text and fall back to raw user text."""
+
         if isinstance(query, LongTermQueryProfile):
             query_text = getattr(query, "retrieval_text", None)
         else:
@@ -616,6 +695,8 @@ class LongTermRetriever:
         return self._normalize_text(fallback_text) or ""
 
     def _normalize_text(self, value: object | None, *, limit: int | None = None) -> str | None:
+        """Collapse whitespace and optionally bound free-form text."""
+
         if value is None:
             return None
         text = collapse_whitespace(str(value))
@@ -634,6 +715,8 @@ class LongTermRetriever:
         default: int,
         minimum: int = 1,
     ) -> int:
+        """Coerce a configured recall limit to an integer floor."""
+
         try:
             parsed = int(value)
         except (TypeError, ValueError):
@@ -641,6 +724,8 @@ class LongTermRetriever:
         return max(minimum, parsed)
 
     def _empty_context(self) -> LongTermMemoryContext:
+        """Return an empty ``LongTermMemoryContext`` with all sections unset."""
+
         return LongTermMemoryContext(
             subtext_context=None,
             midterm_context=None,

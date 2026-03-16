@@ -1,3 +1,9 @@
+"""Run configuration checks for Twinr's operational surfaces.
+
+This module inspects API keys, audio devices, printer, camera, GPIO, PIR, and
+runtime-state paths and returns normalized check records for ops tooling.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
@@ -17,6 +23,8 @@ _PRINTER_CHECK_TIMEOUT_SECONDS = 5.0
 
 @dataclass(frozen=True, slots=True)
 class ConfigCheck:
+    """Represent one normalized configuration audit result."""
+
     key: str
     label: str
     status: str
@@ -35,6 +43,15 @@ class ConfigCheck:
 
 
 def run_config_checks(config: TwinrConfig) -> tuple[ConfigCheck, ...]:
+    """Run the standard Twinr ops configuration checks.
+
+    Args:
+        config: Twinr runtime configuration to inspect.
+
+    Returns:
+        A tuple of normalized ``ConfigCheck`` results ordered for UI display.
+    """
+
     # AUDIT-FIX(#2): Isolate each checker so one malformed config field cannot abort the whole audit run.
     checks: tuple[tuple[str, str, Callable[[TwinrConfig], ConfigCheck]], ...] = (
         ("openai_key", "OpenAI key", _openai_key_check),
@@ -52,6 +69,8 @@ def run_config_checks(config: TwinrConfig) -> tuple[ConfigCheck, ...]:
 
 
 def check_summary(checks: tuple[ConfigCheck, ...] | list[ConfigCheck]) -> dict[str, int]:
+    """Count configuration checks by normalized status."""
+
     summary = {"ok": 0, "warn": 0, "fail": 0}
     for check in checks:
         # AUDIT-FIX(#8): Unknown or malformed statuses are counted as failures instead of creating surprise keys.

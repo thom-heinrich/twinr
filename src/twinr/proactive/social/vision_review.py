@@ -1,3 +1,9 @@
+"""Review social triggers against recent vision frames.
+
+This module buffers recent camera snapshots, builds conservative second-opinion
+review prompts, and parses structured approval or skip decisions.
+"""
+
 from __future__ import annotations
 
 import asyncio  # AUDIT-FIX(#3): Provide an async-safe review path for async uvicorn call sites.
@@ -88,6 +94,8 @@ _DEFAULT_BACKEND_TIMEOUT_S = 6.0  # AUDIT-FIX(#1): Enforce a short latency budge
 
 # AUDIT-FIX(#5): Centralize finite timestamp coercion for temporal filtering and age calculations.
 def _coerce_timestamp(value: object) -> float | None:
+    """Coerce one value to a finite timestamp."""
+
     try:
         timestamp = float(value)
     except (TypeError, ValueError):
@@ -99,6 +107,8 @@ def _coerce_timestamp(value: object) -> float | None:
 
 # AUDIT-FIX(#8): Centralize numeric input hardening for public constructors and helper functions.
 def _coerce_int(value: object, *, minimum: int, default: int) -> int:
+    """Coerce one value to a bounded integer."""
+
     try:
         number = int(value)
     except (TypeError, ValueError):
@@ -108,6 +118,8 @@ def _coerce_int(value: object, *, minimum: int, default: int) -> int:
 
 # AUDIT-FIX(#8): Centralize numeric input hardening for public constructors and helper functions.
 def _coerce_float(value: object, *, minimum: float, default: float) -> float:
+    """Coerce one value to a bounded float."""
+
     number = _coerce_timestamp(value)
     if number is None:
         return default
@@ -115,6 +127,8 @@ def _coerce_float(value: object, *, minimum: float, default: float) -> float:
 
 
 def _stringify(value: object) -> str:
+    """Convert one optional value into text."""
+
     if value is None:
         return ""
     return str(value)
@@ -128,6 +142,8 @@ def _sanitize_text(
     ascii_only: bool = False,
     single_line: bool = False,
 ) -> str:
+    """Normalize, bound, and optionally ASCII-filter one text field."""
+
     text = _stringify(value).replace("\x00", " ")
     text = "".join(character if (character.isprintable() or character in "\n\t") else " " for character in text)
     if single_line:
@@ -147,6 +163,8 @@ def _sanitize_text(
 
 # AUDIT-FIX(#2): Encode upstream strings as inert JSON data before sending them to the reviewer model.
 def _json_untrusted(value: object, *, max_chars: int) -> str:
+    """Encode one untrusted value as inert JSON text."""
+
     return json.dumps(
         _sanitize_text(value, max_chars=max_chars, ascii_only=False, single_line=False),
         ensure_ascii=True,
@@ -154,10 +172,14 @@ def _json_untrusted(value: object, *, max_chars: int) -> str:
 
 
 def _yes_no(value: object) -> str:
+    """Render one truthy value as ``yes`` or ``no``."""
+
     return "yes" if bool(value) else "no"
 
 
 def _pose_value(value: object) -> str:
+    """Render one pose-like value as bounded ASCII text."""
+
     return (
         _sanitize_text(getattr(value, "value", value), max_chars=48, ascii_only=True, single_line=True).lower()
         or "unknown"
@@ -166,12 +188,16 @@ def _pose_value(value: object) -> str:
 
 # AUDIT-FIX(#7): Keep diagnostic IDs compact and ASCII-safe when propagating backend metadata.
 def _optional_short_ascii(value: object) -> str | None:
+    """Return one short ASCII string or ``None`` when empty."""
+
     text = _sanitize_text(value, max_chars=256, ascii_only=True, single_line=True)
     return text or None
 
 
 @dataclass(frozen=True, slots=True)
 class ProactiveVisionReview:
+    """Describe one structured second-opinion review decision."""
+
     approved: bool
     decision: str
     confidence: str
@@ -185,18 +211,26 @@ class ProactiveVisionReview:
 
 
 def is_reviewable_image_trigger(trigger_id: str) -> bool:
+    """Return whether one trigger id requires image review."""
+
     if not isinstance(trigger_id, str):  # AUDIT-FIX(#8): Harden the public helper against mixed Python call sites.
         return False
     return trigger_id.strip().lower() in _REVIEWABLE_TRIGGER_IDS
 
 
 class ProactiveVisionFrameBuffer:
+    """Store and sample recent reviewable vision frames."""
+
     def __init__(self, *, max_items: int = 12) -> None:
+        """Initialize one bounded frame buffer."""
+
         self.max_items = _coerce_int(max_items, minimum=1, default=12)  # AUDIT-FIX(#8): Clamp and normalize the public constructor input.
         self._frames: deque[ProactiveVisionSnapshot] = deque(maxlen=self.max_items)
         self._lock = Lock()  # AUDIT-FIX(#4): Serialize deque mutations and snapshotting.
 
     def record(self, snapshot: ProactiveVisionSnapshot) -> None:
+        """Add one usable vision snapshot to the buffer."""
+
         if getattr(snapshot, "image", None) is None:  # AUDIT-FIX(#5): Ignore unusable snapshots early.
             return
         if _coerce_timestamp(getattr(snapshot, "captured_at", None)) is None:  # AUDIT-FIX(#5): Ignore invalid timestamps early.
@@ -212,6 +246,8 @@ class ProactiveVisionFrameBuffer:
         max_age_s: float,
         min_spacing_s: float,
     ) -> tuple[ProactiveVisionSnapshot, ...]:
+        """Return recent buffered frames filtered by age and spacing."""
+
         now_timestamp = _coerce_timestamp(now)  # AUDIT-FIX(#5): Reject invalid review times instead of producing undefined age math.
         if now_timestamp is None:
             return ()
@@ -263,6 +299,8 @@ class ProactiveVisionFrameBuffer:
         *,
         target: int,
     ) -> list[ProactiveVisionSnapshot]:
+        """Reduce one ordered frame list to the requested count."""
+
         target = max(1, target)
         if len(items) <= target:
             return list(items)
@@ -282,6 +320,8 @@ class ProactiveVisionFrameBuffer:
 
 
 class OpenAIProactiveVisionReviewer:
+    """Ask the vision backend for one conservative second opinion."""
+
     def __init__(
         self,
         *,
@@ -292,6 +332,8 @@ class OpenAIProactiveVisionReviewer:
         min_spacing_s: float = 1.2,
         backend_timeout_s: float | None = _DEFAULT_BACKEND_TIMEOUT_S,
     ) -> None:
+        """Initialize one reviewer with buffering and latency budgets."""
+
         self.backend = backend
         self.frame_buffer = frame_buffer if frame_buffer is not None else ProactiveVisionFrameBuffer()  # AUDIT-FIX(#8): Preserve an explicitly supplied buffer instance regardless of truthiness.
         self.max_frames = _coerce_int(max_frames, minimum=1, default=4)
@@ -301,6 +343,8 @@ class OpenAIProactiveVisionReviewer:
         self.backend_timeout_s = max(0.1, timeout) if timeout is not None else None
 
     def record_snapshot(self, snapshot: ProactiveVisionSnapshot) -> None:
+        """Record one vision snapshot for later review."""
+
         self.frame_buffer.record(snapshot)
 
     async def areview(  # AUDIT-FIX(#3): Async callers can offload the blocking remote review without freezing the uvicorn event loop.
@@ -309,6 +353,8 @@ class OpenAIProactiveVisionReviewer:
         *,
         observation: SocialObservation,
     ) -> ProactiveVisionReview | None:
+        """Run ``review()`` on a worker thread for async callers."""
+
         return await asyncio.to_thread(self.review, trigger, observation=observation)
 
     def review(
@@ -317,6 +363,8 @@ class OpenAIProactiveVisionReviewer:
         *,
         observation: SocialObservation,
     ) -> ProactiveVisionReview | None:
+        """Review one trigger against recent buffered frames."""
+
         if not is_reviewable_image_trigger(getattr(trigger, "trigger_id", "")):
             return None
         observed_at = _coerce_timestamp(getattr(observation, "observed_at", None))
@@ -363,6 +411,8 @@ class OpenAIProactiveVisionReviewer:
         return parsed
 
     def _backend_timeout_kwargs(self) -> dict[str, float]:
+        """Return supported timeout kwargs for the review backend."""
+
         if self.backend_timeout_s is None:
             return {}
         try:
@@ -384,6 +434,8 @@ class OpenAIProactiveVisionReviewer:
         model: str | None = None,
         raw_text: str = "",
     ) -> ProactiveVisionReview:
+        """Build one conservative skip review result."""
+
         return ProactiveVisionReview(
             approved=False,
             decision="skip",
@@ -404,6 +456,8 @@ class OpenAIProactiveVisionReviewer:
         observation: SocialObservation,
         frames: tuple[ProactiveVisionSnapshot, ...],
     ) -> str:
+        """Build the structured review prompt for one trigger and frame set."""
+
         vision = getattr(observation, "vision", None)  # AUDIT-FIX(#6): Tolerate partial sensor objects instead of assuming perfect shape.
         audio = getattr(observation, "audio", None)
         trigger_id = _sanitize_text(getattr(trigger, "trigger_id", ""), max_chars=64, ascii_only=True, single_line=True).lower() or "unknown"
@@ -452,6 +506,8 @@ class OpenAIProactiveVisionReviewer:
         *,
         now: float,
     ) -> list[OpenAIImageInput]:
+        """Annotate buffered frames for the review backend."""
+
         images: list[OpenAIImageInput] = []
         total = len(frames)
         effective_now = _coerce_timestamp(now) or 0.0
@@ -485,6 +541,8 @@ def parse_proactive_vision_review_text(
     request_id: str | None = None,
     model: str | None = None,
 ) -> ProactiveVisionReview | None:
+    """Parse one structured reviewer response into a review result."""
+
     normalized_text = _sanitize_text(text, max_chars=_MAX_RAW_TEXT_CHARS, single_line=False)
     values: dict[str, str] = {}
     for raw_line in normalized_text.splitlines():

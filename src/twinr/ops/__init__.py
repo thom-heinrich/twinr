@@ -1,3 +1,9 @@
+"""Expose Twinr's operational support APIs.
+
+Import ops-facing checks, health snapshots, device diagnostics, locks, paths,
+usage tracking, self-tests, and support exports from this package root.
+"""
+
 from twinr.ops.devices import DeviceFact, DeviceOverview, DeviceStatus, collect_device_overview
 from twinr.ops.health import ServiceHealth, TwinrSystemHealth, collect_system_health
 from twinr.ops.checks import ConfigCheck, check_summary, run_config_checks

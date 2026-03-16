@@ -1,3 +1,5 @@
+"""Provide background reminder, automation, and proactive helpers."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,6 +9,7 @@ import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.agent.tools.handlers.automations import normalize_delivery
+from twinr.agent.tools.runtime.registry import is_automation_safe_tool_name
 from twinr.automations import AutomationAction, AutomationDefinition
 from twinr.memory.reminders import format_due_label
 from twinr.proactive import (
@@ -22,6 +25,8 @@ from twinr.providers.openai.backend import REMINDER_DELIVERY_INSTRUCTIONS
 
 @dataclass(slots=True)
 class _LocalMetadataResponse:
+    """Represent a locally generated fallback response for background work."""
+
     text: str
     model: str = "local_fallback"
     response_id: str | None = None
@@ -31,6 +36,12 @@ class _LocalMetadataResponse:
 
 
 class TwinrRealtimeBackgroundMixin:
+    """Handle background delivery paths without destabilizing the live loop.
+
+    The mixin keeps reminder, automation, and proactive follow-up work bounded
+    and makes telemetry or cleanup failures best-effort.
+    """
+
     # AUDIT-FIX(#8): Telemetry/status side-effects must be best-effort so completed speech/print actions do not get reclassified as failures.
     def _remember_background_fault(self, source: str, error: Exception | str) -> None:
         faults = getattr(self, "_background_faults", None)
@@ -1372,6 +1383,20 @@ class TwinrRealtimeBackgroundMixin:
                 self._print_automation_text(entry, composed_text, request_source="automation")
                 return
             self._speak_automation_text(entry, response_text)
+            return
+        if action_kind == "tool_call":
+            tool_name = self._require_non_empty_text(getattr(action, "tool_name", None), context="automation tool name")
+            if not is_automation_safe_tool_name(tool_name):
+                raise RuntimeError(f"Automation tool_call is not allowed for tool `{tool_name}`")
+            arguments = self._automation_payload(action)
+            handler_name = f"handle_{tool_name}"
+            handler = getattr(self.tool_executor, handler_name, None)
+            if not callable(handler):
+                raise RuntimeError(f"Automation tool_call handler is unavailable for tool `{tool_name}`")
+            result = handler(arguments)
+            self._safe_emit(f"automation_tool_call={tool_name}")
+            if isinstance(result, dict) and result.get("status"):
+                self._safe_emit(f"automation_tool_status={self._coerce_text(result.get('status'))}")
             return
         raise RuntimeError(f"Unsupported automation action kind during execution: {action_kind}")
 

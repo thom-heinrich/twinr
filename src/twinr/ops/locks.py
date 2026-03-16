@@ -1,3 +1,9 @@
+"""Coordinate single-instance Twinr loops through secure file locks.
+
+This module derives lock-file paths from runtime configuration and exposes
+helpers to acquire or inspect per-loop ownership.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -39,6 +45,8 @@ def _resolved_runtime_state_path(config: TwinrConfig) -> Path:
 
 
 def loop_lock_path(config: TwinrConfig, loop_name: str) -> Path:
+    """Return the canonical lock-file path for one Twinr loop."""
+
     runtime_state_path = _resolved_runtime_state_path(config)
     safe_loop_name = _validated_loop_name(loop_name)
     return runtime_state_path.parent / f"twinr-{safe_loop_name}.lock"
@@ -111,11 +119,15 @@ def _open_lock_file(path: Path, *, create: bool) -> TextIO:
 
 @dataclass(slots=True)
 class TwinrInstanceLock:
+    """Guard one Twinr runtime loop against concurrent local execution."""
+
     path: Path
     label: str
     _handle: TextIO | None = field(default=None, init=False, repr=False)  # AUDIT-FIX(#6): Use a concrete handle type for safer static checking.
 
     def acquire(self) -> "TwinrInstanceLock":
+        """Acquire the lock without waiting and record the current PID."""
+
         # AUDIT-FIX(#2): Prevent re-acquiring the same instance and leaking the original lock FD.
         if self._handle is not None:
             raise RuntimeError(f"The Twinr {self.label} lock is already acquired.")
@@ -151,6 +163,8 @@ class TwinrInstanceLock:
         return self
 
     def release(self) -> None:
+        """Release the lock and clear the owner metadata best-effort."""
+
         handle = self._handle
         if handle is None:
             return
@@ -181,6 +195,8 @@ class TwinrInstanceLock:
 def loop_instance_lock(
     config: TwinrConfig, loop_name: str, *, label: str | None = None
 ) -> TwinrInstanceLock:
+    """Build a ``TwinrInstanceLock`` for one named Twinr loop."""
+
     return TwinrInstanceLock(
         path=loop_lock_path(config, loop_name),
         label=label or loop_name.replace("-", " "),
@@ -188,6 +204,8 @@ def loop_instance_lock(
 
 
 def loop_lock_owner(config: TwinrConfig, loop_name: str) -> int | None:
+    """Return the owning PID for a held loop lock, if any."""
+
     path = loop_lock_path(config, loop_name)
 
     try:

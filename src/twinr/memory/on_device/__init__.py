@@ -1,3 +1,14 @@
+"""Provide Twinr's bounded on-device short-term memory package.
+
+Exports the typed records and in-memory store used for runtime conversation
+state, snapshot persistence, and the web memory view. The store keeps recent
+turns, compacted ledger notes, verified search results, and derived state
+bounded for Raspberry Pi-class devices.
+
+Import from ``twinr.memory`` for cross-package usage unless package-local code
+needs this narrower module path directly.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping  # AUDIT-FIX(#5): Sanitize restore inputs without assuming perfect runtime types.
@@ -7,11 +18,21 @@ from typing import Final  # AUDIT-FIX(#7): Use explicit bounded constants for in
 
 
 def _utcnow() -> datetime:
+    """Return the current UTC timestamp as an aware ``datetime``."""
+
     return datetime.now(timezone.utc)
 
 
 @dataclass(slots=True)
 class ConversationTurn:
+    """Store one user or assistant utterance in short-term memory.
+
+    Attributes:
+        role: Normalized speaker role stored in the raw tail.
+        content: Bounded utterance text kept for recent context.
+        created_at: UTC timestamp used for ordering and compaction.
+    """
+
     role: str
     content: str
     created_at: datetime = field(default_factory=_utcnow)
@@ -19,6 +40,16 @@ class ConversationTurn:
 
 @dataclass(slots=True)
 class MemoryLedgerItem:
+    """Store one deduplicated note or compacted summary entry.
+
+    Attributes:
+        kind: Ledger category such as ``conversation_summary`` or ``fact``.
+        content: Human-readable bounded text surfaced in summaries and UI views.
+        created_at: UTC timestamp for ordering and snapshot restore.
+        source: Provenance label for the ledger item.
+        metadata: Optional bounded key-value details associated with the item.
+    """
+
     kind: str
     content: str
     created_at: datetime = field(default_factory=_utcnow)
@@ -28,6 +59,17 @@ class MemoryLedgerItem:
 
 @dataclass(slots=True)
 class SearchMemoryEntry:
+    """Store one verified web lookup for short-term reuse.
+
+    Attributes:
+        question: Bounded normalized search question.
+        answer: Bounded normalized search answer.
+        sources: Source identifiers or URLs shown in the snapshot/UI layer.
+        created_at: UTC timestamp for recency and restore ordering.
+        location_hint: Optional location context attached to the lookup.
+        date_context: Optional explicit date context attached to the lookup.
+    """
+
     question: str
     answer: str
     sources: tuple[str, ...] = ()
@@ -38,6 +80,16 @@ class SearchMemoryEntry:
 
 @dataclass(slots=True)
 class MemoryState:
+    """Store derived runtime hints reconstructed from current short-term memory.
+
+    Attributes:
+        active_topic: Best-effort description of the current user topic.
+        last_user_goal: Latest remembered user goal or need.
+        pending_printable: Latest assistant text suitable for printer output.
+        last_search_summary: Best-effort summary of the latest verified lookup.
+        open_loops: Outstanding user asks that still need follow-up.
+    """
+
     active_topic: str | None = None
     last_user_goal: str | None = None
     pending_printable: str | None = None
@@ -46,6 +98,21 @@ class MemoryState:
 
 
 class OnDeviceMemory:
+    """Manage Twinr's bounded short-term memory on device.
+
+    The store keeps a raw tail of recent conversation turns, a deduplicated
+    ledger of compacted or tool-written memory items, recent verified search
+    results, and a derived ``MemoryState`` snapshot. When the raw tail grows
+    beyond ``max_turns``, older turns are summarized into ledger items so the
+    runtime stays bounded on Raspberry Pi-class devices.
+
+    Args:
+        max_turns: Maximum number of raw turns to retain before compaction.
+            Must be at least 3.
+        keep_recent: Number of newest raw turns preserved across compaction.
+            Must be between 1 and ``max_turns - 1``.
+    """
+
     _SUMMARY_HEADER: Final[str] = "Twinr memory summary:"  # AUDIT-FIX(#1): Detect only explicit memory-summary snapshots.
     _SUMMARY_ROLE: Final[str] = "system"  # AUDIT-FIX(#1): The synthetic summary is Twinr-authored framing for follow-up context.
     _SUMMARY_RESTORE_ROLES: Final[frozenset[str]] = frozenset({"system", "assistant"})  # AUDIT-FIX(#1): Accept older assistant-role snapshots written before the role regression was fixed.
@@ -81,6 +148,13 @@ class OnDeviceMemory:
 
     @property
     def turns(self) -> tuple[ConversationTurn, ...]:
+        """Return the synthetic summary turn followed by the recent raw tail.
+
+        The first returned turn is a generated ``system`` summary when the
+        ledger, search results, or derived state contain reusable context.
+        Otherwise this returns only the raw recent turns.
+        """
+
         summary_turn = self._build_summary_turn()
         raw_tail = tuple(self._clone_turn(turn) for turn in self._raw_tail)  # AUDIT-FIX(#3): Do not expose mutable internal turn objects.
         if summary_turn is None:
@@ -89,21 +163,40 @@ class OnDeviceMemory:
 
     @property
     def raw_tail(self) -> tuple[ConversationTurn, ...]:
+        """Return defensive copies of the unsummarized recent conversation turns."""
+
         return tuple(self._clone_turn(turn) for turn in self._raw_tail)  # AUDIT-FIX(#3): Return defensive copies.
 
     @property
     def ledger(self) -> tuple[MemoryLedgerItem, ...]:
+        """Return defensive copies of bounded ledger entries."""
+
         return tuple(self._clone_ledger_item(item) for item in self._ledger)  # AUDIT-FIX(#3): Return defensive copies.
 
     @property
     def search_results(self) -> tuple[SearchMemoryEntry, ...]:
+        """Return defensive copies of recent verified search results."""
+
         return tuple(self._clone_search_entry(item) for item in self._search_results)  # AUDIT-FIX(#3): Return defensive copies.
 
     @property
     def state(self) -> MemoryState:
+        """Return a defensive copy of the derived memory state."""
+
         return self._clone_state(self._state)  # AUDIT-FIX(#3): Keep callers from mutating internal state through returned objects.
 
     def reconfigure(self, *, max_turns: int, keep_recent: int) -> None:
+        """Update retention limits and recompact current memory if needed.
+
+        Args:
+            max_turns: New maximum number of raw turns to retain.
+            keep_recent: New number of newest turns preserved during compaction.
+
+        Raises:
+            ValueError: If either retention limit is outside the supported
+                bounded range.
+        """
+
         self._validate_limits(max_turns=max_turns, keep_recent=keep_recent)
         self.max_turns = max_turns
         self.keep_recent = keep_recent
@@ -115,6 +208,16 @@ class OnDeviceMemory:
         self._rebuild_state()
 
     def restore(self, turns: tuple[ConversationTurn, ...]) -> None:
+        """Restore memory from the legacy flat turn snapshot format.
+
+        Explicit summary turns with the Twinr memory header are converted back
+        into ledger items. Malformed turns are skipped instead of aborting the
+        restore path.
+
+        Args:
+            turns: Snapshot turns from older runtime persistence formats.
+        """
+
         self._raw_tail = []
         self._ledger = []
         self._search_results = []
@@ -147,6 +250,15 @@ class OnDeviceMemory:
         search_results: tuple[SearchMemoryEntry, ...],
         state: MemoryState | None,
     ) -> None:
+        """Restore memory from structured snapshot collections.
+
+        Args:
+            raw_tail: Recent unsummarized conversation turns.
+            ledger: Persisted ledger items, including compacted summaries.
+            search_results: Persisted verified search results.
+            state: Persisted derived memory state to sanitize and reuse.
+        """
+
         self._raw_tail = []
         for turn in raw_tail:
             normalized_turn = self._coerce_conversation_turn(turn)  # AUDIT-FIX(#5): Defensive restore against malformed turn payloads.
@@ -172,6 +284,24 @@ class OnDeviceMemory:
         self._rebuild_state(preserve_search_summary=state is not None)
 
     def remember(self, role: str, content: str) -> ConversationTurn:
+        """Store one conversation turn in the raw tail.
+
+        Blank content is normalized away and returned as a detached empty turn
+        without mutating internal memory state.
+
+        Args:
+            role: Speaker role for the turn. Supported values normalize to
+                ``user`` or ``assistant``.
+            content: Raw utterance text to store.
+
+        Returns:
+            A detached copy of the normalized turn that was stored, or an empty
+            detached turn when the content collapses to blank.
+
+        Raises:
+            ValueError: If ``role`` does not normalize to a supported role.
+        """
+
         normalized_role = self._normalize_role(role)  # AUDIT-FIX(#4): Enforce supported conversation roles.
         if normalized_role is None:
             raise ValueError("role must be 'user' or 'assistant'")
@@ -197,6 +327,25 @@ class OnDeviceMemory:
         source: str = "tool",
         metadata: dict[str, str] | None = None,
     ) -> MemoryLedgerItem:
+        """Store a normalized note in the bounded memory ledger.
+
+        Notes are deduplicated by normalized ``kind`` and ``content``. ``fact``
+        and ``preference`` notes also refresh ``last_user_goal`` in the derived
+        memory state.
+
+        Args:
+            kind: Ledger category to store.
+            content: Human-readable note content.
+            source: Provenance label for the note.
+            metadata: Optional bounded string metadata associated with the note.
+
+        Returns:
+            A detached copy of the stored ledger item.
+
+        Raises:
+            ValueError: If ``content`` normalizes to blank.
+        """
+
         clean_kind = self._normalize_text(kind, limit=self._MAX_NOTE_KIND_CHARS, collapse_whitespace=True).lower() or "memory"  # AUDIT-FIX(#5): Sanitize note kind inputs.
         clean_content = self._normalize_text(content, limit=self._MAX_NOTE_CONTENT_CHARS, collapse_whitespace=True)
         if not clean_content:
@@ -222,6 +371,25 @@ class OnDeviceMemory:
         location_hint: str | None = None,
         date_context: str | None = None,
     ) -> SearchMemoryEntry:
+        """Store a verified search result and reflect it into derived memory.
+
+        The stored entry is also mirrored into the ledger as a ``search_result``
+        item so summary turns and snapshot views can surface the lookup.
+
+        Args:
+            question: Search question that was resolved.
+            answer: Verified answer returned to the user.
+            sources: Optional source identifiers or URLs for the lookup.
+            location_hint: Optional place context attached to the result.
+            date_context: Optional explicit date string attached to the result.
+
+        Returns:
+            A detached copy of the stored search result.
+
+        Raises:
+            ValueError: If ``question`` or ``answer`` normalizes to blank.
+        """
+
         entry = SearchMemoryEntry(
             question=self._normalize_text(question, limit=self._MAX_SEARCH_QUESTION_CHARS),
             answer=self._normalize_text(answer, limit=self._MAX_SEARCH_ANSWER_CHARS),
@@ -256,6 +424,8 @@ class OnDeviceMemory:
         return self._clone_search_entry(stored_entry)  # AUDIT-FIX(#3): Return a detached copy.
 
     def last_assistant_message(self) -> str | None:
+        """Return the newest assistant message from the raw tail, if any."""
+
         for turn in reversed(self._raw_tail):
             if turn.role == "assistant":
                 return turn.content

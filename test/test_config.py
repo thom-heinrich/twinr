@@ -268,6 +268,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LONG_TERM_MEMORY_RECALL_LIMIT=5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_READ_TIMEOUT_S=5.5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S=11.5",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_KEEPALIVE_INTERVAL_S=2.25",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_RETRY_ATTEMPTS=4",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_RETRY_BACKOFF_S=2.5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_FLUSH_TIMEOUT_S=75",
@@ -575,6 +576,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_recall_limit, 5)
         self.assertEqual(config.long_term_memory_remote_read_timeout_s, 5.5)
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 11.5)
+        self.assertEqual(config.long_term_memory_remote_keepalive_interval_s, 2.25)
         self.assertEqual(config.long_term_memory_remote_retry_attempts, 4)
         self.assertEqual(config.long_term_memory_remote_retry_backoff_s, 2.5)
         self.assertEqual(config.long_term_memory_remote_flush_timeout_s, 75.0)
@@ -727,6 +729,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_recall_limit, 3)
         self.assertEqual(config.long_term_memory_remote_read_timeout_s, 8.0)
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 15.0)
+        self.assertEqual(config.long_term_memory_remote_keepalive_interval_s, 5.0)
         self.assertEqual(config.long_term_memory_remote_retry_attempts, 3)
         self.assertEqual(config.long_term_memory_remote_retry_backoff_s, 1.0)
         self.assertEqual(config.long_term_memory_remote_flush_timeout_s, 60.0)
