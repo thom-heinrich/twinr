@@ -1,0 +1,63 @@
+schema_version: 1
+name: capabilities
+path: src/twinr/providers/openai/capabilities
+kind: python-package
+visibility: internal
+summary: Provide the capability-specific mixins that implement Twinr's OpenAI response, search, speech, phrasing, and print behaviors.
+owned_concerns:
+  - Implement generic text, vision, and streaming response helpers on top of shared OpenAI request builders
+  - Implement live-search prompt shaping, model fallback, and source extraction for fresh-information questions
+  - Implement speech-to-text and text-to-speech helpers with bounded audio request behavior
+  - Implement reminder, proactive, and automation phrasing with deterministic local fallbacks
+  - Implement printer-safe print composition and receipt sanitization
+out_of_scope:
+  - Low-level client construction, shared request builders, and base types in src/twinr/providers/openai/core
+  - Public backend composition and contract adapters in src/twinr/providers/openai/api
+  - Realtime websocket session orchestration in src/twinr/providers/openai/realtime
+files:
+  - path: __init__.py
+    role: Export the public capability mixins
+    exports:
+      - OpenAIMessagePhrasingMixin
+      - OpenAIPrintMixin
+      - OpenAIResponseMixin
+      - OpenAISearchMixin
+      - OpenAISpeechMixin
+  - path: responses.py
+    role: Implement generic text, vision, and streaming response helpers
+    exports:
+      - OpenAIResponseMixin
+  - path: search.py
+    role: Implement live-search request shaping and source extraction
+    exports:
+      - OpenAISearchMixin
+  - path: speech.py
+    role: Implement STT and TTS helpers with model-aware request shaping
+    exports:
+      - OpenAISpeechMixin
+  - path: phrasing.py
+    role: Implement reminder, proactive, and automation phrasing helpers
+    exports:
+      - OpenAIMessagePhrasingMixin
+  - path: printing.py
+    role: Implement printer-safe composition and print sanitization
+    exports:
+      - OpenAIPrintMixin
+public_api:
+  module: twinr.providers.openai.capabilities
+  exports:
+    - OpenAIMessagePhrasingMixin
+    - OpenAIPrintMixin
+    - OpenAIResponseMixin
+    - OpenAISearchMixin
+    - OpenAISpeechMixin
+primary_callers:
+  - path: src/twinr/providers/openai/api/backend.py
+  - path: src/twinr/providers/openai/api/adapters.py
+  - path: src/twinr/providers/openai/__init__.py
+tests:
+  - path: test/test_openai_backend.py
+  - path: test/test_openai_adapters.py
+  - path: test/test_runner.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_streaming_runner.py

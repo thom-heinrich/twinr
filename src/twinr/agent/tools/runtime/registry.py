@@ -11,6 +11,8 @@ from __future__ import annotations
 from inspect import Parameter, signature  # AUDIT-FIX(#3): Validate handler signatures during binding.
 from typing import Any, Callable
 
+from twinr.agent.tools.runtime.broker_policy import default_automation_tool_broker_policy
+
 _REALTIME_TOOL_BINDINGS: tuple[tuple[str, str], ...] = (
     ("print_receipt", "handle_print_receipt"),
     ("search_live_info", "handle_search_live_info"),
@@ -23,6 +25,8 @@ _REALTIME_TOOL_BINDINGS: tuple[tuple[str, str], ...] = (
     ("delete_automation", "handle_delete_automation"),
     ("propose_skill_learning", "handle_propose_skill_learning"),
     ("answer_skill_question", "handle_answer_skill_question"),
+    ("confirm_skill_activation", "handle_confirm_skill_activation"),
+    ("rollback_skill_activation", "handle_rollback_skill_activation"),
     ("remember_memory", "handle_remember_memory"),
     ("remember_contact", "handle_remember_contact"),
     ("lookup_contact", "handle_lookup_contact"),
@@ -39,14 +43,6 @@ _REALTIME_TOOL_BINDINGS: tuple[tuple[str, str], ...] = (
     ("inspect_camera", "handle_inspect_camera"),
     ("end_conversation", "handle_end_conversation"),
 )
-_BACKGROUND_AUTOMATION_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "inspect_camera",
-        "print_receipt",
-        "search_live_info",
-    }
-)
-
 RealtimeToolHandler = Callable[[dict[str, Any]], Any]
 
 
@@ -107,13 +103,13 @@ def realtime_tool_names() -> tuple[str, ...]:
 def automation_safe_tool_names() -> tuple[str, ...]:
     """Return the tool names that background automations may execute directly."""
 
-    return tuple(sorted(_BACKGROUND_AUTOMATION_SAFE_TOOL_NAMES))
+    return default_automation_tool_broker_policy().allowed_tool_names
 
 
 def is_automation_safe_tool_name(tool_name: str) -> bool:
     """Return whether one tool may be executed from background automations."""
 
-    return str(tool_name or "").strip() in _BACKGROUND_AUTOMATION_SAFE_TOOL_NAMES
+    return default_automation_tool_broker_policy().is_allowed(tool_name)
 
 
 def _handler_accepts_payload(handler: Callable[..., Any]) -> bool:

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Configure and optionally probe Twinr button GPIO mappings.
+#
+# Persists button GPIO settings into the selected `.env` file and can launch
+# the matching Python probe to confirm that the configured lines emit events.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

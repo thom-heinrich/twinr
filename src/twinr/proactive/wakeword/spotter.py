@@ -15,7 +15,7 @@ from threading import RLock
 from typing import Any, Callable
 
 from twinr.hardware.audio import AmbientAudioCaptureWindow, pcm16_to_wav_bytes
-from twinr.providers.openai.backend import OpenAIBackend
+from twinr.providers.openai import OpenAIBackend
 
 from .matching import WakewordMatch, match_wakeword_transcript, phrase_from_detector_label, wakeword_primary_prompt
 

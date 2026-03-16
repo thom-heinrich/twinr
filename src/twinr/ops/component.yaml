@@ -3,11 +3,12 @@ name: ops
 path: src/twinr/ops
 kind: python-package
 visibility: internal
-summary: Provide Twinr's operational support layer for config checks, health snapshots, device diagnostics, singleton loop locks, file-backed ops stores, self-tests, and support exports.
+summary: Provide Twinr's operational support layer for config checks, health snapshots, device diagnostics, singleton loop locks, file-backed ops stores, the rolling remote-memory watchdog, self-tests, and support exports.
 owned_concerns:
   - Resolve canonical filesystem paths for ops artifacts, stores, self-tests, and support bundles
   - Persist sanitized operational events and provider usage telemetry as bounded JSONL stores
   - Sample config, device, and host health for Twinr's local web UI and support workflows
+  - Run a dedicated rolling remote-memory watchdog that reuses Twinr's fail-closed readiness probe
   - Coordinate singleton loop ownership through secure per-loop lock files
   - Run bounded hardware self-tests and build redacted support bundles from local ops evidence
 out_of_scope:
@@ -88,6 +89,12 @@ files:
       - ServiceHealth
       - TwinrSystemHealth
       - collect_system_health
+  - path: remote_memory_watchdog.py
+    role: Rolling remote-memory watchdog and state artifact writer
+    exports:
+      - RemoteMemoryWatchdog
+      - RemoteMemoryWatchdogSample
+      - RemoteMemoryWatchdogSnapshot
   - path: devices.py
     role: Dashboard-ready device overview probes and summaries
     exports:
@@ -115,6 +122,9 @@ public_api:
     - ConfigCheck
     - ServiceHealth
     - SelfTestResult
+    - RemoteMemoryWatchdog
+    - RemoteMemoryWatchdogSample
+    - RemoteMemoryWatchdogSnapshot
     - SupportBundleInfo
     - TokenUsage
     - TwinrInstanceLock

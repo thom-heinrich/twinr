@@ -3,17 +3,22 @@ name: self_coding
 path: src/twinr/agent/self_coding
 kind: python-package
 visibility: internal
-summary: Adaptive Skill Engine core package for contracts, runtime persistence, deterministic capability readiness, feasibility checks, and requirements dialogue.
+summary: Adaptive Skill Engine core package for contracts, runtime persistence, deterministic capability readiness, requirements dialogue, the first automation_manifest compiler, the first local compile-worker slice with a pinned Codex SDK primary, and soft-launch activation.
 owned_concerns:
   - Define the stable internal contract objects used across future ASE layers
   - Persist compile jobs and compile artifacts under the Twinr runtime state tree
+  - Persist compile run status for operator/debug visibility under the Twinr runtime state tree
   - Resolve the deterministic MVP capability readiness view for self-coding feasibility checks
   - Decide whether a draft skill request fits the current automation-first or later skill-package envelope
   - Persist and advance the deterministic requirements-dialogue state machine for self-coding
+  - Validate and canonicalize automation_manifest compile outputs into activation-ready Twinr artifacts
+  - Create queued self-coding compile jobs and run them through bounded local Codex drivers
+  - Stage, confirm, and roll back versioned automation-backed learned skills
+  - Build compact operator-facing status summaries from persisted self-coding state
 out_of_scope:
   - Workflow-loop orchestration and live conversation hooks
-  - Provider-specific Codex/OpenAI driver execution
-  - Compile prompting, test generation, and artifact production logic
+  - Long-horizon health scoring and autonomous pause policy
+  - Deep compile-target validation and later compiler specialization work
   - Sandboxed skill execution and brokered effect enforcement
 files:
   - path: __init__.py
@@ -21,23 +26,29 @@ files:
     exports:
       - ActivationRecord
       - ArtifactKind
+      - build_self_coding_operator_status
       - CapabilityAvailability
       - CapabilityDefinition
       - CapabilityRiskClass
       - CapabilityStatus
       - CompileArtifactRecord
       - CompileJobRecord
+      - CompileRunStatusRecord
       - CompileJobStatus
       - CompileTarget
+      - CodexSdkDriver
       - FeasibilityOutcome
       - FeasibilityResult
       - LearnedSkillStatus
+      - LocalCodexCompileDriver
+      - SelfCodingActivationService
       - RequirementsDialogueSession
       - RequirementsDialogueStatus
       - SelfCodingCapabilityRegistry
       - SelfCodingFeasibilityChecker
       - SelfCodingLearningFlow
       - SelfCodingLearningUpdate
+      - SelfCodingOperatorStatus
       - SelfCodingRequirementsDialogue
       - SelfCodingStore
       - SkillSpec
@@ -49,6 +60,8 @@ files:
     role: Shared ASE lifecycle enums
   - path: store.py
     role: File-backed self-coding persistence layer
+  - path: compiler
+    role: Deterministic compile-target validation and canonicalization
   - path: capability_registry.py
     role: Deterministic MVP capability readiness resolver
   - path: feasibility.py
@@ -57,28 +70,43 @@ files:
     role: Deterministic Phase-2 dialogue state machine
   - path: learning_flow.py
     role: Thin application service coordinating feasibility and dialogue persistence
+  - path: worker.py
+    role: Queued compile-job creation and local compile execution
+  - path: activation.py
+    role: Versioned soft-launch staging, confirmation, and rollback
+  - path: operator_status.py
+    role: Compact operator-facing status summary
+  - path: codex_driver
+    role: Pinned Codex SDK bridge, exec fallback, and bounded workspace helpers
 public_api:
   module: twinr.agent.self_coding
   exports:
     - ActivationRecord
     - ArtifactKind
+    - build_self_coding_operator_status
     - CapabilityAvailability
     - CapabilityDefinition
     - CapabilityRiskClass
     - CapabilityStatus
     - CompileArtifactRecord
     - CompileJobRecord
+    - CompileRunStatusRecord
     - CompileJobStatus
     - CompileTarget
+    - CodexSdkDriver
     - FeasibilityOutcome
     - FeasibilityResult
     - LearnedSkillStatus
+    - LocalCodexCompileDriver
+    - SelfCodingActivationService
     - RequirementsDialogueSession
     - RequirementsDialogueStatus
     - SelfCodingCapabilityRegistry
+    - SelfCodingCompileWorker
     - SelfCodingFeasibilityChecker
     - SelfCodingLearningFlow
     - SelfCodingLearningUpdate
+    - SelfCodingOperatorStatus
     - SelfCodingRequirementsDialogue
     - SelfCodingStore
     - SkillSpec
@@ -93,3 +121,8 @@ tests:
   - path: test/test_self_coding_registry.py
   - path: test/test_self_coding_feasibility.py
   - path: test/test_self_coding_dialogue.py
+  - path: test/test_self_coding_compiler.py
+  - path: test/test_self_coding_compile_status.py
+  - path: test/test_self_coding_worker.py
+  - path: test/test_self_coding_activation.py
+  - path: test/test_self_coding_codex_driver.py

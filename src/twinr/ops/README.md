@@ -2,8 +2,8 @@
 
 `ops` owns Twinr's local operational support layer. It provides config audits,
 device and host snapshots, singleton loop locks, file-backed ops stores,
-bounded self-tests, and redacted support exports for the web UI and operator
-tools.
+the rolling remote-memory watchdog, bounded self-tests, and redacted support
+exports for the web UI and operator tools.
 
 ## Responsibility
 
@@ -11,6 +11,8 @@ tools.
 - resolve canonical paths for ops artifacts and stores
 - persist sanitized ops events and usage telemetry
 - collect config, device, and system-health snapshots
+- run a dedicated rolling ChonkyDB remote-memory watchdog
+- infer companion-loop health from loop locks when no standalone process exists
 - coordinate per-loop singleton locks
 - run bounded self-tests and build support bundles
 
@@ -31,6 +33,7 @@ tools.
 | [usage.py](./usage.py) | Usage telemetry store |
 | [checks.py](./checks.py) | Config audit checks |
 | [health.py](./health.py) | Host and service health |
+| [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog |
 | [devices.py](./devices.py) | Device overview probes |
 | [self_test.py](./self_test.py) | Bounded hardware self-tests |
 | [support.py](./support.py) | Support bundle export |
@@ -54,6 +57,13 @@ from twinr.ops import TwinrSelfTestRunner, collect_system_health
 
 health = collect_system_health(config)
 result = TwinrSelfTestRunner(config).run("printer")
+```
+
+```python
+from twinr.ops import RemoteMemoryWatchdog
+
+watchdog = RemoteMemoryWatchdog.from_config(config)
+watchdog.run(duration_s=5.0)
 ```
 
 ## See also

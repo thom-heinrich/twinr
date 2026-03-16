@@ -4,11 +4,13 @@
 
 # Local workflow tooling.
 AGENTS.md
+!hardware/AGENTS.md
 !src/twinr/memory/longterm/runtime/AGENTS.md
 !src/twinr/proactive/governance/AGENTS.md
 !src/twinr/proactive/runtime/AGENTS.md
 !src/twinr/providers/deepgram/AGENTS.md
 !src/twinr/providers/groq/AGENTS.md
+!src/twinr/integrations/email/AGENTS.md
 .codex/
 agentic_tools/
 common/
@@ -26,4 +28,5 @@ state/*.lock
 __pycache__/
 *.pyc
 *.egg-info/
+node_modules/
 hardware/display/vendor/

@@ -1,3 +1,4 @@
+
 """Define versioned contract objects for the Adaptive Skill Engine core.
 
 The dataclasses in this module are the storage and handoff boundary between
@@ -12,6 +13,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
+from math import isfinite
+from pathlib import PurePosixPath
+import re
 from typing import Any, ClassVar
 
 from twinr.text_utils import is_valid_stable_identifier, slugify_identifier, truncate_text
@@ -35,11 +39,44 @@ _FEASIBILITY_RESULT_SCHEMA = "twinr_self_coding_feasibility_result_v1"
 _REQUIREMENTS_DIALOGUE_SESSION_SCHEMA = "twinr_self_coding_requirements_dialogue_session_v1"
 _COMPILE_JOB_SCHEMA = "twinr_self_coding_compile_job_v1"
 _COMPILE_ARTIFACT_SCHEMA = "twinr_self_coding_compile_artifact_v1"
+_COMPILE_RUN_STATUS_SCHEMA = "twinr_self_coding_compile_run_status_v1"
 _ACTIVATION_RECORD_SCHEMA = "twinr_self_coding_activation_record_v1"
+
+_MAX_STABLE_IDENTIFIER_LENGTH = 128
+_MAX_PATH_LENGTH = 240
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class FrozenJsonDict(dict):
+    """Read-only JSON mapping used inside frozen contract objects."""
+
+    __slots__ = ()
+
+    def _immutable(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("JSON mappings are immutable")  # AUDIT-FIX(#9): Prevent mutation through nested dict fields inside frozen dataclasses.
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+    def __ior__(self, other: object):  # pragma: no cover - defensive API surface
+        self._immutable(other)
+        return self
+
+    def copy(self) -> dict[str, Any]:
+        return dict(self)
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _stringify(value: object | None) -> str:
+    return "" if value is None else str(value)
 
 
 def _normalize_datetime(value: datetime | str | None, *, field_name: str) -> datetime:
@@ -49,12 +86,14 @@ def _normalize_datetime(value: datetime | str | None, *, field_name: str) -> dat
         text = value.strip()
         if not text:
             raise ValueError(f"{field_name} must not be empty")
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if text.endswith(("Z", "z")):
+            text = f"{text[:-1]}+00:00"  # AUDIT-FIX(#2): Only normalize an explicit UTC suffix instead of replacing every 'Z' in the string.
+        parsed = datetime.fromisoformat(text)
     else:
         raise TypeError(f"{field_name} must be a datetime or ISO timestamp")
 
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        parsed = parsed.replace(tzinfo=UTC)
+        raise ValueError(f"{field_name} must include timezone information")  # AUDIT-FIX(#2): Reject naive datetimes instead of silently assuming UTC.
     return parsed.astimezone(UTC)
 
 
@@ -63,40 +102,48 @@ def _datetime_payload(value: datetime) -> str:
 
 
 def _require_text(value: object, *, field_name: str, limit: int) -> str:
-    text = truncate_text(str(value or ""), limit=limit)
+    text = truncate_text(_stringify(value), limit=limit).strip()  # AUDIT-FIX(#8): Strip whitespace so empty-looking values do not pass validation.
     if not text:
         raise ValueError(f"{field_name} must not be empty")
     return text
 
 
 def _optional_text(value: object | None, *, limit: int) -> str | None:
-    text = truncate_text("" if value is None else str(value), limit=limit)
+    text = truncate_text(_stringify(value), limit=limit).strip()  # AUDIT-FIX(#8): Normalize surrounding whitespace for optional text fields too.
     return text or None
 
 
 def _require_stable_identifier(value: object, *, field_name: str) -> str:
-    text = truncate_text(str(value or "").strip().lower(), limit=128)
+    text = _stringify(value).strip().lower()
+    if len(text) > _MAX_STABLE_IDENTIFIER_LENGTH:
+        raise ValueError(f"{field_name} must be <= {_MAX_STABLE_IDENTIFIER_LENGTH} characters")  # AUDIT-FIX(#3): Reject overlong IDs instead of truncating them into a different identifier.
     if not is_valid_stable_identifier(text):
         raise ValueError(f"{field_name} must be a stable identifier")
     return text
 
 
 def _coerce_skill_id(value: object, *, name: str) -> str:
-    raw = truncate_text(str(value or "").strip().lower(), limit=128)
-    if is_valid_stable_identifier(raw):
-        return raw
-    generated = slugify_identifier(name, fallback="skill")
-    if not is_valid_stable_identifier(generated):
-        raise ValueError("skill_id must be a stable identifier")
-    return generated
+    raw = _stringify(value).strip().lower()
+    if not raw:
+        generated = slugify_identifier(name, fallback="skill")
+        if not is_valid_stable_identifier(generated):
+            raise ValueError("skill_id must be a stable identifier")
+        return generated
+    if len(raw) > _MAX_STABLE_IDENTIFIER_LENGTH:
+        raise ValueError(f"skill_id must be <= {_MAX_STABLE_IDENTIFIER_LENGTH} characters")  # AUDIT-FIX(#3): Reject explicit IDs that are too long instead of truncating them.
+    if not is_valid_stable_identifier(raw):
+        raise ValueError("skill_id must be a stable identifier")  # AUDIT-FIX(#3): Only auto-generate a skill_id when it is blank, never when the caller supplied an invalid one.
+    return raw
 
 
 def _optional_stable_identifier(value: object | None, *, field_name: str) -> str | None:
     if value is None:
         return None
-    text = truncate_text(str(value or "").strip().lower(), limit=128)
+    text = _stringify(value).strip().lower()
     if not text:
         return None
+    if len(text) > _MAX_STABLE_IDENTIFIER_LENGTH:
+        raise ValueError(f"{field_name} must be <= {_MAX_STABLE_IDENTIFIER_LENGTH} characters")  # AUDIT-FIX(#3): Reject overlong optional IDs instead of silently truncating them.
     if not is_valid_stable_identifier(text):
         raise ValueError(f"{field_name} must be a stable identifier")
     return text
@@ -136,26 +183,112 @@ def _text_tuple(values: object, *, field_name: str, limit: int) -> tuple[str, ..
     normalized: list[str] = []
     seen: set[str] = set()
     for raw_item in raw_items:
-        item = truncate_text(str(raw_item or ""), limit=limit)
-        if not item or item in seen:
+        item = _optional_text(raw_item, limit=limit)  # AUDIT-FIX(#8): Reuse stripped text normalization so whitespace-only entries are dropped.
+        if item is None or item in seen:
             continue
         seen.add(item)
         normalized.append(item)
     return tuple(normalized)
 
 
+def _require_bool(value: object, *, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise TypeError(f"{field_name} must be a boolean")  # AUDIT-FIX(#7): Reject truthy strings and integers instead of coercing them with bool(...).
+
+
+def _require_positive_int(value: object, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be an integer")  # AUDIT-FIX(#7): Reject bool/float/string inputs instead of truncating or reinterpreting them.
+    if value < 1:
+        raise ValueError(f"{field_name} must be >= 1")
+    return value
+
+
+def _require_non_negative_int(value: object, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be an integer")  # AUDIT-FIX(#7): Enforce exact integer shape for counters and byte sizes.
+    if value < 0:
+        raise ValueError(f"{field_name} must be >= 0")
+    return value
+
+
+def _optional_non_negative_int(value: object | None, *, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _require_non_negative_int(value, field_name=field_name)
+
+
+def _optional_safe_relative_path(value: object | None, *, field_name: str, limit: int = _MAX_PATH_LENGTH) -> str | None:
+    text = _stringify(value).strip()
+    if not text:
+        return None
+    if len(text) > limit:
+        raise ValueError(f"{field_name} must be <= {limit} characters")
+    if "\x00" in text or "\\" in text or any(ord(char) < 32 for char in text):
+        raise ValueError(f"{field_name} must not contain control characters or backslashes")  # AUDIT-FIX(#1): Reject path payloads that can confuse downstream file operations.
+    path = PurePosixPath(text)
+    parts = path.parts
+    if path.is_absolute() or str(path) in {".", ".."} or not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"{field_name} must be a safe relative path")  # AUDIT-FIX(#1): Block absolute paths and traversal segments at the contract boundary.
+    return str(path)
+
+
+def _optional_sha256(value: object | None, *, field_name: str) -> str | None:
+    text = _stringify(value).strip().lower()
+    if not text:
+        return None
+    if not _SHA256_RE.fullmatch(text):
+        raise ValueError(f"{field_name} must be a 64-character lowercase SHA-256 hex digest")  # AUDIT-FIX(#1): Validate integrity digests instead of storing arbitrary text.
+    return text
+
+
+def _normalize_json_value(value: object, *, field_name: str, path: str = "$") -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise TypeError(f"{field_name} must not contain NaN or infinity at {path}")
+        return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        normalized: dict[str, Any] = {}
+        for raw_key, raw_item in value.items():
+            if not isinstance(raw_key, str):
+                raise TypeError(f"{field_name} keys must be strings at {path}")  # AUDIT-FIX(#9): Enforce deterministic JSON object keys instead of silently stringifying them.
+            child_path = f"{path}.{raw_key}"
+            normalized[raw_key] = _normalize_json_value(raw_item, field_name=field_name, path=child_path)
+        return FrozenJsonDict(normalized)  # AUDIT-FIX(#9): Store frozen JSON mappings so nested state cannot be mutated after validation.
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(
+            _normalize_json_value(item, field_name=field_name, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        )
+    raise TypeError(f"{field_name} must be JSON serializable at {path}")
+
+
 def _json_mapping(value: object | None, *, field_name: str) -> dict[str, Any]:
     if value is None:
-        return {}
+        return FrozenJsonDict()  # AUDIT-FIX(#9): Always hand out a dedicated immutable mapping, never a shared mutable default.
     if not isinstance(value, Mapping):
         raise TypeError(f"{field_name} must be a mapping")
-    try:
-        normalized = json.loads(json.dumps(dict(value), ensure_ascii=False, sort_keys=True, allow_nan=False))
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{field_name} must be JSON serializable") from exc
-    if not isinstance(normalized, dict):
+    normalized = _normalize_json_value(dict(value), field_name=field_name)
+    if not isinstance(normalized, FrozenJsonDict):
         raise TypeError(f"{field_name} must serialize to a JSON object")
     return normalized
+
+
+def _payload_json_mapping(value: object | None, *, field_name: str) -> dict[str, Any]:
+    normalized = _json_mapping(value, field_name=field_name)
+    payload = json.loads(json.dumps(normalized, ensure_ascii=False, sort_keys=True, allow_nan=False))
+    if not isinstance(payload, dict):
+        raise TypeError(f"{field_name} must serialize to a JSON object")
+    return payload  # AUDIT-FIX(#9): Deep-copy mapping payloads so callers cannot mutate live contract state through to_payload().
 
 
 def _require_mapping(payload: object, *, context: str) -> dict[str, Any]:
@@ -166,14 +299,21 @@ def _require_mapping(payload: object, *, context: str) -> dict[str, Any]:
 
 def _validate_schema(payload: Mapping[str, Any], *, expected: str, context: str) -> None:
     schema = payload.get("schema")
-    if schema is not None and schema != expected:
+    if not isinstance(schema, str) or not schema:
+        raise ValueError(f"{context} payload missing schema")  # AUDIT-FIX(#4): Require an explicit schema marker on every versioned payload.
+    if schema != expected:
         raise ValueError(f"{context} payload schema mismatch: {schema!r} != {expected!r}")
+
+
+def _ensure_not_before(later: datetime, earlier: datetime, *, later_name: str, earlier_name: str) -> None:
+    if later < earlier:
+        raise ValueError(f"{later_name} must be >= {earlier_name}")  # AUDIT-FIX(#2): Reject impossible temporal ordering before the state hits disk.
 
 
 def _coerce_enum(enum_type, value: object, *, field_name: str):
     if isinstance(value, enum_type):
         return value
-    text = truncate_text(str(value or "").strip().lower(), limit=64)
+    text = truncate_text(_stringify(value), limit=64).strip().lower()
     try:
         return enum_type(text)
     except ValueError as exc:
@@ -209,7 +349,7 @@ class SkillTriggerSpec:
         _validate_schema(record, expected=cls.schema_name, context="skill trigger")
         return cls(
             mode=record.get("mode", ""),
-            conditions=tuple(record.get("conditions", ())),
+            conditions=record.get("conditions", ()),  # AUDIT-FIX(#5): Preserve the raw payload shape so validators can reject strings/mappings instead of tuple-mangling them.
         )
 
 
@@ -237,14 +377,11 @@ class SkillSpec:
         object.__setattr__(self, "skill_id", _coerce_skill_id(self.skill_id, name=name))
         if not isinstance(self.trigger, SkillTriggerSpec):
             raise TypeError("trigger must be a SkillTriggerSpec")
-        object.__setattr__(self, "scope", _json_mapping(self.scope, field_name="scope"))
-        object.__setattr__(self, "constraints", _stable_identifier_tuple(self.constraints, field_name="constraints"))
+        object.__setattr__(self, "scope", _json_mapping(self.scope, field_name="scope"))  # AUDIT-FIX(#9): Freeze validated JSON mappings stored on the contract object.
+        object.__setattr__(self, "constraints", _text_tuple(self.constraints, field_name="constraints", limit=220))  # AUDIT-FIX(#6): Keep constraints as free text so dialogue -> skill conversion does not fail.
         object.__setattr__(self, "capabilities", _stable_identifier_tuple(self.capabilities, field_name="capabilities"))
         object.__setattr__(self, "created_at", _normalize_datetime(self.created_at, field_name="created_at"))
-        normalized_version = int(self.version)
-        if normalized_version < 1:
-            raise ValueError("version must be >= 1")
-        object.__setattr__(self, "version", normalized_version)
+        object.__setattr__(self, "version", _require_positive_int(self.version, field_name="version"))  # AUDIT-FIX(#7): Reject bool/float/string version payloads instead of coercing them.
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -253,7 +390,7 @@ class SkillSpec:
             "name": self.name,
             "action": self.action,
             "trigger": self.trigger.to_payload(),
-            "scope": self.scope,
+            "scope": _payload_json_mapping(self.scope, field_name="scope"),  # AUDIT-FIX(#9): Serialize a detached copy of scope so callers cannot mutate the live object.
             "constraints": list(self.constraints),
             "capabilities": list(self.capabilities),
             "created_at": _datetime_payload(self.created_at),
@@ -270,8 +407,8 @@ class SkillSpec:
             action=record.get("action", ""),
             trigger=SkillTriggerSpec.from_payload(record.get("trigger", {})),
             scope=record.get("scope", {}),
-            constraints=tuple(record.get("constraints", ())),
-            capabilities=tuple(record.get("capabilities", ())),
+            constraints=record.get("constraints", ()),  # AUDIT-FIX(#5): Do not wrap sequences with tuple(...); let validators inspect the original type.
+            capabilities=record.get("capabilities", ()),  # AUDIT-FIX(#5): Prevent accidental string -> character tuple corruption on deserialize.
             created_at=record.get("created_at", _utc_now()),
             version=record.get("version", 1),
         )
@@ -296,7 +433,7 @@ class CapabilityDefinition:
         object.__setattr__(self, "module_name", _require_stable_identifier(self.module_name, field_name="module_name"))
         object.__setattr__(self, "summary", _require_text(self.summary, field_name="summary", limit=220))
         object.__setattr__(self, "risk_class", _coerce_enum(CapabilityRiskClass, self.risk_class, field_name="risk_class"))
-        object.__setattr__(self, "requires_configuration", bool(self.requires_configuration))
+        object.__setattr__(self, "requires_configuration", _require_bool(self.requires_configuration, field_name="requires_configuration"))  # AUDIT-FIX(#7): Preserve boolean semantics instead of treating any truthy value as True.
         object.__setattr__(
             self,
             "integration_id",
@@ -325,9 +462,9 @@ class CapabilityDefinition:
             module_name=record.get("module_name", ""),
             summary=record.get("summary", ""),
             risk_class=record.get("risk_class", CapabilityRiskClass.LOW.value),
-            requires_configuration=bool(record.get("requires_configuration", False)),
+            requires_configuration=record.get("requires_configuration", False),  # AUDIT-FIX(#7): Keep the original boolean payload so strict validation can reject bad shapes.
             integration_id=record.get("integration_id"),
-            tags=tuple(record.get("tags", ())),
+            tags=record.get("tags", ()),  # AUDIT-FIX(#5): Preserve raw sequence shape for tag validation.
         )
 
 
@@ -354,7 +491,7 @@ class CapabilityAvailability:
             "integration_id",
             None if self.integration_id is None else _require_stable_identifier(self.integration_id, field_name="integration_id"),
         )
-        object.__setattr__(self, "metadata", _json_mapping(self.metadata, field_name="metadata"))
+        object.__setattr__(self, "metadata", _json_mapping(self.metadata, field_name="metadata"))  # AUDIT-FIX(#9): Freeze metadata after JSON validation.
 
     @property
     def available(self) -> bool:
@@ -372,7 +509,7 @@ class CapabilityAvailability:
             "detail": self.detail,
             "checked_at": _datetime_payload(self.checked_at),
             "integration_id": self.integration_id,
-            "metadata": self.metadata,
+            "metadata": _payload_json_mapping(self.metadata, field_name="metadata"),  # AUDIT-FIX(#9): Return a detached metadata payload.
         }
 
     @classmethod
@@ -436,8 +573,8 @@ class FeasibilityResult:
         return cls(
             outcome=record.get("outcome", FeasibilityOutcome.RED.value),
             summary=record.get("summary", ""),
-            reasons=tuple(record.get("reasons", ())),
-            missing_capabilities=tuple(record.get("missing_capabilities", ())),
+            reasons=record.get("reasons", ()),  # AUDIT-FIX(#5): Keep raw list/string input so reason validation can reject malformed payloads.
+            missing_capabilities=record.get("missing_capabilities", ()),  # AUDIT-FIX(#5): Avoid tuple(...) coercion that can split strings into characters.
             suggested_target=record.get("suggested_target"),
             checked_at=record.get("checked_at", _utc_now()),
         )
@@ -489,7 +626,7 @@ class RequirementsDialogueSession:
             "trigger_conditions",
             _stable_identifier_tuple(self.trigger_conditions, field_name="trigger_conditions"),
         )
-        object.__setattr__(self, "scope", _json_mapping(self.scope, field_name="scope"))
+        object.__setattr__(self, "scope", _json_mapping(self.scope, field_name="scope"))  # AUDIT-FIX(#9): Freeze validated scope so shared async state cannot mutate it by reference.
         object.__setattr__(self, "constraints", _text_tuple(self.constraints, field_name="constraints", limit=220))
         current_question_id = _optional_stable_identifier(self.current_question_id, field_name="current_question_id")
         if self.status == RequirementsDialogueStatus.QUESTIONING and current_question_id not in {"when", "what", "how"}:
@@ -507,13 +644,11 @@ class RequirementsDialogueSession:
             "answered_question_ids",
             _stable_identifier_tuple(self.answered_question_ids, field_name="answered_question_ids"),
         )
-        object.__setattr__(self, "answer_summaries", _json_mapping(self.answer_summaries, field_name="answer_summaries"))
+        object.__setattr__(self, "answer_summaries", _json_mapping(self.answer_summaries, field_name="answer_summaries"))  # AUDIT-FIX(#9): Freeze answer summaries after normalization.
         object.__setattr__(self, "created_at", _normalize_datetime(self.created_at, field_name="created_at"))
         object.__setattr__(self, "updated_at", _normalize_datetime(self.updated_at, field_name="updated_at"))
-        normalized_version = int(self.version)
-        if normalized_version < 1:
-            raise ValueError("version must be >= 1")
-        object.__setattr__(self, "version", normalized_version)
+        _ensure_not_before(self.updated_at, self.created_at, later_name="updated_at", earlier_name="created_at")  # AUDIT-FIX(#2): Reject dialogue records whose update timestamp predates creation.
+        object.__setattr__(self, "version", _require_positive_int(self.version, field_name="version"))  # AUDIT-FIX(#7): Enforce exact integer versions.
 
     def to_skill_spec(self) -> SkillSpec:
         """Render the current dialogue draft as a full skill specification."""
@@ -524,7 +659,7 @@ class RequirementsDialogueSession:
             trigger=SkillTriggerSpec(mode=self.trigger_mode, conditions=self.trigger_conditions),
             skill_id=self.skill_id,
             scope=self.scope,
-            constraints=self.constraints,
+            constraints=self.constraints,  # AUDIT-FIX(#6): This now round-trips because SkillSpec.constraints accepts free text.
             capabilities=self.capabilities,
             created_at=self.created_at,
             version=self.version,
@@ -543,11 +678,11 @@ class RequirementsDialogueSession:
             "status": self.status.value,
             "trigger_mode": self.trigger_mode,
             "trigger_conditions": list(self.trigger_conditions),
-            "scope": self.scope,
+            "scope": _payload_json_mapping(self.scope, field_name="scope"),  # AUDIT-FIX(#9): Return detached JSON payloads for mutable mapping fields.
             "constraints": list(self.constraints),
             "current_question_id": self.current_question_id,
             "answered_question_ids": list(self.answered_question_ids),
-            "answer_summaries": self.answer_summaries,
+            "answer_summaries": _payload_json_mapping(self.answer_summaries, field_name="answer_summaries"),  # AUDIT-FIX(#9): Detach answer summaries from the live object.
             "created_at": _datetime_payload(self.created_at),
             "updated_at": _datetime_payload(self.updated_at),
             "version": self.version,
@@ -562,16 +697,16 @@ class RequirementsDialogueSession:
             request_summary=record.get("request_summary", ""),
             skill_name=record.get("skill_name", ""),
             action=record.get("action", ""),
-            capabilities=tuple(record.get("capabilities", ())),
+            capabilities=record.get("capabilities", ()),  # AUDIT-FIX(#5): Avoid tuple(...) coercion on deserialize for capability lists.
             feasibility=FeasibilityResult.from_payload(record.get("feasibility", {})),
             skill_id=record.get("skill_id", ""),
             status=record.get("status", RequirementsDialogueStatus.QUESTIONING.value),
             trigger_mode=record.get("trigger_mode", "push"),
-            trigger_conditions=tuple(record.get("trigger_conditions", ())),
+            trigger_conditions=record.get("trigger_conditions", ()),  # AUDIT-FIX(#5): Preserve the original trigger_conditions shape for validation.
             scope=record.get("scope", {}),
-            constraints=tuple(record.get("constraints", ())),
+            constraints=record.get("constraints", ()),  # AUDIT-FIX(#5): Keep raw constraint lists or strings so validation can make the right decision.
             current_question_id=record.get("current_question_id"),
-            answered_question_ids=tuple(record.get("answered_question_ids", ())),
+            answered_question_ids=record.get("answered_question_ids", ()),  # AUDIT-FIX(#5): Prevent character-splitting on bad payloads.
             answer_summaries=record.get("answer_summaries", {}),
             created_at=record.get("created_at", _utc_now()),
             updated_at=record.get("updated_at", _utc_now()),
@@ -614,12 +749,10 @@ class CompileJobRecord:
         object.__setattr__(self, "artifact_ids", _stable_identifier_tuple(self.artifact_ids, field_name="artifact_ids"))
         object.__setattr__(self, "created_at", _normalize_datetime(self.created_at, field_name="created_at"))
         object.__setattr__(self, "updated_at", _normalize_datetime(self.updated_at, field_name="updated_at"))
-        normalized_attempts = int(self.attempt_count)
-        if normalized_attempts < 0:
-            raise ValueError("attempt_count must be >= 0")
-        object.__setattr__(self, "attempt_count", normalized_attempts)
+        _ensure_not_before(self.updated_at, self.created_at, later_name="updated_at", earlier_name="created_at")  # AUDIT-FIX(#2): Ensure compile job clocks move forward.
+        object.__setattr__(self, "attempt_count", _require_non_negative_int(self.attempt_count, field_name="attempt_count"))  # AUDIT-FIX(#7): Reject coercion-prone counter payloads.
         object.__setattr__(self, "last_error", _optional_text(self.last_error, limit=240))
-        object.__setattr__(self, "metadata", _json_mapping(self.metadata, field_name="metadata"))
+        object.__setattr__(self, "metadata", _json_mapping(self.metadata, field_name="metadata"))  # AUDIT-FIX(#9): Freeze metadata to stop accidental post-validation mutation.
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -636,7 +769,7 @@ class CompileJobRecord:
             "updated_at": _datetime_payload(self.updated_at),
             "attempt_count": self.attempt_count,
             "last_error": self.last_error,
-            "metadata": self.metadata,
+            "metadata": _payload_json_mapping(self.metadata, field_name="metadata"),  # AUDIT-FIX(#9): Return a detached metadata dict from to_payload().
         }
 
     @classmethod
@@ -650,8 +783,8 @@ class CompileJobRecord:
             status=record.get("status", CompileJobStatus.DRAFT.value),
             requested_target=record.get("requested_target", CompileTarget.AUTOMATION_MANIFEST.value),
             spec_hash=record.get("spec_hash", ""),
-            required_capabilities=tuple(record.get("required_capabilities", ())),
-            artifact_ids=tuple(record.get("artifact_ids", ())),
+            required_capabilities=record.get("required_capabilities", ()),  # AUDIT-FIX(#5): Preserve raw capability sequence shape.
+            artifact_ids=record.get("artifact_ids", ()),  # AUDIT-FIX(#5): Preserve raw artifact sequence shape.
             created_at=record.get("created_at", _utc_now()),
             updated_at=record.get("updated_at", _utc_now()),
             attempt_count=record.get("attempt_count", 0),
@@ -682,18 +815,12 @@ class CompileArtifactRecord:
         object.__setattr__(self, "job_id", _require_stable_identifier(self.job_id, field_name="job_id"))
         object.__setattr__(self, "kind", _coerce_enum(ArtifactKind, self.kind, field_name="kind"))
         object.__setattr__(self, "media_type", _require_text(self.media_type, field_name="media_type", limit=120))
-        object.__setattr__(self, "content_path", _optional_text(self.content_path, limit=240))
-        object.__setattr__(self, "sha256", _optional_text(self.sha256, limit=128))
-        if self.size_bytes is None:
-            normalized_size = None
-        else:
-            normalized_size = int(self.size_bytes)
-            if normalized_size < 0:
-                raise ValueError("size_bytes must be >= 0")
-        object.__setattr__(self, "size_bytes", normalized_size)
+        object.__setattr__(self, "content_path", _optional_safe_relative_path(self.content_path, field_name="content_path"))  # AUDIT-FIX(#1): Validate artifact paths at the contract boundary.
+        object.__setattr__(self, "sha256", _optional_sha256(self.sha256, field_name="sha256"))  # AUDIT-FIX(#1): Store only valid SHA-256 digests.
+        object.__setattr__(self, "size_bytes", _optional_non_negative_int(self.size_bytes, field_name="size_bytes"))  # AUDIT-FIX(#7): Enforce exact integer byte counts.
         object.__setattr__(self, "summary", _optional_text(self.summary, limit=220))
         object.__setattr__(self, "created_at", _normalize_datetime(self.created_at, field_name="created_at"))
-        object.__setattr__(self, "metadata", _json_mapping(self.metadata, field_name="metadata"))
+        object.__setattr__(self, "metadata", _json_mapping(self.metadata, field_name="metadata"))  # AUDIT-FIX(#9): Freeze artifact metadata after validation.
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -707,7 +834,7 @@ class CompileArtifactRecord:
             "size_bytes": self.size_bytes,
             "summary": self.summary,
             "created_at": _datetime_payload(self.created_at),
-            "metadata": self.metadata,
+            "metadata": _payload_json_mapping(self.metadata, field_name="metadata"),  # AUDIT-FIX(#9): Detach artifact metadata from the live object.
         }
 
     @classmethod
@@ -725,6 +852,100 @@ class CompileArtifactRecord:
             summary=record.get("summary"),
             created_at=record.get("created_at", _utc_now()),
             metadata=record.get("metadata", {}),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CompileRunStatusRecord:
+    """Store operator-visible runtime status for one compile attempt."""
+
+    schema_name: ClassVar[str] = _COMPILE_RUN_STATUS_SCHEMA
+
+    job_id: str
+    phase: str
+    driver_name: str | None = None
+    driver_attempts: tuple[str, ...] = ()
+    event_count: int = 0
+    last_event_kind: str | None = None
+    last_event_message: str | None = None
+    thread_id: str | None = None
+    turn_id: str | None = None
+    final_message_seen: bool = False
+    turn_completed: bool = False
+    started_at: datetime | None = None
+    updated_at: datetime = field(default_factory=_utc_now)
+    completed_at: datetime | None = None
+    error_message: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "job_id", _require_stable_identifier(self.job_id, field_name="job_id"))
+        object.__setattr__(self, "phase", _require_stable_identifier(self.phase, field_name="phase"))
+        object.__setattr__(self, "driver_name", _optional_text(self.driver_name, limit=120))
+        object.__setattr__(self, "driver_attempts", _text_tuple(self.driver_attempts, field_name="driver_attempts", limit=120))
+        object.__setattr__(self, "event_count", _require_non_negative_int(self.event_count, field_name="event_count"))  # AUDIT-FIX(#7): Reject coercion-prone event counters.
+        object.__setattr__(self, "last_event_kind", _optional_text(self.last_event_kind, limit=120))
+        object.__setattr__(self, "last_event_message", _optional_text(self.last_event_message, limit=240))
+        object.__setattr__(self, "thread_id", _optional_text(self.thread_id, limit=120))
+        object.__setattr__(self, "turn_id", _optional_text(self.turn_id, limit=120))
+        object.__setattr__(self, "final_message_seen", _require_bool(self.final_message_seen, field_name="final_message_seen"))  # AUDIT-FIX(#7): Keep compile state booleans strict.
+        object.__setattr__(self, "turn_completed", _require_bool(self.turn_completed, field_name="turn_completed"))  # AUDIT-FIX(#7): Reject truthy strings and ints for completion flags.
+        if self.started_at is not None:
+            object.__setattr__(self, "started_at", _normalize_datetime(self.started_at, field_name="started_at"))
+        object.__setattr__(self, "updated_at", _normalize_datetime(self.updated_at, field_name="updated_at"))
+        if self.completed_at is not None:
+            object.__setattr__(self, "completed_at", _normalize_datetime(self.completed_at, field_name="completed_at"))
+        if self.started_at is not None:
+            _ensure_not_before(self.updated_at, self.started_at, later_name="updated_at", earlier_name="started_at")  # AUDIT-FIX(#2): Runtime status updates cannot predate start time.
+        if self.completed_at is not None and self.started_at is not None:
+            _ensure_not_before(self.completed_at, self.started_at, later_name="completed_at", earlier_name="started_at")  # AUDIT-FIX(#2): Compile completion cannot predate compile start.
+        if self.completed_at is not None:
+            _ensure_not_before(self.updated_at, self.completed_at, later_name="updated_at", earlier_name="completed_at")  # AUDIT-FIX(#2): A completed record must be updated at or after completion time.
+        object.__setattr__(self, "error_message", _optional_text(self.error_message, limit=240))
+        object.__setattr__(self, "diagnostics", _json_mapping(self.diagnostics, field_name="diagnostics"))  # AUDIT-FIX(#9): Freeze runtime diagnostics after validation.
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema_name,
+            "job_id": self.job_id,
+            "phase": self.phase,
+            "driver_name": self.driver_name,
+            "driver_attempts": list(self.driver_attempts),
+            "event_count": self.event_count,
+            "last_event_kind": self.last_event_kind,
+            "last_event_message": self.last_event_message,
+            "thread_id": self.thread_id,
+            "turn_id": self.turn_id,
+            "final_message_seen": self.final_message_seen,
+            "turn_completed": self.turn_completed,
+            "started_at": None if self.started_at is None else _datetime_payload(self.started_at),
+            "updated_at": _datetime_payload(self.updated_at),
+            "completed_at": None if self.completed_at is None else _datetime_payload(self.completed_at),
+            "error_message": self.error_message,
+            "diagnostics": _payload_json_mapping(self.diagnostics, field_name="diagnostics"),  # AUDIT-FIX(#9): Return detached diagnostics payloads.
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "CompileRunStatusRecord":
+        record = _require_mapping(payload, context="compile run status")
+        _validate_schema(record, expected=cls.schema_name, context="compile run status")
+        return cls(
+            job_id=record.get("job_id", ""),
+            phase=record.get("phase", ""),
+            driver_name=record.get("driver_name"),
+            driver_attempts=record.get("driver_attempts", ()),  # AUDIT-FIX(#5): Preserve raw attempt sequence shape from storage/web payloads.
+            event_count=record.get("event_count", 0),
+            last_event_kind=record.get("last_event_kind"),
+            last_event_message=record.get("last_event_message"),
+            thread_id=record.get("thread_id"),
+            turn_id=record.get("turn_id"),
+            final_message_seen=record.get("final_message_seen", False),  # AUDIT-FIX(#7): Preserve raw boolean payloads for strict validation.
+            turn_completed=record.get("turn_completed", False),  # AUDIT-FIX(#7): Do not bool(...) coerce incoming state flags.
+            started_at=record.get("started_at"),
+            updated_at=record.get("updated_at", _utc_now()),
+            completed_at=record.get("completed_at"),
+            error_message=record.get("error_message"),
+            diagnostics=record.get("diagnostics", {}),
         )
 
 
@@ -748,10 +969,7 @@ class ActivationRecord:
     def __post_init__(self) -> None:
         object.__setattr__(self, "skill_id", _require_stable_identifier(self.skill_id, field_name="skill_id"))
         object.__setattr__(self, "skill_name", _require_text(self.skill_name, field_name="skill_name", limit=160))
-        normalized_version = int(self.version)
-        if normalized_version < 1:
-            raise ValueError("version must be >= 1")
-        object.__setattr__(self, "version", normalized_version)
+        object.__setattr__(self, "version", _require_positive_int(self.version, field_name="version"))  # AUDIT-FIX(#7): Enforce exact integer versions for activation records.
         object.__setattr__(self, "status", _coerce_enum(LearnedSkillStatus, self.status, field_name="status"))
         object.__setattr__(self, "job_id", _require_stable_identifier(self.job_id, field_name="job_id"))
         object.__setattr__(self, "artifact_id", _require_stable_identifier(self.artifact_id, field_name="artifact_id"))
@@ -766,7 +984,11 @@ class ActivationRecord:
             "feedback_due_at",
             None if self.feedback_due_at is None else _normalize_datetime(self.feedback_due_at, field_name="feedback_due_at"),
         )
-        object.__setattr__(self, "metadata", _json_mapping(self.metadata, field_name="metadata"))
+        if self.activated_at is not None:
+            _ensure_not_before(self.updated_at, self.activated_at, later_name="updated_at", earlier_name="activated_at")  # AUDIT-FIX(#2): Activation snapshots cannot predate the activation moment.
+        if self.feedback_due_at is not None and self.activated_at is not None:
+            _ensure_not_before(self.feedback_due_at, self.activated_at, later_name="feedback_due_at", earlier_name="activated_at")  # AUDIT-FIX(#2): Feedback due dates cannot predate activation.
+        object.__setattr__(self, "metadata", _json_mapping(self.metadata, field_name="metadata"))  # AUDIT-FIX(#9): Freeze activation metadata after validation.
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -780,7 +1002,7 @@ class ActivationRecord:
             "updated_at": _datetime_payload(self.updated_at),
             "activated_at": None if self.activated_at is None else _datetime_payload(self.activated_at),
             "feedback_due_at": None if self.feedback_due_at is None else _datetime_payload(self.feedback_due_at),
-            "metadata": self.metadata,
+            "metadata": _payload_json_mapping(self.metadata, field_name="metadata"),  # AUDIT-FIX(#9): Return detached activation metadata.
         }
 
     @classmethod

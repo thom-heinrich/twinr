@@ -16,11 +16,17 @@ from fastapi.testclient import TestClient
 
 from twinr.agent.base_agent import AdaptiveTimingStore, RuntimeSnapshotStore, TwinrConfig
 from twinr.automations import AutomationAction, AutomationStore, build_sensor_trigger
+from twinr.agent.self_coding import ActivationRecord, CompileRunStatusRecord, LearnedSkillStatus, SelfCodingStore
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.memory.reminders import ReminderStore
 from twinr.memory import ConversationTurn, MemoryLedgerItem, MemoryState, SearchMemoryEntry
 from twinr.integrations import ManagedIntegrationConfig, TwinrIntegrationStore
 from twinr.ops import DeviceFact, DeviceOverview, DeviceStatus, TwinrOpsEventStore, resolve_ops_paths
+from twinr.ops.remote_memory_watchdog import (
+    RemoteMemoryWatchdogSample,
+    RemoteMemoryWatchdogSnapshot,
+    RemoteMemoryWatchdogStore,
+)
 from twinr.web import create_app
 
 
@@ -70,7 +76,7 @@ class WebAppTests(unittest.TestCase):
         (personality_dir / "SYSTEM.md").write_text("System text\n", encoding="utf-8")
         (personality_dir / "PERSONALITY.md").write_text("Personality text\n", encoding="utf-8")
         (personality_dir / "USER.md").write_text("User text\n", encoding="utf-8")
-        return TestClient(create_app(env_path)), env_path
+        return TestClient(create_app(env_path), base_url="http://localhost", client=("127.0.0.1", 50000)), env_path
 
     def test_dashboard_renders_summary(self) -> None:
         client, _env_path = self.make_client()
@@ -83,6 +89,49 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Reminders", response.text)
         self.assertIn("sk-t…1234", response.text)
         self.assertIn("Status and failures", response.text)
+
+    def test_dashboard_renders_self_coding_status_summary(self) -> None:
+        client, env_path = self.make_client()
+        store = SelfCodingStore.from_project_root(env_path.parent)
+        store.save_compile_status(
+            CompileRunStatusRecord(
+                job_id="job_dashboard123",
+                phase="streaming",
+                driver_name="CodexSdkDriver",
+                event_count=12,
+                last_event_kind="assistant_delta",
+            )
+        )
+        store.save_activation(
+            ActivationRecord(
+                skill_id="read_emails",
+                skill_name="Read Emails",
+                version=1,
+                status=LearnedSkillStatus.ACTIVE,
+                job_id="job_dashboard123",
+                artifact_id="artifact_dashboard123",
+                metadata={"automation_id": "ase_read_emails_v1"},
+            )
+        )
+        store.save_activation(
+            ActivationRecord(
+                skill_id="announce_updates",
+                skill_name="Announce Updates",
+                version=1,
+                status=LearnedSkillStatus.SOFT_LAUNCH_READY,
+                job_id="job_dashboard124",
+                artifact_id="artifact_dashboard124",
+                metadata={"automation_id": "ase_announce_updates_v1"},
+            )
+        )
+
+        response = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Self-coding", response.text)
+        self.assertIn("1 active", response.text)
+        self.assertIn("1 soft launch", response.text)
+        self.assertIn("assistant_delta", response.text)
 
     def test_connect_page_renders_inline_help(self) -> None:
         client, _env_path = self.make_client()
@@ -942,6 +991,49 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Live system health", response.text)
         self.assertIn("Services", response.text)
+
+    def test_ops_health_page_renders_remote_memory_watchdog_status(self) -> None:
+        client, env_path = self.make_client()
+        config = TwinrConfig.from_env(env_path)
+        store = RemoteMemoryWatchdogStore.from_config(config)
+        store.save(
+            RemoteMemoryWatchdogSnapshot(
+                schema_version=1,
+                started_at="2026-03-16T18:30:00Z",
+                updated_at="2026-03-16T18:31:00Z",
+                hostname="picarx",
+                pid=321,
+                interval_s=1.0,
+                history_limit=3600,
+                sample_count=12,
+                failure_count=1,
+                last_ok_at="2026-03-16T18:31:00Z",
+                last_failure_at="2026-03-16T18:25:00Z",
+                artifact_path=str(store.path),
+                current=RemoteMemoryWatchdogSample(
+                    seq=12,
+                    captured_at="2026-03-16T18:31:00Z",
+                    status="ok",
+                    ready=True,
+                    mode="remote_primary",
+                    required=True,
+                    latency_ms=18250.0,
+                    consecutive_ok=4,
+                    consecutive_fail=0,
+                    detail=None,
+                ),
+                recent_samples=(),
+            )
+        )
+
+        response = client.get("/ops/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Remote memory watchdog", response.text)
+        self.assertIn("remote_primary", response.text)
+        self.assertIn("18250.0 ms", response.text)
+        self.assertIn("Consecutive ok", response.text)
+        self.assertIn("2026-03-16T18:25:00Z", response.text)
 
     def test_ops_devices_page_renders_device_status(self) -> None:
         client, _env_path = self.make_client()

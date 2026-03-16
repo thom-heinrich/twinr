@@ -8,12 +8,14 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.self_coding import (
+    ActivationRecord,
     ArtifactKind,
     CompileJobRecord,
     CompileJobStatus,
     CompileTarget,
     FeasibilityOutcome,
     FeasibilityResult,
+    LearnedSkillStatus,
     RequirementsDialogueSession,
     RequirementsDialogueStatus,
     SelfCodingStore,
@@ -119,6 +121,40 @@ class SelfCodingStoreTests(unittest.TestCase):
 
         self.assertEqual(loaded.current_question_id, "what")
         self.assertEqual(tuple(session.session_id for session in listed), ("dialogue_beta123", "dialogue_alpha123"))
+
+    def test_save_and_list_activation_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SelfCodingStore.from_project_root(temp_dir)
+            older = ActivationRecord(
+                skill_id="read_emails",
+                skill_name="Read Emails",
+                version=1,
+                status=LearnedSkillStatus.PAUSED,
+                job_id="job_read_emails_v1",
+                artifact_id="artifact_read_emails_v1",
+                updated_at=datetime(2026, 3, 16, 14, 5, tzinfo=UTC),
+                metadata={"automation_id": "ase_read_emails_v1"},
+            )
+            newer = replace(
+                older,
+                version=2,
+                status=LearnedSkillStatus.ACTIVE,
+                job_id="job_read_emails_v2",
+                artifact_id="artifact_read_emails_v2",
+                updated_at=datetime(2026, 3, 16, 14, 6, tzinfo=UTC),
+                metadata={"automation_id": "ase_read_emails_v2"},
+            )
+
+            store.save_activation(older)
+            store.save_activation(newer)
+
+            loaded = store.load_activation("read_emails", version=2)
+            listed = store.list_activations(skill_id="read_emails")
+            by_job = store.find_activation_for_job("job_read_emails_v2")
+
+        self.assertEqual(loaded.status, LearnedSkillStatus.ACTIVE)
+        self.assertEqual(tuple(record.version for record in listed), (2, 1))
+        self.assertEqual(by_job.version, 2)
 
 
 if __name__ == "__main__":

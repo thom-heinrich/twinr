@@ -18,7 +18,7 @@ import time
 
 from twinr.hardware.audio import AmbientAudioLevelSample, AmbientAudioSampler
 from twinr.hardware.camera import V4L2StillCamera
-from twinr.providers.openai.backend import OpenAIBackend, OpenAIImageInput
+from twinr.providers.openai import OpenAIBackend, OpenAIImageInput
 
 from .engine import SocialAudioObservation, SocialBodyPose, SocialVisionObservation
 

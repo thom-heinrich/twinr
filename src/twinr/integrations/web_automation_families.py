@@ -1,3 +1,9 @@
+"""Expose dashboard automation-family blocks for managed integrations.
+
+This module derives lightweight web-facing family blocks from integration
+manifests and store state without taking ownership of full automation flows.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -27,6 +33,8 @@ _DEFAULT_DETAIL = "Future integration-backed automations will be rendered inside
 # AUDIT-FIX(#5): Coerce corrupted or blank persisted identifiers to a stable safe fallback instead of
 # trusting arbitrary store data throughout the provider lifecycle.
 def _coerce_integration_id(value: object) -> str:
+    """Coerce store-derived IDs to a stable fallback when malformed."""
+
     if isinstance(value, str):
         candidate = value.strip()
         if candidate:
@@ -37,6 +45,8 @@ def _coerce_integration_id(value: object) -> str:
 # AUDIT-FIX(#4): Canonicalize integration IDs before reusing them in keys and action/source namespaces
 # so malformed persisted values cannot create ambiguous routing or unsafe identifiers.
 def _canonical_namespace_component(integration_id: str) -> str:
+    """Convert one integration ID into a safe namespace component."""
+
     normalized = _SAFE_NAMESPACE_COMPONENT_RE.sub("_", integration_id.strip().lower()).strip("_")
     return normalized or _UNKNOWN_INTEGRATION_ID
 
@@ -44,6 +54,8 @@ def _canonical_namespace_component(integration_id: str) -> str:
 # AUDIT-FIX(#4): Only keep legacy namespace aliases for already-safe historical IDs; anything containing
 # separators or control characters is rejected from routing identifiers.
 def _legacy_namespace_component(integration_id: str) -> str | None:
+    """Return a legacy-safe namespace alias when one is still valid."""
+
     candidate = integration_id.strip()
     if not candidate:
         return None
@@ -51,6 +63,8 @@ def _legacy_namespace_component(integration_id: str) -> str | None:
 
 
 def _humanize_integration_id(integration_id: str) -> str:
+    """Convert an integration ID into a user-facing title fragment."""
+
     text = integration_id.replace("_", " ").replace("-", " ").strip()
     return text.title() if text else "Unknown Integration"
 
@@ -58,6 +72,8 @@ def _humanize_integration_id(integration_id: str) -> str:
 # AUDIT-FIX(#5): Manifest/store text fields are treated defensively so malformed values do not bubble up
 # into attribute errors or blank UI strings.
 def _coerce_text(value: object, *, default: str) -> str:
+    """Coerce a possibly malformed text value to a safe fallback."""
+
     if isinstance(value, str):
         candidate = value.strip()
         if candidate:
@@ -68,12 +84,16 @@ def _coerce_text(value: object, *, default: str) -> str:
 # AUDIT-FIX(#5): Treat non-boolean persisted "enabled" values as safe False to avoid accidentally exposing
 # an integration as configured when the on-disk state is malformed.
 def _coerce_enabled(value: object) -> bool:
+    """Treat only real booleans as configured state."""
+
     return value if isinstance(value, bool) else False
 
 
 # AUDIT-FIX(#1): Resolve and validate the project root before touching the file-backed integration store;
 # invalid paths degrade to a safe placeholder instead of crashing this provider listing.
 def _resolve_project_path(project_root: str | Path) -> Path | None:
+    """Resolve one project root and degrade safely on invalid paths."""
+
     try:
         project_path = Path(project_root).expanduser().resolve(strict=False)
     except (OSError, RuntimeError, TypeError, ValueError):
@@ -93,6 +113,8 @@ def _resolve_project_path(project_root: str | Path) -> Path | None:
 
 @dataclass(frozen=True, slots=True)
 class IntegrationAutomationFamilyBlock:
+    """Describe one integration-backed automation family block for the web UI."""
+
     key: str
     integration_id: str
     title: str
@@ -105,18 +127,28 @@ class IntegrationAutomationFamilyBlock:
 
 
 class IntegrationAutomationFamilyProvider(Protocol):
+    """Describe the provider interface used by the web automations page."""
+
     def block(self) -> IntegrationAutomationFamilyBlock:
+        """Return the static metadata block for one integration family."""
+
         ...
 
     def handles_action(self, action: str) -> bool:
+        """Return whether this provider owns one incoming action key."""
+
         ...
 
     def handle_action(self, action: str, *, form: dict[str, str], automation_store: AutomationStore) -> bool:
+        """Handle one action and report whether the provider consumed it."""
+
         ...
 
 
 @dataclass(frozen=True, slots=True)
 class ManagedIntegrationAutomationProvider:
+    """Build dashboard-family blocks for one managed integration record."""
+
     project_root: Path
     record: ManagedIntegrationConfig | None = None
     integration_id: str | None = None
@@ -124,6 +156,8 @@ class ManagedIntegrationAutomationProvider:
     load_error: str | None = None
 
     def _resolved_integration_id(self) -> str:
+        """Return the normalized integration ID for this provider."""
+
         if self.integration_id is not None:
             return _coerce_integration_id(self.integration_id)
         if self.record is not None:
@@ -131,6 +165,8 @@ class ManagedIntegrationAutomationProvider:
         return _UNKNOWN_INTEGRATION_ID
 
     def _resolved_configured(self) -> bool:
+        """Return whether the integration is configured and enabled."""
+
         if self.configured is not None:
             return _coerce_enabled(self.configured)
         if self.record is None:
@@ -138,6 +174,8 @@ class ManagedIntegrationAutomationProvider:
         return _coerce_enabled(getattr(self.record, "enabled", False))
 
     def _action_prefixes(self) -> tuple[str, ...]:
+        """Return action prefixes routed to this family provider."""
+
         integration_id = self._resolved_integration_id()
         safe_component = _canonical_namespace_component(integration_id)
         prefixes = [f"integration_family:{safe_component}:"]
@@ -147,6 +185,8 @@ class ManagedIntegrationAutomationProvider:
         return tuple(prefixes)
 
     def _source_prefixes(self) -> tuple[str, ...]:
+        """Return automation-source prefixes tied to this integration."""
+
         integration_id = self._resolved_integration_id()
         safe_component = _canonical_namespace_component(integration_id)
         prefixes = [
@@ -164,6 +204,8 @@ class ManagedIntegrationAutomationProvider:
         return tuple(dict.fromkeys(prefixes))
 
     def block(self) -> IntegrationAutomationFamilyBlock:
+        """Build the dashboard block for the managed integration."""
+
         integration_id = self._resolved_integration_id()
         configured = self._resolved_configured()
 
@@ -234,12 +276,16 @@ class ManagedIntegrationAutomationProvider:
         )
 
     def handles_action(self, action: str) -> bool:
+        """Return whether an action belongs to this integration family."""
+
         # AUDIT-FIX(#6): Reject malformed action values instead of assuming the caller always provides a str.
         if not isinstance(action, str) or not action:
             return False
         return any(action.startswith(prefix) for prefix in self._action_prefixes())
 
     def handle_action(self, action: str, *, form: dict[str, str], automation_store: AutomationStore) -> bool:
+        """Keep the explicit no-op action handling contract for now."""
+
         # AUDIT-FIX(#6): Keep the current explicit no-op behavior, but only after safe action validation so
         # malformed endpoint input does not trigger attribute errors in the provider layer.
         if not self.handles_action(action):
@@ -254,6 +300,8 @@ def _build_safe_placeholder_providers(
     *,
     reason: str,
 ) -> tuple[IntegrationAutomationFamilyProvider, ...]:
+    """Return placeholder providers when store access is unavailable."""
+
     return tuple(
         ManagedIntegrationAutomationProvider(
             project_root=project_root,
@@ -268,6 +316,8 @@ def _build_safe_placeholder_providers(
 def integration_automation_family_providers(
     project_root: str | Path,
 ) -> tuple[IntegrationAutomationFamilyProvider, ...]:
+    """Return automation-family providers for all managed integrations."""
+
     # AUDIT-FIX(#1): Validate the project root up front instead of assuming the caller handed us a usable
     # directory for file-backed state.
     project_path = _resolve_project_path(project_root)

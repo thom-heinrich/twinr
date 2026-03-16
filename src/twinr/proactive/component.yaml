@@ -1,0 +1,186 @@
+schema_version: 1
+name: proactive
+path: src/twinr/proactive
+kind: python-package
+visibility: internal
+summary: Provide the package-root compatibility surface and boundary between Twinr's proactive runtime, social-trigger, governance, and wakeword subsystems.
+owned_concerns:
+  - Expose the broad `twinr.proactive` compatibility import surface across proactive child packages
+  - Define the package boundary between `runtime`, `social`, `governance`, and `wakeword`
+  - Route new work into the correct proactive child package instead of growing the package root
+out_of_scope:
+  - Proactive monitor orchestration and presence-session logic inside src/twinr/proactive/runtime
+  - Social-trigger scoring, observation providers, and vision review inside src/twinr/proactive/social
+  - Delivery reservation and cooldown policy inside src/twinr/proactive/governance
+  - Wakeword matching, calibration, streaming, and evaluation logic inside src/twinr/proactive/wakeword
+files:
+  - path: __init__.py
+    role: Root compatibility export surface across proactive child packages
+    exports:
+      - AmbientAudioObservationProvider
+      - NullAudioObservationProvider
+      - OpenWakeWordPrediction
+      - OpenWakeWordStreamingMonitor
+      - OpenAIVisionObservationProvider
+      - OpenAIProactiveVisionReviewer
+      - ProactiveGovernor
+      - ProactiveGovernorCandidate
+      - ProactiveGovernorDecision
+      - ProactiveGovernorHistoryEntry
+      - ProactiveGovernorReservation
+      - ProactiveAudioSnapshot
+      - ProactiveCoordinator
+      - ProactiveVisionFrameBuffer
+      - ProactiveVisionReview
+      - ProactiveMonitorService
+      - ProactiveVisionSnapshot
+      - PresenceSessionController
+      - PresenceSessionSnapshot
+      - SocialAudioObservation
+      - SocialBodyPose
+      - SocialObservation
+      - SocialTriggerDecision
+      - SocialTriggerEngine
+      - SocialTriggerEvaluation
+      - SocialTriggerPriority
+      - SocialTriggerThresholds
+      - SocialVisionObservation
+      - TriggerScoreEvidence
+      - SttWakewordVerifier
+      - WakewordAutotuneRecommendation
+      - WakewordCalibrationProfile
+      - WakewordCalibrationStore
+      - WakewordDecision
+      - WakewordDecisionPolicy
+      - WakewordEvalEntry
+      - WakewordEvalMetrics
+      - WakewordEvalReport
+      - WakewordMatch
+      - WakewordOpenWakeWordFrameSpotter
+      - WakewordOpenWakeWordSpotter
+      - WakewordPhraseSpotter
+      - WakewordStreamDetection
+      - WakewordVerification
+      - WeightedTriggerScore
+      - append_wakeword_capture_label
+      - apply_wakeword_calibration
+      - autotune_wakeword_profile
+      - bool_score
+      - build_default_proactive_monitor
+      - DEFAULT_WAKEWORD_PHRASES
+      - hold_progress
+      - is_reviewable_image_trigger
+      - load_eval_manifest
+      - load_labeled_ops_captures
+      - parse_vision_observation_text
+      - parse_proactive_vision_review_text
+      - recent_progress
+      - is_safety_trigger
+      - match_wakeword_transcript
+      - normalize_wakeword_backend
+      - normalize_detector_label
+      - normalize_wakeword_verifier_mode
+      - phrase_from_detector_label
+      - proactive_observation_facts
+      - proactive_prompt_mode
+      - run_wakeword_eval
+      - wakeword_primary_prompt
+      - weighted_trigger_score
+subpackages:
+  - path: governance
+    role: Delivery reservation and cooldown policy
+  - path: runtime
+    role: Proactive monitor orchestration and presence-session control
+  - path: social
+    role: Social-trigger models, providers, scoring, and vision review
+  - path: wakeword
+    role: Wakeword detection, calibration, streaming, and evaluation
+public_api:
+  module: twinr.proactive
+  exports:
+    - AmbientAudioObservationProvider
+    - NullAudioObservationProvider
+    - OpenWakeWordPrediction
+    - OpenWakeWordStreamingMonitor
+    - OpenAIVisionObservationProvider
+    - OpenAIProactiveVisionReviewer
+    - ProactiveGovernor
+    - ProactiveGovernorCandidate
+    - ProactiveGovernorDecision
+    - ProactiveGovernorHistoryEntry
+    - ProactiveGovernorReservation
+    - ProactiveAudioSnapshot
+    - ProactiveCoordinator
+    - ProactiveVisionFrameBuffer
+    - ProactiveVisionReview
+    - ProactiveMonitorService
+    - ProactiveVisionSnapshot
+    - PresenceSessionController
+    - PresenceSessionSnapshot
+    - SocialAudioObservation
+    - SocialBodyPose
+    - SocialObservation
+    - SocialTriggerDecision
+    - SocialTriggerEngine
+    - SocialTriggerEvaluation
+    - SocialTriggerPriority
+    - SocialTriggerThresholds
+    - SocialVisionObservation
+    - TriggerScoreEvidence
+    - SttWakewordVerifier
+    - WakewordAutotuneRecommendation
+    - WakewordCalibrationProfile
+    - WakewordCalibrationStore
+    - WakewordDecision
+    - WakewordDecisionPolicy
+    - WakewordEvalEntry
+    - WakewordEvalMetrics
+    - WakewordEvalReport
+    - WakewordMatch
+    - WakewordOpenWakeWordFrameSpotter
+    - WakewordOpenWakeWordSpotter
+    - WakewordPhraseSpotter
+    - WakewordStreamDetection
+    - WakewordVerification
+    - WeightedTriggerScore
+    - append_wakeword_capture_label
+    - apply_wakeword_calibration
+    - autotune_wakeword_profile
+    - bool_score
+    - build_default_proactive_monitor
+    - DEFAULT_WAKEWORD_PHRASES
+    - hold_progress
+    - is_reviewable_image_trigger
+    - load_eval_manifest
+    - load_labeled_ops_captures
+    - parse_vision_observation_text
+    - parse_proactive_vision_review_text
+    - recent_progress
+    - is_safety_trigger
+    - match_wakeword_transcript
+    - normalize_wakeword_backend
+    - normalize_detector_label
+    - normalize_wakeword_verifier_mode
+    - phrase_from_detector_label
+    - proactive_observation_facts
+    - proactive_prompt_mode
+    - run_wakeword_eval
+    - wakeword_primary_prompt
+    - weighted_trigger_score
+primary_callers:
+  - path: src/twinr/__main__.py
+  - path: src/twinr/agent/base_agent/runtime/base.py
+  - path: src/twinr/agent/base_agent/runtime/context.py
+  - path: src/twinr/agent/workflows/__init__.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/realtime_runner_background.py
+tests:
+  - path: test/test_proactive_governor.py
+  - path: test/test_social_triggers.py
+  - path: test/test_proactive_vision_review.py
+  - path: test/test_wakeword.py
+  - path: test/test_proactive_monitor.py
+  - path: test/test_runner.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_main.py

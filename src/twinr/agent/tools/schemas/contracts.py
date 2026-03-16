@@ -834,6 +834,56 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 },
             }
         )
+    if "confirm_skill_activation" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "confirm_skill_activation",
+                "description": (
+                    "Enable a compiled self-coding skill only after the user explicitly agrees that the soft-launch version should be turned on."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": _string_property(
+                            "Compile job identifier that is already soft-launch ready.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly approved enabling this learned behavior."
+                        ),
+                    },
+                    "required": ["job_id", "confirmed"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "rollback_skill_activation" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "rollback_skill_activation",
+                "description": (
+                    "Roll a learned self-coding skill back to an earlier version when the user wants the new behavior undone."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "skill_id": _string_property(
+                            "Stable identifier of the learned skill family to roll back.",
+                            min_length=1,
+                        ),
+                        "target_version": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Optional explicit older version to restore. If omitted, restore the newest earlier stable version.",
+                        },
+                    },
+                    "required": ["skill_id"],
+                    "additionalProperties": False,
+                },
+            }
+        )
     if "remember_memory" in available:
         tools.append(
             {

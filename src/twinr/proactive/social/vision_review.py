@@ -14,7 +14,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from threading import Lock  # AUDIT-FIX(#4): Protect the shared frame deque against concurrent record/sample access.
 
-from twinr.providers.openai.backend import OpenAIBackend, OpenAIImageInput
+from twinr.providers.openai import OpenAIBackend, OpenAIImageInput
 
 from .engine import SocialObservation, SocialTriggerDecision
 from .observers import ProactiveVisionSnapshot

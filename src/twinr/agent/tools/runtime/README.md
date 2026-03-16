@@ -12,7 +12,7 @@ streaming APIs.
 - validate the canonical tool-name to handler binding registry
 - run the generic streaming tool loop and the supervisor/specialist handoff loop
 - emit speech-lane deltas and serialize tool results safely
-- expose the explicit allowlist for background automation `tool_call` execution
+- enforce the focused broker policy for background automation `tool_call` execution
 
 `runtime` does **not** own:
 - concrete tool business logic or payload normalization in `../handlers`
@@ -27,6 +27,7 @@ streaming APIs.
 | [__init__.py](./__init__.py) | Runtime export surface |
 | [executor.py](./executor.py) | Owner-to-handler dispatcher |
 | [registry.py](./registry.py) | Tool binding validation |
+| [broker_policy.py](./broker_policy.py) | Background automation tool-call policy |
 | [streaming_loop.py](./streaming_loop.py) | Generic tool round loop |
 | [dual_lane_loop.py](./dual_lane_loop.py) | Supervisor/specialist handoff loop |
 | [component.yaml](./component.yaml) | Structured package metadata |

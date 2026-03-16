@@ -8,7 +8,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
-from twinr.providers.openai.backend import OpenAIBackend, OpenAIImageInput, _default_client_factory
+from twinr.providers.openai import OpenAIBackend, OpenAIImageInput
+from twinr.providers.openai.core.client import _default_client_factory
 
 
 def _fake_usage(
@@ -233,13 +234,16 @@ class OpenAIBackendTests(unittest.TestCase):
             "All user-facing spoken and written replies for this turn must be in German.",
             request["instructions"],
         )
+        assistant_messages = [item for item in request["input"] if item.get("role") == "assistant"]
+        self.assertEqual(len(assistant_messages), 1)
+        self.assertEqual(assistant_messages[0]["content"][0]["type"], "output_text")
         self.assertEqual(request["tools"][0]["type"], "web_search")
         self.assertEqual(request["tools"][0]["search_context_size"], "medium")
         self.assertEqual(request["tools"][0]["user_location"]["country"], "DE")
         self.assertEqual(request["input"][0]["role"], "system")
         self.assertEqual(request["input"][0]["content"][0]["type"], "input_text")
         self.assertEqual(request["input"][1]["role"], "assistant")
-        self.assertEqual(request["input"][1]["content"][0]["type"], "input_text")
+        self.assertEqual(request["input"][1]["content"][0]["type"], "output_text")
         self.assertEqual(request["input"][2]["role"], "user")
         self.assertEqual(request["input"][2]["content"][0]["type"], "input_text")
 

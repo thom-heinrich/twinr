@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Configure Twinr audio defaults for playback, capture, and proactive sensing.
+#
+# Selects the target ALSA/PipeWire devices, optionally persists proactive-audio
+# env keys, and can run a short playback/capture smoke test on the Pi.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

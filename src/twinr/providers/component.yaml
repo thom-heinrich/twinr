@@ -1,0 +1,67 @@
+schema_version: 1
+name: providers
+path: src/twinr/providers
+kind: python-package
+visibility: internal
+summary: Assemble Twinr's configured runtime provider bundle and expose the stable package-root provider imports used by runtime callers.
+owned_concerns:
+  - Validate top-level STT, LLM, and TTS provider selection from TwinrConfig
+  - Assemble the runtime StreamingProviderBundle and roll back owned resources on bootstrap failure
+  - Expose the stable `twinr.providers` package-root surface, including compatibility re-exports for common OpenAI types
+out_of_scope:
+  - Provider-specific transport, SDK, and request logic in src/twinr/providers/deepgram, src/twinr/providers/groq, and src/twinr/providers/openai
+  - Hardware capture, playback, and runtime orchestration in src/twinr/hardware and src/twinr/agent/workflows
+  - Provider-specific public API design below the sibling provider packages
+files:
+  - path: __init__.py
+    role: Export the stable provider package-root surface
+    exports:
+      - OpenAIBackend
+      - OpenAIImageInput
+      - OpenAIRealtimeSession
+      - OpenAIRealtimeTurn
+      - OpenAITextResponse
+      - StreamingProviderBundle
+      - build_streaming_provider_bundle
+  - path: factory.py
+    role: Validate config and assemble the runtime provider bundle
+    exports:
+      - ProviderConfigurationError
+      - StreamingProviderBundle
+      - build_streaming_provider_bundle
+subpackages:
+  - path: deepgram
+    role: Deepgram speech-to-text providers
+  - path: groq
+    role: Groq text and tool-calling providers
+  - path: openai
+    role: OpenAI backend, capability, and realtime providers
+public_api:
+  module: twinr.providers
+  exports:
+    - OpenAIBackend
+    - OpenAIImageInput
+    - OpenAIRealtimeSession
+    - OpenAIRealtimeTurn
+    - OpenAITextResponse
+    - StreamingProviderBundle
+    - build_streaming_provider_bundle
+compatibility_reexports:
+  - path: src/twinr/providers/openai/__init__.py
+    names:
+      - OpenAIBackend
+      - OpenAIImageInput
+      - OpenAIRealtimeSession
+      - OpenAIRealtimeTurn
+      - OpenAITextResponse
+primary_callers:
+  - path: src/twinr/__main__.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+tests:
+  - path: test/test_main.py
+  - path: test/test_provider_factory.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_runner.py
+  - path: test/test_streaming_runner.py

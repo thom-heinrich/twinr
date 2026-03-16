@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Configure and optionally probe Twinr PIR GPIO settings.
+#
+# Persists PIR motion-related GPIO settings into the selected `.env` file and
+# can launch the matching Python probe to verify motion events on the target Pi.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

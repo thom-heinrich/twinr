@@ -1,3 +1,10 @@
+"""Assemble managed Twinr integrations from config, env, and provider code.
+
+This module wires the shared integration layer to the built-in email and
+calendar packages while keeping setup validation and readiness reporting
+centralized.
+"""
+
 from __future__ import annotations
 
 import errno
@@ -42,6 +49,8 @@ _ICS_HTTP_USER_AGENT = "Twinr/0.1"
 
 @dataclass(frozen=True, slots=True)
 class IntegrationReadiness:
+    """Describe whether one managed integration is ready for runtime use."""
+
     integration_id: str
     label: str
     status: str
@@ -51,16 +60,22 @@ class IntegrationReadiness:
 
     @property
     def ready(self) -> bool:
+        """Return whether the readiness status represents a usable adapter."""
+
         return self.status == "ok"
 
 
 @dataclass(frozen=True, slots=True)
 class ManagedIntegrationsRuntime:
+    """Bundle the built-in managed adapters plus their readiness state."""
+
     email_mailbox: EmailMailboxAdapter | None = None
     calendar_agenda: ReadOnlyCalendarAdapter | None = None
     readiness: tuple[IntegrationReadiness, ...] = ()
 
     def readiness_for(self, integration_id: str) -> IntegrationReadiness | None:
+        """Return readiness metadata for one integration ID."""
+
         for item in self.readiness:
             if item.integration_id == integration_id:
                 return item
@@ -68,8 +83,12 @@ class ManagedIntegrationsRuntime:
 
 
 class _NoRedirectHandler(HTTPRedirectHandler):
+    """Disable implicit redirects so each hop can be revalidated."""
+
     # AUDIT-FIX(#2): Reject urllib's implicit redirect behavior so every hop is revalidated before any request is sent.
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Tell urllib to stop automatic redirect handling for this request."""
+
         return None
 
 
@@ -79,6 +98,8 @@ def build_managed_integrations(
     env_path: str | Path | None = None,
     url_text_loader: Callable[[str], str] | None = None,
 ) -> ManagedIntegrationsRuntime:
+    """Build the managed email and calendar adapters for one project root."""
+
     project_path = Path(project_root).resolve()
     env_values = _read_env_values(_resolve_env_path(project_path, env_path))
 
@@ -133,6 +154,8 @@ def build_email_mailbox_adapter(
     *,
     env_path: str | Path | None = None,
 ) -> EmailMailboxAdapter | None:
+    """Build only the managed email adapter for one project root."""
+
     return build_managed_integrations(project_root, env_path=env_path).email_mailbox
 
 
@@ -142,6 +165,8 @@ def build_calendar_agenda_adapter(
     env_path: str | Path | None = None,
     url_text_loader: Callable[[str], str] | None = None,
 ) -> ReadOnlyCalendarAdapter | None:
+    """Build only the managed calendar adapter for one project root."""
+
     return build_managed_integrations(
         project_root,
         env_path=env_path,
@@ -150,6 +175,8 @@ def build_calendar_agenda_adapter(
 
 
 def validate_calendar_source(*, source_kind: str, source_value: str) -> None:
+    """Validate one calendar source selection from operator settings."""
+
     normalized_source_kind = _coerce_text(source_kind).strip().lower()  # AUDIT-FIX(#8): Normalize source kind so harmless casing differences do not bypass validation or produce inconsistent behavior.
     if normalized_source_kind == "ics_file":
         return
@@ -165,6 +192,8 @@ def _safe_build_email_mailbox_runtime(
     *,
     env_values: dict[str, str],
 ) -> tuple[EmailMailboxAdapter | None, IntegrationReadiness]:
+    """Build the email runtime and degrade cleanly on unexpected failure."""
+
     try:
         # AUDIT-FIX(#4): Degrade this single integration cleanly if an unexpected constructor/runtime error occurs.
         return _build_email_mailbox_runtime(record, env_values=env_values)
@@ -185,6 +214,8 @@ def _safe_build_calendar_agenda_runtime(
     env_values: dict[str, str],
     url_text_loader: Callable[[str], str],
 ) -> tuple[ReadOnlyCalendarAdapter | None, IntegrationReadiness]:
+    """Build the calendar runtime and degrade cleanly on unexpected failure."""
+
     try:
         # AUDIT-FIX(#4): Keep calendar startup failures isolated so one broken source does not take down the process.
         return _build_calendar_agenda_runtime(
@@ -208,6 +239,8 @@ def _build_email_mailbox_runtime(
     *,
     env_values: dict[str, str],
 ) -> tuple[EmailMailboxAdapter | None, IntegrationReadiness]:
+    """Build the email adapter and readiness summary from one config record."""
+
     if not record.enabled:
         return None, IntegrationReadiness(
             integration_id=EMAIL_MAILBOX_INTEGRATION_ID,
@@ -356,6 +389,8 @@ def _build_calendar_agenda_runtime(
     env_values: dict[str, str],
     url_text_loader: Callable[[str], str],
 ) -> tuple[ReadOnlyCalendarAdapter | None, IntegrationReadiness]:
+    """Build the calendar adapter and readiness summary from one config record."""
+
     if not record.enabled:
         return None, IntegrationReadiness(
             integration_id=CALENDAR_AGENDA_INTEGRATION_ID,
@@ -441,6 +476,8 @@ def _build_calendar_reader(
     default_timezone: ZoneInfo,
     url_text_loader: Callable[[str], str],
 ) -> tuple[ICSCalendarSource, str, tuple[str, ...]]:
+    """Build an ``ICSCalendarSource`` plus readiness detail text."""
+
     if source_kind == "ics_file":
         resolved_path, relative_parts = _resolve_local_calendar_file(
             project_root,
@@ -475,6 +512,8 @@ def _build_calendar_reader(
 
 
 def _parse_known_contacts(text: str) -> tuple[ApprovedEmailContacts, tuple[str, ...]]:
+    """Parse approved contacts from operator-supplied multiline text."""
+
     contacts: list[EmailContact] = []
     warnings: list[str] = []
     seen_emails: set[str] = set()  # AUDIT-FIX(#5): Deduplicate approved contacts to keep recipient matching deterministic.
@@ -501,6 +540,8 @@ def _parse_known_contacts(text: str) -> tuple[ApprovedEmailContacts, tuple[str, 
 
 
 def _validate_email_address(value: object, *, label: str) -> str:
+    """Validate one email address from integration settings."""
+
     normalized = normalize_email(_coerce_text(value).strip())  # AUDIT-FIX(#5): Accept None/non-string config values and fail with a clean validation error instead of AttributeError.
     if not normalized or "@" not in normalized:
         raise ValueError(f"{label} must be a valid email address.")
@@ -508,6 +549,8 @@ def _validate_email_address(value: object, *, label: str) -> str:
 
 
 def _parse_positive_int(value: object, *, label: str, max_value: int | None = None) -> int:
+    """Parse one positive integer setting with optional upper bound."""
+
     text = _coerce_text(value).strip()  # AUDIT-FIX(#5): Parse integers from normalized text so invalid types do not crash the validator.
     if not text:
         raise ValueError(f"{label} must be a whole number.")
@@ -523,6 +566,8 @@ def _parse_positive_int(value: object, *, label: str, max_value: int | None = No
 
 
 def _parse_bool(value: object, *, default: bool, label: str = "Boolean value") -> bool:
+    """Parse one boolean setting from tolerant text input."""
+
     normalized = _coerce_text(value).strip().lower()  # AUDIT-FIX(#5): Parse booleans from a tolerant text conversion path.
     if not normalized:
         return default
@@ -534,6 +579,8 @@ def _parse_bool(value: object, *, default: bool, label: str = "Boolean value") -
 
 
 def _resolve_timezone(value: object) -> ZoneInfo:
+    """Resolve one timezone string into a ``ZoneInfo`` instance."""
+
     try:
         return ZoneInfo(_coerce_text(value).strip())
     except Exception:
@@ -541,10 +588,14 @@ def _resolve_timezone(value: object) -> ZoneInfo:
 
 
 def _timezone_label(value: ZoneInfo) -> str:
+    """Return a stable display label for a timezone object."""
+
     return getattr(value, "key", str(value))
 
 
 def _resolve_env_path(project_root: Path, env_path: str | Path | None) -> Path:
+    """Resolve the `.env` path used for managed integration secrets."""
+
     if env_path is None:
         return project_root / ".env"
     path = Path(env_path)
@@ -554,6 +605,8 @@ def _resolve_env_path(project_root: Path, env_path: str | Path | None) -> Path:
 
 
 def _read_env_values(path: Path) -> dict[str, str]:
+    """Read a bounded dotenv-style file into a key/value mapping."""
+
     try:
         if not path.exists():
             return {}
@@ -583,6 +636,8 @@ def _read_env_values(path: Path) -> dict[str, str]:
 
 
 def _parse_env_value(raw_value: str) -> str:
+    """Parse one dotenv value with simple quote and comment handling."""
+
     value = raw_value.strip()
     if not value:
         return ""
@@ -594,6 +649,8 @@ def _parse_env_value(raw_value: str) -> str:
 
 
 def _resolve_allowed_calendar_root(project_root: Path, env_values: dict[str, str]) -> Path:
+    """Resolve the allowed root directory for local ICS files."""
+
     configured_root = _coerce_text(env_values.get(CALENDAR_ALLOWED_ROOT_ENV_KEY, "")).strip()
     root_path = Path(configured_root) if configured_root else project_root
     if not root_path.is_absolute():
@@ -613,6 +670,8 @@ def _resolve_local_calendar_file(
     source_value: str,
     allowed_calendar_root: Path,
 ) -> tuple[Path, tuple[str, ...]]:
+    """Resolve and validate one local ICS file beneath the allowed root."""
+
     raw_path = Path(source_value)
     candidate_path = raw_path if raw_path.is_absolute() else (project_root / raw_path)
     try:
@@ -640,6 +699,8 @@ def _resolve_local_calendar_file(
 
 
 def _read_local_ics_text(allowed_calendar_root: Path, relative_parts: tuple[str, ...]) -> str:
+    """Read one local ICS file through a no-symlink directory walk."""
+
     root_fd = None
     current_fd = None
     file_fd = None
@@ -692,6 +753,8 @@ def _read_local_ics_text(allowed_calendar_root: Path, relative_parts: tuple[str,
 
 
 def _fetch_ics_url(url: str) -> str:
+    """Download one remote ICS feed with bounded redirects and size."""
+
     opener = build_opener(_NoRedirectHandler())
     current_url = url
     for _ in range(_MAX_ICS_URL_REDIRECTS + 1):
@@ -736,6 +799,8 @@ def _fetch_ics_url(url: str) -> str:
 
 
 def _validate_remote_calendar_url(url: str) -> str:
+    """Validate one remote calendar URL and return the normalized text."""
+
     text = _coerce_text(url).strip()
     _validate_calendar_url_text(text)
     hostname = urlsplit(text).hostname or ""
@@ -746,6 +811,8 @@ def _validate_remote_calendar_url(url: str) -> str:
 
 
 def _validate_calendar_url_text(url: str) -> None:
+    """Validate the textual shape of a remote calendar URL."""
+
     if not url:
         raise ValueError("Calendar URL is required.")
     if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in url):
@@ -765,6 +832,8 @@ def _validate_calendar_url_text(url: str) -> None:
 
 
 def _assert_public_remote_host(hostname: str) -> None:
+    """Reject hostnames that resolve to non-public addresses."""
+
     literal_ip = _parse_ip_address(hostname)
     if literal_ip is not None:
         if not literal_ip.is_global:
@@ -786,6 +855,8 @@ def _assert_public_remote_host(hostname: str) -> None:
 
 
 def _parse_ip_address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse a literal IP address if the hostname already is one."""
+
     try:
         return ipaddress.ip_address(value)
     except ValueError:
@@ -793,6 +864,8 @@ def _parse_ip_address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Addre
 
 
 def _display_url(url: str) -> str:
+    """Render a remote URL without credentials, query, or fragment data."""
+
     parts = urlsplit(url)
     hostname = parts.hostname or ""
     netloc = hostname
@@ -802,6 +875,8 @@ def _display_url(url: str) -> str:
 
 
 def _coerce_text(value: object | None, default: str = "") -> str:
+    """Coerce a possibly missing value to text."""
+
     if value is None:
         return default
     if isinstance(value, str):
@@ -810,4 +885,6 @@ def _coerce_text(value: object | None, default: str = "") -> str:
 
 
 def _single_line_text(value: str) -> str:
+    """Collapse internal whitespace to a single display line."""
+
     return " ".join(value.split())

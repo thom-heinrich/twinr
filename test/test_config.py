@@ -29,7 +29,10 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_first_word_max_output_tokens, 32)
         self.assertEqual(config.streaming_first_word_prefetch_min_chars, 4)
         self.assertEqual(config.streaming_first_word_prefetch_wait_ms, 40)
+        self.assertEqual(config.streaming_bridge_reply_timeout_ms, 250)
         self.assertEqual(config.streaming_first_word_final_lane_wait_ms, 900)
+        self.assertEqual(config.streaming_final_lane_watchdog_timeout_ms, 4000)
+        self.assertEqual(config.streaming_final_lane_hard_timeout_ms, 15000)
         self.assertEqual(config.streaming_supervisor_prefetch_min_chars, 8)
         self.assertEqual(config.streaming_supervisor_prefetch_wait_ms, 80)
         self.assertEqual(config.streaming_specialist_model, "gpt-4o-mini")
@@ -269,6 +272,8 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LONG_TERM_MEMORY_REMOTE_READ_TIMEOUT_S=5.5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_WRITE_TIMEOUT_S=11.5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_KEEPALIVE_INTERVAL_S=2.25",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_INTERVAL_S=1.5",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_HISTORY_LIMIT=7200",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_RETRY_ATTEMPTS=4",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_RETRY_BACKOFF_S=2.5",
                         "TWINR_LONG_TERM_MEMORY_REMOTE_FLUSH_TIMEOUT_S=75",
@@ -577,6 +582,8 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_remote_read_timeout_s, 5.5)
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 11.5)
         self.assertEqual(config.long_term_memory_remote_keepalive_interval_s, 2.25)
+        self.assertEqual(config.long_term_memory_remote_watchdog_interval_s, 1.5)
+        self.assertEqual(config.long_term_memory_remote_watchdog_history_limit, 7200)
         self.assertEqual(config.long_term_memory_remote_retry_attempts, 4)
         self.assertEqual(config.long_term_memory_remote_retry_backoff_s, 2.5)
         self.assertEqual(config.long_term_memory_remote_flush_timeout_s, 75.0)
@@ -660,6 +667,15 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.printer_line_width, 28)
         self.assertEqual(config.print_button_cooldown_s, 2.5)
 
+    def test_display_vendor_dir_defaults_to_state_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_vendor_dir, "state/display/vendor")
+
     def test_remote_primary_always_forces_fail_closed_remote_semantics(self) -> None:
         config = TwinrConfig(
             long_term_memory_enabled=True,
@@ -730,6 +746,8 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.long_term_memory_remote_read_timeout_s, 8.0)
         self.assertEqual(config.long_term_memory_remote_write_timeout_s, 15.0)
         self.assertEqual(config.long_term_memory_remote_keepalive_interval_s, 5.0)
+        self.assertEqual(config.long_term_memory_remote_watchdog_interval_s, 1.0)
+        self.assertEqual(config.long_term_memory_remote_watchdog_history_limit, 3600)
         self.assertEqual(config.long_term_memory_remote_retry_attempts, 3)
         self.assertEqual(config.long_term_memory_remote_retry_backoff_s, 1.0)
         self.assertEqual(config.long_term_memory_remote_flush_timeout_s, 60.0)
@@ -855,6 +873,9 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_STREAMING_FIRST_WORD_PREFETCH_ENABLED=false",
                         "TWINR_STREAMING_FIRST_WORD_PREFETCH_MIN_CHARS=5",
                         "TWINR_STREAMING_FIRST_WORD_PREFETCH_WAIT_MS=45",
+                        "TWINR_STREAMING_BRIDGE_REPLY_TIMEOUT_MS=300",
+                        "TWINR_STREAMING_FINAL_LANE_WATCHDOG_TIMEOUT_MS=4500",
+                        "TWINR_STREAMING_FINAL_LANE_HARD_TIMEOUT_MS=16000",
                         "TWINR_STREAMING_SUPERVISOR_MODEL=gpt-4o-mini",
                         "TWINR_STREAMING_SUPERVISOR_REASONING_EFFORT=low",
                         "TWINR_STREAMING_SPECIALIST_MODEL=gpt-5.2-chat-latest",
@@ -875,6 +896,9 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertFalse(config.streaming_first_word_prefetch_enabled)
         self.assertEqual(config.streaming_first_word_prefetch_min_chars, 5)
         self.assertEqual(config.streaming_first_word_prefetch_wait_ms, 45)
+        self.assertEqual(config.streaming_bridge_reply_timeout_ms, 300)
+        self.assertEqual(config.streaming_final_lane_watchdog_timeout_ms, 4500)
+        self.assertEqual(config.streaming_final_lane_hard_timeout_ms, 16000)
         self.assertEqual(config.streaming_supervisor_model, "gpt-4o-mini")
         self.assertEqual(config.streaming_supervisor_reasoning_effort, "low")
         self.assertEqual(config.streaming_specialist_model, "gpt-5.2-chat-latest")

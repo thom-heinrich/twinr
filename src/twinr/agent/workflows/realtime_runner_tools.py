@@ -39,6 +39,12 @@ class TwinrRealtimeToolDelegatesMixin:
     def _handle_answer_skill_question_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_answer_skill_question(arguments)
 
+    def _handle_confirm_skill_activation_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_confirm_skill_activation(arguments)
+
+    def _handle_rollback_skill_activation_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_rollback_skill_activation(arguments)
+
     def _handle_remember_memory_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_remember_memory(arguments)
 

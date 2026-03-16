@@ -1,3 +1,9 @@
+"""Persist Twinr integration configuration on disk.
+
+This module owns the bounded, atomic, file-backed store used by runtime and web
+surfaces to read and update managed integration configuration.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -31,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 
 def integration_store_path(project_root: str | Path) -> Path:
+    """Return the canonical JSON store path below one project root."""
+
     return Path(project_root).resolve() / "artifacts" / "stores" / "integrations" / "integrations.json"
 
 
@@ -40,11 +48,15 @@ class IntegrationStoreError(RuntimeError):
 
 
 def _default_payload() -> dict[str, object]:
+    """Return a fresh empty payload for a new integration store."""
+
     # AUDIT-FIX(#5): Always return a fresh default payload to avoid accidental shared mutable state.
     return {"version": _STORE_VERSION, "integrations": {}}
 
 
 def _coerce_enabled(value: object) -> bool:
+    """Parse persisted enabled flags into a safe boolean."""
+
     # AUDIT-FIX(#3): Parse booleans strictly so strings like "false" do not accidentally enable an integration.
     if isinstance(value, bool):
         return value
@@ -60,6 +72,8 @@ def _coerce_enabled(value: object) -> bool:
 
 
 def _normalize_updated_at(value: object) -> str | None:
+    """Normalize persisted timestamps to UTC ISO-8601 text."""
+
     # AUDIT-FIX(#6): Keep only timezone-aware ISO-8601 timestamps and normalize them to UTC.
     if value is None:
         return None
@@ -78,6 +92,8 @@ def _normalize_updated_at(value: object) -> str | None:
 
 
 def _normalize_integration_id(value: object) -> str:
+    """Validate one persisted integration ID."""
+
     # AUDIT-FIX(#7): Reject empty and control-character IDs so the store cannot accumulate unaddressable entries.
     candidate = str(value).strip()
     if not candidate:
@@ -89,6 +105,8 @@ def _normalize_integration_id(value: object) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ManagedIntegrationConfig:
+    """Store one integration's enabled flag, settings, and update timestamp."""
+
     integration_id: str
     enabled: bool = False
     settings: dict[str, str] = field(default_factory=dict)
@@ -96,6 +114,8 @@ class ManagedIntegrationConfig:
 
     @classmethod
     def from_dict(cls, integration_id: str, payload: dict[str, object]) -> "ManagedIntegrationConfig":
+        """Build a normalized config record from persisted JSON data."""
+
         normalized_integration_id = _normalize_integration_id(integration_id)
         settings = payload.get("settings", {})
         if not isinstance(settings, dict):
@@ -108,6 +128,8 @@ class ManagedIntegrationConfig:
         )
 
     def to_dict(self) -> dict[str, object]:
+        """Serialize the config record into store-ready JSON data."""
+
         return {
             "enabled": self.enabled,
             "settings": dict(sorted(self.settings.items())),
@@ -115,14 +137,20 @@ class ManagedIntegrationConfig:
         }
 
     def value(self, key: str, default: str = "") -> str:
+        """Return one string setting with a default fallback."""
+
         return self.settings.get(key, default)
 
 
 class TwinrIntegrationStore:
+    """Read and write the file-backed managed integration store."""
+
     _thread_locks: ClassVar[dict[Path, threading.RLock]] = {}
     _thread_locks_guard: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, path: str | Path) -> None:
+        """Initialize the store for one explicit JSON path."""
+
         normalized_path = Path(path).expanduser()
         # AUDIT-FIX(#1): Convert relative paths to absolute ones without resolving symlinks away.
         if not normalized_path.is_absolute():
@@ -133,9 +161,13 @@ class TwinrIntegrationStore:
 
     @classmethod
     def from_project_root(cls, project_root: str | Path) -> "TwinrIntegrationStore":
+        """Build the store that belongs to one Twinr project root."""
+
         return cls(integration_store_path(project_root))
 
     def load_all(self) -> dict[str, ManagedIntegrationConfig]:
+        """Load all normalized integration records from disk."""
+
         # AUDIT-FIX(#2): Hold the store lock across the whole read to prevent concurrent readers from observing partial recovery/write state.
         with self._exclusive_lock(create_parent=False):
             payload = self._read_payload()
@@ -156,6 +188,8 @@ class TwinrIntegrationStore:
         return loaded
 
     def get(self, integration_id: str) -> ManagedIntegrationConfig:
+        """Return one config record or an empty default record."""
+
         # AUDIT-FIX(#7): Normalize lookup IDs so callers cannot accidentally read/write different logical keys.
         normalized_integration_id = _normalize_integration_id(integration_id)
         return self.load_all().get(
@@ -164,6 +198,8 @@ class TwinrIntegrationStore:
         )
 
     def save(self, record: ManagedIntegrationConfig) -> ManagedIntegrationConfig:
+        """Persist one config record and return the normalized saved copy."""
+
         raw_settings = record.settings if isinstance(record.settings, dict) else {}
         normalized_record = ManagedIntegrationConfig(
             # AUDIT-FIX(#7): Normalize IDs on write to keep the persisted key-space valid.
@@ -193,6 +229,8 @@ class TwinrIntegrationStore:
         return saved_record
 
     def _read_payload(self) -> dict[str, object]:
+        """Load the primary payload, recovering from backup when needed."""
+
         # AUDIT-FIX(#4): Replace brittle exists()/read_text() logic with deterministic file-state handling and explicit errors.
         primary_state, primary_payload = self._load_payload_file(self.path)
         if primary_state == "ok" and primary_payload is not None:
@@ -217,6 +255,8 @@ class TwinrIntegrationStore:
         raise IntegrationStoreError(f"Integration store cannot be loaded safely: {self.path}")
 
     def _write_payload(self, payload: dict[str, object]) -> None:
+        """Persist the payload and refresh the last-known-good backup."""
+
         # AUDIT-FIX(#2): Persist via atomic replace and fsync so power loss cannot leave a truncated JSON file behind.
         serialized_payload = self._serialize_payload(payload)
         self._write_bytes_atomic(self.path, serialized_payload)
@@ -229,6 +269,8 @@ class TwinrIntegrationStore:
             logger.warning("Failed to refresh integration store backup %s: %s", self._backup_path, exc)
 
     def _serialize_payload(self, payload: dict[str, object]) -> bytes:
+        """Encode one payload into bounded UTF-8 JSON bytes."""
+
         try:
             serialized = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False).encode("utf-8") + b"\n"
         except (TypeError, ValueError) as exc:
@@ -241,6 +283,8 @@ class TwinrIntegrationStore:
         return serialized
 
     def _load_payload_file(self, path: Path) -> tuple[str, dict[str, object] | None]:
+        """Read one store file and classify it as ok, missing, or invalid."""
+
         # AUDIT-FIX(#1): Reject symlinked files so attackers cannot redirect reads/writes to arbitrary targets.
         try:
             stat_result = path.lstat()
@@ -281,6 +325,8 @@ class TwinrIntegrationStore:
 
     @contextmanager
     def _exclusive_lock(self, create_parent: bool) -> Iterator[None]:
+        """Hold thread and process locks around one critical section."""
+
         thread_lock = self._get_thread_lock()
         with thread_lock:
             if create_parent:
@@ -307,6 +353,8 @@ class TwinrIntegrationStore:
                 lock_file.close()
 
     def _get_thread_lock(self) -> threading.RLock:
+        """Return the process-local lock associated with this store path."""
+
         with self._thread_locks_guard:
             lock = self._thread_locks.get(self.path)
             if lock is None:
@@ -315,6 +363,8 @@ class TwinrIntegrationStore:
             return lock
 
     def _ensure_store_parent(self) -> None:
+        """Create and validate the store parent directory."""
+
         # AUDIT-FIX(#1): Refuse symlinked path components before creating any state files.
         self._ensure_no_symlink_ancestors(self.path.parent)
         try:
@@ -326,6 +376,8 @@ class TwinrIntegrationStore:
             raise IntegrationStoreError(f"Integration store parent is not a directory: {self.path.parent}")
 
     def _ensure_no_symlink_ancestors(self, path: Path) -> None:
+        """Reject symlinked path components below the requested directory."""
+
         current = Path(path.anchor) if path.anchor else Path()
         parts = path.parts[1:] if path.anchor else path.parts
 
@@ -338,6 +390,8 @@ class TwinrIntegrationStore:
                 raise IntegrationStoreError(f"Failed to inspect integration store path component: {current}") from exc
 
     def _open_lock_file(self):
+        """Open the OS-level lock file used for cross-process coordination."""
+
         try:
             if self._lock_path.is_symlink():
                 raise IntegrationStoreError(f"Refusing symlinked integration store lock file: {self._lock_path}")
@@ -356,6 +410,8 @@ class TwinrIntegrationStore:
         return os.fdopen(descriptor, "a+b", buffering=0)
 
     def _write_bytes_atomic(self, path: Path, payload_bytes: bytes) -> None:
+        """Write bytes to a path via tempfile plus atomic replace."""
+
         temp_path: str | None = None
         replaced = False
 
@@ -392,6 +448,8 @@ class TwinrIntegrationStore:
             raise IntegrationStoreError(f"Failed to write integration store file atomically: {path}") from exc
 
     def _fsync_directory(self, directory: Path) -> None:
+        """Flush directory metadata after atomic file replacement."""
+
         directory_flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
             directory_flags |= os.O_DIRECTORY

@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone  # AUDIT-FIX(#7): Use aware local timestamps instead of naive localtime.
+import gc
 from importlib import import_module
 import importlib.util  # AUDIT-FIX(#1): Load vendor modules from exact files instead of mutating sys.path.
 from pathlib import Path
@@ -361,15 +362,7 @@ class WaveshareEPD4In2V2:
         if callable(cleanup):
             with suppress(Exception):
                 cleanup(cleanup=True)
-        self._epdconfig_module = None
-        self._driver_module = None
-        self._epd = None
-        for module_name in (
-            "waveshare_epd.epd4in2_V2",
-            "waveshare_epd.epdconfig",
-            "waveshare_epd",
-        ):
-            sys.modules.pop(module_name, None)
+        self._drop_cached_vendor_modules()
 
     def _validate_vendor_config(self, epdconfig: object) -> None:
         expected = {
@@ -1050,6 +1043,7 @@ class WaveshareEPD4In2V2:
             spec.loader.exec_module(module)
         except Exception:
             sys.modules.pop(module_name, None)
+            gc.collect()
             raise
         return module
 
@@ -1085,8 +1079,22 @@ class WaveshareEPD4In2V2:
     # AUDIT-FIX(#4): After any hardware fault, fully discard cached driver state so the next attempt starts from a clean init path.
     def _reset_driver_state(self) -> None:
         self._shutdown_hardware()
+        self._drop_cached_vendor_modules()
+
+    def _drop_cached_vendor_modules(self) -> None:
+        """Discard cached vendor modules so the next render uses a fresh import."""
+
+        self._epdconfig_module = None
+        self._driver_module = None
         self._epd = None
         self._render_count = 0
+        for module_name in (
+            "waveshare_epd.epd4in2_V2",
+            "waveshare_epd.epdconfig",
+            "waveshare_epd",
+        ):
+            sys.modules.pop(module_name, None)
+        gc.collect()
 
     # AUDIT-FIX(#2): Collapse whitespace and coerce arbitrary values into safe display strings, especially on error-reporting paths.
     def _normalise_text(self, value: object, *, fallback: str = "") -> str:

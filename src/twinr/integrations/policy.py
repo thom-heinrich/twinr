@@ -1,3 +1,9 @@
+"""Evaluate safety policy for Twinr integration requests.
+
+This module turns manifests plus normalized requests into allow or deny
+decisions while keeping unknown or malformed state fail-closed.
+"""
+
 from __future__ import annotations
 
 import logging  # AUDIT-FIX(#2): Record unexpected policy-evaluation failures and fail closed instead of crashing the caller.
@@ -32,6 +38,8 @@ _POLICY_FALSE_VALUES: Final[frozenset[str]] = frozenset({"", "0", "false", "no",
 
 
 def _normalize_policy_bool(value: object, *, field_name: str) -> bool:
+    """Parse tolerant config-style booleans into strict ``bool`` values."""
+
     if isinstance(value, bool):
         return value
     if isinstance(value, int) and not isinstance(value, bool) and value in (0, 1):
@@ -46,24 +54,32 @@ def _normalize_policy_bool(value: object, *, field_name: str) -> bool:
 
 
 def _require_bool(value: object, *, field_name: str) -> bool:
+    """Require a real boolean value."""
+
     if isinstance(value, bool):  # AUDIT-FIX(#3): Confirmation and trigger flags must be real booleans so truthy strings cannot authorize actions.
         return value
     raise TypeError(f"{field_name} must be a boolean.")
 
 
 def _require_enum(value: object, *, enum_type: type[EnumT], field_name: str) -> EnumT:
+    """Require an enum member of the expected type."""
+
     if isinstance(value, enum_type):
         return value
     raise TypeError(f"{field_name} must be a {enum_type.__name__}.")
 
 
 def _require_non_negative_int(value: object, *, field_name: str) -> int:
+    """Require a non-negative integer."""
+
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     raise TypeError(f"{field_name} must be a non-negative integer.")
 
 
 def _normalize_identifier(value: object, *, field_name: str) -> str:
+    """Normalize one identifier-like policy value."""
+
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string.")
     normalized = value.strip()
@@ -73,6 +89,8 @@ def _normalize_identifier(value: object, *, field_name: str) -> str:
 
 
 def _normalize_identifier_set(values: object, *, field_name: str) -> frozenset[str]:
+    """Normalize one identifier collection into a frozen set."""
+
     if values is None:
         return frozenset()
 
@@ -98,17 +116,23 @@ def _normalize_identifier_set(values: object, *, field_name: str) -> frozenset[s
 
 
 def _confirmation_rank(mode: ConfirmationMode) -> int:
+    """Map confirmation modes onto an ordering from weaker to stronger."""
+
     return _CONFIRMATION_RANK.get(
         mode, len(_CONFIRMATION_RANK)
     )  # AUDIT-FIX(#4): Treat unknown future confirmation modes as stricter than every known mode.
 
 
 def stricter_confirmation(*modes: ConfirmationMode) -> ConfirmationMode:
+    """Return the strictest confirmation mode from a set of candidates."""
+
     return max(modes, key=_confirmation_rank)
 
 
 @dataclass(slots=True)
 class SafeIntegrationPolicy:
+    """Evaluate whether a normalized integration request may proceed."""
+
     enabled_integrations: frozenset[str] = field(default_factory=frozenset)
     blocked_integrations: frozenset[str] = field(default_factory=frozenset)
     blocked_operations: frozenset[str] = field(default_factory=frozenset)
@@ -117,6 +141,8 @@ class SafeIntegrationPolicy:
     allow_critical_operations: bool = False
 
     def __post_init__(self) -> None:
+        """Normalize allowlists and boolean flags at construction time."""
+
         self.enabled_integrations = _normalize_identifier_set(
             self.enabled_integrations,
             field_name="enabled_integrations",
@@ -143,6 +169,8 @@ class SafeIntegrationPolicy:
         )
 
     def evaluate(self, manifest: IntegrationManifest, request: IntegrationRequest) -> IntegrationDecision:
+        """Evaluate one request and fail closed on unexpected errors."""
+
         try:
             return self._evaluate_impl(manifest, request)
         except Exception:
@@ -154,6 +182,8 @@ class SafeIntegrationPolicy:
             )
 
     def _evaluate_impl(self, manifest: IntegrationManifest, request: IntegrationRequest) -> IntegrationDecision:
+        """Evaluate one request against the normalized policy rules."""
+
         integration_id = _normalize_identifier(
             getattr(manifest, "integration_id"),
             field_name="manifest.integration_id",
@@ -277,6 +307,8 @@ class SafeIntegrationPolicy:
         domain: IntegrationDomain,
         action: IntegrationAction,
     ) -> ConfirmationMode:
+        """Return the minimum confirmation required for a domain/action pair."""
+
         if domain is IntegrationDomain.CALENDAR:
             if action in {IntegrationAction.WRITE, IntegrationAction.SEND, IntegrationAction.CONTROL}:
                 return ConfirmationMode.USER
@@ -311,6 +343,8 @@ class SafeIntegrationPolicy:
         explicit_caregiver_confirmation: bool,
         required_confirmation: ConfirmationMode,
     ) -> bool:
+        """Return whether the request carries enough human confirmation."""
+
         if required_confirmation is ConfirmationMode.NONE:
             return True
         if required_confirmation is ConfirmationMode.USER:

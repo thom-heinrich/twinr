@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass
 
 from twinr.hardware.audio import AmbientAudioCaptureWindow, pcm16_to_wav_bytes
-from twinr.providers.openai.backend import OpenAIBackend
+from twinr.providers.openai import OpenAIBackend
 from twinr.text_utils import folded_lookup_text
 
 

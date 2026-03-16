@@ -1,3 +1,11 @@
+"""Assemble Twinr's configured runtime provider bundle.
+
+This module validates the top-level provider-selection fields on
+``TwinrConfig``, constructs the selected STT, LLM, and TTS providers, and
+rolls back any resources created here if bootstrap fails. Provider-specific
+transport and SDK logic stays in the sibling provider packages.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,16 +26,37 @@ _T = TypeVar("_T")
 
 
 class ProviderConfigurationError(RuntimeError):
-    """Raised when the streaming provider bundle cannot be built safely from config."""  # AUDIT-FIX(#1): Give callers a stable exception type for bootstrap/config failures.
+    """Signal a deterministic provider-bootstrap failure."""  # AUDIT-FIX(#1): Give callers a stable exception type for bootstrap/config failures.
 
 
 @dataclass
 class StreamingProviderBundle(ProviderBundle):
+    """Extend ``ProviderBundle`` with shared support backends used by Twinr.
+
+    Attributes:
+        print_backend: Combined speech/text facade used for printing and
+            support flows that need coordinated STT, agent, and TTS access.
+        support_backend: Shared OpenAI backend reused for support and fallback
+            provider paths.
+    """
+
     print_backend: CombinedSpeechAgentProvider
     support_backend: OpenAIBackend
 
 
 def _describe_config_value(value: object, *, max_length: int = 32) -> str:
+    """Render a bounded config value description for error messages.
+
+    Args:
+        value: Raw config value to describe.
+        max_length: Maximum number of characters to keep before falling back
+            to a type-level placeholder. Defaults to 32.
+
+    Returns:
+        A short string that helps diagnose malformed config without dumping
+        large or secret-like values into logs.
+    """
+
     if isinstance(value, str):
         if len(value) > max_length:
             return f"<str len={len(value)}>"
@@ -44,6 +73,20 @@ def _normalize_provider_name(
     env_key: str,
     default: str,
 ) -> str:
+    """Normalize one configured provider name or fall back to the default.
+
+    Args:
+        value: Raw config value for the provider selector.
+        env_key: Environment-variable name used in error messages.
+        default: Provider name to use when the config is unset or blank.
+
+    Returns:
+        A lower-cased provider name suitable for allow-list validation.
+
+    Raises:
+        ProviderConfigurationError: If ``value`` is set but is not a string.
+    """
+
     if value is None:
         return default
     if not isinstance(value, str):
@@ -62,6 +105,23 @@ def _resolve_provider_name(
     default: str,
     supported: tuple[str, ...],
 ) -> str:
+    """Resolve and validate one provider selector from ``TwinrConfig``.
+
+    Args:
+        config: Runtime config object that carries provider selection fields.
+        attr_name: Attribute name to read from ``config``.
+        env_key: Environment-variable name used in error messages.
+        default: Provider name to use when the config value is unset or blank.
+        supported: Allowed provider names for this selector.
+
+    Returns:
+        The normalized provider name after allow-list validation.
+
+    Raises:
+        ProviderConfigurationError: If the config object is malformed or the
+            resolved provider name is unsupported.
+    """
+
     raw_value = getattr(config, attr_name, _MISSING)
     if raw_value is _MISSING:
         raise ProviderConfigurationError(
@@ -79,6 +139,19 @@ def _resolve_provider_name(
 
 
 def _require_component(component: _T | None, *, name: str) -> _T:
+    """Require that a selected provider component is present.
+
+    Args:
+        component: Component instance pulled from a provider bundle.
+        name: Human-readable component name for the failure message.
+
+    Returns:
+        The non-``None`` component instance.
+
+    Raises:
+        ProviderConfigurationError: If the component is missing.
+    """
+
     if component is None:
         raise ProviderConfigurationError(
             f"Provider bundle is missing required component: {name}"
@@ -87,6 +160,12 @@ def _require_component(component: _T | None, *, name: str) -> _T:
 
 
 def _close_if_possible(resource: object | None) -> None:
+    """Close a created resource without masking the primary failure.
+
+    Args:
+        resource: Resource that may expose a ``close()`` method.
+    """
+
     if resource is None:
         return
     close = getattr(resource, "close", None)
@@ -102,6 +181,26 @@ def build_streaming_provider_bundle(
     *,
     support_backend: OpenAIBackend | None = None,
 ) -> StreamingProviderBundle:
+    """Build the runtime provider bundle from Twinr's provider config.
+
+    Validates the configured STT, LLM, and TTS provider names before any
+    provider-specific work starts. Resources created inside this factory are
+    closed again if a later bootstrap step fails.
+
+    Args:
+        config: Runtime config with provider-selection fields and provider
+            credentials.
+        support_backend: Optional pre-built OpenAI backend to reuse for the
+            support path instead of constructing one inside the factory.
+
+    Returns:
+        A fully wired ``StreamingProviderBundle`` for the active runtime.
+
+    Raises:
+        ProviderConfigurationError: If config is malformed, a provider name is
+            unsupported, or a selected provider cannot be initialized safely.
+    """
+
     if config is None:
         raise ProviderConfigurationError("config must not be None")  # AUDIT-FIX(#1): Replace a later AttributeError with a deterministic bootstrap failure.
 

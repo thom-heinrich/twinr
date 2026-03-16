@@ -1,3 +1,10 @@
+"""Parse iCalendar data and expose an ICS-backed calendar reader.
+
+This module converts `.ics` payloads into ``CalendarEvent`` records,
+normalizes timezone handling for local wall times, and provides a read-only
+source used by Twinr's calendar adapter.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -24,6 +31,15 @@ _VENDOR_TZID_PREFIX_RE = re.compile(r"^[^A-Za-z]*/")
 
 
 def unfold_ics_lines(text: str) -> list[str]:
+    """Unfold RFC 5545 continuation lines in raw ICS text.
+
+    Args:
+        text: Raw iCalendar payload.
+
+    Returns:
+        The logical ICS lines with folded continuations joined.
+    """
+
     lines: list[str] = []
     for raw_line in text.splitlines():
         if raw_line.startswith((" ", "\t")) and lines:
@@ -34,6 +50,17 @@ def unfold_ics_lines(text: str) -> list[str]:
 
 
 def parse_ics_events(text: str, *, default_timezone: tzinfo = UTC) -> list[CalendarEvent]:
+    """Parse VEVENT records from an ICS payload.
+
+    Args:
+        text: Raw iCalendar payload.
+        default_timezone: Timezone used for floating or DATE-only values.
+
+    Returns:
+        Parsed calendar events sorted by ``starts_at``. Invalid VEVENT blocks
+        are skipped instead of aborting the whole parse.
+    """
+
     events: list[CalendarEvent] = []
     current: dict[str, tuple[dict[str, str], str]] | None = None
     nested_depth = 0  # AUDIT-FIX(#2): Ignore nested subcomponents such as VALARM so they cannot overwrite VEVENT fields.
@@ -82,11 +109,28 @@ def parse_ics_events(text: str, *, default_timezone: tzinfo = UTC) -> list[Calen
 
 @dataclass(slots=True)
 class ICSCalendarSource:
+    """Read events from an ICS payload supplier.
+
+    Attributes:
+        loader: Callable returning the raw ICS payload when invoked.
+        default_timezone: Timezone used for floating or DATE-only values.
+    """
+
     loader: Callable[[], str]
     default_timezone: tzinfo = UTC
 
     @classmethod
     def from_path(cls, path: str | Path, *, default_timezone: tzinfo = UTC) -> "ICSCalendarSource":
+        """Build a source that loads ICS text from a filesystem path.
+
+        Args:
+            path: Local path to the ICS file.
+            default_timezone: Timezone used for floating or DATE-only values.
+
+        Returns:
+            A source that reloads the file on each query.
+        """
+
         file_path = Path(path)
         return cls(
             loader=lambda: _read_ics_text_from_path(file_path),  # AUDIT-FIX(#1): Harden filesystem reads against symlinks, special files and oversized input.
@@ -94,6 +138,17 @@ class ICSCalendarSource:
         )
 
     def list_events(self, *, start_at: datetime, end_at: datetime, limit: int) -> list[CalendarEvent]:
+        """List events overlapping a query window.
+
+        Args:
+            start_at: Inclusive query-window start.
+            end_at: Exclusive query-window end.
+            limit: Maximum number of events to return.
+
+        Returns:
+            A bounded list of overlapping calendar events.
+        """
+
         if limit <= 0:  # AUDIT-FIX(#4): Negative slicing semantics previously returned the wrong set of events.
             return []
 
@@ -124,6 +179,8 @@ def _event_from_fields(
     *,
     default_timezone: tzinfo,
 ) -> CalendarEvent | None:
+    """Convert VEVENT fields into a ``CalendarEvent`` when possible."""
+
     start = fields.get("DTSTART")
     summary = fields.get("SUMMARY")
     if start is None or summary is None:
@@ -178,6 +235,8 @@ def _event_from_fields(
 
 
 def _parse_datetime(value: str, *, params: dict[str, str], default_timezone: tzinfo) -> tuple[datetime, bool]:
+    """Parse an ICS DATE or DATE-TIME value into a normalized datetime."""
+
     cleaned_value = value.strip()
     if params.get("VALUE", "").upper() == "DATE":
         parsed_date = _parse_date_value(cleaned_value)
@@ -197,6 +256,8 @@ def _parse_datetime(value: str, *, params: dict[str, str], default_timezone: tzi
 
 
 def _timezone_for_name(name: str | None, *, fallback: tzinfo) -> tzinfo:
+    """Resolve an ICS timezone name into a ``tzinfo`` object."""
+
     if not name:
         return fallback
 
@@ -230,6 +291,8 @@ def _append_event_if_valid(
     *,
     default_timezone: tzinfo,
 ) -> None:
+    """Append a parsed event when the VEVENT fields are valid."""
+
     try:
         event = _event_from_fields(fields, default_timezone=default_timezone)
     except Exception as exc:  # AUDIT-FIX(#3): Malformed VEVENTs are isolated and skipped instead of aborting the full import.
@@ -240,16 +303,22 @@ def _append_event_if_valid(
 
 
 def _normalise_query_datetime(value: datetime, *, fallback_timezone: tzinfo) -> datetime:
+    """Normalize a query bound into an aware datetime."""
+
     if _is_aware_datetime(value):
         return value
     return _attach_timezone(value, fallback_timezone)
 
 
 def _is_aware_datetime(value: datetime) -> bool:
+    """Return True when ``value`` carries a usable timezone offset."""
+
     return value.tzinfo is not None and value.tzinfo.utcoffset(value) is not None
 
 
 def _attach_timezone(value: datetime, timezone: tzinfo) -> datetime:
+    """Attach ``timezone`` to a naive datetime, validating DST gaps."""
+
     if _is_aware_datetime(value):
         return value
 
@@ -268,15 +337,21 @@ def _attach_timezone(value: datetime, timezone: tzinfo) -> datetime:
 
 
 def _roundtrips_local_time(value: datetime, timezone: ZoneInfo) -> bool:
+    """Check whether a timezone attachment preserves the local wall time."""
+
     round_tripped = value.astimezone(UTC).astimezone(timezone)
     return round_tripped.replace(tzinfo=None) == value.replace(tzinfo=None)
 
 
 def _parse_date_value(value: str) -> date:
+    """Parse an ICS DATE value in ``YYYYMMDD`` format."""
+
     return datetime.strptime(value, "%Y%m%d").date()
 
 
 def _parse_datetime_value(value: str) -> datetime:
+    """Parse an ICS DATE-TIME value without timezone metadata."""
+
     for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M"):
         try:
             return datetime.strptime(value, fmt)
@@ -286,6 +361,8 @@ def _parse_datetime_value(value: str) -> datetime:
 
 
 def _parse_duration(value: str) -> timedelta:
+    """Parse an ICS DURATION value into a ``timedelta``."""
+
     match = _DURATION_RE.fullmatch(value.strip().upper())
     if match is None:
         raise ValueError(f"Unsupported iCalendar DURATION value: {value!r}")
@@ -304,6 +381,8 @@ def _parse_duration(value: str) -> timedelta:
 
 
 def _optional_text_field(field: tuple[dict[str, str], str] | None) -> str | None:
+    """Decode an optional text field and drop empty results."""
+
     if field is None:
         return None
     value = _unescape_ics_text(field[1]).strip()
@@ -311,6 +390,8 @@ def _optional_text_field(field: tuple[dict[str, str], str] | None) -> str | None
 
 
 def _unescape_ics_text(value: str) -> str:
+    """Decode iCalendar text escape sequences."""
+
     result: list[str] = []
     index = 0
     while index < len(value):
@@ -336,6 +417,8 @@ def _unescape_ics_text(value: str) -> str:
 
 
 def _split_ics_key(raw_key: str) -> list[str]:
+    """Split an ICS property key while respecting quoted parameters."""
+
     parts: list[str] = []
     current: list[str] = []
     in_quotes = False
@@ -365,6 +448,8 @@ def _split_ics_key(raw_key: str) -> list[str]:
 
 
 def _clean_param_value(value: str) -> str:
+    """Strip whitespace and matching quotes from an ICS parameter value."""
+
     stripped = value.strip()
     if len(stripped) >= 2 and stripped[0] == stripped[-1] == '"':
         stripped = stripped[1:-1]
@@ -372,6 +457,8 @@ def _clean_param_value(value: str) -> str:
 
 
 def _read_ics_text_from_path(path: Path) -> str:
+    """Read UTF-8 ICS text from a bounded regular file path."""
+
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC

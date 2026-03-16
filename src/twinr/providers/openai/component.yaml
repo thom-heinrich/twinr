@@ -1,0 +1,92 @@
+schema_version: 1
+name: openai
+path: src/twinr/providers/openai
+kind: python-package
+visibility: internal
+summary: Expose the stable package-root import surface for Twinr's OpenAI provider stack and route callers into the focused api, core, capabilities, and realtime subpackages.
+owned_concerns:
+  - Expose the stable `twinr.providers.openai` import surface used across Twinr runtime code
+  - Re-export the backend, provider bundle, realtime session types, and shared OpenAI value objects from focused subpackages
+  - Define the package-level boundary between `api`, `core`, `capabilities`, and `realtime`
+out_of_scope:
+  - Backend composition and contract adapter implementation in src/twinr/providers/openai/api
+  - Shared client construction, request builders, and value-object implementation in src/twinr/providers/openai/core
+  - Capability-specific mixin implementation in src/twinr/providers/openai/capabilities
+  - Realtime websocket session implementation in src/twinr/providers/openai/realtime
+files:
+  - path: __init__.py
+    role: Export the stable package-root OpenAI surface
+    exports:
+      - OpenAIAgentTextProvider
+      - OpenAIBackend
+      - OpenAIFirstWordProvider
+      - OpenAIImageInput
+      - OpenAIProviderBundle
+      - OpenAIRealtimeSession
+      - OpenAIRealtimeTurn
+      - OpenAISpeechToTextProvider
+      - OpenAISupervisorDecisionProvider
+      - OpenAITextResponse
+      - OpenAITextToSpeechProvider
+      - OpenAIToolCallingAgentProvider
+subpackages:
+  - path: api
+    role: Backend composition and contract adapters
+  - path: capabilities
+    role: Capability-specific mixin implementations
+  - path: core
+    role: Shared client, request, and value primitives
+  - path: realtime
+    role: Realtime session and turn surfaces
+public_api:
+  module: twinr.providers.openai
+  exports:
+    - OpenAIAgentTextProvider
+    - OpenAIBackend
+    - OpenAIFirstWordProvider
+    - OpenAIImageInput
+    - OpenAIProviderBundle
+    - OpenAIRealtimeSession
+    - OpenAIRealtimeTurn
+    - OpenAISpeechToTextProvider
+    - OpenAISupervisorDecisionProvider
+    - OpenAITextResponse
+    - OpenAITextToSpeechProvider
+    - OpenAIToolCallingAgentProvider
+compatibility_reexports:
+  - path: src/twinr/providers/__init__.py
+    names:
+      - OpenAIBackend
+      - OpenAIImageInput
+      - OpenAIRealtimeSession
+      - OpenAIRealtimeTurn
+      - OpenAITextResponse
+primary_callers:
+  - path: src/twinr/__main__.py
+  - path: src/twinr/providers/__init__.py
+  - path: src/twinr/providers/factory.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/realtime_runner_support.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+  - path: src/twinr/orchestrator/session.py
+  - path: src/twinr/proactive/runtime/service.py
+  - path: src/twinr/proactive/social/observers.py
+  - path: src/twinr/proactive/social/vision_review.py
+  - path: src/twinr/proactive/wakeword/matching.py
+  - path: src/twinr/proactive/wakeword/spotter.py
+  - path: src/twinr/memory/query_normalization.py
+  - path: src/twinr/memory/longterm/evaluation/subtext_eval.py
+  - path: src/twinr/memory/longterm/ingestion/propositions.py
+  - path: src/twinr/memory/longterm/reasoning/midterm.py
+  - path: src/twinr/memory/longterm/retrieval/subtext.py
+tests:
+  - path: test/test_main.py
+  - path: test/test_openai_adapters.py
+  - path: test/test_openai_backend.py
+  - path: test/test_openai_realtime.py
+  - path: test/test_proactive_vision_review.py
+  - path: test/test_provider_factory.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_runner.py
+  - path: test/test_streaming_runner.py

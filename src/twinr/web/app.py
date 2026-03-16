@@ -1,3 +1,9 @@
+"""Serve Twinr's local FastAPI control surface.
+
+This module assembles the web app, applies control-plane security guards, and
+wires route handlers to presenter, support, ops, and automation helpers.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -20,6 +26,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
 from twinr.agent.base_agent import AdaptiveTimingStore, TwinrConfig
+from twinr.agent.self_coding import build_self_coding_operator_status
 from twinr.hardware.voice_profile import VoiceProfileMonitor
 from twinr.integrations import build_managed_integrations, integration_automation_family_providers
 from twinr.memory.reminders import format_due_label
@@ -41,10 +48,10 @@ from twinr.web.automations import (
     toggle_automation_enabled,
 )
 from twinr.web.context import WebAppContext
-from twinr.web.contracts import DashboardCard
-from twinr.web.forms import _collect_standard_updates
-from twinr.web.store import FileBackedSetting, parse_urlencoded_form, read_text_file, write_env_updates, write_text_file
-from twinr.web.viewmodels import (
+from twinr.web.support.contracts import DashboardCard
+from twinr.web.support.forms import _collect_standard_updates
+from twinr.web.support.store import FileBackedSetting, parse_urlencoded_form, read_text_file, write_env_updates, write_text_file
+from twinr.web.presenters import (
     _adaptive_timing_view,
     _build_calendar_integration_record,
     _build_email_integration_record,
@@ -77,6 +84,8 @@ _MAX_FORM_BYTES_CAP = 1024 * 1024
 
 
 def _env_bool(raw_value: Any, *, default: bool) -> bool:
+    """Parse a boolean-like env value with a fallback."""
+
     if raw_value is None:
         return default
     value = str(raw_value).strip().lower()
@@ -88,6 +97,8 @@ def _env_bool(raw_value: Any, *, default: bool) -> bool:
 
 
 def _env_int(raw_value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    """Parse and clamp an integer-like env value."""
+
     try:
         value = int(str(raw_value).strip())
     except (TypeError, ValueError):
@@ -96,6 +107,8 @@ def _env_int(raw_value: Any, *, default: int, minimum: int, maximum: int) -> int
 
 
 def _normalize_host_header(raw_host: str) -> str:
+    """Normalize a host header or allowlist entry for comparison."""
+
     host = raw_host.strip()
     if not host:
         return ""
@@ -109,6 +122,8 @@ def _normalize_host_header(raw_host: str) -> str:
 
 
 def _parse_allowed_hosts(raw_value: str | None) -> tuple[str, ...]:
+    """Split and normalize the configured host allowlist."""
+
     configured = raw_value or _DEFAULT_ALLOWED_HOSTS
     hosts = []
     for chunk in configured.split(","):
@@ -119,6 +134,8 @@ def _parse_allowed_hosts(raw_value: str | None) -> tuple[str, ...]:
 
 
 def _is_allowed_host(host: str, allowed_hosts: tuple[str, ...]) -> bool:
+    """Return whether a normalized host is allowed."""
+
     if not host:
         return False
     if "*" in allowed_hosts:
@@ -127,6 +144,8 @@ def _is_allowed_host(host: str, allowed_hosts: tuple[str, ...]) -> bool:
 
 
 def _is_loopback_host(host: str) -> bool:
+    """Return whether a client host resolves to loopback."""
+
     normalized = host.strip().lower()
     if normalized in {"", "localhost"}:
         return True
@@ -137,6 +156,8 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def _has_valid_basic_auth(request: Request, username: str, password: str) -> bool:
+    """Validate HTTP Basic credentials against configured values."""
+
     header = request.headers.get("authorization", "")
     if not header.startswith("Basic "):
         return False
@@ -151,11 +172,15 @@ def _has_valid_basic_auth(request: Request, username: str, password: str) -> boo
 
 
 def _request_origin(request: Request) -> str:
+    """Build the request origin from scheme and host headers."""
+
     host = request.headers.get("host", "").strip()
     return f"{request.url.scheme}://{host}".rstrip("/")
 
 
 def _is_same_origin_url(candidate: str, expected_origin: str) -> bool:
+    """Return whether a URL matches the expected origin."""
+
     parsed = urlsplit(candidate)
     if not parsed.scheme or not parsed.netloc:
         return False
@@ -163,6 +188,8 @@ def _is_same_origin_url(candidate: str, expected_origin: str) -> bool:
 
 
 def _has_trusted_same_origin(request: Request) -> bool:
+    """Check Origin, Referer, or Fetch metadata for same-origin requests."""
+
     expected_origin = _request_origin(request)
     origin = request.headers.get("origin", "").strip()
     if origin:
@@ -175,6 +202,8 @@ def _has_trusted_same_origin(request: Request) -> bool:
 
 
 def _secure_response(response: Response) -> Response:
+    """Apply no-store and basic hardening headers to a response."""
+
     response.headers.setdefault("Cache-Control", "no-store")
     response.headers.setdefault("Pragma", "no-cache")
     response.headers.setdefault("X-Frame-Options", "DENY")
@@ -184,6 +213,8 @@ def _secure_response(response: Response) -> Response:
 
 
 def _error_response(request: Request, *, status_code: int, message: str) -> Response:
+    """Render a plain-language error response in HTML or text."""
+
     accept = request.headers.get("accept", "")
     if "text/html" in accept or "*/*" in accept:
         body = (
@@ -197,6 +228,8 @@ def _error_response(request: Request, *, status_code: int, message: str) -> Resp
 
 
 def _public_error_message(exc: Exception, *, fallback: str) -> str:
+    """Map internal exceptions to a safe operator-facing message."""
+
     if isinstance(exc, HTTPException):
         detail = exc.detail if isinstance(exc.detail, str) else ""
         clean_detail = " ".join(detail.split()).strip()
@@ -215,14 +248,20 @@ def _public_error_message(exc: Exception, *, fallback: str) -> str:
 
 
 def _redirect_with_error(path: str, message: str) -> RedirectResponse:
+    """Redirect to a page with a flash-style error message."""
+
     return RedirectResponse(f"{path}?error={quote_plus(message)}", status_code=status.HTTP_303_SEE_OTHER)
 
 
 def _redirect_saved(path: str) -> RedirectResponse:
+    """Redirect to a page with the saved flag set."""
+
     return RedirectResponse(f"{path}?saved=1", status_code=status.HTTP_303_SEE_OTHER)
 
 
 def _require_non_empty(value: str, *, message: str) -> str:
+    """Return a stripped non-empty string or raise `ValueError`."""
+
     normalized = value.strip()
     if not normalized:
         raise ValueError(message)
@@ -230,6 +269,8 @@ def _require_non_empty(value: str, *, message: str) -> str:
 
 
 def _safe_project_subpath(project_root: Path, configured_path: str | Path, *, label: str) -> Path:
+    """Resolve a configured project-relative path and keep it rooted."""
+
     resolved_root = project_root.resolve()
     candidate = (resolved_root / Path(configured_path)).resolve()
     try:
@@ -240,6 +281,8 @@ def _safe_project_subpath(project_root: Path, configured_path: str | Path, *, la
 
 
 def _safe_file_in_dir(parent_dir: Path, filename: str, *, label: str) -> Path:
+    """Validate one filename under a trusted parent directory."""
+
     leaf = Path(filename)
     if leaf.name != filename:
         raise ValueError(f"{label} must be a single file name.")
@@ -256,6 +299,8 @@ def _safe_file_in_dir(parent_dir: Path, filename: str, *, label: str) -> Path:
 
 
 def _resolve_downloadable_file(root: Path, requested_name: str) -> Path:
+    """Resolve and validate one downloadable artifact path."""
+
     try:
         candidate = _resolve_named_file(root, requested_name)
     except (OSError, ValueError, RuntimeError) as exc:
@@ -277,6 +322,8 @@ def _resolve_downloadable_file(root: Path, requested_name: str) -> Path:
 
 
 def _reminder_sort_key(entry: Any) -> tuple[int, str]:
+    """Sort reminders with dated entries before undated ones."""
+
     due_at = getattr(entry, "due_at", None)
     if due_at is None:
         return (1, "")
@@ -285,11 +332,15 @@ def _reminder_sort_key(entry: Any) -> tuple[int, str]:
 
 # AUDIT-FIX(#5): Push blocking disk, zip, and hardware helpers off the event loop to keep the single-process UI responsive.
 async def _call_sync(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """Run a blocking callable in the threadpool and await the result."""
+
     return await run_in_threadpool(partial(func, *args, **kwargs))
 
 
 # AUDIT-FIX(#3): Accept only bounded standard form posts so a bad client cannot memory-DoS the Raspberry Pi.
 async def _parse_bounded_form(request: Request, *, max_form_bytes: int) -> dict[str, str]:
+    """Read one bounded URL-encoded form submission."""
+
     content_type = request.headers.get("content-type", "")
     if content_type and not content_type.startswith("application/x-www-form-urlencoded"):
         raise HTTPException(
@@ -315,6 +366,15 @@ async def _parse_bounded_form(request: Request, *, max_form_bytes: int) -> dict[
 
 
 def create_app(env_file: str | Path = ".env") -> FastAPI:
+    """Create the FastAPI app for Twinr's local control surface.
+
+    Args:
+        env_file: Path to the Twinr `.env` file that defines this install.
+
+    Returns:
+        Configured FastAPI application instance.
+    """
+
     env_path = Path(env_file).resolve()
     if env_path.is_dir():
         raise RuntimeError(f"Twinr Control expected an env file path, got directory: {env_path}")
@@ -381,6 +441,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.middleware("http")
     async def guard_control_plane(request: Request, call_next: Any) -> Response:
+        """Enforce host, remote-access, auth, and same-origin policies."""
+
         normalized_host = _normalize_host_header(request.headers.get("host", ""))
         if not _is_allowed_host(normalized_host, allowed_hosts):
             return _error_response(
@@ -422,6 +484,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.exception_handler(HTTPException)
     async def handle_http_exception(request: Request, exc: HTTPException) -> Response:
+        """Convert `HTTPException` instances into safe operator responses."""
+
         return _error_response(
             request,
             status_code=exc.status_code,
@@ -430,6 +494,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.exception_handler(Exception)
     async def handle_unexpected_exception(request: Request, exc: Exception) -> Response:
+        """Log unexpected failures and return a plain-language 500 page."""
+
         # AUDIT-FIX(#6): Keep internal errors in logs and show plain, non-technical fallback text to the operator.
         logger.exception("Unhandled Twinr Control error on %s %s", request.method, request.url.path, exc_info=exc)
         return _error_response(
@@ -440,6 +506,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request) -> HTMLResponse:
+        """Render the dashboard overview page."""
+
         config, env_values = await _call_sync(ctx.load_state)
         snapshot = await _call_sync(ctx.load_snapshot, config)
         reminders = await _call_sync(ctx.reminder_store(config).load_entries)
@@ -454,6 +522,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
         usage_summary = await _call_sync(usage_store.summary, within_hours=24)
         recent_event_rows = await _call_sync(ops_event_store.tail, limit=25)
         health_snapshot = await _call_sync(collect_system_health, config, snapshot=snapshot, event_store=ops_event_store)
+        self_coding_status = await _call_sync(build_self_coding_operator_status, ctx.self_coding_store())
         recent_errors = [
             entry
             for entry in recent_event_rows
@@ -513,6 +582,16 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 href="/ops/health",
             ),
         )
+        if self_coding_status.has_activity:
+            cards = (
+                *cards,
+                DashboardCard(
+                    title="Self-coding",
+                    value=self_coding_status.card_value(),
+                    detail=self_coding_status.card_detail(),
+                    href="/",
+                ),
+            )
         return ctx.render(
             request,
             "dashboard.html",
@@ -532,6 +611,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/ops/self-test", response_class=HTMLResponse)
     async def ops_self_test(request: Request) -> HTMLResponse:
+        """Render the self-test selection page."""
+
         config, _env_values = await _call_sync(ctx.load_state)
         tests = await _call_sync(TwinrSelfTestRunner.available_tests)
         return ctx.render(
@@ -548,6 +629,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/ops/self-test", response_class=HTMLResponse)
     async def run_ops_self_test(request: Request) -> Response:
+        """Run one hardware self-test and render the result."""
+
         try:
             config, _env_values = await _call_sync(ctx.load_state)
             form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
@@ -580,12 +663,16 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/ops/self-test/artifacts/{artifact_name}")
     async def download_self_test_artifact(artifact_name: str) -> FileResponse:
+        """Return one self-test artifact after path validation."""
+
         # AUDIT-FIX(#8): Re-validate downloadable artifact paths here so missing or unsafe names fail closed with a 404.
         artifact_path = _resolve_downloadable_file(ctx.ops_paths.self_tests_root, artifact_name)
         return FileResponse(artifact_path, filename=artifact_path.name)
 
     @app.get("/ops/logs", response_class=HTMLResponse)
     async def ops_logs(request: Request) -> HTMLResponse:
+        """Render recent structured ops events."""
+
         logs = await _call_sync(ctx.event_store().tail, limit=100)
         return ctx.render(
             request,
@@ -598,6 +685,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/ops/usage", response_class=HTMLResponse)
     async def ops_usage(request: Request) -> HTMLResponse:
+        """Render LLM usage summaries and recent usage rows."""
+
         store = ctx.usage_store()
         summary_all = await _call_sync(store.summary)
         summary_24h = await _call_sync(store.summary, within_hours=24)
@@ -616,8 +705,19 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/ops/health", response_class=HTMLResponse)
     async def ops_health(request: Request) -> HTMLResponse:
+        """Render live system-health details."""
+
         config, _env_values = await _call_sync(ctx.load_state)
         snapshot = await _call_sync(ctx.load_snapshot, config)
+        remote_memory_watchdog = None
+        remote_memory_watchdog_error = None
+        try:
+            remote_memory_watchdog = await _call_sync(ctx.load_remote_memory_watchdog, config)
+        except Exception as exc:
+            remote_memory_watchdog_error = _public_error_message(
+                exc,
+                fallback="Twinr could not read the remote memory watchdog state.",
+            )
         ops_event_store = ctx.event_store()
         recent_event_rows = await _call_sync(ops_event_store.tail, limit=25)
         recent_errors = [
@@ -634,11 +734,15 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             restart_notice="This page reads live Raspberry Pi and Twinr process state from the local machine.",
             health=health,
             snapshot=snapshot,
+            remote_memory_watchdog=remote_memory_watchdog,
+            remote_memory_watchdog_error=remote_memory_watchdog_error,
             recent_errors=_format_log_rows(recent_errors),
         )
 
     @app.get("/ops/devices", response_class=HTMLResponse)
     async def ops_devices(request: Request) -> HTMLResponse:
+        """Render the detected device overview."""
+
         config, _env_values = await _call_sync(ctx.load_state)
         overview = await _call_sync(collect_device_overview, config, event_store=ctx.event_store())
         return ctx.render(
@@ -655,6 +759,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/ops/config", response_class=HTMLResponse)
     async def ops_config(request: Request) -> HTMLResponse:
+        """Render config checks plus redacted env values."""
+
         config, env_values = await _call_sync(ctx.load_state)
         checks = await _call_sync(run_config_checks, config)
         return ctx.render(
@@ -672,6 +778,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/ops/support", response_class=HTMLResponse)
     async def ops_support(request: Request) -> HTMLResponse:
+        """Render support-bundle status and recent bundles."""
+
         config, _env_values = await _call_sync(ctx.load_state)
         bundles = await _call_sync(_recent_named_files, ctx.ops_paths.bundles_root, suffix=".zip")
         return ctx.render(
@@ -687,6 +795,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/ops/support", response_class=HTMLResponse)
     async def create_support_bundle(request: Request) -> Response:
+        """Build a support bundle and render the result."""
+
         try:
             config, _env_values = await _call_sync(ctx.load_state)
             await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
@@ -713,11 +823,15 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/ops/support/download/{bundle_name}")
     async def download_support_bundle(bundle_name: str) -> FileResponse:
+        """Return one support bundle after path validation."""
+
         artifact_path = _resolve_downloadable_file(ctx.ops_paths.bundles_root, bundle_name)
         return FileResponse(artifact_path, filename=artifact_path.name)
 
     @app.get("/integrations", response_class=HTMLResponse)
     async def integrations(request: Request) -> HTMLResponse:
+        """Render the integrations configuration page."""
+
         _config, env_values = await _call_sync(ctx.load_state)
         store = ctx.integration_store()
         email_record = await _call_sync(store.get, "email_mailbox")
@@ -741,6 +855,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/integrations")
     async def save_integrations(request: Request) -> RedirectResponse:
+        """Persist one integration form submission."""
+
         try:
             _config, env_values = await _call_sync(ctx.load_state)
             form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
@@ -772,6 +888,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/voice-profile", response_class=HTMLResponse)
     async def voice_profile_page(request: Request) -> HTMLResponse:
+        """Render the voice-profile page."""
+
         config, _env_values = await _call_sync(ctx.load_state)
         snapshot = await _call_sync(ctx.load_snapshot, config)
         return ctx.render(
@@ -791,6 +909,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/voice-profile", response_class=HTMLResponse)
     async def voice_profile_action(request: Request) -> Response:
+        """Run one bounded voice-profile action and re-render the page."""
+
         try:
             config, _env_values = await _call_sync(ctx.load_state)
             form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
@@ -800,6 +920,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 # AUDIT-FIX(#5,#6,#11): Run microphone/profile work off the event loop, sanitize failures, and reload snapshot after changes.
                 if action == "enroll":
                     def _enroll() -> dict[str, str]:
+                        """Capture one sample and append it to the local voice profile."""
+
                         monitor = VoiceProfileMonitor.from_config(config)
                         sample = _capture_voice_profile_sample(config)
                         template = monitor.enroll_wav_bytes(sample)
@@ -815,6 +937,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                     action_result = await _call_sync(_enroll)
                 elif action == "verify":
                     def _verify() -> dict[str, str]:
+                        """Capture one sample and assess it against the local voice profile."""
+
                         monitor = VoiceProfileMonitor.from_config(config)
                         sample = _capture_voice_profile_sample(config)
                         assessment = monitor.assess_wav_bytes(sample)
@@ -823,6 +947,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                     action_result = await _call_sync(_verify)
                 elif action == "reset":
                     def _reset() -> dict[str, str]:
+                        """Delete the stored local voice profile."""
+
                         monitor = VoiceProfileMonitor.from_config(config)
                         monitor.reset()
                         return {
@@ -879,6 +1005,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/automations", response_class=HTMLResponse)
     async def automations(request: Request) -> HTMLResponse:
+        """Render the automations page."""
+
         config, _env_values = await _call_sync(ctx.load_state)
         store = ctx.automation_store(config)
         integration_family_providers = tuple(await _call_sync(integration_automation_family_providers, ctx.project_root))
@@ -907,6 +1035,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/automations")
     async def save_automations(request: Request) -> RedirectResponse:
+        """Persist one automation change requested by the web UI."""
+
         try:
             config = await _call_sync(TwinrConfig.from_env, ctx.env_path)
             form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
@@ -954,6 +1084,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/connect", response_class=HTMLResponse)
     async def connect(request: Request) -> HTMLResponse:
+        """Render provider and credential settings."""
+
         _config, env_values = await _call_sync(ctx.load_state)
         sections = _connect_sections(env_values)
         return ctx.render(
@@ -968,6 +1100,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/connect")
     async def save_connect(request: Request) -> RedirectResponse:
+        """Persist provider selection and credential changes."""
+
         try:
             env_values = (await _call_sync(ctx.load_state))[1]
             form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
@@ -991,6 +1125,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/settings", response_class=HTMLResponse)
     async def settings(request: Request) -> HTMLResponse:
+        """Render the main settings page."""
+
         config, env_values = await _call_sync(ctx.load_state)
         sections = _settings_sections(config, env_values)
         return ctx.render(
@@ -1006,6 +1142,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/settings")
     async def save_settings(request: Request) -> RedirectResponse:
+        """Persist settings changes or reset adaptive timing."""
+
         try:
             config = await _call_sync(TwinrConfig.from_env, ctx.env_path)
             form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
@@ -1028,6 +1166,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/memory", response_class=HTMLResponse)
     async def memory(request: Request) -> HTMLResponse:
+        """Render memory, reminder, and print-bound settings."""
+
         config, env_values = await _call_sync(ctx.load_state)
         sections = _memory_sections(config, env_values)
         snapshot = await _call_sync(ctx.load_snapshot, config)
@@ -1055,6 +1195,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/memory")
     async def save_memory(request: Request) -> RedirectResponse:
+        """Persist memory settings or reminder operations."""
+
         try:
             config = await _call_sync(TwinrConfig.from_env, ctx.env_path)
             form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
@@ -1117,6 +1259,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/personality", response_class=HTMLResponse)
     async def personality(request: Request) -> HTMLResponse:
+        """Render the hidden personality context editor."""
+
         config, _env_values = await _call_sync(ctx.load_state)
         # AUDIT-FIX(#4): Resolve the configured personality directory under the project root before any file access.
         personality_dir = _safe_project_subpath(ctx.project_root, config.personality_dir, label="Personality directory")
@@ -1164,6 +1308,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/personality")
     async def save_personality(request: Request) -> RedirectResponse:
+        """Persist personality base text or managed rules."""
+
         try:
             config = await _call_sync(TwinrConfig.from_env, ctx.env_path)
             # AUDIT-FIX(#4): Re-check the configured personality path on write so edits cannot escape the project tree.
@@ -1195,6 +1341,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.get("/user", response_class=HTMLResponse)
     async def user(request: Request) -> HTMLResponse:
+        """Render the user profile context editor."""
+
         config, _env_values = await _call_sync(ctx.load_state)
         store = ctx.user_context_store(config)
         base_text = await _call_sync(store.load_base_text)
@@ -1231,6 +1379,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
 
     @app.post("/user")
     async def save_user(request: Request) -> RedirectResponse:
+        """Persist user profile base text or managed facts."""
+
         try:
             config = await _call_sync(TwinrConfig.from_env, ctx.env_path)
             store = ctx.user_context_store(config)

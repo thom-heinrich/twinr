@@ -1,3 +1,9 @@
+"""Register adapters and dispatch integration requests safely.
+
+The registry keeps the adapter map, enforces policy decisions, validates
+contracts, and normalizes failures into stable integration-layer errors.
+"""
+
 from __future__ import annotations
 
 import inspect
@@ -11,21 +17,31 @@ from twinr.integrations.policy import SafeIntegrationPolicy
 
 
 class IntegrationRegistryError(RuntimeError):
+    """Base error for registry-level integration failures."""
+
     pass
 
 
 class IntegrationNotFoundError(IntegrationRegistryError):
+    """Raise when a requested integration is not registered."""
+
     pass
 
 
 # AUDIT-FIX(#4): Distinguish adapter/request/policy contract violations from runtime integration failures.
 class IntegrationContractError(IntegrationRegistryError):
+    """Raise when adapters, requests, or policy objects break the contract."""
+
     pass
 
 
 # AUDIT-FIX(#1): Surface policy evaluation failures as deterministic registry errors instead of raw exceptions.
 class IntegrationPolicyEvaluationError(IntegrationRegistryError):
+    """Raise when policy evaluation fails unexpectedly."""
+
     def __init__(self, integration_id: str, operation_id: str) -> None:
+        """Store the failed integration and operation identifiers."""
+
         super().__init__(f"Policy evaluation failed for {integration_id}:{operation_id}.")
         self.integration_id = integration_id
         self.operation_id = operation_id
@@ -33,14 +49,22 @@ class IntegrationPolicyEvaluationError(IntegrationRegistryError):
 
 # AUDIT-FIX(#2): Surface adapter execution failures as deterministic registry errors instead of raw exceptions.
 class IntegrationExecutionError(IntegrationRegistryError):
+    """Raise when adapter execution fails unexpectedly."""
+
     def __init__(self, integration_id: str, operation_id: str) -> None:
+        """Store the failed integration and operation identifiers."""
+
         super().__init__(f"Integration {integration_id}:{operation_id} failed during execution.")
         self.integration_id = integration_id
         self.operation_id = operation_id
 
 
 class IntegrationPolicyError(IntegrationRegistryError):
+    """Raise when policy denies an otherwise valid integration request."""
+
     def __init__(self, decision: IntegrationDecision) -> None:
+        """Wrap the deny decision in a stable operator-facing exception."""
+
         # AUDIT-FIX(#7): Fall back to a stable operator-facing message when the policy omits a usable reason.
         reason = getattr(decision, "reason", None)
         if not isinstance(reason, str) or not reason.strip():
@@ -50,7 +74,11 @@ class IntegrationPolicyError(IntegrationRegistryError):
 
 
 class IntegrationRegistry:
+    """Store integration adapters and dispatch requests through policy checks."""
+
     def __init__(self, adapters: tuple[IntegrationAdapter, ...] = ()) -> None:
+        """Initialize the registry and optionally pre-register adapters."""
+
         self._lock = RLock()
         self._adapters: dict[str, IntegrationAdapter] = {}
         for adapter in adapters:
@@ -59,6 +87,8 @@ class IntegrationRegistry:
     # AUDIT-FIX(#4): Fail closed on malformed identifiers so bad IDs cannot corrupt routing or leak into errors/logs.
     @staticmethod
     def _validate_identifier(value: object, *, field_name: str) -> str:
+        """Validate one identifier used for routing or error reporting."""
+
         if not isinstance(value, str) or not value.strip():
             raise IntegrationContractError(f"{field_name} must be a non-empty string.")
         if any(char in value for char in ("\x00", "\r", "\n")):
@@ -68,6 +98,8 @@ class IntegrationRegistry:
     # AUDIT-FIX(#4): Validate that adapters expose a readable manifest with a usable integration ID.
     @classmethod
     def _manifest_and_integration_id(cls, adapter: IntegrationAdapter) -> tuple[object, str]:
+        """Read one adapter manifest and its normalized integration ID."""
+
         if adapter is None:
             raise IntegrationContractError("Adapter must not be None.")
         try:
@@ -84,6 +116,8 @@ class IntegrationRegistry:
     # AUDIT-FIX(#4): Reject malformed dispatch requests early instead of failing later with AttributeError or truthiness bugs.
     @classmethod
     def _validate_request(cls, request: IntegrationRequest) -> tuple[str, str, bool]:
+        """Extract the identifiers and dry-run flag from one request."""
+
         if request is None:
             raise IntegrationContractError("Request must not be None.")
 
@@ -103,12 +137,16 @@ class IntegrationRegistry:
     # AUDIT-FIX(#4): Validate the policy object up front so bad dependencies fail closed with a deterministic error.
     @staticmethod
     def _validate_policy(policy: SafeIntegrationPolicy) -> None:
+        """Ensure the supplied policy exposes the required interface."""
+
         if policy is None or not callable(getattr(policy, "evaluate", None)):
             raise IntegrationContractError("Policy must expose an evaluate(manifest, request) method.")
 
     # AUDIT-FIX(#2): Normalize warnings/redacted fields without assuming a specific container implementation.
     @staticmethod
     def _normalize_string_tuple(value: object, *, field_name: str) -> tuple[str, ...]:
+        """Normalize a possibly iterable string collection into a tuple."""
+
         if value is None:
             return ()
         if isinstance(value, str):
@@ -128,6 +166,8 @@ class IntegrationRegistry:
     # AUDIT-FIX(#2): Copy result payloads defensively and reject malformed detail mappings before they trigger TypeError later.
     @staticmethod
     def _copy_details(value: object, *, field_name: str) -> dict[str, Any]:
+        """Copy a result details mapping after validating its keys."""
+
         if value is None:
             return {}
         if isinstance(value, Mapping):
@@ -154,6 +194,8 @@ class IntegrationRegistry:
         integration_id: str,
         operation_id: str,
     ) -> tuple[IntegrationDecision, bool, tuple[str, ...]]:
+        """Validate one policy decision before dispatch continues."""
+
         if inspect.isawaitable(decision):
             raise IntegrationContractError(
                 f"Policy evaluate() returned an awaitable for {integration_id}:{operation_id}; "
@@ -182,6 +224,8 @@ class IntegrationRegistry:
         operation_id: str,
         additional_warnings: tuple[str, ...] = (),
     ) -> IntegrationResult:
+        """Normalize one adapter result into a validated ``IntegrationResult``."""
+
         if inspect.isawaitable(result):
             raise IntegrationContractError(
                 f"Adapter execute() returned an awaitable for {integration_id}:{operation_id}; "
@@ -223,6 +267,8 @@ class IntegrationRegistry:
 
     # AUDIT-FIX(#6): Re-read the manifest under the registry lock and fail closed if a mutable adapter drifted after registration.
     def _require_adapter_and_manifest(self, integration_id: str) -> tuple[IntegrationAdapter, object]:
+        """Return one registered adapter plus its stable manifest."""
+
         normalized_integration_id = self._validate_identifier(
             integration_id,
             field_name="integration_id",
@@ -243,6 +289,8 @@ class IntegrationRegistry:
             return adapter, manifest
 
     def register(self, adapter: IntegrationAdapter, *, replace: bool = False) -> None:
+        """Register one adapter under its manifest integration ID."""
+
         # AUDIT-FIX(#5): Enforce an actual boolean so truthy strings like "false" cannot silently replace adapters.
         if not isinstance(replace, bool):
             raise IntegrationContractError("replace must be a boolean.")
@@ -254,6 +302,8 @@ class IntegrationRegistry:
             self._adapters[integration_id] = adapter
 
     def get(self, integration_id: str) -> IntegrationAdapter | None:
+        """Return one registered adapter or ``None`` when absent."""
+
         # AUDIT-FIX(#4): Preserve lookup semantics for callers while refusing malformed identifiers.
         try:
             normalized_integration_id = self._validate_identifier(
@@ -267,6 +317,8 @@ class IntegrationRegistry:
             return self._adapters.get(normalized_integration_id)
 
     def require(self, integration_id: str) -> IntegrationAdapter:
+        """Return one registered adapter or raise ``IntegrationNotFoundError``."""
+
         normalized_integration_id = self._validate_identifier(
             integration_id,
             field_name="integration_id",
@@ -281,6 +333,8 @@ class IntegrationRegistry:
 
     # AUDIT-FIX(#8): Tighten the manifest collection return type for Python 3.11 callers and static analysis.
     def manifests(self) -> tuple[object, ...]:
+        """Return manifests for all registered adapters in sorted ID order."""
+
         with self._lock:
             manifests: list[object] = []
             for integration_id in sorted(self._adapters):
@@ -297,6 +351,8 @@ class IntegrationRegistry:
             return tuple(manifests)
 
     def dispatch(self, request: IntegrationRequest, *, policy: SafeIntegrationPolicy) -> IntegrationResult:
+        """Validate, authorize, and execute one integration request."""
+
         integration_id, operation_id, dry_run = self._validate_request(request)
         self._validate_policy(policy)
 

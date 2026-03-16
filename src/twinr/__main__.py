@@ -143,6 +143,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the local Twinr settings dashboard",
     )
     parser.add_argument(
+        "--watch-remote-memory",
+        action="store_true",
+        help="Run the rolling remote-memory watchdog and print one sample line per probe.",
+    )
+    parser.add_argument(
         "--display-test",
         action="store_true",
         help="Render a black/white test card on the configured Waveshare display",
@@ -196,8 +201,20 @@ def _assert_pi_runtime_root(env_file: str | Path, *, command_name: str) -> None:
 def main() -> int:
     args = build_parser().parse_args()
     config = TwinrConfig.from_env(Path(args.env_file))
-    runtime = TwinrRuntime(config=config)
     env_path = Path(args.env_file).resolve()
+
+    if args.watch_remote_memory:
+        _assert_pi_runtime_root(args.env_file, command_name="watch-remote-memory")
+        from twinr.ops import RemoteMemoryWatchdog, loop_instance_lock
+
+        watchdog = RemoteMemoryWatchdog.from_config(config)
+        print(f"remote_memory_watchdog_artifact={watchdog.artifact_path}")
+        print(f"remote_memory_watchdog_interval_s={watchdog.interval_s}")
+        print(f"remote_memory_watchdog_history_limit={watchdog.history_limit}")
+        with loop_instance_lock(config, "remote-memory-watchdog"):
+            return watchdog.run(duration_s=args.loop_duration)
+
+    runtime = TwinrRuntime(config=config)
 
     print(f"status={runtime.status.value}")
     print(f"web_port={config.web_port}")

@@ -1,6 +1,7 @@
 from pathlib import Path
 from threading import Event
 from time import sleep
+import time
 import sys
 import unittest
 
@@ -28,6 +29,21 @@ class SlowTTSProvider:
             return
         yield b"FINAL-1"
         yield b"FINAL-2"
+
+
+class GatedFirstChunkTTSProvider:
+    def __init__(self) -> None:
+        self.started = Event()
+        self.release = Event()
+
+    def synthesize_stream(self, text: str, **kwargs):
+        del text, kwargs
+        self.started.set()
+        self.release.wait(timeout=5.0)
+        if not self.release.is_set():
+            return
+        yield b"READY-1"
+        yield b"READY-2"
 
 
 class InterruptiblePlayer:
@@ -130,3 +146,84 @@ class InterruptibleSpeechOutputTests(unittest.TestCase):
         self.assertTrue(output.wait_for_first_audio(timeout_s=1.0))
         output.close(timeout_s=2.0)
         output.raise_if_error()
+
+    def test_external_stop_interrupts_current_playback(self) -> None:
+        tts_provider = SlowTTSProvider()
+        player = InterruptiblePlayer()
+        stop_event = Event()
+
+        output = InterruptibleSpeechOutput(
+            tts_provider=tts_provider,
+            player=player,
+            chunk_size=512,
+            segment_boundary=lambda text: len(text) if text.strip() else None,
+            should_stop=stop_event.is_set,
+        )
+
+        output.submit_lane_delta(
+            SpeechLaneDelta(
+                text="Ich schaue kurz nach.",
+                lane="filler",
+            )
+        )
+
+        self.assertTrue(output.wait_for_first_audio(timeout_s=1.0))
+        stop_event.set()
+        output.close(timeout_s=2.0)
+        output.raise_if_error()
+
+        self.assertTrue(player.played)
+        self.assertTrue(len(player.played[0]) < len(b"FILLER-1FILLER-2FILLER-3"))
+
+    def test_speaking_started_waits_for_real_first_audio(self) -> None:
+        tts_provider = GatedFirstChunkTTSProvider()
+        player = InterruptiblePlayer()
+        started: list[str] = []
+
+        output = InterruptibleSpeechOutput(
+            tts_provider=tts_provider,
+            player=player,
+            chunk_size=512,
+            segment_boundary=lambda text: len(text) if text.strip() else None,
+            on_speaking_started=lambda: started.append("started"),
+        )
+
+        output.submit_text_delta("Hallo zusammen.")
+        self.assertTrue(tts_provider.started.wait(timeout=1.0))
+        sleep(0.05)
+        self.assertEqual(started, [])
+        self.assertFalse(output.wait_for_first_audio(timeout_s=0.05))
+
+        tts_provider.release.set()
+        self.assertTrue(output.wait_for_first_audio(timeout_s=1.0))
+        output.close(timeout_s=2.0)
+        output.raise_if_error()
+
+        self.assertEqual(started, ["started"])
+
+    def test_abort_returns_quickly_when_first_chunk_stalls(self) -> None:
+        tts_provider = GatedFirstChunkTTSProvider()
+        player = InterruptiblePlayer()
+
+        output = InterruptibleSpeechOutput(
+            tts_provider=tts_provider,
+            player=player,
+            chunk_size=512,
+            segment_boundary=lambda text: len(text) if text.strip() else None,
+        )
+
+        output.submit_text_delta("Ich schaue kurz nach.")
+        self.assertTrue(tts_provider.started.wait(timeout=1.0))
+
+        started_at = time.monotonic()
+        stopped = output.abort(timeout_s=0.2)
+        elapsed = time.monotonic() - started_at
+        tts_provider.release.set()
+
+        self.assertIn(stopped, {True, False})
+        self.assertLess(elapsed, 0.5)
+        self.assertFalse(output.wait_for_first_audio(timeout_s=0.05))
+
+
+if __name__ == "__main__":
+    unittest.main()

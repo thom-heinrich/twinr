@@ -1,0 +1,78 @@
+schema_version: 1
+name: api
+path: src/twinr/providers/openai/api
+kind: python-package
+visibility: internal
+summary: Export the canonical OpenAI backend plus contract-specific adapter and bundle surfaces for Twinr runtime code.
+owned_concerns:
+  - Compose the public OpenAI backend from shared core and capability modules
+  - Bridge Twinr speech, text, tool-calling, supervisor, and first-word contracts onto the backend
+  - Assemble the OpenAI provider bundle that runtime loops and factories consume
+out_of_scope:
+  - Low-level OpenAI client construction and request helpers in src/twinr/providers/openai/core
+  - Capability-specific response, speech, print, phrasing, and search implementations in src/twinr/providers/openai/capabilities
+  - Realtime websocket session state and turn orchestration in src/twinr/providers/openai/realtime
+files:
+  - path: __init__.py
+    role: Export the public OpenAI API-layer surfaces
+    exports:
+      - OpenAIAgentTextProvider
+      - OpenAIBackend
+      - OpenAIFirstWordProvider
+      - OpenAIProviderBundle
+      - OpenAISpeechToTextProvider
+      - OpenAISupervisorDecisionProvider
+      - OpenAIToolCallingAgentProvider
+      - OpenAITextToSpeechProvider
+  - path: backend.py
+    role: Compose the canonical OpenAI backend class
+    exports:
+      - OpenAIBackend
+      - OpenAIImageInput
+      - OpenAISearchResult
+      - OpenAITextResponse
+  - path: adapters.py
+    role: Implement contract adapters and provider bundle assembly
+    exports:
+      - OpenAIAgentTextProvider
+      - OpenAIFirstWordProvider
+      - OpenAIProviderBundle
+      - OpenAISpeechToTextProvider
+      - OpenAISupervisorDecisionProvider
+      - OpenAIToolCallingAgentProvider
+      - OpenAITextToSpeechProvider
+public_api:
+  module: twinr.providers.openai.api
+  exports:
+    - OpenAIAgentTextProvider
+    - OpenAIBackend
+    - OpenAIFirstWordProvider
+    - OpenAIProviderBundle
+    - OpenAISpeechToTextProvider
+    - OpenAISupervisorDecisionProvider
+    - OpenAIToolCallingAgentProvider
+    - OpenAITextToSpeechProvider
+compatibility_reexports:
+  - path: src/twinr/providers/openai/__init__.py
+    names:
+      - OpenAIAgentTextProvider
+      - OpenAIBackend
+      - OpenAIFirstWordProvider
+      - OpenAIProviderBundle
+      - OpenAISpeechToTextProvider
+      - OpenAISupervisorDecisionProvider
+      - OpenAIToolCallingAgentProvider
+      - OpenAITextToSpeechProvider
+primary_callers:
+  - path: src/twinr/providers/openai/__init__.py
+  - path: src/twinr/providers/factory.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/agent/workflows/streaming_runner.py
+  - path: src/twinr/orchestrator/session.py
+tests:
+  - path: test/test_openai_adapters.py
+  - path: test/test_openai_backend.py
+  - path: test/test_provider_factory.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_streaming_runner.py

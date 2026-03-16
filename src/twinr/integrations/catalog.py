@@ -1,3 +1,9 @@
+"""Define Twinr's builtin integration manifest catalog.
+
+This module owns the canonical manifest metadata for built-in integrations and
+serves defensive clones so callers cannot mutate shared registry state.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping  # AUDIT-FIX(#3): Type immutable lookup indexes precisely in Python 3.11.2.
@@ -27,6 +33,8 @@ __all__ = (
 
 
 def _clone_manifest(manifest: IntegrationManifest) -> IntegrationManifest:
+    """Return a defensive copy of one manifest instance."""
+
     # AUDIT-FIX(#2): Return a defensive clone so callers cannot mutate shared registry state across requests.
     model_copy = getattr(manifest, "model_copy", None)
     if callable(model_copy):
@@ -37,17 +45,23 @@ def _clone_manifest(manifest: IntegrationManifest) -> IntegrationManifest:
 def _clone_manifests(
     manifests: tuple[IntegrationManifest, ...],
 ) -> tuple[IntegrationManifest, ...]:
+    """Return defensive copies for a manifest tuple."""
+
     # AUDIT-FIX(#2): Clone each manifest on export so every caller gets an isolated snapshot.
     return tuple(_clone_manifest(manifest) for manifest in manifests)
 
 
 def _require_non_empty_text(field_name: str, value: object) -> None:
+    """Reject blank human-facing manifest text."""
+
     # AUDIT-FIX(#4): Fail fast on blank human-visible text instead of shipping malformed UI/voice labels.
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
 
 
 def _require_normalized_identifier(field_name: str, value: object) -> None:
+    """Reject identifiers with blank values or edge whitespace."""
+
     # AUDIT-FIX(#4): Reject leading/trailing whitespace in identifiers to avoid silent lookup misses.
     _require_non_empty_text(field_name, value)
     if not isinstance(value, str):
@@ -57,6 +71,8 @@ def _require_normalized_identifier(field_name: str, value: object) -> None:
 
 
 def _validate_builtin_manifests(manifests: tuple[IntegrationManifest, ...]) -> None:
+    """Validate builtin manifests before exposing them to the runtime."""
+
     # AUDIT-FIX(#3): Validate uniqueness and completeness at startup so registry mistakes fail closed.
     seen_manifest_ids: set[str] = set()
 
@@ -133,6 +149,8 @@ def _build_manifest_indexes(
     Mapping[str, IntegrationManifest],
     Mapping[IntegrationDomain, tuple[IntegrationManifest, ...]],
 ]:
+    """Build immutable lookup indexes for the builtin manifest set."""
+
     # AUDIT-FIX(#3): Precompute immutable lookup indexes once after validation to avoid silent overwrite behavior.
     manifests_by_id: dict[str, IntegrationManifest] = {}
     manifests_by_domain: dict[IntegrationDomain, list[IntegrationManifest]] = {}
@@ -445,6 +463,8 @@ _MANIFESTS_BY_ID, _MANIFESTS_BY_DOMAIN = _build_manifest_indexes(
 
 
 def __getattr__(name: str) -> object:
+    """Serve compatibility exports that are materialized on demand."""
+
     if name == "BUILTIN_MANIFESTS":
         # AUDIT-FIX(#2): Preserve the old export name while returning a fresh immutable-by-convention snapshot.
         return _clone_manifests(_CANONICAL_BUILTIN_MANIFESTS)
@@ -452,16 +472,22 @@ def __getattr__(name: str) -> object:
 
 
 def __dir__() -> list[str]:
+    """Keep compatibility exports visible to discovery tools."""
+
     # AUDIT-FIX(#2): Keep BUILTIN_MANIFESTS discoverable even though it is now served via __getattr__.
     return sorted(set(globals()) | {"BUILTIN_MANIFESTS"})
 
 
 def builtin_manifests() -> tuple[IntegrationManifest, ...]:
+    """Return cloned builtin manifests for callers that need a snapshot."""
+
     # AUDIT-FIX(#2): Always return clones so one caller cannot alter another caller's view of the catalog.
     return _clone_manifests(_CANONICAL_BUILTIN_MANIFESTS)
 
 
 def manifest_for_id(integration_id: str) -> IntegrationManifest | None:
+    """Return one cloned builtin manifest by integration ID."""
+
     manifest = _MANIFESTS_BY_ID.get(integration_id)
     if manifest is None:
         return None
@@ -470,6 +496,8 @@ def manifest_for_id(integration_id: str) -> IntegrationManifest | None:
 
 
 def manifests_for_domain(domain: IntegrationDomain) -> tuple[IntegrationManifest, ...]:
+    """Return cloned builtin manifests for one integration domain."""
+
     manifests = _MANIFESTS_BY_DOMAIN.get(domain, ())
     # AUDIT-FIX(#2): Read from the immutable domain index and clone results before returning them.
     return _clone_manifests(manifests)

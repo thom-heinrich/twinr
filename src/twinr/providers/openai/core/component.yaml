@@ -1,0 +1,103 @@
+schema_version: 1
+name: core
+path: src/twinr/providers/openai/core
+kind: python-package
+visibility: internal
+summary: Provide the shared OpenAI client, request-building helpers, prompt constants, and typed payload objects reused by Twinr's API, capability, and realtime provider layers.
+owned_concerns:
+  - Build validated default OpenAI SDK clients and project-header policy from TwinrConfig
+  - Assemble and normalize shared Responses API request payloads, tool settings, and conversation replay data
+  - Define reusable instruction constants, fallback model lists, and typed response/image value objects
+out_of_scope:
+  - Public provider adapters and backend composition in src/twinr/providers/openai/api
+  - Capability-specific speech, search, print, phrasing, or text-response flows in src/twinr/providers/openai/capabilities
+  - Realtime websocket session lifecycle and event handling in src/twinr/providers/openai/realtime
+files:
+  - path: __init__.py
+    role: Export the shared core helper and type surface
+    exports:
+      - ConversationLike
+      - OpenAIImageInput
+      - OpenAISearchResult
+      - OpenAITextResponse
+      - _default_client_factory
+      - _should_send_project_header
+  - path: base.py
+    role: Shared request-building base class for OpenAI capability mixins
+    exports:
+      - OpenAIBackendBase
+  - path: client.py
+    role: Default SDK client factory and config normalization helpers
+    exports:
+      - _default_client_factory
+      - _should_send_project_header
+  - path: instructions.py
+    role: Validated instruction constants and fallback identifier lists
+    exports:
+      - AUTOMATION_EXECUTION_INSTRUCTIONS
+      - PRINT_COMPOSER_INSTRUCTIONS
+      - PRINT_FORMATTER_INSTRUCTIONS
+      - PROACTIVE_PROMPT_INSTRUCTIONS
+      - REMINDER_DELIVERY_INSTRUCTIONS
+      - SEARCH_AGENT_INSTRUCTIONS
+      - SEARCH_MODEL_FALLBACKS
+      - STT_MODEL_FALLBACKS
+      - TTS_MODEL_FALLBACKS
+      - _LEGACY_TTS_FALLBACK_VOICE
+      - _LEGACY_TTS_VOICES
+  - path: types.py
+    role: Canonical response, search, conversation, and image value objects
+    exports:
+      - ConversationLike
+      - OpenAIImageInput
+      - OpenAISearchResult
+      - OpenAITextResponse
+public_api:
+  module: twinr.providers.openai.core
+  exports:
+    - ConversationLike
+    - OpenAIImageInput
+    - OpenAISearchResult
+    - OpenAITextResponse
+    - _default_client_factory
+    - _should_send_project_header
+compatibility_reexports:
+  - path: src/twinr/providers/openai/__init__.py
+    names:
+      - OpenAIImageInput
+      - OpenAITextResponse
+  - path: src/twinr/providers/openai/api/backend.py
+    names:
+      - AUTOMATION_EXECUTION_INSTRUCTIONS
+      - ConversationLike
+      - OpenAIImageInput
+      - OpenAISearchResult
+      - OpenAITextResponse
+      - PRINT_COMPOSER_INSTRUCTIONS
+      - PROACTIVE_PROMPT_INSTRUCTIONS
+      - REMINDER_DELIVERY_INSTRUCTIONS
+      - _default_client_factory
+      - _should_send_project_header
+primary_callers:
+  - path: src/twinr/__main__.py
+  - path: src/twinr/agent/workflows/realtime_runner_background.py
+  - path: src/twinr/agent/workflows/realtime_runner_support.py
+  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/proactive/social/observers.py
+  - path: src/twinr/proactive/social/vision_review.py
+  - path: src/twinr/providers/openai/__init__.py
+  - path: src/twinr/providers/openai/api/adapters.py
+  - path: src/twinr/providers/openai/api/backend.py
+  - path: src/twinr/providers/openai/capabilities/phrasing.py
+  - path: src/twinr/providers/openai/capabilities/printing.py
+  - path: src/twinr/providers/openai/capabilities/responses.py
+  - path: src/twinr/providers/openai/capabilities/search.py
+  - path: src/twinr/providers/openai/capabilities/speech.py
+  - path: src/twinr/providers/openai/realtime/session.py
+tests:
+  - path: test/test_openai_adapters.py
+  - path: test/test_openai_backend.py
+  - path: test/test_proactive_vision_review.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_runner.py
+  - path: test/test_streaming_runner.py

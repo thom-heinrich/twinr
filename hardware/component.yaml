@@ -1,0 +1,42 @@
+schema_version: 1
+name: hardware
+path: hardware
+kind: script-directory
+visibility: internal
+summary: Provide Raspberry Pi setup, probe, smoke-test scripts, and Pi-side watchdog unit definitions for Twinr.
+owned_concerns:
+  - Persist Raspberry Pi hardware settings into Twinr env files and OS configuration
+  - Install vendor or system dependencies needed for the display, audio, and printer paths
+  - Stage Pi-side systemd units for permanent operational watchdogs
+  - Run bounded manual probes for buttons, PIR motion, display, and printer setup
+out_of_scope:
+  - Runtime device adapters in src/twinr/hardware and src/twinr/display
+  - Twinr loop orchestration and product behavior policy
+  - Ad-hoc runtime patches directly in /twinr without leading-repo changes
+files:
+  - path: buttons/setup_buttons.sh
+    role: Persist button GPIO settings and optionally run the configured button probe
+  - path: buttons/probe_buttons.py
+    role: Print live button events for configured or ad-hoc GPIO lines
+  - path: display/setup_display.sh
+    role: Install the Waveshare vendor driver and persist display wiring settings
+  - path: display/display_test.py
+    role: Render a one-shot display test card
+  - path: display/run_display_loop.py
+    role: Run the standalone status display loop for manual validation
+  - path: mic/setup_audio.sh
+    role: Configure ALSA or PipeWire defaults and optional proactive-audio env keys
+  - path: ops/twinr-remote-memory-watchdog.service
+    role: Keep the rolling remote-memory watchdog running as a permanent Pi service
+  - path: pir/setup_pir.sh
+    role: Persist PIR GPIO settings and optionally run the motion probe
+  - path: pir/probe_pir.py
+    role: Print live PIR state and motion events
+  - path: printer/setup_printer.sh
+    role: Create the raw thermal-printer CUPS queue and optional smoke test
+related_runtime_packages:
+  - path: src/twinr/hardware
+  - path: src/twinr/display
+manual_checks:
+  - command: bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
+  - command: PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/pir/probe_pir.py

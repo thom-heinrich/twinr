@@ -7,6 +7,8 @@ summary: Orchestrate the classic, realtime, and streaming Twinr hardware loops p
 owned_concerns:
   - Orchestrate button, wakeword, and proactive entry points for Twinr hardware loops
   - Coordinate live conversation sessions, print delivery, and bounded speech output
+  - Keep required remote-memory fail-closed checks off the GPIO polling thread
+  - Produce bounded forensic run packs for live button/session/audio investigation
   - Share workflow-local support helpers for feedback tones, reference images, and background delivery
   - Expose compatibility workflow entry points for top-level imports and older proactive-trigger paths
 out_of_scope:
@@ -32,9 +34,15 @@ files:
     exports:
       - TwinrRealtimeHardwareLoop
   - path: streaming_runner.py
-    role: Streaming loop with dual-lane tools and speculative speech
+    role: Streaming loop with dual-lane tools, supervisor-derived bridge replies, and speculative speech
     exports:
       - TwinrStreamingHardwareLoop
+  - path: streaming_turn_orchestrator.py
+    role: Parallel bridge/final lane watchdog helper for streaming turns
+    exports:
+      - StreamingTurnOrchestrator
+      - StreamingTurnTimeoutPolicy
+      - StreamingTurnLaneOutcome
   - path: realtime_runner_background.py
     role: Reminder, automation, and proactive background-delivery mixin
     exports:
@@ -47,12 +55,20 @@ files:
     role: Thin realtime tool-callback delegate mixin
     exports:
       - TwinrRealtimeToolDelegatesMixin
+  - path: button_dispatch.py
+    role: Non-blocking button dispatch and busy-turn interruption helper
+  - path: required_remote_watch.py
+    role: Background required-remote readiness watch for fail-closed runtimes
   - path: speech_output.py
-    role: Interruptible streamed TTS playback queue
+    role: Interruptible streamed TTS playback queue with first-audio gating and fast aborts
     exports:
       - InterruptibleSpeechOutput
       - StreamingTextToSpeechProviderLike
       - WaveAudioPlayerLike
+  - path: forensics.py
+    role: Queue-based forensic workflow tracing and runpack generation
+    exports:
+      - WorkflowForensics
   - path: print_lane.py
     role: Single-job background print lane
     exports:
@@ -83,6 +99,7 @@ tests:
   - path: test/test_realtime_runner.py
   - path: test/test_streaming_runner.py
   - path: test/test_speech_output.py
+  - path: test/test_workflow_forensics.py
   - path: test/test_openai_realtime.py
   - path: test/test_longterm_multimodal.py
   - path: test/run_pi_tool_matrix.py

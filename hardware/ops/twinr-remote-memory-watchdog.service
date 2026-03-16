@@ -1,0 +1,18 @@
+[Unit]
+Description=Twinr Remote Memory Watchdog
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=thh
+WorkingDirectory=/twinr
+Environment=TWINR_PYTHON=/twinr/.venv/bin/python
+ExecStart=/usr/bin/env bash -lc 'cd /twinr && PYTHONPATH=src "${TWINR_PYTHON}" -m twinr --env-file .env --watch-remote-memory'
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

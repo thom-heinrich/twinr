@@ -1,3 +1,9 @@
+"""Define the canonical data contracts for Twinr integrations.
+
+These models normalize identifiers, payloads, safety metadata, and redaction
+rules so policy, runtime, registry, and provider packages share one contract.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping  # AUDIT-FIX(#3,#7): Mapping-basierte Normalisierung für Request-/Result-Payloads.
@@ -24,11 +30,15 @@ _StrEnumT = TypeVar("_StrEnumT", bound=StrEnum)
 
 # AUDIT-FIX(#2): Key-Normalisierung verhindert, dass nur eine Schreibweise redacted wird.
 def _normalize_sensitive_key(key: str) -> str:
+    """Normalize a key for case- and punctuation-insensitive matching."""
+
     return _SENSITIVE_KEY_NORMALIZATION_RE.sub("", key.casefold())
 
 
 # AUDIT-FIX(#4,#5,#7): Frühe Validierung verhindert leere Texte, Control-Chars und späte Laufzeitfehler.
 def _ensure_safe_text(value: object, field_name: str) -> str:
+    """Validate non-empty text without control characters."""
+
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string.")
     normalized = value.strip()
@@ -41,6 +51,8 @@ def _ensure_safe_text(value: object, field_name: str) -> str:
 
 # AUDIT-FIX(#4,#5): IDs bleiben delimiter-safe und log-injection-resistent.
 def _ensure_identifier(value: object, field_name: str) -> str:
+    """Validate an audit-safe identifier string."""
+
     normalized = _ensure_safe_text(value, field_name)
     if not _IDENTIFIER_RE.fullmatch(normalized):
         raise ValueError(
@@ -51,6 +63,8 @@ def _ensure_identifier(value: object, field_name: str) -> str:
 
 # AUDIT-FIX(#5,#7): Bool-Felder nicht still aus 0/1/"yes" konvertieren.
 def _ensure_bool(value: object, field_name: str) -> bool:
+    """Require a real boolean instead of a truthy proxy value."""
+
     if not isinstance(value, bool):
         raise TypeError(f"{field_name} must be a bool.")
     return value
@@ -58,6 +72,8 @@ def _ensure_bool(value: object, field_name: str) -> bool:
 
 # AUDIT-FIX(#1,#3): Integer-Grenzen fail-fast prüfen statt erst im Downstream zu crashen.
 def _ensure_positive_int(value: object, field_name: str) -> int:
+    """Require an integer greater than zero."""
+
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{field_name} must be an integer.")
     if value <= 0:
@@ -67,6 +83,8 @@ def _ensure_positive_int(value: object, field_name: str) -> int:
 
 # AUDIT-FIX(#1,#5,#7): Rohstrings aus Config/JSON sicher in StrEnums überführen.
 def _coerce_str_enum(value: object, enum_type: type[_StrEnumT], field_name: str) -> _StrEnumT:
+    """Coerce a raw value into a ``StrEnum`` member."""
+
     if isinstance(value, enum_type):
         return value
     if isinstance(value, str):
@@ -80,6 +98,8 @@ def _coerce_str_enum(value: object, enum_type: type[_StrEnumT], field_name: str)
 
 # AUDIT-FIX(#6,#7): Listen von außen in immutable Tupel überführen, ohne Set-Reihenfolgen einzuschleusen.
 def _coerce_tuple(value: object, field_name: str) -> tuple[object, ...]:
+    """Freeze tuple-like input into an immutable tuple."""
+
     if value is None:
         return ()
     if isinstance(value, tuple):
@@ -91,6 +111,8 @@ def _coerce_tuple(value: object, field_name: str) -> tuple[object, ...]:
 
 # AUDIT-FIX(#6,#7): Textlisten konsistent validieren und säubern.
 def _normalize_text_tuple(value: object, field_name: str) -> tuple[str, ...]:
+    """Normalize an iterable of user-visible text into a tuple."""
+
     raw_items = _coerce_tuple(value, field_name)
     return tuple(
         _ensure_safe_text(item, f"{field_name}[{index}]")
@@ -100,6 +122,8 @@ def _normalize_text_tuple(value: object, field_name: str) -> tuple[str, ...]:
 
 # AUDIT-FIX(#3,#7): Top-Level-Mappings früh in JSON-sichere Dicts kopieren.
 def _normalize_json_mapping(value: object, *, field_name: str) -> dict[str, object]:
+    """Normalize a top-level mapping into a JSON-safe ``dict``."""
+
     if not isinstance(value, Mapping):
         raise TypeError(f"{field_name} must be a mapping with string keys.")
     normalized = _normalize_json_value(value, path=field_name, depth=0, seen=set())
@@ -116,6 +140,8 @@ def _normalize_json_value(
     depth: int,
     seen: set[int],
 ) -> object:
+    """Normalize nested payload data into deterministic JSON-safe values."""
+
     if depth > _MAX_NESTING_DEPTH:
         raise ValueError(f"{path} exceeds the maximum supported nesting depth of {_MAX_NESTING_DEPTH}.")
 
@@ -213,6 +239,8 @@ def _normalize_json_value(
 
 # AUDIT-FIX(#2): Rekursive Redaction schützt auch verschachtelte Tokens/PII und liefert neue Objekte zurück.
 def _redact_value(value: object, *, sensitive_keys: frozenset[str]) -> object:
+    """Redact sensitive keys recursively inside JSON-like values."""
+
     if isinstance(value, Mapping):
         redacted: dict[str, object] = {}
         for key, nested_value in value.items():
@@ -233,6 +261,8 @@ def _redact_value(value: object, *, sensitive_keys: frozenset[str]) -> object:
 
 
 class IntegrationDomain(StrEnum):
+    """Enumerate the high-level domains Twinr integrations can belong to."""
+
     CALENDAR = "calendar"
     EMAIL = "email"
     MESSENGER = "messenger"
@@ -242,6 +272,8 @@ class IntegrationDomain(StrEnum):
 
 
 class IntegrationAction(StrEnum):
+    """Enumerate the actions an integration operation can perform."""
+
     READ = "read"
     WRITE = "write"
     SEND = "send"
@@ -251,12 +283,16 @@ class IntegrationAction(StrEnum):
 
 
 class RequestOrigin(StrEnum):
+    """Enumerate the trusted surfaces that can issue integration requests."""
+
     LOCAL_DEVICE = "local_device"
     LOCAL_DASHBOARD = "local_dashboard"
     REMOTE_SERVICE = "remote_service"
 
 
 class RiskLevel(StrEnum):
+    """Describe the risk tier of an integration operation."""
+
     LOW = "low"
     MODERATE = "moderate"
     HIGH = "high"
@@ -264,12 +300,16 @@ class RiskLevel(StrEnum):
 
 
 class ConfirmationMode(StrEnum):
+    """Describe which human confirmation level an operation requires."""
+
     NONE = "none"
     USER = "user"
     CAREGIVER = "caregiver"
 
 
 class DataSensitivity(StrEnum):
+    """Describe the sensitivity of data touched by an integration."""
+
     NORMAL = "normal"
     PERSONAL = "personal"
     SECURITY = "security"
@@ -277,6 +317,8 @@ class DataSensitivity(StrEnum):
 
 
 class SecretStorage(StrEnum):
+    """Enumerate supported secret-storage backends referenced by manifests."""
+
     ENV_VAR = "env_var"
     FILE = "file"
     KEYRING = "keyring"
@@ -310,12 +352,16 @@ _NORMALIZED_DEFAULT_SENSITIVE_PARAMETER_KEYS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class SecretReference:
+    """Describe one secret dependency required by an integration."""
+
     name: str
     reference: str
     storage: SecretStorage = SecretStorage.ENV_VAR
     required: bool = True
 
     def __post_init__(self) -> None:
+        """Normalize and validate secret-reference fields at construction time."""
+
         # AUDIT-FIX(#5): Secret-Metadaten fail-fast validieren statt Downstream-Fehler zu riskieren.
         object.__setattr__(self, "name", _ensure_identifier(self.name, "name"))
         object.__setattr__(self, "reference", _ensure_safe_text(self.reference, "reference"))
@@ -325,6 +371,8 @@ class SecretReference:
 
 @dataclass(frozen=True, slots=True)
 class SafetyProfile:
+    """Describe the safety requirements for one integration operation."""
+
     risk: RiskLevel
     confirmation: ConfirmationMode = ConfirmationMode.NONE
     sensitivity: DataSensitivity = DataSensitivity.NORMAL
@@ -334,6 +382,8 @@ class SafetyProfile:
     max_payload_bytes: int = 4096
 
     def __post_init__(self) -> None:
+        """Normalize safety fields and reject unsafe high-risk defaults."""
+
         # AUDIT-FIX(#1,#5): Policy-Felder normalisieren und Hochrisiko ohne menschliche Freigabe hart verbieten.
         object.__setattr__(self, "risk", _coerce_str_enum(self.risk, RiskLevel, "risk"))
         object.__setattr__(
@@ -371,6 +421,8 @@ class SafetyProfile:
 
 @dataclass(frozen=True, slots=True)
 class IntegrationOperation:
+    """Describe one operation exposed by an integration manifest."""
+
     operation_id: str
     label: str
     action: IntegrationAction
@@ -378,6 +430,8 @@ class IntegrationOperation:
     safety: SafetyProfile
 
     def __post_init__(self) -> None:
+        """Validate operation identifiers, text, and safety metadata."""
+
         # AUDIT-FIX(#5): Operationen mit kaputten IDs/Enums/Texten direkt am Rand stoppen.
         object.__setattr__(self, "operation_id", _ensure_identifier(self.operation_id, "operation_id"))
         object.__setattr__(self, "label", _ensure_safe_text(self.label, "label"))
@@ -389,6 +443,8 @@ class IntegrationOperation:
 
 @dataclass(frozen=True, slots=True)
 class IntegrationManifest:
+    """Describe one integration and the operations it exposes."""
+
     integration_id: str
     domain: IntegrationDomain
     title: str
@@ -398,6 +454,8 @@ class IntegrationManifest:
     notes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        """Freeze and validate manifest metadata plus nested operations."""
+
         # AUDIT-FIX(#4,#5,#6): Manifest-Metadaten validieren, iterables einfrieren, Duplicate-Secrets verhindern.
         object.__setattr__(self, "integration_id", _ensure_identifier(self.integration_id, "integration_id"))
         object.__setattr__(self, "domain", _coerce_str_enum(self.domain, IntegrationDomain, "domain"))
@@ -433,6 +491,8 @@ class IntegrationManifest:
         object.__setattr__(self, "notes", _normalize_text_tuple(self.notes, "notes"))
 
     def operation(self, operation_id: str) -> IntegrationOperation | None:
+        """Return one operation by ID when the manifest defines it."""
+
         # AUDIT-FIX(#5): Lookup bleibt tolerant bei schlechtem Input, matched aber nur gegen saubere IDs.
         if not isinstance(operation_id, str):
             return None
@@ -447,6 +507,8 @@ class IntegrationManifest:
 
 @dataclass(slots=True)
 class IntegrationRequest:
+    """Represent one normalized integration request."""
+
     integration_id: str
     operation_id: str
     parameters: dict[str, object] = field(default_factory=dict)
@@ -457,6 +519,8 @@ class IntegrationRequest:
     background_trigger: bool = False
 
     def __post_init__(self) -> None:
+        """Normalize request identifiers, payload, and confirmation flags."""
+
         # AUDIT-FIX(#3,#4,#5): Request-Felder sofort normalisieren, audit-sichere IDs erzwingen und JSON-Payload deterministisch machen.
         self.integration_id = _ensure_identifier(self.integration_id, "integration_id")
         self.operation_id = _ensure_identifier(self.operation_id, "operation_id")
@@ -474,6 +538,8 @@ class IntegrationRequest:
         self.background_trigger = _ensure_bool(self.background_trigger, "background_trigger")
 
     def payload_size_bytes(self) -> int:
+        """Return the UTF-8 size of the normalized parameter payload."""
+
         # AUDIT-FIX(#3): Keine stille default=str()-Magie mehr; nur validierte JSON-Strukturen werden gezählt.
         payload = json.dumps(
             self.parameters,
@@ -485,6 +551,8 @@ class IntegrationRequest:
         return len(payload.encode("utf-8"))
 
     def redacted_parameters(self, *, extra_sensitive_keys: set[str] | None = None) -> dict[str, object]:
+        """Return parameters with sensitive keys recursively redacted."""
+
         # AUDIT-FIX(#2): Rekursive, schreibweisen-robuste Redaction für Logs/Audits.
         sensitive_keys = set(_NORMALIZED_DEFAULT_SENSITIVE_PARAMETER_KEYS)
         if extra_sensitive_keys:
@@ -499,18 +567,24 @@ class IntegrationRequest:
         return redacted
 
     def audit_label(self) -> str:
+        """Return a log-safe label for the request."""
+
         # AUDIT-FIX(#4): IDs wurden schon validiert und bleiben damit delimiter-safe für Log-Trails.
         return f"{self.integration_id}:{self.operation_id}:{self.origin.value}"
 
 
 @dataclass(frozen=True, slots=True)
 class IntegrationDecision:
+    """Represent the policy outcome for one integration request."""
+
     allowed: bool
     reason: str
     required_confirmation: ConfirmationMode | None = None
     warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        """Normalize the decision payload and reject contradictory states."""
+
         # AUDIT-FIX(#7): Widersprüchliche Decision-Zustände und unsaubere Texte blocken.
         object.__setattr__(self, "allowed", _ensure_bool(self.allowed, "allowed"))
         object.__setattr__(self, "reason", _ensure_safe_text(self.reason, "reason"))
@@ -532,6 +606,8 @@ class IntegrationDecision:
 
     @classmethod
     def allow(cls, reason: str, *, warnings: tuple[str, ...] = ()) -> "IntegrationDecision":
+        """Build an allow decision."""
+
         return cls(allowed=True, reason=reason, warnings=warnings)
 
     @classmethod
@@ -542,6 +618,8 @@ class IntegrationDecision:
         required_confirmation: ConfirmationMode | None = None,
         warnings: tuple[str, ...] = (),
     ) -> "IntegrationDecision":
+        """Build a deny decision."""
+
         return cls(
             allowed=False,
             reason=reason,
@@ -552,6 +630,8 @@ class IntegrationDecision:
 
 @dataclass(frozen=True, slots=True)
 class IntegrationResult:
+    """Represent the normalized result returned by an integration adapter."""
+
     ok: bool
     summary: str
     details: dict[str, object] = field(default_factory=dict)
@@ -559,6 +639,8 @@ class IntegrationResult:
     redacted_fields: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        """Normalize the adapter result into immutable safe structures."""
+
         # AUDIT-FIX(#7): Frozen-Resultate trotzdem defensiv kopieren/normalisieren, damit API/Logs später nicht kippen.
         object.__setattr__(self, "ok", _ensure_bool(self.ok, "ok"))
         object.__setattr__(self, "summary", _ensure_safe_text(self.summary, "summary"))

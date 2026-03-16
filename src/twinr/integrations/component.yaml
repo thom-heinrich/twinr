@@ -1,0 +1,160 @@
+schema_version: 1
+name: integrations
+path: src/twinr/integrations
+kind: python-package
+visibility: internal
+summary: Provide shared integration contracts, builtin manifests, runtime wiring, and dashboard-facing integration helpers.
+owned_concerns:
+  - Define the canonical manifest, request, result, and safety models shared by all Twinr integrations
+  - Publish Twinr's builtin integration catalog and manifest lookup helpers
+  - Evaluate integration policy decisions and dispatch requests to registered adapters
+  - Build managed email and calendar adapters from store and environment state
+  - Persist integration configuration and expose integration automation family blocks to the web layer
+out_of_scope:
+  - Provider-specific email transport, normalization, and adapter behavior in src/twinr/integrations/email
+  - Provider-specific calendar event parsing and agenda behavior in src/twinr/integrations/calendar
+  - Web routes, form handling, or templates outside the integration-family provider surface in src/twinr/web
+  - Agent orchestration or capability policy outside the integration package boundary
+files:
+  - path: __init__.py
+    role: Stable package export surface for shared integration APIs
+  - path: adapter.py
+    role: Minimal adapter protocol and callable wrapper
+    exports:
+      - CallableIntegrationAdapter
+      - IntegrationAdapter
+  - path: models.py
+    role: Canonical manifests, requests, results, and safety value objects
+    exports:
+      - ConfirmationMode
+      - DataSensitivity
+      - IntegrationAction
+      - IntegrationDecision
+      - IntegrationDomain
+      - IntegrationManifest
+      - IntegrationOperation
+      - IntegrationRequest
+      - IntegrationResult
+      - RequestOrigin
+      - RiskLevel
+      - SafetyProfile
+      - SecretReference
+      - SecretStorage
+  - path: catalog.py
+    role: Builtin integration manifest registry and lookup helpers
+    exports:
+      - BUILTIN_MANIFESTS
+      - builtin_manifests
+      - manifest_for_id
+      - manifests_for_domain
+  - path: policy.py
+    role: Safety gating and confirmation policy for integration requests
+    exports:
+      - SafeIntegrationPolicy
+      - stricter_confirmation
+  - path: registry.py
+    role: Adapter registration, policy enforcement, and sync dispatch
+    exports:
+      - IntegrationNotFoundError
+      - IntegrationPolicyError
+      - IntegrationRegistry
+      - IntegrationRegistryError
+  - path: runtime.py
+    role: Managed email and calendar runtime assembly from config and environment
+    exports:
+      - CALENDAR_AGENDA_INTEGRATION_ID
+      - EMAIL_APP_PASSWORD_ENV_KEY
+      - EMAIL_MAILBOX_INTEGRATION_ID
+      - IntegrationReadiness
+      - ManagedIntegrationsRuntime
+      - build_calendar_agenda_adapter
+      - build_email_mailbox_adapter
+      - build_managed_integrations
+      - validate_calendar_source
+  - path: store.py
+    role: File-backed integration configuration store with bounded atomic writes
+    exports:
+      - ManagedIntegrationConfig
+      - TwinrIntegrationStore
+      - integration_store_path
+  - path: web_automation_families.py
+    role: Dashboard automation-family provider blocks for managed integrations
+    exports:
+      - IntegrationAutomationFamilyBlock
+      - IntegrationAutomationFamilyProvider
+      - integration_automation_family_providers
+  - path: calendar
+    role: Read-only calendar provider package
+  - path: email
+    role: Email provider package
+public_api:
+  module: twinr.integrations
+  exports:
+    - ApprovedEmailContacts
+    - BUILTIN_MANIFESTS
+    - CALENDAR_AGENDA_INTEGRATION_ID
+    - CalendarAdapterSettings
+    - CalendarEvent
+    - CalendarReader
+    - CallableIntegrationAdapter
+    - ConfirmationMode
+    - DataSensitivity
+    - EMAIL_APP_PASSWORD_ENV_KEY
+    - EMAIL_MAILBOX_INTEGRATION_ID
+    - EmailAdapterSettings
+    - EmailContact
+    - EmailDraft
+    - EmailMailboxAdapter
+    - EmailMessageSummary
+    - ICSCalendarSource
+    - IMAPMailboxConfig
+    - IMAPMailboxReader
+    - IntegrationAction
+    - IntegrationAdapter
+    - IntegrationAutomationFamilyBlock
+    - IntegrationAutomationFamilyProvider
+    - IntegrationDecision
+    - IntegrationDomain
+    - IntegrationManifest
+    - IntegrationNotFoundError
+    - IntegrationOperation
+    - IntegrationPolicyError
+    - IntegrationRegistry
+    - IntegrationRegistryError
+    - IntegrationReadiness
+    - IntegrationRequest
+    - IntegrationResult
+    - MailSender
+    - ManagedIntegrationConfig
+    - ManagedIntegrationsRuntime
+    - MailboxReader
+    - ReadOnlyCalendarAdapter
+    - RequestOrigin
+    - RiskLevel
+    - SMTPMailSender
+    - SMTPMailSenderConfig
+    - SafeIntegrationPolicy
+    - SafetyProfile
+    - SecretReference
+    - SecretStorage
+    - TwinrIntegrationStore
+    - builtin_manifests
+    - build_calendar_agenda_adapter
+    - build_email_mailbox_adapter
+    - build_managed_integrations
+    - integration_automation_family_providers
+    - integration_store_path
+    - manifest_for_id
+    - manifests_for_domain
+    - stricter_confirmation
+    - validate_calendar_source
+primary_callers:
+  - path: src/twinr/web/app.py
+  - path: src/twinr/web/context.py
+  - path: src/twinr/web/viewmodels_integrations.py
+  - path: src/twinr/agent/self_coding/capability_registry.py
+tests:
+  - path: test/test_integrations.py
+  - path: test/test_integration_runtime.py
+  - path: test/test_integration_store.py
+  - path: test/test_web_app.py

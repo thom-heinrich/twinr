@@ -12,7 +12,7 @@ out_of_scope:
   - Base-agent implementation details inside src/twinr/agent/base_agent
   - Tool prompting, schema, handler, and runtime execution details inside src/twinr/agent/tools
   - Workflow-loop orchestration details inside src/twinr/agent/workflows
-  - Detailed self-coding contracts, persistence, and capability readiness logic inside src/twinr/agent/self_coding
+  - Detailed self-coding contracts, persistence, compiler validation, local compile-worker logic, and capability readiness inside src/twinr/agent/self_coding
 files:
   - path: __init__.py
     role: Lazy root compatibility export surface
@@ -28,7 +28,7 @@ subpackages:
   - path: workflows
     role: Classic, realtime, and streaming workflow loops
   - path: self_coding
-    role: Adaptive Skill Engine core contracts, persistence, and capability readiness
+    role: Adaptive Skill Engine contracts, persistence, compiler validation, compile worker, and capability readiness
 public_api:
   module: twinr.agent
   exports:

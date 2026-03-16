@@ -1,3 +1,9 @@
+"""Expose Twinr's shared integration package surface.
+
+Re-export the common contracts, builtin provider packages, runtime helpers,
+and dashboard-facing utilities from stable import paths used across Twinr.
+"""
+
 from twinr.integrations.adapter import CallableIntegrationAdapter, IntegrationAdapter
 from twinr.integrations.catalog import BUILTIN_MANIFESTS, builtin_manifests, manifest_for_id, manifests_for_domain
 from twinr.integrations.calendar import CalendarAdapterSettings, CalendarEvent, CalendarReader, ICSCalendarSource, ReadOnlyCalendarAdapter

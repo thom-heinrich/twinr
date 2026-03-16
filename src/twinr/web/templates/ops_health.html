@@ -53,6 +53,55 @@
   </div>
 </section>
 
+<section class="panel two-column">
+  <div>
+    <div class="section-header">
+      <div>
+        <h2>Remote memory watchdog</h2>
+        <p class="section-description">Rolling ChonkyDB readiness state from the dedicated watchdog.</p>
+      </div>
+      {% if remote_memory_watchdog %}
+      {% set watchdog_status_key = 'ok' if remote_memory_watchdog.current.status == 'ok' else ('warn' if remote_memory_watchdog.current.status == 'disabled' else 'fail') %}
+      <span class="status-pill is-{{ watchdog_status_key }}">{{ remote_memory_watchdog.current.status }}</span>
+      {% endif %}
+    </div>
+    {% if remote_memory_watchdog %}
+    <ul class="plain-list">
+      <li><strong>Last sample</strong> {{ remote_memory_watchdog.current.captured_at or "—" }}</li>
+      <li><strong>Ready</strong> {{ "yes" if remote_memory_watchdog.current.ready else "no" }}</li>
+      <li><strong>Mode</strong> {{ remote_memory_watchdog.current.mode }}</li>
+      <li><strong>Required</strong> {{ "yes" if remote_memory_watchdog.current.required else "no" }}</li>
+      <li><strong>Last latency</strong> {{ "%.1f ms"|format(remote_memory_watchdog.current.latency_ms) }}</li>
+      <li><strong>Samples</strong> {{ remote_memory_watchdog.sample_count }}</li>
+      <li><strong>Failures</strong> {{ remote_memory_watchdog.failure_count }}</li>
+      <li><strong>Last good sample</strong> {{ remote_memory_watchdog.last_ok_at or "—" }}</li>
+      <li><strong>Last failure</strong> {{ remote_memory_watchdog.last_failure_at or "—" }}</li>
+      <li><strong>Detail</strong> {{ remote_memory_watchdog.current.detail or "—" }}</li>
+    </ul>
+    {% elif remote_memory_watchdog_error %}
+    <div class="empty-state">{{ remote_memory_watchdog_error }}</div>
+    {% else %}
+    <div class="empty-state">No remote memory watchdog snapshot exists yet.</div>
+    {% endif %}
+  </div>
+  <div>
+    <h2>Probe streak</h2>
+    {% if remote_memory_watchdog %}
+    <ul class="plain-list">
+      <li><strong>Consecutive ok</strong> {{ remote_memory_watchdog.current.consecutive_ok }}</li>
+      <li><strong>Consecutive fail</strong> {{ remote_memory_watchdog.current.consecutive_fail }}</li>
+      <li><strong>History capacity</strong> {{ remote_memory_watchdog.history_limit }}</li>
+      <li><strong>Snapshot updated</strong> {{ remote_memory_watchdog.updated_at or "—" }}</li>
+      <li><strong>Watchdog started</strong> {{ remote_memory_watchdog.started_at or "—" }}</li>
+      <li><strong>Host</strong> {{ remote_memory_watchdog.hostname or "—" }}</li>
+      <li><strong>PID</strong> {{ remote_memory_watchdog.pid }}</li>
+    </ul>
+    {% else %}
+    <div class="empty-state">The watchdog panel will populate after the first saved probe.</div>
+    {% endif %}
+  </div>
+</section>
+
 <section class="panel">
   <div class="section-header">
     <div>

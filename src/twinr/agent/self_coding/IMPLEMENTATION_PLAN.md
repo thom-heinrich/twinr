@@ -20,8 +20,9 @@ Die Umsetzung folgt zwei klar getrennten Ausbaustufen:
 
 ## Festgezogene Architekturentscheidungen
 
-- **Lokaler Coding-Driver:** Primär `codex app-server` via `stdio`, sekundär
-  `codex exec --json` als Fallback-Adapter.
+- **Lokaler Coding-Driver:** Primär gepinnter `codex-sdk`-Bridge-Runner,
+  sekundär `codex exec --json` als Fallback-Adapter. `codex app-server`
+  bleibt höchstens als Legacy-Debugpfad außerhalb des produktiven Surface.
 - **Kein generierter Produktcode unter `src/`:** Generierte Nutzerartefakte
   liegen in einem dedizierten Runtime-Store, nicht im führenden Source-Tree.
 - **Strict SOC:** `self_coding` wird als eigenes Subsystem unter
@@ -222,7 +223,7 @@ Codegenerierung, Tests und Review nutzen kann.
 
 **Umfang**
 
-- Primären Driver für `codex app-server` via `stdio` implementieren.
+- Primären Driver für den gepinnten `codex-sdk`-Bridge-Runner implementieren.
 - Fallback-Driver für `codex exec --json` implementieren.
 - Workspace-Builder für temporäre Compile-Workspaces.
 - Progress-, Cancel-, Timeout- und Artefakt-Sammlung.
@@ -231,7 +232,8 @@ Codegenerierung, Tests und Review nutzen kann.
 
 **Geplante Dateien**
 
-- `src/twinr/agent/self_coding/codex_driver/app_server.py`
+- `src/twinr/agent/self_coding/codex_driver/sdk.py`
+- `src/twinr/agent/self_coding/codex_driver/sdk_bridge/run_compile.mjs`
 - `src/twinr/agent/self_coding/codex_driver/exec_fallback.py`
 - `src/twinr/agent/self_coding/codex_driver/workspace.py`
 - `src/twinr/agent/self_coding/worker.py`

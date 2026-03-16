@@ -1,0 +1,46 @@
+schema_version: 1
+name: realtime
+path: src/twinr/providers/openai/realtime
+kind: python-package
+visibility: internal
+summary: Provide the bounded OpenAI realtime session wrapper and turn result types used by Twinr's realtime runtime.
+owned_concerns:
+  - Manage OpenAI realtime websocket session lifecycle behind a synchronous Twinr-friendly interface
+  - Assemble Twinr-specific realtime instructions, tool schemas, and local time context before each turn
+  - Normalize streamed provider text, audio, and tool events into completed turn objects with bounded waits
+out_of_scope:
+  - Shared OpenAI client construction and request helpers in src/twinr/providers/openai/core
+  - Non-realtime OpenAI backend composition in src/twinr/providers/openai/api
+  - Runtime button, microphone, speaker, and state-machine orchestration in src/twinr/agent/workflows/realtime_runner.py
+files:
+  - path: __init__.py
+    role: Export the realtime package surface
+    exports:
+      - OpenAIRealtimeSession
+      - OpenAIRealtimeTurn
+  - path: session.py
+    role: Session lifecycle, streamed event handling, and tool execution bridge
+    exports:
+      - OpenAIRealtimeSession
+      - OpenAIRealtimeTurn
+public_api:
+  module: twinr.providers.openai.realtime
+  exports:
+    - OpenAIRealtimeSession
+    - OpenAIRealtimeTurn
+compatibility_reexports:
+  - path: src/twinr/providers/openai/__init__.py
+    names:
+      - OpenAIRealtimeSession
+      - OpenAIRealtimeTurn
+  - path: src/twinr/providers/__init__.py
+    names:
+      - OpenAIRealtimeSession
+      - OpenAIRealtimeTurn
+primary_callers:
+  - path: src/twinr/agent/workflows/realtime_runner.py
+  - path: src/twinr/providers/openai/__init__.py
+  - path: src/twinr/providers/__init__.py
+tests:
+  - path: test/test_openai_realtime.py
+  - path: test/test_realtime_runner.py

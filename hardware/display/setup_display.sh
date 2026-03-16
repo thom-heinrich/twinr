@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
+# Configure the Waveshare display driver files and Twinr env wiring.
+#
+# Installs the vendor driver into a runtime-owned directory, persists display
+# GPIO/SPI settings into the selected `.env`, and can run a bounded smoke test.
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_FILE="${ROOT_DIR}/.env"
-VENDOR_DIR="${ROOT_DIR}/hardware/display/vendor"
+VENDOR_DIR="${ROOT_DIR}/state/display/vendor"
 PYTHON_BIN=""
 SPI_BUS=0
 SPI_DEVICE=0
@@ -106,47 +111,14 @@ export ROOT_DIR ENV_FILE VENDOR_DIR SPI_BUS SPI_DEVICE CS_GPIO DC_GPIO RESET_GPI
 apt-get update
 apt-get install -y python3-pil python3-spidev python3-gpiozero python3-lgpio python3-libgpiod
 
-"$PYTHON_BIN" <<'PY'
-from pathlib import Path
-import os
-import urllib.request
-
-vendor_dir = Path(os.environ["VENDOR_DIR"]) / "waveshare_epd"
-vendor_dir.mkdir(parents=True, exist_ok=True)
-
-epdconfig_url = "https://raw.githubusercontent.com/waveshareteam/e-Paper/master/RaspberryPi_JetsonNano/python/lib/waveshare_epd/epdconfig.py"
-driver_url = "https://raw.githubusercontent.com/waveshareteam/e-Paper/master/RaspberryPi_JetsonNano/python/lib/waveshare_epd/epd4in2_V2.py"
-
-epdconfig = urllib.request.urlopen(epdconfig_url, timeout=20).read().decode("utf-8", "ignore")
-driver = urllib.request.urlopen(driver_url, timeout=20).read().decode("utf-8", "ignore")
-
-pin_values = {
-    "RST_PIN": os.environ["RESET_GPIO"],
-    "DC_PIN": os.environ["DC_GPIO"],
-    "CS_PIN": os.environ["CS_GPIO"],
-    "BUSY_PIN": os.environ["BUSY_GPIO"],
-}
-patched_lines = []
-for line in epdconfig.splitlines():
-    stripped = line.strip()
-    left, separator, _right = stripped.partition("=")
-    key = left.strip()
-    if separator and key in pin_values:
-        indent = line[: len(line) - len(line.lstrip())]
-        patched_lines.append(f"{indent}{key:<8} = {pin_values[key]}")
-        continue
-    patched_lines.append(line)
-epdconfig = "\n".join(patched_lines) + "\n"
-
-epdconfig = epdconfig.replace(
-    "self.SPI.open(0, 0)",
-    f"self.SPI.open({os.environ['SPI_BUS']}, {os.environ['SPI_DEVICE']})",
-)
-
-(vendor_dir / "__init__.py").write_text("", encoding="utf-8")
-(vendor_dir / "epdconfig.py").write_text(epdconfig, encoding="utf-8")
-(vendor_dir / "epd4in2_V2.py").write_text(driver, encoding="utf-8")
-PY
+"$PYTHON_BIN" hardware/display/vendor_patch.py \
+  --vendor-dir "${VENDOR_DIR}" \
+  --spi-bus "${SPI_BUS}" \
+  --spi-device "${SPI_DEVICE}" \
+  --cs-gpio "${CS_GPIO}" \
+  --dc-gpio "${DC_GPIO}" \
+  --reset-gpio "${RESET_GPIO}" \
+  --busy-gpio "${BUSY_GPIO}"
 
 touch "${ENV_FILE}"
 

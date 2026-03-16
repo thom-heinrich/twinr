@@ -21,7 +21,7 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware import GpioPirMonitor, V4L2StillCamera, configured_pir_monitor
 from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioSampler, pcm16_to_wav_bytes
 from twinr.ops.paths import resolve_ops_paths_for_config
-from twinr.providers.openai.backend import OpenAIBackend
+from twinr.providers.openai import OpenAIBackend
 
 from ..social.engine import SocialAudioObservation, SocialObservation, SocialTriggerDecision, SocialTriggerEngine, SocialVisionObservation
 from ..social.observers import AmbientAudioObservationProvider, NullAudioObservationProvider, OpenAIVisionObservationProvider

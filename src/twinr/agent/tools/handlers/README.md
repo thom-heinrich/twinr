@@ -28,7 +28,7 @@ keeps shared voice/argument guards close to that boundary.
 | [memory.py](./memory.py) | Durable-memory tool handlers |
 | [output.py](./output.py) | Print, search, and camera handlers |
 | [reminders.py](./reminders.py) | Reminder scheduling handler |
-| [self_coding.py](./self_coding.py) | Self-coding feasibility and dialogue handlers |
+| [self_coding.py](./self_coding.py) | Self-coding feasibility, activation, and rollback handlers |
 | [settings.py](./settings.py) | Simple setting mutation handler |
 | [support.py](./support.py) | Shared voice and argument guards |
 | [voice_profile.py](./voice_profile.py) | Voice-profile tool handlers |

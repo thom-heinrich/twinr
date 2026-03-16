@@ -227,7 +227,10 @@ class TwinrConfig:
     streaming_first_word_prefetch_enabled: bool = True
     streaming_first_word_prefetch_min_chars: int = 4
     streaming_first_word_prefetch_wait_ms: int = 40
+    streaming_bridge_reply_timeout_ms: int = 250
     streaming_first_word_final_lane_wait_ms: int = 900
+    streaming_final_lane_watchdog_timeout_ms: int = 4000
+    streaming_final_lane_hard_timeout_ms: int = 15000
     streaming_supervisor_model: str = "gpt-4o-mini"
     streaming_supervisor_reasoning_effort: str = "low"
     streaming_supervisor_context_turns: int = 4
@@ -399,6 +402,8 @@ class TwinrConfig:
     long_term_memory_remote_read_timeout_s: float = 8.0
     long_term_memory_remote_write_timeout_s: float = 15.0
     long_term_memory_remote_keepalive_interval_s: float = 5.0
+    long_term_memory_remote_watchdog_interval_s: float = 1.0
+    long_term_memory_remote_watchdog_history_limit: int = 3600
     long_term_memory_remote_max_content_chars: int = 2_000_000
     long_term_memory_remote_shard_max_content_chars: int = 1_000_000
     long_term_memory_remote_retry_attempts: int = 3
@@ -465,7 +470,7 @@ class TwinrConfig:
     button_debounce_ms: int = 80
     button_probe_lines: tuple[int, ...] = DEFAULT_BUTTON_PROBE_LINES
     display_driver: str = "waveshare_4in2_v2"
-    display_vendor_dir: str = "hardware/display/vendor"
+    display_vendor_dir: str = "state/display/vendor"
     display_spi_bus: int = 0
     display_spi_device: int = 0
     display_cs_gpio: int = 8
@@ -786,9 +791,21 @@ class TwinrConfig:
                 0,
                 int(get_value("TWINR_STREAMING_FIRST_WORD_PREFETCH_WAIT_MS", "40") or "40"),
             ),
+            streaming_bridge_reply_timeout_ms=max(
+                0,
+                int(get_value("TWINR_STREAMING_BRIDGE_REPLY_TIMEOUT_MS", "250") or "250"),
+            ),
             streaming_first_word_final_lane_wait_ms=max(
                 0,
                 int(get_value("TWINR_STREAMING_FIRST_WORD_FINAL_LANE_WAIT_MS", "900") or "900"),
+            ),
+            streaming_final_lane_watchdog_timeout_ms=max(
+                25,
+                int(get_value("TWINR_STREAMING_FINAL_LANE_WATCHDOG_TIMEOUT_MS", "4000") or "4000"),
+            ),
+            streaming_final_lane_hard_timeout_ms=max(
+                50,
+                int(get_value("TWINR_STREAMING_FINAL_LANE_HARD_TIMEOUT_MS", "15000") or "15000"),
             ),
             streaming_supervisor_model=(
                 get_value("TWINR_STREAMING_SUPERVISOR_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
@@ -1280,6 +1297,15 @@ class TwinrConfig:
                 5.0,
                 minimum=0.1,
             ),
+            long_term_memory_remote_watchdog_interval_s=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_INTERVAL_S"),
+                1.0,
+                minimum=0.1,
+            ),
+            long_term_memory_remote_watchdog_history_limit=max(
+                1,
+                int(get_value("TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_HISTORY_LIMIT", "3600") or "3600"),
+            ),
             long_term_memory_remote_max_content_chars=int(
                 get_value("TWINR_LONG_TERM_MEMORY_REMOTE_MAX_CONTENT_CHARS", "2000000") or "2000000"
             ),
@@ -1455,8 +1481,8 @@ class TwinrConfig:
                 DEFAULT_BUTTON_PROBE_LINES,
             ),
             display_driver=get_value("TWINR_DISPLAY_DRIVER", "waveshare_4in2_v2") or "waveshare_4in2_v2",
-            display_vendor_dir=get_value("TWINR_DISPLAY_VENDOR_DIR", "hardware/display/vendor")
-            or "hardware/display/vendor",
+            display_vendor_dir=get_value("TWINR_DISPLAY_VENDOR_DIR", "state/display/vendor")
+            or "state/display/vendor",
             display_spi_bus=int(get_value("TWINR_DISPLAY_SPI_BUS", "0") or "0"),
             display_spi_device=int(get_value("TWINR_DISPLAY_SPI_DEVICE", "0") or "0"),
             display_cs_gpio=int(get_value("TWINR_DISPLAY_CS_GPIO", "8") or "8"),

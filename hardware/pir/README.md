@@ -1,51 +1,33 @@
-# Twinr PIR Motion Sensor
+# pir
 
-Twinr now supports a dedicated PIR motion input as a first-class hardware path.
+Pi-side setup and probe scripts for Twinr's PIR motion sensor input.
 
-## Current prototype mapping
+## Responsibility
 
-- Motion sensor output: `GPIO26`
-- GPIO chip: `gpiochip0`
-- Default polarity: `active_high=true`
-- Default bias: `pull-down`
+`pir` owns:
+- persist PIR GPIO env settings for the Pi runtime
+- probe configured or ad-hoc PIR motion lines outside the main runtime
 
-On a Raspberry Pi 4 header this is typically:
+`pir` does **not** own:
+- runtime motion monitoring in `src/twinr/hardware/pir.py`
+- button GPIO handling outside shared config dependencies
+- higher-level proactive behavior policy
 
-- `GPIO26` -> physical pin `37`
+## Key files
 
-Some wiring guides or HAT silkscreens call this `IO26`. In Twinr that means BCM `GPIO26`.
+| File | Purpose |
+|---|---|
+| [setup_pir.sh](./setup_pir.sh) | Persist PIR GPIO config |
+| [probe_pir.py](./probe_pir.py) | Print live PIR motion events |
 
-## Persist or update the mapping
-
-```bash
-cd /twinr
-hardware/pir/setup_pir.sh --motion 26 --probe
-```
-
-This writes the PIR settings into `/twinr/.env` and can run a short motion probe immediately after saving.
-
-## Probe the PIR input
+## Usage
 
 ```bash
-cd /twinr
-./.venv/bin/python hardware/pir/probe_pir.py --env-file /twinr/.env --duration 30
+./hardware/pir/setup_pir.sh --env-file .env --motion 26 --probe
+python3 hardware/pir/probe_pir.py --env-file .env --duration 30
 ```
 
-Move in front of the PIR while the probe is running. The script prints the current level and every detected motion edge.
+## See also
 
-## Runtime integration
-
-The Python helper in `src/twinr/hardware/pir.py` exposes:
-
-- `build_pir_binding()` for config-to-GPIO binding
-- `configured_pir_monitor()` for normal Twinr configuration
-- `GpioPirMonitor` for direct GPIO sampling or motion waits
-
-## Wiring guardrails
-
-- PIR `OUT` -> `GPIO26` / physical pin `37`
-- PIR `GND` -> any Pi `GND`
-- PIR `VCC` -> use the supply voltage your PIR module expects
-- The signal presented to the Pi GPIO must never exceed `3.3V`
-
-If your PIR board is not explicitly GPIO-safe at `3.3V`, use a level shifter or a tested resistor divider before connecting the output to the Pi.
+- [Top-level hardware README](../README.md)
+- [Runtime PIR adapter](../../src/twinr/hardware/pir.py)

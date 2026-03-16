@@ -1,0 +1,61 @@
+schema_version: 1
+name: web
+path: src/twinr/web
+kind: python-package
+visibility: internal
+summary: Serve Twinr's local FastAPI control surface and compose route handlers, shared web context, presenters, support primitives, templates, and static assets.
+owned_concerns:
+  - Build the FastAPI app factory, control-plane middleware, and route handlers for Twinr's local dashboard and settings pages
+  - Centralize request-time config loading, store construction, and safe template rendering through `context.py`
+  - Validate and persist web-driven automation, reminder, integration, provider, personality, and user-context edits through the appropriate helpers
+  - Ship the package-local Jinja templates and static CSS used by the local control surface
+out_of_scope:
+  - Core runtime, provider, hardware, memory, or ops business logic outside route orchestration and operator-facing page composition
+  - Presenter-specific section shaping and normalization under `src/twinr/web/presenters`
+  - Generic file-backed contracts, form declarations, and persistence helpers under `src/twinr/web/support`
+  - Raspberry Pi setup scripts and non-web operator workflows outside this package
+files:
+  - path: __init__.py
+    role: Stable package export surface
+    exports:
+      - create_app
+  - path: app.py
+    role: FastAPI app factory, security middleware, and route handlers
+    exports:
+      - create_app
+  - path: context.py
+    role: Shared request-time context, store factories, and safe template renderer
+    exports:
+      - WebAppContext
+      - DEFAULT_RESTART_NOTICE
+  - path: automations.py
+    role: Automation page context builders and validated automation form persistence helpers
+    exports:
+      - AutomationFamilyCard
+      - AutomationFamilyDefinition
+      - AutomationFamilySection
+      - AutomationFormSection
+      - AutomationRow
+      - build_automation_page_context
+      - delete_automation
+      - save_sensor_automation
+      - save_time_automation
+      - toggle_automation_enabled
+  - path: presenters
+    role: Template-ready page sections, normalized rows, and integration form builders
+  - path: support
+    role: Shared contracts, form-field declarations, and file-backed persistence helpers
+  - path: templates
+    role: Jinja templates for the local control surface
+  - path: static
+    role: Package-local CSS assets for the dashboard
+public_api:
+  module: twinr.web
+  exports:
+    - create_app
+primary_callers:
+  - path: src/twinr/__main__.py
+  - path: test/test_web_app.py
+tests:
+  - path: test/test_web_app.py
+  - path: test/test_web_store.py

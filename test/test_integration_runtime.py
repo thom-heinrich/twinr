@@ -50,8 +50,14 @@ class ManagedIntegrationRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.email_mailbox.mail_sender.config.password, "abcd efgh ijkl mnop")
         readiness = runtime.readiness_for("email_mailbox")
         assert readiness is not None
-        self.assertEqual(readiness.status, "ok")
+        self.assertEqual(readiness.status, "warn")
+        self.assertEqual(readiness.summary, "Ready with warnings")
         self.assertIn("credential stored separately in .env", readiness.detail)
+        self.assertIn("Outbound email is not restricted to approved contacts.", readiness.detail)
+        self.assertIn(
+            "Outbound email is not restricted to approved contacts. This increases the risk of misaddressed or unsafe sends.",
+            readiness.warnings,
+        )
         self.assertNotIn("abcd", readiness.detail)
         self.assertNotIn("mnop", readiness.detail)
         self.assertNotIn("abcd efgh ijkl mnop", repr(readiness))

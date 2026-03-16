@@ -1,0 +1,96 @@
+schema_version: 1
+name: email
+path: src/twinr/integrations/email
+kind: python-package
+visibility: internal
+summary: Provide Twinr's email integration models, adapter orchestration, IMAP mailbox reader, and SMTP sender.
+owned_concerns:
+  - Define the canonical email contacts, drafts, mailbox summaries, and address normalization rules used across Twinr
+  - Translate integration requests into bounded read, draft, and send email operations
+  - Read recent mailbox summaries from IMAP and sanitize provider payloads into Twinr data models
+  - Send validated drafts through SMTP with explicit transport and recipient checks
+out_of_scope:
+  - Integration configuration loading and readiness reporting in src/twinr/integrations/runtime.py
+  - Integration catalog metadata, policy gating, or non-email integrations under src/twinr/integrations
+  - Web form normalization and persistence for integration settings under src/twinr/web
+files:
+  - path: __init__.py
+    role: Public email package export surface
+    exports:
+      - ApprovedEmailContacts
+      - EmailAdapterSettings
+      - EmailContact
+      - EmailDraft
+      - EmailMailboxAdapter
+      - EmailMessageSummary
+      - IMAPMailboxConfig
+      - IMAPMailboxReader
+      - MailboxReader
+      - MailSender
+      - SMTPMailSender
+      - SMTPMailSenderConfig
+      - normalize_email
+  - path: models.py
+    role: Canonical email models and normalization helpers
+    exports:
+      - ApprovedEmailContacts
+      - EmailContact
+      - EmailDraft
+      - EmailMessageSummary
+      - normalize_email
+  - path: adapter.py
+    role: Integration request adapter and safety settings
+    exports:
+      - EmailAdapterSettings
+      - EmailMailboxAdapter
+      - MailboxReader
+      - MailSender
+  - path: imap.py
+    role: IMAP mailbox configuration and recent-message reader
+    exports:
+      - IMAPMailboxConfig
+      - IMAPMailboxReader
+  - path: smtp.py
+    role: SMTP transport configuration and mail sender
+    exports:
+      - SMTPMailSender
+      - SMTPMailSenderConfig
+public_api:
+  module: twinr.integrations.email
+  exports:
+    - ApprovedEmailContacts
+    - EmailAdapterSettings
+    - EmailContact
+    - EmailDraft
+    - EmailMailboxAdapter
+    - EmailMessageSummary
+    - IMAPMailboxConfig
+    - IMAPMailboxReader
+    - MailboxReader
+    - MailSender
+    - SMTPMailSender
+    - SMTPMailSenderConfig
+    - normalize_email
+compatibility_reexports:
+  - path: src/twinr/integrations/__init__.py
+    names:
+      - ApprovedEmailContacts
+      - EmailAdapterSettings
+      - EmailContact
+      - EmailDraft
+      - EmailMailboxAdapter
+      - EmailMessageSummary
+      - IMAPMailboxConfig
+      - IMAPMailboxReader
+      - MailboxReader
+      - MailSender
+      - SMTPMailSender
+      - SMTPMailSenderConfig
+      - normalize_email
+primary_callers:
+  - path: src/twinr/integrations/runtime.py
+  - path: src/twinr/integrations/__init__.py
+tests:
+  - path: test/test_integrations_email.py
+  - path: test/test_integration_runtime.py
+  - path: test/test_integrations.py

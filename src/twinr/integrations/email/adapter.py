@@ -1,3 +1,10 @@
+"""Translate Twinr email integration requests into mailbox actions.
+
+This module defines the adapter-level settings, mailbox and sender protocols,
+and the orchestration layer that validates integration requests before reading,
+drafting, or sending email.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -13,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def _parse_strict_bool(value: object, *, field_name: str) -> bool:
+    """Parse a strict boolean or supported boolean-like literal."""
     # AUDIT-FIX(2): Parse approval booleans strictly so strings like "false" do not evaluate to True.
     if isinstance(value, bool):
         return value
@@ -28,6 +36,7 @@ def _parse_strict_bool(value: object, *, field_name: str) -> bool:
 
 
 def _parse_positive_int(value: object, *, field_name: str) -> int:
+    """Parse a positive integer from config or request input."""
     # AUDIT-FIX(4): Parse numeric input explicitly instead of relying on int(...) over arbitrary values.
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be a positive whole number.")
@@ -42,18 +51,26 @@ def _parse_positive_int(value: object, *, field_name: str) -> int:
 
 @runtime_checkable
 class MailboxReader(Protocol):
+    """Define the mailbox read contract required by the email adapter."""
+
     def list_recent(self, *, limit: int, unread_only: bool) -> list[EmailMessageSummary]:
+        """Return the newest mailbox summaries that match the filter."""
         ...
 
 
 @runtime_checkable
 class MailSender(Protocol):
+    """Define the outbound mail transport contract required by the adapter."""
+
     def send(self, draft: EmailDraft) -> str | None:
+        """Send one validated draft and optionally return a provider message ID."""
         ...
 
 
 @dataclass(frozen=True, slots=True)
 class EmailAdapterSettings:
+    """Hold bounded safety and presentation limits for email operations."""
+
     max_read_results: int = 8
     max_subject_chars: int = 160
     max_body_chars: int = 2000
@@ -94,6 +111,12 @@ class EmailAdapterSettings:
 
 @dataclass(slots=True)
 class EmailMailboxAdapter(IntegrationAdapter):
+    """Execute Twinr email integration requests against mailbox providers.
+
+    The adapter keeps request validation, contact policy enforcement, mailbox
+    reads, and SMTP sends within a single bounded integration surface.
+    """
+
     manifest: IntegrationManifest
     contacts: ApprovedEmailContacts
     mailbox_reader: MailboxReader
@@ -101,6 +124,16 @@ class EmailMailboxAdapter(IntegrationAdapter):
     settings: EmailAdapterSettings = field(default_factory=EmailAdapterSettings)
 
     def execute(self, request: IntegrationRequest) -> IntegrationResult:
+        """Dispatch one email integration request into a bounded result.
+
+        Args:
+            request: Integration request carrying the operation ID,
+                parameters, and explicit approval flags.
+
+        Returns:
+            A structured ``IntegrationResult`` describing success or the
+            normalized failure mode.
+        """
         operation_id = getattr(request, "operation_id", None)
         try:
             # AUDIT-FIX(3): Convert validation/provider failures into structured results so the voice flow does not crash.
@@ -137,6 +170,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
             )
 
     def _read_recent(self, request: IntegrationRequest) -> IntegrationResult:
+        """Build a structured result for recent mailbox summaries."""
         params = self._parameters(request)
         limit = min(
             self.settings.max_read_results,
@@ -173,6 +207,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         )
 
     def _draft_message(self, request: IntegrationRequest) -> IntegrationResult:
+        """Validate and stage an outbound email draft without sending it."""
         self._ensure_explicit_approval(request)
         draft = self._build_draft(request)
         return IntegrationResult(
@@ -193,6 +228,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         )
 
     def _send_message(self, request: IntegrationRequest) -> IntegrationResult:
+        """Validate and send one outbound email draft."""
         self._ensure_explicit_approval(request)
         if self.mail_sender is None:
             raise RuntimeError("I couldn't send email because the mail service is not available.")
@@ -222,6 +258,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         )
 
     def _build_draft(self, request: IntegrationRequest) -> EmailDraft:
+        """Construct a validated ``EmailDraft`` from integration parameters."""
         params = self._parameters(request)
         recipients = self._parse_recipients(params.get("to"))
         cc = self._parse_recipients(params.get("cc", ()), optional=True)
@@ -265,6 +302,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         )
 
     def _ensure_explicit_approval(self, request: IntegrationRequest) -> None:
+        """Require an explicit user or caregiver approval signal."""
         # AUDIT-FIX(2): Require an actual boolean confirmation rather than generic truthiness.
         if self._parse_request_confirmation(getattr(request, "explicit_user_confirmation", False)):
             return
@@ -273,6 +311,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         raise ValueError("Please confirm before I prepare or send an email.")
 
     def _parse_recipients(self, raw_value: object, *, optional: bool = False) -> tuple[str, ...]:
+        """Normalize one or more recipient inputs into unique email addresses."""
         if raw_value in (None, ""):
             if optional:
                 return ()
@@ -313,6 +352,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         return tuple(recipients)
 
     def _parameters(self, request: IntegrationRequest) -> Mapping[str, object]:
+        """Return request parameters as a mapping or raise a validation error."""
         parameters = getattr(request, "parameters", None)
         if parameters is None:
             return {}
@@ -321,11 +361,13 @@ class EmailMailboxAdapter(IntegrationAdapter):
         return parameters
 
     def _parse_limit(self, raw_value: object) -> int:
+        """Parse the requested mailbox read limit with a safe default."""
         if raw_value in (None, ""):
             return 5
         return _parse_positive_int(raw_value, field_name="limit")
 
     def _parse_optional_bool(self, raw_value: object, *, default: bool, field_name: str) -> bool:
+        """Parse an optional request flag without falling back to truthiness."""
         # AUDIT-FIX(4): Avoid bool("false") and other Python truthiness traps for request flags.
         if raw_value in (None, ""):
             return default
@@ -335,6 +377,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
             raise ValueError(f"I couldn't understand the {field_name} setting.") from exc
 
     def _parse_request_confirmation(self, raw_value: object) -> bool:
+        """Parse a confirmation flag and reject ambiguous approval values."""
         # AUDIT-FIX(2): Treat ambiguous approval values as no approval instead of accepting them implicitly.
         if raw_value in (None, ""):
             return False
@@ -352,6 +395,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         allow_newlines: bool,
         required: bool,
     ) -> str:
+        """Normalize and bound a subject/body text field from the request."""
         # AUDIT-FIX(1): Normalize and validate user-provided header/body text before it reaches the mail provider.
         if raw_value is None:
             text = ""
@@ -376,6 +420,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         return normalized
 
     def _parse_message_id(self, raw_value: object, *, field_name: str) -> str | None:
+        """Normalize one message ID style header value from the request."""
         # AUDIT-FIX(1): Reject control characters in threading headers to close CRLF/header injection paths.
         if raw_value in (None, ""):
             return None
@@ -392,6 +437,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         return normalized
 
     def _parse_message_id_collection(self, raw_value: object, *, field_name: str) -> tuple[str, ...]:
+        """Normalize a bounded collection of message ID reference values."""
         # AUDIT-FIX(7): Bound and validate message-id collections instead of iterating arbitrary caller-controlled objects.
         if raw_value in (None, "", ()):
             return ()
@@ -426,6 +472,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         return tuple(references)
 
     def _coerce_message_list(self, raw_messages: object) -> list[EmailMessageSummary]:
+        """Coerce mailbox provider output into a concrete summary list."""
         if isinstance(raw_messages, list):
             return raw_messages
         if isinstance(raw_messages, Iterable) and not isinstance(raw_messages, (str, bytes, bytearray)):
@@ -433,6 +480,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         raise RuntimeError("I couldn't read recent email right now.")
 
     def _is_allowed_sender(self, message: EmailMessageSummary) -> bool:
+        """Return whether a summary's sender passes the contact allow list."""
         sender_email = getattr(message, "sender_email", None)
         if not isinstance(sender_email, str) or not sender_email.strip():
             logger.warning("Skipping email summary with missing sender_email.")
@@ -448,6 +496,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         recipients: tuple[str, ...],
         cc: tuple[str, ...],
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Remove recipients from ``cc`` that already appear in ``to``."""
         # AUDIT-FIX(10): Split common recipient separators and remove duplicates across To/Cc.
         seen = {value.casefold() for value in recipients}
         deduplicated_cc: list[str] = []
@@ -460,6 +509,7 @@ class EmailMailboxAdapter(IntegrationAdapter):
         return recipients, tuple(deduplicated_cc)
 
     def _failure_result(self, *, summary: str, error_code: str, operation_id: object) -> IntegrationResult:
+        """Build a normalized integration failure payload."""
         return IntegrationResult(
             ok=False,
             summary=summary,
@@ -471,11 +521,13 @@ class EmailMailboxAdapter(IntegrationAdapter):
 
     @staticmethod
     def _split_recipient_tokens(raw_value: str) -> list[str]:
+        """Split one recipient string on the separators Twinr accepts."""
         normalized = raw_value.replace(";", ",").replace("\r", ",").replace("\n", ",")
         return [token.strip() for token in normalized.split(",")]
 
     @staticmethod
     def _contains_disallowed_control_chars(value: str, *, allow_newlines: bool) -> bool:
+        """Return whether text contains control characters this field forbids."""
         for char in value:
             codepoint = ord(char)
             if allow_newlines and char == "\n":

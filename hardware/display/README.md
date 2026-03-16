@@ -1,35 +1,37 @@
-# Display Setup
+# display
 
-Twinr uses the `Waveshare 4.2inch e-Paper Module` with the `V2` Python driver.
+Pi-side setup and smoke-test scripts for Twinr's Waveshare e-paper display path.
 
-Standard Raspberry Pi wiring:
+## Responsibility
 
-- `VCC -> 3.3V`
-- `GND -> GND`
-- `DIN/MOSI -> GPIO10` (`Pin 19`)
-- `CLK -> GPIO11` (`Pin 23`)
-- `CS -> GPIO8` (`Pin 24`)
-- `DC -> GPIO25` (`Pin 22`)
-- `RST -> GPIO17` (`Pin 11`)
-- `BUSY -> GPIO24` (`Pin 18`)
+`display` owns:
+- install and patch the Waveshare vendor driver for Pi use
+- persist display GPIO and SPI env settings
+- run bounded display smoke commands outside the main runtime
 
-Setup and smoke test:
+`display` does **not** own:
+- runtime rendering logic in `src/twinr/display`
+- main Twinr CLI orchestration
+- unrelated GPIO, audio, or printer setup
 
-```bash
-cd /twinr
-sudo ./hardware/display/setup_display.sh
-```
+## Key files
 
-Standalone test run:
+| File | Purpose |
+|---|---|
+| [setup_display.sh](./setup_display.sh) | Install vendor driver and env wiring |
+| [vendor_patch.py](./vendor_patch.py) | Download and harden the generated Waveshare vendor package |
+| [display_test.py](./display_test.py) | Render one-shot test pattern |
+| [run_display_loop.py](./run_display_loop.py) | Run standalone status loop |
 
-```bash
-cd /twinr
-./.venv/bin/python hardware/display/display_test.py --env-file /twinr/.env
-```
-
-Run the status-display loop:
+## Usage
 
 ```bash
-cd /twinr
-./.venv/bin/python hardware/display/run_display_loop.py --env-file /twinr/.env
+sudo ./hardware/display/setup_display.sh --env-file .env
+python3 hardware/display/display_test.py --env-file .env
+python3 hardware/display/run_display_loop.py --env-file .env --duration 30
 ```
+
+## See also
+
+- [Top-level hardware README](../README.md)
+- [Runtime display package](../../src/twinr/display/README.md)

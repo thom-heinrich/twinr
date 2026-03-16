@@ -9,12 +9,16 @@ adapter used by Twinr's Pi runtime.
 `display` owns:
 - translate runtime snapshots into bounded e-paper status frames
 - render and upload Waveshare 4.2 V2 images with validated driver settings
+- discard cached vendor imports after hardware faults so the next render starts cleanly
 - run the optional companion display loop beside hardware/runtime loops
 
 `display` does **not** own:
 - runtime snapshot storage or health sampling implementations
 - GPIO/SPI bootstrap and vendor installation scripts in `hardware/display`
 - top-level CLI parsing or loop-lock policy outside display-specific behavior
+
+The generated Waveshare vendor files should live under `state/display/vendor/`
+on the Pi so runtime deploy syncs do not wipe the driver package.
 
 ## Key files
 

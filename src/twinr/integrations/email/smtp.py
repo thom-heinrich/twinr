@@ -1,3 +1,9 @@
+"""Send validated email drafts through SMTP.
+
+This module validates SMTP transport settings, builds RFC 5322 messages from
+``EmailDraft`` records, and delivers them over STARTTLS or implicit TLS.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,6 +19,8 @@ from twinr.integrations.email.models import EmailDraft, normalize_email
 
 @dataclass(frozen=True, slots=True)
 class SMTPMailSenderConfig:
+    """Hold validated SMTP transport settings for one mailbox account."""
+
     host: str
     username: str
     password: str
@@ -48,6 +56,8 @@ class SMTPMailSenderConfig:
 
 
 class SMTPMailSender(MailSender):
+    """Send Twinr email drafts through a configured SMTP transport."""
+
     def __init__(
         self,
         config: SMTPMailSenderConfig,
@@ -58,6 +68,15 @@ class SMTPMailSender(MailSender):
         self._connection_factory = connection_factory or self._default_connection
 
     def send(self, draft: EmailDraft) -> str | None:
+        """Send one draft and return the provider-assigned message ID.
+
+        Args:
+            draft: Validated outbound email draft to send.
+
+        Returns:
+            The generated ``Message-ID`` header, or ``None`` if the transport
+            cannot provide one.
+        """
         # AUDIT-FIX(#4): Build and validate the message before opening the SMTP socket so malformed drafts cannot leak connections.
         message = self._build_message(draft)
         connection = self._connection_factory(self.config)
@@ -74,6 +93,7 @@ class SMTPMailSender(MailSender):
             self._close_connection(connection)
 
     def _build_message(self, draft: EmailDraft) -> EmailMessage:
+        """Convert a validated draft into an RFC 5322 message object."""
         to_recipients = self._normalize_recipients(draft.to)
         cc_recipients = self._normalize_recipients(draft.cc)
 
@@ -98,12 +118,14 @@ class SMTPMailSender(MailSender):
         return message
 
     def _normalize_recipients(self, recipients) -> list[str]:
+        """Normalize recipients at the transport boundary."""
         # AUDIT-FIX(#6): Normalize every recipient at the transport boundary so invalid addresses fail before any network I/O starts.
         if not recipients:
             return []
         return [normalize_email(recipient) for recipient in recipients]
 
     def _default_connection(self, config: SMTPMailSenderConfig) -> object:
+        """Build the default SMTP client from validated settings."""
         if config.use_ssl:
             # AUDIT-FIX(#3): Pass an explicitly verified TLS context; permissive library defaults are not acceptable for senior data.
             return smtplib.SMTP_SSL(
@@ -115,6 +137,7 @@ class SMTPMailSender(MailSender):
         return smtplib.SMTP(config.host, config.port, timeout=config.timeout_s)
 
     def _start_session(self, connection: object) -> None:
+        """Run the SMTP greeting, TLS, and login handshake."""
         self._require_method(connection, "ehlo")()
         if self.config.use_starttls and not self.config.use_ssl:
             starttls = self._require_method(connection, "starttls")
@@ -129,10 +152,12 @@ class SMTPMailSender(MailSender):
             self._require_method(connection, "login")(self.config.username, self.config.password)
 
     def _create_tls_context(self) -> ssl.SSLContext:
+        """Create the verified TLS context used for SMTP sessions."""
         # AUDIT-FIX(#3): create_default_context enables certificate validation and hostname checks for server authentication.
         return ssl.create_default_context()
 
     def _require_method(self, connection: object, method_name: str) -> Callable[..., object]:
+        """Return a required SMTP connection method or raise ``TypeError``."""
         method = getattr(connection, method_name, None)
         if method is None or not callable(method):
             # AUDIT-FIX(#2): Missing transport methods are programmer/configuration errors and must not be silently ignored.
@@ -140,6 +165,7 @@ class SMTPMailSender(MailSender):
         return method
 
     def _close_connection(self, connection: object) -> None:
+        """Close the SMTP connection without masking the original failure."""
         try:
             # AUDIT-FIX(#5): Suppress cleanup-only failures so the original send error is not overwritten.
             quit_method = getattr(connection, "quit", None)
@@ -157,6 +183,7 @@ class SMTPMailSender(MailSender):
             pass
 
     def _call_optional(self, connection: object, method_name: str, *args):
+        """Call an optional SMTP method when a test double exposes it."""
         method = getattr(connection, method_name, None)
         if method is None:
             return None

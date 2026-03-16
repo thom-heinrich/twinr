@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.web.store import parse_urlencoded_form, read_env_values, write_env_updates
+from twinr.web.support.store import parse_urlencoded_form, read_env_values, write_env_updates
 
 
 class WebStoreTests(unittest.TestCase):

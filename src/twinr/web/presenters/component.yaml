@@ -1,0 +1,115 @@
+schema_version: 1
+name: presenters
+path: src/twinr/web/presenters
+kind: python-package
+visibility: internal
+summary: Build template-ready presenter models and validated form-normalization helpers for Twinr's local web control surface.
+owned_concerns:
+  - Shape config, runtime, ops, reminder, and integration state into template-ready rows, sections, and page context dictionaries
+  - Normalize malformed persisted values into stable operator-facing defaults instead of letting dashboard pages crash
+  - Validate and canonicalize managed email and calendar form submissions before route handlers persist them
+  - Expose the curated presenter import surface consumed by `src/twinr/web/app.py` and `src/twinr/web/context.py`
+out_of_scope:
+  - FastAPI route definitions, request parsing, redirects, and response handling in `src/twinr/web/app.py`
+  - Template markup, styling, and client-side behavior under `src/twinr/web/templates` and static assets
+  - Persistence contracts for `.env`, integrations, reminders, ops logs, or runtime snapshot stores outside presenter normalization
+  - Hardware orchestration outside narrow guarded helpers such as voice-sample capture handoff
+files:
+  - path: __init__.py
+    role: Stable presenter package export surface
+    exports:
+      - _adaptive_timing_view
+      - _build_calendar_integration_record
+      - _build_email_integration_record
+      - _calendar_integration_sections
+      - _capture_voice_profile_sample
+      - _connect_sections
+      - _default_reminder_due_at
+      - _email_integration_sections
+      - _format_log_rows
+      - _format_usage_rows
+      - _health_card_detail
+      - _integration_overview_rows
+      - _memory_sections
+      - _nav_items
+      - _provider_status
+      - _recent_named_files
+      - _reminder_rows
+      - _resolve_named_file
+      - _settings_sections
+      - _voice_action_result
+      - _voice_profile_page_context
+      - _voice_snapshot_label
+  - path: common.py
+    role: Shared navigation, reminder, provider-status, and safe file-link helpers
+    exports:
+      - _default_reminder_due_at
+      - _nav_items
+      - _provider_status
+      - _recent_named_files
+      - _reminder_rows
+      - _resolve_named_file
+  - path: connect.py
+    role: Provider-routing and credential presenter sections for `/connect`
+    exports:
+      - _connect_sections
+  - path: integrations.py
+    role: Integration overview rows, form sections, and validated form-to-record builders
+    exports:
+      - _build_calendar_integration_record
+      - _build_email_integration_record
+      - _calendar_integration_sections
+      - _email_integration_sections
+      - _integration_overview_rows
+  - path: memory.py
+    role: Memory, reminders, and print-related settings sections
+    exports:
+      - _memory_sections
+  - path: ops.py
+    role: Redacted ops log, usage, and health detail formatters
+    exports:
+      - _format_log_rows
+      - _format_usage_rows
+      - _health_card_detail
+  - path: settings.py
+    role: Global settings form sections and adaptive timing card builder
+    exports:
+      - _adaptive_timing_view
+      - _settings_sections
+  - path: voice.py
+    role: Voice-profile page context, action results, and guarded capture helpers
+    exports:
+      - _capture_voice_profile_sample
+      - _voice_action_result
+      - _voice_profile_page_context
+      - _voice_snapshot_label
+public_api:
+  module: twinr.web.presenters
+  exports:
+    - _adaptive_timing_view
+    - _build_calendar_integration_record
+    - _build_email_integration_record
+    - _calendar_integration_sections
+    - _capture_voice_profile_sample
+    - _connect_sections
+    - _default_reminder_due_at
+    - _email_integration_sections
+    - _format_log_rows
+    - _format_usage_rows
+    - _health_card_detail
+    - _integration_overview_rows
+    - _memory_sections
+    - _nav_items
+    - _provider_status
+    - _recent_named_files
+    - _reminder_rows
+    - _resolve_named_file
+    - _settings_sections
+    - _voice_action_result
+    - _voice_profile_page_context
+    - _voice_snapshot_label
+primary_callers:
+  - path: src/twinr/web/app.py
+  - path: src/twinr/web/context.py
+tests:
+  - path: test/test_web_app.py

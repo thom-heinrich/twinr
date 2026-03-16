@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Configure the Twinr thermal printer CUPS queue and optional raw smoke test.
+#
+# Detects or accepts the printer device URI, recreates the queue as a raw CUPS
+# target, and can submit a short bounded receipt test for operator confirmation.
+
 set -euo pipefail
 
 QUEUE_NAME="${TWINR_PRINTER_QUEUE:-Thermal_GP58}"

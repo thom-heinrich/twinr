@@ -1,7 +1,8 @@
 """Sample bounded Twinr host and service health for ops surfaces.
 
-This module reads runtime snapshot data, host metrics, process presence, and
-recent ops errors to produce dashboard-friendly health snapshots.
+This module reads runtime snapshot data, host metrics, process presence,
+companion-loop locks, and recent ops errors to produce dashboard-friendly
+health snapshots.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import subprocess
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
 from twinr.ops.events import TwinrOpsEventStore
+from twinr.ops.locks import loop_lock_owner
 from twinr.ops.paths import resolve_ops_paths_for_config
 
 
@@ -106,6 +108,11 @@ def collect_system_health(
     memory_total_mb, memory_available_mb, memory_used_percent = _read_memory()
     disk_total_gb, disk_free_gb, disk_used_percent = _read_disk(project_root)
     services, service_probe_ok = _collect_service_health()  # AUDIT-FIX(#4): Probe processes once with bounded latency.
+    if service_probe_ok:
+        services = _apply_display_companion_health(
+            config,
+            services,
+        )  # AUDIT-FIX(#12): A running display companion thread owns the display-loop lock without spawning `--run-display-loop`.
 
     runtime_status = (
         _normalize_optional_text(getattr(snapshot, "status", None))
@@ -441,6 +448,38 @@ def _build_service_detail(matches: tuple[str, ...], *, probe_ok: bool) -> str:
     if len(matches) > _MAX_SERVICE_DETAIL_ITEMS:
         preview = f"{preview}, +{len(matches) - _MAX_SERVICE_DETAIL_ITEMS} more"
     return preview
+
+
+def _apply_display_companion_health(
+    config: TwinrConfig,
+    services: tuple[ServiceHealth, ...],
+) -> tuple[ServiceHealth, ...]:
+    display_service = _get_service(services, "display")
+    if display_service is None:
+        return services
+    if display_service.running or display_service.count != 0:
+        return services
+
+    owner_pid = loop_lock_owner(config, "display-loop")
+    if owner_pid is None:
+        return services
+
+    companion_detail = f"pid={owner_pid} display-companion"
+    updated: list[ServiceHealth] = []
+    for service in services:
+        if service.key != "display":
+            updated.append(service)
+            continue
+        updated.append(
+            ServiceHealth(
+                key=service.key,
+                label=service.label,
+                running=True,
+                count=1,
+                detail=companion_detail,
+            )
+        )
+    return tuple(updated)
 
 
 def _read_recent_error_count(

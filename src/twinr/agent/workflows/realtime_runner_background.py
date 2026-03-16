@@ -9,7 +9,7 @@ import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.agent.tools.handlers.automations import normalize_delivery
-from twinr.agent.tools.runtime.registry import is_automation_safe_tool_name
+from twinr.agent.tools.runtime.broker_policy import AutomationToolBrokerPolicy, default_automation_tool_broker_policy
 from twinr.automations import AutomationAction, AutomationDefinition
 from twinr.memory.reminders import format_due_label
 from twinr.proactive import (
@@ -20,7 +20,7 @@ from twinr.proactive import (
     proactive_observation_facts,
     proactive_prompt_mode,
 )
-from twinr.providers.openai.backend import REMINDER_DELIVERY_INSTRUCTIONS
+from twinr.providers.openai.core.instructions import REMINDER_DELIVERY_INSTRUCTIONS
 
 
 @dataclass(slots=True)
@@ -176,6 +176,14 @@ class TwinrRealtimeBackgroundMixin:
             self.runtime.mark_reminder_failed(reminder_id, error=error)
         except Exception as exc:
             self._remember_background_fault("mark_reminder_failed", exc)
+
+    def _automation_tool_broker_policy(self) -> AutomationToolBrokerPolicy:
+        policy = getattr(self, "_automation_tool_broker_policy_instance", None)
+        if isinstance(policy, AutomationToolBrokerPolicy):
+            return policy
+        policy = default_automation_tool_broker_policy()
+        setattr(self, "_automation_tool_broker_policy_instance", policy)
+        return policy
 
     # AUDIT-FIX(#9): Poll intervals come from config/env and need strict validation to prevent busy loops or type crashes on the RPi.
     def _config_interval_seconds(self, attr_name: str, default: float) -> float:
@@ -1386,13 +1394,8 @@ class TwinrRealtimeBackgroundMixin:
             return
         if action_kind == "tool_call":
             tool_name = self._require_non_empty_text(getattr(action, "tool_name", None), context="automation tool name")
-            if not is_automation_safe_tool_name(tool_name):
-                raise RuntimeError(f"Automation tool_call is not allowed for tool `{tool_name}`")
             arguments = self._automation_payload(action)
-            handler_name = f"handle_{tool_name}"
-            handler = getattr(self.tool_executor, handler_name, None)
-            if not callable(handler):
-                raise RuntimeError(f"Automation tool_call handler is unavailable for tool `{tool_name}`")
+            handler = self._automation_tool_broker_policy().resolve_handler(self.tool_executor, tool_name)
             result = handler(arguments)
             self._safe_emit(f"automation_tool_call={tool_name}")
             if isinstance(result, dict) and result.get("status"):

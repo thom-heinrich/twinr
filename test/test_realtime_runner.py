@@ -2,6 +2,7 @@ from array import array
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 import math
 import shutil
@@ -41,6 +42,7 @@ from twinr.runtime import TwinrRuntime
 from twinr.state_machine import TwinrStatus
 from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
 from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample
+from twinr.agent.workflows.button_dispatch import ButtonPressDispatcher
 
 
 def _voice_sample_pcm_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0.35, duration_s: float = 1.8) -> bytes:
@@ -506,6 +508,7 @@ class FakePlayer:
     def __init__(self) -> None:
         self.played: list[bytes] = []
         self.tones: list[tuple[int, int, float, int]] = []
+        self.stop_calls = 0
 
     def play_tone(
         self,
@@ -537,6 +540,9 @@ class FakePlayer:
 
     def play_wav_bytes(self, audio_bytes: bytes) -> None:
         self.played.append(audio_bytes)
+
+    def stop_playback(self) -> None:
+        self.stop_calls += 1
 
 
 class FakeAmbientAudioSampler:
@@ -664,6 +670,35 @@ class FakeScheduledButtonMonitor(FakeIdleButtonMonitor):
         )
 
 
+class FakeBurstButtonMonitor(FakeIdleButtonMonitor):
+    def __init__(self, events: list[tuple[float, str]]) -> None:
+        super().__init__()
+        self._events = list(events)
+        self._started_at: float | None = None
+
+    def __enter__(self):
+        self._started_at = time.monotonic()
+        return super().__enter__()
+
+    def poll(self, timeout=None):
+        self.poll_calls += 1
+        if timeout:
+            time.sleep(min(timeout, 0.001))
+        if self._started_at is None or not self._events:
+            return None
+        delay_s, name = self._events[0]
+        if time.monotonic() - self._started_at < delay_s:
+            return None
+        self._events.pop(0)
+        return ButtonEvent(
+            name=name,
+            line_offset=22 if name == "yellow" else 23,
+            action=ButtonAction.PRESSED,
+            raw_edge="falling",
+            timestamp_ns=time.monotonic_ns(),
+        )
+
+
 class FakeProactiveMonitor:
     def __init__(self) -> None:
         self.entered = False
@@ -699,6 +734,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         proactive_monitor=None,
     ) -> tuple[TwinrRealtimeHardwareLoop, list[str], FakeRealtimeSession, FakePrintBackend, FakeRecorder, FakePlayer, FakePrinter]:
         temp_dir_handle = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir_handle.cleanup)
         temp_root = Path(temp_dir_handle.name)
         config = config or TwinrConfig()
         original_project_root = Path(config.project_root).resolve()
@@ -1674,10 +1710,73 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(what_answer["status"], "questioning")
         self.assertEqual(how_answer["status"], "confirming")
         self.assertEqual(final["status"], "ready_for_compile")
+        self.assertEqual(final["compile_job_status"], "queued")
+        self.assertIn("compile_job_id", final)
         self.assertEqual(final["skill_spec"]["scope"]["contacts"], ["family"])
         self.assertIn("ask_first", final["skill_spec"]["constraints"])
         self.assertIn("user_visible", final["skill_spec"]["trigger"]["conditions"])
+        self.assertEqual(loop._self_coding_store.load_job(final["compile_job_id"]).status.value, "queued")
         self.assertIn("self_coding_tool_call=true", lines)
+
+    def test_self_coding_confirm_activation_tool_call_enables_soft_launch(self) -> None:
+        from twinr.agent.self_coding.codex_driver import CodexCompileArtifact, CodexCompileEvent, CodexCompileProgress, CodexCompileResult
+        from twinr.agent.self_coding.status import ArtifactKind
+        from twinr.agent.self_coding.worker import SelfCodingCompileWorker
+
+        class FakeCompileDriver:
+            def run_compile(self, request, *, event_sink=None):
+                if event_sink is not None:
+                    event_sink(
+                        CodexCompileEvent(kind="turn_started"),
+                        CodexCompileProgress(driver_name="FakeCompileDriver", event_count=1, last_event_kind="turn_started"),
+                    )
+                return CodexCompileResult(
+                    status="ok",
+                    summary="Compiled",
+                    artifacts=(
+                        CodexCompileArtifact(
+                            kind=ArtifactKind.AUTOMATION_MANIFEST,
+                            artifact_name="automation_manifest.json",
+                            media_type="application/json",
+                            content='{"automation":{"name":"Announce Family Updates","trigger":{"kind":"if_then","event_name":"new_message","all_conditions":[],"any_conditions":[],"cooldown_seconds":45},"actions":[{"kind":"say","text":"Family update arrived."}]}}',
+                            summary="Manifest",
+                        ),
+                    ),
+                )
+
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        loop._self_coding_compile_worker = SelfCodingCompileWorker(
+            store=loop._self_coding_store,
+            driver=FakeCompileDriver(),
+        )
+
+        proposed = loop._handle_propose_skill_learning_tool_call(
+            {
+                "name": "Announce Family Updates",
+                "action": "Read new family updates aloud",
+                "request_summary": "Read out new family updates.",
+                "capabilities": ["speaker", "safety", "rules"],
+                "trigger_mode": "push",
+                "trigger_conditions": ["new_message"],
+            }
+        )
+        loop._handle_answer_skill_question_tool_call({"session_id": proposed["session_id"], "trigger_conditions": ["user_visible"]})
+        loop._handle_answer_skill_question_tool_call({"session_id": proposed["session_id"], "scope": {"contacts": ["family"]}})
+        loop._handle_answer_skill_question_tool_call({"session_id": proposed["session_id"], "constraints": ["ask_first"]})
+        final = loop._handle_answer_skill_question_tool_call({"session_id": proposed["session_id"], "confirmed": True})
+
+        loop._self_coding_compile_worker.run_job(final["compile_job_id"])
+        activated = loop._handle_confirm_skill_activation_tool_call(
+            {
+                "job_id": final["compile_job_id"],
+                "confirmed": True,
+            }
+        )
+
+        self.assertEqual(activated["status"], "active")
+        self.assertEqual(activated["skill_id"], "announce_family_updates")
+        self.assertEqual(activated["version"], 1)
+        self.assertTrue(activated["automation_enabled"])
 
     def test_remember_memory_tool_call_writes_memory_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3310,6 +3409,41 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("status=error", lines)
         self.assertNotIn("required_remote_dependency_restored=true", lines)
 
+    def test_run_polls_buttons_while_required_remote_watch_blocks(self) -> None:
+        button_monitor = FakeScheduledButtonMonitor(event_after_s=0.02, name="yellow")
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, printer = self.make_loop(
+            config=TwinrConfig(
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_keepalive_interval_s=0.01,
+            ),
+            button_monitor=button_monitor,
+        )
+        loop.runtime.last_response = "Bitte druck das."
+        loop.runtime.reset_error()
+        remote_probe_started = Event()
+
+        class _SlowReadyRemote:
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                remote_probe_started.set()
+                time.sleep(0.2)
+
+            def remote_status(self):
+                return LongTermRemoteStatus(mode="remote_primary", ready=True)
+
+        loop.runtime.long_term_memory = _SlowReadyRemote()
+
+        result = loop.run(duration_s=0.12, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(remote_probe_started.is_set())
+        self.assertEqual(len(printer.printed), 1)
+        self.assertIn("button=yellow", lines)
+
     def test_run_handles_button_press_while_housekeeping_blocks(self) -> None:
         button_monitor = FakeScheduledButtonMonitor(event_after_s=0.02, name="yellow")
         loop, lines, _realtime_session, _print_backend, _recorder, _player, printer = self.make_loop(
@@ -3331,6 +3465,72 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(len(printer.printed), 1)
         self.assertIn("button=yellow", lines)
+
+    def test_button_dispatcher_interrupts_busy_green_turn(self) -> None:
+        handled: list[str] = []
+        interrupted: list[str] = []
+        allow_first_turn_to_finish = Event()
+
+        def handle_press(button_name: str) -> None:
+            handled.append(button_name)
+            if len(handled) == 1:
+                allow_first_turn_to_finish.wait(timeout=1.0)
+
+        dispatcher = ButtonPressDispatcher(
+            handle_press=handle_press,
+            interrupt_current=lambda source: interrupted.append(source) or allow_first_turn_to_finish.set() or True,
+        )
+        dispatcher.submit("green")
+        time.sleep(0.02)
+        dispatcher.submit("green")
+        time.sleep(0.05)
+        dispatcher.close(timeout_s=1.0)
+
+        self.assertEqual(interrupted, ["green"])
+        self.assertEqual(handled, ["green", "green"])
+
+    def test_run_interrupts_busy_turn_on_second_green_press(self) -> None:
+        button_monitor = FakeBurstButtonMonitor(events=[(0.0, "green"), (0.02, "green")])
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            button_monitor=button_monitor,
+        )
+        started = Event()
+        released = Event()
+
+        def fake_green_turn() -> None:
+            stop_event = Event()
+            loop._set_active_turn_stop_event(stop_event)
+            started.set()
+            try:
+                while not loop._active_turn_stop_requested():
+                    time.sleep(0.005)
+                loop.runtime.cancel_listening()
+                loop.emit("fake_turn_interrupted=true")
+                released.set()
+            finally:
+                loop._clear_active_turn_stop_event(stop_event)
+
+        loop._handle_green_turn = fake_green_turn  # type: ignore[method-assign]
+
+        result = loop.run(duration_s=0.12, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(started.is_set())
+        self.assertTrue(released.is_set())
+        self.assertIn("button=green", lines)
+        self.assertIn("turn_interrupt_requested=green", lines)
+
+    def test_interrupt_requests_stop_active_player(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()
+        stop_event = Event()
+        loop._set_active_turn_stop_event(stop_event)
+
+        try:
+            self.assertTrue(loop._request_active_turn_interrupt())
+        finally:
+            loop._clear_active_turn_stop_event(stop_event)
+
+        self.assertEqual(player.stop_calls, 1)
 
 
 if __name__ == "__main__":

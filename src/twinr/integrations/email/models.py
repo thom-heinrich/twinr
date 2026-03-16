@@ -1,3 +1,10 @@
+"""Define Twinr's canonical email integration data models.
+
+This module normalizes email addresses, approved contacts, mailbox summaries,
+and outbound drafts so IMAP, SMTP, and runtime configuration paths share the
+same safety guarantees.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
@@ -18,16 +25,19 @@ _FORBIDDEN_BODY_CHARS = frozenset({"\x00"})  # AUDIT-FIX(#1): NUL bytes are neve
 
 
 def _ensure_str(value: object, field_name: str) -> str:  # AUDIT-FIX(#1): Fail fast with controlled type errors instead of AttributeError.
+    """Require a string input for one named field."""
     if not isinstance(value, str):
         raise TypeError(f"{field_name} must be a string.")
     return value
 
 
 def _contains_forbidden_chars(value: str, forbidden_chars: frozenset[str]) -> bool:  # AUDIT-FIX(#1): Centralize control-character checks.
+    """Return whether text contains any forbidden control characters."""
     return any(char in forbidden_chars for char in value)
 
 
 def _normalize_alias_key(value: str) -> str:  # AUDIT-FIX(#2): Canonicalize alias/display-name keys and reject control characters.
+    """Normalize one alias or display-name lookup key."""
     text = _ensure_str(value, "identifier")
     if _contains_forbidden_chars(text, _FORBIDDEN_INLINE_CHARS):
         raise ValueError("identifier contains forbidden control characters.")
@@ -35,6 +45,7 @@ def _normalize_alias_key(value: str) -> str:  # AUDIT-FIX(#2): Canonicalize alia
 
 
 def _normalize_display_name(value: object, field_name: str, *, allow_empty: bool = False) -> str:  # AUDIT-FIX(#2): Prevent blank names from becoming resolvable aliases.
+    """Normalize a human display name used in voice and allowlist flows."""
     text = _ensure_str(value, field_name)
     if _contains_forbidden_chars(text, _FORBIDDEN_INLINE_CHARS):
         raise ValueError(f"{field_name} contains forbidden control characters.")
@@ -45,6 +56,7 @@ def _normalize_display_name(value: object, field_name: str, *, allow_empty: bool
 
 
 def _normalize_header_text(value: object, field_name: str, *, allow_empty: bool = False) -> str:  # AUDIT-FIX(#1): Reject CRLF/NUL in header-like fields.
+    """Normalize a single-line mail header value."""
     text = _ensure_str(value, field_name)
     if _contains_forbidden_chars(text, _FORBIDDEN_INLINE_CHARS):
         raise ValueError(f"{field_name} contains forbidden control characters.")
@@ -55,6 +67,7 @@ def _normalize_header_text(value: object, field_name: str, *, allow_empty: bool 
 
 
 def _normalize_preview(value: object) -> str:  # AUDIT-FIX(#1): Keep previews single-line and safe for logs/UI surfaces.
+    """Normalize a preview string for safe UI and logging use."""
     text = _ensure_str(value, "preview")
     if _contains_forbidden_chars(text, _FORBIDDEN_BODY_CHARS):
         raise ValueError("preview contains forbidden control characters.")
@@ -62,6 +75,7 @@ def _normalize_preview(value: object) -> str:  # AUDIT-FIX(#1): Keep previews si
 
 
 def _normalize_body(value: object) -> str:  # AUDIT-FIX(#1): Allow normal multiline bodies while rejecting unsafe NUL bytes.
+    """Normalize a multiline mail body while rejecting unsafe bytes."""
     text = _ensure_str(value, "body")
     if _contains_forbidden_chars(text, _FORBIDDEN_BODY_CHARS):
         raise ValueError("body contains forbidden control characters.")
@@ -69,6 +83,7 @@ def _normalize_body(value: object) -> str:  # AUDIT-FIX(#1): Allow normal multil
 
 
 def _coerce_bool(value: object, field_name: str) -> bool:  # AUDIT-FIX(#4): Avoid truthy string bugs such as "false" evaluating to True.
+    """Parse a strict boolean or supported boolean-like literal."""
     if isinstance(value, bool):
         return value
     if isinstance(value, int) and value in (0, 1):
@@ -83,6 +98,7 @@ def _coerce_bool(value: object, field_name: str) -> bool:  # AUDIT-FIX(#4): Avoi
 
 
 def _iter_strings(values: object, field_name: str) -> tuple[str, ...]:  # AUDIT-FIX(#1): Treat single strings as single items and reject mappings/char iteration bugs.
+    """Normalize a string or iterable of strings into a tuple."""
     if values is None:
         return ()
     if isinstance(values, str):
@@ -99,6 +115,7 @@ def _iter_strings(values: object, field_name: str) -> tuple[str, ...]:  # AUDIT-
 
 
 def _deduplicate_preserving_order(values: Iterable[str]) -> tuple[str, ...]:  # AUDIT-FIX(#7): Prevent duplicate recipients and duplicate aliases from propagating.
+    """Drop duplicates while keeping the first-seen item order."""
     seen: set[str] = set()
     result: list[str] = []
     for value in values:
@@ -110,6 +127,7 @@ def _deduplicate_preserving_order(values: Iterable[str]) -> tuple[str, ...]:  # 
 
 
 def normalize_email(value: str) -> str:
+    """Normalize an email address into Twinr's canonical safe form."""
     candidate = _ensure_str(value, "email").strip()  # AUDIT-FIX(#1): Convert AttributeError into explicit input validation.
     if not candidate:
         raise ValueError("email cannot be empty.")  # AUDIT-FIX(#1): Reject blank addresses before downstream authorization logic.
@@ -138,6 +156,7 @@ def normalize_email(value: str) -> str:
 
 
 def _try_normalize_email(value: object) -> str | None:  # AUDIT-FIX(#1): Lookup paths should fail closed instead of raising on bad user input.
+    """Normalize an email address or return ``None`` for invalid input."""
     if not isinstance(value, str):
         return None
     try:
@@ -147,6 +166,7 @@ def _try_normalize_email(value: object) -> str | None:  # AUDIT-FIX(#1): Lookup 
 
 
 def _normalize_email_collection(values: object, *, field_name: str, allow_empty: bool) -> tuple[str, ...]:  # AUDIT-FIX(#1): Validate recipient collections and support single-string inputs safely.
+    """Normalize one or more email addresses into a unique tuple."""
     items = _iter_strings(values, field_name)
     normalized = _deduplicate_preserving_order(normalize_email(item) for item in items)
     if not normalized and not allow_empty:
@@ -155,6 +175,7 @@ def _normalize_email_collection(values: object, *, field_name: str, allow_empty:
 
 
 def _normalize_header_collection(values: object, *, field_name: str) -> tuple[str, ...]:  # AUDIT-FIX(#1): Normalize Message-ID style collections safely.
+    """Normalize a unique collection of single-line header values."""
     items = _iter_strings(values, field_name)
     normalized = _deduplicate_preserving_order(
         _normalize_header_text(item, f"{field_name}[{index}]") for index, item in enumerate(items)
@@ -163,6 +184,7 @@ def _normalize_header_collection(values: object, *, field_name: str) -> tuple[st
 
 
 def _normalize_identifier_collection(values: object, *, field_name: str, allow_empty: bool) -> tuple[str, ...]:  # AUDIT-FIX(#7): Validate alias/email identifier collections without char-by-char iteration.
+    """Normalize a tuple of recipient or alias lookup identifiers."""
     items = _iter_strings(values, field_name)
     normalized_items: list[str] = []
     for index, item in enumerate(items):
@@ -179,6 +201,7 @@ def _normalize_identifier_collection(values: object, *, field_name: str, allow_e
 
 
 def _normalize_received_at(value: datetime | str | None) -> datetime | None:  # AUDIT-FIX(#5): Enforce timezone-aware timestamps and normalize to UTC.
+    """Normalize a received-at value into an aware UTC datetime."""
     if value is None:
         return None
     parsed = value
@@ -201,6 +224,16 @@ def _normalize_received_at(value: datetime | str | None) -> datetime | None:  # 
 
 @dataclass(frozen=True, slots=True)
 class EmailContact:
+    """Describe one approved email contact for reading and sending.
+
+    Attributes:
+        email: Canonical email address used for allowlist lookups.
+        display_name: Human-facing contact name used in voice prompts.
+        aliases: Additional lookup names that may resolve to the contact.
+        allow_read: Whether incoming mail from this contact is trusted.
+        allow_send: Whether outbound mail to this contact is allowed.
+    """
+
     email: str
     display_name: str
     aliases: tuple[str, ...] = ()
@@ -226,6 +259,18 @@ class EmailContact:
 
 @dataclass(frozen=True, slots=True)
 class EmailMessageSummary:
+    """Represent one sanitized mailbox message preview.
+
+    Attributes:
+        message_id: Provider message identifier used for threading.
+        sender_email: Canonical sender email address.
+        sender_name: Decoded sender display name, if available.
+        subject: Sanitized subject line.
+        received_at: Optional UTC timestamp for the message.
+        preview: Short single-line preview text for UI surfaces.
+        unread: Whether the message should be presented as unread.
+    """
+
     message_id: str
     sender_email: str
     sender_name: str
@@ -244,6 +289,7 @@ class EmailMessageSummary:
         object.__setattr__(self, "unread", _coerce_bool(self.unread, "unread"))  # AUDIT-FIX(#4): Prevent string/untyped unread state bugs.
 
     def as_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable view of the summary."""
         return {
             "message_id": self.message_id,
             "sender_email": self.sender_email,
@@ -257,6 +303,17 @@ class EmailMessageSummary:
 
 @dataclass(frozen=True, slots=True)
 class EmailDraft:
+    """Represent one validated outbound email draft.
+
+    Attributes:
+        to: Primary recipient addresses in canonical form.
+        subject: Single-line subject text.
+        body: Multiline plain-text body content.
+        cc: Additional recipient addresses in canonical form.
+        in_reply_to: Optional reply threading header value.
+        references: Optional threading reference header values.
+    """
+
     to: tuple[str, ...]
     subject: str
     body: str
@@ -283,10 +340,12 @@ class EmailDraft:
         object.__setattr__(self, "references", references)
 
     def recipients(self) -> tuple[str, ...]:
+        """Return all recipients in send order."""
         return self.to + self.cc
 
 
 def _register_unique(mapping: dict[str, EmailContact], key: str, contact: EmailContact, *, key_kind: str) -> None:  # AUDIT-FIX(#2): Reject ambiguous allowlist keys instead of silently overwriting.
+    """Insert one contact into an index unless the key is ambiguous."""
     existing = mapping.get(key)
     if existing is None:
         mapping[key] = contact
@@ -298,6 +357,12 @@ def _register_unique(mapping: dict[str, EmailContact], key: str, contact: EmailC
 
 @dataclass(frozen=True, slots=True)  # AUDIT-FIX(#6): Freeze allowlist containers so contact indexes cannot drift after construction.
 class ApprovedEmailContacts:
+    """Index approved email contacts for safe read and send decisions.
+
+    Attributes:
+        contacts: Canonical allowlist entries used to build lookup indexes.
+    """
+
     contacts: tuple[EmailContact, ...] = field(default_factory=tuple)
     _by_email: Mapping[str, EmailContact] = field(init=False, repr=False)
     _by_alias: Mapping[str, EmailContact] = field(init=False, repr=False)
@@ -326,6 +391,7 @@ class ApprovedEmailContacts:
         object.__setattr__(self, "_by_alias", MappingProxyType(by_alias))  # AUDIT-FIX(#6): Expose read-only indexes to prevent accidental mutation.
 
     def resolve(self, identifier: str) -> EmailContact | None:
+        """Resolve an email, display name, or alias to a contact."""
         if not isinstance(identifier, str):
             return None  # AUDIT-FIX(#1): Invalid lookup inputs should fail closed.
         stripped_identifier = identifier.strip()
@@ -343,6 +409,7 @@ class ApprovedEmailContacts:
         return self._by_alias.get(alias_key)
 
     def can_read_from(self, sender_email: str) -> bool:
+        """Return whether a sender is approved for mailbox reads."""
         normalized = _try_normalize_email(sender_email)  # AUDIT-FIX(#3): Incoming trust decisions must be based on canonical sender email only.
         if normalized is None:
             return False
@@ -350,10 +417,12 @@ class ApprovedEmailContacts:
         return bool(contact and contact.allow_read)
 
     def can_send_to(self, recipient_email: str) -> bool:
+        """Return whether a recipient is approved for outbound mail."""
         contact = self.resolve(recipient_email)
         return bool(contact and contact.allow_send)
 
     def require_allowed_recipients(self, recipients: tuple[str, ...]) -> tuple[EmailContact, ...]:
+        """Resolve recipients and raise if any are not approved for sending."""
         approved: list[EmailContact] = []
         seen_emails: set[str] = set()
         for recipient in _normalize_identifier_collection(recipients, field_name="recipients", allow_empty=False):

@@ -132,14 +132,17 @@ class EmailMailboxAdapterTests(unittest.TestCase):
             mailbox_reader=_FakeMailboxReader([]),
         )
 
-        with self.assertRaises(ValueError):
-            adapter.execute(
-                IntegrationRequest(
-                    integration_id="email_mailbox",
-                    operation_id="draft_reply",
-                    parameters={"to": "unknown@example.com", "subject": "Hallo", "body": "Text"},
-                )
+        result = adapter.execute(
+            IntegrationRequest(
+                integration_id="email_mailbox",
+                operation_id="draft_reply",
+                parameters={"to": "unknown@example.com", "subject": "Hallo", "body": "Text"},
             )
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.details["error_code"], "invalid_request")
+        self.assertEqual(result.summary, "Please confirm before I prepare or send an email.")
 
     def test_draft_allows_unknown_recipient_after_permission(self) -> None:
         adapter = EmailMailboxAdapter(
@@ -170,15 +173,19 @@ class EmailMailboxAdapterTests(unittest.TestCase):
             settings=EmailAdapterSettings(restrict_recipients_to_known_contacts=True),
         )
 
-        with self.assertRaises(ValueError):
-            adapter.execute(
-                IntegrationRequest(
-                    integration_id="email_mailbox",
-                    operation_id="send_message",
-                    parameters={"to": "unknown@example.com", "subject": "Hallo", "body": "Ich bin zuhause."},
-                    explicit_user_confirmation=True,
-                )
+        result = adapter.execute(
+            IntegrationRequest(
+                integration_id="email_mailbox",
+                operation_id="send_message",
+                parameters={"to": "unknown@example.com", "subject": "Hallo", "body": "Ich bin zuhause."},
+                explicit_user_confirmation=True,
             )
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.details["error_code"], "invalid_request")
+        self.assertEqual(result.summary, "One or more recipients are not approved for sending.")
+        self.assertEqual(fake_sender.sent, [])
 
     def test_send_allows_unknown_recipient_after_permission_by_default(self) -> None:
         fake_sender = _FakeMailSender()

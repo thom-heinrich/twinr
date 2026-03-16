@@ -28,6 +28,7 @@ class RealtimeToolExecutor:
     def __init__(self, owner: Any) -> None:
         """Store the runtime owner used by all delegated handlers."""
         self.owner = owner
+        self_coding.ensure_self_coding_runtime(self.owner)
 
     def handle_print_receipt(self, arguments: dict[str, object]) -> dict[str, object]:
         return output.handle_print_receipt(self.owner, arguments)
@@ -61,6 +62,12 @@ class RealtimeToolExecutor:
 
     def handle_answer_skill_question(self, arguments: dict[str, object]) -> dict[str, object]:
         return self_coding.handle_answer_skill_question(self.owner, arguments)
+
+    def handle_confirm_skill_activation(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self_coding.handle_confirm_skill_activation(self.owner, arguments)
+
+    def handle_rollback_skill_activation(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self_coding.handle_rollback_skill_activation(self.owner, arguments)
 
     def handle_remember_memory(self, arguments: dict[str, object]) -> dict[str, object]:
         return memory.handle_remember_memory(self.owner, arguments)

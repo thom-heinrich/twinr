@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import mimetypes
 import os
 import stat
 import time
+import uuid
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, RLock, Thread, current_thread
@@ -15,6 +17,7 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.conversation.closure import ToolCallingConversationClosureEvaluator
 from twinr.agent.base_agent.conversation.turn_controller import ToolCallingTurnDecisionEvaluator
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+from twinr.agent.workflows.forensics import WorkflowForensics
 from twinr.agent.workflows.working_feedback import WorkingFeedbackKind, start_working_feedback_loop
 from twinr.providers.openai import OpenAIImageInput
 
@@ -63,6 +66,94 @@ class TwinrRealtimeSupportMixin:
             setattr(self, name, lock)
         return lock
 
+    def _new_workflow_trace_id(self) -> str:
+        """Return one stable trace id for a workflow session."""
+
+        return uuid.uuid4().hex
+
+    def _workflow_trace_active_id(self) -> str | None:
+        return getattr(self, "_workflow_active_trace_id", None)
+
+    def _workflow_trace_set_active(self, trace_id: str | None) -> None:
+        self._workflow_active_trace_id = trace_id
+
+    def _trace_event(
+        self,
+        msg: str,
+        *,
+        kind: str = "workflow",
+        details: dict[str, object] | None = None,
+        reason: dict[str, object] | None = None,
+        kpi: dict[str, object] | None = None,
+        level: str = "INFO",
+        trace_id: str | None = None,
+        span_id: str | None = None,
+    ) -> None:
+        tracer = getattr(self, "workflow_forensics", None)
+        if not isinstance(tracer, WorkflowForensics):
+            return
+        tracer.event(
+            kind=kind,
+            msg=msg,
+            details=details,
+            reason=reason,
+            kpi=kpi,
+            level=level,
+            trace_id=trace_id or self._workflow_trace_active_id(),
+            span_id=span_id,
+            loc_skip=3,
+        )
+
+    def _trace_decision(
+        self,
+        msg: str,
+        *,
+        question: str,
+        selected: dict[str, object],
+        options: list[dict[str, object]],
+        context: dict[str, object] | None = None,
+        confidence: object | None = None,
+        guardrails: list[str] | None = None,
+        kpi_impact_estimate: dict[str, object] | None = None,
+        trace_id: str | None = None,
+        span_id: str | None = None,
+    ) -> None:
+        tracer = getattr(self, "workflow_forensics", None)
+        if not isinstance(tracer, WorkflowForensics):
+            return
+        tracer.decision(
+            msg=msg,
+            question=question,
+            selected=selected,
+            options=options,
+            context=context,
+            confidence=confidence,
+            guardrails=guardrails,
+            kpi_impact_estimate=kpi_impact_estimate,
+            trace_id=trace_id or self._workflow_trace_active_id(),
+            span_id=span_id,
+        )
+
+    def _trace_span(
+        self,
+        *,
+        name: str,
+        kind: str = "span",
+        details: dict[str, object] | None = None,
+        trace_id: str | None = None,
+        parent_span_id: str | None = None,
+    ):
+        tracer = getattr(self, "workflow_forensics", None)
+        if not isinstance(tracer, WorkflowForensics):
+            return nullcontext()
+        return tracer.span(
+            name=name,
+            kind=kind,
+            details=details,
+            trace_id=trace_id or self._workflow_trace_active_id(),
+            parent_span_id=parent_span_id,
+        )
+
     # AUDIT-FIX(#4): Sanitize exception text before emitting it outside the process boundary.
     def _safe_error_text(self, exc: BaseException) -> str:
         message = " ".join(str(exc).split()).strip()
@@ -108,7 +199,9 @@ class TwinrRealtimeSupportMixin:
 
     def _best_effort_stop_player(self) -> None:
         player = getattr(self, "player", None)
-        stop_fn = getattr(player, "stop", None)
+        stop_fn = getattr(player, "stop_playback", None)
+        if not callable(stop_fn):
+            stop_fn = getattr(player, "stop", None)
         if not callable(stop_fn):
             return
         try:
@@ -122,6 +215,15 @@ class TwinrRealtimeSupportMixin:
         message = self._safe_error_text(exc) if isinstance(exc, BaseException) else str(exc or "").strip()
         if not message:
             message = "Required remote long-term memory is unavailable."
+        self._trace_event(
+            "required_remote_error_entered",
+            kind="invariant",
+            level="ERROR",
+            details={
+                "message": message,
+                "runtime_status": getattr(getattr(self.runtime, "status", None), "value", "unknown"),
+            },
+        )
         active = bool(getattr(self, "_required_remote_dependency_error_active", False))
         self._required_remote_dependency_cached_ready = False
         self._required_remote_dependency_next_check_at = (
@@ -130,6 +232,12 @@ class TwinrRealtimeSupportMixin:
         self._required_remote_dependency_error_active = True
         if active and getattr(getattr(self.runtime, "status", None), "value", None) == "error":
             return True
+        request_interrupt = getattr(self, "_request_active_turn_interrupt", None)
+        if callable(request_interrupt):
+            try:
+                request_interrupt("required_remote")
+            except Exception:
+                pass
         self._best_effort_stop_player()
         self.runtime.fail(message)
         self._emit_status(force=True)
@@ -137,32 +245,91 @@ class TwinrRealtimeSupportMixin:
         self._try_emit("required_remote_dependency=false")
         return True
 
+    def _required_remote_dependency_current_ready(self) -> bool:
+        if not self._remote_dependency_is_required():
+            return True
+        cached_ready = getattr(self, "_required_remote_dependency_cached_ready", None)
+        if cached_ready is not None:
+            return bool(cached_ready)
+        return getattr(getattr(self.runtime, "status", None), "value", None) != "error"
+
+    def _request_required_remote_dependency_refresh(self) -> None:
+        watcher = getattr(self, "_required_remote_dependency_watch", None)
+        request_refresh = getattr(watcher, "request_refresh", None)
+        if callable(request_refresh):
+            try:
+                request_refresh()
+            except Exception:
+                return
+
     def _refresh_required_remote_dependency(self, *, force: bool = False, force_sync: bool = False) -> bool:
         with self._get_lock("_required_remote_dependency_lock"):
             if not self._remote_dependency_is_required():
                 self._required_remote_dependency_error_active = False
                 self._required_remote_dependency_cached_ready = True
                 self._required_remote_dependency_next_check_at = 0.0
+                self._trace_event(
+                    "required_remote_not_required",
+                    kind="invariant",
+                    details={"force": force, "force_sync": force_sync},
+                )
                 return True
             now = time.monotonic()
             next_check_at = float(getattr(self, "_required_remote_dependency_next_check_at", 0.0) or 0.0)
             cached_ready = getattr(self, "_required_remote_dependency_cached_ready", None)
             if not force and now < next_check_at and cached_ready is not None:
+                self._trace_event(
+                    "required_remote_cached_readiness_used",
+                    kind="cache",
+                    details={
+                        "force": force,
+                        "force_sync": force_sync,
+                        "cached_ready": bool(cached_ready),
+                        "next_check_in_ms": int(max(0.0, next_check_at - now) * 1000),
+                    },
+                )
                 return bool(cached_ready)
             checker = getattr(getattr(self, "runtime", None), "check_required_remote_dependency", None)
             if not callable(checker):
+                self._trace_event(
+                    "required_remote_checker_missing",
+                    kind="warning",
+                    level="WARN",
+                    details={"force": force, "force_sync": force_sync},
+                )
                 return True
+            started = time.monotonic()
             try:
                 checker(force_sync=force_sync)
             except LongTermRemoteUnavailableError as exc:
+                self._trace_event(
+                    "required_remote_refresh_failed",
+                    kind="exception",
+                    level="ERROR",
+                    details={"force": force, "force_sync": force_sync, "exception": self._safe_error_text(exc)},
+                    kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
+                )
                 self._enter_required_remote_error(exc)
                 return False
             except Exception as exc:
+                self._trace_event(
+                    "required_remote_refresh_failed",
+                    kind="exception",
+                    level="ERROR",
+                    details={"force": force, "force_sync": force_sync, "exception": self._safe_error_text(exc)},
+                    kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
+                )
                 self._enter_required_remote_error(exc)
                 return False
 
             self._required_remote_dependency_cached_ready = True
             self._required_remote_dependency_next_check_at = now + self._required_remote_dependency_interval_seconds()
+            self._trace_event(
+                "required_remote_refresh_succeeded",
+                kind="invariant",
+                details={"force": force, "force_sync": force_sync},
+                kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
+            )
             if (
                 getattr(self, "_required_remote_dependency_error_active", False)
                 and getattr(getattr(self.runtime, "status", None), "value", None) == "error"
@@ -170,6 +337,11 @@ class TwinrRealtimeSupportMixin:
                 self.runtime.reset_error()
                 self._emit_status(force=True)
                 self._try_emit("required_remote_dependency_restored=true")
+                self._trace_event(
+                    "required_remote_restored",
+                    kind="invariant",
+                    details={"runtime_status": getattr(getattr(self.runtime, "status", None), "value", "unknown")},
+                )
             self._required_remote_dependency_error_active = False
             return True
 
@@ -314,6 +486,12 @@ class TwinrRealtimeSupportMixin:
         if isinstance(exc, LongTermRemoteUnavailableError) and self._enter_required_remote_error(exc):
             return
         safe_error = self._safe_error_text(exc)  # AUDIT-FIX(#4): Never emit unsanitized exception text.
+        self._trace_event(
+            "workflow_error_handler_entered",
+            kind="exception",
+            level="ERROR",
+            details={"error": safe_error, "error_type": type(exc).__name__},
+        )
         try:
             self.runtime.fail(safe_error)
         except Exception as runtime_exc:  # AUDIT-FIX(#4): Preserve the original failure even if error-state persistence fails.
@@ -331,11 +509,21 @@ class TwinrRealtimeSupportMixin:
         except Exception as runtime_exc:  # AUDIT-FIX(#4): Failing to clear the error state should not raise a second exception here.
             _default_emit(f"runtime_reset_error={self._safe_error_text(runtime_exc)}")
         self._emit_status(force=True)
+        self._trace_event(
+            "workflow_error_handler_completed",
+            kind="exception",
+            details={"error": safe_error},
+        )
 
     def _emit_status(self, *, force: bool = False) -> None:
         status = getattr(getattr(self.runtime, "status", None), "value", "unknown")  # AUDIT-FIX(#9): Guard the first emit when _last_status is unset or runtime is partially initialised.
         if force or status != getattr(self, "_last_status", None):
             self._try_emit(f"status={status}")  # AUDIT-FIX(#4): Status reporting must not crash the main flow.
+            self._trace_event(
+                "runtime_status_emitted",
+                kind="metric",
+                details={"status": status, "force": force},
+            )
             self._last_status = status
 
     def _reload_live_config_from_env(self, env_path: Path) -> None:
@@ -432,6 +620,16 @@ class TwinrRealtimeSupportMixin:
 
     def _play_listen_beep(self) -> None:
         config = self.config  # AUDIT-FIX(#3): Use one config snapshot per tone.
+        started = time.monotonic()
+        self._trace_event(
+            "listen_beep_started",
+            kind="io",
+            details={
+                "frequency_hz": config.audio_beep_frequency_hz,
+                "duration_ms": config.audio_beep_duration_ms,
+                "volume": config.audio_beep_volume,
+            },
+        )
         try:
             with self._get_lock("_audio_lock"):  # AUDIT-FIX(#5): Serialize tone playback with all other speaker output.
                 self.player.play_tone(
@@ -442,12 +640,36 @@ class TwinrRealtimeSupportMixin:
                 )
         except Exception as exc:
             self._try_emit(f"beep_error={self._safe_error_text(exc)}")
+            self._trace_event(
+                "listen_beep_failed",
+                kind="exception",
+                level="ERROR",
+                details={"error": self._safe_error_text(exc)},
+                kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
+            )
             return
+        self._trace_event(
+            "listen_beep_played",
+            kind="io",
+            kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
+        )
         if config.audio_beep_settle_ms > 0:
             try:
                 self.sleep(config.audio_beep_settle_ms / 1000.0)
             except Exception as exc:  # AUDIT-FIX(#4): Post-tone settling must not crash the interaction loop.
                 self._try_emit(f"beep_settle_error={self._safe_error_text(exc)}")
+                self._trace_event(
+                    "listen_beep_settle_failed",
+                    kind="exception",
+                    level="WARN",
+                    details={"error": self._safe_error_text(exc)},
+                )
+                return
+        self._trace_event(
+            "listen_beep_completed",
+            kind="io",
+            details={"settle_ms": config.audio_beep_settle_ms},
+        )
 
     def _start_working_feedback_loop(self, kind: WorkingFeedbackKind) -> Callable[[], None]:
         feedback_lock = self._get_lock("_feedback_lock")  # AUDIT-FIX(#10): Coordinate stop/start mutations across threads.
@@ -459,6 +681,12 @@ class TwinrRealtimeSupportMixin:
                 previous_stop()
             except Exception as exc:  # AUDIT-FIX(#10): A broken previous stop callback must not block the new loop.
                 self._try_emit(f"working_feedback_stop_error={self._safe_error_text(exc)}")
+                self._trace_event(
+                    "working_feedback_stop_failed",
+                    kind="exception",
+                    level="WARN",
+                    details={"kind": kind, "error": self._safe_error_text(exc)},
+                )
         config = self.config  # AUDIT-FIX(#3): Snapshot delay-related config for the new loop.
         try:
             stop = start_working_feedback_loop(
@@ -474,15 +702,31 @@ class TwinrRealtimeSupportMixin:
             )
         except Exception as exc:  # AUDIT-FIX(#10): Feedback audio is optional and must not take down the turn.
             self._try_emit(f"working_feedback_error={self._safe_error_text(exc)}")
+            self._trace_event(
+                "working_feedback_start_failed",
+                kind="exception",
+                level="WARN",
+                details={"kind": kind, "error": self._safe_error_text(exc)},
+            )
             return lambda: None
         generation = previous_generation + 1
         with feedback_lock:
             self._working_feedback_generation = generation
             self._working_feedback_stop = stop
+        self._trace_event(
+            "working_feedback_started",
+            kind="io",
+            details={"kind": kind, "generation": generation},
+        )
 
         def stop_current() -> None:
             with feedback_lock:
                 if getattr(self, "_working_feedback_generation", None) != generation:
+                    self._trace_event(
+                        "working_feedback_stop_skipped_stale",
+                        kind="branch",
+                        details={"kind": kind, "generation": generation},
+                    )
                     return
                 active_stop = getattr(self, "_working_feedback_stop", None)
                 self._working_feedback_stop = None
@@ -491,6 +735,18 @@ class TwinrRealtimeSupportMixin:
                     active_stop()
                 except Exception as exc:  # AUDIT-FIX(#10): Feedback stop callbacks are best-effort.
                     self._try_emit(f"working_feedback_stop_error={self._safe_error_text(exc)}")
+                    self._trace_event(
+                        "working_feedback_stop_failed",
+                        kind="exception",
+                        level="WARN",
+                        details={"kind": kind, "generation": generation, "error": self._safe_error_text(exc)},
+                    )
+                    return
+            self._trace_event(
+                "working_feedback_stopped",
+                kind="io",
+                details={"kind": kind, "generation": generation},
+            )
 
         return stop_current
 

@@ -1,47 +1,33 @@
-# Twinr Audio
+# mic
 
-Twinr currently uses the `Jabra SPEAK 510 USB` attached to the Raspberry Pi as its default microphone and speaker.
-For proactive background listening, Twinr can additionally use the `PlayStation Eye` USB microphone without replacing the main default input.
+Pi-side audio setup script for Twinr playback, capture, and proactive listening defaults.
 
-## Configure audio defaults
+## Responsibility
 
-```bash
-cd /twinr
-sudo hardware/mic/setup_audio.sh --device-match Jabra
-```
+`mic` owns:
+- select ALSA and PipeWire/Pulse default devices for Twinr
+- persist proactive-audio env keys used by the runtime
+- run bounded playback and capture smoke checks
 
-This script:
+`mic` does **not** own:
+- runtime audio capture logic in `src/twinr/hardware/audio.py`
+- wakeword or proactive policy
+- printer, display, or GPIO setup
 
-- writes `/etc/asound.conf` so ALSA `default` uses the selected USB audio device
-- sets the default PipeWire/Pulse sink and source for the current user session
-- can run a short playback/capture smoke test with `--test`
-- can optionally persist `TWINR_PROACTIVE_AUDIO_*` into `.env` for the background-audio path
+## Key files
 
-## Useful options
+| File | Purpose |
+|---|---|
+| [setup_audio.sh](./setup_audio.sh) | Configure audio defaults and smoke test |
 
-- `--card-index N` when auto-detection is not sufficient
-- `--skip-alsa` when only PipeWire/Pulse defaults should change
-- `--skip-pulse` when only ALSA should change
-- `--env-file /twinr/.env` to persist proactive-audio env updates
-- `--proactive-device plughw:CARD=CameraB409241,DEV=0` to set the proactive PS-Eye mic explicitly
-- `--proactive-device-match PlayStation` to auto-detect a PS-Eye style capture card and store it as `plughw:CARD=...,DEV=...`
-- `--proactive-sample-ms 900` to persist the proactive background-audio sample window
-
-## Example: Jabra main audio plus PS-Eye proactive mic
+## Usage
 
 ```bash
-cd /twinr
-sudo hardware/mic/setup_audio.sh \
-  --device-match Jabra \
-  --proactive-device-match Camera-B4.09.24.1 \
-  --proactive-sample-ms 900 \
-  --test
+sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match Jabra --test
+sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match Jabra --proactive-device-match PlayStation
 ```
 
-After that, `/twinr/.env` should contain at least:
+## See also
 
-```dotenv
-TWINR_PROACTIVE_AUDIO_ENABLED=true
-TWINR_PROACTIVE_AUDIO_DEVICE=plughw:CARD=CameraB409241,DEV=0
-TWINR_PROACTIVE_AUDIO_SAMPLE_MS=900
-```
+- [Top-level hardware README](../README.md)
+- [Runtime audio adapter](../../src/twinr/hardware/audio.py)

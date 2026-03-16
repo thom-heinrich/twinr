@@ -1,3 +1,9 @@
+"""Build operator-safe automation page models and form persistence helpers.
+
+This module groups stored automations into UI families, renders stable edit
+sections, and validates web form submissions before they reach `AutomationStore`.
+"""
+
 from __future__ import annotations
 
 import math
@@ -23,7 +29,7 @@ from twinr.automations import (
 )
 from twinr.integrations import IntegrationAutomationFamilyBlock
 from twinr.memory.reminders import format_due_label, now_in_timezone, parse_due_at
-from twinr.web.store import FileBackedSetting
+from twinr.web.support.store import FileBackedSetting
 
 _BOOL_OPTIONS = (("true", "Enabled"), ("false", "Disabled"))
 _DELIVERY_OPTIONS = (("spoken", "Speak it"), ("printed", "Print it"))
@@ -95,6 +101,8 @@ _STORE_MUTATION_LOCK = RLock()
 
 @dataclass(frozen=True, slots=True)
 class AutomationFamilyDefinition:
+    """Describe one automation family shown on the automations page."""
+
     key: str
     title: str
     summary: str
@@ -107,6 +115,8 @@ class AutomationFamilyDefinition:
 
 @dataclass(frozen=True, slots=True)
 class AutomationFamilyCard:
+    """Summarize one automation family for the overview cards."""
+
     key: str
     title: str
     count: int
@@ -118,6 +128,8 @@ class AutomationFamilyCard:
 
 @dataclass(frozen=True, slots=True)
 class AutomationRow:
+    """Represent one stored automation row in the family tables."""
+
     automation_id: str
     name: str
     description: str | None
@@ -136,12 +148,16 @@ class AutomationRow:
 
 @dataclass(frozen=True, slots=True)
 class AutomationFamilySection:
+    """Group one family definition with its rendered rows."""
+
     definition: AutomationFamilyDefinition
     rows: tuple[AutomationRow, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class AutomationFormSection:
+    """Describe one titled automation form section."""
+
     title: str
     description: str
     fields: tuple[FileBackedSetting, ...]
@@ -154,6 +170,18 @@ def build_automation_page_context(
     edit_ref: str | None = None,
     integration_blocks: tuple[IntegrationAutomationFamilyBlock, ...] = (),
 ) -> dict[str, Any]:
+    """Build the template context for the automations page.
+
+    Args:
+        store: Automation store backing the page.
+        timezone_name: IANA timezone used for operator-facing schedule labels.
+        edit_ref: Optional automation id or unique name to open in edit mode.
+        integration_blocks: Extra family definitions provided by integrations.
+
+    Returns:
+        Template-ready context dictionary for `automations_page.html`.
+    """
+
     # AUDIT-FIX(#3): Serialize same-process reads against file-backed mutations to avoid torn snapshots.
     with _STORE_MUTATION_LOCK:
         entries = store.load_entries()
@@ -214,6 +242,8 @@ def save_time_automation(
     *,
     timezone_name: str,
 ) -> AutomationDefinition:
+    """Create or update one scheduled automation from web form data."""
+
     automation_id = _normalize_inline_text(form.get("automation_id"))
     # AUDIT-FIX(#4): Validate persisted text without silently truncating or flattening operator-provided content.
     name = _required_text(form.get("name"), field_name="name", limit=_MAX_NAME_LENGTH)
@@ -289,6 +319,8 @@ def save_time_automation(
 
 
 def save_sensor_automation(store: AutomationStore, form: dict[str, str]) -> AutomationDefinition:
+    """Create or update one sensor automation from web form data."""
+
     automation_id = _normalize_inline_text(form.get("automation_id"))
     # AUDIT-FIX(#4): Validate persisted text without silently truncating or flattening operator-provided content.
     name = _required_text(form.get("name"), field_name="name", limit=_MAX_NAME_LENGTH)
@@ -350,6 +382,8 @@ def save_sensor_automation(store: AutomationStore, form: dict[str, str]) -> Auto
 
 
 def toggle_automation_enabled(store: AutomationStore, automation_id: str) -> AutomationDefinition:
+    """Flip the enabled flag for one operator-editable automation."""
+
     # AUDIT-FIX(#3): Serialize toggles against concurrent writes in the file-backed store.
     with _STORE_MUTATION_LOCK:
         entry = store.get(automation_id)
@@ -364,6 +398,8 @@ def toggle_automation_enabled(store: AutomationStore, automation_id: str) -> Aut
 
 
 def delete_automation(store: AutomationStore, automation_id: str) -> AutomationDefinition:
+    """Delete one operator-editable automation."""
+
     # AUDIT-FIX(#3): Serialize deletes against concurrent writes in the file-backed store.
     with _STORE_MUTATION_LOCK:
         entry = store.get(automation_id)
@@ -381,6 +417,8 @@ def _family_definitions(
     *,
     integration_blocks: tuple[IntegrationAutomationFamilyBlock, ...] = (),
 ) -> tuple[AutomationFamilyDefinition, ...]:
+    """Return the built-in plus integration-provided automation families."""
+
     definitions = [
         AutomationFamilyDefinition(
             key="time",
@@ -427,6 +465,8 @@ def _build_family_rows(
     timezone_name: str,
     integration_blocks: tuple[IntegrationAutomationFamilyBlock, ...] = (),
 ) -> dict[str, tuple[AutomationRow, ...]]:
+    """Group stored automations into template-ready family rows."""
+
     grouped: dict[str, list[AutomationRow]] = {}
     definitions_by_key = {
         definition.key: definition for definition in _family_definitions(integration_blocks=integration_blocks)
@@ -472,6 +512,8 @@ def _build_family_rows(
 
 
 def _trigger_summary(entry: AutomationDefinition, *, timezone_name: str) -> str:
+    """Summarize one automation trigger for operator display."""
+
     trigger = entry.trigger
     try:
         sensor_text = describe_sensor_trigger_text(trigger)
@@ -504,6 +546,8 @@ def _trigger_summary(entry: AutomationDefinition, *, timezone_name: str) -> str:
 
 
 def _action_summary(actions: tuple[AutomationAction, ...]) -> str:
+    """Summarize enabled actions for operator display."""
+
     enabled_actions = [action for action in actions if _coerce_bool(getattr(action, "enabled", True), default=True)]
     if not enabled_actions:
         return "No enabled action"
@@ -537,6 +581,8 @@ def _time_form_sections(
     *,
     timezone_name: str,
 ) -> tuple[AutomationFormSection, ...]:
+    """Build the scheduled-automation form sections."""
+
     trigger = entry.trigger if entry is not None and isinstance(entry.trigger, TimeAutomationTrigger) else None
     action_defaults = _action_defaults(entry)
     return (
@@ -662,6 +708,8 @@ def _sensor_form_sections(
     *,
     sensor_options: tuple[tuple[str, str], ...],
 ) -> tuple[AutomationFormSection, ...]:
+    """Build the sensor-automation form sections."""
+
     sensor_trigger = _safe_describe_sensor_trigger(entry.trigger) if entry is not None else None
     action_defaults = _action_defaults(entry)
     return (
@@ -769,6 +817,8 @@ def _sensor_form_sections(
 
 
 def _action_defaults(entry: AutomationDefinition | None) -> dict[str, str]:
+    """Extract edit-form defaults from an automation's primary action."""
+
     defaults = {
         "delivery": "spoken",
         "content_mode": "llm_prompt",
@@ -798,6 +848,8 @@ def _action_defaults(entry: AutomationDefinition | None) -> dict[str, str]:
 
 
 def _build_action(form: dict[str, str]) -> AutomationAction:
+    """Build one automation action from submitted form data."""
+
     delivery = _parse_choice(form.get("delivery"), field_name="delivery", allowed=_ALLOWED_DELIVERIES, default="spoken")
     content_mode = _parse_choice(
         form.get("content_mode"),
@@ -825,6 +877,8 @@ def _family_key_for_entry(
     *,
     integration_blocks: tuple[IntegrationAutomationFamilyBlock, ...],
 ) -> str:
+    """Classify one automation into a page family."""
+
     source = str(getattr(entry, "source", "") or "")
     for block in integration_blocks:
         if any(prefix and source.startswith(prefix) for prefix in block.source_prefixes):
@@ -837,12 +891,16 @@ def _family_key_for_entry(
 
 
 def _definition_status_key(definition: AutomationFamilyDefinition, *, has_rows: bool) -> str:
+    """Return the status key for one automation family card."""
+
     if definition.status_key:
         return definition.status_key
     return "ok" if has_rows else ("muted" if definition.create_supported else "warn")
 
 
 def _definition_status_label(definition: AutomationFamilyDefinition, *, has_rows: bool) -> str:
+    """Return the status label for one automation family card."""
+
     if definition.status_label:
         return definition.status_label
     if has_rows:
@@ -853,6 +911,8 @@ def _definition_status_label(definition: AutomationFamilyDefinition, *, has_rows
 
 
 def _is_sensor_entry(entry: AutomationDefinition | None) -> bool:
+    """Return whether an automation uses a supported sensor trigger."""
+
     if entry is None:
         return False
     if not isinstance(entry.trigger, IfThenAutomationTrigger):
@@ -861,6 +921,8 @@ def _is_sensor_entry(entry: AutomationDefinition | None) -> bool:
 
 
 def _find_entry(entries: tuple[AutomationDefinition, ...], edit_ref: str | None) -> AutomationDefinition | None:
+    """Find the requested automation by id or unique name."""
+
     lookup = _normalize_inline_text(edit_ref)
     if not lookup:
         return None
@@ -885,6 +947,8 @@ def _required_text(
     limit: int = 420,
     multiline: bool = False,
 ) -> str:
+    """Normalize and require bounded non-empty text input."""
+
     # AUDIT-FIX(#4): Reject overlong persisted input instead of silently truncating it.
     text = _normalize_multiline_text(value) if multiline else _normalize_inline_text(value)
     if not text:
@@ -901,6 +965,8 @@ def _optional_input_text(
     limit: int,
     multiline: bool = False,
 ) -> str | None:
+    """Normalize optional bounded text input from the web form."""
+
     # AUDIT-FIX(#4): Preserve formatting for stored multiline text while validating size explicitly.
     text = _normalize_multiline_text(value) if multiline else _normalize_inline_text(value)
     if not text:
@@ -911,6 +977,8 @@ def _optional_input_text(
 
 
 def _optional_text(value: object, *, limit: int) -> str:
+    """Collapse and trim text for short operator summaries."""
+
     text = " ".join(str(value or "").split()).strip()
     if len(text) <= limit:
         return text
@@ -918,6 +986,8 @@ def _optional_text(value: object, *, limit: int) -> str:
 
 
 def _parse_bool(value: object, *, default: bool) -> bool:
+    """Parse a strict boolean form field."""
+
     text = str(value or "").strip().lower()
     if not text:
         return default
@@ -929,6 +999,8 @@ def _parse_bool(value: object, *, default: bool) -> bool:
 
 
 def _parse_nonnegative_float(value: object, *, default: float) -> float:
+    """Parse a finite non-negative float form field."""
+
     text = str(value or "").strip()
     if not text:
         return default
@@ -945,6 +1017,8 @@ def _parse_nonnegative_float(value: object, *, default: float) -> float:
 
 
 def _parse_tags(value: object) -> tuple[str, ...]:
+    """Parse comma- or newline-separated tags into a stable tuple."""
+
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").replace("\n", ",")
     items = [_normalize_inline_text(item) for item in text.split(",")]
     seen: set[str] = set()
@@ -958,6 +1032,8 @@ def _parse_tags(value: object) -> tuple[str, ...]:
 
 
 def _parse_weekdays(value: object) -> tuple[int, ...]:
+    """Parse weekday tokens into sorted weekday indexes."""
+
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").replace("\n", ",").replace(";", ",")
     if not text.strip():
         return ()
@@ -973,11 +1049,15 @@ def _parse_weekdays(value: object) -> tuple[int, ...]:
 
 
 def _format_weekdays(values: tuple[int, ...]) -> str:
+    """Format stored weekday indexes for the edit form."""
+
     # AUDIT-FIX(#5): Ignore malformed weekday indexes instead of crashing the edit form.
     return ", ".join(_weekday_label(index, lower=True) for index in values)
 
 
 def _format_float(value: float) -> str:
+    """Format a stored numeric value for form display."""
+
     try:
         parsed = float(value)
     except (TypeError, ValueError):
@@ -991,14 +1071,20 @@ def _format_float(value: float) -> str:
 
 
 def _normalize_inline_text(value: object) -> str:
+    """Collapse arbitrary input into single-line text."""
+
     return " ".join(str(value or "").split()).strip()
 
 
 def _normalize_multiline_text(value: object) -> str:
+    """Normalize newlines in multiline text input."""
+
     return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def _parse_choice(value: object, *, field_name: str, allowed: set[str], default: str) -> str:
+    """Parse one allowed choice value with a default."""
+
     text = _normalize_inline_text(value).lower()
     if not text:
         return default
@@ -1009,6 +1095,8 @@ def _parse_choice(value: object, *, field_name: str, allowed: set[str], default:
 
 
 def _coerce_choice(value: object, *, allowed: set[str], default: str) -> str:
+    """Coerce one choice-like value into an allowed set."""
+
     text = _normalize_inline_text(value).lower()
     if text in allowed:
         return text
@@ -1022,6 +1110,8 @@ def _validated_timezone_name(
     field_name: str,
     fallback: str | None = None,
 ) -> str:
+    """Validate and return an IANA timezone name."""
+
     text = _normalize_inline_text(value) or (fallback or "")
     if not text:
         raise ValueError(f"{field_name} must not be empty")
@@ -1033,6 +1123,8 @@ def _validated_timezone_name(
 
 
 def _coerce_timezone_name(value: object, *, fallback: str) -> str:
+    """Return the first valid timezone name among the candidates."""
+
     text = _normalize_inline_text(value)
     for candidate in (text, fallback, _DEFAULT_TIMEZONE_NAME):
         if not candidate:
@@ -1054,6 +1146,8 @@ def _normalize_time_schedule(
     weekdays: tuple[int, ...],
     timezone_name: str,
 ) -> tuple[str, str, str, tuple[int, ...]]:
+    """Normalize schedule-specific fields for time automations."""
+
     if schedule == "once":
         if not due_at:
             raise ValueError("Due at must not be empty for one-time schedules")
@@ -1068,6 +1162,8 @@ def _normalize_time_schedule(
 
 # AUDIT-FIX(#1): Canonicalize one-time schedule timestamps through the shared parser.
 def _validated_due_at(value: str, *, timezone_name: str) -> str:
+    """Canonicalize one one-time due timestamp."""
+
     try:
         due_at = parse_due_at(value, timezone_name=timezone_name)
     except Exception as exc:
@@ -1079,6 +1175,8 @@ def _validated_due_at(value: str, *, timezone_name: str) -> str:
 
 # AUDIT-FIX(#1): Reject invalid daily/weekly clock strings at save time instead of later in the scheduler.
 def _validated_time_of_day(value: str | None) -> str:
+    """Validate a daily or weekly clock value."""
+
     if not value:
         raise ValueError("Time of day must not be empty")
     for fmt in ("%H:%M", "%H:%M:%S"):
@@ -1091,6 +1189,8 @@ def _validated_time_of_day(value: str | None) -> str:
 
 
 def _validated_time_of_day_or_fallback(value: object) -> str:
+    """Return a valid clock string or a display fallback."""
+
     text = _normalize_inline_text(value)
     if not text:
         return "unknown time"
@@ -1102,6 +1202,8 @@ def _validated_time_of_day_or_fallback(value: object) -> str:
 
 # AUDIT-FIX(#5): Fall back to a safe timezone so broken config does not take down the page.
 def _safe_now_in_timezone(timezone_name: str):
+    """Return the current time in a safe timezone fallback chain."""
+
     safe_timezone = _coerce_timezone_name(timezone_name, fallback=_DEFAULT_TIMEZONE_NAME)
     try:
         return now_in_timezone(safe_timezone)
@@ -1111,6 +1213,8 @@ def _safe_now_in_timezone(timezone_name: str):
 
 # AUDIT-FIX(#5): Format persisted datetimes defensively so malformed records degrade gracefully.
 def _safe_due_label(value: object, *, timezone_name: str) -> str | None:
+    """Format a due label without letting bad data crash the page."""
+
     if value is None:
         return None
     safe_timezone = _coerce_timezone_name(timezone_name, fallback=_DEFAULT_TIMEZONE_NAME)
@@ -1122,6 +1226,8 @@ def _safe_due_label(value: object, *, timezone_name: str) -> str | None:
 
 # AUDIT-FIX(#5): Prevent one bad automation from breaking next-run calculation for the whole list.
 def _safe_next_run_at(store: AutomationStore, entry: AutomationDefinition, *, now: object):
+    """Compute `next_run_at` without letting one entry fail the page."""
+
     try:
         return store.engine.next_run_at(entry, now=now)
     except Exception:
@@ -1130,6 +1236,8 @@ def _safe_next_run_at(store: AutomationStore, entry: AutomationDefinition, *, no
 
 # AUDIT-FIX(#5): Contain trigger-summary failures to the affected automation row.
 def _safe_trigger_summary(entry: AutomationDefinition, *, timezone_name: str) -> str:
+    """Summarize one trigger with a guarded fallback."""
+
     try:
         return _trigger_summary(entry, timezone_name=timezone_name)
     except Exception:
@@ -1138,6 +1246,8 @@ def _safe_trigger_summary(entry: AutomationDefinition, *, timezone_name: str) ->
 
 # AUDIT-FIX(#5): Contain action-summary failures to the affected automation row.
 def _safe_action_summary(actions: tuple[AutomationAction, ...]) -> str:
+    """Summarize actions with a guarded fallback."""
+
     try:
         return _action_summary(actions)
     except Exception:
@@ -1146,6 +1256,8 @@ def _safe_action_summary(actions: tuple[AutomationAction, ...]) -> str:
 
 # AUDIT-FIX(#5): Guard sensor-trigger introspection against malformed stored trigger payloads.
 def _safe_describe_sensor_trigger(trigger: object):
+    """Describe a sensor trigger with a guarded fallback."""
+
     try:
         return describe_sensor_trigger(trigger)
     except Exception:
@@ -1153,6 +1265,8 @@ def _safe_describe_sensor_trigger(trigger: object):
 
 
 def _primary_action(entry: AutomationDefinition | None) -> AutomationAction | None:
+    """Return the first enabled action, or the first stored action."""
+
     if entry is None:
         return None
     actions = tuple(getattr(entry, "actions", ()) or ())
@@ -1165,6 +1279,8 @@ def _primary_action(entry: AutomationDefinition | None) -> AutomationAction | No
 
 
 def _coerce_mapping(value: object) -> Mapping[str, Any]:
+    """Return a mapping value or an empty mapping."""
+
     if isinstance(value, Mapping):
         return value
     return {}
@@ -1172,6 +1288,8 @@ def _coerce_mapping(value: object) -> Mapping[str, Any]:
 
 # AUDIT-FIX(#7): Coerce legacy string payloads and malformed booleans without crashing or misreporting.
 def _coerce_bool(value: object, *, default: bool) -> bool:
+    """Coerce legacy or malformed bool-like payload values."""
+
     if isinstance(value, bool):
         return value
     if value is None:
@@ -1192,6 +1310,8 @@ def _coerce_bool(value: object, *, default: bool) -> bool:
 
 
 def _weekday_label(index: object, *, lower: bool) -> str:
+    """Return one weekday label or a safe fallback label."""
+
     if isinstance(index, bool):
         value = int(index)
     elif isinstance(index, int):
@@ -1209,6 +1329,8 @@ def _weekday_label(index: object, *, lower: bool) -> str:
 
 
 def _sensor_trigger_options() -> tuple[tuple[str, str], ...]:
+    """Return supported sensor trigger choices for the edit form."""
+
     options: list[tuple[str, str]] = []
     for trigger_kind in supported_sensor_trigger_kinds():
         try:
@@ -1221,6 +1343,8 @@ def _sensor_trigger_options() -> tuple[tuple[str, str], ...]:
 
 # AUDIT-FIX(#9): Reduce UI-visible filesystem disclosure to a filename only.
 def _store_path_label(store: AutomationStore) -> str:
+    """Reduce the automation store path to a UI-safe filename."""
+
     path_text = str(getattr(store, "path", "") or "")
     if not path_text:
         return ""
@@ -1229,6 +1353,8 @@ def _store_path_label(store: AutomationStore) -> str:
 
 # AUDIT-FIX(#2): Treat only web-form-managed automations as editable through the generic operator forms.
 def _can_operator_edit(entry: AutomationDefinition | None, *, expected_kind: str | None = None) -> bool:
+    """Return whether the generic web UI may edit this automation."""
+
     if entry is None:
         return False
     source = str(getattr(entry, "source", "") or "").strip()
@@ -1242,6 +1368,8 @@ def _can_operator_edit(entry: AutomationDefinition | None, *, expected_kind: str
 
 
 def _ensure_operator_editable(entry: AutomationDefinition, *, expected_kind: str | None = None) -> None:
+    """Raise when an automation is not editable from the web UI."""
+
     if not _can_operator_edit(entry, expected_kind=expected_kind):
         if str(getattr(entry, "source", "") or "").strip() not in {"", "web_ui"}:
             raise ValueError("This automation is managed outside the web form and cannot be changed here.")

@@ -1,4 +1,30 @@
 #!/usr/bin/env python3
+"""Probe Twinr button GPIO lines from the command line.
+
+Purpose
+-------
+Verify configured or ad-hoc button GPIO mappings on a Raspberry Pi without
+starting the full Twinr runtime.
+
+Usage
+-----
+Command-line invocation examples::
+
+    python hardware/buttons/probe_buttons.py --env-file .env --configured --duration 15
+    python hardware/buttons/probe_buttons.py --env-file .env --lines 22,23 --duration 10
+
+Inputs
+------
+- ``--env-file`` path to the Twinr environment file
+- ``--configured`` to use the configured green/yellow button lines
+- ``--lines`` to probe ad-hoc GPIO lines instead of configured buttons
+
+Outputs
+-------
+- Prints one line per observed button event
+- Exit code 0 when at least one event is observed, 1 otherwise
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -13,12 +39,16 @@ from twinr.hardware.buttons import GpioButtonMonitor, build_button_bindings, bui
 
 
 def _parse_lines(raw: str | None, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Parse a comma-separated GPIO line override."""
+
     if raw is None or not raw.strip():
         return default
     return tuple(int(part.strip()) for part in raw.split(",") if part.strip())
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for the button probe script."""
+
     parser = argparse.ArgumentParser(description="Probe Twinr GPIO buttons")
     parser.add_argument("--env-file", default=".env", help="Path to the Twinr .env file")
     parser.add_argument("--chip", help="Override the GPIO chip name")
@@ -41,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    """Run the GPIO button probe and print observed events."""
+
     args = build_parser().parse_args()
     config = TwinrConfig.from_env(Path(args.env_file))
     chip_name = args.chip or config.gpio_chip

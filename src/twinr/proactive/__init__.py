@@ -1,3 +1,13 @@
+"""Expose the ``twinr.proactive`` package surface and child package boundary.
+
+Import from ``twinr.proactive`` when runtime workflows need one compatibility
+surface for proactive governance, monitor wiring, social-trigger scoring, and
+wakeword helpers. Reach into ``twinr.proactive.runtime``,
+``twinr.proactive.social``, ``twinr.proactive.governance``, or
+``twinr.proactive.wakeword`` when the caller only works inside one proactive
+subsystem so this package root stays a thin re-export boundary.
+"""
+
 from twinr.proactive.governance import (
     ProactiveGovernor,
     ProactiveGovernorCandidate,

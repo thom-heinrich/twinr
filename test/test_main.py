@@ -28,6 +28,18 @@ class _FakeHardwareLoop:
         return 0
 
 
+class _FakeRemoteMemoryWatchdog:
+    def __init__(self) -> None:
+        self.duration_s = None
+        self.artifact_path = Path("/tmp/remote-memory-watchdog.json")
+        self.interval_s = 1.0
+        self.history_limit = 3600
+
+    def run(self, *, duration_s: float | None = None) -> int:
+        self.duration_s = duration_s
+        return 0
+
+
 @contextmanager
 def _fake_lock(_config, _name: str):
     yield
@@ -177,6 +189,41 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(companion_calls, [True])
         self.assertEqual(fake_loop.duration_s, 0.0)
+
+    def test_watch_remote_memory_dispatches_without_runtime_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}\n",
+                encoding="utf-8",
+            )
+            fake_watchdog = _FakeRemoteMemoryWatchdog()
+            fake_ops_module = ModuleType("twinr.ops")
+            fake_ops_module.loop_instance_lock = _fake_lock
+            fake_ops_module.RemoteMemoryWatchdog = SimpleNamespace(from_config=lambda _config: fake_watchdog)
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(sys.modules, {"twinr.ops": fake_ops_module}):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "TwinrRuntime", side_effect=AssertionError("runtime must not be created")):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--watch-remote-memory",
+                            "--loop-duration",
+                            "0",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(fake_watchdog.duration_s, 0.0)
 
     def test_wakeword_label_capture_dispatches_to_proactive_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,35 +1,33 @@
-# Twinr Buttons
+# buttons
 
-Current Raspberry Pi inspection shows that the physical Twinr buttons are not exposed as dedicated Linux input devices. They need to be handled as GPIO lines on `gpiochip0`.
+Pi-side setup and probe scripts for Twinr's physical GPIO buttons.
 
-## Current state
+## Responsibility
 
-- No dedicated button devices are present under `/proc/bus/input/devices`
-- The accessible GPIO controller is `gpiochip0`
-- The current mapping is `green=GPIO23` and `yellow=GPIO22`
+`buttons` owns:
+- persist button GPIO env settings for the Pi runtime
+- probe configured or ad-hoc button lines outside the main Twinr loops
 
-## Persist or update the mapping
+`buttons` does **not** own:
+- runtime button semantics in `src/twinr/hardware/buttons.py`
+- PIR motion handling
+- higher-level loop orchestration or user interaction policy
+
+## Key files
+
+| File | Purpose |
+|---|---|
+| [setup_buttons.sh](./setup_buttons.sh) | Persist button GPIO config |
+| [probe_buttons.py](./probe_buttons.py) | Print live button events |
+
+## Usage
 
 ```bash
-cd /twinr
-hardware/buttons/setup_buttons.sh --green 23 --yellow 22
+./hardware/buttons/setup_buttons.sh --env-file .env --green 23 --yellow 22 --probe
+python3 hardware/buttons/probe_buttons.py --env-file .env --configured --duration 15
 ```
 
-This script writes the button mapping into `/twinr/.env` and can run a short configured probe when `--probe` is added.
+## See also
 
-## Probe the buttons
-
-```bash
-cd /twinr
-./.venv/bin/python hardware/buttons/probe_buttons.py --env-file /twinr/.env --configured --duration 15
-```
-
-## Runtime integration
-
-The Python helper in `src/twinr/hardware/buttons.py` exposes:
-
-- `build_button_bindings()` for mapping config to green/yellow buttons
-- `configured_button_monitor()` for the main Twinr event loop
-- `GpioButtonMonitor` for direct GPIO polling and edge handling
-
-The PIR motion sensor lives separately under `hardware/pir/` and should not share the button GPIO lines.
+- [Top-level hardware README](../README.md)
+- [Runtime button adapter](../../src/twinr/hardware/buttons.py)

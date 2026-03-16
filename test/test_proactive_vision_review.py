@@ -19,7 +19,7 @@ from twinr.proactive.social.vision_review import (
     ProactiveVisionFrameBuffer,
     parse_proactive_vision_review_text,
 )
-from twinr.providers.openai.types import OpenAIImageInput
+from twinr.providers.openai import OpenAIImageInput
 
 
 class FakeBackend:

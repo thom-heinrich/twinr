@@ -1,0 +1,68 @@
+schema_version: 1
+name: calendar
+path: src/twinr/integrations/calendar
+kind: python-package
+visibility: internal
+summary: Read Twinr calendar agenda data through a bounded read-only adapter and ICS-backed parsing utilities.
+owned_concerns:
+  - Define the canonical calendar event model with timezone-aware overlap and serialization rules
+  - Translate calendar integration requests into bounded read-only agenda results
+  - Parse ICS payloads and expose a source that filters events by time window
+out_of_scope:
+  - Integration manifest registration and managed runtime wiring in src/twinr/integrations/runtime.py
+  - Calendar source validation and remote/local source policy outside this package
+  - Web form parsing and operator-page rendering in src/twinr/web/viewmodels_integrations.py
+files:
+  - path: __init__.py
+    role: Package export surface for calendar models, adapters, and ICS helpers
+    exports:
+      - CalendarAdapterSettings
+      - CalendarEvent
+      - CalendarReader
+      - ICSCalendarSource
+      - ReadOnlyCalendarAdapter
+      - parse_ics_events
+      - unfold_ics_lines
+  - path: models.py
+    role: Canonical calendar event model and overlap serialization logic
+    exports:
+      - CalendarEvent
+  - path: adapter.py
+    role: Read-only calendar adapter and request-scoped settings
+    exports:
+      - CalendarAdapterSettings
+      - CalendarReader
+      - ReadOnlyCalendarAdapter
+  - path: ics.py
+    role: ICS parsing, timezone normalization, and file-backed event source
+    exports:
+      - ICSCalendarSource
+      - parse_ics_events
+      - unfold_ics_lines
+public_api:
+  module: twinr.integrations.calendar
+  exports:
+    - CalendarAdapterSettings
+    - CalendarEvent
+    - CalendarReader
+    - ICSCalendarSource
+    - ReadOnlyCalendarAdapter
+    - parse_ics_events
+    - unfold_ics_lines
+compatibility_reexports:
+  - path: src/twinr/integrations/__init__.py
+    names:
+      - CalendarAdapterSettings
+      - CalendarEvent
+      - CalendarReader
+      - ICSCalendarSource
+      - ReadOnlyCalendarAdapter
+primary_callers:
+  - path: src/twinr/integrations/__init__.py
+  - path: src/twinr/integrations/runtime.py
+  - path: test/test_integrations.py
+  - path: test/test_integrations_calendar.py
+tests:
+  - path: test/test_integrations_calendar.py
+  - path: test/test_integrations.py
+  - path: test/test_integration_runtime.py

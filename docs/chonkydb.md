@@ -130,6 +130,23 @@ In `remote_primary` mode:
 - local `state/chonkydb/*.json` files are still updated as cache and migration artifacts.
 - if ChonkyDB is unavailable and `TWINR_LONG_TERM_MEMORY_REMOTE_REQUIRED=true`, Twinr withholds long-term graph/fact/midterm memory instead of silently replaying stale local long-term state.
 
+## Continuous watchdog
+
+Twinr now ships a dedicated rolling watchdog for required remote memory:
+
+```bash
+PYTHONPATH=src python3 -m twinr --env-file .env --watch-remote-memory
+```
+
+The watchdog:
+
+- runs the same fail-closed `LongTermMemoryService.ensure_remote_ready()` probe Twinr uses at runtime
+- prints one JSON sample line per probe for journald/systemd capture
+- writes a rolling artifact to `artifacts/stores/ops/remote_memory_watchdog.json`
+- defaults to a `1.0s` cadence via `TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_INTERVAL_S`
+
+For Pi deployment, install the provided systemd unit under [`hardware/ops`](../hardware/ops/README.md).
+
 ## Minimal usage
 
 ```python

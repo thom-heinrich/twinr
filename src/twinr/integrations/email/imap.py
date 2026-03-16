@@ -1,3 +1,10 @@
+"""Read recent email summaries from an IMAP mailbox.
+
+This module validates IMAP connection settings, opens bounded mailbox
+sessions, and converts raw RFC822 messages into sanitized
+``EmailMessageSummary`` records for Twinr.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -24,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 
 class _HTMLTextExtractor(HTMLParser):
+    """Extract visible text nodes from a small HTML fragment."""
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._chunks: list[str] = []
@@ -38,6 +47,8 @@ class _HTMLTextExtractor(HTMLParser):
 
 @dataclass(frozen=True, slots=True)
 class IMAPMailboxConfig:
+    """Hold validated IMAP connection and preview limits."""
+
     host: str
     username: str
     password: str = field(repr=False)  # AUDIT-FIX(#10): prevent accidental password leakage via dataclass repr/logging.
@@ -84,6 +95,8 @@ class IMAPMailboxConfig:
 
 
 class IMAPMailboxReader(MailboxReader):
+    """List recent mailbox messages through a bounded IMAP session."""
+
     def __init__(
         self,
         config: IMAPMailboxConfig,
@@ -94,6 +107,19 @@ class IMAPMailboxReader(MailboxReader):
         self._connection_factory = connection_factory or self._default_connection
 
     def list_recent(self, *, limit: int, unread_only: bool) -> list[EmailMessageSummary]:
+        """Read recent mailbox summaries from the configured IMAP account.
+
+        Args:
+            limit: Maximum number of summaries to return.
+            unread_only: Whether to restrict the search to unread messages.
+
+        Returns:
+            A newest-first list of sanitized message summaries.
+
+        Raises:
+            RuntimeError: If the mailbox cannot be read within the configured
+                retry budget.
+        """
         if limit <= 0:
             return []  # AUDIT-FIX(#9): avoid Python's [-0:] behaviour returning the full mailbox for limit=0.
 
@@ -122,6 +148,7 @@ class IMAPMailboxReader(MailboxReader):
         raise RuntimeError("Unable to read mailbox.")
 
     def _list_recent_once(self, *, limit: int, unread_only: bool) -> list[EmailMessageSummary]:
+        """Run one IMAP search/fetch pass without retry handling."""
         connection = self._connection_factory(self.config)
         try:
             self._prepare_connection(connection)  # AUDIT-FIX(#1,#2): apply operation timeout and secure transport before login.
@@ -153,6 +180,7 @@ class IMAPMailboxReader(MailboxReader):
             self._safe_call(connection, "logout")
 
     def _default_connection(self, config: IMAPMailboxConfig) -> object:
+        """Build the default IMAP client from validated settings."""
         ssl_context = ssl.create_default_context()  # AUDIT-FIX(#2): explicit default TLS context with certificate validation.
         if config.use_ssl:
             return imaplib.IMAP4_SSL(
@@ -168,6 +196,7 @@ class IMAPMailboxReader(MailboxReader):
         )
 
     def _prepare_connection(self, connection: object) -> None:
+        """Apply socket timeouts and the configured transport policy."""
         self._apply_socket_timeout(connection)  # AUDIT-FIX(#1): avoid indefinite blocking on search/fetch/login calls.
         if self.config.use_ssl:
             return
@@ -183,12 +212,14 @@ class IMAPMailboxReader(MailboxReader):
         logger.warning("Proceeding with insecure plaintext IMAP authentication because allow_insecure_auth=True.")
 
     def _starttls(self, connection: object) -> None:
+        """Upgrade a plain IMAP connection to STARTTLS."""
         starttls = getattr(connection, "starttls", None)
         if starttls is None or not callable(starttls):
             raise RuntimeError("IMAP STARTTLS is unavailable for this connection.")
         self._expect_ok(starttls(ssl_context=ssl.create_default_context()))
 
     def _apply_socket_timeout(self, connection: object) -> None:
+        """Apply the configured operation timeout to the IMAP socket."""
         sock = getattr(connection, "sock", None)
         if sock is None:
             return
@@ -198,11 +229,13 @@ class IMAPMailboxReader(MailboxReader):
         settimeout(self.config.operation_timeout_seconds)
 
     def _sleep_before_retry(self, attempt: int) -> None:
+        """Sleep for the configured linear retry backoff."""
         if self.config.retry_backoff_seconds <= 0:
             return
         time.sleep(self.config.retry_backoff_seconds * attempt)
 
     def _parse_message(self, raw_message: bytes, *, unread: bool) -> EmailMessageSummary:
+        """Parse one raw RFC822 message into a sanitized summary."""
         message = BytesParser(policy=policy.default).parsebytes(raw_message)
         raw_from = self._header_as_text(message.get("From", ""))
         sender_name, sender_email = parseaddr(raw_from)
@@ -218,6 +251,7 @@ class IMAPMailboxReader(MailboxReader):
         )
 
     def _preview_for_message(self, message: EmailMessage) -> str:
+        """Choose the best available preview text from a message body."""
         html_fallback: str | None = None
 
         if message.is_multipart():
@@ -244,6 +278,7 @@ class IMAPMailboxReader(MailboxReader):
         return self._normalize_preview(payload)
 
     def _decode_part_text(self, part: EmailMessage) -> str:
+        """Decode one MIME part into bounded text for previews."""
         payload = part.get_payload(decode=True)
         if payload is None:
             raw_payload = part.get_payload()
@@ -263,6 +298,7 @@ class IMAPMailboxReader(MailboxReader):
         return preview_bytes.decode("utf-8", errors="replace")
 
     def _html_to_text(self, value: str) -> str:
+        """Strip HTML markup into plain text for preview generation."""
         if not value:
             return ""
         parser = _HTMLTextExtractor()
@@ -274,9 +310,11 @@ class IMAPMailboxReader(MailboxReader):
         return parser.text()
 
     def _normalize_preview(self, value: str) -> str:
+        """Collapse preview whitespace and enforce the configured limit."""
         return collapse_whitespace(value)[: self.config.preview_char_limit]
 
     def _decode_header_value(self, value: str) -> str:
+        """Decode a mail header value while tolerating malformed input."""
         if not value:
             return ""
         try:
@@ -285,6 +323,7 @@ class IMAPMailboxReader(MailboxReader):
             return value.strip()  # AUDIT-FIX(#6): malformed headers should degrade to raw text, not abort listing.
 
     def _parse_datetime(self, value: str | None) -> datetime | None:
+        """Parse a message date header into an aware UTC datetime."""
         if not value:
             return None
         try:
@@ -297,17 +336,20 @@ class IMAPMailboxReader(MailboxReader):
         return parsed.astimezone(timezone.utc)  # AUDIT-FIX(#8): downstream code now gets a single comparable timezone.
 
     def _header_as_text(self, value: object | None) -> str:
+        """Coerce an optional header object into text."""
         if value is None:
             return ""
         return str(value)
 
     def _call(self, connection: object, method_name: str, *args):
+        """Call a required IMAP method or raise a runtime error."""
         method = getattr(connection, method_name, None)
         if method is None or not callable(method):
             raise RuntimeError(f"IMAP connection is missing method {method_name!r}.")  # AUDIT-FIX(#11): fail clearly on bad test doubles or broken connections.
         return method(*args)
 
     def _safe_call(self, connection: object, method_name: str) -> None:
+        """Invoke a best-effort IMAP cleanup method."""
         try:
             method = getattr(connection, method_name, None)
             if method is not None:
@@ -316,6 +358,7 @@ class IMAPMailboxReader(MailboxReader):
             logger.debug("Ignoring IMAP cleanup failure during %s.", method_name, exc_info=True)  # AUDIT-FIX(#11): keep cleanup best-effort but preserve observability.
 
     def _expect_ok(self, response):
+        """Require an IMAP response with an ``OK`` status."""
         if not isinstance(response, (tuple, list)) or not response:
             raise RuntimeError(f"Malformed IMAP response: {response!r}.")  # AUDIT-FIX(#3,#11): guard against empty/non-tuple responses.
         status = response[0]
@@ -326,6 +369,7 @@ class IMAPMailboxReader(MailboxReader):
         return response
 
     def _extract_message_ids(self, response) -> list[bytes]:
+        """Extract message UIDs from an IMAP SEARCH response."""
         if not isinstance(response, (tuple, list)) or len(response) < 2:
             return []
         payload = response[1]
@@ -340,6 +384,7 @@ class IMAPMailboxReader(MailboxReader):
         return []
 
     def _message_has_seen_flag(self, payload: object) -> bool:
+        """Return whether FETCH metadata marks a message as seen."""
         if not isinstance(payload, list):
             return False
         for item in payload:
@@ -361,6 +406,7 @@ class IMAPMailboxReader(MailboxReader):
         return False
 
     def _first_message_bytes(self, payload: object) -> bytes | None:
+        """Return the first RFC822 byte payload from a FETCH response."""
         if not isinstance(payload, list):
             return None
         for item in payload:

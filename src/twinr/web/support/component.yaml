@@ -1,0 +1,82 @@
+schema_version: 1
+name: support
+path: src/twinr/web/support
+kind: python-package
+visibility: internal
+summary: Provide shared web support contracts, env-backed field helpers, and hardened file-backed persistence utilities for Twinr's local control surface.
+owned_concerns:
+  - Define immutable contract objects shared by web presenters, routes, and templates
+  - Build declared env-backed field definitions and collect fail-closed form updates
+  - Parse URL-encoded request bodies and atomically read or write `.env` and text-backed settings files
+  - Expose the curated support import surface consumed across the web package
+out_of_scope:
+  - FastAPI route handling, redirects, and page composition in `src/twinr/web/app.py`
+  - Presenter-specific defaults, normalization, and integration validation in `src/twinr/web/presenters`
+  - Template markup, styling, and client-side behavior under `src/twinr/web/templates`
+  - Runtime hardware, provider, reminder, or memory orchestration beyond generic file-backed helpers
+files:
+  - path: __init__.py
+    role: Curated support package export surface
+    exports:
+      - AdaptiveTimingView
+      - DashboardCard
+      - DetailMetric
+      - FileBackedSetting
+      - IntegrationOverviewRow
+      - SettingsSection
+      - mask_secret
+      - parse_urlencoded_form
+      - read_env_values
+      - read_text_file
+      - write_env_updates
+      - write_text_file
+  - path: contracts.py
+    role: Immutable contract dataclasses shared by presenters and routes
+    exports:
+      - AdaptiveTimingView
+      - DashboardCard
+      - DetailMetric
+      - IntegrationOverviewRow
+      - SettingsSection
+  - path: forms.py
+    role: Env-backed field builders and sanitized standard update collection
+    exports:
+      - _collect_standard_updates
+      - _select_field
+      - _text_field
+      - _textarea_field
+  - path: store.py
+    role: Hardened request-body parsing and atomic text or `.env` persistence helpers
+    exports:
+      - FileBackedSetting
+      - mask_secret
+      - parse_urlencoded_form
+      - read_env_values
+      - read_text_file
+      - write_env_updates
+      - write_text_file
+public_api:
+  module: twinr.web.support
+  exports:
+    - AdaptiveTimingView
+    - DashboardCard
+    - DetailMetric
+    - FileBackedSetting
+    - IntegrationOverviewRow
+    - SettingsSection
+    - mask_secret
+    - parse_urlencoded_form
+    - read_env_values
+    - read_text_file
+    - write_env_updates
+    - write_text_file
+primary_callers:
+  - path: src/twinr/web/app.py
+  - path: src/twinr/web/context.py
+  - path: src/twinr/web/presenters/connect.py
+  - path: src/twinr/web/presenters/memory.py
+  - path: src/twinr/web/presenters/settings.py
+tests:
+  - path: test/test_web_app.py
+  - path: test/test_web_store.py
+  - path: test/test_simple_settings.py

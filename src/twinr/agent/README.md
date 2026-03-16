@@ -15,7 +15,7 @@ that own core runtime, tool, and workflow behavior.
 - base-agent implementation details in [`base_agent`](./base_agent/README.md)
 - tool prompt, schema, handler, or tool-runtime logic in [`tools`](./tools/README.md)
 - workflow-loop orchestration details in [`workflows`](./workflows/README.md)
-- concrete self-coding runtime behavior at the package-root level; that work belongs in a focused `self_coding/` subpackage when implementation begins
+- concrete self-coding runtime behavior at the package-root level; compile contracts, compiler validation, local Codex driver status, and related work belong in the focused `self_coding/` subpackage
 
 ## Key files
 
