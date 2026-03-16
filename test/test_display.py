@@ -18,6 +18,10 @@ def _prepared_image(width: int = 300, height: int = 400):
     return SimpleNamespace(size=(width, height))
 
 
+def _prepared_image(width: int = 300, height: int = 400):
+    return SimpleNamespace(size=(width, height))
+
+
 class WaveshareDisplayTests(unittest.TestCase):
     def test_split_footer_parts_separates_time_suffix(self) -> None:
         display = WaveshareEPD4In2V2(
