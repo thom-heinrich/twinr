@@ -9,6 +9,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from test.self_coding_test_utils import stable_sha256
 from twinr.agent.self_coding import (
     ArtifactKind,
     CompileJobStatus,
@@ -61,6 +62,9 @@ def _ready_session(
 
 
 def _package_payload(skill_code: str, *, name: str = "Sandbox Watchdog Probe") -> str:
+    normalized_code = skill_code.strip()
+    if not normalized_code.startswith("from __future__ import annotations"):
+        normalized_code = "from __future__ import annotations\n\n" + normalized_code
     return json.dumps(
         {
             "skill_package": {
@@ -80,7 +84,7 @@ def _package_payload(skill_code: str, *, name: str = "Sandbox Watchdog Probe") -
                 "files": [
                     {
                         "path": "skill_main.py",
-                        "content": skill_code.strip(),
+                        "content": normalized_code,
                     }
                 ],
             }
@@ -137,7 +141,7 @@ class SelfCodingWatchdogTests(unittest.TestCase):
             skill_name="Policy Manifest Probe",
             status=CompileJobStatus.COMPILING,
             requested_target=CompileTarget.SKILL_PACKAGE,
-            spec_hash="spec_policy_manifest",
+            spec_hash=stable_sha256("spec_policy_manifest"),
             required_capabilities=session.capabilities,
         )
         compiled = canonical_skill_package_document(
@@ -282,7 +286,7 @@ def refresh(ctx):
                     skill_name="Morning Briefing",
                     status=CompileJobStatus.COMPILING,
                     requested_target=CompileTarget.SKILL_PACKAGE,
-                    spec_hash="spec_watchdog_stale",
+                    spec_hash=stable_sha256("spec_watchdog_stale"),
                     required_capabilities=("speaker", "web_search"),
                     created_at=stale_at,
                     updated_at=stale_at,

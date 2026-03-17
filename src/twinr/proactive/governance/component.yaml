@@ -50,8 +50,8 @@ compatibility_reexports:
 primary_callers:
   - path: src/twinr/agent/base_agent/runtime/base.py
   - path: src/twinr/agent/base_agent/runtime/context.py
-  - path: src/twinr/agent/workflows/runner.py
-  - path: src/twinr/agent/workflows/realtime_runner_background.py
+  - path: src/twinr/agent/legacy/classic_hardware_loop.py
+  - path: src/twinr/agent/workflows/realtime_runtime/background.py
 tests:
   - path: test/test_proactive_governor.py
   - path: test/test_runner.py

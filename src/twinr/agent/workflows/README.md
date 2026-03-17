@@ -3,7 +3,8 @@
 `workflows` owns Twinr's active runtime loop orchestration for the realtime and
 streaming hardware paths plus the compatibility import surfaces that still
 point older callers at legacy code. It also contains the workflow-local
-helpers that keep speech output, print delivery, and background work bounded.
+helpers that keep capture, speech output, print delivery, and background work
+bounded.
 
 ## Responsibility
 
@@ -22,8 +23,10 @@ helpers that keep speech output, print delivery, and background work bounded.
 - recover suspicious or empty streaming transcripts with one bounded full-audio STT retry before surfacing a failed turn
 - wire the optional OpenAI streaming-transcript verifier from the provider bundle into the live streaming loop so suspicious short Deepgram turns, including empty results after a late speech start, are rechecked against the real captured audio before Twinr drops the turn
 - derive dual-lane bridge speech from the fast supervisor decision as the authoritative first spoken lane whenever a supervisor decision provider is available; use the standalone first-word model only as a fallback when that supervisor lane does not exist, and do not fall back to canned watchdog speech
+- downgrade fast-lane decisions that declare `full_context` needs into a filler-plus-final-lane handoff so conversation-recall turns do not get answered from a memory-blind bridge lane
 - only prefetch first-word speech once a partial transcript has enough shape to be meaningful; one dangling tail word must not trigger a filler line on its own
 - keep dual-lane search turns to one bounded final-lane search execution instead of launching a speculative background search worker that can outlive the turn
+- wait briefly for active filler playback to drain before replacing it with the final lane so the fast acknowledgement is not cut off mid-sentence
 - emit bounded pre-speech capture diagnostics on listen timeouts so Pi no-speech failures can be proven from first-run logs instead of guessed
 - emit a forensic run pack for live-runtime debugging when `TWINR_WORKFLOW_TRACE_ENABLED=1`
 - share workflow-local helpers for feedback tones, reference images, and safe background delivery
@@ -41,7 +44,8 @@ helpers that keep speech output, print delivery, and background work bounded.
 |---|---|
 | [runner.py](./runner.py) | Compatibility shim to the legacy classic loop in `src/twinr/agent/legacy/classic_hardware_loop.py` |
 | [realtime_runner.py](./realtime_runner.py) | Realtime session loop |
-| [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and turn orchestration shell |
+| [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell |
+| [streaming_capture.py](./streaming_capture.py) | Streaming microphone capture, timeout handling, and batch-STT fallback |
 | [streaming_speculation.py](./streaming_speculation.py) | Speculative first-word and supervisor warmup controller |
 | [streaming_lane_planner.py](./streaming_lane_planner.py) | Streaming lane-plan and final-lane path selection |
 | [streaming_turn_coordinator.py](./streaming_turn_coordinator.py) | Authoritative streaming turn state machine and completion coordinator |
@@ -76,7 +80,8 @@ Set `TWINR_WORKFLOW_TRACE_ENABLED=1` to write a bounded workflow run pack under
 ## Usage
 
 ```python
-from twinr.agent.workflows import TwinrHardwareLoop, TwinrRealtimeHardwareLoop
+from twinr.agent.legacy.classic_hardware_loop import TwinrHardwareLoop
+from twinr.agent.workflows import TwinrRealtimeHardwareLoop
 
 classic_loop = TwinrHardwareLoop(config=config)
 realtime_loop = TwinrRealtimeHardwareLoop(config=config)
@@ -102,4 +107,5 @@ streaming_loop.run(duration_s=15)
 
 The classic press-to-talk implementation itself now lives outside the active
 workflow package under `src/twinr/agent/legacy/classic_hardware_loop.py`; the
-`workflows.runner` module remains only as a compatibility import shim.
+`workflows.runner` module remains only as a compatibility import shim and
+should not be used for new internal references.

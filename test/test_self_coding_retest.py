@@ -62,6 +62,7 @@ class _SkillPackageCompileDriver:
                                     {
                                         "path": "skill_main.py",
                                         "content": (
+                                            "from __future__ import annotations\n\n"
                                             "def refresh(ctx):\n"
                                             "    lines = []\n"
                                             "    for index in range(3):\n"

@@ -123,6 +123,7 @@ class StreamingTurnOrchestrator:
         timeout_policy: StreamingTurnTimeoutPolicy,
         queue_lane_delta: Callable[[SpeechLaneDelta], None],
         wait_for_first_audio: Callable[..., bool],
+        wait_until_idle: Callable[..., bool] | None = None,
         ensure_processing_feedback: Callable[[], None],
         emit: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
@@ -130,6 +131,7 @@ class StreamingTurnOrchestrator:
         self.timeout_policy = timeout_policy
         self.queue_lane_delta = queue_lane_delta
         self.wait_for_first_audio = wait_for_first_audio
+        self.wait_until_idle = wait_until_idle
         self.ensure_processing_feedback = ensure_processing_feedback
         self.emit = emit
         self.should_stop = should_stop
@@ -334,9 +336,12 @@ class StreamingTurnOrchestrator:
         if not final_text:
             return
         if wait_for_bridge_audio and bridge_reply is not None:
+            gate_timeout_s = max(0.0, self.timeout_policy.first_audio_gate_ms / 1000.0)
             self.wait_for_first_audio(
-                timeout_s=max(0.0, self.timeout_policy.first_audio_gate_ms / 1000.0),
+                timeout_s=gate_timeout_s,
             )
+            if self.wait_until_idle is not None:
+                self.wait_until_idle(timeout_s=gate_timeout_s)
         self._emit_lane_delta(
             final_text,
             lane="final" if bridge_reply is not None else "direct",

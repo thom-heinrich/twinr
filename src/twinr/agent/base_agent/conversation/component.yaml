@@ -71,10 +71,10 @@ tests:
 consumers:
   - path: src/twinr/agent/base_agent/runtime/base.py
   - path: src/twinr/agent/base_agent/runtime/context.py
-  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/agent/workflows/streaming_runner.py
-  - path: src/twinr/agent/workflows/realtime_runner_support.py
+  - path: src/twinr/agent/workflows/realtime_runtime/support.py
   - path: src/twinr/providers/openai/base.py
   - path: src/twinr/providers/openai/adapters.py
   - path: src/twinr/providers/openai/realtime.py

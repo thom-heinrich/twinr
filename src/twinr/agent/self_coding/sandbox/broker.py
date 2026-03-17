@@ -9,6 +9,8 @@ import math
 import threading
 from typing import Any
 
+from twinr.agent.self_coding.sandbox.policy import CapabilityBrokerManifest
+
 
 _DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
 _TRUE_TEXT_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -26,11 +28,16 @@ class SkillBrokerPolicy:
     allowed_methods: frozenset[str] = frozenset(
         {
             "current_presence_session_id",
+            "current_sensor_facts",
             "delete_json",
             "is_night_mode",
             "is_private_for_speech",
+            "list_calendar_events",
+            "list_json_keys",
+            "list_recent_emails",
             "load_json",
             "log_event",
+            "merge_json",
             "now_iso",
             "say",
             "search_web",
@@ -39,6 +46,15 @@ class SkillBrokerPolicy:
             "today_local_date",
         }
     )
+
+    @classmethod
+    def from_manifest(cls, manifest: CapabilityBrokerManifest | Mapping[str, Any] | None) -> "SkillBrokerPolicy":
+        """Build one broker policy from the persisted capability manifest."""
+
+        if manifest is None:
+            return cls()
+        resolved_manifest = manifest if isinstance(manifest, CapabilityBrokerManifest) else CapabilityBrokerManifest.from_payload(manifest)
+        return cls(allowed_methods=frozenset(str(item).strip() for item in resolved_manifest.allowed_methods if str(item).strip()))
 
     def require_allowed(self, method_name: object) -> str:
         """Return the normalized method name or raise when the policy blocks it."""
@@ -169,6 +185,12 @@ class SandboxSkillContextProxy:
     def delete_json(self, key: str) -> None:
         self._rpc("delete_json", key)
 
+    def list_json_keys(self, prefix: str | None = None) -> tuple[str, ...]:
+        return _normalized_string_tuple(self._rpc("list_json_keys", prefix=prefix))
+
+    def merge_json(self, key: str, patch: Any) -> Any:
+        return self._rpc("merge_json", key, patch)
+
     def today_local_date(self) -> str:
         return str(self._rpc("today_local_date") or "").strip()
 
@@ -189,6 +211,17 @@ class SandboxSkillContextProxy:
                 return int(text)
         raise RuntimeError("sandbox broker returned an invalid presence session id")  # AUDIT-FIX(#8): Fail clearly on malformed session identifiers.
 
+    def current_sensor_facts(self) -> dict[str, Any]:
+        result = self._rpc("current_sensor_facts")
+        if result is None:
+            return {}
+        if not isinstance(result, Mapping):
+            raise RuntimeError("sandbox broker returned invalid sensor facts")
+        normalized = _ensure_json_compatible(result, path="result")
+        if not isinstance(normalized, dict):
+            raise RuntimeError("sandbox broker returned invalid sensor facts")
+        return normalized
+
     def is_night_mode(self) -> bool:
         return _coerce_bool_result(self._rpc("is_night_mode"), method_name="is_night_mode")  # AUDIT-FIX(#2): Avoid silent truthiness bugs that can invert night-mode behavior.
 
@@ -200,6 +233,31 @@ class SandboxSkillContextProxy:
 
     def log_event(self, event: str, *, severity: str = "info", **data: object) -> None:
         self._rpc("log_event", event, severity=severity, **data)
+
+    def list_recent_emails(self, *, limit: int = 5, unread_only: bool = True) -> tuple[dict[str, Any], ...]:
+        return _normalized_mapping_tuple(
+            self._rpc("list_recent_emails", limit=limit, unread_only=unread_only),
+            method_name="list_recent_emails",
+        )
+
+    def list_calendar_events(
+        self,
+        *,
+        days: int = 1,
+        limit: int = 5,
+        start_iso: str | None = None,
+        end_iso: str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        return _normalized_mapping_tuple(
+            self._rpc(
+                "list_calendar_events",
+                days=days,
+                limit=limit,
+                start_iso=start_iso,
+                end_iso=end_iso,
+            ),
+            method_name="list_calendar_events",
+        )
 
     def _rpc(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
         normalized_method_name = str(method_name or "").strip()
@@ -310,6 +368,20 @@ def _normalized_string_tuple(value: object) -> tuple[str, ...]:
         if text:
             normalized.append(text)
     return tuple(normalized)
+
+
+def _normalized_mapping_tuple(value: object, *, method_name: str) -> tuple[dict[str, Any], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise RuntimeError(f"sandbox broker returned an invalid result for {method_name}")
+    normalized_items: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        normalized = _ensure_json_compatible(item, path=f"{method_name}[{index}]")
+        if not isinstance(normalized, dict):
+            raise RuntimeError(f"sandbox broker returned an invalid result for {method_name}")
+        normalized_items.append(normalized)
+    return tuple(normalized_items)
 
 
 def _normalized_timeout_seconds(value: float | None) -> float | None:

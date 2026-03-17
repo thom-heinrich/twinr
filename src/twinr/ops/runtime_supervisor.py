@@ -25,7 +25,6 @@ import time
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
-from twinr.display.heartbeat import DisplayHeartbeatStore, display_heartbeat_has_progress
 from twinr.agent.workflows.required_remote_snapshot import (
     RequiredRemoteWatchdogAssessment,
     assess_required_remote_watchdog_snapshot,
@@ -232,10 +231,10 @@ class TwinrRuntimeSupervisor:
             pre-sample startup before the supervisor treats watchdog startup
             itself as stalled.
         streaming_startup_timeout_s: Maximum time a streaming child may stay in
-            pre-lock/pre-display startup before the supervisor treats startup
+            pre-lock/pre-snapshot startup before the supervisor treats startup
             itself as stalled.
         streaming_health_grace_s: How long to ignore startup transients before
-            enforcing display/snapshot health on the streaming child.
+            enforcing snapshot/runtime health on the streaming child.
         max_snapshot_age_s: Maximum allowed runtime-snapshot age before a
             streaming restart is triggered.
         restart_backoff_s: Minimum delay between restarts of the same child.
@@ -288,7 +287,6 @@ class TwinrRuntimeSupervisor:
         self.stop_timeout_s = max(0.1, float(stop_timeout_s))
         self.project_root = Path(config.project_root).expanduser().resolve()
         self.remote_watchdog_store = RemoteMemoryWatchdogStore.from_config(config)
-        self.display_heartbeat_store = DisplayHeartbeatStore.from_config(config)
         self._watchdog = _ManagedChild(
             key="remote-memory-watchdog",
             label="remote memory watchdog",
@@ -599,15 +597,6 @@ class TwinrRuntimeSupervisor:
                 issue="streaming_startup_stalled",
             )
             return
-        if not self._streaming_display_has_progress():
-            if self._streaming.age_s(now_monotonic) < self.streaming_startup_timeout_s:
-                self._streaming.clear_health_issue()
-                return
-            self._restart_streaming_if_persistent(
-                now_monotonic=now_monotonic,
-                issue="display_startup_stalled",
-            )
-            return
         snapshot_issue = self._snapshot_health_issue(snapshot, assessment=assessment)
         if snapshot_issue is not None:
             self._restart_streaming_if_persistent(
@@ -676,26 +665,6 @@ class TwinrRuntimeSupervisor:
         if updated_at is None:
             return False
         return updated_at >= started_at_utc
-
-    def _streaming_display_has_progress(self) -> bool:
-        process = self._streaming.process
-        current_pid = getattr(process, "pid", None) if process is not None else None
-        if current_pid is None:
-            return False
-        try:
-            return display_heartbeat_has_progress(
-                self.config,
-                expected_pid=current_pid,
-                started_at_utc=self._streaming.started_at_utc,
-                heartbeat_store=self.display_heartbeat_store,
-                now=self._utcnow(),
-            )
-        except Exception as exc:
-            self._emit_payload(
-                "runtime_supervisor_display_heartbeat_load_failed",
-                detail=compact_text(f"{type(exc).__name__}: {exc}", limit=160),
-            )
-            return False
 
     def _snapshot_health_issue(
         self,

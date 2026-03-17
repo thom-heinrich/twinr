@@ -39,7 +39,7 @@ compatibility_reexports:
       - build_compact_agent_tool_schemas
       - build_realtime_tool_schemas
 primary_callers:
-  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/streaming_runner.py
   - path: src/twinr/orchestrator/session.py
   - path: src/twinr/providers/openai/realtime.py

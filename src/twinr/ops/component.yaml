@@ -171,7 +171,7 @@ primary_callers:
   - path: src/twinr/web/app.py
   - path: src/twinr/web/context.py
   - path: src/twinr/web/viewmodels_voice.py
-  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/display/service.py
   - path: hardware/ops/twinr-runtime-supervisor.service

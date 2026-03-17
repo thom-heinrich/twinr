@@ -17,7 +17,6 @@ support exports for the web UI and operator tools.
 - ensure the dedicated remote-memory watchdog process is running for live Pi runtimes
 - seed detached Pi runtime processes with the user-session audio env they need for Pulse/ALSA default playback
 - supervise the productive Pi streaming loop plus remote watchdog under one authoritative owner and prime child audio-session env before each spawn
-- defer display-health enforcement until the current streaming child has emitted its own display heartbeat, so cold-start panel renders are not killed as false missing companions
 - consume the shared display heartbeat contract so ops health and the runtime supervisor read the same companion-progress semantics the display loop writes
 - keep display-companion degradation visible in ops health without letting a display fault tear down the speech path
 - recycle failed watchdog service instances so transient remote-state poison does not stick forever
@@ -49,7 +48,7 @@ support exports for the web UI and operator tools.
 | [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog plus structured probe/bootstrap artifacts |
 | [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start the external watchdog process for live Pi loops when needed |
 | [runtime_env.py](./runtime_env.py) | Seed detached Pi runtimes with the minimal user audio-session environment |
-| [runtime_supervisor.py](./runtime_supervisor.py) | Authoritative Pi runtime supervisor for the streaming loop and remote watchdog, including shared display-progress checks |
+| [runtime_supervisor.py](./runtime_supervisor.py) | Authoritative Pi runtime supervisor for the streaming loop and remote watchdog while leaving display degradation to ops health instead of recycling the speech path |
 | [self_coding_pi.py](./self_coding_pi.py) | Pi bootstrap for pinned self-coding Codex bridge, CLI, auth sync, and remote self-test |
 | [remote_memory_watchdog_soak.py](./remote_memory_watchdog_soak.py) | Bounded soak recorder for watchdog stability proof |
 | [devices.py](./devices.py) | Device overview probes |

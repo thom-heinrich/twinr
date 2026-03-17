@@ -72,7 +72,7 @@ compatibility_reexports:
       - build_tool_agent_instructions
       - tool_agent_time_context
 primary_callers:
-  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/streaming_runner.py
   - path: src/twinr/orchestrator/session.py
   - path: src/twinr/orchestrator/acks.py

@@ -14,6 +14,7 @@ import wave
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from fastapi.testclient import TestClient
+from test.self_coding_test_utils import stable_sha256
 
 from twinr.agent.base_agent import AdaptiveTimingStore, RuntimeSnapshotStore, TwinrConfig
 from twinr.automations import AutomationAction, AutomationDefinition, AutomationStore, IfThenAutomationTrigger, build_sensor_trigger
@@ -561,7 +562,7 @@ class WebAppTests(unittest.TestCase):
                 skill_name="Morning Briefing",
                 status=CompileJobStatus.COMPILING,
                 requested_target=CompileTarget.SKILL_PACKAGE,
-                spec_hash="spec_self_coding_stale",
+                spec_hash=stable_sha256("spec_self_coding_stale"),
                 created_at=stale_at,
                 updated_at=stale_at,
             )
@@ -609,7 +610,7 @@ class WebAppTests(unittest.TestCase):
                 skill_name="Morning Briefing",
                 status=CompileJobStatus.COMPILING,
                 requested_target=CompileTarget.SKILL_PACKAGE,
-                spec_hash="spec_self_coding_cleanup_stale",
+                spec_hash=stable_sha256("spec_self_coding_cleanup_stale"),
                 created_at=stale_at,
                 updated_at=stale_at,
             )

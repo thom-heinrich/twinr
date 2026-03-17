@@ -9,7 +9,7 @@ root imports together while pushing behavior into focused subpackages.
 `base_agent` owns:
 - expose stable imports for config, runtime, state, prompting, and conversation helpers
 - define `TwinrConfig` and the shared env-loading path
-- define provider protocols, bundles, and composite provider glue
+- define provider protocols, bundles, and composite provider glue, including the structured supervisor decision contract used by the fast voice lane
 - preserve thin compatibility wrappers during the package split
 
 `base_agent` does **not** own:

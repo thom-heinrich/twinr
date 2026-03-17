@@ -44,14 +44,34 @@ _SKILL_HEALTH_RECORD_SCHEMA = "twinr_self_coding_skill_health_record_v1"
 _EXECUTION_RUN_STATUS_RECORD_SCHEMA = "twinr_self_coding_execution_run_status_record_v1"
 _LIVE_E2E_STATUS_RECORD_SCHEMA = "twinr_self_coding_live_e2e_status_record_v1"
 
+REQUIREMENTS_DIALOGUE_BASELINE_ACTION_KEY = "__baseline_action__"
+REQUIREMENTS_DIALOGUE_BASELINE_TRIGGER_MODE_KEY = "__baseline_trigger_mode__"
+REQUIREMENTS_DIALOGUE_BASELINE_TRIGGER_CONDITIONS_KEY = "__baseline_trigger_conditions__"
+REQUIREMENTS_DIALOGUE_BASELINE_SCOPE_KEY = "__baseline_scope__"
+REQUIREMENTS_DIALOGUE_BASELINE_CONSTRAINTS_KEY = "__baseline_constraints__"
+REQUIREMENTS_DIALOGUE_QUESTION_IDS = frozenset({"when", "what", "how"})
+REQUIREMENTS_DIALOGUE_PUBLIC_ANSWER_SUMMARY_KEYS = frozenset({"when", "what", "how", "confirm"})
+REQUIREMENTS_DIALOGUE_INTERNAL_ANSWER_SUMMARY_KEYS = frozenset(
+    {
+        REQUIREMENTS_DIALOGUE_BASELINE_ACTION_KEY,
+        REQUIREMENTS_DIALOGUE_BASELINE_TRIGGER_MODE_KEY,
+        REQUIREMENTS_DIALOGUE_BASELINE_TRIGGER_CONDITIONS_KEY,
+        REQUIREMENTS_DIALOGUE_BASELINE_SCOPE_KEY,
+        REQUIREMENTS_DIALOGUE_BASELINE_CONSTRAINTS_KEY,
+    }
+)
+
 _MAX_STABLE_IDENTIFIER_LENGTH = 128
 _MAX_PATH_LENGTH = 240
 _MAX_JSON_DEPTH = 8
 _MAX_JSON_CONTAINER_ITEMS = 256
 _MAX_JSON_KEY_LENGTH = 240
 _MAX_JSON_STRING_LENGTH = 4096
-_ALLOWED_REQUIREMENTS_QUESTION_IDS = frozenset({"when", "what", "how"})
-_ALLOWED_REQUIREMENTS_DIALOGUE_IDS = frozenset({"when", "what", "how", "confirm"})
+_ALLOWED_REQUIREMENTS_QUESTION_IDS = REQUIREMENTS_DIALOGUE_QUESTION_IDS
+_ALLOWED_REQUIREMENTS_DIALOGUE_IDS = frozenset(
+    REQUIREMENTS_DIALOGUE_PUBLIC_ANSWER_SUMMARY_KEYS
+    | REQUIREMENTS_DIALOGUE_INTERNAL_ANSWER_SUMMARY_KEYS
+)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -77,6 +97,20 @@ class FrozenJsonDict(dict):
 
     def copy(self) -> dict[str, Any]:
         return dict(self)
+
+
+class FrozenJsonList(tuple):
+    """Read-only JSON array that stays immutable but compares list-like."""
+
+    __slots__ = ()
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (list, tuple)):
+            return tuple(self) == tuple(other)
+        return super().__eq__(other)
+
+    def copy(self) -> list[Any]:
+        return list(self)
 
 
 def _utc_now() -> datetime:
@@ -324,7 +358,7 @@ def _normalize_json_value(value: object, *, field_name: str, path: str = "$", de
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         if len(value) > _MAX_JSON_CONTAINER_ITEMS:
             raise ValueError(f"{field_name} arrays must contain <= {_MAX_JSON_CONTAINER_ITEMS} items at {path}")  # AUDIT-FIX(#5): Limit sequence fan-out for generic JSON payloads.
-        return tuple(
+        return FrozenJsonList(
             _normalize_json_value(item, field_name=field_name, path=f"{path}[{index}]", depth=depth + 1)
             for index, item in enumerate(value)
         )
@@ -716,7 +750,9 @@ class RequirementsDialogueSession:
         object.__setattr__(self, "answered_question_ids", answered_question_ids)
         answer_summaries = _json_mapping(self.answer_summaries, field_name="answer_summaries")
         if any(key not in _ALLOWED_REQUIREMENTS_DIALOGUE_IDS for key in answer_summaries):
-            raise ValueError("answer_summaries keys must be limited to {'when', 'what', 'how', 'confirm'}")  # AUDIT-FIX(#10): Prevent arbitrary answer-summary keys from corrupting dialogue recovery.
+            raise ValueError(
+                "answer_summaries keys must be limited to the recognized dialogue summary ids"
+            )  # AUDIT-FIX(#10): Allow only the public dialogue summaries plus the reserved rollback-baseline keys used by the deterministic confirmation restart path.
         object.__setattr__(self, "answer_summaries", answer_summaries)
         object.__setattr__(self, "created_at", _normalize_datetime(self.created_at, field_name="created_at"))
         object.__setattr__(self, "updated_at", _normalize_datetime(self.updated_at, field_name="updated_at"))

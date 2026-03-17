@@ -5,6 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from test.self_coding_test_utils import stable_sha256
 from twinr.agent.self_coding import (
     ArtifactKind,
     CompileJobRecord,
@@ -67,7 +68,7 @@ class SelfCodingCompileValidatorTests(unittest.TestCase):
             skill_name="Read Emails",
             status=CompileJobStatus.VALIDATING,
             requested_target=CompileTarget.AUTOMATION_MANIFEST,
-            spec_hash="validator-mismatch",
+            spec_hash=stable_sha256("validator-mismatch"),
         )
         artifact = CodexCompileArtifact(
             kind=ArtifactKind.SKILL_PACKAGE,
@@ -105,7 +106,7 @@ class SelfCodingCompileValidatorTests(unittest.TestCase):
             skill_name="Morning Briefing",
             status=CompileJobStatus.VALIDATING,
             requested_target=CompileTarget.SKILL_PACKAGE,
-            spec_hash="validator-skill",
+            spec_hash=stable_sha256("validator-skill"),
         )
         artifact = CodexCompileArtifact(
             kind=ArtifactKind.SKILL_PACKAGE,

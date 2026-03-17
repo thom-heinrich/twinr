@@ -5,6 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from test.self_coding_test_utils import stable_sha256
 from twinr.agent.self_coding import (
     CompileJobRecord,
     CompileJobStatus,
@@ -48,7 +49,7 @@ class AutomationManifestCompilerTests(unittest.TestCase):
             skill_name="Read Emails",
             status=CompileJobStatus.COMPILING,
             requested_target=CompileTarget.AUTOMATION_MANIFEST,
-            spec_hash="manifest-spec",
+            spec_hash=stable_sha256("manifest-spec"),
         )
 
         compiled = compile_automation_manifest_content(
@@ -97,7 +98,7 @@ class AutomationManifestCompilerTests(unittest.TestCase):
             skill_name="Read Emails",
             status=CompileJobStatus.COMPILING,
             requested_target=CompileTarget.AUTOMATION_MANIFEST,
-            spec_hash="manifest-spec",
+            spec_hash=stable_sha256("manifest-spec"),
         )
 
         with self.assertRaises(AutomationManifestCompilerError):
@@ -121,7 +122,7 @@ class AutomationManifestCompilerTests(unittest.TestCase):
             skill_name="Probe Skill",
             status=CompileJobStatus.COMPILING,
             requested_target=CompileTarget.AUTOMATION_MANIFEST,
-            spec_hash="manifest-spec",
+            spec_hash=stable_sha256("manifest-spec"),
         )
 
         compiled = compile_automation_manifest_content(
@@ -153,7 +154,7 @@ class AutomationManifestCompilerTests(unittest.TestCase):
             skill_name="Probe Skill",
             status=CompileJobStatus.COMPILING,
             requested_target=CompileTarget.AUTOMATION_MANIFEST,
-            spec_hash="manifest-spec",
+            spec_hash=stable_sha256("manifest-spec"),
         )
 
         compiled = compile_automation_manifest_content(

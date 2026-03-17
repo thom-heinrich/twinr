@@ -153,6 +153,30 @@ class InterruptibleSpeechOutputTests(unittest.TestCase):
         output.close(timeout_s=2.0)
         output.raise_if_error()
 
+    def test_wait_until_idle_observes_playback_completion(self) -> None:
+        tts_provider = SlowTTSProvider()
+        player = InterruptiblePlayer()
+
+        output = InterruptibleSpeechOutput(
+            tts_provider=tts_provider,
+            player=player,
+            chunk_size=512,
+            segment_boundary=lambda text: len(text) if text.strip() else None,
+        )
+
+        output.submit_lane_delta(
+            SpeechLaneDelta(
+                text="Ich schaue kurz nach.",
+                lane="filler",
+            )
+        )
+
+        self.assertTrue(output.wait_for_first_audio(timeout_s=1.0))
+        self.assertFalse(output.wait_until_idle(timeout_s=0.05))
+        self.assertTrue(output.wait_until_idle(timeout_s=1.0))
+        output.close(timeout_s=2.0)
+        output.raise_if_error()
+
     def test_external_stop_interrupts_current_playback(self) -> None:
         tts_provider = SlowTTSProvider()
         player = InterruptiblePlayer()

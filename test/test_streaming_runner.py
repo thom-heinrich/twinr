@@ -2115,6 +2115,76 @@ class StreamingRunnerTests(unittest.TestCase):
             trace.index("tts_start:Heute wird es sonnig."),
         )
 
+    def test_full_context_direct_supervisor_decision_uses_filler_and_final_lane(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            trace: list[str] = []
+            tts_provider = TraceTextToSpeechProvider(config, trace)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=tts_provider,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
+                action="direct",
+                spoken_ack=None,
+                spoken_reply="Ich kann mich nicht erinnern.",
+                kind="memory",
+                goal="Recall what Twinr and the user discussed earlier today.",
+                allow_web_search=None,
+                context_scope="full_context",
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+
+            def fake_final_response(transcript: str, *, turn_instructions: str | None, prefetched_decision=None):
+                del transcript, turn_instructions, prefetched_decision
+                return SimpleNamespace(
+                    text="Vorhin haben wir über das Wetter gesprochen.",
+                    response_id="resp_final",
+                    request_id="req_final",
+                    rounds=1,
+                    tool_calls=(),
+                    used_web_search=False,
+                    model="gpt-4o-mini",
+                    token_usage=None,
+                )
+
+            loop._run_dual_lane_final_response = fake_final_response  # type: ignore[method-assign]
+
+            keep_listening = loop._run_single_text_turn(
+                transcript="Worüber haben wir heute geredet?",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertEqual(runtime.last_response, "Vorhin haben wir über das Wetter gesprochen.")
+        self.assertLess(
+            trace.index("tts_start:Einen Moment bitte."),
+            trace.index("tts_start:Vorhin haben wir über das Wetter gesprochen."),
+        )
+
     def test_interrupt_does_not_wait_for_stalled_tts_first_chunk(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -2639,6 +2709,45 @@ class StreamingRunnerTests(unittest.TestCase):
             loop._on_streaming_stt_endpoint(SimpleNamespace(transcript="Alles okay bei dir", event_type="speech_final"))
 
         self.assertEqual(seen, ["Alles okay bei dir"])
+
+    def test_capture_and_transcribe_streaming_resets_speculative_supervisor_before_capture(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=TwinrRuntime(config=config),
+                tool_agent_provider=FakeToolAgentProvider(config),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            sequence: list[str] = []
+            expected = (SimpleNamespace(pcm_bytes=b""), "Hallo", 11, 22, None)
+            loop._reset_speculative_supervisor_decision = lambda: sequence.append("reset")  # type: ignore[method-assign]
+            loop._capture_and_transcribe_with_turn_controller = lambda **kwargs: (  # type: ignore[method-assign]
+                sequence.append("capture") or expected
+            )
+
+            result = loop._capture_and_transcribe_streaming(
+                listening_window=SimpleNamespace(speech_pause_ms=450),
+                speech_start_chunks=2,
+                ignore_initial_ms=75,
+            )
+
+        self.assertEqual(sequence, ["reset", "capture"])
+        self.assertIs(result, expected)
 
     def test_streaming_endpoint_can_prime_speculative_first_word(self) -> None:
         with TemporaryDirectory() as temp_dir:

@@ -7,6 +7,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from test.self_coding_test_utils import stable_sha256
 from twinr.agent.self_coding import (
     ActivationRecord,
     ArtifactKind,
@@ -37,14 +38,14 @@ class SelfCodingStoreTests(unittest.TestCase):
                 skill_name="Read Messages",
                 status=CompileJobStatus.QUEUED,
                 requested_target=CompileTarget.AUTOMATION_MANIFEST,
-                spec_hash="old-spec",
+                spec_hash=stable_sha256("old-spec"),
                 created_at=datetime(2026, 3, 16, 14, 0, tzinfo=UTC),
                 updated_at=datetime(2026, 3, 16, 14, 1, tzinfo=UTC),
             )
             newer = replace(
                 older,
                 job_id="job_newer123",
-                spec_hash="new-spec",
+                spec_hash=stable_sha256("new-spec"),
                 updated_at=datetime(2026, 3, 16, 14, 2, tzinfo=UTC),
             )
 
@@ -54,7 +55,7 @@ class SelfCodingStoreTests(unittest.TestCase):
             loaded = store.load_job("job_newer123")
             all_jobs = store.list_jobs()
 
-        self.assertEqual(loaded.spec_hash, "new-spec")
+        self.assertEqual(loaded.spec_hash, stable_sha256("new-spec"))
         self.assertEqual(tuple(job.job_id for job in all_jobs), ("job_newer123", "job_older123"))
 
     def test_write_text_artifact_and_attach_it_to_job(self) -> None:
@@ -66,7 +67,7 @@ class SelfCodingStoreTests(unittest.TestCase):
                 skill_name="Read Calendar",
                 status=CompileJobStatus.COMPILING,
                 requested_target=CompileTarget.AUTOMATION_MANIFEST,
-                spec_hash="artifact-spec",
+                spec_hash=stable_sha256("artifact-spec"),
             )
             store.save_job(job)
 

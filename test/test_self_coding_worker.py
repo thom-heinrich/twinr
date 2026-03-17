@@ -8,6 +8,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from test.self_coding_test_utils import stable_sha256
 from twinr.agent.self_coding import (
     ArtifactKind,
     CompileJobRecord,
@@ -130,7 +131,7 @@ class SelfCodingCompileWorkerTests(unittest.TestCase):
                     skill_name="Fallback Skill",
                     status=CompileJobStatus.QUEUED,
                     requested_target=CompileTarget.AUTOMATION_MANIFEST,
-                    spec_hash="fallback-spec",
+                    spec_hash=stable_sha256("fallback-spec"),
                 ),
                 session=_ready_session(),
                 prompt="compile",
@@ -323,7 +324,7 @@ class SelfCodingCompileWorkerTests(unittest.TestCase):
             skill_name="Read Emails",
             status=CompileJobStatus.QUEUED,
             requested_target=CompileTarget.AUTOMATION_MANIFEST,
-            spec_hash="prompt-spec",
+            spec_hash=stable_sha256("prompt-spec"),
         )
 
         prompt = SelfCodingCompileWorker._build_prompt(job, session)
@@ -348,7 +349,7 @@ class SelfCodingCompileWorkerTests(unittest.TestCase):
             skill_name="Morning Briefing",
             status=CompileJobStatus.QUEUED,
             requested_target=CompileTarget.SKILL_PACKAGE,
-            spec_hash="skill-prompt-spec",
+            spec_hash=stable_sha256("skill-prompt-spec"),
         )
 
         prompt = SelfCodingCompileWorker._build_prompt(job, session)

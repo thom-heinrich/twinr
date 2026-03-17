@@ -120,6 +120,9 @@ class SupervisorDecision:
     kind: str | None = None
     goal: str | None = None
     allow_web_search: bool | None = None
+    location_hint: str | None = None
+    date_context: str | None = None
+    context_scope: str | None = None
     response_id: str | None = None
     request_id: str | None = None
     model: str | None = None
@@ -130,6 +133,35 @@ class SupervisorDecision:
         if normalized not in {"direct", "handoff", "end_conversation"}:
             raise ValueError(f"Unsupported supervisor action: {self.action}")
         object.__setattr__(self, "action", normalized)
+        object.__setattr__(
+            self,
+            "context_scope",
+            normalize_supervisor_decision_context_scope(self.context_scope),
+        )
+
+
+_SUPERVISOR_CONTEXT_SCOPES = frozenset({"tiny_recent", "full_context"})
+
+
+def normalize_supervisor_decision_context_scope(value: object) -> str | None:
+    """Return the validated supervisor decision context scope, if present."""
+
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in _SUPERVISOR_CONTEXT_SCOPES:
+        return normalized
+    return None
+
+
+def supervisor_decision_requires_full_context(decision: object | None) -> bool:
+    """Return whether a supervisor decision says the fast lane lacks context."""
+
+    if decision is None:
+        return False
+    return normalize_supervisor_decision_context_scope(
+        getattr(decision, "context_scope", None)
+    ) == "full_context"
 
 
 @dataclass(frozen=True, slots=True)

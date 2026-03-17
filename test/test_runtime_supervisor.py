@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
-from twinr.display.heartbeat import DisplayHeartbeatStore, build_display_heartbeat
 from twinr.agent.workflows.required_remote_snapshot import RequiredRemoteWatchdogAssessment
 from twinr.ops.health import ServiceHealth, TwinrSystemHealth
 from twinr.ops.remote_memory_watchdog import RemoteMemoryWatchdogStore
@@ -469,7 +468,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
         self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)
         self.assertEqual(health_call_count, 0)
 
-    def test_run_waits_for_current_streaming_child_display_heartbeat_before_enforcing_display_health(self) -> None:
+    def test_run_does_not_require_display_heartbeat_before_enforcing_health(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self._build_config(root)
@@ -512,9 +511,9 @@ class RuntimeSupervisorTests(unittest.TestCase):
             supervisor.run(duration_s=12.0)
 
         self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)
-        self.assertEqual(health_call_count, 0)
+        self.assertGreaterEqual(health_call_count, 2)
 
-    def test_run_starts_display_health_checks_after_current_child_emits_display_heartbeat(self) -> None:
+    def test_run_does_not_restart_streaming_when_display_heartbeat_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = self._build_config(root)
@@ -527,28 +526,6 @@ class RuntimeSupervisorTests(unittest.TestCase):
                 health_call_count += 1
                 return _build_health(display_running=False, display_count=0)
 
-            def _sleep(seconds: float) -> None:
-                clock.sleep(seconds)
-                streaming_process = next(
-                    (process for process in reversed(factory.processes) if process.key == "streaming"),
-                    None,
-                )
-                if streaming_process is None:
-                    return
-                if clock.monotonic() < 1.0:
-                    return
-                DisplayHeartbeatStore.from_config(config).save(
-                    build_display_heartbeat(
-                        runtime_status="waiting",
-                        phase="idle",
-                        seq=1,
-                        pid=streaming_process.pid,
-                        updated_at=clock.utcnow(),
-                        last_render_started_at=clock.utcnow(),
-                        last_render_completed_at=clock.utcnow(),
-                    )
-                )
-
             supervisor = TwinrRuntimeSupervisor(
                 config=config,
                 env_file=root / ".env",
@@ -557,7 +534,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
                 health_collector=_health_collector,
                 watchdog_assessor=lambda _config: _build_assessment(ready=True),
                 monotonic=clock.monotonic,
-                sleep=_sleep,
+                sleep=clock.sleep,
                 utcnow=clock.utcnow,
                 loop_owner=lambda _config, name: (
                     next(
@@ -575,7 +552,7 @@ class RuntimeSupervisorTests(unittest.TestCase):
                 restart_backoff_s=0.0,
             )
 
-            supervisor.run(duration_s=6.0)
+            supervisor.run(duration_s=70.0)
 
         self.assertGreaterEqual(health_call_count, 2)
         self.assertEqual([call["key"] for call in factory.calls].count("streaming"), 1)

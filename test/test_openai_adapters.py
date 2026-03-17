@@ -456,7 +456,9 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
                 model="gpt-4o-mini",
                 output_text=(
                     '{"action":"handoff","spoken_ack":"Ich schaue kurz nach.","spoken_reply":null,'
-                    '"kind":"search","goal":"weather tomorrow","allow_web_search":true}'
+                    '"kind":"search","goal":"weather tomorrow","allow_web_search":true,'
+                    '"location_hint":"Schwarzenbek","date_context":"Tuesday, 2026-03-17 (Europe/Berlin)",'
+                    '"context_scope":"full_context"}'
                 ),
                 output=[],
                 usage=None,
@@ -481,6 +483,9 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
         self.assertEqual(decision.spoken_ack, "Ich schaue kurz nach.")
         self.assertEqual(decision.kind, "search")
         self.assertTrue(decision.allow_web_search)
+        self.assertEqual(decision.location_hint, "Schwarzenbek")
+        self.assertEqual(decision.date_context, "Tuesday, 2026-03-17 (Europe/Berlin)")
+        self.assertEqual(decision.context_scope, "full_context")
         self.assertEqual(request["model"], "gpt-4o-mini")
         self.assertIn("Supervisor decision base instructions", request["instructions"])
         self.assertIn("Runtime extra", request["instructions"])
@@ -488,3 +493,6 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
         self.assertEqual(request["prompt_cache_key"], "twinr:supervisor_decision:gpt-4o-mini:de")
         self.assertEqual(request["max_output_tokens"], 80)
         self.assertEqual(request["text"]["format"]["type"], "json_schema")
+        self.assertIn("location_hint", request["text"]["format"]["schema"]["properties"])
+        self.assertIn("date_context", request["text"]["format"]["schema"]["properties"])
+        self.assertIn("context_scope", request["text"]["format"]["schema"]["properties"])

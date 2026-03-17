@@ -225,13 +225,17 @@ class InterruptibleSpeechOutput:
         self._generation = 0
         self._cancel_event = Event()
         self._segment_lock = Lock()
+        self._idle_event = Event()
         self._error_lock = Lock()
         self._first_audio_lock = Lock()
         self._first_audio_event = Event()
         self._answer_started = False
         self._first_audio_emitted = False
+        self._queued_items = 0
+        self._playing = False
         self._errors: list[Exception] = []
         self._worker = Thread(target=self._tts_worker, daemon=True)
+        self._idle_event.set()
         self._worker.start()
         self._trace("speech_output_initialized", chunk_size=self.chunk_size)
 
@@ -286,6 +290,16 @@ class InterruptibleSpeechOutput:
         self._trace("speech_output_first_audio_wait_completed", timeout_s=timeout_s, ready=ready)
         return ready
 
+    def wait_until_idle(self, *, timeout_s: float | None = None) -> bool:
+        """Wait until no queued or active speech remains for the current output."""
+
+        if self._idle_event.is_set():
+            self._trace("speech_output_idle_already_ready", timeout_s=timeout_s)
+            return True
+        ready = self._idle_event.wait(timeout=timeout_s)
+        self._trace("speech_output_idle_wait_completed", timeout_s=timeout_s, ready=ready)
+        return ready
+
     def raise_if_error(self) -> None:
         with self._error_lock:
             error = self._errors[0] if self._errors else None
@@ -308,9 +322,11 @@ class InterruptibleSpeechOutput:
             if atomic:
                 self._pending_segment = ""
                 self._enqueue_locked(cleaned, atomic=True)
+                self._update_idle_locked()
                 return
             self._pending_segment += cleaned
             self._queue_ready_segments_locked()
+            self._update_idle_locked()
 
     def _preempt_locked(self) -> None:
         if self._pending_segment.strip():
@@ -318,6 +334,7 @@ class InterruptibleSpeechOutput:
         self._generation += 1
         self._cancel_event.set()
         self._cancel_event = Event()
+        self._update_idle_locked()
         self._trace("speech_output_preempted", generation=self._generation)
         if self.on_preempt is not None:
             self.on_preempt()
@@ -343,6 +360,7 @@ class InterruptibleSpeechOutput:
         self._enqueue_locked(segment)
 
     def _enqueue_locked(self, segment: str, *, atomic: bool = False) -> None:
+        self._queued_items += 1
         self._queue.put(
             _PlaybackItem(
                 text=segment,
@@ -365,13 +383,19 @@ class InterruptibleSpeechOutput:
                 self._trace("speech_output_worker_exit", reason="sentinel")
                 return
             with self._segment_lock:
+                self._queued_items = max(0, self._queued_items - 1)
                 current_generation = self._generation
+                self._playing = True
+                self._update_idle_locked()
             if item.generation != current_generation:
                 self._trace(
                     "speech_output_stale_item_skipped",
                     item_generation=item.generation,
                     current_generation=current_generation,
                 )
+                with self._segment_lock:
+                    self._playing = False
+                    self._update_idle_locked()
                 continue
             try:
                 self._trace(
@@ -385,7 +409,13 @@ class InterruptibleSpeechOutput:
                 with self._error_lock:
                     self._errors.append(exc)
                 self._trace("speech_output_worker_failed", error_type=type(exc).__name__)
+                with self._segment_lock:
+                    self._playing = False
+                    self._update_idle_locked()
                 return
+            with self._segment_lock:
+                self._playing = False
+                self._update_idle_locked()
 
     def _play_item(self, item: _PlaybackItem) -> None:
         pump = _TTSChunkPump(
@@ -487,3 +517,12 @@ class InterruptibleSpeechOutput:
             except Exception:
                 return _INTERRUPTED_TTS_PUMP_JOIN_TIMEOUT_SECONDS
         return _TTS_PUMP_JOIN_TIMEOUT_SECONDS
+
+    def _update_idle_locked(self) -> None:
+        """Refresh the idle signal after queue or playback state changes."""
+
+        has_pending_text = bool(self._pending_segment.strip())
+        if self._queued_items == 0 and not self._playing and not has_pending_text:
+            self._idle_event.set()
+            return
+        self._idle_event.clear()

@@ -28,10 +28,9 @@ from twinr.agent.tools import (
     realtime_tool_names,
 )
 from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
-from twinr.agent.workflows.listen_timeout_diagnostics import (
-    diagnostics_as_details,
-    diagnostics_from_exception,
-    emit_listen_timeout_diagnostics,
+from twinr.agent.workflows.streaming_capture import (
+    StreamingAudioTurnRequest,
+    StreamingCaptureController,
 )
 from twinr.agent.workflows.streaming_lane_planner import StreamingLanePlanner
 from twinr.agent.workflows.streaming_speculation import StreamingSpeculationController
@@ -43,7 +42,7 @@ from twinr.agent.workflows.streaming_turn_coordinator import (
     StreamingTurnSpeechServices,
 )
 from twinr.agent.workflows.streaming_turn_orchestrator import StreamingTurnTimeoutPolicy
-from twinr.hardware.audio import SilenceDetectedRecorder, pcm16_to_wav_bytes
+from twinr.hardware.audio import SilenceDetectedRecorder
 from twinr.providers.factory import build_streaming_provider_bundle
 from twinr.providers.openai import (
     OpenAIBackend,
@@ -150,6 +149,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
             tool_schemas=tool_schemas,
         )
         self.first_word_provider: FirstWordProvider | None = getattr(self, "first_word_provider", None)
+        self._streaming_capture = StreamingCaptureController(self)
         self._streaming_speculation = StreamingSpeculationController(self)
         self._streaming_lane_planner = StreamingLanePlanner(self)
         self._prime_supervisor_decision_cache()
@@ -311,45 +311,17 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         speech_start_chunks: int | None,
         ignore_initial_ms: int,
     ):
-        self._reset_speculative_supervisor_decision()
-        self._trace_event(
-            "streaming_capture_cycle_reset_speculation",
-            kind="branch",
-            details={
-                "speech_start_chunks": speech_start_chunks,
-                "ignore_initial_ms": ignore_initial_ms,
-                "pause_ms": listening_window.speech_pause_ms,
-            },
-        )
-        return super()._capture_and_transcribe_streaming(
+        return self._streaming_capture.capture_and_transcribe_streaming(
             listening_window=listening_window,
             speech_start_chunks=speech_start_chunks,
             ignore_initial_ms=ignore_initial_ms,
         )
 
     def _on_streaming_stt_interim(self, text: str) -> None:
-        self._trace_event(
-            "streaming_stt_interim_received",
-            kind="io",
-            details={"text_len": len(text.strip()), "preview": text.strip()[:80]},
-        )
-        self._maybe_start_speculative_first_word(text)
-        self._maybe_start_speculative_supervisor_decision(text)
+        self._streaming_capture.handle_stt_interim(text)
 
     def _on_streaming_stt_endpoint(self, event) -> None:
-        transcript = str(getattr(event, "transcript", "") or "").strip()
-        self._trace_event(
-            "streaming_stt_endpoint_received",
-            kind="io",
-            details={
-                "text_len": len(transcript),
-                "speech_final": bool(getattr(event, "speech_final", False)),
-                "utterance_end": bool(getattr(event, "utterance_end", False)),
-            },
-        )
-        if transcript:
-            self._maybe_start_speculative_first_word(transcript)
-            self._maybe_start_speculative_supervisor_decision(transcript)
+        self._streaming_capture.handle_stt_endpoint(event)
 
     def _maybe_start_speculative_first_word(self, text: str) -> None:
         self._streaming_speculation.maybe_start_first_word(text)
@@ -439,226 +411,19 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         timeout_message: str,
         play_initial_beep: bool,
     ) -> bool:
-        turn_started = time.monotonic()
-        self._trace_event(
-            "streaming_audio_turn_started",
-            kind="span_start",
-            details={
-                "initial_source": initial_source,
-                "follow_up": follow_up,
-                "listen_source": listen_source,
-                "play_initial_beep": play_initial_beep,
-            },
-        )
-        if listen_source == "button":
-            self.runtime.press_green_button()
-        else:
-            if follow_up and getattr(self.runtime.status, "value", None) == "listening":
-                self._trace_event(
-                    "streaming_follow_up_reuse_listening_state",
-                    kind="branch",
-                    details={"listen_source": listen_source},
-                )
-            else:
-                self.runtime.begin_listening(
-                    request_source=listen_source,
-                    proactive_trigger=proactive_trigger,
-                )
-        self._emit_status(force=True)
-        if play_initial_beep:
-            self._play_listen_beep()
-
-        capture_started = time.monotonic()
-        try:
-            with self._audio_lock:
-                self._trace_event(
-                    "streaming_audio_capture_started",
-                    kind="span_start",
-                    details={
-                        "streaming_stt": isinstance(self.stt_provider, StreamingSpeechToTextProvider),
-                        "speech_start_chunks": speech_start_chunks,
-                        "ignore_initial_ms": ignore_initial_ms,
-                    },
-                )
-                if isinstance(self.stt_provider, StreamingSpeechToTextProvider):
-                    try:
-                        self._trace_event("streaming_audio_capture_path", kind="decision", details={"path": "streaming_stt"})
-                        capture_result, transcript, capture_ms, stt_ms, _turn_label = self._capture_and_transcribe_streaming(
-                            listening_window=listening_window,
-                            speech_start_chunks=speech_start_chunks,
-                            ignore_initial_ms=ignore_initial_ms,
-                        )
-                    except RuntimeError as exc:
-                        if self._is_no_speech_timeout(exc):
-                            raise
-                        self.emit(f"turn_controller_fallback={type(exc).__name__}")
-                        self._trace_event(
-                            "streaming_audio_capture_fallback",
-                            kind="branch",
-                            level="WARN",
-                            details={"error_type": type(exc).__name__, "path": "streaming_stt"},
-                        )
-                        capture_result = self.recorder.capture_pcm_until_pause_with_options(
-                            pause_ms=listening_window.speech_pause_ms,
-                            start_timeout_s=listening_window.start_timeout_s,
-                            speech_start_chunks=speech_start_chunks,
-                            ignore_initial_ms=ignore_initial_ms,
-                            pause_grace_ms=listening_window.pause_grace_ms,
-                            should_stop=self._active_turn_stop_requested,
-                        )
-                        capture_ms = int((time.monotonic() - capture_started) * 1000)
-                        stt_ms = -1
-                        transcript = ""
-                    except Exception as exc:
-                        self.emit(f"turn_controller_fallback={type(exc).__name__}")
-                        self._trace_event(
-                            "streaming_audio_capture_fallback",
-                            kind="branch",
-                            level="WARN",
-                            details={"error_type": type(exc).__name__, "path": "streaming_stt"},
-                        )
-                        capture_result = self.recorder.capture_pcm_until_pause_with_options(
-                            pause_ms=listening_window.speech_pause_ms,
-                            start_timeout_s=listening_window.start_timeout_s,
-                            speech_start_chunks=speech_start_chunks,
-                            ignore_initial_ms=ignore_initial_ms,
-                            pause_grace_ms=listening_window.pause_grace_ms,
-                            should_stop=self._active_turn_stop_requested,
-                        )
-                        capture_ms = int((time.monotonic() - capture_started) * 1000)
-                        stt_ms = -1
-                        transcript = ""
-                else:
-                    self._trace_event("streaming_audio_capture_path", kind="decision", details={"path": "recorder_only"})
-                    capture_result = self.recorder.capture_pcm_until_pause_with_options(
-                        pause_ms=listening_window.speech_pause_ms,
-                        start_timeout_s=listening_window.start_timeout_s,
-                        speech_start_chunks=speech_start_chunks,
-                        ignore_initial_ms=ignore_initial_ms,
-                        pause_grace_ms=listening_window.pause_grace_ms,
-                        should_stop=self._active_turn_stop_requested,
-                    )
-                    capture_ms = int((time.monotonic() - capture_started) * 1000)
-                    stt_ms = -1
-                    transcript = ""
-                self._trace_event(
-                    "streaming_audio_capture_completed",
-                    kind="span_end",
-                    details={
-                        "pcm_bytes": len(capture_result.pcm_bytes),
-                        "speech_started_after_ms": capture_result.speech_started_after_ms,
-                        "resumed_after_pause_count": capture_result.resumed_after_pause_count,
-                    },
-                    kpi={"duration_ms": capture_ms},
-                )
-        except RuntimeError as exc:
-            if self._active_turn_stop_requested():
-                self._cancel_interrupted_turn()
-                self._trace_event("streaming_audio_turn_interrupted_during_capture", kind="branch", details={})
-                return False
-            if not self._is_no_speech_timeout(exc):
-                raise
-            timeout_diagnostics = diagnostics_from_exception(exc)
-            emit_listen_timeout_diagnostics(self.emit, timeout_diagnostics)
-            self.runtime.remember_listen_timeout(
+        return self._streaming_capture.run_audio_turn(
+            StreamingAudioTurnRequest(
                 initial_source=initial_source,
                 follow_up=follow_up,
-            )
-            self.runtime.cancel_listening()
-            self._emit_status(force=True)
-            self.emit(f"{timeout_emit_key}=true")
-            self._record_event("listen_timeout", timeout_message, request_source=listen_source)
-            self._trace_event(
-                "streaming_audio_turn_timeout_no_speech",
-                kind="warning",
-                level="WARN",
-                details={
-                    "timeout_emit_key": timeout_emit_key,
-                    "listen_source": listen_source,
-                    **diagnostics_as_details(timeout_diagnostics),
-                },
-            )
-            return False
-        audio_pcm = capture_result.pcm_bytes
-        self.runtime.remember_listen_capture(
-            initial_source=initial_source,
-            follow_up=follow_up,
-            speech_started_after_ms=capture_result.speech_started_after_ms,
-            resumed_after_pause_count=capture_result.resumed_after_pause_count,
-        )
-        self._update_voice_assessment_from_pcm(audio_pcm)
-
-        recorder_sample_rate = self._recorder_sample_rate()
-        self._current_turn_audio_pcm = audio_pcm
-        self._current_turn_audio_sample_rate = recorder_sample_rate
-        try:
-            if stt_ms < 0:
-                audio_bytes = pcm16_to_wav_bytes(
-                    audio_pcm,
-                    sample_rate=recorder_sample_rate,
-                    channels=self.config.audio_channels,
-                )
-                stt_started = time.monotonic()
-                self._trace_event(
-                    "streaming_batch_stt_started",
-                    kind="llm_call",
-                    details={"audio_bytes": len(audio_bytes)},
-                )
-                transcript = self.stt_provider.transcribe(
-                    audio_bytes,
-                    filename="twinr-streaming-listen.wav",
-                    content_type="audio/wav",
-                ).strip()
-                stt_ms = int((time.monotonic() - stt_started) * 1000)
-                self._trace_event(
-                    "streaming_batch_stt_completed",
-                    kind="llm_call",
-                    details={"transcript_len": len(transcript)},
-                    kpi={"duration_ms": stt_ms},
-                )
-            if not transcript:
-                self._trace_event(
-                    "streaming_transcript_empty_after_stt",
-                    kind="warning",
-                    level="WARN",
-                    details={"capture_ms": capture_ms, "stt_ms": stt_ms},
-                )
-                raise RuntimeError("Speech-to-text returned an empty transcript")
-            self.emit(f"transcript={transcript}")
-            self._trace_event(
-                "streaming_transcript_ready",
-                kind="observation",
-                details={"transcript_len": len(transcript), "capture_ms": capture_ms, "stt_ms": stt_ms},
-            )
-            return self._complete_streaming_turn(
-                transcript=transcript,
+                listening_window=listening_window,
                 listen_source=listen_source,
                 proactive_trigger=proactive_trigger,
-                turn_started=turn_started,
-                capture_ms=capture_ms,
-                stt_ms=stt_ms,
-                allow_follow_up_rearm=self._follow_up_allowed_for_source(initial_source=initial_source),
+                speech_start_chunks=speech_start_chunks,
+                ignore_initial_ms=ignore_initial_ms,
+                timeout_emit_key=timeout_emit_key,
+                timeout_message=timeout_message,
+                play_initial_beep=play_initial_beep,
             )
-        finally:
-            self._current_turn_audio_pcm = None
-            self._trace_event(
-                "streaming_audio_turn_finished",
-                kind="span_end",
-                kpi={"duration_ms": round((time.monotonic() - turn_started) * 1000.0, 3)},
-            )
-
-    def _capture_and_transcribe_streaming(
-        self,
-        *,
-        listening_window,
-        speech_start_chunks: int | None,
-        ignore_initial_ms: int,
-    ):
-        return self._capture_and_transcribe_with_turn_controller(
-            stt_provider=self.stt_provider,
-            listening_window=listening_window,
-            speech_start_chunks=speech_start_chunks,
-            ignore_initial_ms=ignore_initial_ms,
         )
 
     def _run_single_text_turn(

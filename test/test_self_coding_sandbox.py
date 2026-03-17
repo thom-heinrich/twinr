@@ -44,6 +44,9 @@ def _ready_session(*, session_id: str, skill_name: str = "Sandbox Probe") -> Req
 
 
 def _package_payload(skill_code: str) -> str:
+    normalized_code = skill_code.strip()
+    if not normalized_code.startswith("from __future__ import annotations"):
+        normalized_code = "from __future__ import annotations\n\n" + normalized_code
     return json.dumps(
         {
             "skill_package": {
@@ -63,7 +66,7 @@ def _package_payload(skill_code: str) -> str:
                 "files": [
                     {
                         "path": "skill_main.py",
-                        "content": skill_code.strip(),
+                        "content": normalized_code,
                     }
                 ],
             }

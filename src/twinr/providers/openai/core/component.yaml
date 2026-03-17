@@ -80,9 +80,9 @@ compatibility_reexports:
       - _should_send_project_header
 primary_callers:
   - path: src/twinr/__main__.py
-  - path: src/twinr/agent/workflows/realtime_runner_background.py
-  - path: src/twinr/agent/workflows/realtime_runner_support.py
-  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/workflows/realtime_runtime/background.py
+  - path: src/twinr/agent/workflows/realtime_runtime/support.py
+  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/proactive/social/observers.py
   - path: src/twinr/proactive/social/vision_review.py
   - path: src/twinr/providers/openai/__init__.py

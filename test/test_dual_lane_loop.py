@@ -167,6 +167,9 @@ class FakeSupervisorDecisionProvider:
             kind=self.decision.get("kind"),
             goal=self.decision.get("goal"),
             allow_web_search=self.decision.get("allow_web_search"),
+            location_hint=self.decision.get("location_hint"),
+            date_context=self.decision.get("date_context"),
+            context_scope=self.decision.get("context_scope"),
             response_id="decision_1",
             request_id="req_decision_1",
             model="gpt-4o-mini",
@@ -398,6 +401,7 @@ class DualLaneLoopTests(unittest.TestCase):
     def test_structured_supervisor_decision_can_handoff_without_tool_loop_supervisor(self) -> None:
         supervisor = FakeSupervisorProvider()
         specialist = FakeSpecialistProvider()
+        search_calls: list[dict[str, object]] = []
         decision_provider = FakeSupervisorDecisionProvider(
             {
                 "action": "handoff",
@@ -405,6 +409,9 @@ class DualLaneLoopTests(unittest.TestCase):
                 "kind": "search",
                 "goal": "Weather tomorrow in Schwarzenbek.",
                 "allow_web_search": True,
+                "location_hint": "Schwarzenbek",
+                "date_context": "Tuesday, 2026-03-17 (Europe/Berlin)",
+                "context_scope": "full_context",
             }
         )
         streamed: list[str] = []
@@ -413,7 +420,7 @@ class DualLaneLoopTests(unittest.TestCase):
             specialist_provider=specialist,
             supervisor_decision_provider=decision_provider,
             tool_handlers={
-                "search_live_info": lambda arguments: {"answer": "8 Grad", "arguments": arguments},
+                "search_live_info": lambda arguments: search_calls.append(arguments) or {"answer": "8 Grad", "arguments": arguments},
             },
             tool_schemas=[{"type": "function", "name": "search_live_info"}],
             supervisor_instructions="Supervisor instructions",
@@ -431,6 +438,16 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertEqual(len(supervisor.start_calls), 0)
         self.assertEqual(decision_provider.calls[0]["conversation"], (("user", "kurzer kontext"),))
         self.assertEqual(specialist.start_calls, [])
+        self.assertEqual(
+            search_calls,
+            [
+                {
+                    "question": "Wie wird das Wetter morgen in Schwarzenbek?",
+                    "location_hint": "Schwarzenbek",
+                    "date_context": "Tuesday, 2026-03-17 (Europe/Berlin)",
+                }
+            ],
+        )
         self.assertEqual(result.tool_calls[0].name, "handoff_specialist_worker")
         self.assertTrue(result.used_web_search)
 
@@ -460,6 +477,73 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertEqual(result.text, "Hallo!")
         self.assertEqual(streamed, ["Hallo!"])
         self.assertEqual(len(specialist.start_calls), 0)
+
+    def test_structured_supervisor_direct_full_context_downgrades_to_memory_handoff(self) -> None:
+        supervisor = FakeSupervisorProvider()
+
+        class MemorySpecialistProvider:
+            def __init__(self) -> None:
+                self.start_calls: list[dict[str, object]] = []
+
+            def start_turn_streaming(
+                self,
+                prompt: str,
+                *,
+                conversation=None,
+                instructions=None,
+                tool_schemas=(),
+                allow_web_search=None,
+                on_text_delta=None,
+            ) -> ToolCallingTurnResponse:
+                self.start_calls.append(
+                    {
+                        "prompt": prompt,
+                        "conversation": conversation,
+                        "instructions": instructions,
+                        "tool_schemas": list(tool_schemas),
+                        "allow_web_search": allow_web_search,
+                    }
+                )
+                if on_text_delta is not None:
+                    on_text_delta("Vorhin haben wir über das Wetter gesprochen.")
+                return ToolCallingTurnResponse(
+                    text="Vorhin haben wir über das Wetter gesprochen.",
+                    response_id="memory_done",
+                    model="gpt-5.2",
+                )
+
+        specialist = MemorySpecialistProvider()
+        decision_provider = FakeSupervisorDecisionProvider(
+            {
+                "action": "direct",
+                "spoken_reply": "Ich kann mich nicht erinnern.",
+                "spoken_ack": None,
+                "kind": "memory",
+                "goal": "Recall what Twinr and the user discussed earlier today.",
+                "context_scope": "full_context",
+            }
+        )
+        streamed: list[str] = []
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            supervisor_decision_provider=decision_provider,
+            tool_handlers={},
+            tool_schemas=[],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+
+        result = loop.run(
+            "Worüber haben wir heute geredet?",
+            specialist_conversation=(("system", "reicher erinnerungskontext"),),
+            on_text_delta=streamed.append,
+        )
+
+        self.assertEqual(streamed[0], "Einen Moment bitte.")
+        self.assertEqual(result.text, "Vorhin haben wir über das Wetter gesprochen.")
+        self.assertEqual(len(specialist.start_calls), 1)
+        self.assertEqual(specialist.start_calls[0]["conversation"], (("system", "reicher erinnerungskontext"),))
 
     def test_prefetched_decision_skips_supervisor_decision_provider_roundtrip(self) -> None:
         supervisor = FakeSupervisorProvider()

@@ -80,6 +80,10 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("one or two short sentences", instructions)
         self.assertIn("without sounding canned", instructions)
         self.assertIn("must not imply the task is already finished", instructions)
+        self.assertIn("context_scope", instructions)
+        self.assertIn("location_hint", instructions)
+        self.assertIn("date_context", instructions)
+        self.assertIn("broader memory", instructions)
         self.assertIn("put the full user-facing answer into spoken_reply", instructions)
         self.assertIn("Do not wait for the specialist result", instructions)
 

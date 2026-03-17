@@ -65,9 +65,9 @@ primary_callers:
   - path: src/twinr/__main__.py
   - path: src/twinr/providers/__init__.py
   - path: src/twinr/providers/factory.py
-  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
-  - path: src/twinr/agent/workflows/realtime_runner_support.py
+  - path: src/twinr/agent/workflows/realtime_runtime/support.py
   - path: src/twinr/agent/workflows/streaming_runner.py
   - path: src/twinr/orchestrator/session.py
   - path: src/twinr/proactive/runtime/service.py

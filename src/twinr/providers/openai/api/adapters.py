@@ -642,6 +642,28 @@ _SUPERVISOR_DECISION_SCHEMA: dict[str, Any] = {
             "type": ["boolean", "null"],
             "description": "True only when the specialist may use live web search.",
         },
+        "location_hint": {
+            "type": ["string", "null"],
+            "description": (
+                "Explicit place already named by the user for this turn. "
+                "Use null only when the turn did not name a concrete place."
+            ),
+        },
+        "date_context": {
+            "type": ["string", "null"],
+            "description": (
+                "Explicit absolute or resolved local date context for the turn. "
+                "Use null when no date anchor is needed."
+            ),
+        },
+        "context_scope": {
+            "type": ["string", "null"],
+            "enum": ["tiny_recent", "full_context", None],
+            "description": (
+                "tiny_recent only when the fast lane can answer safely from the tiny recent context alone. "
+                "full_context when the answer depends on broader memory or richer provider context."
+            ),
+        },
     },
     "required": [
         "action",
@@ -650,6 +672,9 @@ _SUPERVISOR_DECISION_SCHEMA: dict[str, Any] = {
         "kind",
         "goal",
         "allow_web_search",
+        "location_hint",
+        "date_context",
+        "context_scope",
     ],
     "additionalProperties": False,
 }
@@ -788,6 +813,9 @@ class OpenAISupervisorDecisionProvider:
             kind=_optional_text(payload.get("kind")),
             goal=_optional_text(payload.get("goal")),
             allow_web_search=_optional_bool(payload.get("allow_web_search")),
+            location_hint=_optional_text(payload.get("location_hint")),
+            date_context=_optional_text(payload.get("date_context")),
+            context_scope=_optional_text(payload.get("context_scope")),
             response_id=getattr(response, "id", None),
             request_id=getattr(response, "_request_id", None),
             model=extract_model_name(response, model),

@@ -9,8 +9,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.agent.workflows.realtime_runner_background import TwinrRealtimeBackgroundMixin
-from twinr.agent.workflows.realtime_runner_support import TwinrRealtimeSupportMixin
+from twinr.agent.workflows.realtime_runtime.background import TwinrRealtimeBackgroundMixin
+from twinr.agent.workflows.realtime_runtime.support import TwinrRealtimeSupportMixin
 from twinr.config import TwinrConfig
 from twinr.runtime import TwinrRuntime
 from twinr.memory.longterm.runtime.service import LongTermMemoryService

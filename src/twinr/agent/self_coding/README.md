@@ -115,7 +115,7 @@ job = CompileJobRecord(
     skill_name="Read Messages",
     status=CompileJobStatus.QUEUED,
     requested_target=CompileTarget.AUTOMATION_MANIFEST,
-    spec_hash="spec-demo",
+    spec_hash="0" * 64,
 )
 store.save_job(job)
 store.save_compile_status(CompileRunStatusRecord(job_id=job.job_id, phase="starting"))

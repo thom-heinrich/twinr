@@ -605,6 +605,7 @@ class StreamingTurnCoordinator:
             timeout_policy=lane_plan.timeout_policy,
             queue_lane_delta=self._queue_lane_segments,
             wait_for_first_audio=self._speech_output.wait_for_first_audio,
+            wait_until_idle=self._speech_output.wait_until_idle,
             ensure_processing_feedback=self.processing_feedback.ensure_started,
             emit=self.hooks.emit,
             should_stop=self.hooks.should_stop,
@@ -744,8 +745,6 @@ class StreamingTurnCoordinator:
     ) -> _DeferredFollowUpClosureEvaluation | None:
         """Kick off closure evaluation while audio is still draining."""
 
-        if not self.request.allow_follow_up_rearm:
-            return None
         if any(call.name == "end_conversation" for call in response.tool_calls):
             return None
         deferred = _DeferredFollowUpClosureEvaluation(
@@ -768,7 +767,7 @@ class StreamingTurnCoordinator:
     ) -> ConversationClosureEvaluation:
         """Collect the closure evaluation that gates follow-up reopening."""
 
-        if end_conversation or not self.request.allow_follow_up_rearm:
+        if end_conversation:
             return ConversationClosureEvaluation()
         if deferred_closure_evaluation is not None:
             return deferred_closure_evaluation.result()

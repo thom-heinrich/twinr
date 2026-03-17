@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from threading import Event, Lock, Thread
 
-from twinr.agent.base_agent.contracts import FirstWordReply, SupervisorDecision
+from twinr.agent.base_agent.contracts import (
+    FirstWordReply,
+    SupervisorDecision,
+    supervisor_decision_requires_full_context,
+)
 from twinr.agent.base_agent.conversation.turn_controller import _normalize_turn_text
 from twinr.agent.base_agent.prompting.personality import merge_instructions
 from twinr.agent.tools import DualLaneToolLoop
@@ -495,11 +499,21 @@ class StreamingSpeculationController:
     ) -> FirstWordReply | None:
         """Build a bridge reply directly from one resolved supervisor decision."""
 
+        loop = self._loop
+        default_spoken_ack = str(
+            getattr(getattr(loop, "streaming_turn_loop", None), "default_spoken_ack", "Einen Moment bitte.")
+            or "Einen Moment bitte."
+        ).strip()
         fallback_text = ""
         fallback_mode = "filler"
         if prefetched_decision is not None:
             action = str(getattr(prefetched_decision, "action", "") or "").strip().lower()
-            if action in {"direct", "end_conversation"}:
+            if action == "direct" and supervisor_decision_requires_full_context(prefetched_decision):
+                fallback_text = str(
+                    getattr(prefetched_decision, "spoken_ack", None) or default_spoken_ack
+                ).strip()
+                fallback_mode = "filler"
+            elif action in {"direct", "end_conversation"}:
                 fallback_text = str(
                     getattr(prefetched_decision, "spoken_reply", None)
                     or getattr(prefetched_decision, "spoken_ack", None)

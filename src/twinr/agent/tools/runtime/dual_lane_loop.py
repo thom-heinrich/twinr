@@ -21,6 +21,7 @@ from twinr.agent.base_agent.contracts import (
     ConversationLike,
     SupervisorDecisionProvider,
     ToolCallingAgentProvider,
+    supervisor_decision_requires_full_context,
 )
 from twinr.agent.base_agent.prompting.personality import merge_instructions
 from .streaming_loop import StreamingToolLoopResult, ToolCallingStreamingLoop
@@ -528,6 +529,22 @@ class DualLaneToolLoop:
 
         if decision is not None:
             action = _normalize_decision_action(getattr(decision, "action", None))
+            if action == "direct" and supervisor_decision_requires_full_context(decision):
+                return self.run_handoff_only(
+                    prompt,
+                    handoff=_decision_fallback_handoff(
+                        decision,
+                        prompt=prompt,
+                        default_spoken_ack=self.default_spoken_ack,
+                    ),
+                    conversation=conversation,
+                    specialist_conversation=resolved_specialist_conversation,
+                    instructions=instructions,
+                    allow_web_search=allow_web_search,
+                    on_text_delta=on_text_delta,
+                    on_lane_text_delta=on_lane_text_delta,
+                    emit_filler=True,
+                )
             if action == "direct":
                 reply = _strip_text(getattr(decision, "spoken_reply", None) or getattr(decision, "spoken_ack", None))
                 if not reply:
@@ -981,3 +998,30 @@ def _normalize_spoken_ack(arguments: dict[str, Any], default: str) -> str:
     if raw:
         return raw
     return default
+
+
+def _decision_fallback_handoff(
+    decision: Any,
+    *,
+    prompt: str,
+    default_spoken_ack: str,
+) -> dict[str, Any]:
+    """Convert a full-context direct decision into a safe handoff payload."""
+
+    kind = _normalize_handoff_kind(getattr(decision, "kind", None))
+    if kind == "general":
+        kind = "memory"
+    fallback_arguments = {
+        "kind": kind,
+        "goal": _strip_text(getattr(decision, "goal", None)) or prompt,
+        "spoken_ack": _strip_text(getattr(decision, "spoken_ack", None)) or default_spoken_ack,
+        "prompt": _strip_text(getattr(decision, "prompt", None)),
+        "allow_web_search": getattr(decision, "allow_web_search", None),
+        "location_hint": _strip_text(getattr(decision, "location_hint", None)),
+        "date_context": _strip_text(getattr(decision, "date_context", None)),
+        "response_id": getattr(decision, "response_id", None),
+        "request_id": getattr(decision, "request_id", None),
+        "model": getattr(decision, "model", None),
+        "token_usage": getattr(decision, "token_usage", None),
+    }
+    return fallback_arguments

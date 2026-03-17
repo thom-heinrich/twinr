@@ -538,8 +538,9 @@ def load_trusted_skill_module(*, source_text: str, filename: str) -> TrustedSkil
     # AUDIT-FIX(#8): Add stage-specific error context so the caller can recover,
     # quarantine, and report the failure deterministically.
     except Exception as exc:
+        detail = str(exc).strip() or type(exc).__name__
         raise RuntimeError(
-            f"Sandbox skill validation failed: {normalized_filename}"
+            f"Sandbox skill validation failed: {normalized_filename}: {detail}"
         ) from exc
 
     module_tree = _assert_safe_module_shape(tree, filename=normalized_filename)
@@ -555,16 +556,18 @@ def load_trusted_skill_module(*, source_text: str, filename: str) -> TrustedSkil
             optimize=0,
         )
     except Exception as exc:
+        detail = str(exc).strip() or type(exc).__name__
         raise RuntimeError(
-            f"Sandbox skill compilation failed: {normalized_filename}"
+            f"Sandbox skill compilation failed: {normalized_filename}: {detail}"
         ) from exc
 
     _assert_safe_code_object_names(code, filename=normalized_filename)
 
     namespace_dict: dict[str, Any] = {
-        # AUDIT-FIX(#3): Share the read-only builtin mapping directly instead of
-        # copying it into a mutable per-module dict.
-        "__builtins__": _SAFE_BUILTINS,
+        # AUDIT-FIX(#3): CPython exec() expects a real builtin dict here; using a
+        # plain snapshot preserves the restricted surface without tripping the
+        # interpreter-level MappingProxyType crash path.
+        "__builtins__": dict(_SAFE_BUILTINS),
         "__name__": _SANDBOX_MODULE_NAME,
     }
 

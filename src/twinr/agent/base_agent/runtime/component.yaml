@@ -62,10 +62,10 @@ compatibility_reexports:
     mode: star
 primary_callers:
   - path: src/twinr/__main__.py
-  - path: src/twinr/agent/workflows/runner.py
+  - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/agent/workflows/streaming_runner.py
-  - path: src/twinr/agent/workflows/realtime_runner_background.py
+  - path: src/twinr/agent/workflows/realtime_runtime/background.py
   - path: src/twinr/proactive/runtime/service.py
   - path: src/twinr/memory/longterm/evaluation/subtext_eval.py
 tests:

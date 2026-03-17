@@ -10,6 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from test.self_coding_test_utils import stable_sha256
 from twinr.agent.self_coding import (
     CompileJobRecord,
     CompileJobStatus,
@@ -64,14 +65,14 @@ def _compile_request(root: Path) -> CodexCompileRequest:
             skill_name="SDK Skill",
             status=CompileJobStatus.QUEUED,
             requested_target=CompileTarget.AUTOMATION_MANIFEST,
-            spec_hash="sdk-spec",
+            spec_hash=stable_sha256("sdk-spec"),
         ),
         session=_ready_session(),
         prompt="compile",
         output_schema={},
         workspace_root=str(root),
-        request_path=str(request_path),
-        output_schema_path=str(output_schema_path),
+        request_path="REQUEST.md",
+        output_schema_path="output_schema.json",
     )
 
 

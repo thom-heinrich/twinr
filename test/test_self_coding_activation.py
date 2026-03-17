@@ -220,6 +220,7 @@ class SelfCodingActivationServiceTests(unittest.TestCase):
                                                 {
                                                     "path": "skill_main.py",
                                                     "content": (
+                                                        "from __future__ import annotations\n\n"
                                                         "def refresh(ctx):\n"
                                                         "    ctx.store_json('value', {'ok': True})\n"
                                                     ),

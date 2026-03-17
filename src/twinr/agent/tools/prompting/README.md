@@ -8,6 +8,7 @@ default, compact, supervisor, first-word, and specialist instruction bundles.
 
 `prompting` owns:
 - define the canonical tool-lane instruction constants and fast ack phrases
+- encode when the fast supervisor must carry structured `location_hint` / `date_context` fields and when it must escalate memory-dependent turns to fuller context
 - merge time and simple-setting context into tool-lane instruction bundles
 - encode the learned-skill tool policy for self-coding activation, rollback, pause, and reactivation
 - expose public builders for default, compact, supervisor, first-word, and specialist lanes

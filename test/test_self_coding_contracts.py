@@ -5,6 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from test.self_coding_test_utils import stable_sha256
 from twinr.agent.self_coding import (
     ActivationRecord,
     ArtifactKind,
@@ -101,7 +102,7 @@ class SkillContractTests(unittest.TestCase):
             skill_name="Read New Emails",
             status=CompileJobStatus.VALIDATING,
             requested_target=CompileTarget.AUTOMATION_MANIFEST,
-            spec_hash="spec-hash-123",
+            spec_hash=stable_sha256("spec-hash-123"),
             required_capabilities=("email", "speaker"),
             artifact_ids=("artifact_demo123",),
             created_at=datetime(2026, 3, 16, 14, 0, tzinfo=UTC),
@@ -126,10 +127,11 @@ class SkillContractTests(unittest.TestCase):
             skill_id="read_new_emails",
             skill_name="Read New Emails",
             version=1,
-            status=LearnedSkillStatus.SOFT_LAUNCH_READY,
+            status=LearnedSkillStatus.ACTIVE,
             job_id="job_demo123",
             artifact_id="artifact_demo123",
             updated_at=datetime(2026, 3, 16, 14, 9, tzinfo=UTC),
+            activated_at=datetime(2026, 3, 16, 14, 9, tzinfo=UTC),
             feedback_due_at=datetime(2026, 3, 19, 14, 9, tzinfo=UTC),
             metadata={"source": "soft_launch"},
         )
@@ -142,7 +144,7 @@ class SkillContractTests(unittest.TestCase):
         self.assertEqual(restored_job.attempt_count, 2)
         self.assertEqual(restored_artifact.kind, ArtifactKind.AUTOMATION_MANIFEST)
         self.assertEqual(restored_artifact.content_path, "contents/artifact_demo123.json")
-        self.assertEqual(restored_activation.status, LearnedSkillStatus.SOFT_LAUNCH_READY)
+        self.assertEqual(restored_activation.status, LearnedSkillStatus.ACTIVE)
         self.assertEqual(restored_activation.feedback_due_at.day, 19)
 
     def test_capability_availability_properties_match_status(self) -> None:

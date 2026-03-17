@@ -298,19 +298,21 @@ class CodexSdkDriver:
     ) -> str:
         path_text = cls._coerce_path_text(raw_path, field_name=field_name)  # AUDIT-FIX(#1): Validate bridge file-path fields before serializing them into the Node job payload.
         candidate = Path(path_text)
-        if candidate.is_absolute():
-            raise CodexDriverProtocolError(f"{field_name} must be a relative path inside workspace_root")
-        if any(part == ".." for part in candidate.parts):
-            raise CodexDriverProtocolError(f"{field_name} must not escape workspace_root")
         try:
-            resolved_candidate = (workspace_root / candidate).resolve(strict=False)
+            resolved_candidate = candidate.resolve(strict=False) if candidate.is_absolute() else (workspace_root / candidate).resolve(strict=False)
         except OSError as exc:
             raise CodexDriverProtocolError(f"failed to resolve {field_name}: {exc}") from exc
         try:
             resolved_candidate.relative_to(workspace_root)
         except ValueError as exc:
             raise CodexDriverProtocolError(f"{field_name} must stay inside workspace_root") from exc
-        return str(candidate)
+        try:
+            relative_candidate = resolved_candidate.relative_to(workspace_root)
+        except ValueError as exc:
+            raise CodexDriverProtocolError(f"{field_name} must stay inside workspace_root") from exc
+        if any(part == ".." for part in relative_candidate.parts):
+            raise CodexDriverProtocolError(f"{field_name} must not escape workspace_root")
+        return str(relative_candidate)
 
     @classmethod
     def _resolve_workspace_root(cls, raw_workspace_root: str | os.PathLike[str]) -> Path:

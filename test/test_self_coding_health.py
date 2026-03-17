@@ -109,6 +109,8 @@ class _Owner:
 class SelfCodingHealthServiceTests(unittest.TestCase):
     def test_skill_health_records_successful_runs_and_delivery(self) -> None:
         entry_code = """
+from __future__ import annotations
+
 def refresh(ctx):
     ctx.store_json('briefing', {'summary': 'Hallo'})
 
@@ -155,6 +157,8 @@ def deliver(ctx, event_name=None):
 
     def test_skill_health_auto_pauses_after_consecutive_failures(self) -> None:
         entry_code = """
+from __future__ import annotations
+
 def refresh(ctx):
     raise RuntimeError('search backend unavailable')
 
