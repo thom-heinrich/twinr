@@ -10,7 +10,7 @@ post-response closure checks.
 - Adapt listening timeout, pause, and grace values from observed turns
 - Build bounded language instructions for user replies and memory text
 - Evaluate streaming turn boundaries through tool-calling providers
-- Evaluate whether follow-up listening should close after a response
+- Evaluate whether follow-up listening should close after a response with a hard wall-clock watchdog even when a provider adapter ignores timeout kwargs
 
 `conversation` does **not** own:
 - Audio capture, playback, or hardware control

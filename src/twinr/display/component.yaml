@@ -6,7 +6,10 @@ visibility: internal
 summary: Render Twinr runtime state on the Waveshare 4.2 V2 e-paper panel and optionally keep the display loop running beside other hardware loops.
 owned_concerns:
   - Translate runtime snapshots and health signals into bounded e-paper status frames
+  - Compose operator-friendly layout variants such as the grouped debug log display
+  - Derive bounded debug-log sections from persisted ops events, usage telemetry, host health, and the remote-memory watchdog artifact without poll-to-poll timer churn or raw high-frequency metric jitter
   - Validate and load the configured Waveshare vendor driver with Twinr GPIO and SPI expectations
+  - Persist authoritative display forward-progress heartbeats so ops health and supervision can detect hung companion threads
   - Manage the optional companion display loop that shadows other runtime loops
 out_of_scope:
   - Runtime snapshot persistence, health collection, or loop-lock implementations
@@ -22,6 +25,12 @@ files:
     role: Snapshot-driven e-paper status loop orchestration
     exports:
       - TwinrStatusDisplayLoop
+  - path: debug_log.py
+    role: Group recent system, llm, hardware, and ChonkyDB watchdog telemetry into display-safe log sections
+  - path: heartbeat.py
+    role: Persist display forward-progress heartbeats and expose the shared companion-health contract for ops health and supervision
+  - path: layouts.py
+    role: Status-card layout composition for default and debug display variants
   - path: waveshare_v2.py
     role: Waveshare panel adapter, rendering, and driver loading
     exports:

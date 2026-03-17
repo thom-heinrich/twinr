@@ -9,6 +9,7 @@ owned_concerns:
   - Build provider and tool-facing long-term memory context for runtime prompts
   - Persist conversation turns and multimodal evidence through bounded workers and synchronous fallback paths
   - Verify remote-primary snapshot readiness before runtime loops depend on long-term memory state
+  - Preserve per-snapshot pointer/origin probe evidence for fail-closed remote readiness
   - Expose runtime entry points for reflection, retention, proactive policy, review, and operator memory mutation
 out_of_scope:
   - Define canonical long-term schemas or ontology normalization
@@ -28,8 +29,9 @@ files:
       - AsyncLongTermMemoryWriter
       - AsyncLongTermMultimodalWriter
   - path: health.py
-    role: Remote snapshot readiness probe for runtime startup
+    role: Remote snapshot readiness probe for runtime startup with per-snapshot evidence
     exports:
+      - LongTermRemoteWarmCheck
       - LongTermRemoteWarmResult
       - LongTermRemoteHealthProbe
 public_api:

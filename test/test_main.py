@@ -3,11 +3,14 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 import importlib
+import json
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from twinr.ops.locks import TwinrInstanceAlreadyRunningError
 
 
 class _FakeDisplayLoop:
@@ -34,6 +37,16 @@ class _FakeRemoteMemoryWatchdog:
         self.artifact_path = Path("/tmp/remote-memory-watchdog.json")
         self.interval_s = 1.0
         self.history_limit = 3600
+
+    def run(self, *, duration_s: float | None = None) -> int:
+        self.duration_s = duration_s
+        return 0
+
+
+class _FakeRuntimeSupervisor:
+    def __init__(self) -> None:
+        self.duration_s = None
+        self.env_file = None
 
     def run(self, *, duration_s: float | None = None) -> int:
         self.duration_s = duration_s
@@ -122,6 +135,80 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(fake_loop.duration_s, 0.0)
 
+    def test_main_primes_user_audio_env_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}\n",
+                encoding="utf-8",
+            )
+            fake_loop = _FakeDisplayLoop()
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                main_mod = importlib.import_module("twinr.__main__")
+                with patch("twinr.display.TwinrStatusDisplayLoop.from_config", return_value=fake_loop):
+                    with patch("twinr.ops.loop_instance_lock", _fake_lock):
+                        with patch.object(main_mod, "prime_user_session_audio_env") as priming:
+                            sys.argv = [
+                                "twinr",
+                                "--env-file",
+                                str(env_path),
+                                "--run-display-loop",
+                                "--loop-duration",
+                                "0",
+                            ]
+                            exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        priming.assert_called_once_with()
+
+    def test_lock_contention_does_not_poison_runtime_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime_state_path = root / "runtime-state.json"
+            env_path = root / ".env"
+            env_path.write_text(
+                f"TWINR_RUNTIME_STATE_PATH={runtime_state_path}\n",
+                encoding="utf-8",
+            )
+            fake_loop = _FakeDisplayLoop()
+            original_argv = list(sys.argv)
+
+            @contextmanager
+            def _contention_lock(_config, _name: str):
+                raise TwinrInstanceAlreadyRunningError(label="display loop", owner_pid=4242)
+                yield
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                main_mod = importlib.import_module("twinr.__main__")
+                with patch("twinr.display.TwinrStatusDisplayLoop.from_config", return_value=fake_loop):
+                    with patch("twinr.ops.loop_instance_lock", _contention_lock):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--run-display-loop",
+                            "--loop-duration",
+                            "0",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+            payload = json.loads(runtime_state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["status"], "waiting")
+        self.assertIsNone(payload["error_message"])
+
     def test_run_hardware_loop_enables_display_companion_for_pi_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -138,7 +225,7 @@ class MainCliTests(unittest.TestCase):
             )
             fake_loop = _FakeHardwareLoop()
             companion_calls: list[bool] = []
-            fake_runner_module = ModuleType("twinr.agent.workflows.runner")
+            fake_runner_module = ModuleType("twinr.agent.legacy.classic_hardware_loop")
             fake_runner_module.TwinrHardwareLoop = lambda **_kwargs: fake_loop
             fake_openai_module = ModuleType("twinr.providers.openai")
 
@@ -164,7 +251,7 @@ class MainCliTests(unittest.TestCase):
                 with patch.dict(
                     sys.modules,
                     {
-                        "twinr.agent.workflows.runner": fake_runner_module,
+                        "twinr.agent.legacy.classic_hardware_loop": fake_runner_module,
                         "twinr.providers.openai": fake_openai_module,
                         "twinr.display.companion": fake_companion_module,
                         "twinr.ops": fake_ops_module,
@@ -190,6 +277,208 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(companion_calls, [True])
         self.assertEqual(fake_loop.duration_s, 0.0)
 
+    def test_streaming_loop_ensures_remote_watchdog_companion_for_pi_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    (
+                        f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
+                        "TWINR_OPENAI_API_KEY=sk-test",
+                        "TWINR_LONG_TERM_MEMORY_ENABLED=true",
+                        "TWINR_LONG_TERM_MEMORY_MODE=remote_primary",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_REQUIRED=true",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_RUNTIME_CHECK_MODE=watchdog_artifact",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_loop = _FakeHardwareLoop()
+            watchdog_calls: list[str] = []
+            fake_streaming_module = ModuleType("twinr.agent.workflows.streaming_runner")
+            fake_streaming_module.TwinrStreamingHardwareLoop = lambda **_kwargs: fake_loop
+            fake_openai_module = ModuleType("twinr.providers.openai")
+
+            class _FakeBackend:
+                def __init__(self, config) -> None:
+                    self.config = config
+
+            fake_openai_module.OpenAIBackend = _FakeBackend
+            fake_providers_module = ModuleType("twinr.providers")
+            fake_providers_module.build_streaming_provider_bundle = lambda *args, **kwargs: SimpleNamespace(
+                print_backend=SimpleNamespace(),
+                stt=SimpleNamespace(),
+                agent=SimpleNamespace(),
+                tts=SimpleNamespace(),
+                tool_agent=SimpleNamespace(),
+            )
+            fake_companion_module = ModuleType("twinr.display.companion")
+
+            @contextmanager
+            def _fake_companion(_config, *, enabled: bool):
+                yield
+
+            fake_companion_module.optional_display_companion = _fake_companion
+            fake_watchdog_module = ModuleType("twinr.ops.remote_memory_watchdog_companion")
+
+            def _ensure_remote_memory_watchdog_process(_config, *, env_file):
+                watchdog_calls.append(str(env_file))
+                return 4321
+
+            fake_watchdog_module.ensure_remote_memory_watchdog_process = _ensure_remote_memory_watchdog_process
+            fake_ops_module = ModuleType("twinr.ops")
+            fake_ops_module.loop_instance_lock = _fake_lock
+            fake_runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.agent.workflows.streaming_runner": fake_streaming_module,
+                        "twinr.providers": fake_providers_module,
+                        "twinr.providers.openai": fake_openai_module,
+                        "twinr.display.companion": fake_companion_module,
+                        "twinr.ops": fake_ops_module,
+                        "twinr.ops.remote_memory_watchdog_companion": fake_watchdog_module,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_should_enable_display_companion", return_value=False):
+                        with patch.object(main_mod, "_assert_pi_runtime_root", return_value=None):
+                            with patch.object(main_mod, "_uses_pi_runtime_root", return_value=True):
+                                with patch.object(main_mod, "_build_runtime", return_value=fake_runtime):
+                                    sys.argv = [
+                                        "twinr",
+                                        "--env-file",
+                                        str(env_path),
+                                        "--run-streaming-loop",
+                                        "--loop-duration",
+                                        "0",
+                                    ]
+                                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(watchdog_calls, [str(env_path)])
+
+    def test_streaming_loop_acquires_lock_and_display_companion_before_runtime_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    (
+                        f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
+                        "TWINR_OPENAI_API_KEY=sk-test",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            events: list[str] = []
+            fake_loop = _FakeHardwareLoop()
+            fake_streaming_module = ModuleType("twinr.agent.workflows.streaming_runner")
+            fake_streaming_module.TwinrStreamingHardwareLoop = lambda **_kwargs: (
+                events.append("loop_init") or fake_loop
+            )
+            fake_openai_module = ModuleType("twinr.providers.openai")
+
+            class _FakeBackend:
+                def __init__(self, config) -> None:
+                    del config
+                    events.append("backend_init")
+
+            fake_openai_module.OpenAIBackend = _FakeBackend
+            fake_providers_module = ModuleType("twinr.providers")
+            fake_providers_module.build_streaming_provider_bundle = lambda *args, **kwargs: (
+                events.append("bundle_init")
+                or SimpleNamespace(
+                    print_backend=SimpleNamespace(),
+                    stt=SimpleNamespace(),
+                    agent=SimpleNamespace(),
+                    tts=SimpleNamespace(),
+                    tool_agent=SimpleNamespace(),
+                )
+            )
+            fake_companion_module = ModuleType("twinr.display.companion")
+
+            @contextmanager
+            def _fake_companion(_config, *, enabled: bool):
+                events.append(f"companion_enter:{str(enabled).lower()}")
+                try:
+                    yield
+                finally:
+                    events.append("companion_exit")
+
+            fake_companion_module.optional_display_companion = _fake_companion
+            fake_ops_module = ModuleType("twinr.ops")
+
+            @contextmanager
+            def _recording_lock(_config, _name: str):
+                events.append("lock_enter")
+                try:
+                    yield
+                finally:
+                    events.append("lock_exit")
+
+            fake_ops_module.loop_instance_lock = _recording_lock
+            fake_runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.agent.workflows.streaming_runner": fake_streaming_module,
+                        "twinr.providers": fake_providers_module,
+                        "twinr.providers.openai": fake_openai_module,
+                        "twinr.display.companion": fake_companion_module,
+                        "twinr.ops": fake_ops_module,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_should_enable_display_companion", return_value=True):
+                        with patch.object(main_mod, "_should_ensure_remote_watchdog_companion", return_value=False):
+                            with patch.object(main_mod, "_assert_pi_runtime_root", return_value=None):
+                                with patch.object(
+                                    main_mod,
+                                    "_build_runtime",
+                                    side_effect=lambda _config: events.append("runtime_init") or fake_runtime,
+                                ):
+                                    sys.argv = [
+                                        "twinr",
+                                        "--env-file",
+                                        str(env_path),
+                                        "--run-streaming-loop",
+                                        "--loop-duration",
+                                        "0",
+                                    ]
+                                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            events[:6],
+            [
+                "lock_enter",
+                "companion_enter:true",
+                "runtime_init",
+                "backend_init",
+                "bundle_init",
+                "loop_init",
+            ],
+        )
+        self.assertEqual(events[-2:], ["companion_exit", "lock_exit"])
+
     def test_watch_remote_memory_dispatches_without_runtime_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -208,7 +497,7 @@ class MainCliTests(unittest.TestCase):
                 sys.modules.pop("twinr.__main__", None)
                 with patch.dict(sys.modules, {"twinr.ops": fake_ops_module}):
                     main_mod = importlib.import_module("twinr.__main__")
-                    with patch.object(main_mod, "TwinrRuntime", side_effect=AssertionError("runtime must not be created")):
+                    with patch.object(main_mod, "_build_runtime", side_effect=AssertionError("runtime must not be created")):
                         sys.argv = [
                             "twinr",
                             "--env-file",
@@ -224,6 +513,145 @@ class MainCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(fake_watchdog.duration_s, 0.0)
+
+    def test_run_runtime_supervisor_dispatches_without_runtime_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}\n",
+                encoding="utf-8",
+            )
+            fake_supervisor = _FakeRuntimeSupervisor()
+            fake_supervisor_module = ModuleType("twinr.ops.runtime_supervisor")
+            fake_supervisor_module.TwinrRuntimeSupervisor = lambda **kwargs: (
+                setattr(fake_supervisor, "env_file", kwargs["env_file"]) or fake_supervisor
+            )
+            fake_ops_module = ModuleType("twinr.ops")
+            fake_ops_module.loop_instance_lock = _fake_lock
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.ops": fake_ops_module,
+                        "twinr.ops.runtime_supervisor": fake_supervisor_module,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_build_runtime", side_effect=AssertionError("runtime must not be created")):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--run-runtime-supervisor",
+                            "--loop-duration",
+                            "0",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(fake_supervisor.duration_s, 0.0)
+        self.assertEqual(fake_supervisor.env_file, str(env_path))
+
+    def test_self_coding_codex_self_test_dispatches_without_runtime_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("", encoding="utf-8")
+            fake_environment_module = ModuleType("twinr.agent.self_coding.codex_driver.environment")
+            fake_environment_module.collect_codex_sdk_environment_report = lambda **_kwargs: SimpleNamespace(
+                status="ok",
+                ready=True,
+                detail="bridge self-test ok",
+                node_version="v18.20.4",
+                npm_version="9.2.0",
+                codex_version="codex-cli 0.114.0",
+                auth_present=True,
+                local_self_test_ok=True,
+                live_auth_check_ok=True,
+            )
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {"twinr.agent.self_coding.codex_driver.environment": fake_environment_module},
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_build_runtime", side_effect=AssertionError("runtime must not be created")):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--self-coding-codex-self-test",
+                            "--self-coding-live-auth-check",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+
+    def test_self_coding_morning_briefing_acceptance_dispatches_without_runtime_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("", encoding="utf-8")
+            calls: list[dict[str, object]] = []
+            fake_acceptance_module = ModuleType("twinr.agent.self_coding.live_acceptance")
+
+            def _run_live_acceptance(**kwargs):
+                calls.append(kwargs)
+                return SimpleNamespace(
+                    job_id="job_acceptance",
+                    job_status="soft_launch_ready",
+                    skill_id="morning_briefing",
+                    version=1,
+                    activation_status="active",
+                    refresh_status="ok",
+                    delivery_status="ok",
+                    delivery_delivered=True,
+                    search_call_count=3,
+                    summary_call_count=1,
+                    spoken_count=1,
+                    last_summary_text="Guten Morgen.",
+                )
+
+            fake_acceptance_module.run_live_morning_briefing_acceptance = _run_live_acceptance
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {"twinr.agent.self_coding.live_acceptance": fake_acceptance_module},
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_build_runtime", side_effect=AssertionError("runtime must not be created")):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--self-coding-morning-briefing-acceptance",
+                            "--self-coding-acceptance-capture-only",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["speak_out_loud"])
+        self.assertEqual(calls[0]["live_e2e_environment"], "local")
 
     def test_wakeword_label_capture_dispatches_to_proactive_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

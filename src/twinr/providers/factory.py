@@ -8,11 +8,15 @@ transport and SDK logic stays in the sibling provider packages.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final, TypeVar
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.contracts import CombinedSpeechAgentProvider, ProviderBundle
+from twinr.agent.base_agent.contracts import (
+    CombinedSpeechAgentProvider,
+    ProviderBundle,
+    SpeechToTextProvider,
+)
 from twinr.providers.deepgram import DeepgramSpeechToTextProvider
 from twinr.providers.groq import GroqAgentTextProvider, GroqToolCallingAgentProvider
 from twinr.providers.openai import OpenAIBackend, OpenAIProviderBundle
@@ -42,6 +46,31 @@ class StreamingProviderBundle(ProviderBundle):
 
     print_backend: CombinedSpeechAgentProvider
     support_backend: OpenAIBackend
+    verification_stt: SpeechToTextProvider | None = None
+
+
+def _build_openai_streaming_verification_provider(
+    config: TwinrConfig,
+) -> SpeechToTextProvider:
+    """Build the bounded OpenAI verifier STT used for short streaming turns.
+
+    The live streaming path can receive short or low-confidence Deepgram
+    transcripts. When verifier support is enabled, this provider is used for
+    one bounded second-pass transcription against the captured WAV without
+    mutating the main OpenAI support backend.
+    """
+
+    verifier_backend = OpenAIBackend(
+        config=replace(
+            config,
+            openai_stt_model=config.streaming_transcript_verifier_model,
+        )
+    )
+    verifier_bundle = OpenAIProviderBundle.from_backend(verifier_backend)
+    return _require_component(
+        verifier_bundle.stt,
+        name="openai streaming transcript verifier",
+    )
 
 
 def _describe_config_value(value: object, *, max_length: int = 32) -> str:
@@ -322,6 +351,15 @@ def build_streaming_provider_bundle(
                 f"Unsupported TWINR_TTS_PROVIDER: {_describe_config_value(tts_name)}"
             )  # AUDIT-FIX(#2): Defensive branch; prior validation should make this unreachable.
 
+        verification_stt: SpeechToTextProvider | None = None
+        if bool(config.streaming_transcript_verifier_enabled):
+            try:
+                verification_stt = _build_openai_streaming_verification_provider(config)
+            except Exception as exc:
+                raise ProviderConfigurationError(
+                    "Failed to initialize streaming transcript verifier provider"
+                ) from exc
+
         return StreamingProviderBundle(
             stt=stt,
             agent=agent,
@@ -329,6 +367,7 @@ def build_streaming_provider_bundle(
             tool_agent=tool_agent,
             print_backend=print_backend,
             support_backend=support,
+            verification_stt=verification_stt,
         )
     except ProviderConfigurationError:
         for resource in reversed(owned_resources):

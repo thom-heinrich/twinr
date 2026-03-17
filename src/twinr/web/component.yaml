@@ -3,9 +3,12 @@ name: web
 path: src/twinr/web
 kind: python-package
 visibility: internal
-summary: Serve Twinr's local FastAPI control surface and compose route handlers, shared web context, presenters, support primitives, templates, and static assets.
+summary: Serve Twinr's local FastAPI control surface and compose route handlers, shared web context, presenters, support primitives, templates, and static assets, including managed portal sign-in plus the self-coding and tabbed debug operator pages.
 owned_concerns:
   - Build the FastAPI app factory, control-plane middleware, and route handlers for Twinr's local dashboard and settings pages
+  - Enforce managed portal sign-in, including first-login password change for the permanent Pi web service
+  - Expose the self-coding operator page and learned-skill control forms backed by `src/twinr/agent/self_coding`
+  - Expose the read-only tabbed debug page for runtime, ChonkyDB, LLM, events, hardware, and raw artifacts
   - Centralize request-time config loading, store construction, and safe template rendering through `context.py`
   - Validate and persist web-driven automation, reminder, integration, provider, personality, and user-context edits through the appropriate helpers
   - Ship the package-local Jinja templates and static CSS used by the local control surface

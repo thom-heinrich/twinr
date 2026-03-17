@@ -1,10 +1,9 @@
 """Expose the core Adaptive Skill Engine package surface.
 
-This package currently owns the versioned contract objects, status enums,
-file-backed store, and deterministic capability registry used by the
-`self_coding` subsystem. Workflow integration stays thin here; compile workers
-and local Codex drivers now live behind focused modules and sandboxed skill
-execution still belongs to later slices.
+This package owns the versioned contract objects, status enums, file-backed
+store, deterministic capability registry, compile workers, local Codex drivers,
+the first brokered sandbox runtime for `skill_package`, and the operator-facing
+activation/retest control path around learned skills.
 """
 
 from twinr.agent.self_coding.activation import SelfCodingActivationService
@@ -18,13 +17,18 @@ from twinr.agent.self_coding.contracts import (
     CompileJobRecord,
     CompileRunStatusRecord,
     FeasibilityResult,
+    LiveE2EStatusRecord,
     RequirementsDialogueSession,
+    SkillHealthRecord,
     SkillSpec,
     SkillTriggerSpec,
 )
 from twinr.agent.self_coding.feasibility import SelfCodingFeasibilityChecker
+from twinr.agent.self_coding.health import SelfCodingHealthService
 from twinr.agent.self_coding.learning_flow import SelfCodingLearningFlow, SelfCodingLearningUpdate
 from twinr.agent.self_coding.operator_status import SelfCodingOperatorStatus, build_self_coding_operator_status
+from twinr.agent.self_coding.retest import SelfCodingSkillRetestResult, run_self_coding_skill_retest
+from twinr.agent.self_coding.runtime import SelfCodingSkillExecutionService, SkillContext, SkillPackage
 from twinr.agent.self_coding.status import (
     ArtifactKind,
     CapabilityRiskClass,
@@ -57,18 +61,26 @@ __all__ = [
     "RequirementsDialogueStatus",
     "FeasibilityResult",
     "LearnedSkillStatus",
+    "LiveE2EStatusRecord",
     "LocalCodexCompileDriver",
     "SelfCodingActivationService",
     "SelfCodingCapabilityRegistry",
     "SelfCodingCompileWorker",
     "SelfCodingFeasibilityChecker",
+    "SelfCodingHealthService",
     "SelfCodingLearningFlow",
     "SelfCodingLearningUpdate",
     "SelfCodingOperatorStatus",
+    "SelfCodingSkillExecutionService",
+    "SelfCodingSkillRetestResult",
     "SelfCodingRequirementsDialogue",
     "SelfCodingStore",
     "RequirementsDialogueSession",
+    "SkillContext",
+    "SkillHealthRecord",
+    "SkillPackage",
     "SkillSpec",
     "SkillTriggerSpec",
+    "run_self_coding_skill_retest",
     "self_coding_store_root",
 ]

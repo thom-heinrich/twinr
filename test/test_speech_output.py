@@ -4,10 +4,13 @@ from time import sleep
 import time
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.tools import SpeechLaneDelta
+from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator
+from twinr.agent.workflows import speech_output as speech_output_module
 from twinr.agent.workflows.speech_output import InterruptibleSpeechOutput
 
 
@@ -59,6 +62,9 @@ class InterruptiblePlayer:
                 self.stopped = True
                 break
         self.played.append(bytes(payload))
+
+    def stop_playback(self) -> None:
+        self.stopped = True
 
 
 class InterruptibleSpeechOutputTests(unittest.TestCase):
@@ -201,6 +207,28 @@ class InterruptibleSpeechOutputTests(unittest.TestCase):
 
         self.assertEqual(started, ["started"])
 
+    def test_output_can_play_through_playback_coordinator(self) -> None:
+        tts_provider = SlowTTSProvider()
+        player = InterruptiblePlayer()
+        coordinator = PlaybackCoordinator(player)
+
+        output = InterruptibleSpeechOutput(
+            tts_provider=tts_provider,
+            player=player,
+            chunk_size=512,
+            segment_boundary=lambda text: len(text) if text.strip() else None,
+            playback_coordinator=coordinator,
+        )
+
+        output.submit_text_delta("Hallo zusammen.")
+        output.flush()
+        output.close(timeout_s=2.0)
+        output.raise_if_error()
+        coordinator.close(timeout_s=1.0)
+
+        self.assertTrue(player.played)
+        self.assertIn(b"FINAL-1", player.played[0])
+
     def test_abort_returns_quickly_when_first_chunk_stalls(self) -> None:
         tts_provider = GatedFirstChunkTTSProvider()
         player = InterruptiblePlayer()
@@ -223,6 +251,36 @@ class InterruptibleSpeechOutputTests(unittest.TestCase):
         self.assertIn(stopped, {True, False})
         self.assertLess(elapsed, 0.5)
         self.assertFalse(output.wait_for_first_audio(timeout_s=0.05))
+
+    def test_interrupt_path_uses_short_pump_join_timeout_with_playback_coordinator(self) -> None:
+        tts_provider = GatedFirstChunkTTSProvider()
+        player = InterruptiblePlayer()
+        coordinator = PlaybackCoordinator(player)
+        recorded_timeouts: list[float | None] = []
+        original_join = speech_output_module._TTSChunkPump.join
+
+        output = InterruptibleSpeechOutput(
+            tts_provider=tts_provider,
+            player=player,
+            chunk_size=512,
+            segment_boundary=lambda text: len(text) if text.strip() else None,
+            playback_coordinator=coordinator,
+        )
+
+        def _record_join(pump, *, timeout_s=None):
+            recorded_timeouts.append(timeout_s)
+            return original_join(pump, timeout_s=0.0)
+
+        with mock.patch.object(speech_output_module._TTSChunkPump, "join", autospec=True, side_effect=_record_join):
+            output.submit_text_delta("Ich schaue kurz nach.")
+            self.assertTrue(tts_provider.started.wait(timeout=1.0))
+            output.abort(timeout_s=0.2)
+            tts_provider.release.set()
+
+        coordinator.close(timeout_s=1.0)
+
+        self.assertTrue(recorded_timeouts)
+        self.assertLessEqual(recorded_timeouts[0] or 0.0, 0.05)
 
 
 if __name__ == "__main__":

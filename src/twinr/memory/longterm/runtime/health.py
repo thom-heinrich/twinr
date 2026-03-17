@@ -2,8 +2,8 @@
 
 This module verifies that every required remote-primary snapshot and shard can
 be loaded before Twinr enters runtime flows that depend on long-term memory.
-It does not mutate runtime state; it only proves readiness or raises a hard
-failure for required remote backends.
+It records per-snapshot pointer/origin evidence so fail-closed watchdogs can
+prove exactly which remote read failed and how Twinr tried to resolve it.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ from twinr.memory.context_store import PromptContextStore
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteFetchAttempt,
+    LongTermRemoteSnapshotProbe,
     LongTermRemoteStateStore,
     LongTermRemoteUnavailableError,
 )
@@ -21,10 +23,58 @@ from twinr.memory.longterm.storage.store import LongTermStructuredStore
 
 
 @dataclass(frozen=True, slots=True)
+class LongTermRemoteWarmCheck:
+    """Capture one required remote snapshot check with pointer/origin evidence."""
+
+    store: str
+    snapshot_kind: str
+    status: str
+    latency_ms: float
+    detail: str | None = None
+    selected_source: str | None = None
+    document_id: str | None = None
+    pointer_document_id: str | None = None
+    attempts: tuple[LongTermRemoteFetchAttempt, ...] = ()
+    payload: dict[str, object] | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe summary without leaking full snapshot payloads."""
+
+        return {
+            "store": self.store,
+            "snapshot_kind": self.snapshot_kind,
+            "status": self.status,
+            "latency_ms": self.latency_ms,
+            "detail": self.detail,
+            "selected_source": self.selected_source,
+            "document_id": self.document_id,
+            "pointer_document_id": self.pointer_document_id,
+            "attempts": [attempt.to_dict() for attempt in self.attempts],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class LongTermRemoteWarmResult:
-    """Capture which remote snapshots were checked during a warm probe."""
+    """Capture the outcome of one runtime remote warm probe."""
 
     checked_snapshots: tuple[str, ...]
+    ready: bool = True
+    detail: str | None = None
+    failed_store: str | None = None
+    failed_snapshot_kind: str | None = None
+    checks: tuple[LongTermRemoteWarmCheck, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe summary for ops artifacts."""
+
+        return {
+            "ready": self.ready,
+            "detail": self.detail,
+            "failed_store": self.failed_store,
+            "failed_snapshot_kind": self.failed_snapshot_kind,
+            "checked_snapshots": list(self.checked_snapshots),
+            "checks": [check.to_dict() for check in self.checks],
+        }
 
 
 @dataclass(slots=True)
@@ -40,6 +90,109 @@ class LongTermRemoteHealthProbe:
     graph_store: TwinrPersonalGraphStore
     midterm_store: LongTermMidtermStore
 
+    def probe_operational(self) -> LongTermRemoteWarmResult:
+        """Return structured per-snapshot readiness evidence without raising."""
+
+        checked: list[str] = []
+        checks: list[LongTermRemoteWarmCheck] = []
+        try:
+            prompt_remote_state = self._require_remote_state(self.prompt_context_store.memory_store.remote_state)
+            self._ensure_state_ready(prompt_remote_state)
+            result = self._probe_snapshot(
+                store="prompt_context",
+                remote_state=prompt_remote_state,
+                snapshot_kind=self.prompt_context_store.memory_store.remote_snapshot_kind,
+                checked=checked,
+                checks=checks,
+            )
+            if not result.ready:
+                return result
+            result = self._probe_snapshot(
+                store="prompt_context",
+                remote_state=prompt_remote_state,
+                snapshot_kind=self.prompt_context_store.user_store.remote_snapshot_kind,
+                checked=checked,
+                checks=checks,
+            )
+            if not result.ready:
+                return result
+            result = self._probe_snapshot(
+                store="prompt_context",
+                remote_state=prompt_remote_state,
+                snapshot_kind=self.prompt_context_store.personality_store.remote_snapshot_kind,
+                checked=checked,
+                checks=checks,
+            )
+            if not result.ready:
+                return result
+
+            object_remote_state = self._require_remote_state(self.object_store.remote_state)
+            self._ensure_state_ready(object_remote_state)
+            result = self._probe_sharded_snapshot_tree(
+                store="object_store",
+                remote_state=object_remote_state,
+                snapshot_kind="objects",
+                checked=checked,
+                checks=checks,
+            )
+            if not result.ready:
+                return result
+            result = self._probe_snapshot(
+                store="object_store",
+                remote_state=object_remote_state,
+                snapshot_kind="conflicts",
+                checked=checked,
+                checks=checks,
+            )
+            if not result.ready:
+                return result
+            result = self._probe_sharded_snapshot_tree(
+                store="object_store",
+                remote_state=object_remote_state,
+                snapshot_kind="archive",
+                checked=checked,
+                checks=checks,
+            )
+            if not result.ready:
+                return result
+
+            graph_remote_state = self._require_remote_state(self.graph_store.remote_state)
+            self._ensure_state_ready(graph_remote_state)
+            result = self._probe_snapshot(
+                store="graph_store",
+                remote_state=graph_remote_state,
+                snapshot_kind="graph",
+                checked=checked,
+                checks=checks,
+            )
+            if not result.ready:
+                return result
+
+            midterm_remote_state = self._require_remote_state(self.midterm_store.remote_state)
+            self._ensure_state_ready(midterm_remote_state)
+            result = self._probe_snapshot(
+                store="midterm_store",
+                remote_state=midterm_remote_state,
+                snapshot_kind="midterm",
+                checked=checked,
+                checks=checks,
+            )
+            if not result.ready:
+                return result
+        except LongTermRemoteUnavailableError as exc:
+            return LongTermRemoteWarmResult(
+                checked_snapshots=tuple(checked),
+                ready=False,
+                detail=str(exc),
+                checks=tuple(checks),
+            )
+
+        return LongTermRemoteWarmResult(
+            checked_snapshots=tuple(checked),
+            ready=True,
+            checks=tuple(checks),
+        )
+
     def ensure_operational(self) -> LongTermRemoteWarmResult:
         """Load every required remote snapshot and shard once.
 
@@ -51,78 +204,126 @@ class LongTermRemoteHealthProbe:
                 snapshot, or shard is missing or unreadable.
         """
 
-        checked: list[str] = []
-
-        prompt_remote_state = self._require_remote_state(self.prompt_context_store.memory_store.remote_state)
-        self._ensure_state_ready(prompt_remote_state)
-        self._ensure_snapshot(prompt_remote_state, self.prompt_context_store.memory_store.remote_snapshot_kind, checked)
-        self._ensure_snapshot(prompt_remote_state, self.prompt_context_store.user_store.remote_snapshot_kind, checked)
-        self._ensure_snapshot(
-            prompt_remote_state,
-            self.prompt_context_store.personality_store.remote_snapshot_kind,
-            checked,
+        result = self.probe_operational()
+        if result.ready:
+            return result
+        raise LongTermRemoteUnavailableError(
+            str(result.detail or "Required remote long-term memory is unavailable.")
         )
 
-        object_remote_state = self._require_remote_state(self.object_store.remote_state)
-        self._ensure_state_ready(object_remote_state)
-        self._ensure_sharded_snapshot_tree(object_remote_state, "objects", checked)
-        self._ensure_snapshot(object_remote_state, "conflicts", checked)
-        self._ensure_sharded_snapshot_tree(object_remote_state, "archive", checked)
-
-        graph_remote_state = self._require_remote_state(self.graph_store.remote_state)
-        self._ensure_state_ready(graph_remote_state)
-        self._ensure_snapshot(graph_remote_state, "graph", checked)
-
-        midterm_remote_state = self._require_remote_state(self.midterm_store.remote_state)
-        self._ensure_state_ready(midterm_remote_state)
-        self._ensure_snapshot(midterm_remote_state, "midterm", checked)
-
-        return LongTermRemoteWarmResult(checked_snapshots=tuple(checked))
-
-    def _ensure_sharded_snapshot_tree(
+    def _probe_sharded_snapshot_tree(
         self,
+        *,
+        store: str,
         remote_state: LongTermRemoteStateStore,
         snapshot_kind: str,
         checked: list[str],
-    ) -> None:
+        checks: list[LongTermRemoteWarmCheck],
+    ) -> LongTermRemoteWarmResult:
         """Load a manifest snapshot and then every shard it references."""
 
-        payload = self._load_required_snapshot(remote_state, snapshot_kind, checked)
-        shards = payload.get("shards")
+        result = self._probe_snapshot(
+            store=store,
+            remote_state=remote_state,
+            snapshot_kind=snapshot_kind,
+            checked=checked,
+            checks=checks,
+        )
+        if not result.ready:
+            return result
+        manifest_payload = checks[-1].payload
+        shards = None if manifest_payload is None else manifest_payload.get("shards")
         if not isinstance(shards, list):
-            return
+            return LongTermRemoteWarmResult(
+                checked_snapshots=tuple(checked),
+                ready=True,
+                checks=tuple(checks),
+            )
         for shard_kind in shards:
             if isinstance(shard_kind, str) and shard_kind:
-                self._load_required_snapshot(remote_state, shard_kind, checked)
+                shard_result = self._probe_snapshot(
+                    store=store,
+                    remote_state=remote_state,
+                    snapshot_kind=shard_kind,
+                    checked=checked,
+                    checks=checks,
+                )
+                if not shard_result.ready:
+                    return shard_result
+        return LongTermRemoteWarmResult(
+            checked_snapshots=tuple(checked),
+            ready=True,
+            checks=tuple(checks),
+        )
 
-    def _ensure_snapshot(
+    def _probe_snapshot(
         self,
+        *,
+        store: str,
         remote_state: LongTermRemoteStateStore,
         snapshot_kind: str | None,
         checked: list[str],
-    ) -> None:
-        """Require one named snapshot kind and record the successful load."""
+        checks: list[LongTermRemoteWarmCheck],
+    ) -> LongTermRemoteWarmResult:
+        """Probe one named snapshot and preserve pointer/origin evidence."""
 
         normalized_kind = str(snapshot_kind or "").strip()
         if not normalized_kind:
-            raise LongTermRemoteUnavailableError("Required remote long-term snapshot kind is missing.")
-        self._load_required_snapshot(remote_state, normalized_kind, checked)
-
-    def _load_required_snapshot(
-        self,
-        remote_state: LongTermRemoteStateStore,
-        snapshot_kind: str,
-        checked: list[str],
-    ) -> dict[str, object]:
-        """Load one snapshot and fail closed if it is missing or malformed."""
-
-        payload = remote_state.load_snapshot(snapshot_kind=snapshot_kind)
-        if not isinstance(payload, dict):
-            raise LongTermRemoteUnavailableError(
-                f"Required remote long-term snapshot {snapshot_kind!r} is unavailable."
+            return LongTermRemoteWarmResult(
+                checked_snapshots=tuple(checked),
+                ready=False,
+                detail="Required remote long-term snapshot kind is missing.",
+                failed_store=store,
+                checks=tuple(checks),
             )
-        checked.append(snapshot_kind)
-        return payload
+        probe_loader = getattr(remote_state, "probe_snapshot_load", None)
+        if callable(probe_loader):
+            probe = probe_loader(snapshot_kind=normalized_kind)
+        else:
+            payload = remote_state.load_snapshot(snapshot_kind=normalized_kind)
+            probe = LongTermRemoteSnapshotProbe(
+                snapshot_kind=normalized_kind,
+                status="found" if isinstance(payload, dict) else "unavailable",
+                latency_ms=0.0,
+                detail=None if isinstance(payload, dict) else f"Required remote long-term snapshot {normalized_kind!r} is unavailable.",
+                payload=payload if isinstance(payload, dict) else None,
+            )
+        check = self._warm_check_from_probe(store=store, probe=probe)
+        checks.append(check)
+        if not isinstance(probe.payload, dict):
+            return LongTermRemoteWarmResult(
+                checked_snapshots=tuple(checked),
+                ready=False,
+                detail=probe.detail or f"Required remote long-term snapshot {normalized_kind!r} is unavailable.",
+                failed_store=store,
+                failed_snapshot_kind=normalized_kind,
+                checks=tuple(checks),
+            )
+        checked.append(normalized_kind)
+        return LongTermRemoteWarmResult(
+            checked_snapshots=tuple(checked),
+            ready=True,
+            checks=tuple(checks),
+        )
+
+    @staticmethod
+    def _warm_check_from_probe(
+        *,
+        store: str,
+        probe: LongTermRemoteSnapshotProbe,
+    ) -> LongTermRemoteWarmCheck:
+        return LongTermRemoteWarmCheck(
+            store=store,
+            snapshot_kind=probe.snapshot_kind,
+            status=probe.status,
+            latency_ms=probe.latency_ms,
+            detail=probe.detail,
+            selected_source=probe.selected_source,
+            document_id=probe.document_id,
+            pointer_document_id=probe.pointer_document_id,
+            attempts=probe.attempts,
+            payload=probe.payload,
+        )
 
     def _ensure_state_ready(self, remote_state: LongTermRemoteStateStore) -> None:
         """Require the remote state backend to report itself ready."""

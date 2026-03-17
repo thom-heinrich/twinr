@@ -1,21 +1,26 @@
 """Drive the Twinr status display loop from runtime snapshots.
 
 This module polls the runtime snapshot store, samples bounded health and
-connectivity signals, and translates them into short status frames for the
-e-paper adapter. Hardware-specific rendering lives in ``waveshare_v2.py``.
+connectivity signals, translates them into short status frames for the e-paper
+adapter, and persists a small display heartbeat so supervision can distinguish
+an alive companion from a hung one. Hardware-specific rendering lives in
+``waveshare_v2.py``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import math
+import os
 import socket
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
+from twinr.display.debug_log import LogSections, TwinrDisplayDebugLogBuilder
+from twinr.display.heartbeat import DisplayHeartbeatStore, save_display_heartbeat
 from twinr.display.waveshare_v2 import WaveshareEPD4In2V2
 from twinr.ops.health import TwinrSystemHealth, collect_system_health
 
@@ -36,6 +41,7 @@ _SNAPSHOT_RETRY_DELAY_S = 0.05
 _STATUS_TEXT_MAX_LEN = 32
 _EMIT_LINE_MAX_LEN = 160
 _ERROR_LOG_THROTTLE_S = 30.0
+_HEARTBEAT_IDLE_REFRESH_S = 5.0
 
 
 def _default_emit(line: str) -> None:
@@ -85,6 +91,8 @@ class TwinrStatusDisplayLoop:
             labels.
         clock: Callable that returns the current local time.
         internet_probe: Callable that samples outbound connectivity.
+        heartbeat_store: File-backed display-progress heartbeat sink for
+            supervisor and ops health consumers.
     """
 
     config: TwinrConfig
@@ -96,6 +104,8 @@ class TwinrStatusDisplayLoop:
     health_collector: Callable[..., TwinrSystemHealth] = collect_system_health
     clock: Callable[[], datetime] = _default_clock
     internet_probe: Callable[[], bool] = _default_internet_probe
+    debug_log_builder: TwinrDisplayDebugLogBuilder | None = None
+    heartbeat_store: DisplayHeartbeatStore | None = None
     _cached_health: TwinrSystemHealth | None = field(default=None, init=False, repr=False)
     _cached_health_error: str | None = field(default=None, init=False, repr=False)
     _cached_health_status: str | None = field(default=None, init=False, repr=False)
@@ -105,6 +115,10 @@ class TwinrStatusDisplayLoop:
     _last_snapshot: RuntimeSnapshot | None = field(default=None, init=False, repr=False)
     _last_error_key: str | None = field(default=None, init=False, repr=False)
     _last_error_at: float = field(default=0.0, init=False, repr=False)
+    _heartbeat_seq: int = field(default=0, init=False, repr=False)
+    _last_heartbeat_at: float = field(default=0.0, init=False, repr=False)
+    _last_render_started_at: datetime | None = field(default=None, init=False, repr=False)
+    _last_render_completed_at: datetime | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_config(
@@ -131,6 +145,8 @@ class TwinrStatusDisplayLoop:
             snapshot_store=RuntimeSnapshotStore(config.runtime_state_path),
             emit=emit or _default_emit,
             sleep=sleep,
+            debug_log_builder=TwinrDisplayDebugLogBuilder.from_config(config),
+            heartbeat_store=DisplayHeartbeatStore.from_config(config),
         )
 
     def run(self, *, duration_s: float | None = None, max_cycles: int | None = None) -> int:
@@ -145,7 +161,7 @@ class TwinrStatusDisplayLoop:
         """
         started_at = time.monotonic()
         # AUDIT-FIX(#8): Track the full display signature with the correct tuple shape so static checks match runtime behavior.
-        last_signature: tuple[str, str, tuple[str, ...], int] | None = None
+        last_signature: tuple[str, str, tuple[str, ...], tuple[tuple[str, str], ...], LogSections, int] | None = None
         cycles = 0
         try:
             while True:
@@ -157,21 +173,35 @@ class TwinrStatusDisplayLoop:
                 # AUDIT-FIX(#1): Never let snapshot read/build/display failures terminate the status loop; degrade to last-known-good state.
                 snapshot, snapshot_stale = self._load_snapshot()
                 headline, details = self._build_status_content(snapshot, stale=snapshot_stale)
+                state_fields = self._build_state_fields(snapshot, stale=snapshot_stale)
+                log_sections = self._build_log_sections(snapshot, stale=snapshot_stale)
                 status = self._snapshot_status(snapshot)
-                frame = self._animation_frame(status)
-                signature = (status, headline, details, frame)
+                frame = self._display_animation_frame(status)
+                signature = (status, headline, details, state_fields, log_sections, frame)
                 if signature != last_signature:
+                    self._last_render_started_at = datetime.now(timezone.utc)
+                    self._write_heartbeat(status, phase="rendering", force=True)
                     if self._show_status(
                         status,
                         headline=headline,
                         details=details,
+                        state_fields=state_fields,
+                        log_sections=log_sections,
                         animation_frame=frame,
                     ):
                         self._safe_emit(f"display_status={status}")
                         last_signature = signature
+                        self._last_render_completed_at = datetime.now(timezone.utc)
+                        self._write_heartbeat(status, phase="idle", force=True)
+                    else:
+                        self._write_heartbeat(status, phase="error", detail="display_show_failed", force=True)
+                else:
+                    self._write_heartbeat(status, phase="idle")
                 cycles += 1
                 self._sleep_once()
         finally:
+            status = self._snapshot_status(self._last_snapshot)
+            self._write_heartbeat(status, phase="stopping", detail="display_loop_stopping", force=True)
             # AUDIT-FIX(#10): Cleanup must never mask the real failure path.
             self._close_display()
 
@@ -242,6 +272,49 @@ class TwinrStatusDisplayLoop:
             f"Zeit {self._clock_text()}",
         )
 
+    def _build_state_fields(
+        self,
+        snapshot: RuntimeSnapshot | None,
+        *,
+        stale: bool = False,
+    ) -> tuple[tuple[str, str], ...]:
+        note = "Status wird aktualisiert" if stale else None
+        if snapshot is None and not stale:
+            note = "Status nicht verfügbar"
+        health = self._current_health(snapshot)
+        internet_ok = self._internet_ok()
+        state_fields = [
+            ("Status", self._runtime_state_value(snapshot)),
+            ("Internet", self._internet_state_value(internet_ok)),
+            ("AI", self._ai_state_value(snapshot, health, internet_ok)),
+            ("System", self._system_state_value(snapshot, health)),
+            ("Zeit", self._clock_text()),
+        ]
+        if note:
+            state_fields.append(("Hinweis", note))
+        return tuple(state_fields)
+
+    def _build_log_sections(
+        self,
+        snapshot: RuntimeSnapshot | None,
+        *,
+        stale: bool = False,
+    ) -> LogSections:
+        if self._display_layout() != "debug_log":
+            return ()
+        health = self._current_health(snapshot)
+        internet_ok = self._internet_ok()
+        return self._debug_log_builder().build_sections(
+            snapshot=snapshot,
+            runtime_status=self._runtime_state_value(snapshot),
+            internet_state=self._internet_state_value(internet_ok),
+            ai_state=self._ai_state_value(snapshot, health, internet_ok),
+            system_state=self._system_state_value(snapshot, health),
+            clock_text=self._clock_text(),
+            health=health,
+            stale=stale,
+        )
+
     def _current_health(self, snapshot: RuntimeSnapshot | None) -> TwinrSystemHealth | None:
         now = time.monotonic()
         snapshot_error = self._snapshot_error_message(snapshot)
@@ -296,13 +369,21 @@ class TwinrStatusDisplayLoop:
         health: TwinrSystemHealth | None,
         internet_ok: bool | None,
     ) -> str:
+        return f"AI {self._ai_state_value(snapshot, health, internet_ok)}"
+
+    def _ai_state_value(
+        self,
+        snapshot: RuntimeSnapshot | None,
+        health: TwinrSystemHealth | None,
+        internet_ok: bool | None,
+    ) -> str:
         if not self.config.openai_api_key:
-            return "AI fehlt"
+            return "fehlt"
         # AUDIT-FIX(#6): Do not claim "AI ok" while the network is down or unknown.
         if internet_ok is False:
-            return "AI wartet"
+            return "wartet"
         if internet_ok is None:
-            return "AI ?"
+            return "?"
         health_error = self._compact_text(getattr(health, "runtime_error", None))
         error_text = " ".join(
             part
@@ -323,32 +404,61 @@ class TwinrStatusDisplayLoop:
                 "model",
             )
         ):
-            return "AI Achtung"
-        return "AI ok"
+            return "Achtung"
+        return "ok"
 
     def _system_footer_label(self, snapshot: RuntimeSnapshot | None, health: TwinrSystemHealth | None) -> str:
+        return f"System {self._system_state_value(snapshot, health)}"
+
+    def _system_state_value(self, snapshot: RuntimeSnapshot | None, health: TwinrSystemHealth | None) -> str:
         snapshot_status = self._snapshot_status(snapshot)
         snapshot_error = self._snapshot_error_message(snapshot)
         runtime_error = self._compact_text(getattr(health, "runtime_error", None))
         if snapshot_status == "error" or snapshot_error or runtime_error:
-            return "System Fehler"
+            return "Fehler"
         if health is None:
-            return "System ?"
+            return "?"
 
         health_status = self._compact_text(getattr(health, "status", None)).lower()
         if health_status == "fail":
-            return "System Fehler"
+            return "Fehler"
         if not self._service_running(health, "conversation_loop"):
-            return "System Achtung"
+            return "Achtung"
         if getattr(health, "cpu_temperature_c", None) is not None and health.cpu_temperature_c >= 72:
-            return "System warm"
+            return "warm"
         if getattr(health, "memory_used_percent", None) is not None and health.memory_used_percent >= 80:
-            return "System Achtung"
+            return "Achtung"
         if getattr(health, "disk_used_percent", None) is not None and health.disk_used_percent >= 85:
-            return "System Achtung"
+            return "Achtung"
         if health_status == "warn":
-            return "System Achtung"
-        return "System ok"
+            return "Achtung"
+        return "ok"
+
+    def _internet_footer_label(self, internet_ok: bool | None) -> str:
+        return f"Internet {self._internet_state_value(internet_ok)}"
+
+    def _internet_state_value(self, internet_ok: bool | None) -> str:
+        if internet_ok is True:
+            return "ok"
+        if internet_ok is False:
+            return "fehlt"
+        return "?"
+
+    def _runtime_state_value(self, snapshot: RuntimeSnapshot | None) -> str:
+        status = self._snapshot_status(snapshot)
+        if status == "waiting":
+            return "Waiting"
+        if status == "listening":
+            return "Listening"
+        if status == "processing":
+            return "Processing"
+        if status == "answering":
+            return "Answering"
+        if status == "printing":
+            return "Printing"
+        if status == "error":
+            return "Error"
+        return status.replace("_", " ").title()
 
     def _service_running(self, health: TwinrSystemHealth | None, key: str) -> bool:
         if health is None:
@@ -381,6 +491,8 @@ class TwinrStatusDisplayLoop:
         *,
         headline: str,
         details: tuple[str, ...],
+        state_fields: tuple[tuple[str, str], ...],
+        log_sections: LogSections,
         animation_frame: int,
     ) -> bool:
         try:
@@ -388,6 +500,8 @@ class TwinrStatusDisplayLoop:
                 status,
                 headline=headline,
                 details=details,
+                state_fields=state_fields,
+                log_sections=log_sections,
                 animation_frame=animation_frame,
             )
             return True
@@ -401,12 +515,46 @@ class TwinrStatusDisplayLoop:
                     status,
                     headline=headline,
                     details=details,
+                    state_fields=state_fields,
+                    log_sections=log_sections,
                     animation_frame=animation_frame,
                 )
                 return True
             except Exception as retry_exc:
                 self._emit_error("display_show_retry_failed", retry_exc)
         return False
+
+    def _write_heartbeat(
+        self,
+        runtime_status: str,
+        *,
+        phase: str,
+        detail: str | None = None,
+        force: bool = False,
+    ) -> None:
+        store = self.heartbeat_store
+        if store is None:
+            return
+        now_monotonic = time.monotonic()
+        if not force and (now_monotonic - self._last_heartbeat_at) < _HEARTBEAT_IDLE_REFRESH_S:
+            return
+        self._heartbeat_seq += 1
+        try:
+            save_display_heartbeat(
+                store,
+                runtime_status=runtime_status,
+                phase=phase,
+                seq=self._heartbeat_seq,
+                detail=self._compact_text(detail, max_len=_STATUS_TEXT_MAX_LEN) or None,
+                pid=os.getpid(),
+                updated_at=datetime.now(timezone.utc),
+                last_render_started_at=self._last_render_started_at,
+                last_render_completed_at=self._last_render_completed_at,
+            )
+        except Exception as exc:
+            self._emit_error("display_heartbeat_save_failed", exc)
+            return
+        self._last_heartbeat_at = now_monotonic
 
     def _reopen_display(self) -> bool:
         self._close_display()
@@ -466,12 +614,18 @@ class TwinrStatusDisplayLoop:
             self._emit_error("clock_failed", exc)
             return "--:--"
 
-    def _internet_footer_label(self, internet_ok: bool | None) -> str:
-        if internet_ok is True:
-            return "Internet ok"
-        if internet_ok is False:
-            return "Internet fehlt"
-        return "Internet ?"
+    def _display_animation_frame(self, status: str) -> int:
+        if self._display_layout() != "default":
+            return 0
+        return self._animation_frame(status)
+
+    def _display_layout(self) -> str:
+        return self._compact_text(getattr(self.config, "display_layout", "default")).lower() or "default"
+
+    def _debug_log_builder(self) -> TwinrDisplayDebugLogBuilder:
+        if self.debug_log_builder is None:
+            self.debug_log_builder = TwinrDisplayDebugLogBuilder.from_config(self.config)
+        return self.debug_log_builder
 
     def _snapshot_status(self, snapshot: RuntimeSnapshot | None) -> str:
         if snapshot is None:

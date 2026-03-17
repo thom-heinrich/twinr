@@ -13,7 +13,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.agent.base_agent import TwinrConfig
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.ops import TwinrOpsEventStore
-from twinr.ops.remote_memory_watchdog import RemoteMemoryWatchdog, RemoteMemoryWatchdogStore
+from twinr.ops.remote_memory_watchdog import (
+    RemoteMemoryWatchdog,
+    RemoteMemoryWatchdogSample,
+    RemoteMemoryWatchdogSnapshot,
+    RemoteMemoryWatchdogStore,
+)
 
 
 class _SequencedRemoteService:
@@ -52,6 +57,131 @@ class _SlowReadyRemoteService(_SequencedRemoteService):
         super().ensure_remote_ready()
 
 
+class _DeepProbeSequencedRemoteService:
+    def __init__(self, states: list[str]) -> None:
+        self._states = list(states)
+        self._index = 0
+        self.shutdown_calls = 0
+
+    def remote_required(self) -> bool:
+        return True
+
+    def remote_status(self):
+        return SimpleNamespace(mode="remote_primary", ready=True, detail=None)
+
+    def ensure_remote_ready(self) -> None:
+        state = self._states[min(self._index, len(self._states) - 1)]
+        self._index += 1
+        if state != "ok":
+            raise LongTermRemoteUnavailableError("remote unavailable")
+
+    def shutdown(self, *, timeout_s: float = 2.0) -> None:
+        del timeout_s
+        self.shutdown_calls += 1
+
+
+class _AlwaysFailRemoteService:
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+
+    def remote_required(self) -> bool:
+        return True
+
+    def remote_status(self):
+        return SimpleNamespace(mode="remote_primary", ready=True, detail=None)
+
+    def ensure_remote_ready(self) -> None:
+        raise LongTermRemoteUnavailableError("remote unavailable")
+
+    def shutdown(self, *, timeout_s: float = 2.0) -> None:
+        del timeout_s
+        self.shutdown_calls += 1
+
+
+class _ShallowFailThenRecoverRemoteService:
+    def __init__(self) -> None:
+        self.status_calls = 0
+        self.ensure_calls = 0
+        self.shutdown_calls = 0
+
+    def remote_required(self) -> bool:
+        return True
+
+    def remote_status(self):
+        self.status_calls += 1
+        if self.status_calls == 1:
+            return SimpleNamespace(
+                mode="remote_primary",
+                ready=False,
+                detail="Remote long-term memory is temporarily cooling down after recent failures.",
+            )
+        return SimpleNamespace(mode="remote_primary", ready=True, detail=None)
+
+    def ensure_remote_ready(self) -> None:
+        self.ensure_calls += 1
+
+    def shutdown(self, *, timeout_s: float = 2.0) -> None:
+        del timeout_s
+        self.shutdown_calls += 1
+
+
+class _StructuredProbeRemoteService:
+    def remote_required(self) -> bool:
+        return True
+
+    def remote_status(self):
+        return SimpleNamespace(mode="remote_primary", ready=True, detail=None)
+
+    def probe_remote_ready(self):
+        class _ProbeResult:
+            ready = False
+            detail = "Failed to read remote long-term snapshot 'prompt_memory' (ChonkyDBError)."
+            remote_status = SimpleNamespace(mode="remote_primary", ready=True, detail=None)
+
+            @staticmethod
+            def to_dict() -> dict[str, object]:
+                return {
+                    "ready": False,
+                    "detail": "Failed to read remote long-term snapshot 'prompt_memory' (ChonkyDBError).",
+                    "remote_status": {
+                        "mode": "remote_primary",
+                        "ready": True,
+                        "detail": None,
+                    },
+                    "steps": (
+                        {
+                            "name": "LongTermRemoteHealthProbe.probe_operational",
+                            "status": "fail",
+                            "warm_result": {
+                                "ready": False,
+                                "failed_snapshot_kind": "prompt_memory",
+                                "checks": [
+                                    {
+                                        "store": "prompt_context",
+                                        "snapshot_kind": "prompt_memory",
+                                        "status": "unavailable",
+                                        "selected_source": "pointer_document",
+                                        "attempts": [
+                                            {
+                                                "source": "pointer_document",
+                                                "attempt": 1,
+                                                "status": "error",
+                                                "status_code": 503,
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        },
+                    ),
+                }
+
+        return _ProbeResult()
+
+    def shutdown(self, *, timeout_s: float = 2.0) -> None:
+        del timeout_s
+
+
 class RemoteMemoryWatchdogTests(unittest.TestCase):
     def test_store_load_roundtrips_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -88,6 +218,10 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
                         detail=None,
                     ),
                     recent_samples=(),
+                    heartbeat_at="2026-03-16T18:00:05Z",
+                    probe_inflight=False,
+                    probe_started_at=None,
+                    probe_age_s=None,
                 )
             )
 
@@ -98,6 +232,8 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(loaded.current.status, "ok")
         self.assertEqual(loaded.sample_count, 5)
         self.assertEqual(loaded.failure_count, 1)
+        self.assertEqual(loaded.heartbeat_at, "2026-03-16T18:00:05Z")
+        self.assertFalse(loaded.probe_inflight)
 
     def test_probe_once_persists_rolling_snapshot_and_transition_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -110,11 +246,13 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
                 long_term_memory_remote_watchdog_history_limit=2,
             )
             event_store = TwinrOpsEventStore.from_config(config)
-            service = _SequencedRemoteService(["ok", "fail", "ok"])
+            first_service = _DeepProbeSequencedRemoteService(["ok", "fail"])
+            second_service = _DeepProbeSequencedRemoteService(["ok"])
+            service_instances = [first_service, second_service]
             emitted: list[str] = []
             watchdog = RemoteMemoryWatchdog(
                 config=config,
-                service_factory=lambda: service,
+                service_factory=lambda: service_instances.pop(0),
                 store=RemoteMemoryWatchdogStore.from_config(config),
                 event_store=event_store,
                 emit=emitted.append,
@@ -142,7 +280,8 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(payload["recent_samples"][1]["status"], "ok")
         self.assertEqual(len(status_events), 3)
         self.assertEqual(json.loads(emitted[-1])["status"], "ok")
-        self.assertEqual(service.shutdown_calls, 1)
+        self.assertEqual(first_service.shutdown_calls, 1)
+        self.assertEqual(second_service.shutdown_calls, 1)
 
     def test_probe_once_marks_disabled_when_remote_is_not_required(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -197,12 +336,127 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
                 emit=emitted.append,
             )
 
-            result = watchdog.run(duration_s=0.05)
+            result = watchdog.run(duration_s=0.2)
 
         events = [json.loads(line)["event"] for line in emitted]
         self.assertEqual(result, 0)
         self.assertIn("remote_memory_watchdog_heartbeat", events)
         self.assertIn("remote_memory_watchdog_sample", events)
+
+    def test_heartbeat_persists_startup_progress_before_first_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            store = RemoteMemoryWatchdogStore.from_config(config)
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=lambda: _SlowReadyRemoteService(sleep_s=0.03),
+                store=store,
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            watchdog._emit_heartbeat(
+                probe_started_at="2026-03-16T18:00:00Z",
+                probe_started_monotonic=watchdog._monotonic(),
+                probe_inflight=True,
+            )
+            snapshot = store.load()
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.current.status, "starting")
+        self.assertTrue(snapshot.probe_inflight)
+        self.assertEqual(snapshot.current.seq, 0)
+        self.assertIsNotNone(snapshot.heartbeat_at)
+
+    def test_probe_once_recreates_cached_service_after_remote_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            failing_service = _AlwaysFailRemoteService()
+            recovering_service = _SequencedRemoteService(["ok"])
+            service_instances = [failing_service, recovering_service]
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=lambda: service_instances.pop(0),
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            first = watchdog.probe_once()
+            second = watchdog.probe_once()
+            watchdog.close()
+
+        self.assertEqual(first.current.status, "fail")
+        self.assertEqual(second.current.status, "ok")
+        self.assertEqual(failing_service.shutdown_calls, 1)
+        self.assertEqual(recovering_service.shutdown_calls, 1)
+
+    def test_probe_once_preserves_cached_service_when_shallow_remote_status_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            service = _ShallowFailThenRecoverRemoteService()
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=lambda: service,
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            first = watchdog.probe_once()
+            second = watchdog.probe_once()
+            watchdog.close()
+
+        self.assertEqual(first.current.status, "fail")
+        self.assertIn("cooling down", first.current.detail or "")
+        self.assertEqual(second.current.status, "ok")
+        self.assertEqual(service.ensure_calls, 1)
+        self.assertEqual(service.shutdown_calls, 1)
+
+    def test_probe_once_persists_structured_probe_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_StructuredProbeRemoteService,
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            snapshot = watchdog.probe_once()
+
+        self.assertEqual(snapshot.current.status, "fail")
+        self.assertIsNotNone(snapshot.current.probe)
+        assert snapshot.current.probe is not None
+        warm_result = snapshot.current.probe["steps"][0]["warm_result"]
+        self.assertEqual(warm_result["failed_snapshot_kind"], "prompt_memory")
+        self.assertEqual(warm_result["checks"][0]["attempts"][0]["status_code"], 503)
 
 
 if __name__ == "__main__":

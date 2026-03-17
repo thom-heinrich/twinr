@@ -1,5 +1,7 @@
 from pathlib import Path
+from threading import Event
 import sys
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -58,6 +60,28 @@ class FakeClosureToolAgentProvider:
         )
 
 
+class BlockingClosureToolAgentProvider:
+    def __init__(self, config: TwinrConfig) -> None:
+        self.config = config
+        self.started = Event()
+        self.release = Event()
+
+    def start_turn_streaming(
+        self,
+        prompt: str,
+        *,
+        conversation=None,
+        instructions=None,
+        tool_schemas=(),
+        allow_web_search=None,
+        on_text_delta=None,
+    ) -> ToolCallingTurnResponse:
+        del prompt, conversation, instructions, tool_schemas, allow_web_search, on_text_delta
+        self.started.set()
+        self.release.wait(timeout=5.0)
+        return ToolCallingTurnResponse(text="", tool_calls=())
+
+
 class ConversationClosureEvaluatorTests(unittest.TestCase):
     def test_evaluator_returns_structured_close_decision(self) -> None:
         config = TwinrConfig(
@@ -102,6 +126,31 @@ class ConversationClosureEvaluatorTests(unittest.TestCase):
 
         self.assertFalse(decision.close_now)
         self.assertEqual(decision.reason, "still_engaged")
+
+    def test_evaluator_enforces_wall_clock_timeout_without_adapter_timeout_kwarg(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+            conversation_closure_provider_timeout_seconds=0.25,
+        )
+        provider = BlockingClosureToolAgentProvider(config)
+        evaluator = ToolCallingConversationClosureEvaluator(config=config, provider=provider)
+
+        started = time.monotonic()
+        try:
+            with self.assertRaises(TimeoutError):
+                evaluator.evaluate(
+                    user_transcript="Danke.",
+                    assistant_response="Gern geschehen.",
+                    request_source="button",
+                )
+        finally:
+            provider.release.set()
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(provider.started.is_set())
+        self.assertLess(elapsed, 1.0)
 
 
 if __name__ == "__main__":

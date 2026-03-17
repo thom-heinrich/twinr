@@ -27,6 +27,16 @@ from twinr.agent.self_coding.codex_driver.exec_fallback import (
     _enqueue_stream_lines,
     _normalize_error_message,
 )
+from twinr.agent.self_coding.codex_driver.config import (
+    codex_optional_model,
+    codex_reasoning_effort,
+    codex_timeout_seconds,
+)
+from twinr.agent.self_coding.codex_driver.environment import (
+    assert_codex_sdk_environment_ready,
+    collect_codex_sdk_environment_report,
+    default_bridge_script_path,
+)
 from twinr.agent.self_coding.codex_driver.types import (
     CodexCompileEvent,
     CodexCompileProgress,
@@ -37,10 +47,10 @@ from twinr.agent.self_coding.codex_driver.types import (
     compile_result_from_text,
 )
 
-_DEFAULT_TIMEOUT_SECONDS = 180.0
 _MAX_ERROR_TEXT_CHARS = 16_384
 _QUEUE_POLL_SECONDS = 0.25
 _TERMINATION_GRACE_SECONDS = 5.0
+_STREAM_QUEUE_MAX_RECORDS = 1_024  # AUDIT-FIX(#4): Bound queued bridge output to prevent unbounded RAM growth on the RPi.
 _StreamRecord = tuple[str, str, str | BaseException | None]
 _EventSink = Callable[[CodexCompileEvent, CodexCompileProgress], None]
 
@@ -59,54 +69,80 @@ class CodexSdkDriver:
         *,
         command: tuple[str, ...] = ("node",),
         bridge_script: str | Path | None = None,
-        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        timeout_seconds: float | None = None,
+        model: str | None = None,
+        model_reasoning_effort: str | None = None,
     ) -> None:
         if not command or any(not str(part).strip() for part in command):
             raise ValueError("command must contain at least one non-empty argument")
-        normalized_timeout = float(timeout_seconds)
+        resolved_timeout = codex_timeout_seconds(
+            "TWINR_SELF_CODING_CODEX_SDK_TIMEOUT_SECONDS",
+            "TWINR_SELF_CODING_CODEX_TIMEOUT_SECONDS",
+        )
+        if timeout_seconds is not None:
+            resolved_timeout = float(timeout_seconds)
+        normalized_timeout = float(resolved_timeout)
         if not math.isfinite(normalized_timeout) or normalized_timeout <= 0.0:
             raise ValueError("timeout_seconds must be a finite positive number")
-        self.command = tuple(str(part) for part in command)
+        self.command = tuple(str(part).strip() for part in command)  # AUDIT-FIX(#8): Persist the normalized command actually validated above.
         self.timeout_seconds = normalized_timeout
-        self._uses_default_bridge = bridge_script is None
-        self._startup_self_test_passed = False
-        self.bridge_script = (
-            _default_bridge_script_path() if bridge_script is None else Path(bridge_script).expanduser().resolve(strict=False)
+        self.model = model if model is not None else codex_optional_model("TWINR_SELF_CODING_CODEX_MODEL")
+        self.model_reasoning_effort = (
+            model_reasoning_effort
+            if model_reasoning_effort is not None
+            else codex_reasoning_effort("TWINR_SELF_CODING_CODEX_MODEL_REASONING_EFFORT", default="high")
         )
+
+        default_bridge = default_bridge_script_path().resolve(strict=False)
+        resolved_bridge = default_bridge if bridge_script is None else Path(bridge_script).expanduser().resolve(strict=False)
+        self._uses_default_bridge = resolved_bridge == default_bridge  # AUDIT-FIX(#9): Preserve default-bridge safety checks even when the caller passes the default path explicitly.
+        self._startup_self_test_passed = False
+        self._startup_self_test_lock = threading.Lock()  # AUDIT-FIX(#6): Serialize first-run self-test so concurrent compile calls cannot race.
+        self.bridge_script = resolved_bridge
 
     def run_compile(self, request: CodexCompileRequest, *, event_sink: _EventSink | None = None) -> CodexCompileResult:
         """Run one bounded SDK-backed compile turn and return the normalized result."""
 
-        workspace_root = self._resolve_workspace_root(request.workspace_root)
+        try:
+            workspace_root = self._resolve_workspace_root(request.workspace_root)  # AUDIT-FIX(#5): Normalize request input failures into deterministic driver errors.
+        except AttributeError as exc:
+            raise CodexDriverProtocolError("compile request is missing `workspace_root`") from exc
+
         bridge_script = self._resolve_bridge_script()
         resolved_command = self._resolve_command()
-        self._ensure_startup_self_test(resolved_command=resolved_command, bridge_script=bridge_script)
         payload = self._build_bridge_payload(request, workspace_root)
+        self._ensure_startup_self_test(resolved_command=resolved_command, bridge_script=bridge_script)
         process = self._start_process([*resolved_command, str(bridge_script)], workspace_root)
 
-        stream_queue: Queue[_StreamRecord] = Queue()
-        stdout_thread = threading.Thread(
-            target=_enqueue_stream_lines,
-            args=("stdout", process.stdout, stream_queue),
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=_enqueue_stream_lines,
-            args=("stderr", process.stderr, stream_queue),
-            daemon=True,
-        )
-        stdout_thread.start()
-        stderr_thread.start()
-
-        self._write_payload_to_stdin(process, payload)
-
+        stream_queue: Queue[_StreamRecord] = Queue(maxsize=_STREAM_QUEUE_MAX_RECORDS)  # AUDIT-FIX(#4): Apply backpressure instead of allowing unlimited queued output.
         collector = CodexExecRunCollector()
         stderr_buffer = _BoundedTextBuffer(max_chars=_MAX_ERROR_TEXT_CHARS)
         deadline = time.monotonic() + self.timeout_seconds
         stdout_done = False
         stderr_done = False
+        stdout_thread: threading.Thread | None = None
+        stderr_thread: threading.Thread | None = None
+        stdout_thread_started = False
+        stderr_thread_started = False
 
-        try:
+        try:  # AUDIT-FIX(#2): Guard the entire child-process lifecycle so every failure path tears the process tree down cleanly.
+            stdout_thread = threading.Thread(
+                target=_enqueue_stream_lines,
+                args=("stdout", process.stdout, stream_queue),
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=_enqueue_stream_lines,
+                args=("stderr", process.stderr, stream_queue),
+                daemon=True,
+            )
+            stdout_thread.start()
+            stdout_thread_started = True
+            stderr_thread.start()
+            stderr_thread_started = True
+
+            self._write_payload_to_stdin(process, payload)
+
             while not (stdout_done and stderr_done and process.poll() is not None):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
@@ -129,7 +165,8 @@ class CodexSdkDriver:
 
                 if record_type == "error":
                     self._terminate_process_tree(process)
-                    assert isinstance(payload_record, BaseException)
+                    if not isinstance(payload_record, BaseException):  # AUDIT-FIX(#7): Do not rely on `assert`, which disappears under `python -O`.
+                        raise CodexDriverProtocolError("internal stream reader returned a non-exception error payload")
                     if stream_name == "stdout":
                         raise CodexDriverProtocolError("failed to decode the local codex-sdk bridge stdout stream") from payload_record
                     raise CodexDriverUnavailableError("failed to read stderr from the local codex-sdk bridge") from payload_record
@@ -143,16 +180,27 @@ class CodexSdkDriver:
 
                 self._terminate_process_tree(process)
                 raise CodexDriverProtocolError("internal stream reader returned an unknown record type")
+        except BaseException:
+            self._terminate_process_tree(process)
+            raise
         finally:
             self._safe_close_pipe(process.stdin)
             self._safe_close_pipe(process.stdout)
             self._safe_close_pipe(process.stderr)
-            stdout_thread.join(timeout=1.0)
-            stderr_thread.join(timeout=1.0)
+            if stdout_thread_started and stdout_thread is not None:
+                stdout_thread.join(timeout=1.0)
+            if stderr_thread_started and stderr_thread is not None:
+                stderr_thread.join(timeout=1.0)
 
-        transcript = collector.build_result()
+        try:
+            transcript = collector.build_result()  # AUDIT-FIX(#2): Normalize malformed collector state instead of leaking raw internal exceptions.
+        except Exception as exc:
+            raise CodexDriverProtocolError("failed to build the local codex-sdk transcript") from exc
+
         stderr_text = stderr_buffer.render()
-        returncode = process.returncode if process.returncode is not None else process.wait(timeout=0)
+        returncode = process.returncode
+        if returncode is None:  # AUDIT-FIX(#2): Fail closed if the child somehow exited the loop without a stable return code.
+            raise CodexDriverProtocolError("the local codex-sdk bridge exited without a final return code")
         if collector.turn_failed:
             raise CodexDriverUnavailableError(
                 _normalize_error_message(
@@ -211,50 +259,63 @@ class CodexSdkDriver:
     ) -> None:
         if self._startup_self_test_passed:
             return
-
-        command = [*resolved_command, str(bridge_script), "--self-test"]
-        timeout_seconds = min(self.timeout_seconds, 15.0)
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=str(bridge_script.parent),
-                text=True,
-                encoding="utf-8",
-                errors="strict",
-                capture_output=True,
-                timeout=timeout_seconds,
-                check=False,
+        with self._startup_self_test_lock:  # AUDIT-FIX(#6): Make the one-time self-test idempotent under concurrent callers.
+            if self._startup_self_test_passed:
+                return
+            report = collect_codex_sdk_environment_report(
+                bridge_script=bridge_script,
+                bridge_command=resolved_command,
+                which_resolver=shutil.which,
+                subprocess_runner=subprocess.run,
+                run_local_self_test=True,
+                run_live_auth_check=False,
+                self_test_timeout_seconds=min(self.timeout_seconds, 15.0),
+                require_bridge_dependencies=self._uses_default_bridge,
+                require_codex_auth=self._uses_default_bridge,
             )
-        except FileNotFoundError as exc:
-            raise CodexDriverUnavailableError("the configured codex-sdk bridge command is unavailable on this machine") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise CodexDriverUnavailableError("the codex-sdk bridge startup self-test timed out") from exc
-        except OSError as exc:
-            raise CodexDriverUnavailableError(f"failed to start the codex-sdk bridge startup self-test: {exc}") from exc
-
-        stdout_text = str(completed.stdout or "").strip()
-        stderr_text = str(completed.stderr or "").strip()
-        if completed.returncode != 0:
-            detail = _normalize_error_message(
-                stderr_text or stdout_text,
-                fallback="the codex-sdk bridge startup self-test failed",
-            )
-            raise CodexDriverUnavailableError(f"codex-sdk bridge startup self-test failed: {detail}")
-
-        if not stdout_text:
-            raise CodexDriverUnavailableError("codex-sdk bridge startup self-test returned no result payload")
-        last_line = stdout_text.splitlines()[-1]
-        try:
-            payload = json.loads(last_line)
-        except json.JSONDecodeError as exc:
-            raise CodexDriverUnavailableError("codex-sdk bridge startup self-test returned invalid JSON") from exc
-        if not isinstance(payload, dict) or payload.get("ok") is not True:
-            raise CodexDriverUnavailableError("codex-sdk bridge startup self-test did not confirm a healthy runtime")
-        self._startup_self_test_passed = True
+            assert_codex_sdk_environment_ready(report)
+            self._startup_self_test_passed = True
 
     @staticmethod
-    def _resolve_workspace_root(raw_workspace_root: str) -> Path:
-        workspace_root = Path(raw_workspace_root).expanduser()
+    def _coerce_path_text(raw_path: str | os.PathLike[str], *, field_name: str) -> str:
+        try:
+            path_text = os.fspath(raw_path)
+        except TypeError as exc:
+            raise CodexDriverProtocolError(f"{field_name} must be a path-like string") from exc
+        if not isinstance(path_text, str):
+            raise CodexDriverProtocolError(f"{field_name} must be a text path")
+        if not path_text.strip():
+            raise CodexDriverProtocolError(f"{field_name} must not be empty")
+        return path_text
+
+    @classmethod
+    def _normalize_workspace_relative_path(
+        cls,
+        raw_path: str | os.PathLike[str],
+        *,
+        field_name: str,
+        workspace_root: Path,
+    ) -> str:
+        path_text = cls._coerce_path_text(raw_path, field_name=field_name)  # AUDIT-FIX(#1): Validate bridge file-path fields before serializing them into the Node job payload.
+        candidate = Path(path_text)
+        if candidate.is_absolute():
+            raise CodexDriverProtocolError(f"{field_name} must be a relative path inside workspace_root")
+        if any(part == ".." for part in candidate.parts):
+            raise CodexDriverProtocolError(f"{field_name} must not escape workspace_root")
+        try:
+            resolved_candidate = (workspace_root / candidate).resolve(strict=False)
+        except OSError as exc:
+            raise CodexDriverProtocolError(f"failed to resolve {field_name}: {exc}") from exc
+        try:
+            resolved_candidate.relative_to(workspace_root)
+        except ValueError as exc:
+            raise CodexDriverProtocolError(f"{field_name} must stay inside workspace_root") from exc
+        return str(candidate)
+
+    @classmethod
+    def _resolve_workspace_root(cls, raw_workspace_root: str | os.PathLike[str]) -> Path:
+        workspace_root_text = cls._coerce_path_text(raw_workspace_root, field_name="workspace_root")  # AUDIT-FIX(#5): Reject empty and non-path-like workspace roots instead of silently falling back to the service CWD.
+        workspace_root = Path(workspace_root_text).expanduser()
         try:
             resolved = workspace_root.resolve(strict=True)
         except FileNotFoundError as exc:
@@ -265,16 +326,33 @@ class CodexSdkDriver:
             raise CodexDriverUnavailableError("workspace_root is not a directory")
         return resolved
 
-    @staticmethod
-    def _build_bridge_payload(request: CodexCompileRequest, workspace_root: Path) -> str:
+    def _build_bridge_payload(self, request: CodexCompileRequest, workspace_root: Path) -> str:
+        try:
+            request_path = self._normalize_workspace_relative_path(
+                request.request_path,
+                field_name="request_path",
+                workspace_root=workspace_root,
+            )
+            output_schema_path = self._normalize_workspace_relative_path(
+                request.output_schema_path,
+                field_name="output_schema_path",
+                workspace_root=workspace_root,
+            )
+            prompt = request.prompt
+            output_schema = request.output_schema
+        except AttributeError as exc:
+            raise CodexDriverProtocolError("compile request is missing one or more required fields") from exc
+
         try:
             return json.dumps(
                 {
                     "workspaceRoot": str(workspace_root),
-                    "requestPath": request.request_path,
-                    "outputSchemaPath": request.output_schema_path,
-                    "prompt": request.prompt,
-                    "outputSchema": request.output_schema,
+                    "requestPath": request_path,
+                    "outputSchemaPath": output_schema_path,
+                    "prompt": prompt,
+                    "outputSchema": output_schema,
+                    "model": self.model,
+                    "modelReasoningEffort": self.model_reasoning_effort,
                 },
                 ensure_ascii=False,
             )
@@ -310,8 +388,11 @@ class CodexSdkDriver:
             raise CodexDriverUnavailableError("the local codex-sdk bridge stdin pipe is unavailable")
         try:
             stdin.write(payload)
-        except BrokenPipeError:
-            return
+            stdin.write("\n")  # AUDIT-FIX(#3): Force a flushable record boundary for bridges that consume stdin line-by-line.
+            stdin.flush()  # AUDIT-FIX(#3): Surface short writes/BrokenPipe here instead of suppressing them during close().
+        except BrokenPipeError as exc:
+            self._terminate_process_tree(process)
+            raise CodexDriverUnavailableError("the local codex-sdk bridge closed stdin before receiving the compile payload") from exc
         except OSError as exc:
             self._terminate_process_tree(process)
             raise CodexDriverUnavailableError("failed to send the compile payload to the local codex-sdk bridge") from exc
@@ -336,9 +417,17 @@ class CodexSdkDriver:
         if not isinstance(payload, dict):
             self._terminate_process_tree(process)
             raise CodexDriverProtocolError("the local codex-sdk bridge returned a non-object event")
-        emitted = collector.consume(payload)
-        if event_sink is not None:
-            snapshot = collector.snapshot()
+
+        try:
+            emitted = collector.consume(payload)  # AUDIT-FIX(#2): Treat malformed event sequences as protocol failures and terminate the child promptly.
+            snapshot = collector.snapshot() if event_sink is not None else None
+        except Exception as exc:
+            self._terminate_process_tree(process)
+            if isinstance(exc, (CodexDriverProtocolError, CodexDriverUnavailableError)):
+                raise
+            raise CodexDriverProtocolError("the local codex-sdk bridge emitted an invalid event sequence") from exc
+
+        if event_sink is not None and snapshot is not None:
             for event in emitted:
                 try:
                     event_sink(event, snapshot)
@@ -388,7 +477,3 @@ class CodexSdkDriver:
             pipe.close()
         except Exception:
             return
-
-
-def _default_bridge_script_path() -> Path:
-    return Path(__file__).with_name("sdk_bridge") / "run_compile.mjs"

@@ -586,6 +586,23 @@ class OpenAIBackendTests(unittest.TestCase):
             "Bitte mit Temperatur und Regen.",
         )
 
+    def test_search_live_info_does_not_inject_default_city_prompt_hint_when_location_hint_is_missing(self) -> None:
+        self.responses.output_text = "In Schwarzenbek 9 Grad, trocken."
+
+        backend = OpenAIBackend(
+            config=replace(self.config, openai_search_model="gpt-5.2-chat-latest"),
+            client=self.client,
+        )
+
+        backend.search_live_info_with_metadata(
+            "Wie ist das Wetter in Schwarzenbek?",
+        )
+
+        request = self.responses.calls[0]
+        prompt = request["input"][-1]["content"][0]["text"]
+        self.assertNotIn("Location hint: Berlin", prompt)
+        self.assertEqual(request["tools"][0]["user_location"]["city"], "Berlin")
+
     def test_search_live_info_falls_back_to_chat_latest_when_primary_search_model_returns_blank(self) -> None:
         class BlankThenAnswerResponses:
             def __init__(self) -> None:

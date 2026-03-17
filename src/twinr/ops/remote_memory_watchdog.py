@@ -80,8 +80,11 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
 class _RemoteMemoryService(Protocol):
     """Protocol used by the watchdog so tests can provide fakes."""
 
-    def ensure_remote_ready(self) -> None:
+    def ensure_remote_ready(self):
         """Raise if required remote memory is unavailable."""
+
+    def probe_remote_ready(self):
+        """Return structured remote-memory readiness evidence when available."""
 
     def remote_required(self) -> bool:
         """Report whether this runtime must fail closed on remote loss."""
@@ -107,6 +110,7 @@ class RemoteMemoryWatchdogSample:
     consecutive_ok: int
     consecutive_fail: int
     detail: str | None = None
+    probe: dict[str, object] | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> "RemoteMemoryWatchdogSample":
@@ -123,6 +127,7 @@ class RemoteMemoryWatchdogSample:
             consecutive_ok=int(payload.get("consecutive_ok", 0) or 0),
             consecutive_fail=int(payload.get("consecutive_fail", 0) or 0),
             detail=cls._coerce_optional_text(payload.get("detail")),
+            probe=dict(payload.get("probe")) if isinstance(payload.get("probe"), dict) else None,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -154,6 +159,10 @@ class RemoteMemoryWatchdogSnapshot:
     artifact_path: str
     current: RemoteMemoryWatchdogSample
     recent_samples: tuple[RemoteMemoryWatchdogSample, ...]
+    heartbeat_at: str | None = None
+    probe_inflight: bool = False
+    probe_started_at: str | None = None
+    probe_age_s: float | None = None
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> "RemoteMemoryWatchdogSnapshot":
@@ -186,6 +195,10 @@ class RemoteMemoryWatchdogSnapshot:
                 for item in raw_recent_samples
                 if isinstance(item, dict)
             ),
+            heartbeat_at=RemoteMemoryWatchdogSample._coerce_optional_text(payload.get("heartbeat_at")),
+            probe_inflight=bool(payload.get("probe_inflight", False)),
+            probe_started_at=RemoteMemoryWatchdogSample._coerce_optional_text(payload.get("probe_started_at")),
+            probe_age_s=cls._coerce_optional_float(payload.get("probe_age_s")),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -195,6 +208,16 @@ class RemoteMemoryWatchdogSnapshot:
         payload["current"] = self.current.to_dict()
         payload["recent_samples"] = [sample.to_dict() for sample in self.recent_samples]
         return payload
+
+    @staticmethod
+    def _coerce_optional_float(value: object) -> float | None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not parsed >= 0.0:
+            return None
+        return parsed
 
 
 class RemoteMemoryWatchdogStore:
@@ -234,6 +257,66 @@ class RemoteMemoryWatchdogStore:
             raise RuntimeError(f"Remote memory watchdog snapshot is malformed: {self.path}") from exc
 
 
+def build_remote_memory_watchdog_bootstrap_snapshot(
+    config: TwinrConfig,
+    *,
+    pid: int,
+    artifact_path: str | Path,
+    started_at: str | None = None,
+    captured_at: str | None = None,
+) -> RemoteMemoryWatchdogSnapshot:
+    """Build the supervisor-seeded startup snapshot for a fresh watchdog child."""
+
+    resolved_started_at = str(started_at or _utc_now_iso())
+    resolved_captured_at = str(captured_at or resolved_started_at)
+    required = bool(
+        config.long_term_memory_enabled
+        and config.long_term_memory_mode == "remote_primary"
+        and config.long_term_memory_remote_required
+    )
+    current = RemoteMemoryWatchdogSample(
+        seq=0,
+        captured_at=resolved_captured_at,
+        status="starting",
+        ready=False,
+        mode="remote_primary" if required else "disabled",
+        required=required,
+        latency_ms=0.0,
+        consecutive_ok=0,
+        consecutive_fail=0,
+        detail="Remote memory watchdog is starting.",
+        probe=None,
+    )
+    interval_s = _coerce_interval_s(
+        getattr(config, "long_term_memory_remote_watchdog_interval_s", _DEFAULT_WATCHDOG_INTERVAL_S),
+        default=_DEFAULT_WATCHDOG_INTERVAL_S,
+    )
+    history_limit = _coerce_history_limit(
+        getattr(config, "long_term_memory_remote_watchdog_history_limit", _DEFAULT_HISTORY_LIMIT),
+        default=_DEFAULT_HISTORY_LIMIT,
+    )
+    return RemoteMemoryWatchdogSnapshot(
+        schema_version=_SNAPSHOT_SCHEMA_VERSION,
+        started_at=resolved_started_at,
+        updated_at=resolved_captured_at,
+        hostname=socket.gethostname(),
+        pid=int(pid),
+        interval_s=interval_s,
+        history_limit=history_limit,
+        sample_count=0,
+        failure_count=0,
+        last_ok_at=None,
+        last_failure_at=None,
+        artifact_path=str(artifact_path),
+        current=current,
+        recent_samples=(),
+        heartbeat_at=resolved_captured_at,
+        probe_inflight=True,
+        probe_started_at=resolved_captured_at,
+        probe_age_s=0.0,
+    )
+
+
 class RemoteMemoryWatchdog:
     """Continuously verify remote-primary long-term memory readiness."""
 
@@ -265,6 +348,7 @@ class RemoteMemoryWatchdog:
         self._sleep = sleep or time.sleep
         self._service: _RemoteMemoryService | None = None
         self._probe_lock = Lock()
+        self._store_lock = Lock()
         self._started_at = _utc_now_iso()
         self._sample_count = 0
         self._failure_count = 0
@@ -291,13 +375,7 @@ class RemoteMemoryWatchdog:
     def close(self) -> None:
         """Shut down the owned long-term memory service best-effort."""
 
-        service = self._service
-        if service is None:
-            return
-        try:
-            service.shutdown(timeout_s=2.0)
-        except Exception:
-            return
+        self._drop_service_instance()
 
     def probe_once(self) -> RemoteMemoryWatchdogSnapshot:
         """Run one remote-memory readiness probe and persist the rolling state."""
@@ -310,6 +388,8 @@ class RemoteMemoryWatchdog:
             mode = "unknown"
             required = False
             detail: str | None = None
+            probe_payload: dict[str, object] | None = None
+            deep_probe_attempted = False
 
             try:
                 service = self._service_instance()
@@ -321,19 +401,50 @@ class RemoteMemoryWatchdog:
                     status = "disabled"
                     ready = False
                     detail = status_detail or "Remote-primary long-term memory is not required."
+                elif not bool(getattr(remote_status, "ready", False)):
+                    # Keep the same service instance alive so the remote-state
+                    # circuit breaker can cool down after transient backend
+                    # outages instead of being reset on every watchdog tick.
+                    status = "fail"
+                    ready = False
+                    detail = status_detail or "Required remote long-term memory is unavailable."
                 else:
-                    service.ensure_remote_ready()
-                    status = "ok"
-                    ready = True
-                    detail = status_detail
+                    deep_probe_attempted = True
+                    probe_remote_ready = getattr(service, "probe_remote_ready", None)
+                    if callable(probe_remote_ready):
+                        probe_result = probe_remote_ready()
+                        probe_payload = self._normalize_probe_payload(
+                            getattr(probe_result, "to_dict", lambda: None)()
+                            if probe_result is not None
+                            else None
+                        )
+                        ready = bool(getattr(probe_result, "ready", False))
+                        status = "ok" if ready else "fail"
+                        detail = self._normalize_detail(getattr(probe_result, "detail", None)) or status_detail
+                        mode = str(
+                            getattr(
+                                getattr(probe_result, "remote_status", None),
+                                "mode",
+                                mode,
+                            )
+                            or mode
+                        )
+                    else:
+                        service.ensure_remote_ready()
+                        status = "ok"
+                        ready = True
+                        detail = status_detail
             except LongTermRemoteUnavailableError as exc:
                 status = "fail"
                 ready = False
                 detail = self._normalize_detail(str(exc))
+                if deep_probe_attempted:
+                    self._drop_service_instance()
             except Exception as exc:
                 status = "fail"
                 ready = False
                 detail = self._normalize_detail(f"{type(exc).__name__}: {exc}")
+                self._drop_service_instance()
 
             latency_ms = round(max(0.0, (self._monotonic() - started) * 1000.0), 1)
             sample = self._build_sample(
@@ -344,9 +455,11 @@ class RemoteMemoryWatchdog:
                 required=required,
                 latency_ms=latency_ms,
                 detail=detail,
+                probe=probe_payload,
             )
             snapshot = self._build_snapshot(sample)
-            self.store.save(snapshot)
+            with self._store_lock:
+                self.store.save(snapshot)
             self._emit_transition_event(sample)
             self.emit(
                 json.dumps(
@@ -448,10 +561,30 @@ class RemoteMemoryWatchdog:
             self._service = service
         return service
 
+    def _drop_service_instance(self) -> None:
+        """Discard one potentially poisoned service instance after a probe failure."""
+
+        service = self._service
+        self._service = None
+        if service is None:
+            return
+        try:
+            service.shutdown(timeout_s=2.0)
+        except Exception:
+            return
+
     @staticmethod
     def _normalize_detail(value: object) -> str | None:
         text = compact_text(str(value or "").strip(), limit=240)
         return text or None
+
+    @staticmethod
+    def _normalize_probe_payload(value: object) -> dict[str, object] | None:
+        """Keep only dict-like probe payloads for watchdog artifacts."""
+
+        if not isinstance(value, dict):
+            return None
+        return dict(value)
 
     def _probe_worker_main(self) -> None:
         """Run one deep remote probe in the background."""
@@ -479,18 +612,28 @@ class RemoteMemoryWatchdog:
     ) -> None:
         """Emit one per-second heartbeat line while the deep probe runs."""
 
+        captured_at = _utc_now_iso()
+        probe_age_s: float | None = None
+        if probe_inflight and probe_started_monotonic is not None:
+            probe_age_s = round(max(0.0, self._monotonic() - probe_started_monotonic), 1)
+        self._persist_heartbeat_snapshot(
+            heartbeat_at=captured_at,
+            probe_inflight=probe_inflight,
+            probe_started_at=probe_started_at,
+            probe_age_s=probe_age_s,
+        )
         last_sample = self._recent_samples[-1] if self._recent_samples else None
         payload: dict[str, object] = {
             "event": "remote_memory_watchdog_heartbeat",
             "artifact_path": str(self.artifact_path),
-            "captured_at": _utc_now_iso(),
+            "captured_at": captured_at,
             "probe_inflight": probe_inflight,
             "probe_started_at": probe_started_at,
             "sample_count": self._sample_count,
             "failure_count": self._failure_count,
         }
-        if probe_inflight and probe_started_monotonic is not None:
-            payload["probe_age_s"] = round(max(0.0, self._monotonic() - probe_started_monotonic), 1)
+        if probe_age_s is not None:
+            payload["probe_age_s"] = probe_age_s
         if last_sample is None:
             payload["status"] = "starting"
             payload["ready"] = False
@@ -518,6 +661,7 @@ class RemoteMemoryWatchdog:
         required: bool,
         latency_ms: float,
         detail: str | None,
+        probe: dict[str, object] | None = None,
     ) -> RemoteMemoryWatchdogSample:
         self._sample_count += 1
         if status == "ok":
@@ -543,6 +687,7 @@ class RemoteMemoryWatchdog:
             consecutive_ok=self._consecutive_ok,
             consecutive_fail=self._consecutive_fail,
             detail=detail,
+            probe=probe,
         )
         self._recent_samples.append(sample)
         return sample
@@ -563,6 +708,66 @@ class RemoteMemoryWatchdog:
             artifact_path=str(self.artifact_path),
             current=current,
             recent_samples=tuple(self._recent_samples),
+            heartbeat_at=current.captured_at,
+            probe_inflight=False,
+            probe_started_at=None,
+            probe_age_s=None,
+        )
+
+    def _persist_heartbeat_snapshot(
+        self,
+        *,
+        heartbeat_at: str,
+        probe_inflight: bool,
+        probe_started_at: str | None,
+        probe_age_s: float | None,
+    ) -> None:
+        """Persist liveness metadata even while a deep probe is still running."""
+
+        last_sample = self._recent_samples[-1] if self._recent_samples else None
+        current = last_sample or self._starting_sample(captured_at=heartbeat_at)
+        snapshot = RemoteMemoryWatchdogSnapshot(
+            schema_version=_SNAPSHOT_SCHEMA_VERSION,
+            started_at=self._started_at,
+            updated_at=current.captured_at,
+            hostname=socket.gethostname(),
+            pid=os.getpid(),
+            interval_s=self.interval_s,
+            history_limit=self.history_limit,
+            sample_count=self._sample_count,
+            failure_count=self._failure_count,
+            last_ok_at=self._last_ok_at,
+            last_failure_at=self._last_failure_at,
+            artifact_path=str(self.artifact_path),
+            current=current,
+            recent_samples=tuple(self._recent_samples),
+            heartbeat_at=heartbeat_at,
+            probe_inflight=probe_inflight,
+            probe_started_at=probe_started_at,
+            probe_age_s=probe_age_s,
+        )
+        with self._store_lock:
+            self.store.save(snapshot)
+
+    def _starting_sample(self, *, captured_at: str) -> RemoteMemoryWatchdogSample:
+        """Synthesize the startup state before the first real probe sample exists."""
+
+        required = bool(
+            self.config.long_term_memory_enabled
+            and self.config.long_term_memory_mode == "remote_primary"
+            and self.config.long_term_memory_remote_required
+        )
+        return RemoteMemoryWatchdogSample(
+            seq=0,
+            captured_at=captured_at,
+            status="starting",
+            ready=False,
+            mode="remote_primary" if required else "disabled",
+            required=required,
+            latency_ms=0.0,
+            consecutive_ok=0,
+            consecutive_fail=0,
+            detail="Remote memory watchdog is starting.",
         )
 
     def _emit_transition_event(self, sample: RemoteMemoryWatchdogSample) -> None:

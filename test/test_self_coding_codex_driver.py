@@ -1,10 +1,12 @@
 import json
 import importlib
+import os
 from pathlib import Path
 import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -18,6 +20,7 @@ from twinr.agent.self_coding import (
     RequirementsDialogueStatus,
 )
 from twinr.agent.self_coding.codex_driver import (
+    CodexExecFallbackDriver,
     CodexCompileProgress,
     CodexCompileRequest,
     CodexDriverUnavailableError,
@@ -275,6 +278,61 @@ sys.stdout.flush()
 
         self.assertIn("sdk compile failed", str(ctx.exception))
 
+    def test_sdk_driver_passes_model_and_reasoning_effort_to_bridge(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            request = _compile_request(root)
+            marker_path = Path(temp_dir) / "sdk_payload.json"
+            bridge_script = _write_fake_bridge(
+                temp_dir,
+                f"""
+from pathlib import Path
+marker_path = Path({str(marker_path)!r})
+if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+    sys.stdout.write(json.dumps({{"ok": True, "node_version": "test"}}) + "\\n")
+    sys.exit(0)
+payload = json.loads(sys.stdin.read())
+marker_path.write_text(json.dumps({{"model": payload.get("model"), "effort": payload.get("modelReasoningEffort")}}), encoding="utf-8")
+events = [
+    {{"type": "thread.started", "thread_id": "thread-sdk-123"}},
+    {{"type": "turn.started"}},
+    {{
+        "type": "item.completed",
+        "item": {{
+            "id": "item-1",
+            "type": "agent_message",
+            "text": json.dumps(
+                {{
+                    "status": "ok",
+                    "summary": "Compiled through SDK.",
+                    "review": "Ready for review.",
+                    "artifacts": [],
+                }}
+            ),
+        }},
+    }},
+    {{"type": "turn.completed", "usage": {{"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 2}}}},
+]
+for event in events:
+    sys.stdout.write(json.dumps(event) + "\\n")
+    sys.stdout.flush()
+                """,
+            )
+            driver = CodexSdkDriver(
+                command=(sys.executable, "-u"),
+                bridge_script=bridge_script,
+                timeout_seconds=5.0,
+                model="gpt-5-codex",
+                model_reasoning_effort="high",
+            )
+
+            result = driver.run_compile(request)
+            payload = json.loads(marker_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(payload["model"], "gpt-5-codex")
+        self.assertEqual(payload["effort"], "high")
+
     def test_sdk_driver_runs_startup_self_test_before_compile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -305,6 +363,106 @@ sys.stdout.write(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens
         driver = LocalCodexCompileDriver()
 
         self.assertIsInstance(driver.primary, CodexSdkDriver)
+
+    def test_exec_fallback_driver_adds_model_and_reasoning_effort_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            request = _compile_request(root)
+            marker_path = root / "argv.json"
+            script_path = root / "fake_codex_exec.py"
+            script_path.write_text(
+                textwrap.dedent(
+                    f"""
+                    import json
+                    import sys
+                    from pathlib import Path
+
+                    marker_path = Path({str(marker_path)!r})
+                    marker_path.write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+                    sys.stdin.read()
+                    events = [
+                        {{"type": "thread.started", "thread_id": "thread-exec-123"}},
+                        {{"type": "turn.started"}},
+                        {{
+                            "type": "item.completed",
+                            "item": {{
+                                "id": "item-1",
+                                "type": "agent_message",
+                                "text": json.dumps(
+                                    {{
+                                        "status": "ok",
+                                        "summary": "Compiled through exec.",
+                                        "review": "Ready for review.",
+                                        "artifacts": [],
+                                    }}
+                                ),
+                            }},
+                        }},
+                        {{"type": "turn.completed", "usage": {{"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 2}}}},
+                    ]
+                    for event in events:
+                        sys.stdout.write(json.dumps(event) + "\\n")
+                        sys.stdout.flush()
+                    """
+                ).strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            driver = CodexExecFallbackDriver(
+                command=(sys.executable, str(script_path)),
+                timeout_seconds=5.0,
+                model="gpt-5-codex",
+                model_reasoning_effort="high",
+            )
+
+            result = driver.run_compile(request)
+            argv = json.loads(marker_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.status, "ok")
+        self.assertIn("--model", argv)
+        self.assertIn("gpt-5-codex", argv)
+        self.assertIn("--config", argv)
+        self.assertIn('model_reasoning_effort="high"', argv)
+
+    def test_local_compile_driver_uses_environment_budget_defaults(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TWINR_SELF_CODING_CODEX_TIMEOUT_SECONDS": "720",
+                "TWINR_SELF_CODING_CODEX_MODEL": "gpt-5-codex",
+                "TWINR_SELF_CODING_CODEX_MODEL_REASONING_EFFORT": "xhigh",
+            },
+            clear=False,
+        ):
+            driver = LocalCodexCompileDriver()
+
+        self.assertEqual(driver.primary.timeout_seconds, 720.0)
+        self.assertEqual(driver.fallback.timeout_seconds, 720.0)
+        self.assertEqual(driver.primary.model, "gpt-5-codex")
+        self.assertEqual(driver.fallback.model, "gpt-5-codex")
+        self.assertEqual(driver.primary.model_reasoning_effort, "xhigh")
+        self.assertEqual(driver.fallback.model_reasoning_effort, "xhigh")
+
+    def test_local_compile_driver_uses_codex_high_defaults_without_env_overrides(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TWINR_SELF_CODING_CODEX_TIMEOUT_SECONDS": "",
+                "TWINR_SELF_CODING_CODEX_MODEL": "",
+                "TWINR_SELF_CODING_CODEX_MODEL_REASONING_EFFORT": "",
+                "TWINR_SELF_CODING_CODEX_SDK_TIMEOUT_SECONDS": "",
+                "TWINR_SELF_CODING_CODEX_EXEC_TIMEOUT_SECONDS": "",
+            },
+            clear=False,
+        ):
+            driver = LocalCodexCompileDriver()
+
+        self.assertEqual(driver.primary.timeout_seconds, 900.0)
+        self.assertEqual(driver.fallback.timeout_seconds, 900.0)
+        self.assertEqual(driver.primary.model, "gpt-5-codex")
+        self.assertEqual(driver.fallback.model, "gpt-5-codex")
+        self.assertEqual(driver.primary.model_reasoning_effort, "high")
+        self.assertEqual(driver.fallback.model_reasoning_effort, "high")
 
 
 if __name__ == "__main__":

@@ -301,6 +301,33 @@ class TwinrRuntimeFlowMixin:
         )
         return status
 
+    def rearm_follow_up(
+        self,
+        *,
+        request_source: str = "follow_up",
+    ) -> TwinrStatus:
+        """Re-open listening directly after speaking without a transient idle state.
+
+        This is used for conversation follow-up turns so the runtime can move
+        straight from ``answering`` back to ``listening`` and the operator
+        surfaces do not briefly show ``waiting`` between the spoken reply and
+        the reopened microphone window.
+        """
+
+        normalized_request_source = self._require_text(request_source, field_name="request_source")
+
+        with self._runtime_flow_lock():
+            status = self.state_machine.transition(TwinrEvent.FOLLOW_UP_ARMED)
+            self.last_transcript = ""
+            self._persist_snapshot_safe()
+
+        self._append_ops_event(
+            event="follow_up_rearmed",
+            message="Conversation follow-up listening window opened immediately after speech.",
+            data={"status": status.value, "request_source": normalized_request_source},
+        )
+        return status
+
     def press_yellow_button(self) -> str:
         """Request printing of the last assistant response."""
 

@@ -1,6 +1,7 @@
 from array import array
 from dataclasses import replace
 from datetime import datetime, timedelta
+import json
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.automations import AutomationAction
+from twinr.automations import AutomationAction, AutomationStore
 from twinr.agent.base_agent.contracts import (
     AgentToolCall,
     StreamingSpeechEndpointEvent,
@@ -41,7 +42,25 @@ from twinr.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.runtime import TwinrRuntime
 from twinr.state_machine import TwinrStatus
 from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
-from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample
+from twinr.agent.self_coding import (
+    ArtifactKind,
+    CompileTarget,
+    FeasibilityOutcome,
+    FeasibilityResult,
+    RequirementsDialogueSession,
+    RequirementsDialogueStatus,
+    SelfCodingActivationService,
+    SelfCodingCompileWorker,
+    SelfCodingStore,
+)
+from twinr.agent.self_coding.codex_driver import CodexCompileArtifact, CodexCompileResult
+from twinr.hardware.audio import (
+    AmbientAudioCaptureWindow,
+    AmbientAudioLevelSample,
+    ListenTimeoutCaptureDiagnostics,
+    SpeechCaptureResult,
+    SpeechStartTimeoutError,
+)
 from twinr.agent.workflows.button_dispatch import ButtonPressDispatcher
 
 
@@ -151,6 +170,7 @@ class FakePrintBackend:
         self.calls: list[tuple[tuple[tuple[str, str], ...] | None, str | None, str | None, str]] = []
         self.search_calls: list[tuple[str, tuple[tuple[str, str], ...] | None, str | None, str | None]] = []
         self.vision_calls: list[tuple[str, list[object], tuple[tuple[str, str], ...] | None, bool | None]] = []
+        self.summary_calls: list[str] = []
         self.search_sleep_s = 0.0
         self.synthesize_sleep_s = 0.0
         self.synthesize_calls: list[str] = []
@@ -204,6 +224,11 @@ class FakePrintBackend:
     ) -> OpenAITextResponse:
         self.vision_calls.append((prompt, list(images), conversation, allow_web_search))
         return OpenAITextResponse(text="Ich sehe die Kameraansicht.")
+
+    def respond_with_metadata(self, prompt: str, *, instructions=None, allow_web_search=None) -> OpenAITextResponse:
+        del instructions, allow_web_search
+        self.summary_calls.append(prompt)
+        return OpenAITextResponse(text="Guten Morgen. Hier ist dein Morgenabstract.")
 
     def synthesize_stream(self, text: str):
         self.synthesize_calls.append(text)
@@ -307,6 +332,104 @@ class FakePrintBackend:
     ) -> str:
         self.transcribe_calls.append((audio_bytes, language, prompt))
         return self.transcribe_result
+
+
+def _self_coding_briefing_skill_code() -> str:
+    return """
+from __future__ import annotations
+
+
+SEARCH_TERMS = (
+    "seniorenpolitik deutschland",
+    "pflege gesundheit deutschland",
+    "lokale nachrichten schleswig-holstein",
+)
+
+
+def refresh_briefing(ctx):
+    research_lines = []
+    for search_term in SEARCH_TERMS:
+        result = ctx.search_web(search_term)
+        research_lines.append(f"{search_term}: {result.answer}")
+    abstract = ctx.summarize_text("\\n".join(research_lines), instructions="Schreibe einen kurzen deutschen Morgenabstract.")
+    ctx.store_json(
+        f"briefing:{ctx.today_local_date()}",
+        {
+            "abstract": abstract,
+            "delivered_date": None,
+        },
+    )
+
+
+def deliver_briefing(ctx, *, event_name=None):
+    payload = ctx.load_json(f"briefing:{ctx.today_local_date()}", {}) or {}
+    abstract = str(payload.get("abstract") or "").strip()
+    if not abstract:
+        return
+    if payload.get("delivered_date") == ctx.today_local_date():
+        return
+    if ctx.is_night_mode() or not ctx.is_private_for_speech():
+        return
+    ctx.say(abstract)
+    payload["delivered_date"] = ctx.today_local_date()
+    payload["delivered_event_name"] = event_name
+    ctx.store_json(f"briefing:{ctx.today_local_date()}", payload)
+""".strip()
+
+
+def _self_coding_skill_package_payload() -> str:
+    return json.dumps(
+        {
+            "skill_package": {
+                "name": "Morning Briefing",
+                "description": "Research three topics at 08:00 and read an abstract aloud when I enter the room.",
+                "entry_module": "skill_main.py",
+                "scheduled_triggers": [
+                    {
+                        "trigger_id": "refresh_briefing",
+                        "schedule": "daily",
+                        "time_of_day": "08:00",
+                        "timezone_name": "Europe/Berlin",
+                        "handler": "refresh_briefing",
+                    }
+                ],
+                "sensor_triggers": [
+                    {
+                        "trigger_id": "deliver_briefing",
+                        "sensor_trigger_kind": "camera_person_visible",
+                        "cooldown_seconds": 30,
+                        "handler": "deliver_briefing",
+                    }
+                ],
+                "files": [
+                    {
+                        "path": "skill_main.py",
+                        "content": _self_coding_briefing_skill_code(),
+                    }
+                ],
+            }
+        }
+    )
+
+
+def _ready_self_coding_skill_session() -> RequirementsDialogueSession:
+    return RequirementsDialogueSession(
+        session_id="dialogue_loop_briefing",
+        request_summary="Research three morning topics at 08:00 and read the abstract aloud when I enter the room.",
+        skill_name="Morning Briefing",
+        action="Research three morning topics, prepare an abstract, and read it aloud when I enter the room.",
+        capabilities=("web_search", "llm_call", "memory", "speaker", "camera", "scheduler", "safety"),
+        feasibility=FeasibilityResult(
+            outcome=FeasibilityOutcome.YELLOW,
+            summary="This request needs the later skill-package path.",
+            suggested_target=CompileTarget.SKILL_PACKAGE,
+        ),
+        status=RequirementsDialogueStatus.READY_FOR_COMPILE,
+        trigger_mode="push",
+        trigger_conditions=("camera_person_visible", "daily_0800"),
+        scope={"channel": "voice", "time_of_day": "08:00"},
+        constraints=("read_once_per_morning",),
+    )
 
 
 class FakeRecorder:
@@ -1036,6 +1159,70 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         assert conversation is not None
         self.assertTrue(any("short backchannel" in message for role, message in conversation if role == "system"))
 
+    def test_streaming_transcript_verifier_recovers_empty_short_audio_after_late_start(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+            streaming_transcript_verifier_enabled=True,
+            streaming_transcript_verifier_max_capture_ms=6500,
+        )
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=config,
+        )
+        verifier_provider = FakePrintBackend()
+        verifier_provider.transcribe_result = "Wie geht es dir heute?"
+        loop.transcript_verifier_provider = verifier_provider
+
+        transcript = loop._maybe_verify_streaming_transcript(
+            capture_result=SpeechCaptureResult(
+                pcm_bytes=_voice_sample_pcm_bytes(duration_s=2.1),
+                speech_started_after_ms=10128,
+                resumed_after_pause_count=0,
+            ),
+            transcript="",
+            capture_ms=12027,
+            saw_speech_final=True,
+            saw_utterance_end=False,
+            confidence=None,
+        )
+
+        self.assertEqual(transcript, "Wie geht es dir heute?")
+        self.assertEqual(len(verifier_provider.transcribe_calls), 1)
+        self.assertIn("stt_streaming_verified_via_openai=true", lines)
+
+    def test_streaming_transcript_verifier_skips_empty_long_audio(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+            streaming_transcript_verifier_enabled=True,
+            streaming_transcript_verifier_max_capture_ms=6500,
+        )
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=config,
+        )
+        verifier_provider = FakePrintBackend()
+        verifier_provider.transcribe_result = "Das darf hier nicht auftauchen."
+        loop.transcript_verifier_provider = verifier_provider
+
+        transcript = loop._maybe_verify_streaming_transcript(
+            capture_result=SpeechCaptureResult(
+                pcm_bytes=_voice_sample_pcm_bytes(duration_s=7.0),
+                speech_started_after_ms=1500,
+                resumed_after_pause_count=0,
+            ),
+            transcript="",
+            capture_ms=12027,
+            saw_speech_final=True,
+            saw_utterance_end=False,
+            confidence=None,
+        )
+
+        self.assertEqual(transcript, "")
+        self.assertEqual(verifier_provider.transcribe_calls, [])
+        self.assertNotIn("stt_streaming_verified_via_openai=true", lines)
+
     def test_user_interrupt_stops_answer_and_opens_follow_up_turn(self) -> None:
         config = TwinrConfig(
             turn_controller_interrupt_enabled=True,
@@ -1242,10 +1429,34 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         loop.wait_for_print_lane_idle()
 
         self.assertEqual(len(print_backend.calls), 1)
-        self._assert_language_contract_only(print_backend.calls[0][0])
+        self.assertEqual(print_backend.calls[0][0], ())
         self.assertEqual(print_backend.calls[0][1:], (None, "Guten Tag", "button"))
         self.assertEqual(printer.printed, ["GUTEN TAG"])
         self.assertEqual(loop.runtime.status, TwinrStatus.WAITING)
+        self.assertIn("print_lane=queued", lines)
+        self.assertIn("print_lane=completed", lines)
+
+    def test_yellow_button_uses_local_conversation_context_without_provider_lookup(self) -> None:
+        loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop()
+        loop.runtime.last_response = "Guten Tag"
+        local_conversation = (
+            ("user", "Kannst du das drucken?"),
+            ("assistant", "Guten Tag"),
+        )
+        loop.runtime.conversation_context = mock.Mock(return_value=local_conversation)  # type: ignore[method-assign]
+        loop.runtime.provider_conversation_context = mock.Mock(  # type: ignore[method-assign]
+            side_effect=AssertionError("yellow print must not build provider context")
+        )
+
+        loop.handle_button_press("yellow")
+        self.assertTrue(loop.wait_for_print_lane_idle(timeout_s=1.0))
+
+        loop.runtime.conversation_context.assert_called_once_with()
+        loop.runtime.provider_conversation_context.assert_not_called()
+        self.assertEqual(len(print_backend.calls), 1)
+        self.assertEqual(print_backend.calls[0][0], local_conversation)
+        self.assertEqual(print_backend.calls[0][1:], (None, "Guten Tag", "button"))
+        self.assertEqual(printer.printed, ["GUTEN TAG"])
         self.assertIn("print_lane=queued", lines)
         self.assertIn("print_lane=completed", lines)
 
@@ -1424,6 +1635,40 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
         self.assertGreaterEqual(len(player.tones), 2)
         self.assertIn("listen_timeout=true", lines)
+
+    def test_button_listening_timeout_emits_capture_diagnostics(self) -> None:
+        diagnostics = ListenTimeoutCaptureDiagnostics(
+            device="default",
+            sample_rate=16000,
+            channels=1,
+            chunk_ms=100,
+            speech_threshold=700,
+            chunk_count=12,
+            active_chunk_count=1,
+            average_rms=188,
+            peak_rms=412,
+            listened_ms=8040,
+        )
+        recorder = FakeRecorder(
+            recordings=[
+                SpeechStartTimeoutError(
+                    "No speech detected before timeout",
+                    diagnostics=diagnostics,
+                )
+            ]
+        )
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            recorder=recorder,
+        )
+
+        loop.handle_button_press("green")
+
+        self.assertIn("listen_timeout=true", lines)
+        self.assertIn("listen_timeout_capture_device=default", lines)
+        self.assertIn("listen_timeout_speech_threshold=700", lines)
+        self.assertIn("listen_timeout_chunk_count=12", lines)
+        self.assertIn("listen_timeout_peak_rms=412", lines)
+        self.assertIn("listen_timeout_active_ratio=0.08", lines)
 
     def test_resumed_pause_adapts_next_pause_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2288,6 +2533,126 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertTrue(executed)
         self.assertEqual(printer.printed, ["Bitte leise bleiben."])
         self.assertIn("automation_trigger_source=sensor", lines)
+
+    def test_idle_loop_executes_self_coding_skill_package_schedule_and_sensor_delivery(self) -> None:
+        class _LoopBriefingBackend(FakePrintBackend):
+            def respond_with_metadata(
+                self,
+                prompt: str,
+                *,
+                conversation=None,
+                instructions: str | None = None,
+                allow_web_search: bool | None = None,
+            ) -> OpenAITextResponse:
+                del conversation, instructions, allow_web_search
+                self.summary_calls.append(prompt)
+                return OpenAITextResponse(
+                    text="Guten Morgen. Hier ist dein Morgenabstract.",
+                    response_id="resp_skill_summary_1",
+                    request_id="req_skill_summary_1",
+                    used_web_search=False,
+                    model="gpt-5.2",
+                    token_usage=None,
+                )
+
+        class _SkillPackageCompileDriver:
+            def run_compile(self, request, *, event_sink=None) -> CodexCompileResult:
+                del request, event_sink
+                return CodexCompileResult(
+                    status="ok",
+                    summary="Compiled a self-coding morning briefing package.",
+                    artifacts=(
+                        CodexCompileArtifact(
+                            kind=ArtifactKind.SKILL_PACKAGE,
+                            artifact_name="skill_package.json",
+                            media_type="application/json",
+                            content=_self_coding_skill_package_payload(),
+                            summary="Morning briefing package.",
+                        ),
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                automation_store_path=str(Path(temp_dir) / "state" / "automations.json"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            backend = _LoopBriefingBackend()
+            loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop(
+                config=config,
+                print_backend=backend,
+                agent_provider=backend,
+            )
+            store = SelfCodingStore.from_project_root(config.project_root)
+            worker = SelfCodingCompileWorker(store=store, driver=_SkillPackageCompileDriver())
+            activation = SelfCodingActivationService(
+                store=store,
+                automation_store=AutomationStore(config.automation_store_path, timezone_name=config.local_timezone_name),
+            )
+
+            job = worker.ensure_job_for_session(_ready_self_coding_skill_session())
+            completed = worker.run_job(job.job_id)
+            active = activation.confirm_activation(job_id=completed.job_id, confirmed=True)
+
+            automation_ids = tuple(active.metadata["automation_ids"])
+            schedule_entry = next(
+                loop.runtime.automation_store.get(item)
+                for item in automation_ids
+                if loop.runtime.automation_store.get(item) is not None
+                and getattr(loop.runtime.automation_store.get(item).trigger, "kind", None) == "time"
+            )
+            sensor_entry = next(
+                loop.runtime.automation_store.get(item)
+                for item in automation_ids
+                if loop.runtime.automation_store.get(item) is not None
+                and getattr(loop.runtime.automation_store.get(item).trigger, "kind", None) == "if_then"
+            )
+            sensor_facts = {
+                "sensor": {"inspected": True, "observed_at": 5.0},
+                "pir": {"motion_detected": True, "low_motion": False, "no_motion_for_s": 0.0},
+                "camera": {
+                    "person_visible": True,
+                    "count_persons": 1,
+                    "person_visible_for_s": 0.0,
+                    "looking_toward_device": True,
+                    "body_pose": "upright",
+                    "smiling": False,
+                    "hand_or_object_near_camera": False,
+                    "hand_or_object_near_camera_for_s": 0.0,
+                },
+                "vad": {
+                    "speech_detected": False,
+                    "speech_detected_for_s": 0.0,
+                    "quiet": True,
+                    "quiet_for_s": 12.0,
+                    "distress_detected": False,
+                },
+            }
+
+            scheduled_executed = loop._run_automation_entry(schedule_entry, trigger_source="time_schedule")
+            loop._latest_sensor_observation_facts = sensor_facts
+            first_delivery = loop._run_automation_entry(
+                sensor_entry,
+                trigger_source="sensor",
+                event_name="camera.person_visible",
+                facts=sensor_facts,
+            )
+            second_delivery_same_day = loop._run_automation_entry(
+                sensor_entry,
+                trigger_source="sensor",
+                event_name="camera.person_visible",
+                facts=sensor_facts,
+            )
+
+        self.assertTrue(scheduled_executed)
+        self.assertTrue(first_delivery)
+        self.assertTrue(second_delivery_same_day)
+        self.assertEqual(len(backend.search_calls), 3)
+        self.assertEqual(len(backend.summary_calls), 1)
+        self.assertEqual(player.played, [b"PCM"])
+        self.assertIn("automation_tool_call=run_self_coding_skill_scheduled", lines)
+        self.assertIn("automation_tool_call=run_self_coding_skill_sensor", lines)
 
     def test_idle_loop_delivers_due_reminder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3443,6 +3808,103 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertTrue(remote_probe_started.is_set())
         self.assertEqual(len(printer.printed), 1)
         self.assertIn("button=yellow", lines)
+
+    def test_run_uses_external_watchdog_artifact_instead_of_deep_remote_check(self) -> None:
+        button_monitor = FakeScheduledButtonMonitor(event_after_s=0.02, name="yellow")
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, printer = self.make_loop(
+            config=TwinrConfig(
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_runtime_check_mode="watchdog_artifact",
+                long_term_memory_remote_watchdog_interval_s=0.01,
+            ),
+            button_monitor=button_monitor,
+        )
+        loop.runtime.last_response = "Bitte druck das."
+
+        class _ShouldNotBeCalledRemote:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                self.calls += 1
+                raise AssertionError("deep remote check must not run in watchdog_artifact mode")
+
+            def remote_status(self):
+                return LongTermRemoteStatus(mode="remote_primary", ready=True)
+
+        remote = _ShouldNotBeCalledRemote()
+        loop.runtime.long_term_memory = remote
+
+        with mock.patch(
+            "twinr.agent.workflows.realtime_runtime.support.ensure_required_remote_watchdog_snapshot_ready",
+            return_value=SimpleNamespace(
+                artifact_path="/tmp/remote_memory_watchdog.json",
+                sample_age_s=1.0,
+                max_sample_age_s=45.0,
+                pid_alive=True,
+            ),
+        ):
+            result = loop.run(duration_s=0.12, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(remote.calls, 0)
+        self.assertEqual(len(printer.printed), 1)
+        self.assertIn("button=yellow", lines)
+
+    def test_run_enters_error_when_external_watchdog_artifact_reports_failure(self) -> None:
+        button_monitor = FakeIdleButtonMonitor()
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=TwinrConfig(
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_runtime_check_mode="watchdog_artifact",
+                long_term_memory_remote_watchdog_interval_s=0.01,
+            ),
+            button_monitor=button_monitor,
+        )
+
+        class _RemoteStillRequired:
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                raise AssertionError("deep remote check must not run in watchdog_artifact mode")
+
+            def remote_status(self):
+                return LongTermRemoteStatus(mode="remote_primary", ready=True)
+
+        loop.runtime.long_term_memory = _RemoteStillRequired()
+
+        failing_assessment = SimpleNamespace(
+            artifact_path="/tmp/remote_memory_watchdog.json",
+            detail="Remote memory watchdog snapshot is stale.",
+            sample_age_s=91.0,
+            max_sample_age_s=45.0,
+            pid_alive=False,
+            sample_status="fail",
+            sample_ready=False,
+        )
+
+        with mock.patch(
+            "twinr.agent.workflows.realtime_runtime.support.ensure_required_remote_watchdog_snapshot_ready",
+            side_effect=LongTermRemoteUnavailableError(failing_assessment.detail),
+        ):
+            with mock.patch(
+                "twinr.agent.workflows.realtime_runtime.support.assess_required_remote_watchdog_snapshot",
+                return_value=failing_assessment,
+            ):
+                result = loop.run(duration_s=0.05, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(loop.runtime.status.value, "error")
+        self.assertIn("status=error", lines)
+        self.assertEqual(button_monitor.poll_calls, 0)
 
     def test_run_handles_button_press_while_housekeeping_blocks(self) -> None:
         button_monitor = FakeScheduledButtonMonitor(event_after_s=0.02, name="yellow")

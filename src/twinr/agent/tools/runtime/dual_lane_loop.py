@@ -64,6 +64,20 @@ _HANDOFF_TOOL_SCHEMA: dict[str, Any] = {
                 "type": "boolean",
                 "description": "Set true when the specialist should be allowed to use live web search.",
             },
+            "location_hint": {
+                "type": "string",
+                "description": (
+                    "Optional explicit place already named by the user, for example a city, district, or street. "
+                    "Use this for search handoffs when the target location matters."
+                ),
+            },
+            "date_context": {
+                "type": "string",
+                "description": (
+                    "Optional absolute date or local date/time context for search handoffs when the user referred "
+                    "to relative dates such as today or tomorrow."
+                ),
+            },
         },
         "required": ["kind", "goal", "spoken_ack"],
         "additionalProperties": False,
@@ -181,6 +195,12 @@ class DualLaneToolLoop:
         search_prompt = _strip_text(arguments.get("prompt")) or prompt
         call_id = _make_call_id("search_live_info")
         tool_arguments = {"question": search_prompt}
+        location_hint = _strip_text(arguments.get("location_hint"))
+        if location_hint:
+            tool_arguments["location_hint"] = location_hint
+        date_context = _strip_text(arguments.get("date_context"))
+        if date_context:
+            tool_arguments["date_context"] = date_context
         output = search_handler(tool_arguments)
         answer_text = _strip_text(
             output.get("answer")
@@ -283,6 +303,8 @@ class DualLaneToolLoop:
                 "spoken_ack": getattr(handoff, "spoken_ack", None),
                 "prompt": getattr(handoff, "prompt", None),
                 "allow_web_search": getattr(handoff, "allow_web_search", None),
+                "location_hint": getattr(handoff, "location_hint", None),
+                "date_context": getattr(handoff, "date_context", None),
             }
             response_id = getattr(handoff, "response_id", None)
             request_id = getattr(handoff, "request_id", None)
@@ -914,6 +936,12 @@ def _normalize_handoff_arguments(
         normalized["prompt"] = prompt
     if "allow_web_search" in arguments:
         normalized["allow_web_search"] = arguments.get("allow_web_search")
+    location_hint = _strip_text(arguments.get("location_hint"))
+    if location_hint:
+        normalized["location_hint"] = location_hint
+    date_context = _strip_text(arguments.get("date_context"))
+    if date_context:
+        normalized["date_context"] = date_context
     return normalized
 
 

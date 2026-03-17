@@ -133,11 +133,12 @@ def _close_pipe(pipe: object | None) -> None:
 
 
 def _read_process_stderr(process: subprocess.Popen[bytes]) -> bytes:
-    if process.stderr is None:
+    stderr = process.stderr
+    if stderr is None or getattr(stderr, "closed", False):
         return b""
     try:
-        return process.stderr.read().strip()
-    except OSError:
+        return stderr.read().strip()
+    except (OSError, ValueError):
         return b""
 
 
@@ -231,6 +232,36 @@ class SpeechCaptureResult:
     resumed_after_pause_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class ListenTimeoutCaptureDiagnostics:
+    """Summarize pre-speech capture evidence for one listen-timeout."""
+
+    device: str
+    sample_rate: int
+    channels: int
+    chunk_ms: int
+    speech_threshold: int
+    chunk_count: int
+    active_chunk_count: int
+    average_rms: int
+    peak_rms: int
+    listened_ms: int
+
+    @property
+    def active_ratio(self) -> float:
+        """Return the fraction of pre-speech chunks above the speech threshold."""
+
+        return self.active_chunk_count / max(1, self.chunk_count)
+
+
+class SpeechStartTimeoutError(RuntimeError):
+    """Raise when speech never starts and retain bounded capture diagnostics."""
+
+    def __init__(self, message: str, *, diagnostics: ListenTimeoutCaptureDiagnostics) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
 def resolve_pause_resume_confirmation(
     *,
     consecutive_resume_chunks: int,
@@ -307,6 +338,24 @@ def pcm16_to_wav_bytes(
         wav_file.setframerate(normalized_sample_rate)
         wav_file.writeframes(aligned_pcm_bytes)
     return buffer.getvalue()
+
+
+def pcm16_duration_ms(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> int:
+    """Return the duration of a PCM16 payload after frame alignment."""
+
+    normalized_sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
+    normalized_channels = _ensure_int("channels", channels, minimum=1)
+    frame_bytes = _SAMPLE_WIDTH_BYTES * normalized_channels
+    aligned_pcm_bytes = _trim_incomplete_bytes(pcm_bytes, alignment=frame_bytes)
+    if not aligned_pcm_bytes:
+        return 0
+    frame_count = len(aligned_pcm_bytes) // frame_bytes
+    return int((frame_count / normalized_sample_rate) * 1000)
 
 
 class SilenceDetectedRecorder:
@@ -485,12 +534,33 @@ class SilenceDetectedRecorder:
         last_chunk_at = started_at
         speech_started_after_ms = 0
         resumed_after_pause_count = 0
+        pre_speech_chunk_count = 0
+        pre_speech_active_chunk_count = 0
+        pre_speech_total_rms = 0
+        pre_speech_peak_rms = 0
         chunk_bytes = _chunk_byte_count(
             sample_rate=self.sample_rate,
             channels=self.channels,
             chunk_ms=self.chunk_ms,
         )
         read_stall_timeout_s = _compute_read_stall_timeout(self.chunk_ms)
+
+        def _listen_timeout_diagnostics(*, listened_ms: int) -> ListenTimeoutCaptureDiagnostics:
+            average_rms = 0
+            if pre_speech_chunk_count > 0:
+                average_rms = int(pre_speech_total_rms / pre_speech_chunk_count)
+            return ListenTimeoutCaptureDiagnostics(
+                device=self.device,
+                sample_rate=self.sample_rate,
+                channels=self.channels,
+                chunk_ms=self.chunk_ms,
+                speech_threshold=self.speech_threshold,
+                chunk_count=pre_speech_chunk_count,
+                active_chunk_count=pre_speech_active_chunk_count,
+                average_rms=average_rms,
+                peak_rms=pre_speech_peak_rms,
+                listened_ms=max(0, int(listened_ms)),
+            )
 
         try:
             while True:
@@ -502,7 +572,12 @@ class SilenceDetectedRecorder:
                         break
                     raise RuntimeError("Audio capture stopped before speech started")
                 if not heard_speech and now - started_at >= effective_start_timeout_s:
-                    raise RuntimeError("No speech detected before timeout")
+                    raise SpeechStartTimeoutError(
+                        "No speech detected before timeout",
+                        diagnostics=_listen_timeout_diagnostics(
+                            listened_ms=(now - started_at) * 1000.0,
+                        ),
+                    )
                 # AUDIT-FIX(#2): Enforce max recording length from speech start, not from when the microphone opened.
                 if (
                     heard_speech
@@ -547,6 +622,11 @@ class SilenceDetectedRecorder:
                         continue
                     if on_chunk is not None:
                         on_chunk(chunk)
+                    pre_speech_chunk_count += 1
+                    pre_speech_total_rms += rms
+                    pre_speech_peak_rms = max(pre_speech_peak_rms, rms)
+                    if rms >= self.speech_threshold:
+                        pre_speech_active_chunk_count += 1
                     preroll.append(chunk)
                     if rms >= self.speech_threshold:
                         consecutive_speech_chunks += 1
@@ -615,7 +695,14 @@ class SilenceDetectedRecorder:
         finally:
             self._stop_process(process)
 
-        if not heard_speech or not captured:
+        if not heard_speech:
+            raise SpeechStartTimeoutError(
+                "Speech capture ended without usable audio",
+                diagnostics=_listen_timeout_diagnostics(
+                    listened_ms=(time.monotonic() - started_at) * 1000.0,
+                ),
+            )
+        if not captured:
             raise RuntimeError("Speech capture ended without usable audio")
         return SpeechCaptureResult(
             pcm_bytes=bytes(captured),

@@ -16,6 +16,7 @@ from twinr.web.presenters.common import (
     _resolve_named_file,
 )
 from twinr.web.presenters.connect import _connect_sections
+from twinr.web.presenters.debug import build_ops_debug_page_context, coerce_ops_debug_tab
 from twinr.web.presenters.integrations import (
     _build_calendar_integration_record,
     _build_email_integration_record,
@@ -25,6 +26,7 @@ from twinr.web.presenters.integrations import (
 )
 from twinr.web.presenters.memory import _memory_sections
 from twinr.web.presenters.ops import _format_log_rows, _format_usage_rows, _health_card_detail
+from twinr.web.presenters.self_coding import build_self_coding_ops_page_context
 from twinr.web.presenters.settings import _adaptive_timing_view, _settings_sections
 from twinr.web.presenters.voice import (
     _capture_voice_profile_sample,
@@ -53,6 +55,9 @@ __all__ = [
     "_reminder_rows",
     "_resolve_named_file",
     "_settings_sections",
+    "build_ops_debug_page_context",
+    "build_self_coding_ops_page_context",
+    "coerce_ops_debug_tab",
     "_voice_action_result",
     "_voice_profile_page_context",
     "_voice_snapshot_label",

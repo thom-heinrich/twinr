@@ -12,7 +12,7 @@ keeps shared voice/argument guards close to that boundary.
 - validate and normalize tool arguments before they reach runtime methods
 - keep handler-local telemetry and audit side effects best-effort
 - share sensitive-action confirmation and live-audio guard helpers
-- bridge the self-coding front-stage flow into deterministic ASE modules
+- bridge the self-coding front-stage flow plus learned-skill control/runtime hooks into deterministic ASE modules
 
 `handlers` does **not** own:
 - tool registry, binding, schemas, or prompt instruction assembly
@@ -28,7 +28,7 @@ keeps shared voice/argument guards close to that boundary.
 | [memory.py](./memory.py) | Durable-memory tool handlers |
 | [output.py](./output.py) | Print, search, and camera handlers |
 | [reminders.py](./reminders.py) | Reminder scheduling handler |
-| [self_coding.py](./self_coding.py) | Self-coding feasibility, activation, and rollback handlers |
+| [self_coding.py](./self_coding.py) | Self-coding learning, activation, pause/reactivate, and hidden runtime handlers |
 | [settings.py](./settings.py) | Simple setting mutation handler |
 | [support.py](./support.py) | Shared voice and argument guards |
 | [voice_profile.py](./voice_profile.py) | Voice-profile tool handlers |

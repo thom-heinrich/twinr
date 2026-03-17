@@ -140,6 +140,36 @@ class WaveshareDisplayTests(unittest.TestCase):
             sum(1 for pixel in one_line_right.getdata() if pixel == 0),
         )
 
+    def test_render_status_image_debug_log_draws_section_titles_and_entries(self) -> None:
+        display = WaveshareEPD4In2V2(
+            project_root=Path("."),
+            vendor_dir=Path("hardware/display/vendor"),
+            width=400,
+            height=300,
+            rotation_degrees=270,
+            layout_mode="debug_log",
+        )
+
+        image = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok", "System ok", "Zeit 12:34"),
+            log_sections=(
+                ("System Log", ("09:31 now Waiting", "net ok | ai ok | sys ok")),
+                ("LLM Log", ("user Wie geht es dir heute?", "ai Mir geht es gut.")),
+                ("Hardware Log", ("button green", "remote ok")),
+            ),
+            animation_frame=0,
+        )
+
+        header_region = image.crop((14, 8, 386, 42))
+        system_region = image.crop((14, 48, 386, 118))
+        lower_region = image.crop((14, 120, 386, 290))
+
+        self.assertGreater(sum(1 for pixel in header_region.getdata() if pixel == 0), 200)
+        self.assertGreater(sum(1 for pixel in system_region.getdata() if pixel == 0), 300)
+        self.assertGreater(sum(1 for pixel in lower_region.getdata() if pixel == 0), 1000)
+
     def test_prepare_image_applies_configured_rotation(self) -> None:
         display = WaveshareEPD4In2V2(
             project_root=Path("."),
@@ -198,6 +228,16 @@ class WaveshareDisplayTests(unittest.TestCase):
             "Display BUSY GPIO 24 collides with yellow button GPIO 24.",
         ):
             WaveshareEPD4In2V2.from_config(config)
+
+    def test_from_config_applies_display_layout_mode(self) -> None:
+        config = TwinrConfig(
+            project_root=".",
+            display_layout="debug_log",
+        )
+
+        display = WaveshareEPD4In2V2.from_config(config)
+
+        self.assertEqual(display.layout_mode, "debug_log")
 
     def test_load_driver_module_releases_failed_vendor_import_before_retry(self) -> None:
         sentinel_name = "__twinr_display_vendor_pin_busy__"
@@ -338,7 +378,7 @@ class WaveshareDisplayTests(unittest.TestCase):
                 ],
             )
 
-    def test_show_image_prefers_partial_refresh_after_first_render(self) -> None:
+    def test_show_image_prefers_fast_refresh_over_partial_after_first_render(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             vendor_dir = Path(temp_dir) / "vendor" / "waveshare_epd"
             vendor_dir.mkdir(parents=True)
@@ -409,8 +449,9 @@ class WaveshareDisplayTests(unittest.TestCase):
                     "init",
                     ("buffer", first),
                     ("display", first),
+                    ("init_fast", 7),
                     ("buffer", second),
-                    ("display_partial", second),
+                    ("display_fast", second),
                 ],
             )
 
@@ -557,6 +598,81 @@ class WaveshareDisplayTests(unittest.TestCase):
                     "init",
                     ("buffer", third),
                     ("display", third),
+                ],
+            )
+
+    def test_show_image_debug_log_uses_fast_refresh_after_first_render(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            vendor_dir = Path(temp_dir) / "vendor" / "waveshare_epd"
+            vendor_dir.mkdir(parents=True)
+            (vendor_dir / "__init__.py").write_text("", encoding="utf-8")
+            (vendor_dir / "epdconfig.py").write_text(
+                textwrap.dedent(
+                    """
+                    RST_PIN = 17
+                    DC_PIN = 25
+                    CS_PIN = 8
+                    BUSY_PIN = 24
+                    PWR_PIN = 18
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (vendor_dir / "epd4in2_V2.py").write_text(
+                textwrap.dedent(
+                    """
+                    EVENTS = []
+
+                    class EPD:
+                        width = 400
+                        height = 300
+                        Seconds_1_5S = 7
+
+                        def init(self):
+                            EVENTS.append("init")
+
+                        def init_fast(self, mode):
+                            EVENTS.append(("init_fast", mode))
+
+                        def getbuffer(self, image):
+                            EVENTS.append(("buffer", image))
+                            return image
+
+                        def display(self, buffer):
+                            EVENTS.append(("display", buffer))
+
+                        def display_Partial(self, buffer):
+                            EVENTS.append(("display_partial", buffer))
+
+                        def display_Fast(self, buffer):
+                            EVENTS.append(("display_fast", buffer))
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            display = WaveshareEPD4In2V2(
+                project_root=Path(temp_dir),
+                vendor_dir=Path(temp_dir) / "vendor",
+                layout_mode="debug_log",
+            )
+
+            first = _prepared_image()
+            second = _prepared_image()
+
+            display.show_image(first, clear_first=False)
+            display.show_image(second, clear_first=False)
+
+            module = display._load_driver_module()
+            self.assertEqual(
+                module.EVENTS,
+                [
+                    "init",
+                    ("buffer", first),
+                    ("display", first),
+                    ("init_fast", 7),
+                    ("buffer", second),
+                    ("display_fast", second),
                 ],
             )
 

@@ -6,7 +6,13 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.ops.locks import TwinrInstanceLock, loop_instance_lock, loop_lock_owner, loop_lock_path
+from twinr.ops.locks import (
+    TwinrInstanceAlreadyRunningError,
+    TwinrInstanceLock,
+    loop_instance_lock,
+    loop_lock_owner,
+    loop_lock_path,
+)
 
 
 class LoopLockTests(unittest.TestCase):
@@ -26,7 +32,7 @@ class LoopLockTests(unittest.TestCase):
             path = Path(temp_dir) / "twinr-realtime-loop.lock"
             with TwinrInstanceLock(path, "realtime loop"):
                 with self.assertRaisesRegex(
-                    RuntimeError,
+                    TwinrInstanceAlreadyRunningError,
                     r"Another Twinr realtime loop is already running",
                 ):
                     with TwinrInstanceLock(path, "realtime loop"):

@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -28,6 +29,28 @@ class StreamingProviderFactoryTests(unittest.TestCase):
         self.assertIsInstance(bundle.tool_agent, GroqToolCallingAgentProvider)
         self.assertEqual(bundle.tts.__class__.__name__, "OpenAITextToSpeechProvider")
         self.assertEqual(bundle.print_backend.__class__.__name__, "CompositeSpeechAgentProvider")
+        self.assertEqual(bundle.verification_stt.__class__.__name__, "OpenAISpeechToTextProvider")
+
+    @patch("twinr.providers.factory._build_openai_streaming_verification_provider")
+    def test_builds_verification_stt_when_enabled(
+        self,
+        build_verifier,
+    ) -> None:
+        verifier_stt = object()
+        build_verifier.return_value = verifier_stt
+        bundle = build_streaming_provider_bundle(
+            TwinrConfig(
+                openai_api_key="openai-key",
+                stt_provider="openai",
+                llm_provider="openai",
+                tts_provider="openai",
+                streaming_transcript_verifier_enabled=True,
+                streaming_transcript_verifier_model="gpt-4o-mini-transcribe",
+            )
+        )
+
+        self.assertIs(bundle.verification_stt, verifier_stt)
+        build_verifier.assert_called_once()
 
 
 if __name__ == "__main__":

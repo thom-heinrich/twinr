@@ -3,14 +3,15 @@ name: workflows
 path: src/twinr/agent/workflows
 kind: python-package
 visibility: internal
-summary: Orchestrate the classic, realtime, and streaming Twinr hardware loops plus their bounded speech, print, and feedback helpers.
+summary: Orchestrate the active realtime and streaming Twinr hardware loops plus their bounded speech, print, and feedback helpers while retaining compatibility shims for older loop imports.
 owned_concerns:
   - Orchestrate button, wakeword, and proactive entry points for Twinr hardware loops
   - Coordinate live conversation sessions, print delivery, and bounded speech output
+  - Serialize beep, feedback, and spoken playback under one priority-aware speaker coordinator
   - Keep required remote-memory fail-closed checks off the GPIO polling thread
   - Produce bounded forensic run packs for live button/session/audio investigation
   - Share workflow-local support helpers for feedback tones, reference images, and background delivery
-  - Expose compatibility workflow entry points for top-level imports and older proactive-trigger paths
+  - Expose compatibility workflow entry points for top-level imports and older proactive-trigger paths without eager runner imports
 out_of_scope:
   - Runtime state, memory, reminder, or automation store implementations
   - Provider transport adapters, prompt authoring, or tool schema definitions
@@ -26,7 +27,7 @@ files:
       - TwinrRealtimeHardwareLoop
       - TwinrStreamingHardwareLoop
   - path: runner.py
-    role: Classic press-to-talk hardware loop orchestration
+    role: Compatibility shim to the legacy classic press-to-talk hardware loop implementation
     exports:
       - TwinrHardwareLoop
   - path: realtime_runner.py
@@ -34,21 +35,49 @@ files:
     exports:
       - TwinrRealtimeHardwareLoop
   - path: streaming_runner.py
-    role: Streaming loop with dual-lane tools, supervisor-derived bridge replies, and speculative speech
+    role: Streaming loop entrypoint and turn orchestration shell that delegates speculation and lane-planning
     exports:
       - TwinrStreamingHardwareLoop
+  - path: streaming_speculation.py
+    role: Speculative first-word and supervisor warmup controller for the streaming loop
+  - path: streaming_lane_planner.py
+    role: Streaming lane-plan construction and final-lane path selection
+  - path: streaming_turn_coordinator.py
+    role: Authoritative streaming turn state machine for speech lifecycle, deadlines, cancellation, and completion
+    exports:
+      - StreamingTurnCoordinator
+      - StreamingTurnCoordinatorHooks
+      - StreamingTurnExecutionOutcome
+      - StreamingTurnLanePlan
+      - StreamingTurnRequest
+      - StreamingTurnSpeechServices
   - path: streaming_turn_orchestrator.py
-    role: Parallel bridge/final lane watchdog helper for streaming turns
+    role: Low-level bridge/final lane watchdog helper used by the streaming turn coordinator
     exports:
       - StreamingTurnOrchestrator
       - StreamingTurnTimeoutPolicy
       - StreamingTurnLaneOutcome
+  - path: playback_coordinator.py
+    role: Single-owner speaker queue with priority and preemption across beep, feedback, and TTS
+    exports:
+      - PlaybackCoordinator
+      - PlaybackPriority
+      - PlaybackRunResult
+  - path: realtime_runtime/background.py
+    role: Active reminder, automation, and proactive background-delivery mixin
+    exports:
+      - TwinrRealtimeBackgroundMixin
+  - path: realtime_runtime/support.py
+    role: Active emit, media, config, and feedback helpers for the realtime runtime
+    exports:
+      - TwinrRealtimeSupportMixin
+      - _default_emit
   - path: realtime_runner_background.py
-    role: Reminder, automation, and proactive background-delivery mixin
+    role: Compatibility shim for the active realtime background-delivery mixin
     exports:
       - TwinrRealtimeBackgroundMixin
   - path: realtime_runner_support.py
-    role: Shared emit, media, config, and feedback helpers
+    role: Compatibility shim for the active realtime support helpers
     exports:
       - TwinrRealtimeSupportMixin
   - path: realtime_runner_tools.py
@@ -59,6 +88,8 @@ files:
     role: Non-blocking button dispatch and busy-turn interruption helper
   - path: required_remote_watch.py
     role: Background required-remote readiness watch for fail-closed runtimes
+  - path: required_remote_snapshot.py
+    role: External remote-watchdog snapshot evaluation for live loop gating
   - path: speech_output.py
     role: Interruptible streamed TTS playback queue with first-audio gating and fast aborts
     exports:
@@ -94,6 +125,7 @@ primary_callers:
   - path: src/twinr/agent/tools/handlers/output.py
   - path: src/twinr/agent/tools/runtime/dual_lane_loop.py
 tests:
+  - path: test/test_playback_coordinator.py
   - path: test/test_main.py
   - path: test/test_runner.py
   - path: test/test_realtime_runner.py

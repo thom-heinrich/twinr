@@ -64,6 +64,7 @@ def run_config_checks(config: TwinrConfig) -> tuple[ConfigCheck, ...]:
         ("display_gpio", "Display GPIO", _display_gpio_check),
         ("pir", "PIR motion sensor", _pir_check),
         ("runtime_state", "Runtime snapshot", _runtime_state_check),
+        ("self_coding_codex", "Self-coding Codex", _self_coding_codex_check),
     )
     return tuple(_run_check_safely(key, label, check_fn, config) for key, label, check_fn in checks)
 
@@ -257,6 +258,23 @@ def _camera_check(config: TwinrConfig) -> ConfigCheck:
         "Camera",
         "warn",
         f"Camera device `{_display_value(device)}` exists, but ffmpeg `{_display_value(ffmpeg_path)}` is not available.",
+    )
+
+
+def _self_coding_codex_check(_config: TwinrConfig) -> ConfigCheck:
+    """Check whether the local self_coding Codex runtime is runnable."""
+
+    from twinr.agent.self_coding.codex_driver.environment import collect_codex_sdk_environment_report
+
+    report = collect_codex_sdk_environment_report(
+        run_local_self_test=True,
+        run_live_auth_check=False,
+    )
+    return ConfigCheck(
+        "self_coding_codex",
+        "Self-coding Codex",
+        "ok" if report.ready else "fail",
+        report.detail,
     )
 
 

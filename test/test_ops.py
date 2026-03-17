@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 import json
 import sys
 import tempfile
@@ -206,6 +208,23 @@ class OpsModuleTests(unittest.TestCase):
         by_key = {check.key: check for check in checks}
         self.assertEqual(by_key["display_gpio"].status, "fail")
         self.assertIn("Display BUSY GPIO 24 collides with yellow button GPIO 24.", by_key["display_gpio"].detail)
+
+    def test_run_config_checks_includes_self_coding_codex_readiness(self) -> None:
+        config = TwinrConfig()
+        fake_report = SimpleNamespace(
+            ready=False,
+            detail="codex auth file is missing: /tmp/.codex/auth.json",
+        )
+
+        with patch(
+            "twinr.agent.self_coding.codex_driver.environment.collect_codex_sdk_environment_report",
+            return_value=fake_report,
+        ):
+            checks = run_config_checks(config)
+
+        by_key = {check.key: check for check in checks}
+        self.assertEqual(by_key["self_coding_codex"].status, "fail")
+        self.assertIn("codex auth file is missing", by_key["self_coding_codex"].detail)
 
     def test_pir_self_test_succeeds_with_motion_event(self) -> None:
         class FakePirMonitor:

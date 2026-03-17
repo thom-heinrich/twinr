@@ -18,7 +18,7 @@ from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
 
 from twinr.agent.base_agent import RuntimeSnapshot, RuntimeSnapshotStore, TwinrConfig
-from twinr.agent.self_coding import SelfCodingStore
+from twinr.agent.self_coding.store import SelfCodingStore
 from twinr.automations import AutomationStore
 from twinr.integrations import TwinrIntegrationStore
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
@@ -26,6 +26,7 @@ from twinr.memory.reminders import ReminderStore
 from twinr.ops import TwinrOpsEventStore, TwinrUsageStore
 from twinr.ops.remote_memory_watchdog import RemoteMemoryWatchdogSnapshot, RemoteMemoryWatchdogStore
 from twinr.web.presenters import _nav_items
+from twinr.web.support.auth import FileBackedWebAuthStore
 
 # AUDIT-FIX(#7): Use plain language in the default restart notice so user-facing pages do not expose internal jargon.
 DEFAULT_RESTART_NOTICE = "Some settings only take effect after Twinr is restarted."
@@ -205,6 +206,11 @@ class WebAppContext:
 
         return TwinrIntegrationStore.from_project_root(self.project_root)
 
+    def web_auth_store(self) -> FileBackedWebAuthStore:
+        """Build the managed web-auth store rooted under the Twinr project."""
+
+        return FileBackedWebAuthStore.from_project_root(self.project_root)
+
     def render(
         self,
         request: Request,
@@ -264,6 +270,7 @@ class WebAppContext:
                 "error_message": error_message,
                 "restart_notice": restart_notice,
                 "env_path": str(self.env_path),
+                "auth_context": getattr(request.state, "web_auth_context", None),
             }
             return self.templates.TemplateResponse(request, template_name, response_context)
         except Exception:

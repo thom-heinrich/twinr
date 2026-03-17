@@ -24,6 +24,7 @@ state/
 state/runtime-state.json
 state/MEMORY.md
 state/*.lock
+__legacy__/
 
 __pycache__/
 *.pyc

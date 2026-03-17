@@ -27,6 +27,16 @@ _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
+class TwinrInstanceAlreadyRunningError(RuntimeError):
+    """Signal a non-authoritative Twinr start attempt for an already-owned loop."""
+
+    def __init__(self, *, label: str, owner_pid: int | None = None) -> None:
+        self.label = str(label)
+        self.owner_pid = int(owner_pid) if owner_pid is not None else None
+        owner_suffix = f" (pid {self.owner_pid})" if self.owner_pid is not None else ""
+        super().__init__(f"Another Twinr {self.label} is already running{owner_suffix}.")
+
+
 def _validated_loop_name(loop_name: str) -> str:
     if not _LOCK_NAME_RE.fullmatch(loop_name):
         raise ValueError(
@@ -140,9 +150,9 @@ class TwinrInstanceLock:
         except BlockingIOError as exc:
             owner = _read_owner_text(handle)
             _close_quietly(handle)
-            owner_suffix = f" (pid {owner})" if owner.isdigit() else ""
-            raise RuntimeError(
-                f"Another Twinr {self.label} is already running{owner_suffix}."
+            raise TwinrInstanceAlreadyRunningError(
+                label=self.label,
+                owner_pid=int(owner) if owner.isdigit() else None,
             ) from exc
         except Exception:
             # AUDIT-FIX(#3): Close the FD on non-contention flock failures so we do not leak descriptors.

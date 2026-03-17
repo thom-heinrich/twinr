@@ -3,14 +3,20 @@ name: ops
 path: src/twinr/ops
 kind: python-package
 visibility: internal
-summary: Provide Twinr's operational support layer for config checks, health snapshots, device diagnostics, singleton loop locks, file-backed ops stores, the rolling remote-memory watchdog, self-tests, and support exports.
+summary: Provide Twinr's operational support layer for config checks, health snapshots, device diagnostics, singleton loop locks, file-backed ops stores, detached-runtime audio-session env priming, the rolling remote-memory watchdog, authoritative Pi runtime supervision, Pi-side self-coding Codex bootstrap, self-tests, and support exports.
 owned_concerns:
   - Resolve canonical filesystem paths for ops artifacts, stores, self-tests, and support bundles
   - Persist sanitized operational events and provider usage telemetry as bounded JSONL stores
   - Sample config, device, and host health for Twinr's local web UI and support workflows
   - Run a dedicated rolling remote-memory watchdog that reuses Twinr's fail-closed readiness probe
+  - Persist structured probe evidence and supervisor-seeded watchdog bootstrap snapshots for required-remote debugging
+  - Ensure live Pi runtimes can start that watchdog as a separate companion process
+  - Seed detached Pi runtime processes with the minimum user-session audio environment required for Pulse/ALSA default playback
+  - Supervise the productive Pi streaming loop plus remote watchdog under one authoritative owner
+  - Keep display-companion degradation visible through ops health without letting it tear down the productive speech runtime
   - Coordinate singleton loop ownership through secure per-loop lock files
   - Run bounded hardware self-tests and build redacted support bundles from local ops evidence
+  - Bootstrap the Pi-side self-coding Codex bridge, CLI, and auth prerequisites from the leading repo
 out_of_scope:
   - Runtime orchestration and state transitions in src/twinr/agent/workflows and src/twinr/agent/base_agent/runtime
   - Hardware adapter implementations in src/twinr/hardware
@@ -83,18 +89,29 @@ files:
       - ConfigCheck
       - check_summary
       - run_config_checks
+  - path: self_coding_pi.py
+    role: Pi bootstrap for the pinned self-coding Codex bridge, CLI, auth sync, and remote self-test
   - path: health.py
-    role: Host and service health snapshot assembly
+    role: Host and service health snapshot assembly, including display-companion assessment via the shared display heartbeat contract
     exports:
       - ServiceHealth
       - TwinrSystemHealth
       - collect_system_health
   - path: remote_memory_watchdog.py
-    role: Rolling remote-memory watchdog and state artifact writer
+    role: Rolling remote-memory watchdog, structured probe recorder, and startup bootstrap artifact writer
     exports:
       - RemoteMemoryWatchdog
       - RemoteMemoryWatchdogSample
       - RemoteMemoryWatchdogSnapshot
+  - path: remote_memory_watchdog_companion.py
+    role: Process-based launcher for the external remote-memory watchdog used by live Pi loops
+  - path: runtime_env.py
+    role: Seed detached Pi runtime processes with the minimal user-session audio environment
+  - path: runtime_supervisor.py
+    role: Authoritative supervisor for the productive Pi streaming loop and remote watchdog, including shared display-progress checks
+    exports:
+      - RUNTIME_SUPERVISOR_ENV_KEY
+      - TwinrRuntimeSupervisor
   - path: devices.py
     role: Dashboard-ready device overview probes and summaries
     exports:
@@ -157,12 +174,15 @@ primary_callers:
   - path: src/twinr/agent/workflows/runner.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/display/service.py
+  - path: hardware/ops/twinr-runtime-supervisor.service
   - path: src/twinr/proactive/wakeword/evaluation.py
 tests:
   - path: test/test_ops.py
   - path: test/test_ops_health.py
   - path: test/test_devices.py
   - path: test/test_locks.py
+  - path: test/test_runtime_supervisor.py
+  - path: test/test_runtime_env.py
   - path: test/test_web_app.py
   - path: test/test_main.py
   - path: test/test_display_service.py

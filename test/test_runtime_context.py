@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.runtime import TwinrRuntime
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
-from twinr.memory.longterm.core.models import LongTermMemoryContext
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshotStore
 
 
@@ -148,39 +147,70 @@ class RuntimeContextTests(unittest.TestCase):
                     runtime.provider_conversation_context()
                 with self.assertRaises(LongTermRemoteUnavailableError):
                     runtime.tool_provider_conversation_context()
-                with self.assertRaises(LongTermRemoteUnavailableError):
-                    runtime.first_word_provider_conversation_context()
+                first_word_context = runtime.first_word_provider_conversation_context()
+                self.assertIn(("user", "Letzte Frage"), first_word_context)
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
-    def test_first_word_context_includes_one_relevant_memory_message(self) -> None:
+    def test_first_word_context_uses_local_summary_and_skips_remote_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = TwinrRuntime(config=self._config(temp_dir))
             try:
                 runtime.memory.remember("user", "Mir ging es gestern nicht gut.")
-                runtime.last_transcript = "Geht's dir heute gut?"
+                runtime.memory.remember_note(
+                    kind="fact",
+                    content="Die Nutzerin hatte gestern Kopfweh.",
+                    source="memory",
+                )
 
-                class _MemoryAwareLongTermMemory:
+                class _FailingLongTermMemory:
                     def build_provider_context(self, query_text):
-                        self.query_text = query_text
-                        return LongTermMemoryContext(
-                            subtext_context="Relevant memory: The user had a headache yesterday.",
-                            durable_context="Durable memory: preferred pharmacy nearby.",
-                        )
+                        raise AssertionError("first-word context must not query remote long-term memory")
 
-                runtime.long_term_memory = _MemoryAwareLongTermMemory()
+                runtime.long_term_memory = _FailingLongTermMemory()
 
                 context = runtime.first_word_provider_conversation_context()
 
-                self.assertIn(
-                    ("system", "Relevant memory: The user had a headache yesterday."),
-                    context,
-                )
-                self.assertNotIn(
-                    ("system", "Durable memory: preferred pharmacy nearby."),
-                    context,
+                summary_messages = [content for role, content in context if role == "system"]
+                self.assertTrue(
+                    any(
+                        "Twinr memory summary:" in message
+                        and "Die Nutzerin hatte gestern Kopfweh." in message
+                        for message in summary_messages
+                    )
                 )
                 self.assertIn(("user", "Mir ging es gestern nicht gut."), context)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_supervisor_context_uses_local_summary_and_skips_remote_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime.memory.remember("user", "Ich bin morgen in Schwarzenbek.")
+                runtime.memory.remember_note(
+                    kind="fact",
+                    content="Die Nutzerin fährt morgen nach Schwarzenbek.",
+                    source="memory",
+                )
+
+                class _FailingLongTermMemory:
+                    def build_provider_context(self, query_text):
+                        raise AssertionError("supervisor context must not query remote long-term memory")
+
+                runtime.long_term_memory = _FailingLongTermMemory()
+
+                context = runtime.supervisor_provider_conversation_context()
+
+                summary_messages = [content for role, content in context if role == "system"]
+                self.assertTrue(
+                    any(
+                        "Twinr memory summary:" in message
+                        and "Die Nutzerin fährt morgen nach Schwarzenbek." in message
+                        for message in summary_messages
+                    )
+                )
+                self.assertIn(("user", "Ich bin morgen in Schwarzenbek."), context)
             finally:
                 runtime.shutdown(timeout_s=1.0)
 

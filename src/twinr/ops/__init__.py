@@ -9,7 +9,13 @@ from twinr.ops.devices import DeviceFact, DeviceOverview, DeviceStatus, collect_
 from twinr.ops.health import ServiceHealth, TwinrSystemHealth, collect_system_health
 from twinr.ops.checks import ConfigCheck, check_summary, run_config_checks
 from twinr.ops.events import TwinrOpsEventStore, compact_text
-from twinr.ops.locks import TwinrInstanceLock, loop_instance_lock, loop_lock_owner, loop_lock_path
+from twinr.ops.locks import (
+    TwinrInstanceAlreadyRunningError,
+    TwinrInstanceLock,
+    loop_instance_lock,
+    loop_lock_owner,
+    loop_lock_path,
+)
 from twinr.ops.paths import TwinrOpsPaths, resolve_ops_paths, resolve_ops_paths_for_config
 from twinr.ops.remote_memory_watchdog import (
     RemoteMemoryWatchdog,
@@ -32,6 +38,7 @@ __all__ = [
     "RemoteMemoryWatchdogSnapshot",
     "SupportBundleInfo",
     "TokenUsage",
+    "TwinrInstanceAlreadyRunningError",
     "TwinrInstanceLock",
     "TwinrOpsEventStore",
     "TwinrOpsPaths",

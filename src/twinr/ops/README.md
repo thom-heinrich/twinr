@@ -2,8 +2,9 @@
 
 `ops` owns Twinr's local operational support layer. It provides config audits,
 device and host snapshots, singleton loop locks, file-backed ops stores,
-the rolling remote-memory watchdog, bounded self-tests, and redacted support
-exports for the web UI and operator tools.
+the rolling remote-memory watchdog, bounded soak evidence for that watchdog,
+bounded self-tests, detached-runtime audio-session env priming, and redacted
+support exports for the web UI and operator tools.
 
 ## Responsibility
 
@@ -12,9 +13,21 @@ exports for the web UI and operator tools.
 - persist sanitized ops events and usage telemetry
 - collect config, device, and system-health snapshots
 - run a dedicated rolling ChonkyDB remote-memory watchdog
-- infer companion-loop health from loop locks when no standalone process exists
+- persist structured remote-readiness probe evidence and supervisor-seeded watchdog bootstrap snapshots so restart phases do not look like dead/stale watchdog failures
+- ensure the dedicated remote-memory watchdog process is running for live Pi runtimes
+- seed detached Pi runtime processes with the user-session audio env they need for Pulse/ALSA default playback
+- supervise the productive Pi streaming loop plus remote watchdog under one authoritative owner and prime child audio-session env before each spawn
+- defer display-health enforcement until the current streaming child has emitted its own display heartbeat, so cold-start panel renders are not killed as false missing companions
+- consume the shared display heartbeat contract so ops health and the runtime supervisor read the same companion-progress semantics the display loop writes
+- keep display-companion degradation visible in ops health without letting a display fault tear down the speech path
+- recycle failed watchdog service instances so transient remote-state poison does not stick forever
+- run bounded soak observations that prove the watchdog stays healthy over time
+- infer companion-loop health from loop locks plus authoritative forward-progress heartbeats when no standalone process exists
+- tolerate bounded display-render inflight windows when evaluating companion health, so long Waveshare refreshes are not misclassified as dead threads
 - coordinate per-loop singleton locks
 - run bounded self-tests and build support bundles
+- bootstrap the Pi-side self-coding Codex runtime prerequisites from the leading repo
+- expose config checks that fail clearly when the self-coding Codex bridge, CLI, or auth is not ready
 
 `ops` does **not** own:
 - runtime orchestration in `src/twinr/agent/workflows`
@@ -32,8 +45,13 @@ exports for the web UI and operator tools.
 | [events.py](./events.py) | Ops event JSONL store |
 | [usage.py](./usage.py) | Usage telemetry store |
 | [checks.py](./checks.py) | Config audit checks |
-| [health.py](./health.py) | Host and service health |
-| [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog |
+| [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract |
+| [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog plus structured probe/bootstrap artifacts |
+| [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start the external watchdog process for live Pi loops when needed |
+| [runtime_env.py](./runtime_env.py) | Seed detached Pi runtimes with the minimal user audio-session environment |
+| [runtime_supervisor.py](./runtime_supervisor.py) | Authoritative Pi runtime supervisor for the streaming loop and remote watchdog, including shared display-progress checks |
+| [self_coding_pi.py](./self_coding_pi.py) | Pi bootstrap for pinned self-coding Codex bridge, CLI, auth sync, and remote self-test |
+| [remote_memory_watchdog_soak.py](./remote_memory_watchdog_soak.py) | Bounded soak recorder for watchdog stability proof |
 | [devices.py](./devices.py) | Device overview probes |
 | [self_test.py](./self_test.py) | Bounded hardware self-tests |
 | [support.py](./support.py) | Support bundle export |
@@ -64,6 +82,22 @@ from twinr.ops import RemoteMemoryWatchdog
 
 watchdog = RemoteMemoryWatchdog.from_config(config)
 watchdog.run(duration_s=5.0)
+```
+
+```python
+from twinr.ops.runtime_supervisor import TwinrRuntimeSupervisor
+
+supervisor = TwinrRuntimeSupervisor(config=config, env_file="/twinr/.env")
+supervisor.run(duration_s=5.0)
+```
+
+```bash
+PYTHONPATH=src python3 -m twinr.ops.remote_memory_watchdog_soak --project-root /twinr --duration-s 14400 --interval-s 30
+```
+
+```bash
+python3 hardware/ops/bootstrap_self_coding_pi.py
+PYTHONPATH=src python3 -m twinr --env-file .env --self-coding-codex-self-test --self-coding-live-auth-check
 ```
 
 ## See also

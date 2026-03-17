@@ -122,8 +122,7 @@ class SelfCodingFeasibilityChecker:
 
             if status != CapabilityStatus.READY:
                 missing_capabilities.append(capability_id)
-                # AUDIT-FIX(#7): Return only user-safe status text instead of raw internal detail blobs.
-                detail = _status_reason(status)
+                detail = _safe_capability_detail(availability, status)
                 reasons.append(f"Capability `{capability_id}` is not ready: {detail}")
 
         if missing_capabilities:
@@ -349,6 +348,15 @@ def _status_reason(status: Any) -> str:
     if isinstance(status, CapabilityStatus):
         return f"Capability status is {status.value}."
     return "Capability status is unavailable."
+
+
+def _safe_capability_detail(availability: Any, status: Any) -> str:
+    """Return the best user-safe explanation for one unavailable capability."""
+
+    detail = getattr(availability, "detail", None)
+    if isinstance(detail, str) and detail.strip():
+        return detail.strip()
+    return _status_reason(status)
 
 
 def _scope_leaf_count(payload: Mapping[str, Any], *, max_count: int | None = None) -> int:

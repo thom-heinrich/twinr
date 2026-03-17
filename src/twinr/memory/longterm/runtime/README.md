@@ -12,6 +12,7 @@ bounded background writers into the APIs used by agent runtime loops.
 - Build runtime provider context and tool-safe context
 - Persist conversation turns and multimodal evidence through bounded workers
 - Verify remote-primary snapshot readiness before runtime loops start
+- Record per-snapshot pointer/origin readiness evidence so watchdog failures can be traced to the exact remote read path
 - Fail closed when any required remote snapshot or shard is unreadable
 - Expose review, retention, proactive, and operator mutation entry points
 
@@ -27,7 +28,7 @@ bounded background writers into the APIs used by agent runtime loops.
 |---|---|
 | `service.py` | Runtime orchestration service |
 | `worker.py` | Bounded async persistence |
-| `health.py` | Remote readiness probe |
+| `health.py` | Remote readiness probe with per-snapshot pointer/origin evidence |
 | `component.yaml` | Structured package metadata |
 | `AGENTS.md` | Local editing rules |
 

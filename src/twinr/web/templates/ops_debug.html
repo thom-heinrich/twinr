@@ -1,0 +1,328 @@
+{% extends "base.html" %}
+
+{% macro detail_grid(items) -%}
+  <div class="detail-grid">
+    {% for item in items %}
+    <article class="detail-card {% if item.wide %}detail-card-wide{% endif %}">
+      <div class="detail-label">{{ item.label }}</div>
+      <div class="{% if item.copy %}detail-body-copy{% else %}detail-body{% endif %}">{{ item.value }}</div>
+      {% if item.detail %}
+      <div class="card-detail">{{ item.detail }}</div>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+{%- endmacro %}
+
+{% block content %}
+<div class="ops-debug-page">
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Debug categories</h2>
+        <p class="section-description">{{ active_debug_description }}</p>
+      </div>
+    </div>
+    <nav class="tab-strip ops-debug-tabs" aria-label="Debug categories">
+      {% for tab in debug_tabs %}
+      <a class="tab-link {% if tab.active %}active{% endif %}" href="{{ tab.href }}">{{ tab.label }}</a>
+      {% endfor %}
+    </nav>
+  </section>
+
+  {% if active_debug_tab == "overview" %}
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Current state at a glance</h2>
+        <p class="section-description">A compact cross-section of the live runtime and local artifact stores.</p>
+      </div>
+    </div>
+    {{ detail_grid(overview_cards) }}
+  </section>
+
+  <section class="panel ops-debug-panel two-column">
+    <div>
+      <h2>Artifact locations</h2>
+      {{ detail_grid(artifact_rows) }}
+    </div>
+    <div>
+      <h2>Recent signals</h2>
+      {% if event_rows %}
+      <div class="log-list">
+        {% for row in event_rows[:5] %}
+        <article class="log-entry">
+          <div class="log-entry-header">
+            <span class="log-level is-{{ row.level }}">{{ row.level }}</span>
+            <span class="log-event">{{ row.event }}</span>
+            <span class="log-time">{{ row.created_at }}</span>
+          </div>
+          <div class="log-message">{{ row.message }}</div>
+        </article>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state">No recent events are stored yet.</div>
+      {% endif %}
+    </div>
+  </section>
+  {% endif %}
+
+  {% if active_debug_tab == "runtime" %}
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Runtime snapshot</h2>
+        <p class="section-description">The latest file-backed runtime state that drives the display and web surfaces.</p>
+      </div>
+    </div>
+    {{ detail_grid(runtime_rows) }}
+  </section>
+
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Services</h2>
+        <p class="section-description">What the live health collector currently sees for Twinr background workers.</p>
+      </div>
+    </div>
+    {{ detail_grid(service_rows) }}
+  </section>
+
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Recent runtime errors</h2>
+        <p class="section-description">Newest error-level events first.</p>
+      </div>
+    </div>
+    {% if recent_error_rows %}
+    <div class="log-list">
+      {% for row in recent_error_rows %}
+      <article class="log-entry">
+        <div class="log-entry-header">
+          <span class="log-level is-{{ row.level }}">{{ row.level }}</span>
+          <span class="log-event">{{ row.event }}</span>
+          <span class="log-time">{{ row.created_at }}</span>
+        </div>
+        <div class="log-message">{{ row.message }}</div>
+        {% if row.data_pretty %}
+        <pre class="log-data">{{ row.data_pretty }}</pre>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">No recent runtime errors are recorded.</div>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {% if active_debug_tab == "chonkydb" %}
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Required remote assessment</h2>
+        <p class="section-description">This is the authoritative ChonkyDB readiness verdict used by the live runtime.</p>
+      </div>
+      <span class="status-pill is-{{ watchdog_status.status }}">{{ watchdog_status.label }}</span>
+    </div>
+    {{ detail_grid(watchdog_assessment_rows) }}
+  </section>
+
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Watchdog snapshot</h2>
+        <p class="section-description">The latest persisted watchdog sample and probe metadata.</p>
+      </div>
+    </div>
+    {{ detail_grid(watchdog_current_rows) }}
+  </section>
+
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Recent watchdog samples</h2>
+        <p class="section-description">Newest persisted samples first.</p>
+      </div>
+    </div>
+    {% if watchdog_history_rows %}
+    <div class="log-list">
+      {% for row in watchdog_history_rows %}
+      <article class="log-entry">
+        <div class="log-entry-header">
+          <span class="log-level is-{{ row.level }}">{{ row.level }}</span>
+          <span class="log-event">{{ row.event }}</span>
+          <span class="log-time">{{ row.created_at }}</span>
+        </div>
+        <div class="log-message">{{ row.message }}</div>
+        {% if row.data_pretty %}
+        <pre class="log-data">{{ row.data_pretty }}</pre>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">No historical watchdog samples exist yet.</div>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {% if active_debug_tab == "llm" %}
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>LLM usage summary</h2>
+        <p class="section-description">Tracked response usage from the local Twinr runtime.</p>
+      </div>
+    </div>
+    {{ detail_grid(usage_summary_rows) }}
+  </section>
+
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Recent usage records</h2>
+        <p class="section-description">Newest tracked LLM calls first.</p>
+      </div>
+    </div>
+    {% if usage_rows %}
+    <div class="log-list">
+      {% for row in usage_rows %}
+      <article class="log-entry">
+        <div class="log-entry-header">
+          <span class="log-level is-ok">{{ row.request_kind }}</span>
+          <span class="log-event">{{ row.model }}</span>
+          <span class="log-time">{{ row.created_at }}</span>
+        </div>
+        <div class="log-message">
+          source={{ row.source }} · total={{ row.total_tokens }} · input={{ row.input_tokens }} · output={{ row.output_tokens }} · cached={{ row.cached_input_tokens }} · reasoning={{ row.reasoning_tokens }} · web={{ row.used_web_search }}
+        </div>
+        <div class="log-message">response_id={{ row.response_id }} · request_id={{ row.request_id }}</div>
+        {% if row.metadata_pretty %}
+        <pre class="log-data">{{ row.metadata_pretty }}</pre>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">No LLM usage records exist yet.</div>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {% if active_debug_tab == "events" %}
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Structured ops events</h2>
+        <p class="section-description">Newest local structured events first.</p>
+      </div>
+    </div>
+    {% if event_rows %}
+    <div class="log-list">
+      {% for row in event_rows %}
+      <article class="log-entry">
+        <div class="log-entry-header">
+          <span class="log-level is-{{ row.level }}">{{ row.level }}</span>
+          <span class="log-event">{{ row.event }}</span>
+          <span class="log-time">{{ row.created_at }}</span>
+        </div>
+        <div class="log-message">{{ row.message }}</div>
+        {% if row.data_pretty %}
+        <pre class="log-data">{{ row.data_pretty }}</pre>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">No structured ops events exist yet.</div>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {% if active_debug_tab == "hardware" %}
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Live hardware overview</h2>
+        <p class="section-description">The same bounded hardware snapshot Twinr uses for operator diagnostics.</p>
+      </div>
+    </div>
+    {% if device_rows %}
+    <div class="device-grid">
+      {% for device in device_rows %}
+      <article class="detail-card">
+        <div class="device-card-header">
+          <div class="detail-label">{{ device.label }}</div>
+          <span class="status-pill is-{{ device.status }}">{{ device.status }}</span>
+        </div>
+        <div class="detail-body-copy">{{ device.summary }}</div>
+        {% if device.facts %}
+        <ul class="device-facts">
+          {% for fact in device.facts %}
+          <li><strong>{{ fact.label }}</strong> {{ fact.value }}</li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+        {% if device.notes %}
+        <ul class="device-notes">
+          {% for note in device.notes %}
+          <li>{{ note }}</li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">Open the hardware tab on a live Twinr runtime to load the current device overview.</div>
+    {% endif %}
+  </section>
+
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Service state</h2>
+        <p class="section-description">Live host/service health observed from this machine.</p>
+      </div>
+    </div>
+    {{ detail_grid(service_rows) }}
+  </section>
+  {% endif %}
+
+  {% if active_debug_tab == "raw" %}
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Artifact locations</h2>
+        <p class="section-description">All core local files and directories involved in Twinr runtime diagnostics.</p>
+      </div>
+    </div>
+    {{ detail_grid(artifact_rows) }}
+  </section>
+
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Config check summary</h2>
+        <p class="section-description">The same normalized config checks used by other ops surfaces.</p>
+      </div>
+    </div>
+    {{ detail_grid(config_summary_rows) }}
+  </section>
+
+  {% for block in raw_blocks %}
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>{{ block.title }}</h2>
+      </div>
+    </div>
+    <pre class="log-data raw-data-block">{{ block.body }}</pre>
+  </section>
+  {% endfor %}
+  {% endif %}
+</div>
+{% endblock %}

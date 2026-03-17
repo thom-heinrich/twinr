@@ -53,6 +53,15 @@ class TwinrConfigTests(unittest.TestCase):
             ("Display BUSY GPIO 24 collides with yellow button GPIO 24.",),
         )
 
+    def test_from_env_normalizes_display_layout_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("TWINR_DISPLAY_LAYOUT=DEBUG_FACE\n", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_layout, "debug_log")
+
     def test_reads_openai_button_and_printer_settings_from_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -716,6 +725,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_transcript_verifier_max_chars, 32)
         self.assertEqual(config.streaming_transcript_verifier_min_confidence, 0.92)
         self.assertEqual(config.streaming_transcript_verifier_max_capture_ms, 6500)
+        self.assertEqual(config.streaming_first_word_prefetch_min_words, 2)
         self.assertTrue(config.conversation_closure_guard_enabled)
         self.assertEqual(config.conversation_closure_context_turns, 4)
         self.assertEqual(config.conversation_closure_instructions_file, "CONVERSATION_CLOSURE.md")
@@ -858,6 +868,15 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.chonkydb_base_url, "https://legacy-memory.example.com:2149")
         self.assertEqual(config.chonkydb_api_key, "legacy-secret")
 
+    def test_chonkydb_response_limit_defaults_to_64_mib(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.chonkydb_max_response_bytes, 64 * 1024 * 1024)
+
     def test_streaming_dual_lane_env_settings_are_parsed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -872,6 +891,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_STREAMING_FIRST_WORD_MAX_OUTPUT_TOKENS=36",
                         "TWINR_STREAMING_FIRST_WORD_PREFETCH_ENABLED=false",
                         "TWINR_STREAMING_FIRST_WORD_PREFETCH_MIN_CHARS=5",
+                        "TWINR_STREAMING_FIRST_WORD_PREFETCH_MIN_WORDS=3",
                         "TWINR_STREAMING_FIRST_WORD_PREFETCH_WAIT_MS=45",
                         "TWINR_STREAMING_BRIDGE_REPLY_TIMEOUT_MS=300",
                         "TWINR_STREAMING_FINAL_LANE_WATCHDOG_TIMEOUT_MS=4500",
@@ -895,6 +915,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_first_word_max_output_tokens, 36)
         self.assertFalse(config.streaming_first_word_prefetch_enabled)
         self.assertEqual(config.streaming_first_word_prefetch_min_chars, 5)
+        self.assertEqual(config.streaming_first_word_prefetch_min_words, 3)
         self.assertEqual(config.streaming_first_word_prefetch_wait_ms, 45)
         self.assertEqual(config.streaming_bridge_reply_timeout_ms, 300)
         self.assertEqual(config.streaming_final_lane_watchdog_timeout_ms, 4500)

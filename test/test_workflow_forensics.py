@@ -114,6 +114,35 @@ class WorkflowForensicsTests(unittest.TestCase):
                     else:
                         os.environ[key] = value
 
+    def test_forensics_handles_string_exception_payload_without_crashing(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            trace_dir = Path(temp_dir) / "state" / "forensics" / "workflow"
+            previous_env = {
+                key: os.environ.get(key)
+                for key in (
+                    "TWINR_WORKFLOW_TRACE_ENABLED",
+                    "TWINR_WORKFLOW_TRACE_MODE",
+                    "TWINR_WORKFLOW_TRACE_DIR",
+                )
+            }
+            os.environ["TWINR_WORKFLOW_TRACE_ENABLED"] = "1"
+            os.environ["TWINR_WORKFLOW_TRACE_MODE"] = "forensic"
+            os.environ["TWINR_WORKFLOW_TRACE_DIR"] = str(trace_dir)
+            try:
+                tracer = WorkflowForensics.from_env(project_root=Path(temp_dir), service="workflow-test")
+                tracer.event(kind="exception", msg="legacy_exception", details={"exception": "LegacyError: boom"})
+                tracer.close()
+
+                run_id = (trace_dir / "LATEST").read_text(encoding="utf-8").strip()
+                summary = json.loads((trace_dir / run_id / "run.summary.json").read_text(encoding="utf-8"))
+                self.assertEqual(summary["exception_counts"].get("LegacyError"), 1)
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
 
 if __name__ == "__main__":
     unittest.main()

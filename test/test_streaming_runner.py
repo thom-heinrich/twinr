@@ -21,7 +21,9 @@ from twinr.agent.base_agent.contracts import (
 from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
 from twinr.agent.tools.runtime.dual_lane_loop import DualLaneToolLoop
 from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
+from twinr.agent.workflows.streaming_turn_coordinator import StreamingTurnLanePlan
 from twinr.config import TwinrConfig
+from twinr.hardware.audio import ListenTimeoutCaptureDiagnostics, SpeechStartTimeoutError
 from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
@@ -35,6 +37,7 @@ from twinr.providers.openai import (
     OpenAITextResponse,
 )
 from twinr.runtime import TwinrRuntime
+from twinr.state_machine import TwinrEvent, TwinrStatus
 
 
 class FakeToolAgentProvider:
@@ -470,6 +473,29 @@ class DelayedFirstWordProvider(FakeFirstWordProvider):
         return result
 
 
+class ExplodingFirstWordProvider(FakeFirstWordProvider):
+    def reply(self, prompt: str, *, conversation=None, instructions=None) -> FirstWordReply:
+        raise AssertionError(
+            f"first-word provider must not be called in supervisor-bridge mode: {prompt!r}"
+        )
+
+
+class FakeSupervisorDecisionProvider:
+    def __init__(self, decision) -> None:
+        self.decision = decision
+        self.calls: list[dict[str, object]] = []
+
+    def decide(self, prompt: str, *, conversation=None, instructions=None):
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "conversation": conversation,
+                "instructions": instructions,
+            }
+        )
+        return self.decision
+
+
 class FakeTextToSpeechProvider:
     def __init__(self, config: TwinrConfig) -> None:
         self.config = config
@@ -536,6 +562,20 @@ class FakePlayer:
 
     def play_tone(self, **kwargs) -> None:
         del kwargs
+
+
+class TimedPlayer(FakePlayer):
+    def __init__(self, *, playback_delay_s: float) -> None:
+        super().__init__()
+        self.playback_delay_s = playback_delay_s
+        self.playback_started_at: float | None = None
+        self.playback_finished_at: float | None = None
+
+    def play_wav_chunks(self, chunks, *, should_stop=None) -> None:
+        self.playback_started_at = time.monotonic()
+        super().play_wav_chunks(chunks, should_stop=should_stop)
+        time.sleep(self.playback_delay_s)
+        self.playback_finished_at = time.monotonic()
 
 
 class FakePrinter:
@@ -669,6 +709,25 @@ class StubConversationClosureEvaluator:
         self.request_id = "prefetch_req"
         self.model = "gpt-4o-mini"
         self.token_usage = None
+
+
+class TimedConversationClosureEvaluator:
+    def __init__(self, *, delay_s: float, close_now: bool = False) -> None:
+        self.delay_s = delay_s
+        self.close_now = close_now
+        self.started_at: float | None = None
+        self.finished_at: float | None = None
+
+    def evaluate(self, **kwargs) -> ConversationClosureDecision:
+        del kwargs
+        self.started_at = time.monotonic()
+        time.sleep(self.delay_s)
+        self.finished_at = time.monotonic()
+        return ConversationClosureDecision(
+            close_now=self.close_now,
+            confidence=0.91 if self.close_now else 0.18,
+            reason="explicit_goodbye" if self.close_now else "still_engaged",
+        )
 
 
 class StreamingRunnerTests(unittest.TestCase):
@@ -1048,6 +1107,72 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertIn("listen_timeout=true", lines)
         self.assertNotIn("turn_controller_fallback=RuntimeError", lines)
 
+    def test_streaming_no_speech_timeout_emits_capture_diagnostics(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            lines: list[str] = []
+            diagnostics = ListenTimeoutCaptureDiagnostics(
+                device="default",
+                sample_rate=16000,
+                channels=1,
+                chunk_ms=100,
+                speech_threshold=700,
+                chunk_count=11,
+                active_chunk_count=2,
+                average_rms=205,
+                peak_rms=477,
+                listened_ms=8012,
+            )
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeStreamingSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                recorder=FailIfCalledRecorder(),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+                emit=lines.append,
+            )
+            loop._capture_and_transcribe_streaming = lambda **kwargs: (_ for _ in ()).throw(
+                SpeechStartTimeoutError(
+                    "No speech detected before timeout",
+                    diagnostics=diagnostics,
+                )
+            )
+
+            keep_listening = loop._run_single_audio_turn(
+                initial_source="button",
+                follow_up=False,
+                listening_window=runtime.listening_window(initial_source="button", follow_up=False),
+                listen_source="button",
+                proactive_trigger=None,
+                speech_start_chunks=None,
+                ignore_initial_ms=0,
+                timeout_emit_key="listen_timeout",
+                timeout_message="Listening timed out before speech started.",
+                play_initial_beep=False,
+            )
+
+        self.assertFalse(keep_listening)
+        self.assertIn("listen_timeout=true", lines)
+        self.assertIn("listen_timeout_capture_device=default", lines)
+        self.assertIn("listen_timeout_chunk_count=11", lines)
+        self.assertIn("listen_timeout_peak_rms=477", lines)
+        self.assertIn("listen_timeout_active_ratio=0.18", lines)
+
     def test_audio_turn_recovers_empty_speech_final_with_batch_stt(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -1354,7 +1479,7 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(player.played_wav_bytes, [])
         self.assertIn("Ich schaue kurz nach.", tts_provider.stream_calls)
 
-    def test_prefetched_search_handoff_uses_speculative_result_before_full_run(self) -> None:
+    def test_prefetched_search_handoff_runs_handoff_only_lane_once(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 openai_api_key="test-key",
@@ -1393,21 +1518,8 @@ class StreamingRunnerTests(unittest.TestCase):
                 model="gpt-4o-mini",
                 token_usage=None,
             )
-            speculative_result = SimpleNamespace(
-                text="Heute wird es sonnig.",
-                response_id="resp_spec",
-                request_id="req_spec",
-                rounds=2,
-                tool_calls=(),
-                used_web_search=True,
-                model="gpt-4o-mini",
-                token_usage=None,
-            )
 
             loop._consume_speculative_supervisor_decision = lambda transcript: decision  # type: ignore[method-assign]
-            loop._consume_speculative_handoff_result = (  # type: ignore[method-assign]
-                lambda transcript, handoff, wait_for_completion: speculative_result
-            )
 
             keep_listening = loop._run_single_text_turn(
                 transcript="Wie ist das Wetter heute?",
@@ -1417,11 +1529,12 @@ class StreamingRunnerTests(unittest.TestCase):
 
         self.assertTrue(keep_listening)
         self.assertEqual(dual_lane.run_calls, [])
-        self.assertEqual(dual_lane.run_handoff_calls, [])
+        self.assertEqual(len(dual_lane.run_handoff_calls), 1)
+        self.assertFalse(dual_lane.run_handoff_calls[0]["emit_filler"])
         self.assertEqual(tts_provider.stream_calls, ["Ich schaue kurz nach.", "Heute wird es sonnig."])
         self.assertEqual(runtime.last_response, "Heute wird es sonnig.")
 
-    def test_prefetched_search_handoff_falls_back_to_handoff_only_lane(self) -> None:
+    def test_prefetched_search_handoff_handoff_only_lane_skips_internal_filler(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 openai_api_key="test-key",
@@ -1466,9 +1579,6 @@ class StreamingRunnerTests(unittest.TestCase):
             )
 
             loop._consume_speculative_supervisor_decision = lambda transcript: decision  # type: ignore[method-assign]
-            loop._consume_speculative_handoff_result = (  # type: ignore[method-assign]
-                lambda transcript, handoff, wait_for_completion: None
-            )
 
             keep_listening = loop._run_single_text_turn(
                 transcript="Wie ist das Wetter heute?",
@@ -1615,6 +1725,120 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(runtime.status.value, "waiting")
         self.assertEqual(runtime.snapshot_store.load().status, "waiting")
 
+    def test_dual_lane_sync_bridge_uses_supervisor_instead_of_first_word_provider(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+                streaming_first_word_final_lane_wait_ms=0,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            decision = SimpleNamespace(
+                action="direct",
+                spoken_ack=None,
+                spoken_reply="Mir geht's gut, danke! Und dir?",
+                kind=None,
+                goal=None,
+                allow_web_search=None,
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            decision_provider = FakeSupervisorDecisionProvider(decision)
+            dual_lane.supervisor_decision_provider = decision_provider
+            dual_lane.supervisor_instructions = "Kurz und warm antworten."
+            tts_provider = FakeTextToSpeechProvider(config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=tts_provider,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            loop.first_word_provider = ExplodingFirstWordProvider(config)
+            loop._run_dual_lane_final_response = lambda *args, **kwargs: SimpleNamespace(  # type: ignore[method-assign]
+                text="Dieser Pfad darf nicht die erste Antwort liefern.",
+                response_id="resp_unexpected",
+                request_id="req_unexpected",
+                rounds=1,
+                tool_calls=(),
+                used_web_search=False,
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+
+            keep_listening = loop._run_single_text_turn(
+                transcript="Wie gehts dir heute so?",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertEqual(decision_provider.calls[-1]["prompt"], "Wie gehts dir heute so?")
+        self.assertEqual(tts_provider.stream_calls, ["Mir geht's gut, danke! Und dir?"])
+        self.assertEqual(runtime.last_response, "Mir geht's gut, danke! Und dir?")
+        self.assertEqual(runtime.status.value, "waiting")
+
+    def test_dual_lane_skips_speculative_first_word_when_supervisor_bridge_is_available(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            dual_lane.supervisor_decision_provider = FakeSupervisorDecisionProvider(
+                SimpleNamespace(
+                    action="handoff",
+                    spoken_ack="Ich schaue kurz nach.",
+                    spoken_reply=None,
+                    kind="search",
+                    goal="search",
+                    allow_web_search=True,
+                    response_id="resp_prefetch",
+                    request_id="req_prefetch",
+                    model="gpt-4o-mini",
+                    token_usage=None,
+                )
+            )
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            exploding = ExplodingFirstWordProvider(config)
+            loop.first_word_provider = exploding
+
+            loop._maybe_start_speculative_first_word("Wie gehts")
+
+        self.assertEqual(exploding.calls, [])
+
     def test_direct_goodbye_turn_uses_closure_guard_to_suppress_follow_up(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -1670,6 +1894,157 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(runtime.last_response, "Bis dann!")
         self.assertEqual(len(closure.calls), 1)
         self.assertEqual(closure.calls[0]["user_transcript"], "Bis später.")
+
+    def test_direct_follow_up_rearms_to_listening_without_waiting_gap(self) -> None:
+        class SequencedRecorder:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def capture_pcm_until_pause_with_options(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                if len(self.calls) == 1:
+                    return SimpleNamespace(
+                        pcm_bytes=b"PCM1",
+                        speech_started_after_ms=80,
+                        resumed_after_pause_count=0,
+                    )
+                raise RuntimeError("No speech detected before timeout")
+
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                conversation_follow_up_enabled=True,
+                conversation_follow_up_timeout_s=3.0,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            recorder = SequencedRecorder()
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                recorder=recorder,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
+                action="direct",
+                spoken_ack=None,
+                spoken_reply="Mir geht's gut, danke! Und dir?",
+                kind=None,
+                goal=None,
+                allow_web_search=None,
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            beep_statuses: list[str] = []
+            loop._play_listen_beep = lambda: beep_statuses.append(loop.runtime.status.value)  # type: ignore[method-assign]
+
+            result = loop._run_conversation_session(initial_source="button")
+
+        self.assertTrue(result)
+        self.assertEqual(beep_statuses, ["listening", "listening"])
+        self.assertEqual(runtime.last_response, "Mir geht's gut, danke! Und dir?")
+        self.assertEqual(recorder.calls[0]["speech_start_chunks"], None)
+        self.assertEqual(recorder.calls[0]["ignore_initial_ms"], 0)
+        self.assertEqual(recorder.calls[1]["speech_start_chunks"], 1)
+        self.assertEqual(recorder.calls[1]["ignore_initial_ms"], 0)
+        self.assertIn(
+            (TwinrStatus.ANSWERING, TwinrEvent.FOLLOW_UP_ARMED, TwinrStatus.LISTENING),
+            runtime.state_machine.history,
+        )
+        self.assertNotIn(
+            (TwinrStatus.ANSWERING, TwinrEvent.TTS_FINISHED, TwinrStatus.WAITING),
+            runtime.state_machine.history,
+        )
+
+    def test_follow_up_closure_eval_runs_during_playback(self) -> None:
+        class SequencedRecorder:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def capture_pcm_until_pause_with_options(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                if len(self.calls) == 1:
+                    return SimpleNamespace(
+                        pcm_bytes=b"PCM1",
+                        speech_started_after_ms=80,
+                        resumed_after_pause_count=0,
+                    )
+                raise RuntimeError("No speech detected before timeout")
+
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                conversation_follow_up_enabled=True,
+                conversation_follow_up_timeout_s=3.0,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            recorder = SequencedRecorder()
+            player = TimedPlayer(playback_delay_s=0.25)
+            evaluator = TimedConversationClosureEvaluator(delay_s=0.12, close_now=False)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                recorder=recorder,
+                player=player,
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+                conversation_closure_evaluator=evaluator,
+            )
+            loop._consume_speculative_supervisor_decision = lambda transcript: SimpleNamespace(  # type: ignore[method-assign]
+                action="direct",
+                spoken_ack=None,
+                spoken_reply="Mir geht's gut, danke! Und dir?",
+                kind=None,
+                goal=None,
+                allow_web_search=None,
+                response_id="decision_resp",
+                request_id="decision_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            beep_times: list[float] = []
+            loop._play_listen_beep = lambda: beep_times.append(time.monotonic())  # type: ignore[method-assign]
+
+            result = loop._run_conversation_session(initial_source="button")
+
+        self.assertTrue(result)
+        self.assertEqual(len(beep_times), 2)
+        self.assertIsNotNone(evaluator.started_at)
+        self.assertIsNotNone(evaluator.finished_at)
+        self.assertIsNotNone(player.playback_finished_at)
+        assert evaluator.started_at is not None
+        assert evaluator.finished_at is not None
+        assert player.playback_finished_at is not None
+        self.assertLess(evaluator.started_at, player.playback_finished_at)
+        self.assertLessEqual(evaluator.finished_at, player.playback_finished_at + 0.05)
+        self.assertLess(beep_times[1] - player.playback_finished_at, 0.12)
 
     def test_final_lane_waits_for_first_audio_gate(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1799,7 +2174,7 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertEqual(results, [False])
         self.assertLess(elapsed, 0.5)
 
-    def test_dual_lane_ignores_model_first_word_provider(self) -> None:
+    def test_dual_lane_uses_model_first_word_provider_when_supervisor_prefetch_misses(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 openai_api_key="test-key",
@@ -1858,12 +2233,52 @@ class StreamingRunnerTests(unittest.TestCase):
             time.sleep(0.22)
 
         self.assertTrue(keep_listening)
-        self.assertIn("final_start", trace)
-        self.assertNotIn("first_word_start", trace)
-        self.assertNotIn("first_word_end", trace)
+        self.assertIn("first_word_start", trace)
+        self.assertIn("first_word_end", trace)
         self.assertEqual(runtime.last_response, "Heute wird es sonnig.")
 
-    def test_bridge_watchdog_emits_fallback_without_waiting_for_slow_first_word(self) -> None:
+    def test_speculative_first_word_requires_multiple_words(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                streaming_first_word_prefetch_min_chars=4,
+                streaming_first_word_prefetch_min_words=2,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            provider = FakeFirstWordProvider(
+                config,
+                reply=FirstWordReply(mode="filler", spoken_text="Ich schaue kurz nach."),
+            )
+            loop.first_word_provider = provider
+
+            loop._maybe_start_speculative_first_word("heute")
+            self.assertFalse(loop._speculative_first_word_started)
+            self.assertEqual(provider.calls, [])
+
+            loop._maybe_start_speculative_first_word("wie heute")
+            self.assertTrue(loop._speculative_first_word_done.wait(timeout=0.5))
+            self.assertEqual(len(provider.calls), 1)
+
+    def test_bridge_watchdog_does_not_emit_canned_fallback_when_model_first_word_misses(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 openai_api_key="test-key",
@@ -1925,8 +2340,8 @@ class StreamingRunnerTests(unittest.TestCase):
             time.sleep(0.24)
 
         self.assertTrue(keep_listening)
-        self.assertEqual(tts_provider.stream_calls[:2], ["Einen Moment bitte.", "Heute wird es sonnig."])
-        self.assertNotIn("Ich schaue kurz nach.", tts_provider.stream_calls[:2])
+        self.assertEqual(tts_provider.stream_calls[:1], ["Heute wird es sonnig."])
+        self.assertNotIn("Einen Moment bitte.", tts_provider.stream_calls)
         self.assertIn("first_word_timeout=true", lines)
         self.assertEqual(runtime.last_response, "Heute wird es sonnig.")
 
@@ -1987,12 +2402,10 @@ class StreamingRunnerTests(unittest.TestCase):
 
         self.assertTrue(keep_listening)
         self.assertEqual(
-            tts_provider.stream_calls[:2],
-            [
-                "Einen Moment bitte.",
-                "Das hat gerade nicht geklappt. Bitte versuche es noch einmal.",
-            ],
+            tts_provider.stream_calls[:1],
+            ["Das hat gerade nicht geklappt. Bitte versuche es noch einmal."],
         )
+        self.assertEqual(lines.count("first_word_timeout=true"), 1)
         self.assertIn("final_lane_watchdog=true", lines)
         self.assertIn("final_lane_timeout=true", lines)
         self.assertEqual(
@@ -2000,6 +2413,66 @@ class StreamingRunnerTests(unittest.TestCase):
             "Das hat gerade nicht geklappt. Bitte versuche es noch einmal.",
         )
         self.assertEqual(runtime.status.value, "waiting")
+
+    def test_streaming_turn_builds_lane_plan_after_transcript_submission(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=CapturingDualLaneLoop(),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            observed: dict[str, str] = {}
+
+            def fake_build_lane_plan(transcript: str) -> StreamingTurnLanePlan:
+                observed["transcript"] = transcript
+                observed["last_transcript"] = runtime.last_transcript
+
+                def _run_single_lane(_on_text_delta):
+                    return SimpleNamespace(
+                        text="Heute wird es sonnig.",
+                        response_id="resp_final",
+                        request_id="req_final",
+                        rounds=1,
+                        tool_calls=(),
+                        used_web_search=True,
+                        model="gpt-4o-mini",
+                        token_usage=None,
+                    )
+
+                return StreamingTurnLanePlan(
+                    turn_instructions="test",
+                    run_single_lane=_run_single_lane,
+                )
+
+            loop._build_streaming_turn_lane_plan = fake_build_lane_plan  # type: ignore[method-assign]
+
+            keep_listening = loop._run_single_text_turn(
+                transcript="Wie ist das Wetter heute?",
+                listen_source="button",
+                proactive_trigger=None,
+            )
+
+        self.assertTrue(keep_listening)
+        self.assertEqual(observed["transcript"], "Wie ist das Wetter heute?")
+        self.assertEqual(observed["last_transcript"], "Wie ist das Wetter heute?")
 
     def test_dual_lane_streaming_runner_passes_slim_supervisor_context(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -2460,6 +2933,10 @@ class StreamingRunnerTests(unittest.TestCase):
                 )
                 runtime = TwinrRuntime(config=config)
                 dual_lane = CapturingDualLaneLoop()
+                dual_lane.supervisor_decision_provider = SimpleNamespace(
+                    decide=lambda *args, **kwargs: None
+                )
+                dual_lane.supervisor_instructions = "Kurz und klar antworten."
                 loop = TwinrStreamingHardwareLoop(
                     config=config,
                     runtime=runtime,
@@ -2477,6 +2954,7 @@ class StreamingRunnerTests(unittest.TestCase):
                     button_monitor=SimpleNamespace(),
                     proactive_monitor=SimpleNamespace(),
                 )
+                loop.first_word_provider = FakeFirstWordProvider(config)
 
                 result = loop._run_conversation_session(initial_source="button")
                 loop.workflow_forensics.close()
@@ -2502,6 +2980,10 @@ class StreamingRunnerTests(unittest.TestCase):
                 self.assertIn("streaming_audio_turn_started", msgs)
                 self.assertIn("streaming_audio_capture_completed", msgs)
                 self.assertIn("streaming_transcript_ready", msgs)
+                self.assertIn("streaming_lane_plan_build", msgs)
+                self.assertIn("supervisor_bridge_context_build_sync", msgs)
+                self.assertIn("speculative_first_word_skipped_supervisor_bridge", msgs)
+                self.assertIn("speculative_supervisor_context_build", msgs)
                 self.assertIn("streaming_turn_completion_finished", msgs)
                 self.assertIn("speech_output_first_audio_emitted", msgs)
                 self.assertIn("runtime_status_emitted", msgs)

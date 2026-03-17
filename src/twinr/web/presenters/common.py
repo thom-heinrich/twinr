@@ -54,8 +54,10 @@ def _nav_items() -> tuple[tuple[str, str, str], ...]:
 
     return (
         ("dashboard", "Dashboard", "/"),
+        ("ops_self_coding", "Self-Coding", "/ops/self-coding"),
         ("ops_self_test", "Self-Test", "/ops/self-test"),
         ("ops_devices", "Devices", "/ops/devices"),
+        ("ops_debug", "Debug View", "/ops/debug"),
         ("ops_usage", "LLM Usage", "/ops/usage"),
         ("ops_health", "System Health", "/ops/health"),
         ("ops_logs", "Ops Logs", "/ops/logs"),

@@ -357,7 +357,7 @@ class ChonkyDBConnectionConfig:
     api_key_header: str = "x-api-key"
     allow_bearer_auth: bool = False
     timeout_s: float = 20.0
-    max_response_bytes: int = 32 * 1024 * 1024
+    max_response_bytes: int = 64 * 1024 * 1024
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", _normalize_base_url(self.base_url))  # AUDIT-FIX(#2)

@@ -17,6 +17,11 @@ import time
 from queue import Empty, Queue
 from typing import Any
 
+from twinr.agent.self_coding.codex_driver.config import (
+    codex_optional_model,
+    codex_reasoning_effort,
+    codex_timeout_seconds,
+)
 from twinr.agent.self_coding.codex_driver.types import (
     CodexCompileEvent,
     CodexCompileProgress,
@@ -133,16 +138,30 @@ class CodexExecFallbackDriver:
         self,
         *,
         command: tuple[str, ...] = ("codex", "exec"),
-        timeout_seconds: float = 180.0,
+        timeout_seconds: float | None = None,
+        model: str | None = None,
+        model_reasoning_effort: str | None = None,
     ) -> None:
         # AUDIT-FIX(#9): Reject empty command vectors and invalid timeout values during construction.
         if not command or any(not str(part).strip() for part in command):
             raise ValueError("command must contain at least one non-empty argument")
-        normalized_timeout = float(timeout_seconds)
+        resolved_timeout = codex_timeout_seconds(
+            "TWINR_SELF_CODING_CODEX_EXEC_TIMEOUT_SECONDS",
+            "TWINR_SELF_CODING_CODEX_TIMEOUT_SECONDS",
+        )
+        if timeout_seconds is not None:
+            resolved_timeout = float(timeout_seconds)
+        normalized_timeout = float(resolved_timeout)
         if not math.isfinite(normalized_timeout) or normalized_timeout <= 0.0:
             raise ValueError("timeout_seconds must be a finite positive number")
         self.command = tuple(str(part) for part in command)
         self.timeout_seconds = normalized_timeout
+        self.model = model if model is not None else codex_optional_model("TWINR_SELF_CODING_CODEX_MODEL")
+        self.model_reasoning_effort = (
+            model_reasoning_effort
+            if model_reasoning_effort is not None
+            else codex_reasoning_effort("TWINR_SELF_CODING_CODEX_MODEL_REASONING_EFFORT", default="high")
+        )
 
     def run_compile(self, request: CodexCompileRequest, *, event_sink: _EventSink | None = None) -> CodexCompileResult:
         # AUDIT-FIX(#2): Canonicalize and validate all filesystem paths before handing them to the CLI.
@@ -165,6 +184,15 @@ class CodexExecFallbackDriver:
             str(output_schema_path),
             "-",  # AUDIT-FIX(#3): Always read the prompt from stdin to avoid argv-length limits and accidental "-" sentinel hangs.
         ]
+        insertion_index = len(resolved_command)
+        if self.model:
+            command[insertion_index:insertion_index] = ["--model", self.model]
+            insertion_index += 2
+        if self.model_reasoning_effort:
+            command[insertion_index:insertion_index] = [
+                "--config",
+                f'model_reasoning_effort="{self.model_reasoning_effort}"',
+            ]
 
         # AUDIT-FIX(#6): Stream JSONL incrementally so progress events are emitted while the run is still active.
         # AUDIT-FIX(#4): Normalize launch-time OS failures into the driver's domain exception contract.

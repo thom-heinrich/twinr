@@ -1,0 +1,21 @@
+[Unit]
+Description=Twinr Web Control Portal
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=thh
+WorkingDirectory=/twinr
+Environment=TWINR_PYTHON=/twinr/.venv/bin/python
+ExecStart=/usr/bin/env bash -lc 'cd /twinr && PYTHONPATH=src "${TWINR_PYTHON}" -m twinr --env-file .env --run-web'
+Restart=always
+RestartSec=2
+TimeoutStopSec=30
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

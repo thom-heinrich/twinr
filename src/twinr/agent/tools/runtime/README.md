@@ -10,9 +10,14 @@ streaming APIs.
 `runtime` owns:
 - adapt workflow owners into `handle_*` methods for realtime tools
 - validate the canonical tool-name to handler binding registry
+- dispatch learned-skill control tools and hidden self-coding runtime triggers through the same thin executor surface
 - run the generic streaming tool loop and the supervisor/specialist handoff loop
 - emit speech-lane deltas and serialize tool results safely
 - enforce the focused broker policy for background automation `tool_call` execution
+
+The dual-lane handoff loop preserves optional explicit search hints such as a
+spoken target location or resolved date context when they are provided at the
+handoff boundary.
 
 `runtime` does **not** own:
 - concrete tool business logic or payload normalization in `../handlers`

@@ -3,23 +3,29 @@ name: self_coding
 path: src/twinr/agent/self_coding
 kind: python-package
 visibility: internal
-summary: Adaptive Skill Engine core package for contracts, runtime persistence, deterministic capability readiness, requirements dialogue, the first automation_manifest compiler, the first local compile-worker slice with a pinned Codex SDK primary, and soft-launch activation.
+summary: Adaptive Skill Engine core package for contracts, runtime persistence, deterministic capability readiness, the curated MVP module library, requirements dialogue, deterministic automation_manifest and skill_package compilers plus validator, a brokered process-isolated skill-package sandbox with explicit capability-policy manifests and best-effort child hardening, pinned Codex SDK compile/preflight slices, live morning-briefing acceptance, and versioned learned-skill activation/health/retest/watchdog control.
 owned_concerns:
   - Define the stable internal contract objects used across future ASE layers
   - Persist compile jobs and compile artifacts under the Twinr runtime state tree
   - Persist compile run status for operator/debug visibility under the Twinr runtime state tree
   - Resolve the deterministic MVP capability readiness view for self-coding feasibility checks
+  - Expose the curated Codex-readable MVP module library for ASE compile prompts and future sandboxed skills
   - Decide whether a draft skill request fits the current automation-first or later skill-package envelope
   - Persist and advance the deterministic requirements-dialogue state machine for self-coding
-  - Validate and canonicalize automation_manifest compile outputs into activation-ready Twinr artifacts
+  - Validate and canonicalize automation_manifest and skill_package compile outputs into activation-ready Twinr artifacts
   - Create queued self-coding compile jobs and run them through bounded local Codex drivers
-  - Stage, confirm, and roll back versioned automation-backed learned skills
+  - Materialize and execute bounded skill_package runtime code through the self_coding runtime service and brokered sandbox
+  - Persist sandbox/retest execution runs plus stale-run watchdog visibility and cleanup helpers
+  - Stage, confirm, roll back, pause, reactivate, retest, and clean up versioned learned skills
+  - Persist bounded skill-health counters and live-e2e proof records with auto-pause policy
   - Build compact operator-facing status summaries from persisted self-coding state
+  - Verify local/Pi Codex SDK bridge, CLI, and auth readiness before live compiles
+  - Prove the minimum morning-briefing product path through real compile, refresh, delivery, and spoken output
 out_of_scope:
   - Workflow-loop orchestration and live conversation hooks
-  - Long-horizon health scoring and autonomous pause policy
+  - Long-horizon health scoring and review workflow beyond the bounded current counters
   - Deep compile-target validation and later compiler specialization work
-  - Sandboxed skill execution and brokered effect enforcement
+  - Deeper seccomp/filter-style sandbox hardening beyond the current best-effort no_new_privs plus Landlock slice
 files:
   - path: __init__.py
     role: Package export surface for ASE core entrypoints
@@ -40,8 +46,10 @@ files:
       - FeasibilityOutcome
       - FeasibilityResult
       - LearnedSkillStatus
+      - LiveE2EStatusRecord
       - LocalCodexCompileDriver
       - SelfCodingActivationService
+      - SelfCodingHealthService
       - RequirementsDialogueSession
       - RequirementsDialogueStatus
       - SelfCodingCapabilityRegistry
@@ -51,6 +59,7 @@ files:
       - SelfCodingOperatorStatus
       - SelfCodingRequirementsDialogue
       - SelfCodingStore
+      - SkillHealthRecord
       - SkillSpec
       - SkillTriggerSpec
       - self_coding_store_root
@@ -62,6 +71,8 @@ files:
     role: File-backed self-coding persistence layer
   - path: compiler
     role: Deterministic compile-target validation and canonicalization
+  - path: modules
+    role: Curated Codex-readable capability module library for ASE
   - path: capability_registry.py
     role: Deterministic MVP capability readiness resolver
   - path: feasibility.py
@@ -73,11 +84,27 @@ files:
   - path: worker.py
     role: Queued compile-job creation and local compile execution
   - path: activation.py
-    role: Versioned soft-launch staging, confirmation, and rollback
+    role: Versioned soft-launch staging, confirmation, rollback, pause, reactivation, and cleanup
+  - path: sandbox
+    role: AST validation, trusted loading, capability-policy brokering, child hardening, and child-process execution
+  - path: execution_runs.py
+    role: Persisted sandbox and retest run lifecycle transitions
+  - path: health.py
+    role: Persisted skill-health counters, live-e2e proofs, and bounded auto-pause policy
+  - path: retest.py
+    role: Capture-only operator retest runner for active learned skills
+  - path: watchdog.py
+    role: Stale compile/run visibility and cleanup helpers
+  - path: runtime
+    role: Materialized skill_package runtime, loader, and bounded execution context
   - path: operator_status.py
     role: Compact operator-facing status summary
   - path: codex_driver
     role: Pinned Codex SDK bridge, exec fallback, and bounded workspace helpers
+  - path: codex_driver/environment.py
+    role: Explicit Codex SDK bridge, CLI, and auth readiness preflight
+  - path: live_acceptance.py
+    role: Real morning-briefing compile and delivery acceptance runner
 public_api:
   module: twinr.agent.self_coding
   exports:
@@ -97,8 +124,10 @@ public_api:
     - FeasibilityOutcome
     - FeasibilityResult
     - LearnedSkillStatus
+    - LiveE2EStatusRecord
     - LocalCodexCompileDriver
     - SelfCodingActivationService
+    - SelfCodingHealthService
     - RequirementsDialogueSession
     - RequirementsDialogueStatus
     - SelfCodingCapabilityRegistry
@@ -107,10 +136,13 @@ public_api:
     - SelfCodingLearningFlow
     - SelfCodingLearningUpdate
     - SelfCodingOperatorStatus
+    - SelfCodingSkillRetestResult
     - SelfCodingRequirementsDialogue
     - SelfCodingStore
+    - SkillHealthRecord
     - SkillSpec
     - SkillTriggerSpec
+    - run_self_coding_skill_retest
     - self_coding_store_root
 primary_callers:
   - path: src/twinr/agent/self_coding/IMPLEMENTATION_PLAN.md
@@ -125,4 +157,12 @@ tests:
   - path: test/test_self_coding_compile_status.py
   - path: test/test_self_coding_worker.py
   - path: test/test_self_coding_activation.py
+  - path: test/test_self_coding_health.py
   - path: test/test_self_coding_codex_driver.py
+  - path: test/test_self_coding_live_briefing_e2e.py
+  - path: test/test_self_coding_validator.py
+  - path: test/test_self_coding_live_acceptance.py
+  - path: test/test_self_coding_codex_environment.py
+  - path: test/test_self_coding_sandbox.py
+  - path: test/test_self_coding_retest.py
+  - path: test/test_self_coding_watchdog.py

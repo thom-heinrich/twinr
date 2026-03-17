@@ -7,6 +7,42 @@
     <link rel="stylesheet" href="{{ request.url_for('static', path='twinr.css') }}">
   </head>
   <body>
+    {% set shell_mode_value = shell_mode if shell_mode is defined else "full" %}
+    {% if shell_mode_value == "auth" %}
+    <main class="auth-shell page-{{ active_page }}">
+      <section class="auth-card">
+        <div class="auth-brand-row">
+          <div class="brand">
+            <span class="brand-mark">T</span>
+            <div>
+              <div class="brand-name">Twinr</div>
+              <div class="brand-subtitle">Control Surface</div>
+            </div>
+          </div>
+        </div>
+        <header class="auth-header">
+          <h1>{{ page_title }}</h1>
+          {% if intro %}
+          <p class="intro">{{ intro }}</p>
+          {% endif %}
+          <div class="path-hint">{{ env_path }}</div>
+        </header>
+
+        {% if saved %}
+        <section class="flash success">Saved.</section>
+        {% endif %}
+
+        {% if error_message %}
+        <section class="flash error">{{ error_message }}</section>
+        {% endif %}
+
+        {% if restart_notice %}
+        <section class="flash subtle">{{ restart_notice }}</section>
+        {% endif %}
+        {{ self.content() }}
+      </section>
+    </main>
+    {% else %}
     <div class="shell">
       <aside class="sidebar">
         <div class="brand">
@@ -22,7 +58,7 @@
           {% endfor %}
         </nav>
       </aside>
-      <main class="content">
+      <main class="content page-{{ active_page }}">
         <header class="page-header">
           <div class="page-header-main">
             <h1>{{ page_title }}</h1>
@@ -35,6 +71,16 @@
             <div class="page-notes">
               <span class="pill">LAN local</span>
               <span class="pill">No build step</span>
+              {% if auth_context and auth_context.logged_in %}
+              <span class="pill">Signed in {{ auth_context.username }}</span>
+              {% if auth_context.must_change_password %}
+              <span class="pill pill-warn">Password change required</span>
+              {% endif %}
+              <a class="link-button" href="{{ auth_context.password_path }}">Change password</a>
+              <form class="inline-form" method="post" action="{{ auth_context.logout_path }}">
+                <button class="button-secondary" type="submit">Sign out</button>
+              </form>
+              {% endif %}
             </div>
           </div>
         </header>
@@ -50,9 +96,10 @@
         {% if restart_notice %}
         <section class="flash subtle">{{ restart_notice }}</section>
         {% endif %}
-
-        {% block content %}{% endblock %}
+        {{ self.content() }}
       </main>
     </div>
+    {% endif %}
+    {% block content %}{% endblock %}
   </body>
 </html>

@@ -362,10 +362,10 @@ class OpenAISearchMixin:
         """Build the final search prompt with date and location grounding."""
 
         parts = [f"User question: {question}"]
-        resolved_location = (
-            _collapse_whitespace(location_hint)
-            or _collapse_whitespace(getattr(self.config, "openai_web_search_city", None))
-        )
+        # Keep configured geography in the structured web-search request only.
+        # The free-text prompt must not override an explicit place already named
+        # in the user's question with the runtime's default city.
+        resolved_location = _collapse_whitespace(location_hint)
         if resolved_location:
             parts.append(f"Location hint: {resolved_location}")
         resolved_date_context = _collapse_whitespace(date_context) or self._relative_date_context()

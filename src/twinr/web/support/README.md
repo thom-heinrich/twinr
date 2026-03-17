@@ -10,6 +10,7 @@ file-backed read/write utilities used by routes and presenters.
 - define reusable dashboard and settings contract objects
 - build declared env-backed form fields and collect fail-closed updates
 - parse form bodies and atomically read/write `.env` and text-backed settings
+- persist the managed web sign-in state, bootstrap the local `admin/admin` login, and sign or validate portal session cookies
 - expose the curated support import surface through [`__init__.py`](./__init__.py)
 
 `support` does **not** own:
@@ -26,6 +27,7 @@ file-backed read/write utilities used by routes and presenters.
 | [`contracts.py`](./contracts.py) | Immutable dashboard and settings models |
 | [`forms.py`](./forms.py) | Env-backed field builders and update filtering |
 | [`store.py`](./store.py) | Atomic text and `.env` persistence helpers |
+| [`auth.py`](./auth.py) | Managed web login state, password hashing, and signed session cookies |
 
 ## Usage
 

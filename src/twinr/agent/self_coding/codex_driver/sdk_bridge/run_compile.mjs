@@ -15,7 +15,8 @@ import { spawnSync } from "child_process";
  * Read a single JSON request object from stdin.
  *
  * Returns:
- *   A parsed request payload with workspaceRoot, prompt, and outputSchema.
+ *   A parsed request payload with workspaceRoot, prompt, outputSchema, and
+ *   optional model settings.
  */
 async function readRequestFromStdin() {
   const chunks = [];
@@ -39,6 +40,8 @@ async function readRequestFromStdin() {
     workspaceRoot: requireString(payload.workspaceRoot, "workspaceRoot"),
     prompt: requireString(payload.prompt, "prompt"),
     outputSchema: requireObject(payload.outputSchema, "outputSchema"),
+    model: optionalString(payload.model),
+    modelReasoningEffort: optionalReasoningEffort(payload.modelReasoningEffort),
   };
 }
 
@@ -74,6 +77,47 @@ function requireObject(value, fieldName) {
     throw new Error(`${fieldName} must be a JSON object`);
   }
   return value;
+}
+
+/**
+ * Return one optional string field from the request payload.
+ *
+ * Args:
+ *   value: Candidate field value.
+ *
+ * Returns:
+ *   A trimmed string or undefined.
+ */
+function optionalString(value) {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new Error("optional string fields must be strings when provided");
+  }
+  const normalized = value.trim();
+  return normalized || undefined;
+}
+
+/**
+ * Return one validated optional reasoning effort string.
+ *
+ * Args:
+ *   value: Candidate reasoning effort value.
+ *
+ * Returns:
+ *   A validated effort string or undefined.
+ */
+function optionalReasoningEffort(value) {
+  const normalized = optionalString(value);
+  if (!normalized) {
+    return undefined;
+  }
+  const allowed = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+  if (!allowed.has(normalized)) {
+    throw new Error("modelReasoningEffort must be one of minimal, low, medium, high, or xhigh");
+  }
+  return normalized;
 }
 
 /**
@@ -145,6 +189,8 @@ async function main() {
     skipGitRepoCheck: true,
     networkAccessEnabled: false,
     webSearchMode: "disabled",
+    model: request.model,
+    modelReasoningEffort: request.modelReasoningEffort,
   });
   const { events } = await thread.runStreamed(request.prompt, {
     outputSchema: request.outputSchema,

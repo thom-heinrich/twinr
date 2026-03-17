@@ -13,6 +13,10 @@ responses, live search, speech, reminder phrasing, or printing.
 - reminder, proactive, and automation phrasing with deterministic local fallbacks
 - printer-safe receipt composition and print-text sanitization
 
+Search prompt shaping keeps approximate default geography in structured
+`user_location` metadata, while free-text location hints are reserved for
+explicit user-provided target places.
+
 `capabilities` does **not** own:
 - low-level client construction, shared request builders, or base types in [`../core`](../core/README.md)
 - public backend composition and contract adapters in [`../api`](../api/README.md)

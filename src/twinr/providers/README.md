@@ -10,6 +10,7 @@
 - assemble the runtime provider bundle in [`factory.py`](./factory.py)
 - expose package-root imports and compatibility re-exports in [`__init__.py`](./__init__.py)
 - define the boundary above [`deepgram/`](./deepgram/README.md), [`groq/`](./groq/README.md), and [`openai/`](./openai/README.md)
+- attach the optional OpenAI streaming-transcript verifier to the runtime bundle when the fail-safe verifier path is enabled
 
 `providers` does **not** own:
 - provider-specific transport or SDK logic inside the sibling provider packages
@@ -34,6 +35,9 @@ from twinr.providers import OpenAIBackend, build_streaming_provider_bundle
 
 backend = OpenAIBackend(config=config)
 bundle = build_streaming_provider_bundle(config, support_backend=backend)
+
+# bundle.verification_stt is the optional bounded second-pass STT verifier
+# used by the streaming loop for suspicious short live transcripts.
 ```
 
 ## See also

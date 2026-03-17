@@ -26,7 +26,12 @@ from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
 from twinr.agent.base_agent import AdaptiveTimingStore, TwinrConfig
-from twinr.agent.self_coding import build_self_coding_operator_status
+from twinr.agent.workflows.required_remote_snapshot import assess_required_remote_watchdog_snapshot
+from twinr.agent.self_coding import SelfCodingActivationService
+from twinr.agent.self_coding.retest import run_self_coding_skill_retest
+from twinr.agent.self_coding.runtime import SelfCodingSkillRuntimeStore
+from twinr.agent.self_coding.operator_status import build_self_coding_operator_status
+from twinr.agent.self_coding.watchdog import cleanup_stale_compile_status, cleanup_stale_execution_run
 from twinr.hardware.voice_profile import VoiceProfileMonitor
 from twinr.integrations import build_managed_integrations, integration_automation_family_providers
 from twinr.memory.reminders import format_due_label
@@ -50,14 +55,26 @@ from twinr.web.automations import (
 from twinr.web.context import WebAppContext
 from twinr.web.support.contracts import DashboardCard
 from twinr.web.support.forms import _collect_standard_updates
+from twinr.web.support.auth import (
+    WebAuthState,
+    build_web_auth_session_cookie,
+    default_web_auth_username,
+    load_authenticated_web_session,
+    verify_web_auth_password,
+    web_auth_password_min_length,
+    web_auth_session_cookie_name,
+    web_auth_session_max_age_seconds,
+)
 from twinr.web.support.store import FileBackedSetting, parse_urlencoded_form, read_text_file, write_env_updates, write_text_file
 from twinr.web.presenters import (
     _adaptive_timing_view,
     _build_calendar_integration_record,
     _build_email_integration_record,
     _calendar_integration_sections,
+    build_ops_debug_page_context,
     _capture_voice_profile_sample,
     _connect_sections,
+    coerce_ops_debug_tab,
     _default_reminder_due_at,
     _email_integration_sections,
     _format_log_rows,
@@ -70,6 +87,7 @@ from twinr.web.presenters import (
     _reminder_rows,
     _resolve_named_file,
     _settings_sections,
+    build_self_coding_ops_page_context,
     _voice_action_result,
     _voice_profile_page_context,
     _voice_snapshot_label,
@@ -171,6 +189,83 @@ def _has_valid_basic_auth(request: Request, username: str, password: str) -> boo
     return secrets.compare_digest(provided_username, username) and secrets.compare_digest(provided_password, password)
 
 
+def _request_target_path(request: Request) -> str:
+    """Return the current path plus query string for safe local redirects."""
+
+    path = request.url.path or "/"
+    query = str(request.url.query or "").strip()
+    if query:
+        return f"{path}?{query}"
+    return path
+
+
+def _safe_next_path(raw_value: object | None) -> str:
+    """Normalize one untrusted local redirect target to a safe in-app path."""
+
+    if raw_value is None:
+        return "/"
+    candidate = str(raw_value).strip()
+    if not candidate.startswith("/") or candidate.startswith("//"):
+        return "/"
+    if candidate.startswith("/auth/login"):
+        return "/"
+    return candidate
+
+
+def _auth_login_location(request: Request) -> str:
+    """Build the managed-login redirect path for one unauthenticated request."""
+
+    next_path = _safe_next_path(_request_target_path(request))
+    if next_path == "/":
+        return "/auth/login"
+    return f"/auth/login?next={quote_plus(next_path)}"
+
+
+def _set_managed_auth_cookie(
+    response: Response,
+    *,
+    state: WebAuthState,
+    username: str,
+    request: Request,
+) -> None:
+    """Attach one signed managed-auth cookie to the response."""
+
+    response.set_cookie(
+        key=web_auth_session_cookie_name(),
+        value=build_web_auth_session_cookie(state, username=username),
+        max_age=web_auth_session_max_age_seconds(),
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+        path="/",
+    )
+
+
+def _clear_managed_auth_cookie(response: Response) -> None:
+    """Remove the managed-auth cookie from the response."""
+
+    response.delete_cookie(web_auth_session_cookie_name(), path="/")
+
+
+def _apply_auth_context(
+    request: Request,
+    *,
+    mode: str,
+    username: str | None = None,
+    must_change_password: bool = False,
+) -> None:
+    """Expose lightweight auth UI state to templates via `request.state`."""
+
+    request.state.web_auth_context = {
+        "mode": mode,
+        "logged_in": bool(username),
+        "username": username or "",
+        "must_change_password": bool(must_change_password),
+        "password_path": "/auth/password",
+        "logout_path": "/auth/logout",
+    }
+
+
 def _request_origin(request: Request) -> str:
     """Build the request origin from scheme and host headers."""
 
@@ -198,7 +293,10 @@ def _has_trusted_same_origin(request: Request) -> bool:
     if referer:
         return _is_same_origin_url(referer, expected_origin)
     sec_fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
-    return sec_fetch_site in {"same-origin", "none"}
+    if sec_fetch_site:
+        return sec_fetch_site in {"same-origin", "none"}
+    client_host = request.client.host if request.client else ""
+    return _is_loopback_host(client_host)
 
 
 def _secure_response(response: Response) -> Response:
@@ -266,6 +364,18 @@ def _require_non_empty(value: str, *, message: str) -> str:
     if not normalized:
         raise ValueError(message)
     return normalized
+
+
+def _require_positive_int(value: str, *, message: str) -> int:
+    """Return one positive integer parsed from form input."""
+
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(message) from exc
+    if parsed < 1:
+        raise ValueError(message)
+    return parsed
 
 
 def _safe_project_subpath(project_root: Path, configured_path: str | Path, *, label: str) -> Path:
@@ -429,20 +539,26 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
     )
     auth_username = str(security_env_values.get("TWINR_WEB_USERNAME", "")).strip()
     auth_password = str(security_env_values.get("TWINR_WEB_PASSWORD", ""))
-    if require_auth and not (auth_username and auth_password):
-        raise RuntimeError("Twinr Control requires both TWINR_WEB_USERNAME and TWINR_WEB_PASSWORD when auth is enabled.")
+    static_auth_partially_configured = bool(auth_username or auth_password)
+    if static_auth_partially_configured and not (auth_username and auth_password):
+        raise RuntimeError("Twinr Control static web auth requires both TWINR_WEB_USERNAME and TWINR_WEB_PASSWORD.")
+    managed_auth_enabled = bool(require_auth and not static_auth_partially_configured)
+    managed_auth_store = ctx.web_auth_store() if managed_auth_enabled else None
     if allow_remote and not require_auth:
-        raise RuntimeError("Twinr Control remote access requires auth. Set TWINR_WEB_USERNAME and TWINR_WEB_PASSWORD.")
+        raise RuntimeError("Twinr Control remote access requires web sign-in. Enable TWINR_WEB_REQUIRE_AUTH first.")
 
     # AUDIT-FIX(#7): Serialize file-backed control-plane writes inside the single-process app to avoid state corruption.
     state_write_lock = asyncio.Lock()
     ops_job_lock = asyncio.Lock()
     voice_profile_lock = asyncio.Lock()
+    managed_auth_write_lock = asyncio.Lock()
 
     @app.middleware("http")
     async def guard_control_plane(request: Request, call_next: Any) -> Response:
         """Enforce host, remote-access, auth, and same-origin policies."""
 
+        request_path = request.url.path.rstrip("/") or "/"
+        public_auth_path = request_path.startswith("/static/") or request_path == "/auth/login"
         normalized_host = _normalize_host_header(request.headers.get("host", ""))
         if not _is_allowed_host(normalized_host, allowed_hosts):
             return _error_response(
@@ -452,18 +568,41 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             )
 
         client_host = request.client.host if request.client else ""
-        if not allow_remote and not _is_loopback_host(client_host):
+        client_is_loopback = _is_loopback_host(client_host)
+        managed_auth_state: WebAuthState | None = None
+        managed_session_username: str | None = None
+        if managed_auth_enabled:
+            try:
+                managed_auth_state = await _call_sync(managed_auth_store.load_or_bootstrap)
+            except Exception as exc:
+                logger.exception("Failed to load managed web auth state", exc_info=exc)
+                return _error_response(
+                    request,
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    message="Twinr Control could not load the local web sign-in state.",
+                )
+            managed_session_username = load_authenticated_web_session(
+                managed_auth_state,
+                request.cookies.get(web_auth_session_cookie_name()),
+            )
+            _apply_auth_context(
+                request,
+                mode="managed",
+                username=managed_session_username,
+                must_change_password=managed_auth_state.must_change_password,
+            )
+
+        if not allow_remote and not client_is_loopback:
             return _error_response(
                 request,
                 status_code=status.HTTP_403_FORBIDDEN,
                 message=(
                     "Twinr Control only accepts browser access from this device right now. "
-                    "To allow remote access, set TWINR_WEB_ALLOW_REMOTE=1, TWINR_WEB_ALLOWED_HOSTS, and web credentials."
+                    "To allow remote access, set TWINR_WEB_ALLOW_REMOTE=1, TWINR_WEB_ALLOWED_HOSTS, and web sign-in."
                 ),
             )
-
         # AUDIT-FIX(#1,#2): Require auth when configured and block cross-site state-changing requests.
-        if require_auth and not _has_valid_basic_auth(request, auth_username, auth_password):
+        if require_auth and not managed_auth_enabled and not _has_valid_basic_auth(request, auth_username, auth_password):
             response = _error_response(
                 request,
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -471,6 +610,11 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             )
             response.headers["WWW-Authenticate"] = 'Basic realm="Twinr Control", charset="UTF-8"'
             return response
+        if managed_auth_enabled and not public_auth_path:
+            if not managed_session_username:
+                return _secure_response(RedirectResponse(_auth_login_location(request), status_code=status.HTTP_303_SEE_OTHER))
+            if managed_auth_state is not None and managed_auth_state.must_change_password and request_path not in {"/auth/password", "/auth/logout"}:
+                return _secure_response(RedirectResponse("/auth/password", status_code=status.HTTP_303_SEE_OTHER))
 
         if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _has_trusted_same_origin(request):
             return _error_response(
@@ -503,6 +647,190 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             message="Twinr Control hit a local problem and could not finish that page. Please try again.",
         )
+
+    @app.get("/auth/login", response_class=HTMLResponse)
+    async def auth_login(request: Request) -> HTMLResponse:
+        """Render the managed-login page used by the permanent Pi web service."""
+
+        if not managed_auth_enabled or managed_auth_store is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This page is not available.")
+
+        auth_state = await _call_sync(managed_auth_store.load_or_bootstrap)
+        authenticated_username = load_authenticated_web_session(
+            auth_state,
+            request.cookies.get(web_auth_session_cookie_name()),
+        )
+        if authenticated_username:
+            if auth_state.must_change_password:
+                return RedirectResponse("/auth/password", status_code=status.HTTP_303_SEE_OTHER)
+            return RedirectResponse(
+                _safe_next_path(request.query_params.get("next")),
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
+        _apply_auth_context(request, mode="managed")
+        return ctx.render(
+            request,
+            "auth_login.html",
+            page_title="Sign in",
+            active_page="auth_login",
+            restart_notice=None,
+            intro=(
+                "Sign in to Twinr Control. On the first sign-in use admin / admin. "
+                "Twinr will ask for a new password right away."
+            ),
+            shell_mode="auth",
+            next_path=_safe_next_path(request.query_params.get("next")),
+            suggested_username=default_web_auth_username(),
+        )
+
+    @app.post("/auth/login")
+    async def auth_login_post(request: Request) -> Response:
+        """Authenticate one managed web login and start a signed session."""
+
+        if not managed_auth_enabled or managed_auth_store is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This page is not available.")
+
+        auth_state = await _call_sync(managed_auth_store.load_or_bootstrap)
+        form_values = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+        username = str(form_values.get("username", "") or "").strip()
+        password = str(form_values.get("password", "") or "")
+        next_path = _safe_next_path(form_values.get("next"))
+        if not verify_web_auth_password(auth_state, username=username, password=password):
+            _apply_auth_context(request, mode="managed")
+            return ctx.render(
+                request,
+                "auth_login.html",
+                page_title="Sign in",
+                active_page="auth_login",
+                restart_notice=None,
+                intro=(
+                    "Sign in to Twinr Control. On the first sign-in use admin / admin. "
+                    "Twinr will ask for a new password right away."
+                ),
+                shell_mode="auth",
+                next_path=next_path,
+                suggested_username=username or default_web_auth_username(),
+                error_message="Username or password was not correct.",
+            )
+
+        response = RedirectResponse(
+            "/auth/password" if auth_state.must_change_password else next_path,
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+        _set_managed_auth_cookie(response, state=auth_state, username=auth_state.username, request=request)
+        return response
+
+    @app.get("/auth/password", response_class=HTMLResponse)
+    async def auth_password(request: Request) -> HTMLResponse:
+        """Render the password-change page for managed web sign-in."""
+
+        if not managed_auth_enabled or managed_auth_store is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This page is not available.")
+
+        auth_state = await _call_sync(managed_auth_store.load_or_bootstrap)
+        authenticated_username = load_authenticated_web_session(
+            auth_state,
+            request.cookies.get(web_auth_session_cookie_name()),
+        )
+        if not authenticated_username:
+            return RedirectResponse(_auth_login_location(request), status_code=status.HTTP_303_SEE_OTHER)
+        _apply_auth_context(
+            request,
+            mode="managed",
+            username=authenticated_username,
+            must_change_password=auth_state.must_change_password,
+        )
+        return ctx.render(
+            request,
+            "auth_password.html",
+            page_title="Change password",
+            active_page="auth_password",
+            restart_notice=(
+                "Finish this step once. After that, Twinr Control stays unlocked for normal LAN sign-in."
+                if auth_state.must_change_password
+                else "Change the local Twinr Control password used for sign-in."
+            ),
+            intro=(
+                "Choose a new password before the full Twinr Control portal is unlocked."
+                if auth_state.must_change_password
+                else "Update the password used to sign in to Twinr Control."
+            ),
+            shell_mode="auth",
+            password_min_length=web_auth_password_min_length(),
+        )
+
+    @app.post("/auth/password")
+    async def auth_password_post(request: Request) -> Response:
+        """Persist one managed web password change."""
+
+        if not managed_auth_enabled or managed_auth_store is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This page is not available.")
+
+        auth_state = await _call_sync(managed_auth_store.load_or_bootstrap)
+        authenticated_username = load_authenticated_web_session(
+            auth_state,
+            request.cookies.get(web_auth_session_cookie_name()),
+        )
+        if not authenticated_username:
+            return RedirectResponse(_auth_login_location(request), status_code=status.HTTP_303_SEE_OTHER)
+
+        form_values = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+        current_password = str(form_values.get("current_password", "") or "")
+        new_password = str(form_values.get("new_password", "") or "")
+        confirm_password = str(form_values.get("confirm_password", "") or "")
+        try:
+            async with managed_auth_write_lock:
+                updated_auth_state = await _call_sync(
+                    managed_auth_store.update_password,
+                    current_password=current_password,
+                    new_password=new_password,
+                    confirm_password=confirm_password,
+                )
+        except ValueError as exc:
+            _apply_auth_context(
+                request,
+                mode="managed",
+                username=authenticated_username,
+                must_change_password=auth_state.must_change_password,
+            )
+            return ctx.render(
+                request,
+                "auth_password.html",
+                page_title="Change password",
+                active_page="auth_password",
+                restart_notice=(
+                    "Finish this step once. After that, Twinr Control stays unlocked for normal LAN sign-in."
+                    if auth_state.must_change_password
+                    else "Change the local Twinr Control password used for sign-in."
+                ),
+                intro=(
+                    "Choose a new password before the full Twinr Control portal is unlocked."
+                    if auth_state.must_change_password
+                    else "Update the password used to sign in to Twinr Control."
+                ),
+                shell_mode="auth",
+                password_min_length=web_auth_password_min_length(),
+                error_message=_public_error_message(exc, fallback="Twinr could not save the new password."),
+            )
+
+        response = RedirectResponse("/?saved=1", status_code=status.HTTP_303_SEE_OTHER)
+        _set_managed_auth_cookie(
+            response,
+            state=updated_auth_state,
+            username=updated_auth_state.username,
+            request=request,
+        )
+        return response
+
+    @app.post("/auth/logout")
+    async def auth_logout(request: Request) -> Response:
+        """End the current managed web session."""
+
+        if not managed_auth_enabled:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="This page is not available.")
+        response = RedirectResponse("/auth/login", status_code=status.HTTP_303_SEE_OTHER)
+        _clear_managed_auth_cookie(response)
+        return response
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request) -> HTMLResponse:
@@ -589,7 +917,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                     title="Self-coding",
                     value=self_coding_status.card_value(),
                     detail=self_coding_status.card_detail(),
-                    href="/",
+                    href="/ops/self-coding",
                 ),
             )
         return ctx.render(
@@ -660,6 +988,198 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             result=result,
             artifact_href=artifact_href,
         )
+
+    @app.get("/ops/self-coding", response_class=HTMLResponse)
+    async def ops_self_coding(request: Request) -> HTMLResponse:
+        """Render the self-coding operator page."""
+
+        page_context = await _call_sync(build_self_coding_ops_page_context, ctx.self_coding_store())
+        return ctx.render(
+            request,
+            "ops_self_coding.html",
+            page_title="Self-coding operations",
+            active_page="ops_self_coding",
+            restart_notice="This page shows learned-skill compile telemetry, health, and explicit operator controls.",
+            **page_context,
+        )
+
+    @app.post("/ops/self-coding/pause")
+    async def pause_self_coding_activation(request: Request) -> Response:
+        """Pause one learned self-coding skill version from the web UI."""
+
+        try:
+            config, _env_values = await _call_sync(ctx.load_state)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            skill_id = _require_non_empty(form.get("skill_id", ""), message="Please choose a learned skill.")
+            version = _require_positive_int(form.get("version", ""), message="Please choose a valid learned skill version.")
+            reason = form.get("reason", "").strip() or "operator_pause"
+            activation_service = SelfCodingActivationService(
+                store=ctx.self_coding_store(),
+                automation_store=ctx.automation_store(config),
+            )
+            async with state_write_lock:
+                await _call_sync(
+                    activation_service.pause_activation,
+                    skill_id=skill_id,
+                    version=version,
+                    reason=reason,
+                )
+        except Exception as exc:
+            return _redirect_with_error(
+                "/ops/self-coding",
+                _public_error_message(exc, fallback="Twinr could not pause that learned skill."),
+            )
+        return _redirect_saved("/ops/self-coding")
+
+    @app.post("/ops/self-coding/reactivate")
+    async def reactivate_self_coding_activation(request: Request) -> Response:
+        """Re-enable one paused learned self-coding skill version from the web UI."""
+
+        try:
+            config, _env_values = await _call_sync(ctx.load_state)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            skill_id = _require_non_empty(form.get("skill_id", ""), message="Please choose a learned skill.")
+            version = _require_positive_int(form.get("version", ""), message="Please choose a valid learned skill version.")
+            activation_service = SelfCodingActivationService(
+                store=ctx.self_coding_store(),
+                automation_store=ctx.automation_store(config),
+            )
+            async with state_write_lock:
+                await _call_sync(
+                    activation_service.reactivate_activation,
+                    skill_id=skill_id,
+                    version=version,
+                )
+        except Exception as exc:
+            return _redirect_with_error(
+                "/ops/self-coding",
+                _public_error_message(exc, fallback="Twinr could not reactivate that learned skill."),
+            )
+        return _redirect_saved("/ops/self-coding")
+
+    @app.post("/ops/self-coding/rollback")
+    async def rollback_self_coding_activation(request: Request) -> Response:
+        """Restore the previous learned-skill version from the web UI."""
+
+        try:
+            config, _env_values = await _call_sync(ctx.load_state)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            skill_id = _require_non_empty(form.get("skill_id", ""), message="Please choose a learned skill.")
+            raw_target_version = form.get("target_version", "").strip()
+            target_version = None if not raw_target_version else _require_positive_int(
+                raw_target_version,
+                message="Please choose a valid rollback target version.",
+            )
+            activation_service = SelfCodingActivationService(
+                store=ctx.self_coding_store(),
+                automation_store=ctx.automation_store(config),
+            )
+            async with state_write_lock:
+                await _call_sync(
+                    activation_service.rollback_activation,
+                    skill_id=skill_id,
+                    target_version=target_version,
+                )
+        except Exception as exc:
+            return _redirect_with_error(
+                "/ops/self-coding",
+                _public_error_message(exc, fallback="Twinr could not roll back that learned skill."),
+            )
+        return _redirect_saved("/ops/self-coding")
+
+    @app.post("/ops/self-coding/retest")
+    async def retest_self_coding_activation(request: Request) -> Response:
+        """Run one capture-only retest for an active learned skill version."""
+
+        try:
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            skill_id = _require_non_empty(form.get("skill_id", ""), message="Please choose a learned skill.")
+            version = _require_positive_int(form.get("version", ""), message="Please choose a valid learned skill version.")
+            async with state_write_lock:
+                await _call_sync(
+                    run_self_coding_skill_retest,
+                    project_root=ctx.project_root,
+                    env_file=ctx.env_path,
+                    skill_id=skill_id,
+                    version=version,
+                    environment="web",
+                )
+        except Exception as exc:
+            return _redirect_with_error(
+                "/ops/self-coding",
+                _public_error_message(exc, fallback="Twinr could not retest that learned skill."),
+            )
+        return _redirect_saved("/ops/self-coding")
+
+    @app.post("/ops/self-coding/cleanup")
+    async def cleanup_self_coding_activation(request: Request) -> Response:
+        """Retire one inactive learned skill version and remove its runtime artifacts."""
+
+        try:
+            config, _env_values = await _call_sync(ctx.load_state)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            skill_id = _require_non_empty(form.get("skill_id", ""), message="Please choose a learned skill.")
+            version = _require_positive_int(form.get("version", ""), message="Please choose a valid learned skill version.")
+            activation_service = SelfCodingActivationService(
+                store=ctx.self_coding_store(),
+                automation_store=ctx.automation_store(config),
+            )
+            runtime_store = SelfCodingSkillRuntimeStore(ctx.self_coding_store().root)
+            async with state_write_lock:
+                await _call_sync(
+                    activation_service.cleanup_activation,
+                    skill_id=skill_id,
+                    version=version,
+                    runtime_store=runtime_store,
+                )
+        except Exception as exc:
+            return _redirect_with_error(
+                "/ops/self-coding",
+                _public_error_message(exc, fallback="Twinr could not clean up that learned skill version."),
+            )
+        return _redirect_saved("/ops/self-coding")
+
+    @app.post("/ops/self-coding/cleanup-run")
+    async def cleanup_self_coding_run(request: Request) -> Response:
+        """Mark one stale sandbox or retest run as cleaned from the operator UI."""
+
+        try:
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            run_id = _require_non_empty(form.get("run_id", ""), message="Please choose a valid self-coding run.")
+            async with state_write_lock:
+                await _call_sync(
+                    cleanup_stale_execution_run,
+                    store=ctx.self_coding_store(),
+                    run_id=run_id,
+                    reason="operator_cleanup",
+                )
+        except Exception as exc:
+            return _redirect_with_error(
+                "/ops/self-coding",
+                _public_error_message(exc, fallback="Twinr could not clean up that stale run."),
+            )
+        return _redirect_saved("/ops/self-coding")
+
+    @app.post("/ops/self-coding/cleanup-compile")
+    async def cleanup_self_coding_compile(request: Request) -> Response:
+        """Abort one stale compile run from the operator UI."""
+
+        try:
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            job_id = _require_non_empty(form.get("job_id", ""), message="Please choose a valid compile job.")
+            async with state_write_lock:
+                await _call_sync(
+                    cleanup_stale_compile_status,
+                    store=ctx.self_coding_store(),
+                    job_id=job_id,
+                    reason="operator_cleanup",
+                )
+        except Exception as exc:
+            return _redirect_with_error(
+                "/ops/self-coding",
+                _public_error_message(exc, fallback="Twinr could not clean up that stale compile."),
+            )
+        return _redirect_saved("/ops/self-coding")
 
     @app.get("/ops/self-test/artifacts/{artifact_name}")
     async def download_self_test_artifact(artifact_name: str) -> FileResponse:
@@ -737,6 +1257,75 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             remote_memory_watchdog=remote_memory_watchdog,
             remote_memory_watchdog_error=remote_memory_watchdog_error,
             recent_errors=_format_log_rows(recent_errors),
+        )
+
+    @app.get("/ops/debug", response_class=HTMLResponse)
+    async def ops_debug(request: Request) -> HTMLResponse:
+        """Render the full tabbed operator debug view."""
+
+        active_tab = coerce_ops_debug_tab(request.query_params.get("tab"))
+        config, env_values = await _call_sync(ctx.load_state)
+        snapshot = await _call_sync(ctx.load_snapshot, config)
+        event_store = ctx.event_store()
+        usage_store = ctx.usage_store()
+        recent_events = await _call_sync(event_store.tail, limit=120)
+        recent_usage = await _call_sync(usage_store.tail, limit=80)
+        summary_all = await _call_sync(usage_store.summary)
+        summary_24h = await _call_sync(usage_store.summary, within_hours=24)
+        health = await _call_sync(collect_system_health, config, snapshot=snapshot, event_store=event_store)
+
+        remote_memory_watchdog = None
+        remote_memory_watchdog_assessment = None
+        remote_memory_watchdog_error = None
+        try:
+            remote_memory_watchdog = await _call_sync(ctx.load_remote_memory_watchdog, config)
+            remote_memory_watchdog_assessment = await _call_sync(
+                assess_required_remote_watchdog_snapshot,
+                config,
+            )
+        except Exception as exc:
+            remote_memory_watchdog_error = _public_error_message(
+                exc,
+                fallback="Twinr could not read the remote memory watchdog state.",
+            )
+
+        device_overview = None
+        if active_tab == "hardware":
+            device_overview = await _call_sync(collect_device_overview, config, event_store=event_store)
+
+        config_checks: tuple[Any, ...] = ()
+        config_check_summary = None
+        if active_tab == "raw":
+            config_checks = await _call_sync(run_config_checks, config)
+            config_check_summary = await _call_sync(check_summary, config_checks)
+
+        page_context = build_ops_debug_page_context(
+            active_tab=active_tab,
+            env_path=ctx.env_path,
+            config=config,
+            ops_paths=ctx.ops_paths,
+            snapshot=snapshot,
+            health=health,
+            remote_memory_watchdog=remote_memory_watchdog,
+            remote_memory_watchdog_assessment=remote_memory_watchdog_assessment,
+            remote_memory_watchdog_error=remote_memory_watchdog_error,
+            recent_events=tuple(recent_events),
+            recent_usage=tuple(recent_usage),
+            summary_all=summary_all,
+            summary_24h=summary_24h,
+            device_overview=device_overview,
+            redacted_env_values=redact_env_values(env_values),
+            config_checks=tuple(config_checks),
+            config_check_summary=config_check_summary,
+        )
+        return ctx.render(
+            request,
+            "ops_debug.html",
+            page_title="Debug View",
+            active_page="ops_debug",
+            intro="Read-only operator view of Twinr runtime evidence, grouped into runtime, ChonkyDB, LLM, events, hardware, and raw artifacts.",
+            restart_notice="This page is read-only and reflects the latest local Twinr artifacts.",
+            **page_context,
         )
 
     @app.get("/ops/devices", response_class=HTMLResponse)

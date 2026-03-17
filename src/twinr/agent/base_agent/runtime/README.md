@@ -11,7 +11,10 @@ durability.
 - compose `TwinrRuntime` from focused mixins
 - bootstrap and shut down runtime-owned stores and services
 - drive state transitions for listening, answering, printing, and failures
+- rearm follow-up listening directly from `answering` when a conversation stays open after a spoken reply
 - assemble provider-facing context, adaptive timing, and voice guidance
+- keep the first-word lane on bounded local context so direct replies never block on remote long-term retrieval
+- keep the supervisor fast lane on the same remote-free path while still surfacing one local on-device memory summary
 - mediate on-device memory, durable memory, reminders, automations, and snapshots
 
 `runtime` does **not** own:
@@ -42,6 +45,7 @@ runtime = TwinrRuntime(config=TwinrConfig())
 runtime.begin_listening(request_source="button", button="green")
 runtime.submit_transcript("Bitte erinnere mich morgen an meine Tabletten.")
 runtime.complete_agent_turn("Ich erinnere dich morgen daran.")
+runtime.rearm_follow_up()
 runtime.shutdown(timeout_s=1.0)
 ```
 

@@ -56,6 +56,11 @@ DEFAULT_WAKEWORD_PHRASES = (
 # Custom openWakeWord models can legitimately need very low operating thresholds.
 # Keep the parser permissive and let deployment tuning decide the actual value.
 MIN_SAFE_OPENWAKEWORD_THRESHOLD = 0.0
+SUPPORTED_DISPLAY_LAYOUTS = (
+    "default",
+    "debug_log",
+    "debug_face",
+)
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -226,6 +231,7 @@ class TwinrConfig:
     streaming_first_word_max_output_tokens: int = 32
     streaming_first_word_prefetch_enabled: bool = True
     streaming_first_word_prefetch_min_chars: int = 4
+    streaming_first_word_prefetch_min_words: int = 2
     streaming_first_word_prefetch_wait_ms: int = 40
     streaming_bridge_reply_timeout_ms: int = 250
     streaming_first_word_final_lane_wait_ms: int = 900
@@ -271,8 +277,8 @@ class TwinrConfig:
     audio_dynamic_pause_long_pause_grace_penalty_ms: int = 220
     audio_pause_resume_chunks: int = 2
     audio_speech_start_chunks: int = 1
-    audio_follow_up_speech_start_chunks: int = 4
-    audio_follow_up_ignore_ms: int = 300
+    audio_follow_up_speech_start_chunks: int = 1
+    audio_follow_up_ignore_ms: int = 0
     openai_enable_web_search: bool = False
     openai_search_model: str = "gpt-4o-mini-search-preview"
     openai_web_search_context_size: str = "medium"
@@ -402,6 +408,7 @@ class TwinrConfig:
     long_term_memory_remote_read_timeout_s: float = 8.0
     long_term_memory_remote_write_timeout_s: float = 15.0
     long_term_memory_remote_keepalive_interval_s: float = 5.0
+    long_term_memory_remote_runtime_check_mode: str = "direct"
     long_term_memory_remote_watchdog_interval_s: float = 1.0
     long_term_memory_remote_watchdog_history_limit: int = 3600
     long_term_memory_remote_max_content_chars: int = 2_000_000
@@ -444,7 +451,7 @@ class TwinrConfig:
     chonkydb_api_key_header: str = "x-api-key"
     chonkydb_allow_bearer_auth: bool = False
     chonkydb_timeout_s: float = 20.0
-    chonkydb_max_response_bytes: int = 32 * 1024 * 1024
+    chonkydb_max_response_bytes: int = 64 * 1024 * 1024
     restore_runtime_state_on_startup: bool = False
     reminder_poll_interval_s: float = 1.0
     reminder_retry_delay_s: float = 90.0
@@ -482,6 +489,7 @@ class TwinrConfig:
     display_rotation_degrees: int = 270
     display_full_refresh_interval: int = 0
     display_poll_interval_s: float = 0.5
+    display_layout: str = "default"
     printer_queue: str = "Thermal_GP58"
     printer_device_uri: str | None = None
     printer_header_text: str = "TWINR.com"
@@ -496,12 +504,21 @@ class TwinrConfig:
         """Normalize derived long-term-memory mode fields after construction."""
 
         normalized_mode = str(self.long_term_memory_mode or "local_first").strip().lower() or "local_first"
+        normalized_display_layout = str(self.display_layout or "default").strip().lower() or "default"
+        if normalized_display_layout == "debug_face":
+            normalized_display_layout = "debug_log"
+        if normalized_display_layout not in SUPPORTED_DISPLAY_LAYOUTS:
+            raise ValueError(
+                "display_layout must be one of: "
+                + ", ".join(SUPPORTED_DISPLAY_LAYOUTS)
+            )
         object.__setattr__(self, "long_term_memory_mode", normalized_mode)
         object.__setattr__(
             self,
             "long_term_memory_remote_required",
             normalized_mode == "remote_primary",
         )
+        object.__setattr__(self, "display_layout", normalized_display_layout)
 
     @property
     def button_gpios(self) -> dict[str, int]:
@@ -588,6 +605,9 @@ class TwinrConfig:
         path = Path(env_path)
         file_values = _read_dotenv(path)
         project_root = path.parent.resolve()
+        default_remote_runtime_check_mode = (
+            "watchdog_artifact" if project_root == Path("/twinr") else "direct"
+        )
 
         def get_value(name: str, default: str | None = None) -> str | None:
             if name in os.environ:
@@ -787,6 +807,10 @@ class TwinrConfig:
                 1,
                 int(get_value("TWINR_STREAMING_FIRST_WORD_PREFETCH_MIN_CHARS", "4") or "4"),
             ),
+            streaming_first_word_prefetch_min_words=max(
+                1,
+                int(get_value("TWINR_STREAMING_FIRST_WORD_PREFETCH_MIN_WORDS", "2") or "2"),
+            ),
             streaming_first_word_prefetch_wait_ms=max(
                 0,
                 int(get_value("TWINR_STREAMING_FIRST_WORD_PREFETCH_WAIT_MS", "40") or "40"),
@@ -922,9 +946,9 @@ class TwinrConfig:
             ),
             audio_speech_start_chunks=int(get_value("TWINR_AUDIO_SPEECH_START_CHUNKS", "1") or "1"),
             audio_follow_up_speech_start_chunks=int(
-                get_value("TWINR_AUDIO_FOLLOW_UP_SPEECH_START_CHUNKS", "4") or "4"
+                get_value("TWINR_AUDIO_FOLLOW_UP_SPEECH_START_CHUNKS", "1") or "1"
             ),
-            audio_follow_up_ignore_ms=int(get_value("TWINR_AUDIO_FOLLOW_UP_IGNORE_MS", "300") or "300"),
+            audio_follow_up_ignore_ms=int(get_value("TWINR_AUDIO_FOLLOW_UP_IGNORE_MS", "0") or "0"),
             openai_enable_web_search=_parse_bool(get_value("TWINR_OPENAI_ENABLE_WEB_SEARCH"), False),
             openai_search_model=get_value("OPENAI_SEARCH_MODEL", "gpt-4o-mini-search-preview")
             or "gpt-4o-mini-search-preview",
@@ -1297,6 +1321,13 @@ class TwinrConfig:
                 5.0,
                 minimum=0.1,
             ),
+            long_term_memory_remote_runtime_check_mode=(
+                get_value(
+                    "TWINR_LONG_TERM_MEMORY_REMOTE_RUNTIME_CHECK_MODE",
+                    default_remote_runtime_check_mode,
+                )
+                or default_remote_runtime_check_mode
+            ).strip().lower(),
             long_term_memory_remote_watchdog_interval_s=_parse_float(
                 get_value("TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_INTERVAL_S"),
                 1.0,
@@ -1442,7 +1473,7 @@ class TwinrConfig:
             chonkydb_allow_bearer_auth=_parse_bool(get_value("TWINR_CHONKYDB_ALLOW_BEARER_AUTH"), False),
             chonkydb_timeout_s=_parse_float(get_value("TWINR_CHONKYDB_TIMEOUT_S"), 20.0),
             chonkydb_max_response_bytes=int(
-                get_value("TWINR_CHONKYDB_MAX_RESPONSE_BYTES", str(32 * 1024 * 1024)) or str(32 * 1024 * 1024)
+                get_value("TWINR_CHONKYDB_MAX_RESPONSE_BYTES", str(64 * 1024 * 1024)) or str(64 * 1024 * 1024)
             ),
             restore_runtime_state_on_startup=_parse_bool(
                 get_value("TWINR_RESTORE_RUNTIME_STATE_ON_STARTUP"),
@@ -1494,6 +1525,7 @@ class TwinrConfig:
             display_rotation_degrees=int(get_value("TWINR_DISPLAY_ROTATION_DEGREES", "270") or "270"),
             display_full_refresh_interval=int(get_value("TWINR_DISPLAY_FULL_REFRESH_INTERVAL", "0") or "0"),
             display_poll_interval_s=_parse_float(get_value("TWINR_DISPLAY_POLL_INTERVAL_S"), 0.5),
+            display_layout=get_value("TWINR_DISPLAY_LAYOUT", "default") or "default",
             printer_queue=get_value("TWINR_PRINTER_QUEUE", "Thermal_GP58") or "Thermal_GP58",
             printer_device_uri=get_value("TWINR_PRINTER_DEVICE_URI"),
             printer_header_text=get_value("TWINR_PRINTER_HEADER_TEXT", "TWINR.com") or "TWINR.com",

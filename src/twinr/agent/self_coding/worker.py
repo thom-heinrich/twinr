@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+from collections import deque
+from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import re
 import threading
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 from twinr.agent.self_coding.codex_driver import (
-    CodexAppServerDriver,
     CodexCompileArtifact,
     CodexCompileEvent,
     CodexCompileProgress,
@@ -23,8 +25,12 @@ from twinr.agent.self_coding.codex_driver import (
     CodexCompileWorkspaceBuilder,
     CodexDriverError,
     CodexExecFallbackDriver,
+    CodexSdkDriver,
 )
-from twinr.agent.self_coding.compiler import compile_automation_manifest_content
+from twinr.agent.self_coding.compiler import (
+    build_compile_prompt,
+    validate_compile_artifact,
+)
 from twinr.agent.self_coding.contracts import CompileJobRecord, CompileRunStatusRecord, RequirementsDialogueSession
 from twinr.agent.self_coding.status import ArtifactKind, CompileJobStatus, CompileTarget, RequirementsDialogueStatus
 from twinr.agent.self_coding.store import SelfCodingStore
@@ -36,9 +42,10 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 )
 _BEARER_TOKEN_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _VALID_SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9][A-Za-z0-9._+-]{0,15}$")
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
-# AUDIT-FIX(#3): Add env-backed guardrails so compiler output cannot exhaust the Pi's SD card.
 _MAX_ERROR_MESSAGE_CHARS = 240
+_MAX_IDENTIFIER_CHARS = 128
 _MAX_METADATA_DEPTH = 4
 _MAX_METADATA_ITEMS = 32
 _MAX_METADATA_STRING_CHARS = 512
@@ -81,21 +88,59 @@ MAX_EVENT_LOG_BYTES = _env_int(
     minimum=8_192,
     maximum=8_000_000,
 )
+MAX_COMPILE_RUN_ATTEMPTS = _env_int(
+    "TWINR_SELF_CODING_MAX_COMPILE_RUN_ATTEMPTS",
+    default=2,
+    minimum=1,
+    maximum=4,
+)
+COMPILE_JOB_HEARTBEAT_SECONDS = _env_int(
+    "TWINR_SELF_CODING_COMPILE_HEARTBEAT_SECONDS",
+    default=30,
+    minimum=5,
+    maximum=300,
+)
+STALE_JOB_SECONDS = _env_int(
+    "TWINR_SELF_CODING_STALE_JOB_SECONDS",
+    default=900,
+    minimum=60,
+    maximum=86_400,
+)
 
-# AUDIT-FIX(#1): Serialize session/job mutations to stop duplicate jobs and double execution against a file-backed store.
+
+class _TrackedRLock:
+    __slots__ = ("lock", "refcount")
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.refcount = 0
+
+
+# AUDIT-FIX(#6): Track lock lifetimes so per-job/per-session lock registries do not leak forever in a long-lived Pi process.
 _LOCK_REGISTRY_GUARD = threading.Lock()
-_SESSION_LOCKS: dict[str, threading.RLock] = {}
-_JOB_LOCKS: dict[str, threading.RLock] = {}
+_SESSION_LOCKS: dict[str, _TrackedRLock] = {}
+_JOB_LOCKS: dict[str, _TrackedRLock] = {}
 
 
-def _named_lock(registry: dict[str, threading.RLock], key: str) -> threading.RLock:
+# AUDIT-FIX(#6): Acquire named locks with ref-counted cleanup instead of keeping one RLock per historical job forever.
+@contextmanager
+def _acquire_named_lock(registry: dict[str, _TrackedRLock], key: str) -> Iterator[threading.RLock]:
     normalized_key = str(key or "").strip() or "__empty__"
     with _LOCK_REGISTRY_GUARD:
-        lock = registry.get(normalized_key)
-        if lock is None:
-            lock = threading.RLock()
-            registry[normalized_key] = lock
-        return lock
+        entry = registry.get(normalized_key)
+        if entry is None:
+            entry = _TrackedRLock()
+            registry[normalized_key] = entry
+        entry.refcount += 1
+    entry.lock.acquire()
+    try:
+        yield entry.lock
+    finally:
+        entry.lock.release()
+        with _LOCK_REGISTRY_GUARD:
+            entry.refcount -= 1
+            if entry.refcount <= 0:
+                registry.pop(normalized_key, None)
 
 
 def _normalize_text(value: Any, *, max_chars: int) -> str:
@@ -113,7 +158,6 @@ def _redact_secretish_text(text: str) -> str:
     return redacted
 
 
-# AUDIT-FIX(#6): Never persist raw exception strings; normalize and redact them before they can leak upstream.
 def _safe_error_message(error: Any) -> str:
     if isinstance(error, BaseException):
         prefix = type(error).__name__
@@ -125,6 +169,16 @@ def _safe_error_message(error: Any) -> str:
         _normalize_text(error or "unknown compile failure", max_chars=_MAX_ERROR_MESSAGE_CHARS)
     )
     return message or "unknown compile failure"
+
+
+# AUDIT-FIX(#2): Reject path-like and malformed IDs before they touch the file-backed store.
+def _require_safe_identifier(value: Any, *, label: str) -> str:
+    candidate = "" if value is None else str(value).strip()
+    if not candidate or len(candidate) > _MAX_IDENTIFIER_CHARS:
+        raise ValueError(f"{label} is invalid")
+    if _CONTROL_CHAR_RE.search(candidate) or not _SAFE_IDENTIFIER_RE.fullmatch(candidate):
+        raise ValueError(f"{label} is invalid")
+    return candidate
 
 
 def _safe_media_type(value: Any) -> str:
@@ -161,8 +215,11 @@ def _truncate_utf8_text(text: str, *, max_bytes: int, trailer: str) -> str:
 def _safe_json_value(value: Any, *, depth: int = 0) -> Any:
     if depth >= _MAX_METADATA_DEPTH:
         return _normalize_text(value, max_chars=_MAX_METADATA_STRING_CHARS)
-    if value is None or isinstance(value, (bool, int, float)):
+    if value is None or isinstance(value, (bool, int)):
         return value
+    if isinstance(value, float):
+        # AUDIT-FIX(#7): Convert NaN/Infinity to strings so persisted JSON stays standards-compliant.
+        return value if math.isfinite(value) else _normalize_text(value, max_chars=32)
     if isinstance(value, str):
         return _redact_secretish_text(_normalize_text(value, max_chars=_MAX_METADATA_STRING_CHARS))
     if isinstance(value, datetime):
@@ -192,7 +249,6 @@ def _safe_json_value(value: Any, *, depth: int = 0) -> Any:
     return _normalize_text(value, max_chars=_MAX_METADATA_STRING_CHARS)
 
 
-# AUDIT-FIX(#5): Coerce every metadata/diagnostics payload to a JSON-safe mapping before merging or serializing it.
 def _metadata_dict(value: Any) -> dict[str, Any]:
     sanitized = _safe_json_value(value)
     return sanitized if isinstance(sanitized, dict) else {"value": sanitized}
@@ -258,8 +314,94 @@ def _internal_event(kind: str, message: Any, *, metadata: dict[str, Any] | None 
     )
 
 
+# AUDIT-FIX(#2): Coerce persisted/LLM-suggested targets back onto the supported enum values.
+def _coerce_compile_target(value: Any) -> CompileTarget:
+    normalized = _normalize_text(value, max_chars=64).lower()
+    if value == CompileTarget.SKILL_PACKAGE or normalized in {"skill_package", "compiletarget.skill_package"}:
+        return CompileTarget.SKILL_PACKAGE
+    if value == CompileTarget.AUTOMATION_MANIFEST or normalized in {
+        "",
+        "automation_manifest",
+        "compiletarget.automation_manifest",
+    }:
+        return CompileTarget.AUTOMATION_MANIFEST
+    return CompileTarget.AUTOMATION_MANIFEST
+
+
+# AUDIT-FIX(#4): Parse persisted timestamps defensively so stale-job recovery works across aware/naive store records.
+def _coerce_utc_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(parsed, datetime):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+# AUDIT-FIX(#4): Treat old in-progress jobs as recoverable after the worker disappears mid-compile.
+def _job_is_stale(job: CompileJobRecord, *, now: datetime | None = None) -> bool:
+    if job.status not in (CompileJobStatus.COMPILING, CompileJobStatus.VALIDATING):
+        return False
+    updated_at = _coerce_utc_datetime(getattr(job, "updated_at", None))
+    if updated_at is None:
+        return True
+    reference = now if now is not None else datetime.now(UTC)
+    return reference - updated_at > timedelta(seconds=STALE_JOB_SECONDS)
+
+
+class _BoundedCompileEventBuffer:
+    """Keep compile events within a fixed byte budget."""
+
+    def __init__(self, *, max_bytes: int) -> None:
+        self.max_bytes = max(1_024, int(max_bytes))
+        self._events: deque[CodexCompileEvent] = deque()
+        self._sizes: deque[int] = deque()
+        self._total_bytes = 0
+        self._truncated_event: CodexCompileEvent | None = None
+        self._truncated_event_size = 0
+
+    @staticmethod
+    def _event_size(event: CodexCompileEvent) -> int:
+        return _utf8_size(_event_signature(event) + "\n")
+
+    def append(self, event: CodexCompileEvent) -> None:
+        self._events.append(event)
+        size = self._event_size(event)
+        self._sizes.append(size)
+        self._total_bytes += size
+        self._trim_to_budget()
+
+    def to_tuple(self) -> tuple[CodexCompileEvent, ...]:
+        if self._truncated_event is None:
+            return tuple(self._events)
+        return (self._truncated_event, *tuple(self._events))
+
+    # AUDIT-FIX(#1): Bound in-memory event accumulation so a noisy compiler cannot OOM the single-process worker.
+    def _trim_to_budget(self) -> None:
+        if self._total_bytes <= self.max_bytes:
+            return
+        if self._truncated_event is None:
+            self._truncated_event = _internal_event(
+                "log_truncated",
+                "Compile log truncated to fit in-memory limits.",
+                metadata={"max_bytes": self.max_bytes},
+            )
+            self._truncated_event_size = self._event_size(self._truncated_event)
+            self._total_bytes += self._truncated_event_size
+        while self._total_bytes > self.max_bytes and self._events:
+            self._total_bytes -= self._sizes.popleft()
+            self._events.popleft()
+
+
 class LocalCodexCompileDriver:
-    """Prefer app-server and fall back to `codex exec --json` when needed."""
+    """Prefer the pinned Codex SDK bridge and fall back to `codex exec --json`."""
 
     def __init__(
         self,
@@ -267,33 +409,33 @@ class LocalCodexCompileDriver:
         primary: object | None = None,
         fallback: object | None = None,
     ) -> None:
-        # AUDIT-FIX(#11): Use explicit None checks so valid falsy test doubles are not silently replaced.
-        self.primary = primary if primary is not None else CodexAppServerDriver()
-        # AUDIT-FIX(#11): Use explicit None checks so valid falsy test doubles are not silently replaced.
+        self.primary = primary if primary is not None else CodexSdkDriver()
         self.fallback = fallback if fallback is not None else CodexExecFallbackDriver()
 
     def run_compile(self, request: CodexCompileRequest, *, event_sink=None) -> CodexCompileResult:
         errors: list[str] = []
-        combined_events: list[CodexCompileEvent] = []
+        # AUDIT-FIX(#1): Cap retained compile events to the persisted log budget instead of keeping an unbounded list in RAM.
+        combined_events = _BoundedCompileEventBuffer(max_bytes=MAX_EVENT_LOG_BYTES)
+        total_event_count = 0
         for attempt_index, driver in enumerate((self.primary, self.fallback), start=1):
             driver_name = type(driver).__name__
             sink_failure_message: str | None = None
 
             def _forward(event: CodexCompileEvent, progress: CodexCompileProgress) -> None:
-                nonlocal sink_failure_message
+                nonlocal sink_failure_message, total_event_count
                 enriched_event = _event_with_driver_metadata(event, driver_name=driver_name, attempt_index=attempt_index)
+                total_event_count += 1
                 combined_events.append(enriched_event)
                 if event_sink is None:
                     return
                 try:
-                    # AUDIT-FIX(#4): Shield progress sinks so status persistence bugs do not abort the compile or suppress fallback.
                     event_sink(
                         enriched_event,
                         CodexCompileProgress(
                             driver_name=driver_name,
                             thread_id=getattr(progress, "thread_id", None),
                             turn_id=getattr(progress, "turn_id", None),
-                            event_count=len(combined_events),
+                            event_count=total_event_count,
                             last_event_kind=enriched_event.kind,
                             final_message_seen=getattr(progress, "final_message_seen", None),
                             turn_completed=getattr(progress, "turn_completed", None),
@@ -306,6 +448,7 @@ class LocalCodexCompileDriver:
                 except Exception as sink_exc:
                     if sink_failure_message is None:
                         sink_failure_message = _safe_error_message(sink_exc)
+                        total_event_count += 1
                         combined_events.append(
                             _event_with_driver_metadata(
                                 _internal_event(
@@ -321,18 +464,17 @@ class LocalCodexCompileDriver:
             try:
                 result = driver.run_compile(request, event_sink=_forward)
                 returned_events = tuple(getattr(result, "events", ()) or ())
-                # AUDIT-FIX(#8): Merge returned events even after streaming so late/fallback events are not dropped.
                 _merge_compile_events(
                     combined_events,
                     returned_events,
                     driver_name=driver_name,
                     attempt_index=attempt_index,
                 )
-                return replace(result, events=tuple(combined_events))
+                return replace(result, events=combined_events.to_tuple())
             except Exception as exc:
-                # AUDIT-FIX(#4): Catch unexpected driver exceptions too, so a buggy primary still falls back to the secondary driver.
                 safe_error = _safe_error_message(exc)
                 errors.append(f"{driver_name}: {safe_error}")
+                total_event_count += 1
                 failure_event = _event_with_driver_metadata(
                     CodexCompileEvent(
                         kind="driver_failure",
@@ -349,7 +491,7 @@ class LocalCodexCompileDriver:
                             failure_event,
                             CodexCompileProgress(
                                 driver_name=driver_name,
-                                event_count=len(combined_events),
+                                event_count=total_event_count,
                                 last_event_kind=failure_event.kind,
                                 error_message=safe_error,
                                 metadata={"driver_attempt": attempt_index},
@@ -358,6 +500,7 @@ class LocalCodexCompileDriver:
                     except Exception as sink_exc:
                         if sink_failure_message is None:
                             sink_failure_message = _safe_error_message(sink_exc)
+                            total_event_count += 1
                             combined_events.append(
                                 _event_with_driver_metadata(
                                     _internal_event(
@@ -384,174 +527,217 @@ class SelfCodingCompileWorker:
         workspace_builder: CodexCompileWorkspaceBuilder | None = None,
     ) -> None:
         self.store = store
-        # AUDIT-FIX(#11): Use explicit None checks so valid falsy dependency injections survive.
         self.driver = driver if driver is not None else LocalCodexCompileDriver()
-        # AUDIT-FIX(#11): Use explicit None checks so valid falsy dependency injections survive.
         self.workspace_builder = workspace_builder if workspace_builder is not None else CodexCompileWorkspaceBuilder()
+
+    # AUDIT-FIX(#3): Normalize unexpected store failures into bounded, redacted driver errors.
+    @staticmethod
+    def _raise_safe_store_error(exc: Exception) -> None:
+        raise CodexDriverError(_safe_error_message(exc)) from exc
+
+    # AUDIT-FIX(#4): Requeue stale in-progress jobs so a reboot/crash does not strand the session forever.
+    def _recover_stale_job_if_needed(self, job: CompileJobRecord) -> CompileJobRecord:
+        if not _job_is_stale(job):
+            return job
+        return self.store.save_job(
+            replace(
+                job,
+                status=CompileJobStatus.QUEUED,
+                updated_at=datetime.now(UTC),
+                last_error="Recovered stale in-progress compile job after worker interruption.",
+            )
+        )
 
     def ensure_job_for_session(self, session: RequirementsDialogueSession) -> CompileJobRecord:
         """Return an existing queued job for a ready session or create a new one."""
 
-        if session.status != RequirementsDialogueStatus.READY_FOR_COMPILE:
-            raise ValueError("compile jobs require a ready_for_compile session")
-        skill_spec = session.to_skill_spec()
-        suggested_target = getattr(getattr(session, "feasibility", None), "suggested_target", None)
-        requested_target = suggested_target or CompileTarget.AUTOMATION_MANIFEST
-        spec_hash = self._spec_hash(skill_spec.to_payload())
-        session_lock = _named_lock(_SESSION_LOCKS, session.session_id)
-        with session_lock:
-            # AUDIT-FIX(#1): Serialize save/find/create to remove the TOCTOU window that can create duplicate jobs.
-            self.store.save_dialogue_session(session)
-            existing = self.store.find_job_for_session(session.session_id)
-            if (
-                existing is not None
-                and existing.spec_hash == spec_hash
-                and existing.requested_target == requested_target
-                and existing.status in (
-                    CompileJobStatus.QUEUED,
-                    CompileJobStatus.COMPILING,
-                    CompileJobStatus.VALIDATING,
-                    CompileJobStatus.SOFT_LAUNCH_READY,
+        try:
+            if session.status != RequirementsDialogueStatus.READY_FOR_COMPILE:
+                raise ValueError("compile jobs require a ready_for_compile session")
+            # AUDIT-FIX(#2): Validate file-backed identifiers and normalize requested target before persisting any job record.
+            session_id = _require_safe_identifier(session.session_id, label="session_id")
+            skill_spec = session.to_skill_spec()
+            suggested_target = getattr(getattr(session, "feasibility", None), "suggested_target", None)
+            requested_target = _coerce_compile_target(suggested_target)
+            spec_hash = self._spec_hash(skill_spec.to_payload())
+            with _acquire_named_lock(_SESSION_LOCKS, session_id):
+                self.store.save_dialogue_session(session)
+                existing = self.store.find_job_for_session(session_id)
+                if existing is not None and existing.spec_hash == spec_hash and existing.requested_target == requested_target:
+                    existing = self._recover_stale_job_if_needed(existing)
+                    if existing.status in (
+                        CompileJobStatus.QUEUED,
+                        CompileJobStatus.COMPILING,
+                        CompileJobStatus.VALIDATING,
+                        CompileJobStatus.SOFT_LAUNCH_READY,
+                    ):
+                        return existing
+                job = CompileJobRecord(
+                    job_id=f"job_{uuid4().hex}",
+                    skill_id=skill_spec.skill_id,
+                    skill_name=skill_spec.name,
+                    status=CompileJobStatus.QUEUED,
+                    requested_target=requested_target,
+                    spec_hash=spec_hash,
+                    required_capabilities=skill_spec.capabilities,
+                    metadata={
+                        "session_id": session_id,
+                        # AUDIT-FIX(#7): Bound and sanitize persisted request summaries before they hit JSON-backed state.
+                        "request_summary": _normalize_text(session.request_summary, max_chars=_MAX_PROMPT_FIELD_CHARS),
+                    },
                 )
-            ):
-                return existing
-            job = CompileJobRecord(
-                job_id=f"job_{uuid4().hex}",
-                skill_id=skill_spec.skill_id,
-                skill_name=skill_spec.name,
-                status=CompileJobStatus.QUEUED,
-                requested_target=requested_target,
-                spec_hash=spec_hash,
-                required_capabilities=skill_spec.capabilities,
-                metadata={
-                    "session_id": session.session_id,
-                    "request_summary": session.request_summary,
-                },
-            )
-            return self.store.save_job(job)
+                return self.store.save_job(job)
+        except ValueError:
+            raise
+        except CodexDriverError:
+            raise
+        except Exception as exc:
+            self._raise_safe_store_error(exc)
 
     def run_job(self, job_id: str) -> CompileJobRecord:
         """Run one queued compile job and persist its log and output artifacts."""
 
-        normalized_job_id = str(job_id or "").strip()
-        if not normalized_job_id:
-            raise ValueError("job_id is required")
-        job_lock = _named_lock(_JOB_LOCKS, normalized_job_id)
-        with job_lock:
-            # AUDIT-FIX(#2): Serialize per-job execution and treat non-queued jobs as idempotent no-ops.
-            job = self.store.load_job(normalized_job_id)
-            if job.status != CompileJobStatus.QUEUED:
-                return job
+        # AUDIT-FIX(#2): Reject malformed job IDs before touching the file-backed store.
+        normalized_job_id = _require_safe_identifier(job_id, label="job_id")
+        with _acquire_named_lock(_JOB_LOCKS, normalized_job_id):
+            job: CompileJobRecord | None = None
+            status_record: CompileRunStatusRecord | None = None
             try:
+                job = self.store.load_job(normalized_job_id)
+                job = self._recover_stale_job_if_needed(job)
+                if job.status != CompileJobStatus.QUEUED:
+                    return job
                 session = self._load_job_session(job)
-            except Exception as exc:
-                # AUDIT-FIX(#7): Corrupt job/session metadata must fail the job instead of crashing the worker.
-                return self._mark_failed(job, _safe_error_message(exc))
-            started_at = datetime.now(UTC)
-            compiling_job = self.store.save_job(
-                replace(
-                    job,
-                    status=CompileJobStatus.COMPILING,
-                    updated_at=started_at,
-                    attempt_count=int(getattr(job, "attempt_count", 0) or 0) + 1,
-                    last_error=None,
-                )
-            )
-            status_record = self.store.save_compile_status(
-                CompileRunStatusRecord(
-                    job_id=compiling_job.job_id,
-                    phase="starting",
-                    started_at=started_at,
-                    updated_at=started_at,
-                )
-            )
-
-            prompt = self._build_prompt(compiling_job, session)
-            streamed_events: list[CodexCompileEvent] = []
-            progress_persist_error: str | None = None
-
-            def _event_sink(event: CodexCompileEvent, progress: CodexCompileProgress) -> None:
-                nonlocal status_record, progress_persist_error
-                streamed_events.append(event)
-                try:
-                    status_record = self._record_compile_progress(
-                        current=status_record,
-                        event=event,
-                        progress=progress,
-                    )
-                except Exception as exc:
-                    # AUDIT-FIX(#4): Status-stream persistence is best-effort; do not kill the compile because telemetry failed.
-                    progress_persist_error = _safe_error_message(exc)
-
-            try:
-                # AUDIT-FIX(#7): Wrap workspace creation too, otherwise setup errors bypass failure marking and leave jobs stuck.
-                with self.workspace_builder.build(job=compiling_job, session=session, prompt=prompt) as request:
-                    result = self.driver.run_compile(
-                        request,
-                        event_sink=_event_sink,
-                    )
-            except Exception as exc:
-                safe_error = _safe_error_message(exc)
-                # AUDIT-FIX(#9): Persist whatever event stream we captured even when every driver attempt failed.
-                job_with_failure_log = self._try_persist_failure_log(
-                    compiling_job,
-                    events=tuple(streamed_events),
-                    error_message=safe_error,
-                    progress_persist_error=progress_persist_error,
-                )
-                return self._mark_failed(job_with_failure_log, safe_error, compile_status=status_record)
-
-            validating_diagnostics: dict[str, Any] = {"result_status": result.status}
-            if progress_persist_error:
-                validating_diagnostics["progress_persist_error"] = progress_persist_error
-            try:
-                status_record = self._save_compile_status_transition(
-                    status_record,
-                    phase="validating",
-                    diagnostics=validating_diagnostics,
-                )
-            except Exception:
-                pass
-
-            try:
-                job_with_logs = self._persist_driver_result(compiling_job, session, result)
-            except Exception as exc:
-                safe_error = _safe_error_message(exc)
-                latest_job = self._safe_load_job(compiling_job.job_id, default=compiling_job)
-                return self._mark_failed(latest_job, safe_error, compile_status=status_record)
-            target_kind = _target_artifact_kind(job_with_logs.requested_target)
-            has_target_artifact = any(
-                artifact.kind == target_kind for artifact in self.store.list_artifacts(job_id=job_with_logs.job_id)
-            )
-            if result.status == "ok" and has_target_artifact:
-                completed = self.store.save_job(
+                started_at = datetime.now(UTC)
+                active_job = self.store.save_job(
                     replace(
-                        job_with_logs,
-                        status=CompileJobStatus.SOFT_LAUNCH_READY,
-                        updated_at=datetime.now(UTC),
+                        job,
+                        status=CompileJobStatus.COMPILING,
+                        updated_at=started_at,
+                        attempt_count=int(getattr(job, "attempt_count", 0) or 0) + 1,
                         last_error=None,
                     )
                 )
+                last_job_heartbeat = started_at
+                status_record = self.store.save_compile_status(
+                    CompileRunStatusRecord(
+                        job_id=active_job.job_id,
+                        phase="starting",
+                        started_at=started_at,
+                        updated_at=started_at,
+                    )
+                )
+
+                prompt = self._build_prompt(active_job, session)
+                # AUDIT-FIX(#1): Keep streamed event history bounded even on all-driver failure paths.
+                streamed_events = _BoundedCompileEventBuffer(max_bytes=MAX_EVENT_LOG_BYTES)
+                progress_persist_error: str | None = None
+
+                def _event_sink(event: CodexCompileEvent, progress: CodexCompileProgress) -> None:
+                    nonlocal active_job, last_job_heartbeat, status_record, progress_persist_error
+                    streamed_events.append(event)
+                    try:
+                        status_record = self._record_compile_progress(
+                            current=status_record,
+                            event=event,
+                            progress=progress,
+                        )
+                        # AUDIT-FIX(#4): Heartbeat the in-progress job record so stale-job recovery does not resurrect live compiles.
+                        now = datetime.now(UTC)
+                        if now - last_job_heartbeat >= timedelta(seconds=COMPILE_JOB_HEARTBEAT_SECONDS):
+                            active_job = self.store.save_job(replace(active_job, updated_at=now))
+                            last_job_heartbeat = now
+                    except Exception as exc:
+                        progress_persist_error = _safe_error_message(exc)
+
                 try:
-                    self._save_compile_status_transition(
+                    with self.workspace_builder.build(job=active_job, session=session, prompt=prompt) as request:
+                        result = self.driver.run_compile(
+                            request,
+                            event_sink=_event_sink,
+                        )
+                except Exception as exc:
+                    safe_error = _safe_error_message(exc)
+                    job_with_failure_log = self._try_persist_failure_log(
+                        active_job,
+                        events=streamed_events.to_tuple(),
+                        error_message=safe_error,
+                        progress_persist_error=progress_persist_error,
+                    )
+                    if self._should_retry_compile(active_job, result_status="failed"):
+                        return self._queue_retry(job_with_failure_log, safe_error, compile_status=status_record)
+                    return self._mark_failed(job_with_failure_log, safe_error, compile_status=status_record)
+
+                validating_diagnostics: dict[str, Any] = {"result_status": result.status}
+                if progress_persist_error:
+                    validating_diagnostics["progress_persist_error"] = progress_persist_error
+                try:
+                    status_record = self._save_compile_status_transition(
                         status_record,
-                        phase="completed",
-                        completed_at=datetime.now(UTC),
-                        diagnostics={
-                            "result_status": result.status,
-                            "artifact_count": len(self.store.list_artifacts(job_id=completed.job_id)),
-                        },
+                        phase="validating",
+                        diagnostics=validating_diagnostics,
                     )
                 except Exception:
                     pass
-                return completed
-            return self._mark_failed(job_with_logs, _safe_error_message(result.summary), compile_status=status_record)
+
+                try:
+                    job_with_logs, has_current_target_artifact = self._persist_driver_result(active_job, session, result)
+                except Exception as exc:
+                    safe_error = _safe_error_message(exc)
+                    latest_job = self._safe_load_job(active_job.job_id, default=active_job)
+                    if self._should_retry_compile(active_job, result_status="failed"):
+                        return self._queue_retry(latest_job, safe_error, compile_status=status_record)
+                    return self._mark_failed(latest_job, safe_error, compile_status=status_record)
+                target_kind = _target_artifact_kind(job_with_logs.requested_target)
+                effective_result_status = result.status
+                failure_message = _safe_error_message(result.summary)
+                if result.status == "ok" and not has_current_target_artifact:
+                    # AUDIT-FIX(#5): Treat missing or stale target artifacts as a failed compile so retry logic still engages.
+                    effective_result_status = "failed"
+                    failure_message = (
+                        f"Compile completed without required {_normalize_text(getattr(target_kind, 'value', target_kind), max_chars=64)} artifact"
+                    )
+                if effective_result_status == "ok":
+                    completed = self.store.save_job(
+                        replace(
+                            job_with_logs,
+                            status=CompileJobStatus.SOFT_LAUNCH_READY,
+                            updated_at=datetime.now(UTC),
+                            last_error=None,
+                        )
+                    )
+                    try:
+                        self._save_compile_status_transition(
+                            status_record,
+                            phase="completed",
+                            completed_at=datetime.now(UTC),
+                            diagnostics={
+                                "result_status": result.status,
+                                "artifact_count": len(getattr(completed, "artifact_ids", ()) or ()),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    return completed
+                if self._should_retry_compile(active_job, result_status=effective_result_status):
+                    return self._queue_retry(job_with_logs, failure_message, compile_status=status_record)
+                return self._mark_failed(job_with_logs, failure_message, compile_status=status_record)
+            except Exception as exc:
+                # AUDIT-FIX(#3): Best-effort mark unexpected store/state failures without leaking raw filesystem details.
+                safe_error = _safe_error_message(exc)
+                if job is not None:
+                    latest_job = self._safe_load_job(job.job_id, default=job)
+                    try:
+                        return self._mark_failed(latest_job, safe_error, compile_status=status_record)
+                    except Exception:
+                        pass
+                raise CodexDriverError(safe_error) from exc
 
     def _load_job_session(self, job: CompileJobRecord) -> RequirementsDialogueSession:
-        # AUDIT-FIX(#5): Guard against missing/None metadata payloads when loading the owning dialogue session.
-        session_id = str(_metadata_dict(getattr(job, "metadata", {})).get("session_id", "") or "").strip()
-        if not session_id:
-            raise ValueError(f"Compile job {job.job_id!r} is missing session_id metadata")
+        session_id = _require_safe_identifier(
+            _metadata_dict(getattr(job, "metadata", {})).get("session_id", ""),
+            label="session_id",
+        )
         return self.store.load_dialogue_session(session_id)
 
     def _persist_driver_result(
@@ -559,10 +745,9 @@ class SelfCodingCompileWorker:
         job: CompileJobRecord,
         session: RequirementsDialogueSession,
         result: CodexCompileResult,
-    ) -> CompileJobRecord:
+    ) -> tuple[CompileJobRecord, bool]:
         artifacts = tuple(getattr(result, "artifacts", ()) or ())
         if len(artifacts) > MAX_ARTIFACTS_PER_JOB:
-            # AUDIT-FIX(#3): Reject pathological result fan-out before it can fill the local store.
             raise CodexDriverError(
                 f"compile result returned {len(artifacts)} artifacts; limit is {MAX_ARTIFACTS_PER_JOB}"
             )
@@ -579,6 +764,8 @@ class SelfCodingCompileWorker:
             events=tuple(getattr(result, "events", ()) or ()),
             driver_result_status=result.status,
         )
+
+        persisted_target_artifact = False
 
         review_text = _coerce_text(getattr(result, "review", ""))
         if review_text:
@@ -601,22 +788,35 @@ class SelfCodingCompileWorker:
             )
             metadata = {
                 **_metadata_dict(getattr(artifact, "metadata", {})),
-                # AUDIT-FIX(#5): Sanitize artifact metadata from drivers/manifests before persisting it to JSON-backed state.
                 "artifact_name": _normalize_text(getattr(artifact, "artifact_name", ""), max_chars=128),
             }
             suffix = _artifact_suffix(artifact)
             media_type = _safe_media_type(getattr(artifact, "media_type", "text/plain"))
             if artifact.kind == ArtifactKind.AUTOMATION_MANIFEST:
-                compiled_manifest = compile_automation_manifest_content(
+                validated_artifact = validate_compile_artifact(
                     job=current,
                     session=session,
-                    raw_content=artifact.content,
+                    artifact=artifact,
                 )
-                content = _coerce_text(compiled_manifest.content)
-                summary = _normalize_text(compiled_manifest.summary or summary, max_chars=_MAX_METADATA_STRING_CHARS)
+                content = _coerce_text(validated_artifact.content)
+                summary = _normalize_text(validated_artifact.summary or summary, max_chars=_MAX_METADATA_STRING_CHARS)
                 metadata = {
                     **metadata,
-                    **_metadata_dict(getattr(compiled_manifest, "metadata", {})),
+                    **_metadata_dict(getattr(validated_artifact, "metadata", {})),
+                }
+                suffix = ".json"
+                media_type = "application/json"
+            elif artifact.kind == ArtifactKind.SKILL_PACKAGE:
+                validated_artifact = validate_compile_artifact(
+                    job=current,
+                    session=session,
+                    artifact=artifact,
+                )
+                content = _coerce_text(validated_artifact.content)
+                summary = _normalize_text(validated_artifact.summary or summary, max_chars=_MAX_METADATA_STRING_CHARS)
+                metadata = {
+                    **metadata,
+                    **_metadata_dict(getattr(validated_artifact, "metadata", {})),
                 }
                 suffix = ".json"
                 media_type = "application/json"
@@ -631,8 +831,10 @@ class SelfCodingCompileWorker:
                 suffix=suffix,
             )
             current = self.store.append_artifact_to_job(current.job_id, persisted.artifact_id)
+            if artifact.kind == _target_artifact_kind(job.requested_target):
+                persisted_target_artifact = True
 
-        return current
+        return current, persisted_target_artifact
 
     def _persist_event_log_artifact(
         self,
@@ -648,7 +850,6 @@ class SelfCodingCompileWorker:
             job_id=job.job_id,
             kind=ArtifactKind.LOG,
             text=event_log_text,
-            # AUDIT-FIX(#12): JSONL/NDJSON logs must be labeled correctly for downstream readers.
             media_type="application/x-ndjson",
             summary="Local Codex compile event log.",
             metadata={"driver_result_status": _normalize_text(driver_result_status, max_chars=64)},
@@ -723,29 +924,50 @@ class SelfCodingCompileWorker:
                 pass
         return failed
 
+    def _queue_retry(
+        self,
+        job: CompileJobRecord,
+        error: str,
+        *,
+        compile_status: CompileRunStatusRecord | None = None,
+    ) -> CompileJobRecord:
+        retry_job = self.store.save_job(
+            replace(
+                job,
+                status=CompileJobStatus.QUEUED,
+                updated_at=datetime.now(UTC),
+                last_error=_safe_error_message(error),
+            )
+        )
+        if compile_status is not None:
+            try:
+                self._save_compile_status_transition(
+                    compile_status,
+                    phase="retrying",
+                    error_message=_safe_error_message(error),
+                    diagnostics={"retry_attempt": int(getattr(job, "attempt_count", 0) or 0)},
+                )
+            except Exception:
+                pass
+        return self.run_job(retry_job.job_id)
+
+    @staticmethod
+    def _should_retry_compile(job: CompileJobRecord, *, result_status: str) -> bool:
+        normalized_status = _normalize_text(result_status, max_chars=32).lower()
+        if normalized_status != "failed":
+            return False
+        return int(getattr(job, "attempt_count", 0) or 0) < MAX_COMPILE_RUN_ATTEMPTS
+
     @staticmethod
     def _spec_hash(payload: dict[str, Any]) -> str:
-        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        stable_payload = dict(payload)
+        stable_payload.pop("created_at", None)
+        encoded = json.dumps(stable_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
         return sha256(encoded).hexdigest()
 
     @staticmethod
     def _build_prompt(job: CompileJobRecord, session: RequirementsDialogueSession) -> str:
-        target = _normalize_text(job.requested_target.value, max_chars=128)
-        skill_name = _normalize_text(session.skill_name, max_chars=256)
-        request_summary = _normalize_text(session.request_summary, max_chars=_MAX_PROMPT_FIELD_CHARS)
-        return (
-            "You are compiling a Twinr self-coding request into reviewable artifacts.\n\n"
-            "Read the workspace files `REQUEST.md`, `skill_spec.json`, `dialogue_session.json`, and `compile_job.json`.\n"
-            "Return only JSON that matches the provided output schema.\n"
-            "Do not ask follow-up questions.\n"
-            f"Requested target: {target}\n"
-            f"Skill name: {skill_name}\n"
-            f"Request summary: {request_summary}\n"
-            "Rules:\n"
-            "- If the request fits the target, set `status` to `ok` and include at least one artifact of the requested kind.\n"
-            "- If the request does not fit the target, set `status` to `unsupported`, explain why in `summary`, and keep artifacts empty.\n"
-            "- Put all artifact contents directly into the JSON response; do not describe patches or external files.\n"
-        )
+        return build_compile_prompt(job, session)
 
     @staticmethod
     def _event_log_text(events: tuple[CodexCompileEvent, ...]) -> str:
@@ -812,7 +1034,6 @@ class SelfCodingCompileWorker:
         error_message: str | None = None,
         diagnostics: dict[str, Any] | None = None,
     ) -> CompileRunStatusRecord:
-        # AUDIT-FIX(#5): `current.diagnostics` may be None or non-serializable; sanitize before copying/updating it.
         merged_diagnostics = _metadata_dict(getattr(current, "diagnostics", {}))
         if diagnostics:
             merged_diagnostics.update(_metadata_dict(diagnostics))
@@ -840,15 +1061,15 @@ class SelfCodingCompileWorker:
         )
 
 
-# AUDIT-FIX(#10): Restrict suffixes to a sane allow-list instead of trusting model-supplied filenames.
 def _artifact_suffix(artifact: CodexCompileArtifact) -> str:
+    if artifact.kind in {ArtifactKind.AUTOMATION_MANIFEST, ArtifactKind.SKILL_PACKAGE}:
+        return ".json"
     suffix = Path(str(getattr(artifact, "artifact_name", "") or "")).suffix.strip()
     if suffix and _VALID_SUFFIX_RE.fullmatch(suffix):
         return suffix.lower()
     return ".txt"
 
 
-# AUDIT-FIX(#5): Sanitize event metadata before merging it so `None`, paths, datetimes, or secret-bearing fields cannot break logs.
 def _event_with_driver_metadata(
     event: CodexCompileEvent,
     *,
@@ -867,13 +1088,13 @@ def _event_with_driver_metadata(
 
 
 def _merge_compile_events(
-    combined_events: list[CodexCompileEvent],
+    combined_events: _BoundedCompileEventBuffer,
     returned_events: tuple[CodexCompileEvent, ...],
     *,
     driver_name: str,
     attempt_index: int,
 ) -> None:
-    seen_signatures = {_event_signature(event) for event in combined_events}
+    seen_signatures = {_event_signature(event) for event in combined_events.to_tuple()}
     for event in returned_events:
         enriched = _event_with_driver_metadata(
             event,

@@ -131,6 +131,34 @@ a, button, input, select, textarea {
   padding: var(--content-padding);
 }
 
+.auth-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: var(--space-7);
+}
+
+.auth-card {
+  width: min(100%, 560px);
+  padding: var(--space-7);
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--color-border-strong);
+  background:
+    linear-gradient(180deg, rgba(20, 27, 47, 0.98) 0%, rgba(15, 20, 36, 0.98) 100%),
+    radial-gradient(circle at top right, rgba(124, 156, 255, 0.18) 0%, rgba(124, 156, 255, 0) 52%);
+  box-shadow: 0 20px 44px rgba(0, 0, 0, 0.34);
+}
+
+.auth-brand-row {
+  margin-bottom: var(--space-6);
+}
+
+.auth-header {
+  display: grid;
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+}
+
 .page-header {
   display: flex;
   justify-content: space-between;
@@ -201,6 +229,12 @@ h3 {
   border-radius: var(--radius-pill);
   color: var(--color-text-muted);
   font-size: var(--font-size-xs);
+}
+
+.pill-warn {
+  border-color: rgba(198, 160, 95, 0.52);
+  color: #efcf9d;
+  background: rgba(198, 160, 95, 0.12);
 }
 
 .flash {
@@ -478,6 +512,31 @@ button {
   cursor: pointer;
 }
 
+.button-secondary,
+.link-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 42px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border-strong);
+  background: rgba(16, 23, 44, 0.9);
+  color: var(--color-text);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.button-secondary {
+  box-shadow: none;
+}
+
+.link-button:hover,
+.button-secondary:hover {
+  border-color: var(--color-accent);
+  background: rgba(27, 36, 64, 0.96);
+}
+
 .actions {
   display: flex;
   justify-content: flex-end;
@@ -489,6 +548,20 @@ button {
 
 .inline-form {
   margin: 0;
+}
+
+.auth-form {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.auth-note {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+.auth-panel {
+  margin-bottom: 0;
 }
 
 .stack {
@@ -753,6 +826,234 @@ button {
   word-break: break-word;
 }
 
+.tab-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.tab-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 14px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  text-decoration: none;
+  background: rgba(14, 21, 48, 0.52);
+  transition: border-color 120ms ease, color 120ms ease, background-color 120ms ease;
+}
+
+.tab-link:hover,
+.tab-link.active {
+  color: var(--color-text);
+  border-color: var(--color-accent);
+  background: rgba(124, 156, 255, 0.16);
+}
+
+.device-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: var(--space-4);
+}
+
+.device-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.device-facts,
+.device-notes {
+  margin: var(--space-4) 0 0;
+  padding-left: 18px;
+  color: var(--color-text-muted);
+}
+
+.device-facts {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.device-notes {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.raw-data-block {
+  max-height: 560px;
+  overflow: auto;
+}
+
+.page-ops_debug .page-header {
+  padding: var(--space-6);
+  border-radius: var(--radius-lg);
+  border: 1px solid #4a5e8f;
+  background:
+    linear-gradient(180deg, rgba(18, 23, 36, 0.98) 0%, rgba(11, 15, 25, 0.98) 100%),
+    radial-gradient(circle at top right, rgba(142, 197, 255, 0.18) 0%, rgba(142, 197, 255, 0) 52%);
+  box-shadow: 0 18px 38px rgba(0, 0, 0, 0.34);
+}
+
+.page-ops_debug .intro,
+.page-ops_debug .path-hint,
+.page-ops_debug .pill {
+  color: #d8e1fb;
+}
+
+.page-ops_debug .pill {
+  border-color: #5c71a3;
+  background: rgba(23, 31, 49, 0.86);
+}
+
+.ops-debug-page {
+  --debug-bg: #0b0f18;
+  --debug-panel-bg: #141b29;
+  --debug-card-bg: #1b2435;
+  --debug-card-bg-strong: #101726;
+  --debug-border: #5f73a5;
+  --debug-border-soft: #40506f;
+  --debug-text: #f7f9ff;
+  --debug-text-muted: #dde6ff;
+  --debug-text-subtle: #b3c1e3;
+  --debug-accent: #8ec5ff;
+  --debug-accent-strong: #dff1ff;
+  display: grid;
+  gap: var(--space-4);
+}
+
+.ops-debug-page h2,
+.ops-debug-page h3,
+.ops-debug-page strong {
+  color: var(--debug-text);
+}
+
+.ops-debug-page .ops-debug-panel {
+  margin-bottom: 0;
+  background:
+    linear-gradient(180deg, rgba(22, 29, 43, 0.98) 0%, rgba(15, 21, 33, 0.98) 100%),
+    radial-gradient(circle at top right, rgba(142, 197, 255, 0.08) 0%, rgba(142, 197, 255, 0) 46%);
+  border-color: var(--debug-border-soft);
+  box-shadow: 0 18px 38px rgba(0, 0, 0, 0.36);
+}
+
+.ops-debug-page .section-header {
+  margin-bottom: var(--space-5);
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid rgba(95, 115, 165, 0.46);
+}
+
+.ops-debug-page .section-description,
+.ops-debug-page .card-detail,
+.ops-debug-page .device-facts,
+.ops-debug-page .device-notes,
+.ops-debug-page .log-time,
+.ops-debug-page .empty-state {
+  color: var(--debug-text-muted);
+}
+
+.ops-debug-page .detail-card,
+.ops-debug-page .log-entry,
+.ops-debug-page .empty-state {
+  background: linear-gradient(180deg, rgba(29, 37, 55, 0.98) 0%, rgba(21, 28, 41, 0.98) 100%);
+  border-color: var(--debug-border-soft);
+}
+
+.ops-debug-page .empty-state {
+  border: 1px solid var(--debug-border-soft);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+}
+
+.ops-debug-page .detail-label {
+  color: var(--debug-text-subtle);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ops-debug-page .detail-body,
+.ops-debug-page .detail-body-copy,
+.ops-debug-page .log-event,
+.ops-debug-page .log-message {
+  color: var(--debug-text);
+}
+
+.ops-debug-page .ops-debug-tabs {
+  padding: var(--space-2);
+  border-radius: var(--radius-lg);
+  background: rgba(9, 13, 21, 0.9);
+  border: 1px solid rgba(95, 115, 165, 0.4);
+}
+
+.ops-debug-page .tab-link {
+  min-height: 42px;
+  padding: 10px 16px;
+  border-color: var(--debug-border-soft);
+  color: var(--debug-text-muted);
+  background: rgba(24, 31, 46, 0.96);
+}
+
+.ops-debug-page .tab-link:hover {
+  color: var(--debug-text);
+  border-color: var(--debug-border);
+  background: rgba(45, 59, 88, 0.9);
+}
+
+.ops-debug-page .tab-link.active {
+  color: #08111d;
+  border-color: var(--debug-accent-strong);
+  background: linear-gradient(135deg, var(--debug-accent) 0%, #c9eeff 100%);
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.24);
+}
+
+.ops-debug-page .status-pill,
+.ops-debug-page .log-level {
+  border: 1px solid transparent;
+}
+
+.ops-debug-page .status-pill.is-ok,
+.ops-debug-page .log-level.is-info {
+  border-color: rgba(103, 216, 182, 0.55);
+  background: rgba(18, 74, 57, 0.9);
+  color: #d8ffef;
+}
+
+.ops-debug-page .status-pill.is-warn,
+.ops-debug-page .status-pill.is-blocked,
+.ops-debug-page .log-level.is-warn {
+  border-color: rgba(255, 210, 120, 0.55);
+  background: rgba(90, 63, 8, 0.9);
+  color: #fff0c8;
+}
+
+.ops-debug-page .status-pill.is-fail,
+.ops-debug-page .log-level.is-error {
+  border-color: rgba(255, 142, 164, 0.58);
+  background: rgba(97, 20, 36, 0.92);
+  color: #ffdbe3;
+}
+
+.ops-debug-page .status-pill.is-muted {
+  border-color: rgba(142, 197, 255, 0.46);
+  background: rgba(23, 53, 92, 0.88);
+  color: #e2f3ff;
+}
+
+.ops-debug-page .log-data {
+  background: #090d15;
+  border-color: #5d6f95;
+  color: #f3f6ff;
+  font-family: ui-monospace, "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+  line-height: 1.55;
+}
+
+.ops-debug-page .raw-data-block {
+  box-shadow: inset 0 0 0 1px rgba(93, 111, 149, 0.16);
+}
+
 @media (max-width: 900px) {
   .shell {
     grid-template-columns: 1fr;
@@ -767,6 +1068,14 @@ button {
 
   .content {
     padding: var(--space-5);
+  }
+
+  .auth-shell {
+    padding: var(--space-5);
+  }
+
+  .auth-card {
+    padding: var(--space-6);
   }
 
   .page-header,

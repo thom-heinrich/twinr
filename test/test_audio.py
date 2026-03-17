@@ -8,6 +8,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.hardware.audio import (
+    SilenceDetectedRecorder,
+    SpeechStartTimeoutError,
     WaveAudioPlayer,
     resolve_dynamic_pause_thresholds,
     resolve_pause_resume_confirmation,
@@ -116,6 +118,34 @@ class _FakePlaybackProcess:
         self.returncode = -9
 
 
+class _FakeReadableStream:
+    def fileno(self) -> int:
+        return 0
+
+
+class _FakeCaptureProcess:
+    def __init__(self) -> None:
+        self.stdin = None
+        self.stdout = _FakeReadableStream()
+        self.stderr = TemporaryFile()
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        del timeout
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
 class WaveAudioPlayerTests(unittest.TestCase):
     def test_preempted_stream_terminates_aplay_without_waiting_for_drain(self) -> None:
         player = WaveAudioPlayer(device="default")
@@ -150,6 +180,65 @@ class WaveAudioPlayerTests(unittest.TestCase):
         player.stop_playback()
 
         self.assertGreaterEqual(process.terminate_calls, 1)
+
+    def test_stream_error_tolerates_closed_stderr_after_stop(self) -> None:
+        player = WaveAudioPlayer(device="default")
+        process = _FakePlaybackProcess()
+
+        player._set_active_process(process)
+        player.stop_playback()
+
+        with self.assertRaisesRegex(RuntimeError, "Audio playback failed: exit code -15"):
+            player._raise_stream_error(process)
+
+
+class SilenceDetectedRecorderTests(unittest.TestCase):
+    def test_start_timeout_carries_pre_speech_capture_diagnostics(self) -> None:
+        recorder = SilenceDetectedRecorder(
+            device="default",
+            sample_rate=16000,
+            channels=1,
+            chunk_ms=100,
+            speech_threshold=700,
+            speech_start_chunks=3,
+            start_timeout_s=0.18,
+        )
+        process = _FakeCaptureProcess()
+        quiet_chunk = b"\x00\x00" * 1600
+
+        def fake_wait_for_readable(*_args, **_kwargs):
+            fake_wait_for_readable.calls += 1
+            return fake_wait_for_readable.calls <= 2
+
+        fake_wait_for_readable.calls = 0
+
+        class _AdvancingMonotonic:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def __call__(self) -> float:
+                current = self.value
+                self.value += 0.05
+                return current
+
+        monotonic = _AdvancingMonotonic()
+
+        with (
+            mock.patch("twinr.hardware.audio._spawn_audio_process", return_value=process),
+            mock.patch("twinr.hardware.audio._wait_for_readable", side_effect=fake_wait_for_readable),
+            mock.patch("twinr.hardware.audio.os.read", side_effect=[quiet_chunk, quiet_chunk]),
+            mock.patch("twinr.hardware.audio.time.monotonic", side_effect=monotonic),
+        ):
+            with self.assertRaises(SpeechStartTimeoutError) as captured:
+                recorder.capture_pcm_until_pause_with_options(pause_ms=1200)
+
+        diagnostics = captured.exception.diagnostics
+        self.assertEqual(diagnostics.device, "default")
+        self.assertGreaterEqual(diagnostics.chunk_count, 1)
+        self.assertEqual(diagnostics.active_chunk_count, 0)
+        self.assertEqual(diagnostics.average_rms, 0)
+        self.assertEqual(diagnostics.peak_rms, 0)
+        self.assertGreaterEqual(diagnostics.listened_ms, 150)
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from twinr.agent.base_agent.conversation.turn_controller import (
     _normalize_turn_text,
 )
 from twinr.agent.base_agent.conversation.closure import (
+    ConversationClosureEvaluation,
     ConversationClosureDecision,
     ToolCallingConversationClosureEvaluator,
 )
@@ -38,23 +39,29 @@ from twinr.hardware.audio import (
     SilenceDetectedRecorder,
     SpeechCaptureResult,
     WaveAudioPlayer,
+    pcm16_duration_ms,
     pcm16_to_wav_bytes,
 )
 from twinr.hardware.buttons import ButtonAction, configured_button_monitor
 from twinr.hardware.camera import V4L2StillCamera
 from twinr.hardware.printer import RawReceiptPrinter
 from twinr.hardware.voice_profile import VoiceProfileMonitor
-from twinr.ops import TwinrUsageStore
+from twinr.ops.usage import TwinrUsageStore
 from twinr.proactive import SocialTriggerDecision, WakewordMatch, build_default_proactive_monitor
 from twinr.providers.openai import OpenAIProviderBundle
 from twinr.providers.factory import build_streaming_provider_bundle
 from twinr.providers.openai.realtime import OpenAIRealtimeSession
-from twinr.agent.workflows.realtime_runner_background import TwinrRealtimeBackgroundMixin
+from twinr.agent.workflows.realtime_runtime.background import TwinrRealtimeBackgroundMixin
 from twinr.agent.workflows.required_remote_watch import RequiredRemoteDependencyWatch
 from twinr.agent.workflows.button_dispatch import ButtonPressDispatcher
 from twinr.agent.workflows.forensics import WorkflowForensics
+from twinr.agent.workflows.listen_timeout_diagnostics import (
+    diagnostics_from_exception,
+    emit_listen_timeout_diagnostics,
+)
+from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
 from twinr.agent.workflows.print_lane import PrintLaneRequest, TwinrPrintLane
-from twinr.agent.workflows.realtime_runner_support import TwinrRealtimeSupportMixin, _default_emit
+from twinr.agent.workflows.realtime_runtime.support import TwinrRealtimeSupportMixin, _default_emit
 from twinr.agent.workflows.realtime_runner_tools import TwinrRealtimeToolDelegatesMixin
 
 
@@ -136,6 +143,11 @@ class TwinrRealtimeHardwareLoop(
         self._ambient_audio_sampler = ambient_audio_sampler
         self._camera_lock = Lock()
         self._audio_lock = Lock()
+        self.playback_coordinator = PlaybackCoordinator(
+            self.player,
+            emit=emit or _default_emit,
+            io_lock=self._audio_lock,
+        )
         self._active_turn_stop_lock = Lock()
         self._active_turn_stop_event: Event | None = None
         self._conversation_session_lock = Lock()  # AUDIT-FIX(#1): Serialize session entry across button, wakeword, and proactive threads.
@@ -275,6 +287,8 @@ class TwinrRealtimeHardwareLoop(
             and getattr(getattr(self.runtime, "status", None), "value", None) == "error"
         )
         self._required_remote_dependency_cached_ready = self._required_remote_dependency_current_ready()
+        if self._remote_dependency_is_required() and self._required_remote_dependency_uses_watchdog_artifact():
+            self._required_remote_dependency_cached_ready = False
         self._required_remote_dependency_watch = RequiredRemoteDependencyWatch(
             interval_s=self._required_remote_dependency_interval_seconds(),
             refresh=lambda force: self._refresh_required_remote_dependency(
@@ -526,11 +540,31 @@ class TwinrRealtimeHardwareLoop(
         request_source: str,
         proactive_trigger: str | None,
     ) -> bool:
+        evaluation = self._evaluate_follow_up_closure(
+            user_transcript=user_transcript,
+            assistant_response=assistant_response,
+            request_source=request_source,
+            proactive_trigger=proactive_trigger,
+        )
+        return self._apply_follow_up_closure_evaluation(
+            evaluation=evaluation,
+            request_source=request_source,
+            proactive_trigger=proactive_trigger,
+        )
+
+    def _evaluate_follow_up_closure(
+        self,
+        *,
+        user_transcript: str,
+        assistant_response: str,
+        request_source: str,
+        proactive_trigger: str | None,
+    ) -> ConversationClosureEvaluation:
         evaluator = self.conversation_closure_evaluator
         if evaluator is None or not self.config.conversation_closure_guard_enabled:
-            return False
+            return ConversationClosureEvaluation()
         if not self._follow_up_allowed_for_source(initial_source=request_source):
-            return False
+            return ConversationClosureEvaluation()
         try:
             decision = evaluator.evaluate(
                 user_transcript=user_transcript,
@@ -540,7 +574,21 @@ class TwinrRealtimeHardwareLoop(
                 conversation=self.runtime.conversation_context(),
             )
         except Exception as exc:
-            self.emit(f"conversation_closure_fallback={type(exc).__name__}")
+            return ConversationClosureEvaluation(error_type=type(exc).__name__)
+        return ConversationClosureEvaluation(decision=decision)
+
+    def _apply_follow_up_closure_evaluation(
+        self,
+        *,
+        evaluation: ConversationClosureEvaluation,
+        request_source: str,
+        proactive_trigger: str | None,
+    ) -> bool:
+        if evaluation.error_type:
+            self.emit(f"conversation_closure_fallback={evaluation.error_type}")
+            return False
+        decision = evaluation.decision
+        if decision is None:
             return False
         self._emit_closure_decision(decision)
         if not decision.close_now:
@@ -869,6 +917,21 @@ class TwinrRealtimeHardwareLoop(
         self.emit("stt_streaming_recovered_via_batch=true")
         return recovered
 
+    def _captured_audio_duration_ms(
+        self,
+        *,
+        capture_result: SpeechCaptureResult | None,
+    ) -> int:
+        """Measure real captured speech duration instead of wall-clock listen time."""
+
+        if capture_result is None or not capture_result.pcm_bytes:
+            return 0
+        return pcm16_duration_ms(
+            capture_result.pcm_bytes,
+            sample_rate=self._recorder_sample_rate(),
+            channels=self.config.audio_channels,
+        )
+
     def _should_verify_streaming_transcript(
         self,
         *,
@@ -882,13 +945,14 @@ class TwinrRealtimeHardwareLoop(
         verifier = getattr(self, "transcript_verifier_provider", None)
         if verifier is None or not callable(getattr(verifier, "transcribe", None)):
             return False
-        cleaned = str(transcript or "").strip()
-        if not cleaned:
-            return False
         if capture_result is None or not capture_result.pcm_bytes:
             return False
-        if capture_ms > max(1000, int(self.config.streaming_transcript_verifier_max_capture_ms)):
+        cleaned = str(transcript or "").strip()
+        effective_audio_ms = self._captured_audio_duration_ms(capture_result=capture_result) or max(0, int(capture_ms))
+        if effective_audio_ms > max(1000, int(self.config.streaming_transcript_verifier_max_capture_ms)):
             return False
+        if not cleaned:
+            return True
         word_count = len(cleaned.split())
         if (
             word_count > max(1, int(self.config.streaming_transcript_verifier_max_words))
@@ -975,6 +1039,9 @@ class TwinrRealtimeHardwareLoop(
         cleaned = str(transcript or "").strip()
         if not verified:
             return cleaned
+        if not cleaned:
+            self.emit("stt_streaming_verified_via_openai=true")
+            return verified
         if _normalize_turn_text(verified) == _normalize_turn_text(cleaned):
             self.emit("stt_streaming_verified_via_openai=true")
             return verified
@@ -1402,6 +1469,10 @@ class TwinrRealtimeHardwareLoop(
                 return False
             if not self._is_no_speech_timeout(exc):
                 raise
+            emit_listen_timeout_diagnostics(
+                self.emit,
+                diagnostics_from_exception(exc),
+            )
             self.runtime.remember_listen_timeout(
                 initial_source=initial_source,
                 follow_up=follow_up,
@@ -1803,12 +1874,19 @@ class TwinrRealtimeHardwareLoop(
         tts_started = time.monotonic()
         try:
             self._play_listen_beep()
-            with self._audio_lock:
-                if cached_audio is not None:
-                    self.player.play_wav_bytes(cached_audio)
-                else:
-                    self._ensure_wakeword_ack_prefetch_started()
-                    self.player.play_wav_chunks(self.tts_provider.synthesize_stream(prompt))
+            if cached_audio is not None:
+                self.playback_coordinator.play_wav_bytes(
+                    owner="wakeword_ack",
+                    priority=PlaybackPriority.SPEECH,
+                    wav_bytes=cached_audio,
+                )
+            else:
+                self._ensure_wakeword_ack_prefetch_started()
+                self.playback_coordinator.play_wav_chunks(
+                    owner="wakeword_ack",
+                    priority=PlaybackPriority.SPEECH,
+                    chunks=self.tts_provider.synthesize_stream(prompt),
+                )
         finally:
             self.runtime.finish_speaking()  # AUDIT-FIX(#6): Ensure wakeword acknowledgment failures do not strand runtime state in "speaking".
             self._emit_status(force=True)
@@ -1893,7 +1971,10 @@ class TwinrRealtimeHardwareLoop(
                 self._record_event("print_skipped", "Print request ignored because another print job is already in progress.")
                 return
             response_to_print = self.runtime.prepare_background_button_print_request()
-            conversation = self.runtime.provider_conversation_context()
+            # Yellow-button prints should stay local and immediate. Pulling the
+            # full provider context here can block on remote long-term memory
+            # retrieval even though the print lane already has the direct text.
+            conversation = self.runtime.conversation_context()
             request = PrintLaneRequest(
                 conversation=conversation,
                 focus_hint=self.runtime.last_transcript,

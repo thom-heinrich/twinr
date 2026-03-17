@@ -15,7 +15,8 @@ from typing import Callable, Generic, TypeVar
 import time
 
 from twinr.agent.base_agent.contracts import FirstWordReply
-from twinr.agent.tools.runtime import SpeechLaneDelta, StreamingToolLoopResult
+from twinr.agent.tools.runtime.dual_lane_loop import SpeechLaneDelta
+from twinr.agent.tools.runtime.streaming_loop import StreamingToolLoopResult
 
 
 T = TypeVar("T")
@@ -169,6 +170,7 @@ class StreamingTurnOrchestrator:
         bridge_source = prefetched_first_word_source if prefetched_first_word is not None else "none"
         bridge_emitted = False
         bridge_watchdog_triggered = False
+        bridge_timeout_triggered = False
         final_lane_watchdog_triggered = False
         first_audio_gate_required = False
 
@@ -231,10 +233,13 @@ class StreamingTurnOrchestrator:
                     )
 
             if (
+                not bridge_timeout_triggered
+                and
                 not bridge_emitted
                 and bridge_reply is None
                 and now >= bridge_deadline
             ):
+                bridge_timeout_triggered = True
                 bridge_watchdog_triggered = True
                 self._emit("first_word_timeout=true")
                 bridge_reply = bridge_fallback_reply
@@ -266,7 +271,13 @@ class StreamingTurnOrchestrator:
                 or now >= bridge_deadline
             )
 
-            if final_task.done and bridge_phase_resolved:
+            if final_task.done and (
+                bridge_phase_resolved
+                or (
+                    bridge_reply is None
+                    and bridge_fallback_reply is None
+                )
+            ):
                 try:
                     response = final_task.result()
                 except Exception as exc:

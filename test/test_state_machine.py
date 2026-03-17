@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.config import TwinrConfig
 from twinr.memory import ConversationTurn, OnDeviceMemory
 from twinr.runtime import TwinrRuntime
-from twinr.state_machine import TwinrStatus
+from twinr.state_machine import TwinrEvent, TwinrStatus
 
 
 class TwinrRuntimeTests(unittest.TestCase):
@@ -35,6 +35,22 @@ class TwinrRuntimeTests(unittest.TestCase):
         runtime.finish_speaking()
         self.assertEqual(runtime.status, TwinrStatus.WAITING)
         self.assertEqual(runtime.memory.last_assistant_message(), "Hello back")
+
+    def test_follow_up_rearm_transitions_directly_back_to_listening(self) -> None:
+        runtime = TwinrRuntime(config=TwinrConfig())
+
+        runtime.press_green_button()
+        runtime.submit_transcript("Hallo")
+        runtime.complete_agent_turn("Mir geht's gut, danke! Und dir?")
+
+        runtime.rearm_follow_up()
+
+        self.assertEqual(runtime.status, TwinrStatus.LISTENING)
+        self.assertEqual(runtime.last_transcript, "")
+        self.assertEqual(
+            runtime.state_machine.history[-1],
+            (TwinrStatus.ANSWERING, TwinrEvent.FOLLOW_UP_ARMED, TwinrStatus.LISTENING),
+        )
 
     def test_print_requires_previous_answer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

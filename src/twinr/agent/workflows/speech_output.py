@@ -15,6 +15,7 @@ from typing import Callable, Protocol
 import time
 
 from twinr.agent.tools.runtime.dual_lane_loop import SpeechLaneDelta
+from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
 
 
 class StreamingTextToSpeechProviderLike(Protocol):
@@ -47,6 +48,9 @@ class _PlaybackItem:
 
 
 _QUEUE_SENTINEL = object()
+_TTS_CHUNK_POLL_TIMEOUT_SECONDS = 0.02
+_TTS_PUMP_JOIN_TIMEOUT_SECONDS = 0.05
+_INTERRUPTED_TTS_PUMP_JOIN_TIMEOUT_SECONDS = 0.01
 
 
 class _TTSChunkPump:
@@ -123,7 +127,7 @@ class _TTSChunkPump:
                 self.stop()
                 return
             try:
-                item = self._queue.get(timeout=0.05)
+                item = self._queue.get(timeout=_TTS_CHUNK_POLL_TIMEOUT_SECONDS)
             except Empty:
                 if self._done.is_set():
                     if self._error is not None:
@@ -199,6 +203,7 @@ class InterruptibleSpeechOutput:
         on_speaking_started: Callable[[], None] | None = None,
         on_first_audio: Callable[[], None] | None = None,
         on_preempt: Callable[[], None] | None = None,
+        playback_coordinator: PlaybackCoordinator | None = None,
         playback_lock: Lock | None = None,
         should_stop: Callable[[], bool] | None = None,
         trace_event: Callable[[str, dict[str, object] | None], None] | None = None,
@@ -210,6 +215,7 @@ class InterruptibleSpeechOutput:
         self.on_speaking_started = on_speaking_started
         self.on_first_audio = on_first_audio
         self.on_preempt = on_preempt
+        self.playback_coordinator = playback_coordinator
         self.playback_lock = playback_lock
         self.should_stop = should_stop
         self._trace_event = trace_event
@@ -416,6 +422,23 @@ class InterruptibleSpeechOutput:
                 self._trace("speech_output_first_audio_emitted", generation=item.generation)
 
         pump.start()
+        if self.playback_coordinator is not None:
+            try:
+                self.playback_coordinator.play_wav_chunks(
+                    owner="streaming_tts",
+                    priority=PlaybackPriority.SPEECH,
+                    chunks=pump.iter_chunks(
+                        should_stop=stop_requested,
+                        on_first_chunk=emit_first_chunk,
+                    ),
+                    should_stop=stop_requested,
+                    atomic=item.atomic,
+                )
+            finally:
+                pump.stop()
+                pump.join(timeout_s=self._pump_join_timeout(item))
+                self._trace("speech_output_play_item_completed", generation=item.generation)
+            return
         if self.playback_lock is None:
             try:
                 self.player.play_wav_chunks(
@@ -427,7 +450,7 @@ class InterruptibleSpeechOutput:
                 )
             finally:
                 pump.stop()
-                pump.join(timeout_s=0.2)
+                pump.join(timeout_s=self._pump_join_timeout(item))
                 self._trace("speech_output_play_item_completed", generation=item.generation)
             return
         with self.playback_lock:
@@ -441,7 +464,7 @@ class InterruptibleSpeechOutput:
                 )
             finally:
                 pump.stop()
-                pump.join(timeout_s=0.2)
+                pump.join(timeout_s=self._pump_join_timeout(item))
                 self._trace("speech_output_play_item_completed", generation=item.generation)
 
     def _trace(self, msg: str, **details: object) -> None:
@@ -451,3 +474,16 @@ class InterruptibleSpeechOutput:
             self._trace_event(msg, details)
         except Exception:
             return
+
+    def _pump_join_timeout(self, item: _PlaybackItem) -> float:
+        """Use a very short join budget after interruption or preemption."""
+
+        if item.cancel_event.is_set():
+            return _INTERRUPTED_TTS_PUMP_JOIN_TIMEOUT_SECONDS
+        if self.should_stop is not None:
+            try:
+                if bool(self.should_stop()):
+                    return _INTERRUPTED_TTS_PUMP_JOIN_TIMEOUT_SECONDS
+            except Exception:
+                return _INTERRUPTED_TTS_PUMP_JOIN_TIMEOUT_SECONDS
+        return _TTS_PUMP_JOIN_TIMEOUT_SECONDS

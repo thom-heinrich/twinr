@@ -2,6 +2,7 @@ from array import array
 from datetime import datetime, timezone
 import io
 import math
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -15,8 +16,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from fastapi.testclient import TestClient
 
 from twinr.agent.base_agent import AdaptiveTimingStore, RuntimeSnapshotStore, TwinrConfig
-from twinr.automations import AutomationAction, AutomationStore, build_sensor_trigger
-from twinr.agent.self_coding import ActivationRecord, CompileRunStatusRecord, LearnedSkillStatus, SelfCodingStore
+from twinr.automations import AutomationAction, AutomationDefinition, AutomationStore, IfThenAutomationTrigger, build_sensor_trigger
+from twinr.agent.self_coding.contracts import (
+    ActivationRecord,
+    CompileJobRecord,
+    CompileRunStatusRecord,
+    LiveE2EStatusRecord,
+    SkillHealthRecord,
+)
+from twinr.agent.self_coding.status import CompileJobStatus, CompileTarget, LearnedSkillStatus
+from twinr.agent.self_coding.store import SelfCodingStore
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.memory.reminders import ReminderStore
 from twinr.memory import ConversationTurn, MemoryLedgerItem, MemoryState, SearchMemoryEntry
@@ -53,30 +62,36 @@ def _voice_sample_wav_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0
 
 
 class WebAppTests(unittest.TestCase):
-    def make_client(self) -> tuple[TestClient, Path]:
+    def make_client(
+        self,
+        *,
+        extra_env: dict[str, str] | None = None,
+        base_url: str = "http://localhost",
+        client_host: str = "127.0.0.1",
+    ) -> tuple[TestClient, Path]:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         root = Path(temp_dir.name)
         env_path = root / ".env"
         personality_dir = root / "personality"
         personality_dir.mkdir(parents=True, exist_ok=True)
+        env_lines = [
+            "OPENAI_MODEL=gpt-5.2",
+            "OPENAI_API_KEY=sk-test-1234",
+            "TWINR_WEB_HOST=0.0.0.0",
+            "TWINR_WEB_PORT=1337",
+            f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
+        ]
+        if extra_env:
+            env_lines.extend(f"{key}={value}" for key, value in extra_env.items())
         env_path.write_text(
-            "\n".join(
-                [
-                    "OPENAI_MODEL=gpt-5.2",
-                    "OPENAI_API_KEY=sk-test-1234",
-                    "TWINR_WEB_HOST=0.0.0.0",
-                    "TWINR_WEB_PORT=1337",
-                    f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
-                ]
-            )
-            + "\n",
+            "\n".join(env_lines) + "\n",
             encoding="utf-8",
         )
         (personality_dir / "SYSTEM.md").write_text("System text\n", encoding="utf-8")
         (personality_dir / "PERSONALITY.md").write_text("Personality text\n", encoding="utf-8")
         (personality_dir / "USER.md").write_text("User text\n", encoding="utf-8")
-        return TestClient(create_app(env_path), base_url="http://localhost", client=("127.0.0.1", 50000)), env_path
+        return TestClient(create_app(env_path), base_url=base_url, client=(client_host, 50000)), env_path
 
     def test_dashboard_renders_summary(self) -> None:
         client, _env_path = self.make_client()
@@ -90,6 +105,131 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("sk-t…1234", response.text)
         self.assertIn("Status and failures", response.text)
 
+    def test_managed_web_auth_redirects_unauthenticated_requests_to_login(self) -> None:
+        client, env_path = self.make_client(
+            extra_env={
+                "TWINR_WEB_REQUIRE_AUTH": "1",
+                "TWINR_WEB_ALLOW_REMOTE": "1",
+            }
+        )
+
+        response = client.get("/", follow_redirects=False)
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/auth/login")
+        self.assertTrue((env_path.parent / "state" / "web_auth.json").exists())
+
+    def test_managed_web_auth_forces_password_change_after_bootstrap_login(self) -> None:
+        client, _env_path = self.make_client(
+            extra_env={
+                "TWINR_WEB_REQUIRE_AUTH": "1",
+                "TWINR_WEB_ALLOW_REMOTE": "1",
+            }
+        )
+
+        response = client.post(
+            "/auth/login",
+            data={"username": "admin", "password": "admin", "next": "/ops/debug"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/auth/password")
+
+        password_page = client.get("/auth/password")
+
+        self.assertEqual(password_page.status_code, 200)
+        self.assertIn("Set a new password", password_page.text)
+        self.assertIn("at least 8 characters", password_page.text)
+
+    def test_managed_web_auth_password_change_replaces_bootstrap_password(self) -> None:
+        client, _env_path = self.make_client(
+            extra_env={
+                "TWINR_WEB_REQUIRE_AUTH": "1",
+                "TWINR_WEB_ALLOW_REMOTE": "1",
+            }
+        )
+
+        client.post(
+            "/auth/login",
+            data={"username": "admin", "password": "admin", "next": "/"},
+            follow_redirects=False,
+        )
+
+        response = client.post(
+            "/auth/password",
+            data={
+                "current_password": "admin",
+                "new_password": "fresh-password-123",
+                "confirm_password": "fresh-password-123",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/?saved=1")
+
+        client.post("/auth/logout", follow_redirects=False)
+        failed_login = client.post(
+            "/auth/login",
+            data={"username": "admin", "password": "admin", "next": "/"},
+        )
+        self.assertEqual(failed_login.status_code, 200)
+        self.assertIn("not correct", failed_login.text)
+
+        new_login = client.post(
+            "/auth/login",
+            data={"username": "admin", "password": "fresh-password-123", "next": "/"},
+            follow_redirects=False,
+        )
+        self.assertEqual(new_login.status_code, 303)
+        self.assertEqual(new_login.headers["location"], "/")
+
+    def test_managed_web_auth_allows_remote_bootstrap_login_and_password_change(self) -> None:
+        client, _env_path = self.make_client(
+            extra_env={
+                "TWINR_WEB_REQUIRE_AUTH": "1",
+                "TWINR_WEB_ALLOW_REMOTE": "1",
+                "TWINR_WEB_ALLOWED_HOSTS": "portal",
+            },
+            base_url="http://portal",
+            client_host="192.168.1.44",
+        )
+
+        response = client.get("/auth/login")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("admin</strong> / <strong>admin", response.text)
+
+        login = client.post(
+            "/auth/login",
+            data={"username": "admin", "password": "admin", "next": "/ops/debug"},
+            headers={"origin": "http://portal"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(login.status_code, 303)
+        self.assertEqual(login.headers["location"], "/auth/password")
+
+        password_change = client.post(
+            "/auth/password",
+            data={
+                "current_password": "admin",
+                "new_password": "remote-password-123",
+                "confirm_password": "remote-password-123",
+            },
+            headers={"origin": "http://portal"},
+            follow_redirects=False,
+        )
+
+        self.assertEqual(password_change.status_code, 303)
+        self.assertEqual(password_change.headers["location"], "/?saved=1")
+
+        dashboard = client.get("/")
+
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertIn("Dashboard", dashboard.text)
+
     def test_dashboard_renders_self_coding_status_summary(self) -> None:
         client, env_path = self.make_client()
         store = SelfCodingStore.from_project_root(env_path.parent)
@@ -100,6 +240,12 @@ class WebAppTests(unittest.TestCase):
                 driver_name="CodexSdkDriver",
                 event_count=12,
                 last_event_kind="assistant_delta",
+                diagnostics={
+                    "model": "gpt-5-codex",
+                    "reasoning_effort": "high",
+                    "duration_seconds": 67.4,
+                    "fallback_reason": "CodexSdkDriver: timeout",
+                },
             )
         )
         store.save_activation(
@@ -124,6 +270,17 @@ class WebAppTests(unittest.TestCase):
                 metadata={"automation_id": "ase_announce_updates_v1"},
             )
         )
+        store.save_live_e2e_status(
+            LiveE2EStatusRecord(
+                suite_id="morning_briefing",
+                environment="local",
+                status="passed",
+                duration_seconds=67.4,
+                model="gpt-5-codex",
+                reasoning_effort="high",
+                details="26 passed",
+            )
+        )
 
         response = client.get("/")
 
@@ -132,6 +289,373 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("1 active", response.text)
         self.assertIn("1 soft launch", response.text)
         self.assertIn("assistant_delta", response.text)
+        self.assertIn("gpt-5-codex", response.text)
+        self.assertIn("live e2e passed", response.text.lower())
+
+    def test_ops_self_coding_page_renders_telemetry_and_controls(self) -> None:
+        client, env_path = self.make_client()
+        store = SelfCodingStore.from_project_root(env_path.parent)
+        store.save_compile_status(
+            CompileRunStatusRecord(
+                job_id="job_self_coding_ops",
+                phase="completed",
+                driver_name="CodexSdkDriver",
+                event_count=42,
+                last_event_kind="turn_completed",
+                diagnostics={
+                    "model": "gpt-5-codex",
+                    "reasoning_effort": "high",
+                    "duration_seconds": 67.4,
+                    "fallback_reason": "CodexSdkDriver: timeout",
+                },
+            )
+        )
+        store.save_activation(
+            ActivationRecord(
+                skill_id="morning_briefing",
+                skill_name="Morning Briefing",
+                version=1,
+                status=LearnedSkillStatus.PAUSED,
+                job_id="job_self_coding_ops_v1",
+                artifact_id="artifact_self_coding_ops_v1",
+                metadata={
+                    "artifact_kind": "skill_package",
+                    "automation_ids": ["ase_morning_briefing_v1_schedule", "ase_morning_briefing_v1_sensor"],
+                },
+            )
+        )
+        store.save_activation(
+            ActivationRecord(
+                skill_id="morning_briefing",
+                skill_name="Morning Briefing",
+                version=2,
+                status=LearnedSkillStatus.ACTIVE,
+                job_id="job_self_coding_ops_v2",
+                artifact_id="artifact_self_coding_ops_v2",
+                metadata={
+                    "artifact_kind": "skill_package",
+                    "automation_ids": ["ase_morning_briefing_v2_schedule", "ase_morning_briefing_v2_sensor"],
+                },
+            )
+        )
+        store.save_skill_health(
+            SkillHealthRecord(
+                skill_id="morning_briefing",
+                version=1,
+                status="healthy",
+                trigger_count=5,
+                delivered_count=2,
+                error_count=1,
+            )
+        )
+        store.save_live_e2e_status(
+            LiveE2EStatusRecord(
+                suite_id="morning_briefing",
+                environment="local",
+                status="passed",
+                duration_seconds=67.4,
+                model="gpt-5-codex",
+                reasoning_effort="high",
+                details="26 passed",
+            )
+        )
+
+        response = client.get("/ops/self-coding")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Self-coding operations", response.text)
+        self.assertIn("gpt-5-codex", response.text)
+        self.assertIn("67.4", response.text)
+        self.assertIn("CodexSdkDriver: timeout", response.text)
+        self.assertIn("Pause skill", response.text)
+        self.assertIn("Reactivate skill", response.text)
+        self.assertIn("Rollback skill", response.text)
+        self.assertIn("Retest skill", response.text)
+        self.assertIn("Clean up version", response.text)
+        self.assertIn("Morning Briefing", response.text)
+
+    def test_ops_self_coding_pause_and_reactivate_update_activation_status(self) -> None:
+        client, env_path = self.make_client()
+        store = SelfCodingStore.from_project_root(env_path.parent)
+        store.save_activation(
+            ActivationRecord(
+                skill_id="morning_briefing",
+                skill_name="Morning Briefing",
+                version=1,
+                status=LearnedSkillStatus.ACTIVE,
+                job_id="job_self_coding_toggle",
+                artifact_id="artifact_self_coding_toggle",
+                metadata={"automation_ids": ["ase_morning_briefing_v1"]},
+            )
+        )
+        automation_store = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin")
+        automation_store.upsert(
+            AutomationDefinition(
+                automation_id="ase_morning_briefing_v1",
+                name="Morning Briefing",
+                description="Read the briefing aloud.",
+                enabled=True,
+                trigger=IfThenAutomationTrigger(event_name="camera.person_visible"),
+                actions=(AutomationAction(kind="say", text="Hallo"),),
+                source="test",
+                tags=("self_coding",),
+            )
+        )
+
+        pause_response = client.post(
+            "/ops/self-coding/pause",
+            data={"skill_id": "morning_briefing", "version": "1"},
+            follow_redirects=False,
+        )
+        paused = store.load_activation("morning_briefing", version=1)
+
+        reactivate_response = client.post(
+            "/ops/self-coding/reactivate",
+            data={"skill_id": "morning_briefing", "version": "1"},
+            follow_redirects=False,
+        )
+        active = store.load_activation("morning_briefing", version=1)
+
+        self.assertEqual(pause_response.status_code, 303)
+        self.assertEqual(paused.status, LearnedSkillStatus.PAUSED)
+        self.assertEqual(reactivate_response.status_code, 303)
+        self.assertEqual(active.status, LearnedSkillStatus.ACTIVE)
+
+    def test_ops_self_coding_rollback_restores_previous_version(self) -> None:
+        client, env_path = self.make_client()
+        store = SelfCodingStore.from_project_root(env_path.parent)
+        store.save_activation(
+            ActivationRecord(
+                skill_id="morning_briefing",
+                skill_name="Morning Briefing",
+                version=1,
+                status=LearnedSkillStatus.PAUSED,
+                job_id="job_self_coding_v1",
+                artifact_id="artifact_self_coding_v1",
+                metadata={"automation_ids": ["ase_morning_briefing_v1"]},
+            )
+        )
+        store.save_activation(
+            ActivationRecord(
+                skill_id="morning_briefing",
+                skill_name="Morning Briefing",
+                version=2,
+                status=LearnedSkillStatus.ACTIVE,
+                job_id="job_self_coding_v2",
+                artifact_id="artifact_self_coding_v2",
+                metadata={"automation_ids": ["ase_morning_briefing_v2"]},
+            )
+        )
+        automation_store = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin")
+        automation_store.upsert(
+            AutomationDefinition(
+                automation_id="ase_morning_briefing_v1",
+                name="Morning Briefing v1",
+                description="Old version.",
+                enabled=False,
+                trigger=IfThenAutomationTrigger(event_name="camera.person_visible"),
+                actions=(AutomationAction(kind="say", text="Hallo v1"),),
+                source="test",
+                tags=("self_coding",),
+            )
+        )
+        automation_store.upsert(
+            AutomationDefinition(
+                automation_id="ase_morning_briefing_v2",
+                name="Morning Briefing v2",
+                description="New version.",
+                enabled=True,
+                trigger=IfThenAutomationTrigger(event_name="camera.person_visible"),
+                actions=(AutomationAction(kind="say", text="Hallo v2"),),
+                source="test",
+                tags=("self_coding",),
+            )
+        )
+
+        response = client.post(
+            "/ops/self-coding/rollback",
+            data={"skill_id": "morning_briefing"},
+            follow_redirects=False,
+        )
+
+        restored = store.load_activation("morning_briefing", version=1)
+        paused = store.load_activation("morning_briefing", version=2)
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(restored.status, LearnedSkillStatus.ACTIVE)
+        self.assertEqual(paused.status, LearnedSkillStatus.PAUSED)
+        self.assertTrue(automation_store.get("ase_morning_briefing_v1").enabled)
+        self.assertFalse(automation_store.get("ase_morning_briefing_v2").enabled)
+
+    def test_ops_self_coding_cleanup_retires_version(self) -> None:
+        client, env_path = self.make_client()
+        store = SelfCodingStore.from_project_root(env_path.parent)
+        store.save_activation(
+            ActivationRecord(
+                skill_id="morning_briefing",
+                skill_name="Morning Briefing",
+                version=1,
+                status=LearnedSkillStatus.PAUSED,
+                job_id="job_self_coding_cleanup",
+                artifact_id="artifact_self_coding_cleanup",
+                metadata={"automation_ids": ["ase_morning_briefing_v1"]},
+            )
+        )
+        automation_store = AutomationStore(env_path.parent / "state" / "automations.json", timezone_name="Europe/Berlin")
+        automation_store.upsert(
+            AutomationDefinition(
+                automation_id="ase_morning_briefing_v1",
+                name="Morning Briefing v1",
+                description="Old version.",
+                enabled=False,
+                trigger=IfThenAutomationTrigger(event_name="camera.person_visible"),
+                actions=(AutomationAction(kind="say", text="Hallo"),),
+                source="test",
+                tags=("self_coding",),
+            )
+        )
+
+        response = client.post(
+            "/ops/self-coding/cleanup",
+            data={"skill_id": "morning_briefing", "version": "1"},
+            follow_redirects=False,
+        )
+
+        cleaned = store.load_activation("morning_briefing", version=1)
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(cleaned.status, LearnedSkillStatus.RETIRED)
+        self.assertIsNone(automation_store.get("ase_morning_briefing_v1"))
+
+    def test_ops_self_coding_retest_records_capture_result(self) -> None:
+        client, env_path = self.make_client()
+        store = SelfCodingStore.from_project_root(env_path.parent)
+        store.save_activation(
+            ActivationRecord(
+                skill_id="morning_briefing",
+                skill_name="Morning Briefing",
+                version=2,
+                status=LearnedSkillStatus.ACTIVE,
+                job_id="job_self_coding_retest",
+                artifact_id="artifact_self_coding_retest",
+                metadata={"artifact_kind": "skill_package", "automation_ids": ["ase_morning_briefing_v2"]},
+            )
+        )
+
+        with patch("twinr.web.app.run_self_coding_skill_retest") as retest:
+            response = client.post(
+                "/ops/self-coding/retest",
+                data={"skill_id": "morning_briefing", "version": "2"},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 303)
+        retest.assert_called_once()
+
+    def test_ops_self_coding_page_renders_watchdog_rows(self) -> None:
+        client, env_path = self.make_client()
+        store = SelfCodingStore.from_project_root(env_path.parent)
+        stale_at = datetime(2026, 3, 17, 7, 0, tzinfo=timezone.utc)
+        store.save_job(
+            CompileJobRecord(
+                job_id="job_self_coding_stale",
+                skill_id="morning_briefing",
+                skill_name="Morning Briefing",
+                status=CompileJobStatus.COMPILING,
+                requested_target=CompileTarget.SKILL_PACKAGE,
+                spec_hash="spec_self_coding_stale",
+                created_at=stale_at,
+                updated_at=stale_at,
+            )
+        )
+        store.save_compile_status(
+            CompileRunStatusRecord(
+                job_id="job_self_coding_stale",
+                phase="streaming",
+                driver_name="CodexSdkDriver",
+                event_count=8,
+                last_event_kind="assistant_delta",
+                started_at=stale_at,
+                updated_at=stale_at,
+                diagnostics={"timeout_reason": "compile stalled"},
+            )
+        )
+        store.save_execution_run(
+            run_id="run_self_coding_stale",
+            run_kind="retest",
+            skill_id="morning_briefing",
+            version=2,
+            status="running",
+            started_at=stale_at,
+            updated_at=stale_at,
+            metadata={"environment": "web", "timeout_reason": "retest stalled"},
+        )
+
+        response = client.get("/ops/self-coding")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Watchdog", response.text)
+        self.assertIn("job_self_coding_stale", response.text)
+        self.assertIn("run_self_coding_stale", response.text)
+        self.assertIn("Clean up stale compile", response.text)
+        self.assertIn("Clean up stale run", response.text)
+
+    def test_ops_self_coding_cleanup_watchdog_rows_updates_store(self) -> None:
+        client, env_path = self.make_client()
+        store = SelfCodingStore.from_project_root(env_path.parent)
+        stale_at = datetime(2026, 3, 17, 7, 0, tzinfo=timezone.utc)
+        store.save_job(
+            CompileJobRecord(
+                job_id="job_self_coding_cleanup_stale",
+                skill_id="morning_briefing",
+                skill_name="Morning Briefing",
+                status=CompileJobStatus.COMPILING,
+                requested_target=CompileTarget.SKILL_PACKAGE,
+                spec_hash="spec_self_coding_cleanup_stale",
+                created_at=stale_at,
+                updated_at=stale_at,
+            )
+        )
+        store.save_compile_status(
+            CompileRunStatusRecord(
+                job_id="job_self_coding_cleanup_stale",
+                phase="streaming",
+                driver_name="CodexSdkDriver",
+                event_count=2,
+                started_at=stale_at,
+                updated_at=stale_at,
+            )
+        )
+        store.save_execution_run(
+            run_id="run_self_coding_cleanup_stale",
+            run_kind="retest",
+            skill_id="morning_briefing",
+            version=2,
+            status="running",
+            started_at=stale_at,
+            updated_at=stale_at,
+            metadata={"environment": "web"},
+        )
+
+        compile_response = client.post(
+            "/ops/self-coding/cleanup-compile",
+            data={"job_id": "job_self_coding_cleanup_stale"},
+            follow_redirects=False,
+        )
+        run_response = client.post(
+            "/ops/self-coding/cleanup-run",
+            data={"run_id": "run_self_coding_cleanup_stale"},
+            follow_redirects=False,
+        )
+
+        compile_status = store.load_compile_status("job_self_coding_cleanup_stale")
+        compile_job = store.load_job("job_self_coding_cleanup_stale")
+        execution_run = store.load_execution_run("run_self_coding_cleanup_stale")
+
+        self.assertEqual(compile_response.status_code, 303)
+        self.assertEqual(run_response.status_code, 303)
+        self.assertEqual(compile_status.phase, "aborted")
+        self.assertEqual(compile_job.status, CompileJobStatus.FAILED)
+        self.assertEqual(execution_run.status, "cleaned")
+        self.assertEqual(execution_run.reason, "operator_cleanup")
 
     def test_connect_page_renders_inline_help(self) -> None:
         client, _env_path = self.make_client()
@@ -1034,6 +1558,125 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("18250.0 ms", response.text)
         self.assertIn("Consecutive ok", response.text)
         self.assertIn("2026-03-16T18:25:00Z", response.text)
+
+    def test_ops_debug_page_renders_overview_tabs_and_summary(self) -> None:
+        client, env_path = self.make_client()
+        config = TwinrConfig.from_env(env_path)
+        RuntimeSnapshotStore(config.runtime_state_path).save(
+            status="waiting",
+            memory_turns=(),
+            last_transcript="Wie geht es dir heute?",
+            last_response="Mir geht es gut.",
+        )
+        TwinrOpsEventStore.from_config(config).append(
+            event="turn_started",
+            message="Green button started a conversation turn.",
+            data={"request_source": "button"},
+        )
+        from twinr.ops import TokenUsage, TwinrUsageStore
+
+        TwinrUsageStore.from_config(config).append(
+            source="hardware_loop",
+            request_kind="conversation",
+            model="gpt-5.2",
+            response_id="resp_debug_overview",
+            token_usage=TokenUsage(input_tokens=100, output_tokens=40, total_tokens=140),
+        )
+
+        response = client.get("/ops/debug")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("page-ops_debug", response.text)
+        self.assertIn("ops-debug-page", response.text)
+        self.assertIn("ops-debug-tabs", response.text)
+        self.assertIn("Debug categories", response.text)
+        self.assertIn("/ops/debug?tab=runtime", response.text)
+        self.assertIn("ChonkyDB", response.text)
+        self.assertIn("Current state at a glance", response.text)
+        self.assertIn("LLM requests 24h", response.text)
+
+    def test_ops_debug_page_renders_chonkydb_tab(self) -> None:
+        client, env_path = self.make_client()
+        config = TwinrConfig.from_env(env_path)
+        store = RemoteMemoryWatchdogStore.from_config(config)
+        sample = RemoteMemoryWatchdogSample(
+            seq=12,
+            captured_at="2026-03-16T18:31:00Z",
+            status="ok",
+            ready=True,
+            mode="remote_primary",
+            required=True,
+            latency_ms=18250.0,
+            consecutive_ok=4,
+            consecutive_fail=0,
+            detail=None,
+        )
+        store.save(
+            RemoteMemoryWatchdogSnapshot(
+                schema_version=1,
+                started_at="2026-03-16T18:30:00Z",
+                updated_at="2026-03-16T18:31:00Z",
+                hostname="picarx",
+                pid=os.getpid(),
+                interval_s=1.0,
+                history_limit=3600,
+                sample_count=12,
+                failure_count=1,
+                last_ok_at="2026-03-16T18:31:00Z",
+                last_failure_at="2026-03-16T18:25:00Z",
+                artifact_path=str(store.path),
+                current=sample,
+                recent_samples=(sample,),
+            )
+        )
+
+        response = client.get("/ops/debug?tab=chonkydb")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Required remote assessment", response.text)
+        self.assertIn("Watchdog snapshot", response.text)
+        self.assertIn("remote_primary", response.text)
+        self.assertIn("18250.0 ms", response.text)
+        self.assertIn("PID alive", response.text)
+
+    def test_ops_debug_page_renders_hardware_tab(self) -> None:
+        client, _env_path = self.make_client()
+        fake_overview = DeviceOverview(
+            captured_at="2026-03-13T16:10:00+00:00",
+            devices=(
+                DeviceStatus(
+                    key="printer",
+                    label="Printer",
+                    status="warn",
+                    summary="Queue is visible, but paper output must be confirmed on the device.",
+                    facts=(
+                        DeviceFact("Queue", "Thermal_GP58"),
+                        DeviceFact("Paper status", "unknown on the current raw USB/CUPS path"),
+                    ),
+                    notes=("Twinr cannot prove real paper output from this printer path.",),
+                ),
+            ),
+        )
+
+        with patch("twinr.web.app.collect_device_overview", return_value=fake_overview):
+            response = client.get("/ops/debug?tab=hardware")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Live hardware overview", response.text)
+        self.assertIn("Printer", response.text)
+        self.assertIn("Thermal_GP58", response.text)
+        self.assertIn("Queue is visible, but paper output must be confirmed on the device.", response.text)
+
+    def test_ops_debug_page_raw_tab_redacts_env(self) -> None:
+        client, _env_path = self.make_client()
+
+        response = client.get("/ops/debug?tab=raw")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Redacted env", response.text)
+        self.assertIn("OPENAI_API_KEY", response.text)
+        self.assertNotIn("sk-test-1234", response.text)
+        self.assertIn("Config check summary", response.text)
 
     def test_ops_devices_page_renders_device_status(self) -> None:
         client, _env_path = self.make_client()

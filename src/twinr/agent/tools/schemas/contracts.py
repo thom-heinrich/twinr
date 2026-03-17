@@ -884,6 +884,62 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 },
             }
         )
+    if "pause_skill_activation" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "pause_skill_activation",
+                "description": (
+                    "Pause one active learned self-coding skill version when the user or operator wants it temporarily disabled."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "skill_id": _string_property(
+                            "Stable identifier of the learned skill family to pause.",
+                            min_length=1,
+                        ),
+                        "version": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Active learned skill version to pause.",
+                        },
+                        "reason": _string_property(
+                            "Optional short pause reason such as operator_pause.",
+                            min_length=1,
+                        ),
+                    },
+                    "required": ["skill_id", "version"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "reactivate_skill_activation" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "reactivate_skill_activation",
+                "description": (
+                    "Re-enable one paused learned self-coding skill version after the user or operator wants it active again."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "skill_id": _string_property(
+                            "Stable identifier of the learned skill family to reactivate.",
+                            min_length=1,
+                        ),
+                        "version": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Paused learned skill version to reactivate.",
+                        },
+                    },
+                    "required": ["skill_id", "version"],
+                    "additionalProperties": False,
+                },
+            }
+        )
     if "remember_memory" in available:
         tools.append(
             {

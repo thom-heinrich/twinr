@@ -69,6 +69,18 @@ class RealtimeToolExecutor:
     def handle_rollback_skill_activation(self, arguments: dict[str, object]) -> dict[str, object]:
         return self_coding.handle_rollback_skill_activation(self.owner, arguments)
 
+    def handle_pause_skill_activation(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self_coding.handle_pause_skill_activation(self.owner, arguments)
+
+    def handle_reactivate_skill_activation(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self_coding.handle_reactivate_skill_activation(self.owner, arguments)
+
+    def handle_run_self_coding_skill_scheduled(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self_coding.handle_run_self_coding_skill_scheduled(self.owner, arguments)
+
+    def handle_run_self_coding_skill_sensor(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self_coding.handle_run_self_coding_skill_sensor(self.owner, arguments)
+
     def handle_remember_memory(self, arguments: dict[str, object]) -> dict[str, object]:
         return memory.handle_remember_memory(self.owner, arguments)
 

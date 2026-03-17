@@ -9,6 +9,11 @@ templates and CSS that power the operator dashboard.
 `web` owns:
 - assemble the local FastAPI app, middleware, and page/form routes
 - load config, runtime snapshot, and store handles through [`context.py`](./context.py)
+- enforce local or managed sign-in policy for the portal, including first-login password change for the permanent Pi web service over LAN
+- render the ops health page with the persisted remote-memory watchdog state
+- render the tabbed debug page that groups runtime, ChonkyDB, LLM, events, hardware, and raw local artifacts
+- keep the `/ops/debug` operator surface high-contrast and readable on external monitors, including dense log-like sections
+- render the self-coding operator page with compile telemetry, health, live-e2e state, stale compile/run watchdog visibility, and learned-skill lifecycle controls
 - compose presenters, support helpers, templates, and static assets into operator pages
 - persist safe web-driven changes for settings, reminders, automations, integrations, personality, and user context
 

@@ -20,11 +20,13 @@ import sys
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.display.layouts import draw_status_card
 
 
 _LOGGER = logging.getLogger(__name__)
 _IMPORT_LOCK = RLock()
 _SUPPORTED_ROTATIONS = {0, 90, 180, 270}
+_SUPPORTED_LAYOUT_MODES = {"default", "debug_log"}
 
 
 @dataclass(slots=True)
@@ -52,6 +54,7 @@ class WaveshareEPD4In2V2:
         rotation_degrees: Rotation applied before panel upload.
         full_refresh_interval: Number of partial renders between full
             refreshes.
+        layout_mode: Named status-card layout variant used for live renders.
     """
 
     project_root: Path
@@ -67,6 +70,7 @@ class WaveshareEPD4In2V2:
     height: int = 300
     rotation_degrees: int = 270
     full_refresh_interval: int = 0
+    layout_mode: str = "default"
     _driver_module: object | None = field(default=None, init=False, repr=False)
     _epdconfig_module: object | None = field(default=None, init=False, repr=False)  # AUDIT-FIX(#5): Keep vendor transport module for deterministic cleanup.
     _epd: object | None = field(default=None, init=False, repr=False)
@@ -80,6 +84,7 @@ class WaveshareEPD4In2V2:
         self.project_root = self.project_root.expanduser().resolve(strict=False)
         self.vendor_dir = self._resolve_vendor_dir(self.vendor_dir)
         self.rotation_degrees = self.rotation_degrees % 360
+        self.layout_mode = self._normalise_layout_mode(self.layout_mode)
 
         if self.width <= 0 or self.height <= 0:
             raise RuntimeError("Display width and height must be positive integers.")
@@ -127,6 +132,7 @@ class WaveshareEPD4In2V2:
             height=config.display_height,
             rotation_degrees=config.display_rotation_degrees,
             full_refresh_interval=config.display_full_refresh_interval,
+            layout_mode=config.display_layout,
         )
 
     @property
@@ -158,6 +164,8 @@ class WaveshareEPD4In2V2:
         *,
         headline: str | None = None,
         details: tuple[str, ...] = (),
+        state_fields: tuple[tuple[str, str], ...] = (),
+        log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
         animation_frame: int = 0,
     ) -> None:
         """Render and display one runtime status frame.
@@ -166,12 +174,16 @@ class WaveshareEPD4In2V2:
             status: Canonical runtime status key.
             headline: Optional headline override shown in the top bar.
             details: Up to four short footer/detail lines.
+            state_fields: Structured state/value pairs for richer layouts.
+            log_sections: Structured log sections for debug/operator layouts.
             animation_frame: Precomputed animation frame index.
         """
         image = self.render_status_image(
             status=status,
             headline=headline,
             details=details,
+            state_fields=state_fields,
+            log_sections=log_sections,
             animation_frame=animation_frame,
         )
         self.show_image(image, clear_first=False)
@@ -260,6 +272,8 @@ class WaveshareEPD4In2V2:
         status: str,
         headline: str | None,
         details: tuple[str, ...],
+        state_fields: tuple[tuple[str, str], ...] = (),
+        log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
         animation_frame: int = 0,
     ) -> object:
         """Build a status card image without sending it to the panel.
@@ -268,6 +282,8 @@ class WaveshareEPD4In2V2:
             status: Canonical runtime status key.
             headline: Optional headline override shown in the top bar.
             details: Footer/detail lines for health and time labels.
+            state_fields: Structured state/value pairs for richer layouts.
+            log_sections: Structured log sections for debug/operator layouts.
             animation_frame: Precomputed animation frame index.
 
         Returns:
@@ -277,35 +293,22 @@ class WaveshareEPD4In2V2:
             safe_status = self._normalise_text(status, fallback="status")
             safe_headline = self._normalise_text(headline, fallback=safe_status)
             safe_details = self._normalise_details(details)
+            safe_state_fields = self._normalise_state_fields(state_fields)
+            safe_log_sections = self._normalise_log_sections(log_sections)
             safe_animation_frame = self._normalise_animation_frame(animation_frame)
 
             image, draw = self._new_canvas()
             canvas_width, canvas_height = image.size
-            brand_font = self._font(28, bold=True)
-            status_font = self._font(24, bold=True)
-            draw.rectangle((0, 0, canvas_width - 1, canvas_height - 1), fill=255)
-            draw.rectangle((0, 0, canvas_width - 1, 58), fill=0)
-            draw.text((18, 10), "TWINR", fill=255, font=brand_font)
-            status_label = " ".join(safe_headline.split())
-            label_text = self._truncate_text(
+            draw_status_card(
+                self,
                 draw,
-                status_label,
-                max_width=max(canvas_width - 170, 110),
-                font=status_font,
-            )
-            label_width = self._text_width(draw, label_text, font=status_font)
-            draw.text((canvas_width - label_width - 18, 12), label_text, fill=255, font=status_font)
-
-            self._draw_face(
-                draw,
+                layout_mode=self.layout_mode,
                 status=safe_status.lower(),
-                animation_frame=safe_animation_frame,
-                canvas_width=canvas_width,
-                canvas_height=canvas_height,
-            )
-            self._draw_details_footer(
-                draw,
+                headline=safe_headline,
                 details=safe_details,
+                state_fields=safe_state_fields,
+                log_sections=safe_log_sections,
+                animation_frame=safe_animation_frame,
                 canvas_width=canvas_width,
                 canvas_height=canvas_height,
             )
@@ -423,23 +426,46 @@ class WaveshareEPD4In2V2:
         *,
         status: str,
         animation_frame: int,
-        canvas_width: int,
-        canvas_height: int,
+        center_x: int,
+        center_y: int,
+        scale: float = 1.0,
     ) -> None:
-        face_center_x = canvas_width // 2
-        face_center_y = (canvas_height // 2) + 16
+        safe_scale = self._normalise_scale(scale)
         jitter_x, jitter_y = self._face_offset(status, animation_frame)
+        jitter_x = self._scaled_offset(jitter_x, safe_scale)
+        jitter_y = self._scaled_offset(jitter_y, safe_scale)
 
-        left_eye = (face_center_x - 72 + jitter_x, face_center_y - 24 + jitter_y)
-        right_eye = (face_center_x + 72 + jitter_x, face_center_y - 24 + jitter_y)
-        self._draw_eye(draw, left_eye, status=status, side="left", animation_frame=animation_frame)
-        self._draw_eye(draw, right_eye, status=status, side="right", animation_frame=animation_frame)
+        left_eye = (
+            center_x - self._scaled_offset(72, safe_scale) + jitter_x,
+            center_y - self._scaled_offset(24, safe_scale) + jitter_y,
+        )
+        right_eye = (
+            center_x + self._scaled_offset(72, safe_scale) + jitter_x,
+            center_y - self._scaled_offset(24, safe_scale) + jitter_y,
+        )
+        self._draw_eye(
+            draw,
+            left_eye,
+            status=status,
+            side="left",
+            animation_frame=animation_frame,
+            scale=safe_scale,
+        )
+        self._draw_eye(
+            draw,
+            right_eye,
+            status=status,
+            side="right",
+            animation_frame=animation_frame,
+            scale=safe_scale,
+        )
         self._draw_mouth(
             draw,
-            center_x=face_center_x + jitter_x,
-            center_y=face_center_y + 56 + jitter_y,
+            center_x=center_x + jitter_x,
+            center_y=center_y + self._scaled_offset(56, safe_scale) + jitter_y,
             status=status,
             animation_frame=animation_frame,
+            scale=safe_scale,
         )
 
     # AUDIT-FIX(#2): Only render sanitised detail lines so exception objects or control characters cannot break the status footer.
@@ -550,53 +576,55 @@ class WaveshareEPD4In2V2:
         status: str,
         side: str,
         animation_frame: int,
+        scale: float = 1.0,
     ) -> None:
         center_x, center_y = origin
         eye = self._eye_state(status, animation_frame, side)
+        line_width = self._scaled_size(4, scale, minimum=2)
 
-        brow_y = center_y - 52 + int(eye["brow_raise"])
+        brow_y = center_y - self._scaled_offset(52, scale) + self._scaled_offset(int(eye["brow_raise"]), scale)
         if side == "left":
             draw.line(
                 (
-                    center_x - 24,
-                    brow_y + int(eye["brow_slant"]),
-                    center_x + 24,
-                    brow_y - int(eye["brow_slant"]),
+                    center_x - self._scaled_offset(24, scale),
+                    brow_y + self._scaled_offset(int(eye["brow_slant"]), scale),
+                    center_x + self._scaled_offset(24, scale),
+                    brow_y - self._scaled_offset(int(eye["brow_slant"]), scale),
                 ),
                 fill=0,
-                width=4,
+                width=line_width,
             )
         else:
             draw.line(
                 (
-                    center_x - 24,
-                    brow_y - int(eye["brow_slant"]),
-                    center_x + 24,
-                    brow_y + int(eye["brow_slant"]),
+                    center_x - self._scaled_offset(24, scale),
+                    brow_y - self._scaled_offset(int(eye["brow_slant"]), scale),
+                    center_x + self._scaled_offset(24, scale),
+                    brow_y + self._scaled_offset(int(eye["brow_slant"]), scale),
                 ),
                 fill=0,
-                width=4,
+                width=line_width,
             )
 
         if bool(eye["blink"]):
             draw.arc(
                 (
-                    center_x - 26,
-                    center_y - 8,
-                    center_x + 26,
-                    center_y + 10,
+                    center_x - self._scaled_offset(26, scale),
+                    center_y - self._scaled_offset(8, scale),
+                    center_x + self._scaled_offset(26, scale),
+                    center_y + self._scaled_offset(10, scale),
                 ),
                 start=200,
                 end=340,
                 fill=0,
-                width=5,
+                width=self._scaled_size(5, scale, minimum=2),
             )
             return
 
-        width = int(eye["width"])
-        height = int(eye["height"])
-        offset_x = int(eye["eye_shift_x"])
-        offset_y = int(eye["eye_shift_y"])
+        width = self._scaled_size(int(eye["width"]), scale, minimum=8)
+        height = self._scaled_size(int(eye["height"]), scale, minimum=8)
+        offset_x = self._scaled_offset(int(eye["eye_shift_x"]), scale)
+        offset_y = self._scaled_offset(int(eye["eye_shift_y"]), scale)
         box = (
             center_x - (width // 2) + offset_x,
             center_y - (height // 2) + offset_y,
@@ -604,20 +632,20 @@ class WaveshareEPD4In2V2:
             center_y + (height // 2) + offset_y,
         )
         draw.ellipse(box, fill=0)
-        self._draw_eye_highlights(draw, box, eye)
+        self._draw_eye_highlights(draw, box, eye, scale=scale)
 
         if bool(eye["lid_arc"]):
             draw.arc(
                 (
-                    box[0] + 4,
-                    box[1] - 10,
-                    box[2] - 4,
-                    box[1] + 18,
+                    box[0] + self._scaled_offset(4, scale),
+                    box[1] - self._scaled_offset(10, scale),
+                    box[2] - self._scaled_offset(4, scale),
+                    box[1] + self._scaled_offset(18, scale),
                 ),
                 start=180,
                 end=360,
                 fill=0,
-                width=3,
+                width=self._scaled_size(3, scale, minimum=2),
             )
 
     def _draw_mouth(
@@ -628,67 +656,109 @@ class WaveshareEPD4In2V2:
         center_y: int,
         status: str,
         animation_frame: int,
+        scale: float = 1.0,
     ) -> None:
+        line_width = self._scaled_size(4, scale, minimum=2)
         if status == "waiting":
             sway = (-1, 0, 1, 0, -1, 0)[animation_frame % 6]
             draw.arc(
-                (center_x - 24, center_y - 10 + sway, center_x + 24, center_y + 12 + sway),
+                (
+                    center_x - self._scaled_offset(24, scale),
+                    center_y - self._scaled_offset(10, scale) + self._scaled_offset(sway, scale),
+                    center_x + self._scaled_offset(24, scale),
+                    center_y + self._scaled_offset(12, scale) + self._scaled_offset(sway, scale),
+                ),
                 start=18,
                 end=162,
                 fill=0,
-                width=4,
+                width=line_width,
             )
             return
         if status == "listening":
             openness = (14, 18, 14, 12)[animation_frame % 4]
-            draw.ellipse((center_x - 10, center_y - 8, center_x + 10, center_y + openness), outline=0, width=4)
+            draw.ellipse(
+                (
+                    center_x - self._scaled_offset(10, scale),
+                    center_y - self._scaled_offset(8, scale),
+                    center_x + self._scaled_offset(10, scale),
+                    center_y + self._scaled_offset(openness, scale),
+                ),
+                outline=0,
+                width=line_width,
+            )
             return
         if status == "processing":
             offset_y = (-1, 0, 1, 0)[animation_frame % 4]
             left_segment = (
-                center_x - 22,
-                center_y + 4 + offset_y,
-                center_x - 4,
-                center_y + 2 + offset_y,
+                center_x - self._scaled_offset(22, scale),
+                center_y + self._scaled_offset(4 + offset_y, scale),
+                center_x - self._scaled_offset(4, scale),
+                center_y + self._scaled_offset(2 + offset_y, scale),
             )
             right_segment = (
-                center_x + 4,
-                center_y + 2 + offset_y,
-                center_x + 22,
-                center_y + 4 + offset_y,
+                center_x + self._scaled_offset(4, scale),
+                center_y + self._scaled_offset(2 + offset_y, scale),
+                center_x + self._scaled_offset(22, scale),
+                center_y + self._scaled_offset(4 + offset_y, scale),
             )
-            draw.line(left_segment, fill=0, width=4)
-            draw.line(right_segment, fill=0, width=4)
+            draw.line(left_segment, fill=0, width=line_width)
+            draw.line(right_segment, fill=0, width=line_width)
             return
         if status == "answering":
             openness = (8, 11, 7, 10)[animation_frame % 4]
             draw.rounded_rectangle(
-                (center_x - 22, center_y - 2, center_x + 22, center_y + openness),
-                radius=8,
+                (
+                    center_x - self._scaled_offset(22, scale),
+                    center_y - self._scaled_offset(2, scale),
+                    center_x + self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(openness, scale),
+                ),
+                radius=self._scaled_size(8, scale, minimum=2),
                 outline=0,
-                width=4,
+                width=line_width,
             )
             return
         if status == "printing":
             lift = (0, -1, 0, 1)[animation_frame % 4]
             draw.arc(
-                (center_x - 28, center_y - 6 + lift, center_x + 28, center_y + 16 + lift),
+                (
+                    center_x - self._scaled_offset(28, scale),
+                    center_y - self._scaled_offset(6, scale) + self._scaled_offset(lift, scale),
+                    center_x + self._scaled_offset(28, scale),
+                    center_y + self._scaled_offset(16, scale) + self._scaled_offset(lift, scale),
+                ),
                 start=12,
                 end=168,
                 fill=0,
-                width=4,
+                width=line_width,
             )
             return
         if status == "error":
             draw.arc(
-                (center_x - 22, center_y + 6, center_x + 22, center_y + 18),
+                (
+                    center_x - self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(6, scale),
+                    center_x + self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(18, scale),
+                ),
                 start=200,
                 end=340,
                 fill=0,
-                width=4,
+                width=line_width,
             )
             return
-        draw.arc((center_x - 20, center_y - 8, center_x + 20, center_y + 8), start=20, end=160, fill=0, width=4)
+        draw.arc(
+            (
+                center_x - self._scaled_offset(20, scale),
+                center_y - self._scaled_offset(8, scale),
+                center_x + self._scaled_offset(20, scale),
+                center_y + self._scaled_offset(8, scale),
+            ),
+            start=20,
+            end=160,
+            fill=0,
+            width=line_width,
+        )
 
     def _prepare_image(self, image: object):
         if hasattr(image, "rotate") and hasattr(image, "size"):
@@ -731,13 +801,17 @@ class WaveshareEPD4In2V2:
             self._render_count += 1
             return
 
-        if hasattr(epd, "display_Partial"):
-            prepared = epd.getbuffer(prepared_image)
-            epd.display_Partial(prepared)
-        elif hasattr(epd, "display_Fast") and hasattr(epd, "init_fast"):
+        if hasattr(epd, "display_Fast") and hasattr(epd, "init_fast"):
+            # The Waveshare 4.2 V2 vendor partial-refresh path only updates one
+            # RAM plane. For animated status faces that can flip black/white
+            # polarity after a few live refreshes, so prefer the fast path that
+            # refreshes both planes like a normal full render.
             self._init_fast(epd)
             prepared = epd.getbuffer(prepared_image)
             epd.display_Fast(prepared)
+        elif hasattr(epd, "display_Partial"):
+            prepared = epd.getbuffer(prepared_image)
+            epd.display_Partial(prepared)
         else:
             self._init_full(epd)
             prepared = epd.getbuffer(prepared_image)
@@ -845,13 +919,41 @@ class WaveshareEPD4In2V2:
 
         return state
 
-    def _draw_eye_highlights(self, draw: object, box: tuple[int, int, int, int], eye: dict[str, int | bool]) -> None:
+    def _draw_eye_highlights(
+        self,
+        draw: object,
+        box: tuple[int, int, int, int],
+        eye: dict[str, int | bool],
+        *,
+        scale: float = 1.0,
+    ) -> None:
         center_x = (box[0] + box[2]) // 2
         center_y = (box[1] + box[3]) // 2
-        main_x = center_x + int(eye["highlight_dx"])
-        main_y = center_y + int(eye["highlight_dy"])
-        draw.ellipse((main_x - 8, main_y - 8, main_x + 8, main_y + 8), fill=255)
-        draw.ellipse((main_x + 10, main_y + 8, main_x + 16, main_y + 14), fill=255)
+        main_x = center_x + self._scaled_offset(int(eye["highlight_dx"]), scale)
+        main_y = center_y + self._scaled_offset(int(eye["highlight_dy"]), scale)
+        main_radius = self._scaled_size(8, scale, minimum=2)
+        secondary_x_offset = self._scaled_offset(10, scale)
+        secondary_y_offset = self._scaled_offset(8, scale)
+        secondary_width = self._scaled_size(6, scale, minimum=2)
+        secondary_height = self._scaled_size(6, scale, minimum=2)
+        draw.ellipse(
+            (
+                main_x - main_radius,
+                main_y - main_radius,
+                main_x + main_radius,
+                main_y + main_radius,
+            ),
+            fill=255,
+        )
+        draw.ellipse(
+            (
+                main_x + secondary_x_offset,
+                main_y + secondary_y_offset,
+                main_x + secondary_x_offset + secondary_width,
+                main_y + secondary_y_offset + secondary_height,
+            ),
+            fill=255,
+        )
 
     def _split_footer_parts(self, text: str) -> tuple[str, str]:
         compact = text.strip()
@@ -959,6 +1061,19 @@ class WaveshareEPD4In2V2:
         while compact and self._text_width(draw, compact + ellipsis, font=font) > max_width:
             compact = compact[:-1].rstrip()
         return (compact + ellipsis) if compact else ellipsis
+
+    def _scaled_offset(self, value: int | float, scale: float) -> int:
+        return int(round(float(value) * scale))
+
+    def _scaled_size(self, value: int | float, scale: float, *, minimum: int = 1) -> int:
+        return max(minimum, int(round(float(value) * scale)))
+
+    def _normalise_scale(self, value: object) -> float:
+        with suppress(Exception):
+            parsed = float(value)
+            if parsed > 0:
+                return parsed
+        return 1.0
 
     # AUDIT-FIX(#1): Keep vendor imports pinned to project-local paths and reject path traversal outside project_root.
     def _resolve_vendor_dir(self, vendor_dir: Path) -> Path:
@@ -1124,8 +1239,63 @@ class WaveshareEPD4In2V2:
         text = self._normalise_text(details)
         return (text,) if text else ()
 
+    def _normalise_state_fields(self, state_fields: object) -> tuple[tuple[str, str], ...]:
+        if state_fields is None:
+            return ()
+
+        normalised: list[tuple[str, str]] = []
+        with suppress(TypeError):
+            for item in state_fields:
+                label = ""
+                value = ""
+                with suppress(Exception):
+                    label = self._normalise_text(item[0])
+                    value = self._normalise_text(item[1])
+                if not value:
+                    value = self._normalise_text(item)
+                if label or value:
+                    normalised.append((label, value))
+                if len(normalised) >= 6:
+                    break
+            return tuple(normalised)
+
+        text = self._normalise_text(state_fields)
+        return (("", text),) if text else ()
+
+    def _normalise_log_sections(
+        self,
+        log_sections: object,
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        if log_sections is None:
+            return ()
+        normalised_sections: list[tuple[str, tuple[str, ...]]] = []
+        with suppress(TypeError):
+            for section in log_sections:
+                title = ""
+                raw_lines: object = ()
+                with suppress(Exception):
+                    title = self._normalise_text(section[0])
+                    raw_lines = section[1]
+                lines = self._normalise_details(raw_lines)[:4]
+                if title or lines:
+                    normalised_sections.append((title, lines))
+                if len(normalised_sections) >= 3:
+                    break
+            return tuple(normalised_sections)
+        text = self._normalise_text(log_sections)
+        return ((text or "Log", ()),) if text else ()
+
     # AUDIT-FIX(#2): Coerce animation_frame defensively so status rendering keeps working even when callers pass floats, strings, or None.
     def _normalise_animation_frame(self, value: object) -> int:
         with suppress(Exception):
             return int(value)
         return 0
+
+    def _normalise_layout_mode(self, value: object) -> str:
+        layout_mode = self._normalise_text(value, fallback="default").lower() or "default"
+        if layout_mode not in _SUPPORTED_LAYOUT_MODES:
+            raise RuntimeError(
+                "Display layout must be one of: "
+                + ", ".join(sorted(_SUPPORTED_LAYOUT_MODES))
+            )
+        return layout_mode

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 from threading import Lock
+from typing import Any
 
-from twinr.agent.base_agent import TwinrConfig, TwinrRuntime
+from twinr.agent.base_agent import TwinrConfig
+from twinr.ops.locks import TwinrInstanceAlreadyRunningError
+from twinr.ops.runtime_env import prime_user_session_audio_env
+
+_RUNTIME_SUPERVISOR_ENV_KEY = "TWINR_RUNTIME_SUPERVISOR_ACTIVE"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -124,6 +130,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the GPIO -> STT -> tool-calling LLM -> TTS -> speaker/printer loop",
     )
     parser.add_argument(
+        "--run-runtime-supervisor",
+        action="store_true",
+        help="Run the authoritative Pi runtime supervisor for the streaming loop and remote watchdog.",
+    )
+    parser.add_argument(
+        "--self-coding-codex-self-test",
+        action="store_true",
+        help="Run the bounded self_coding Codex SDK preflight on this machine.",
+    )
+    parser.add_argument(
+        "--self-coding-live-auth-check",
+        action="store_true",
+        help="When used with --self-coding-codex-self-test, also run a tiny live Codex auth probe.",
+    )
+    parser.add_argument(
+        "--self-coding-morning-briefing-acceptance",
+        action="store_true",
+        help="Compile and execute the minimum self_coding morning-briefing acceptance flow.",
+    )
+    parser.add_argument(
+        "--self-coding-acceptance-capture-only",
+        action="store_true",
+        help="Capture morning-briefing speech in memory instead of playing it aloud during acceptance.",
+    )
+    parser.add_argument(
         "--run-orchestrator-server",
         action="store_true",
         help="Run the Twinr websocket orchestrator service",
@@ -178,6 +209,20 @@ def _should_enable_display_companion(env_file: str | Path) -> bool:
     return _uses_pi_runtime_root(env_file) and _is_raspberry_pi_host()
 
 
+def _should_ensure_remote_watchdog_companion(config: TwinrConfig, env_file: str | Path) -> bool:
+    if str(os.environ.get(_RUNTIME_SUPERVISOR_ENV_KEY, "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return False
+    if not _uses_pi_runtime_root(env_file):
+        return False
+    return (
+        config.long_term_memory_enabled
+        and str(config.long_term_memory_mode or "").strip().lower() == "remote_primary"
+        and config.long_term_memory_remote_required
+        and str(config.long_term_memory_remote_runtime_check_mode or "").strip().lower()
+        == "watchdog_artifact"
+    )
+
+
 def _assert_pi_runtime_root(env_file: str | Path, *, command_name: str) -> None:
     if not _uses_pi_runtime_root(env_file):
         return
@@ -198,23 +243,16 @@ def _assert_pi_runtime_root(env_file: str | Path, *, command_name: str) -> None:
         )
 
 
-def main() -> int:
-    args = build_parser().parse_args()
-    config = TwinrConfig.from_env(Path(args.env_file))
-    env_path = Path(args.env_file).resolve()
+def _build_runtime(config: TwinrConfig) -> Any:
+    """Create the live runtime lazily so loop locks can be acquired first."""
 
-    if args.watch_remote_memory:
-        _assert_pi_runtime_root(args.env_file, command_name="watch-remote-memory")
-        from twinr.ops import RemoteMemoryWatchdog, loop_instance_lock
+    from twinr.agent.base_agent import TwinrRuntime
 
-        watchdog = RemoteMemoryWatchdog.from_config(config)
-        print(f"remote_memory_watchdog_artifact={watchdog.artifact_path}")
-        print(f"remote_memory_watchdog_interval_s={watchdog.interval_s}")
-        print(f"remote_memory_watchdog_history_limit={watchdog.history_limit}")
-        with loop_instance_lock(config, "remote-memory-watchdog"):
-            return watchdog.run(duration_s=args.loop_duration)
+    return TwinrRuntime(config=config)
 
-    runtime = TwinrRuntime(config=config)
+
+def _print_runtime_banner(runtime: Any, config: TwinrConfig, env_path: Path) -> None:
+    """Emit the standard runtime bootstrap facts once the runtime exists."""
 
     print(f"status={runtime.status.value}")
     print(f"web_port={config.web_port}")
@@ -230,18 +268,94 @@ def main() -> int:
         print("runtime_package_root=unknown")
     print(f"runtime_env_file={env_path}")
 
-    if args.demo_transcript:
-        runtime.press_green_button()
-        print(f"status={runtime.status.value}")
-        runtime.submit_transcript(args.demo_transcript)
-        print(f"status={runtime.status.value}")
-        answer = runtime.complete_agent_turn(
-            f"Placeholder answer for: {args.demo_transcript.strip()}"
+
+def _print_self_coding_codex_report(report: Any) -> None:
+    """Emit the bounded self_coding Codex preflight result as key/value lines."""
+
+    print(f"self_coding_codex_status={getattr(report, 'status', 'unknown')}")
+    print(f"self_coding_codex_ready={str(bool(getattr(report, 'ready', False))).lower()}")
+    print(f"self_coding_codex_detail={getattr(report, 'detail', '')}")
+    if getattr(report, "node_version", None):
+        print(f"self_coding_codex_node_version={report.node_version}")
+    if getattr(report, "npm_version", None):
+        print(f"self_coding_codex_npm_version={report.npm_version}")
+    if getattr(report, "codex_version", None):
+        print(f"self_coding_codex_version={report.codex_version}")
+    print(f"self_coding_codex_auth_present={str(bool(getattr(report, 'auth_present', False))).lower()}")
+    if getattr(report, "local_self_test_ok", None) is not None:
+        print(f"self_coding_codex_bridge_self_test={str(bool(report.local_self_test_ok)).lower()}")
+    if getattr(report, "live_auth_check_ok", None) is not None:
+        print(f"self_coding_codex_live_auth_check={str(bool(report.live_auth_check_ok)).lower()}")
+
+
+def _print_morning_briefing_acceptance_result(result: Any) -> None:
+    """Emit the morning-briefing acceptance result as key/value lines."""
+
+    print("self_coding_acceptance_case=morning_briefing")
+    print(f"self_coding_acceptance_job_id={getattr(result, 'job_id', '')}")
+    print(f"self_coding_acceptance_job_status={getattr(result, 'job_status', '')}")
+    print(f"self_coding_acceptance_skill_id={getattr(result, 'skill_id', '')}")
+    print(f"self_coding_acceptance_version={getattr(result, 'version', '')}")
+    print(f"self_coding_acceptance_activation_status={getattr(result, 'activation_status', '')}")
+    print(f"self_coding_acceptance_refresh_status={getattr(result, 'refresh_status', '')}")
+    print(f"self_coding_acceptance_delivery_status={getattr(result, 'delivery_status', '')}")
+    print(f"self_coding_acceptance_delivery_delivered={str(bool(getattr(result, 'delivery_delivered', False))).lower()}")
+    print(f"self_coding_acceptance_search_calls={getattr(result, 'search_call_count', 0)}")
+    print(f"self_coding_acceptance_summary_calls={getattr(result, 'summary_call_count', 0)}")
+    print(f"self_coding_acceptance_spoken_count={getattr(result, 'spoken_count', 0)}")
+    if getattr(result, "last_summary_text", None):
+        print(f"self_coding_acceptance_last_summary={result.last_summary_text}")
+
+
+def main() -> int:
+    prime_user_session_audio_env()
+    args = build_parser().parse_args()
+    config = TwinrConfig.from_env(Path(args.env_file))
+    env_path = Path(args.env_file).resolve()
+
+    if args.watch_remote_memory:
+        _assert_pi_runtime_root(args.env_file, command_name="watch-remote-memory")
+        from twinr.ops import RemoteMemoryWatchdog, loop_instance_lock
+
+        watchdog = RemoteMemoryWatchdog.from_config(config)
+        print(f"remote_memory_watchdog_artifact={watchdog.artifact_path}")
+        print(f"remote_memory_watchdog_interval_s={watchdog.interval_s}")
+        print(f"remote_memory_watchdog_history_limit={watchdog.history_limit}")
+        with loop_instance_lock(config, "remote-memory-watchdog"):
+            return watchdog.run(duration_s=args.loop_duration)
+
+    if args.run_runtime_supervisor:
+        _assert_pi_runtime_root(args.env_file, command_name="run-runtime-supervisor")
+        from twinr.ops import loop_instance_lock
+        from twinr.ops.runtime_supervisor import TwinrRuntimeSupervisor
+
+        supervisor = TwinrRuntimeSupervisor(config=config, env_file=args.env_file)
+        with loop_instance_lock(config, "runtime-supervisor"):
+            return supervisor.run(duration_s=args.loop_duration)
+
+    if args.self_coding_codex_self_test:
+        _assert_pi_runtime_root(args.env_file, command_name="self-coding-codex-self-test")
+        from twinr.agent.self_coding.codex_driver.environment import collect_codex_sdk_environment_report
+
+        report = collect_codex_sdk_environment_report(
+            run_local_self_test=True,
+            run_live_auth_check=args.self_coding_live_auth_check,
         )
-        print(f"status={runtime.status.value}")
-        print(f"response={answer}")
-        runtime.finish_speaking()
-        print(f"status={runtime.status.value}")
+        _print_self_coding_codex_report(report)
+        return 0 if report.ready else 1
+
+    if args.self_coding_morning_briefing_acceptance:
+        _assert_pi_runtime_root(args.env_file, command_name="self-coding-morning-briefing-acceptance")
+        from twinr.agent.self_coding.live_acceptance import run_live_morning_briefing_acceptance
+
+        result = run_live_morning_briefing_acceptance(
+            project_root=config.project_root,
+            env_file=args.env_file,
+            speak_out_loud=not args.self_coding_acceptance_capture_only,
+            live_e2e_environment="pi" if _uses_pi_runtime_root(args.env_file) else "local",
+        )
+        _print_morning_briefing_acceptance_result(result)
+        return 0 if getattr(result, "delivery_delivered", False) else 1
 
     uses_openai = any(
         [
@@ -261,6 +375,56 @@ def main() -> int:
     uses_camera = bool(args.vision_camera_capture or args.camera_capture_output or args.proactive_observe_once)
 
     try:
+        if args.run_streaming_loop:
+            _assert_pi_runtime_root(args.env_file, command_name="run-streaming-loop")
+            from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
+            from twinr.display.companion import optional_display_companion
+            from twinr.ops import loop_instance_lock
+            from twinr.providers import build_streaming_provider_bundle
+            from twinr.providers.openai import OpenAIBackend
+
+            if _should_ensure_remote_watchdog_companion(config, args.env_file):
+                from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
+
+                ensure_remote_memory_watchdog_process(config, env_file=args.env_file)
+
+            with loop_instance_lock(config, "streaming-loop"):
+                with optional_display_companion(
+                    config,
+                    enabled=_should_enable_display_companion(args.env_file),
+                ):
+                    runtime = _build_runtime(config)
+                    _print_runtime_banner(runtime, config, env_path)
+                    backend = OpenAIBackend(config=config)
+                    provider_bundle = build_streaming_provider_bundle(config, support_backend=backend)
+                    loop = TwinrStreamingHardwareLoop(
+                        config=config,
+                        runtime=runtime,
+                        print_backend=provider_bundle.print_backend,
+                        stt_provider=provider_bundle.stt,
+                        verification_stt_provider=getattr(provider_bundle, "verification_stt", None),
+                        agent_provider=provider_bundle.agent,
+                        tts_provider=provider_bundle.tts,
+                        tool_agent_provider=provider_bundle.tool_agent,
+                    )
+                    return loop.run(duration_s=args.loop_duration)
+
+        runtime = _build_runtime(config)
+        _print_runtime_banner(runtime, config, env_path)
+
+        if args.demo_transcript:
+            runtime.press_green_button()
+            print(f"status={runtime.status.value}")
+            runtime.submit_transcript(args.demo_transcript)
+            print(f"status={runtime.status.value}")
+            answer = runtime.complete_agent_turn(
+                f"Placeholder answer for: {args.demo_transcript.strip()}"
+            )
+            print(f"status={runtime.status.value}")
+            print(f"response={answer}")
+            runtime.finish_speaking()
+            print(f"status={runtime.status.value}")
+
         backend = None
         if uses_openai:
             from twinr.providers.openai import OpenAIBackend
@@ -326,35 +490,16 @@ def main() -> int:
             from twinr.display.companion import optional_display_companion
             from twinr.ops import loop_instance_lock
 
+            if _should_ensure_remote_watchdog_companion(config, args.env_file):
+                from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
+
+                ensure_remote_memory_watchdog_process(config, env_file=args.env_file)
             loop = TwinrRealtimeHardwareLoop(
                 config=config,
                 runtime=runtime,
                 print_backend=backend,
             )
             with loop_instance_lock(config, "realtime-loop"):
-                with optional_display_companion(config, enabled=_should_enable_display_companion(args.env_file)):
-                    return loop.run(duration_s=args.loop_duration)
-
-        if args.run_streaming_loop:
-            _assert_pi_runtime_root(args.env_file, command_name="run-streaming-loop")
-            from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
-            from twinr.display.companion import optional_display_companion
-            from twinr.ops import loop_instance_lock
-            from twinr.providers import build_streaming_provider_bundle
-
-            if backend is None:
-                raise RuntimeError("Streaming loop requires configured providers")
-            provider_bundle = build_streaming_provider_bundle(config, support_backend=backend)
-            loop = TwinrStreamingHardwareLoop(
-                config=config,
-                runtime=runtime,
-                print_backend=provider_bundle.print_backend,
-                stt_provider=provider_bundle.stt,
-                agent_provider=provider_bundle.agent,
-                tts_provider=provider_bundle.tts,
-                tool_agent_provider=provider_bundle.tool_agent,
-            )
-            with loop_instance_lock(config, "streaming-loop"):
                 with optional_display_companion(config, enabled=_should_enable_display_companion(args.env_file)):
                     return loop.run(duration_s=args.loop_duration)
 
@@ -373,6 +518,7 @@ def main() -> int:
                 runtime=runtime,
                 print_backend=provider_bundle.print_backend,
                 stt_provider=provider_bundle.stt,
+                verification_stt_provider=getattr(provider_bundle, "verification_stt", None),
                 agent_provider=provider_bundle.agent,
                 tts_provider=provider_bundle.tts,
                 tool_agent_provider=provider_bundle.tool_agent,
@@ -407,10 +553,14 @@ def main() -> int:
 
         if args.run_hardware_loop and backend is not None:
             _assert_pi_runtime_root(args.env_file, command_name="run-hardware-loop")
-            from twinr.agent.workflows.runner import TwinrHardwareLoop
+            from twinr.agent.legacy.classic_hardware_loop import TwinrHardwareLoop
             from twinr.display.companion import optional_display_companion
             from twinr.ops import loop_instance_lock
 
+            if _should_ensure_remote_watchdog_companion(config, args.env_file):
+                from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
+
+                ensure_remote_memory_watchdog_process(config, env_file=args.env_file)
             loop = TwinrHardwareLoop(
                 config=config,
                 runtime=runtime,
@@ -624,6 +774,10 @@ def main() -> int:
             if formatted.response_id:
                 print(f"print_response_id={formatted.response_id}")
     except Exception as exc:
+        if isinstance(exc, TwinrInstanceAlreadyRunningError):
+            print(f"status={runtime.status.value}")
+            print(f"error={exc}")
+            return 1
         runtime.fail(str(exc))
         print(f"status={runtime.status.value}")
         print(f"error={exc}")

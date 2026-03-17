@@ -557,6 +557,49 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertEqual(search_calls, [{"question": "Wie wird das Wetter morgen in Schwarzenbek?"}])
         self.assertEqual(specialist.start_calls, [])
 
+    def test_run_handoff_only_passes_location_and_date_hints_to_direct_search(self) -> None:
+        supervisor = FakeSupervisorProvider()
+        specialist = FakeSpecialistProvider()
+        search_calls: list[dict[str, object]] = []
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            tool_handlers={
+                "search_live_info": lambda arguments: search_calls.append(arguments) or {"answer": "8 Grad"},
+            },
+            tool_schemas=[{"type": "function", "name": "search_live_info"}],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+
+        loop.run_handoff_only(
+            "Wie wird das Wetter morgen dort?",
+            handoff=SimpleNamespace(
+                action="handoff",
+                spoken_ack="Ich schaue kurz nach.",
+                kind="search",
+                goal="Find the weather.",
+                allow_web_search=True,
+                location_hint="Schwarzenbek",
+                date_context="Tuesday, 2026-03-17 (Europe/Berlin)",
+                response_id="prefetch_resp",
+                request_id="prefetch_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            ),
+        )
+
+        self.assertEqual(
+            search_calls,
+            [
+                {
+                    "question": "Wie wird das Wetter morgen dort?",
+                    "location_hint": "Schwarzenbek",
+                    "date_context": "Tuesday, 2026-03-17 (Europe/Berlin)",
+                }
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

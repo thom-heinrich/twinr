@@ -10,6 +10,8 @@ from threading import Event, Lock, Thread, current_thread
 from typing import Literal
 from weakref import WeakKeyDictionary
 
+from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
+
 WorkingFeedbackKind = Literal["processing", "answering", "printing"]
 
 
@@ -353,6 +355,7 @@ def start_working_feedback_loop(
     emit: Callable[[str], None] | None = None,
     profiles: Mapping[WorkingFeedbackKind, WorkingFeedbackProfile] | None = None,
     delay_override_ms: int | None = None,
+    playback_coordinator: PlaybackCoordinator | None = None,
 ) -> Callable[[], None]:
     """Start a bounded feedback loop and return its stop callback.
 
@@ -416,10 +419,12 @@ def start_working_feedback_loop(
                 while not stop_event.is_set():
                     if not _is_active_player_loop(player_state, generation, stop_event):
                         return
+                    if playback_coordinator is not None:
+                        break
                     acquired = player_state.playback_lock.acquire(timeout=0.1)
                     if acquired:
                         break
-                if not acquired:
+                if not acquired and playback_coordinator is None:
                     return
 
                 try:
@@ -429,14 +434,25 @@ def start_working_feedback_loop(
                         stop_event,
                     ):
                         return
-                    _play_sequence(
-                        player,
-                        sequence,
-                        volume=profile.volume,
-                        sample_rate=normalized_sample_rate,
-                        gap_ms=profile.gap_ms,
-                        stop_event=stop_event,
-                    )
+                    if playback_coordinator is None:
+                        _play_sequence(
+                            player,
+                            sequence,
+                            volume=profile.volume,
+                            sample_rate=normalized_sample_rate,
+                            gap_ms=profile.gap_ms,
+                            stop_event=stop_event,
+                        )
+                    else:
+                        playback_coordinator.play_tone_sequence(
+                            owner=f"working_feedback:{kind}",
+                            priority=PlaybackPriority.FEEDBACK,
+                            sequence=sequence,
+                            volume=profile.volume,
+                            sample_rate=normalized_sample_rate,
+                            gap_ms=profile.gap_ms,
+                            should_stop=stop_event.is_set,
+                        )
                 except Exception as exc:
                     # AUDIT-FIX(#5): Never emit raw exception payloads from the audio backend.
                     _safe_emit(
@@ -445,7 +461,8 @@ def start_working_feedback_loop(
                     )
                     return
                 finally:
-                    player_state.playback_lock.release()
+                    if acquired:
+                        player_state.playback_lock.release()
 
                 if stop_event.wait(max(0.05, profile.pause_ms / 1000.0)):
                     return
@@ -461,6 +478,7 @@ def start_working_feedback_loop(
     thread.start()
 
     stop_called = Event()
+    owner = f"working_feedback:{kind}"
 
     def stop() -> None:
         # AUDIT-FIX(#2): Make stop idempotent and warn if the worker could not be drained in time.
@@ -469,7 +487,10 @@ def start_working_feedback_loop(
         stop_called.set()
         stop_event.set()
         if _is_active_player_loop(player_state, generation, stop_event):
-            _stop_player_playback(player)
+            if playback_coordinator is not None:
+                playback_coordinator.stop_owner(owner)
+            else:
+                _stop_player_playback(player)
         if thread.is_alive() and thread is not current_thread():
             thread.join(timeout=1.0)
         if thread.is_alive():

@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel auth-panel">
+  <div class="section-header">
+    <div>
+      <h2>Portal sign-in</h2>
+      <p class="section-description">Use the admin account to open Twinr Control.</p>
+    </div>
+  </div>
+  <form class="auth-form" method="post" action="/auth/login">
+    <input type="hidden" name="next" value="{{ next_path }}">
+    <label class="field">
+      <span class="field-label">Username</span>
+      <input type="text" name="username" value="{{ suggested_username }}" autocomplete="username" spellcheck="false">
+    </label>
+    <label class="field">
+      <span class="field-label">Password</span>
+      <input type="password" name="password" value="" autocomplete="current-password">
+    </label>
+    <div class="auth-note">
+      First sign-in: <strong>{{ suggested_username }}</strong> / <strong>admin</strong>
+    </div>
+    <div class="actions actions-start">
+      <button type="submit">Sign in</button>
+    </div>
+  </form>
+</section>
+{% endblock %}

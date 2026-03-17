@@ -8,6 +8,7 @@ owned_concerns:
   - Define immutable contract objects shared by web presenters, routes, and templates
   - Build declared env-backed field definitions and collect fail-closed form updates
   - Parse URL-encoded request bodies and atomically read or write `.env` and text-backed settings files
+  - Persist the managed web-auth state and verify signed portal sessions without leaking raw passwords
   - Expose the curated support import surface consumed across the web package
 out_of_scope:
   - FastAPI route handling, redirects, and page composition in `src/twinr/web/app.py`
@@ -55,6 +56,18 @@ files:
       - read_text_file
       - write_env_updates
       - write_text_file
+  - path: auth.py
+    role: File-backed managed web-auth state, password hashing, and signed session helpers
+    exports:
+      - FileBackedWebAuthStore
+      - WebAuthState
+      - build_web_auth_session_cookie
+      - default_web_auth_username
+      - load_authenticated_web_session
+      - verify_web_auth_password
+      - web_auth_password_min_length
+      - web_auth_session_cookie_name
+      - web_auth_session_max_age_seconds
 public_api:
   module: twinr.web.support
   exports:
@@ -77,6 +90,7 @@ primary_callers:
   - path: src/twinr/web/presenters/memory.py
   - path: src/twinr/web/presenters/settings.py
 tests:
+  - path: test/test_web_auth.py
   - path: test/test_web_app.py
   - path: test/test_web_store.py
   - path: test/test_simple_settings.py

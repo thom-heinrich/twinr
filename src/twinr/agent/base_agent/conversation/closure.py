@@ -8,6 +8,7 @@ model output into a safe ``ConversationClosureDecision`` shape.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Event, Thread
 import inspect
 import json
 import time
@@ -70,6 +71,14 @@ class ConversationClosureDecision:
     close_now: bool
     confidence: float
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationClosureEvaluation:
+    """Capture one bounded closure-evaluation attempt for workflow consumers."""
+
+    decision: ConversationClosureDecision | None = None
+    error_type: str | None = None
 
 
 class ToolCallingConversationClosureEvaluator:
@@ -139,22 +148,21 @@ class ToolCallingConversationClosureEvaluator:
             proactive_trigger=proactive_trigger,
             conversation=compact_conversation,
         )
+        timeout_seconds = _config_float(
+            self.config,
+            "conversation_closure_provider_timeout_seconds",
+            _DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+            minimum=0.25,
+            maximum=15.0,
+        )
         provider_kwargs: dict[str, object] = {}
         if self._provider_timeout_kwarg_name is not None:
-            provider_kwargs[self._provider_timeout_kwarg_name] = _config_float(
-                self.config,
-                "conversation_closure_provider_timeout_seconds",
-                _DEFAULT_PROVIDER_TIMEOUT_SECONDS,
-                minimum=0.25,
-                maximum=15.0,
-            )
-        response = self.provider.start_turn_streaming(
-            prompt,
-            conversation=compact_conversation,
-            instructions=load_conversation_closure_instructions(self.config),
-            tool_schemas=(_CLOSURE_DECISION_TOOL_SCHEMA,),
-            allow_web_search=False,
-            **provider_kwargs,
+            provider_kwargs[self._provider_timeout_kwarg_name] = timeout_seconds
+        response = self._start_turn_streaming_with_watchdog(
+            prompt=prompt,
+            compact_conversation=compact_conversation,
+            timeout_seconds=timeout_seconds,
+            provider_kwargs=provider_kwargs,
         )
         tool_calls = getattr(response, "tool_calls", ()) or ()
         for tool_call in tool_calls:
@@ -239,3 +247,50 @@ class ToolCallingConversationClosureEvaluator:
         if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
             return "timeout_seconds"
         return None
+
+    def _start_turn_streaming_with_watchdog(
+        self,
+        *,
+        prompt: str,
+        compact_conversation: tuple[tuple[str, str], ...],
+        timeout_seconds: float,
+        provider_kwargs: dict[str, object],
+    ):
+        """Bound closure-model latency even when adapters ignore timeout kwargs."""
+
+        done = Event()
+        response_holder: list[object] = []
+        error_holder: list[BaseException] = []
+
+        def _worker() -> None:
+            try:
+                response_holder.append(
+                    self.provider.start_turn_streaming(
+                        prompt,
+                        conversation=compact_conversation,
+                        instructions=load_conversation_closure_instructions(self.config),
+                        tool_schemas=(_CLOSURE_DECISION_TOOL_SCHEMA,),
+                        allow_web_search=False,
+                        **provider_kwargs,
+                    )
+                )
+            except BaseException as exc:
+                error_holder.append(exc)
+            finally:
+                done.set()
+
+        worker = Thread(
+            target=_worker,
+            daemon=True,
+            name="twinr-closure-evaluator",
+        )
+        worker.start()
+        if not done.wait(timeout_seconds):
+            raise TimeoutError(
+                f"Conversation closure evaluation exceeded {timeout_seconds:.2f}s"
+            )
+        if error_holder:
+            raise error_holder[0]
+        if not response_holder:
+            raise RuntimeError("Conversation closure evaluation returned no response")
+        return response_holder[0]

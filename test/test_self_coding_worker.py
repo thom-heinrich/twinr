@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 import json
 import sys
@@ -27,6 +28,8 @@ from twinr.agent.self_coding.codex_driver import (
     CodexCompileRequest,
     CodexCompileResult,
     CodexDriverUnavailableError,
+    CodexExecFallbackDriver,
+    CodexSdkDriver,
 )
 from twinr.agent.self_coding.worker import SelfCodingCompileWorker
 
@@ -86,7 +89,33 @@ def _ready_session() -> RequirementsDialogueSession:
     )
 
 
+def _ready_skill_package_session() -> RequirementsDialogueSession:
+    return RequirementsDialogueSession(
+        session_id="dialogue_briefing123",
+        request_summary="Every day at 08:00 research three topics, write a short German abstract, and read it aloud when I enter the room.",
+        skill_name="Morning Briefing",
+        action="Research three topics, write a short German abstract, and read it aloud when I enter the room.",
+        capabilities=("web_search", "llm_call", "memory", "speaker", "camera", "scheduler", "safety"),
+        feasibility=FeasibilityResult(
+            outcome=FeasibilityOutcome.YELLOW,
+            summary="Needs the skill-package path.",
+            suggested_target=CompileTarget.SKILL_PACKAGE,
+        ),
+        status=RequirementsDialogueStatus.READY_FOR_COMPILE,
+        trigger_mode="push",
+        trigger_conditions=("camera_person_visible", "daily_0800"),
+        scope={"channel": "voice", "time_of_day": "08:00", "query_count": 3},
+        constraints=("read_once_per_morning", "quiet_at_night"),
+    )
+
+
 class SelfCodingCompileWorkerTests(unittest.TestCase):
+    def test_local_codex_driver_defaults_to_sdk_primary_and_exec_fallback(self) -> None:
+        driver = LocalCodexCompileDriver()
+
+        self.assertIsInstance(driver.primary, CodexSdkDriver)
+        self.assertIsInstance(driver.fallback, CodexExecFallbackDriver)
+
     def test_local_codex_driver_falls_back_when_primary_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -262,7 +291,27 @@ class SelfCodingCompileWorkerTests(unittest.TestCase):
             session = _ready_session()
 
             first = worker.ensure_job_for_session(session)
-            second = worker.ensure_job_for_session(replace(session, action="Read new email aloud slowly"))
+            second = worker.ensure_job_for_session(replace(session, answer_summaries={"when": "immediately"}))
+
+        self.assertEqual(first.job_id, second.job_id)
+
+    def test_worker_reuses_existing_job_when_only_created_at_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SelfCodingStore.from_project_root(temp_dir)
+            worker = SelfCodingCompileWorker(
+                store=store,
+                driver=_FakeCompileDriver(CodexCompileResult(status="ok", summary="done")),
+            )
+            session = _ready_session()
+
+            first = worker.ensure_job_for_session(session)
+            second = worker.ensure_job_for_session(
+                replace(
+                    session,
+                    created_at=session.created_at + timedelta(minutes=5),
+                    updated_at=session.updated_at + timedelta(minutes=5),
+                )
+            )
 
         self.assertEqual(first.job_id, second.job_id)
 
@@ -286,8 +335,28 @@ class SelfCodingCompileWorkerTests(unittest.TestCase):
         self.assertIn('"kind": "time"', prompt)
         self.assertIn('"time_of_day": "08:00"', prompt)
         self.assertIn('"kind": "say"', prompt)
+        self.assertIn("Relevant Twinr module APIs:", prompt)
+        self.assertIn("ask_and_wait(question: str) -> str", prompt)
         self.assertIn("`mode`", prompt)
         self.assertIn("`conditions`", prompt)
+
+    def test_worker_build_prompt_keeps_skill_package_context_on_ctx_api_surface(self) -> None:
+        session = _ready_skill_package_session()
+        job = CompileJobRecord(
+            job_id="job_skill_prompt123",
+            skill_id="morning_briefing",
+            skill_name="Morning Briefing",
+            status=CompileJobStatus.QUEUED,
+            requested_target=CompileTarget.SKILL_PACKAGE,
+            spec_hash="skill-prompt-spec",
+        )
+
+        prompt = SelfCodingCompileWorker._build_prompt(job, session)
+
+        self.assertIn("ctx.search_web", prompt)
+        self.assertIn("ctx.store_json", prompt)
+        self.assertIn("Relevant capability modules:", prompt)
+        self.assertNotIn("Relevant Twinr module APIs:", prompt)
 
 
 if __name__ == "__main__":

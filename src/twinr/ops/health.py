@@ -16,6 +16,7 @@ import subprocess
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
+from twinr.display.heartbeat import assess_display_companion_health
 from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.locks import loop_lock_owner
 from twinr.ops.paths import resolve_ops_paths_for_config
@@ -460,11 +461,10 @@ def _apply_display_companion_health(
     if display_service.running or display_service.count != 0:
         return services
 
-    owner_pid = loop_lock_owner(config, "display-loop")
-    if owner_pid is None:
+    companion = assess_display_companion_health(config, loop_owner_fn=loop_lock_owner)
+    if companion.owner_pid is None:
         return services
 
-    companion_detail = f"pid={owner_pid} display-companion"
     updated: list[ServiceHealth] = []
     for service in services:
         if service.key != "display":
@@ -474,9 +474,9 @@ def _apply_display_companion_health(
             ServiceHealth(
                 key=service.key,
                 label=service.label,
-                running=True,
-                count=1,
-                detail=companion_detail,
+                running=companion.running,
+                count=companion.count,
+                detail=_truncate_text(companion.detail, _MAX_SERVICE_DETAIL_LENGTH),
             )
         )
     return tuple(updated)

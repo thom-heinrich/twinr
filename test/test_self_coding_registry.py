@@ -7,6 +7,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.self_coding import CapabilityStatus, SelfCodingCapabilityRegistry
+from twinr.agent.self_coding.modules import MODULE_LIBRARY
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,7 @@ class SelfCodingCapabilityRegistryTests(unittest.TestCase):
                 "camera",
                 "pir",
                 "speaker",
+                "web_search",
                 "llm_call",
                 "memory",
                 "scheduler",
@@ -46,6 +48,21 @@ class SelfCodingCapabilityRegistryTests(unittest.TestCase):
                 "email",
                 "calendar",
             ),
+        )
+
+    def test_registry_exposes_matching_module_specs(self) -> None:
+        registry = SelfCodingCapabilityRegistry(
+            project_root=".",
+            integration_runtime_factory=lambda *args, **kwargs: _FakeManagedIntegrationsRuntime(),
+        )
+
+        self.assertEqual(
+            tuple(spec.module_name for spec in registry.module_specs()),
+            tuple(spec.module_name for spec in MODULE_LIBRARY),
+        )
+        self.assertEqual(
+            registry.module_spec_for("speaker").capability_definition(),
+            registry.definition_for("speaker"),
         )
 
     def test_registry_maps_integration_readiness_to_capability_status(self) -> None:
@@ -61,7 +78,7 @@ class SelfCodingCapabilityRegistryTests(unittest.TestCase):
                 _FakeIntegrationReadiness(
                     integration_id="calendar_agenda",
                     label="Calendar",
-                    status="warn",
+                    status="missing",
                     summary="Calendar needs setup.",
                     detail="Missing ICS source.",
                 ),
@@ -100,7 +117,7 @@ class SelfCodingCapabilityRegistryTests(unittest.TestCase):
         assert calendar is not None
         self.assertEqual(email.status, CapabilityStatus.BLOCKED)
         self.assertEqual(calendar.status, CapabilityStatus.BLOCKED)
-        self.assertIn("integration store unavailable", email.detail)
+        self.assertEqual(email.detail, "Managed integration readiness could not be loaded.")
 
 
 if __name__ == "__main__":

@@ -232,6 +232,31 @@ class TwinrRuntimeContextMixin:
             messages.append((str(role), str(content)))
         return tuple(messages)
 
+    def _local_summary_context_unlocked(self, *, limit: int = 1) -> tuple[tuple[str, str], ...]:
+        """Return bounded on-device summary context without remote retrieval.
+
+        The first-word lane is latency-critical. It may use Twinr's already
+        materialized on-device summary turn, but it must not synchronously call
+        remote long-term retrieval while the user is waiting for the first
+        spoken answer.
+        """
+
+        if limit <= 0:
+            return ()
+        turns = tuple(getattr(getattr(self, "memory", None), "turns", ()) or ())
+        messages: list[tuple[str, str]] = []
+        for turn in turns:
+            role = getattr(turn, "role", None)
+            if role != "system":
+                continue
+            content = str(getattr(turn, "content", "") or "").strip()
+            if not content:
+                continue
+            messages.append(("system", content))
+            if len(messages) >= limit:
+                break
+        return tuple(messages)
+
     def conversation_context(self) -> tuple[tuple[str, str], ...]:
         """Return the current short-term conversation context tuple."""
 
@@ -324,7 +349,12 @@ class TwinrRuntimeContextMixin:
             return tuple(messages)
 
     def supervisor_provider_conversation_context(self) -> tuple[tuple[str, str], ...]:
-        """Return the reduced fast-lane supervisor context window."""
+        """Return the reduced fast-lane supervisor context window.
+
+        The supervisor stays remote-free for latency, but it still receives one
+        local summary turn so direct conversational replies can reuse the
+        already-materialized on-device memory summary.
+        """
 
         with self._runtime_context_lock():
             messages: list[tuple[str, str]] = []
@@ -343,6 +373,7 @@ class TwinrRuntimeContextMixin:
             if guidance:
                 messages.append(("system", guidance))
 
+            messages.extend(self._local_summary_context_unlocked(limit=1))
             messages.extend(
                 self._raw_tail_context_unlocked(limit=max(int(self.config.streaming_supervisor_context_turns), 0))
             )
@@ -368,28 +399,7 @@ class TwinrRuntimeContextMixin:
             if guidance:
                 messages.append(("system", guidance))
 
-            last_transcript = str(getattr(self, "last_transcript", "") or "")
-            if last_transcript:
-                try:
-                    memory_context = self.long_term_memory.build_provider_context(last_transcript)
-                    for memory_message in memory_context.system_messages()[:1]:
-                        normalized_memory_message = str(memory_message or "").strip()
-                        if normalized_memory_message:
-                            messages.append(("system", normalized_memory_message))
-                except LongTermRemoteUnavailableError as exc:
-                    if self._remote_long_term_failure_is_fatal():
-                        raise
-                    self._safe_append_ops_event(
-                        event="first_word_context_memory_failed",
-                        message="Twinr skipped relevant long-term memory context for the fast lane because the remote snapshot is unavailable.",
-                        data={"error_type": type(exc).__name__},
-                    )
-                except Exception as exc:
-                    self._safe_append_ops_event(
-                        event="first_word_context_memory_failed",
-                        message="Twinr skipped relevant long-term memory context for the fast lane after a runtime error.",
-                        data={"error_type": type(exc).__name__},
-                    )
+            messages.extend(self._local_summary_context_unlocked(limit=1))
 
             messages.extend(
                 self._raw_tail_context_unlocked(limit=max(int(self.config.streaming_first_word_context_turns), 0))

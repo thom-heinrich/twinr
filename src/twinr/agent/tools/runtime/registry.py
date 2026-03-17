@@ -27,6 +27,8 @@ _REALTIME_TOOL_BINDINGS: tuple[tuple[str, str], ...] = (
     ("answer_skill_question", "handle_answer_skill_question"),
     ("confirm_skill_activation", "handle_confirm_skill_activation"),
     ("rollback_skill_activation", "handle_rollback_skill_activation"),
+    ("pause_skill_activation", "handle_pause_skill_activation"),
+    ("reactivate_skill_activation", "handle_reactivate_skill_activation"),
     ("remember_memory", "handle_remember_memory"),
     ("remember_contact", "handle_remember_contact"),
     ("lookup_contact", "handle_lookup_contact"),

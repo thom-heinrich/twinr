@@ -3,11 +3,13 @@ name: hardware
 path: hardware
 kind: script-directory
 visibility: internal
-summary: Provide Raspberry Pi setup, probe, smoke-test scripts, and Pi-side watchdog unit definitions for Twinr.
+summary: Provide Raspberry Pi setup, probe, smoke-test scripts, Pi-side authoritative runtime supervision units, and the self-coding Codex bootstrap entrypoint for Twinr.
 owned_concerns:
   - Persist Raspberry Pi hardware settings into Twinr env files and OS configuration
   - Install vendor or system dependencies needed for the display, audio, and printer paths
-  - Stage Pi-side systemd units for permanent operational watchdogs
+  - Stage Pi-side productive systemd units for authoritative runtime supervision and the web portal
+  - Retire standalone break-glass units out of the tracked hardware tree once they are no longer part of product operation
+  - Bootstrap the Pi-side self-coding Codex bridge, CLI, and auth prerequisites from the leading repo
   - Run bounded manual probes for buttons, PIR motion, display, and printer setup
 out_of_scope:
   - Runtime device adapters in src/twinr/hardware and src/twinr/display
@@ -26,8 +28,10 @@ files:
     role: Run the standalone status display loop for manual validation
   - path: mic/setup_audio.sh
     role: Configure ALSA or PipeWire defaults and optional proactive-audio env keys
-  - path: ops/twinr-remote-memory-watchdog.service
-    role: Keep the rolling remote-memory watchdog running as a permanent Pi service
+  - path: ops/bootstrap_self_coding_pi.py
+    role: Reproducibly sync the pinned self-coding Codex bridge/auth to the Pi and run the remote readiness self-test
+  - path: ops/twinr-runtime-supervisor.service
+    role: Authoritatively supervise the productive streaming loop plus remote watchdog on the Pi
   - path: pir/setup_pir.sh
     role: Persist PIR GPIO settings and optionally run the motion probe
   - path: pir/probe_pir.py

@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Compile telemetry</h2>
+      <p class="section-description">Latest compile run and explicit live proof status.</p>
+    </div>
+  </div>
+  <div class="stats-grid">
+    <div class="stat-tile">
+      <span class="stat-label">Active skills</span>
+      <span class="stat-value">{{ operator_status.active_count }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Soft launch</span>
+      <span class="stat-value">{{ operator_status.soft_launch_count }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Paused</span>
+      <span class="stat-value">{{ operator_status.paused_count }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Driver</span>
+      <span class="stat-value stat-value-small">{{ operator_status.latest_driver_name or "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Model</span>
+      <span class="stat-value stat-value-small">{{ latest_compile_diagnostics.model or "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Reasoning</span>
+      <span class="stat-value stat-value-small">{{ latest_compile_diagnostics.reasoning_effort or "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Duration</span>
+      <span class="stat-value stat-value-small">{{ latest_compile_diagnostics.duration_seconds if latest_compile_diagnostics.duration_seconds is not none else "—" }}</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">Fallback</span>
+      <span class="stat-value stat-value-small">{{ latest_compile_diagnostics.fallback_reason or "—" }}</span>
+    </div>
+  </div>
+  {% if latest_live_e2e %}
+  <div class="key-value-grid">
+    <div class="key-value">
+      <span class="key">Latest live e2e</span>
+      <span class="value">{{ latest_live_e2e.suite_id }} · {{ latest_live_e2e.environment }} · {{ latest_live_e2e.status }}</span>
+    </div>
+    <div class="key-value">
+      <span class="key">Live e2e model</span>
+      <span class="value">{{ latest_live_e2e.model or "—" }}</span>
+    </div>
+    <div class="key-value">
+      <span class="key">Live e2e duration</span>
+      <span class="value">{{ latest_live_e2e.duration_seconds if latest_live_e2e.duration_seconds is not none else "—" }}</span>
+    </div>
+    <div class="key-value">
+      <span class="key">Details</span>
+      <span class="value">{{ latest_live_e2e.details or "—" }}</span>
+    </div>
+  </div>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Watchdog</h2>
+      <p class="section-description">Stale compile or execution work that should be inspected or explicitly cleaned up.</p>
+    </div>
+  </div>
+  {% if watchdog_snapshot.stale_compile_runs or watchdog_snapshot.stale_execution_runs %}
+  <div class="detail-grid">
+    {% for row in watchdog_snapshot.stale_compile_runs %}
+    <article class="detail-card detail-card-wide">
+      <span class="detail-label">Compile {{ row.job_id }}</span>
+      <div class="detail-body detail-body-copy">
+        {{ row.phase }} · {{ row.age_seconds|round(1) }}s stale
+        {% if row.skill_name %} · {{ row.skill_name }}{% endif %}
+        {% if row.reason %} · {{ row.reason }}{% endif %}
+      </div>
+      <div class="link-row">
+        <form method="post" action="/ops/self-coding/cleanup-compile">
+          <input type="hidden" name="job_id" value="{{ row.job_id }}">
+          <button type="submit">Clean up stale compile</button>
+        </form>
+      </div>
+    </article>
+    {% endfor %}
+    {% for row in watchdog_snapshot.stale_execution_runs %}
+    <article class="detail-card detail-card-wide">
+      <span class="detail-label">Run {{ row.run_id }}</span>
+      <div class="detail-body detail-body-copy">
+        {{ row.run_kind }} · v{{ row.version }} · {{ row.age_seconds|round(1) }}s stale
+        {% if row.reason %} · {{ row.reason }}{% endif %}
+      </div>
+      <div class="link-row">
+        <form method="post" action="/ops/self-coding/cleanup-run">
+          <input type="hidden" name="run_id" value="{{ row.run_id }}">
+          <button type="submit">Clean up stale run</button>
+        </form>
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No stale self-coding compile or execution runs are visible.</div>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>Learned skills</h2>
+      <p class="section-description">Operate the full learned-skill lifecycle without losing version history or compile telemetry.</p>
+    </div>
+  </div>
+  {% if skill_rows %}
+  <div class="detail-grid">
+    {% for row in skill_rows %}
+    <article class="detail-card detail-card-wide">
+      <span class="detail-label">{{ row.skill_name }}</span>
+      <div class="detail-body detail-body-copy">
+        Version {{ row.version }} · {{ row.status }}
+        {% if row.artifact_kind %} · {{ row.artifact_kind }}{% endif %}
+        {% if row.health_status %} · health {{ row.health_status }}{% endif %}
+        {% if row.pause_reason %} · pause {{ row.pause_reason }}{% endif %}
+      </div>
+      {% if row.sandbox_allowed_methods %}
+      <div class="detail-body detail-body-copy">
+        Sandbox methods: {{ row.sandbox_allowed_methods|join(", ") }}
+      </div>
+      {% endif %}
+      <div class="detail-body detail-body-copy">
+        Triggers {{ row.trigger_count if row.trigger_count is not none else 0 }} · Delivered {{ row.delivered_count if row.delivered_count is not none else 0 }} · Errors {{ row.error_count if row.error_count is not none else 0 }}
+      </div>
+      <div class="link-row">
+        {% if row.can_pause %}
+        <form method="post" action="/ops/self-coding/pause">
+          <input type="hidden" name="skill_id" value="{{ row.skill_id }}">
+          <input type="hidden" name="version" value="{{ row.version }}">
+          <input type="hidden" name="reason" value="operator_pause">
+          <button type="submit">Pause skill</button>
+        </form>
+        {% endif %}
+        {% if row.can_reactivate %}
+        <form method="post" action="/ops/self-coding/reactivate">
+          <input type="hidden" name="skill_id" value="{{ row.skill_id }}">
+          <input type="hidden" name="version" value="{{ row.version }}">
+          <button type="submit">Reactivate skill</button>
+        </form>
+        {% endif %}
+        {% if row.can_rollback %}
+        <form method="post" action="/ops/self-coding/rollback">
+          <input type="hidden" name="skill_id" value="{{ row.skill_id }}">
+          <input type="hidden" name="target_version" value="{{ row.rollback_target_version }}">
+          <button type="submit">Rollback skill</button>
+        </form>
+        {% endif %}
+        {% if row.can_retest %}
+        <form method="post" action="/ops/self-coding/retest">
+          <input type="hidden" name="skill_id" value="{{ row.skill_id }}">
+          <input type="hidden" name="version" value="{{ row.version }}">
+          <button type="submit">Retest skill</button>
+        </form>
+        {% endif %}
+        {% if row.can_cleanup %}
+        <form method="post" action="/ops/self-coding/cleanup">
+          <input type="hidden" name="skill_id" value="{{ row.skill_id }}">
+          <input type="hidden" name="version" value="{{ row.version }}">
+          <button type="submit">Clean up version</button>
+        </form>
+        {% endif %}
+      </div>
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">No learned self-coding skills are stored yet.</div>
+  {% endif %}
+</section>
+{% endblock %}

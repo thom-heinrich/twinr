@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import threading
+import time
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.longterm.ingestion.backfill import (
@@ -60,7 +61,7 @@ from twinr.memory.longterm.ingestion.sensor_memory import LongTermSensorMemoryCo
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder, LongTermSubtextCompiler
 from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
-from twinr.memory.longterm.runtime.health import LongTermRemoteHealthProbe
+from twinr.memory.longterm.runtime.health import LongTermRemoteHealthProbe, LongTermRemoteWarmResult
 from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter, AsyncLongTermMultimodalWriter
 
 
@@ -240,6 +241,60 @@ def _sort_conflicts(items: Iterable[Any]) -> tuple[Any, ...]:
     return tuple(sorted(items, key=lambda row: (row.slot_key, row.candidate_memory_id)))
 
 
+@dataclass(frozen=True, slots=True)
+class LongTermRemoteReadinessStep:
+    """Capture one readiness step executed by the runtime service."""
+
+    name: str
+    status: str
+    latency_ms: float
+    detail: str | None = None
+    warm_result: LongTermRemoteWarmResult | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe summary for ops artifacts."""
+
+        payload: dict[str, object] = {
+            "name": self.name,
+            "status": self.status,
+            "latency_ms": self.latency_ms,
+            "detail": self.detail,
+        }
+        if self.warm_result is not None:
+            payload["warm_result"] = self.warm_result.to_dict()
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class LongTermRemoteReadinessResult:
+    """Capture the full fail-closed remote readiness proof for one probe."""
+
+    ready: bool
+    detail: str | None
+    remote_status: LongTermRemoteStatus
+    steps: tuple[LongTermRemoteReadinessStep, ...]
+    warm_result: LongTermRemoteWarmResult | None = None
+    total_latency_ms: float = 0.0
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe summary for watchdog artifacts and debugging."""
+
+        payload: dict[str, object] = {
+            "ready": self.ready,
+            "detail": self.detail,
+            "remote_status": {
+                "mode": self.remote_status.mode,
+                "ready": self.remote_status.ready,
+                "detail": self.remote_status.detail,
+            },
+            "steps": [step.to_dict() for step in self.steps],
+            "total_latency_ms": self.total_latency_ms,
+        }
+        if self.warm_result is not None:
+            payload["warm_result"] = self.warm_result.to_dict()
+        return payload
+
+
 @dataclass(slots=True)
 class LongTermMemoryService:
     """Coordinate Twinr long-term memory runtime flows.
@@ -399,7 +454,97 @@ class LongTermMemoryService:
             _store_lock=store_lock,
         )
 
-    def ensure_remote_ready(self) -> None:
+    def probe_remote_ready(self) -> LongTermRemoteReadinessResult:
+        """Return structured required-remote readiness evidence for runtime use."""
+
+        remote_state = getattr(self.prompt_context_store.memory_store, "remote_state", None)
+        if remote_state is None or not remote_state.enabled:
+            return LongTermRemoteReadinessResult(
+                ready=False,
+                detail="Remote-primary long-term memory is disabled.",
+                remote_status=LongTermRemoteStatus(mode="disabled", ready=False),
+                steps=(),
+                total_latency_ms=0.0,
+            )
+        steps: list[LongTermRemoteReadinessStep] = []
+        started = time.monotonic()
+        status_started = time.monotonic()
+        status = remote_state.status()
+        steps.append(
+            LongTermRemoteReadinessStep(
+                name="remote_status",
+                status="ok" if status.ready else "fail",
+                latency_ms=round(max(0.0, (time.monotonic() - status_started) * 1000.0), 3),
+                detail=status.detail,
+            )
+        )
+        if not status.ready:
+            return LongTermRemoteReadinessResult(
+                ready=False,
+                detail=status.detail or "Remote-primary long-term memory is not ready.",
+                remote_status=status,
+                steps=tuple(steps),
+                total_latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
+            )
+        with self._store_lock:
+            for step_name, callback in (
+                ("prompt_context_store.ensure_remote_snapshots", self.prompt_context_store.ensure_remote_snapshots),
+                ("graph_store.ensure_remote_snapshot", self.graph_store.ensure_remote_snapshot),
+                ("object_store.ensure_remote_snapshots", self.object_store.ensure_remote_snapshots),
+                ("midterm_store.ensure_remote_snapshot", self.midterm_store.ensure_remote_snapshot),
+            ):
+                step_started = time.monotonic()
+                try:
+                    callback()
+                except Exception as exc:
+                    steps.append(
+                        LongTermRemoteReadinessStep(
+                            name=step_name,
+                            status="fail",
+                            latency_ms=round(max(0.0, (time.monotonic() - step_started) * 1000.0), 3),
+                            detail=f"{type(exc).__name__}: {exc}",
+                        )
+                    )
+                    return LongTermRemoteReadinessResult(
+                        ready=False,
+                        detail=f"{type(exc).__name__}: {exc}",
+                        remote_status=status,
+                        steps=tuple(steps),
+                        total_latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
+                    )
+                steps.append(
+                    LongTermRemoteReadinessStep(
+                        name=step_name,
+                        status="ok",
+                        latency_ms=round(max(0.0, (time.monotonic() - step_started) * 1000.0), 3),
+                    )
+                )
+            warm_started = time.monotonic()
+            warm_result = LongTermRemoteHealthProbe(
+                prompt_context_store=self.prompt_context_store,
+                object_store=self.object_store,
+                graph_store=self.graph_store,
+                midterm_store=self.midterm_store,
+            ).probe_operational()
+            steps.append(
+                LongTermRemoteReadinessStep(
+                    name="LongTermRemoteHealthProbe.probe_operational",
+                    status="ok" if warm_result.ready else "fail",
+                    latency_ms=round(max(0.0, (time.monotonic() - warm_started) * 1000.0), 3),
+                    detail=warm_result.detail,
+                    warm_result=warm_result,
+                )
+            )
+        return LongTermRemoteReadinessResult(
+            ready=warm_result.ready,
+            detail=warm_result.detail,
+            remote_status=status,
+            steps=tuple(steps),
+            warm_result=warm_result,
+            total_latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
+        )
+
+    def ensure_remote_ready(self) -> LongTermRemoteReadinessResult:
         """Prove required remote-primary long-term state is ready to use.
 
         Raises:
@@ -407,27 +552,14 @@ class LongTermMemoryService:
                 required snapshot is unavailable.
         """
 
-        remote_state = getattr(self.prompt_context_store.memory_store, "remote_state", None)
-        if remote_state is None or not remote_state.enabled:
-            return
-        status = remote_state.status()
-        if not status.ready:
-            if remote_state.required:
-                raise LongTermRemoteUnavailableError(
-                    status.detail or "Remote-primary long-term memory is not ready."
-                )
-            return
-        with self._store_lock:
-            self.prompt_context_store.ensure_remote_snapshots()
-            self.graph_store.ensure_remote_snapshot()
-            self.object_store.ensure_remote_snapshots()
-            self.midterm_store.ensure_remote_snapshot()
-            LongTermRemoteHealthProbe(
-                prompt_context_store=self.prompt_context_store,
-                object_store=self.object_store,
-                graph_store=self.graph_store,
-                midterm_store=self.midterm_store,
-            ).ensure_operational()
+        result = self.probe_remote_ready()
+        if result.ready:
+            return result
+        if self.remote_required():
+            raise LongTermRemoteUnavailableError(
+                result.detail or "Remote-primary long-term memory is not ready."
+            )
+        return result
 
     def remote_required(self) -> bool:
         """Report whether runtime callers must hard-fail on remote loss."""
