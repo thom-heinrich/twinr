@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import logging
 import mimetypes
 import os
 import stat
@@ -49,6 +50,8 @@ _NO_SPEECH_TIMEOUT_MARKERS: tuple[str, ...] = (
     "timeout waiting for user speech",
     "no input audio received",
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _default_emit(line: str) -> None:
@@ -216,7 +219,18 @@ class TwinrRealtimeSupportMixin:
         if callable(checker):
             try:
                 return bool(checker())
-            except Exception:
+            except Exception as exc:
+                error_text = self._safe_error_text(exc)
+                self._trace_event(
+                    "remote_dependency_required_check_failed",
+                    kind="error",
+                    details={"error": error_text},
+                    level="WARNING",
+                )
+                _LOGGER.warning(
+                    "remote_dependency_required() failed; assuming remote dependency is not required.",
+                    exc_info=True,
+                )
                 return False
         config = getattr(self, "config", None)
         return bool(
@@ -241,8 +255,13 @@ class TwinrRealtimeSupportMixin:
             try:
                 stop_from_coordinator()
                 return
-            except Exception:
-                pass
+            except Exception as exc:
+                self._trace_event(
+                    "required_remote_stop_from_coordinator_failed",
+                    kind="error",
+                    level="ERROR",
+                    details={"error_type": type(exc).__name__, "error": self._safe_error_text(exc)},
+                )
         player = getattr(self, "player", None)
         stop_fn = getattr(player, "stop_playback", None)
         if not callable(stop_fn):
@@ -251,7 +270,13 @@ class TwinrRealtimeSupportMixin:
             return
         try:
             stop_fn()
-        except Exception:
+        except Exception as exc:
+            self._trace_event(
+                "required_remote_stop_player_failed",
+                kind="error",
+                level="ERROR",
+                details={"error_type": type(exc).__name__, "error": self._safe_error_text(exc)},
+            )
             return
 
     def _enter_required_remote_error(self, exc: BaseException | str) -> bool:
@@ -281,8 +306,13 @@ class TwinrRealtimeSupportMixin:
         if callable(request_interrupt):
             try:
                 request_interrupt("required_remote")
-            except Exception:
-                pass
+            except Exception as exc:
+                self._trace_event(
+                    "required_remote_interrupt_request_failed",
+                    kind="error",
+                    level="ERROR",
+                    details={"error_type": type(exc).__name__, "error": self._safe_error_text(exc)},
+                )
         self._best_effort_stop_player()
         self.runtime.fail(message)
         self._emit_status(force=True)
@@ -304,7 +334,13 @@ class TwinrRealtimeSupportMixin:
         if callable(request_refresh):
             try:
                 request_refresh()
-            except Exception:
+            except Exception as exc:
+                self._trace_event(
+                    "required_remote_refresh_request_failed",
+                    kind="error",
+                    level="ERROR",
+                    details={"error_type": type(exc).__name__, "error": self._safe_error_text(exc)},
+                )
                 return
 
     def _refresh_required_remote_dependency(self, *, force: bool = False, force_sync: bool = False) -> bool:

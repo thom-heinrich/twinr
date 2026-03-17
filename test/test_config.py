@@ -15,6 +15,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(_parse_float("0.1", 2.0, minimum=0.25), 0.25)
         self.assertEqual(_parse_float("9.5", 2.0, maximum=5.0), 5.0)
         self.assertEqual(_parse_float(None, 2.0, minimum=1.0), 2.0)
+        self.assertEqual(_parse_float(12.5, 2.0, minimum=1.0), 12.5)
 
     def test_frontier_streaming_defaults_favor_fast_search_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -61,6 +62,15 @@ class TwinrConfigTests(unittest.TestCase):
             config = TwinrConfig.from_env(env_path)
 
         self.assertEqual(config.display_layout, "debug_log")
+
+    def test_from_env_reads_display_busy_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("TWINR_DISPLAY_BUSY_TIMEOUT_S=12.5\n", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_busy_timeout_s, 12.5)
 
     def test_reads_openai_button_and_printer_settings_from_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -666,6 +676,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_height, 300)
         self.assertEqual(config.display_rotation_degrees, 270)
         self.assertEqual(config.display_full_refresh_interval, 120)
+        self.assertEqual(config.display_busy_timeout_s, 20.0)
         self.assertEqual(config.printer_queue, "Twinr_Test_Printer")
         self.assertEqual(
             config.printer_device_uri,

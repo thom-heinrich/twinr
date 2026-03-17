@@ -727,7 +727,7 @@ def _looks_like_local_model_path(value: str) -> bool:
         if os.altsep:
             separators.append(os.altsep)
     except Exception:  # pragma: no cover - defensive only
-        pass
+        LOGGER.warning("Failed to inspect local path separators for wakeword model path detection.", exc_info=True)
     return (
         value.startswith(("~", ".", "/"))
         or any(separator and separator in value for separator in separators)

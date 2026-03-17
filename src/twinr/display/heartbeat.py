@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -23,6 +24,8 @@ _DISPLAY_HEARTBEAT_RELATIVE_PATH = Path("artifacts") / "stores" / "ops" / "displ
 _DEFAULT_STALE_AFTER_S = 15.0
 _DEFAULT_RENDERING_STALE_AFTER_S = 30.0
 _MIN_STALE_AFTER_S = 5.0
+
+_LOGGER = logging.getLogger(__name__)
 
 LoopOwnerFn = Callable[[TwinrConfig, str], int | None]
 
@@ -124,12 +127,15 @@ class DisplayHeartbeatStore:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except Exception:
+            _LOGGER.warning("Failed to read display heartbeat from %s.", self.path, exc_info=True)
             return None
         if not isinstance(payload, dict):
+            _LOGGER.warning("Ignoring invalid display heartbeat payload at %s because it is not an object.", self.path)
             return None
         try:
             return DisplayHeartbeat.from_dict(payload)
         except Exception:
+            _LOGGER.warning("Ignoring invalid display heartbeat payload at %s.", self.path, exc_info=True)
             return None
 
     def save(self, heartbeat: DisplayHeartbeat) -> None:

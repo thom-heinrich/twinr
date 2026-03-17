@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
 from typing import TYPE_CHECKING, Any, Callable
+import logging
 import os
 import tempfile
 import time
@@ -49,6 +50,8 @@ _MAX_WAKEWORD_STREAM_EVENTS_PER_CYCLE = 8
 _DEFAULT_CLOSE_JOIN_TIMEOUT_S = 5.0
 _MAX_CAPTURE_PHRASE_TOKEN_LEN = 64
 
+_LOGGER = logging.getLogger(__name__)
+
 
 # AUDIT-FIX(#1): Isolate telemetry and log formatting so ops-event persistence or emit sinks cannot kill safety-critical monitoring.
 def _safe_emit(emit: Callable[[str], None] | None, line: str) -> None:
@@ -59,6 +62,7 @@ def _safe_emit(emit: Callable[[str], None] | None, line: str) -> None:
     try:
         emit(line)
     except Exception:
+        _LOGGER.warning("Proactive emit sink failed.", exc_info=True)
         return
 
 
@@ -167,7 +171,7 @@ def _write_bytes_atomic(path: Path, payload: bytes) -> None:
         try:
             tmp_path.unlink(missing_ok=True)
         except Exception:
-            pass
+            _LOGGER.warning("Failed to remove proactive capture temp file after write error.", exc_info=True)
         raise
 
 

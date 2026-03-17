@@ -1,3 +1,10 @@
+"""Parse user-facing dates into timezone-aware local calendar values.
+
+This module centralizes the small amount of natural-language date parsing that
+multiple Twinr subsystems need, while keeping timezone normalization explicit
+and fail-closed.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -14,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 def _is_aware_datetime(value: datetime) -> bool:
+    """Return whether a datetime carries a usable UTC offset."""
+
     # AUDIT-FIX(#4): Python defines awareness as tzinfo set and utcoffset()
     # returning a non-None offset.
     try:
@@ -26,6 +35,8 @@ def _normalize_reference_datetime(
     reference_datetime: datetime | None,
     zone: ZoneInfo,
 ) -> datetime:
+    """Normalize an optional reference datetime into the target timezone."""
+
     if reference_datetime is None:
         return datetime.now(zone)
     if _is_aware_datetime(reference_datetime):
@@ -43,6 +54,18 @@ def parse_local_date_text(
     timezone_name: str,
     reference_datetime: datetime | None = None,
 ) -> date | None:
+    """Parse free-form date text into a local calendar date.
+
+    Args:
+        value: Optional user-facing date text such as ``"morgen"`` or
+            ``"March 21"``.
+        timezone_name: IANA timezone name used for relative-date resolution.
+        reference_datetime: Optional clock reference for deterministic parsing.
+
+    Returns:
+        A local calendar date when parsing succeeds, otherwise ``None``.
+    """
+
     # AUDIT-FIX(#6): Respect the optional-input contract before delegating to a
     # helper whose None-handling is not guaranteed by this file.
     if value is None:

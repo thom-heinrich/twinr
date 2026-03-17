@@ -451,14 +451,14 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertEqual(result.tool_calls[0].name, "handoff_specialist_worker")
         self.assertTrue(result.used_web_search)
 
-    def test_structured_supervisor_direct_reply_falls_back_to_spoken_ack_field(self) -> None:
+    def test_structured_supervisor_direct_reply_uses_spoken_reply_field(self) -> None:
         supervisor = FakeSupervisorProvider()
         specialist = FakeSpecialistProvider()
         decision_provider = FakeSupervisorDecisionProvider(
             {
                 "action": "direct",
-                "spoken_ack": "Hallo!",
-                "spoken_reply": None,
+                "spoken_ack": None,
+                "spoken_reply": "Hallo!",
             }
         )
         streamed: list[str] = []
@@ -513,11 +513,12 @@ class DualLaneLoopTests(unittest.TestCase):
                 )
 
         specialist = MemorySpecialistProvider()
+        trace_decisions: list[tuple[str, dict[str, object]]] = []
         decision_provider = FakeSupervisorDecisionProvider(
             {
                 "action": "direct",
                 "spoken_reply": "Ich kann mich nicht erinnern.",
-                "spoken_ack": None,
+                "spoken_ack": "Ich hole kurz unser Gespräch zusammen.",
                 "kind": "memory",
                 "goal": "Recall what Twinr and the user discussed earlier today.",
                 "context_scope": "full_context",
@@ -532,6 +533,7 @@ class DualLaneLoopTests(unittest.TestCase):
             tool_schemas=[],
             supervisor_instructions="Supervisor instructions",
             specialist_instructions="Specialist instructions",
+            trace_decision=lambda name, **kwargs: trace_decisions.append((name, kwargs)),
         )
 
         result = loop.run(
@@ -540,10 +542,18 @@ class DualLaneLoopTests(unittest.TestCase):
             on_text_delta=streamed.append,
         )
 
-        self.assertEqual(streamed[0], "Einen Moment bitte.")
+        self.assertEqual(streamed[0], "Ich hole kurz unser Gespräch zusammen.")
         self.assertEqual(result.text, "Vorhin haben wir über das Wetter gesprochen.")
         self.assertEqual(len(specialist.start_calls), 1)
         self.assertEqual(specialist.start_calls[0]["conversation"], (("system", "reicher erinnerungskontext"),))
+        self.assertTrue(
+            any(
+                name == "dual_lane_direct_downgraded_to_handoff"
+                and payload["context"]["decision"]["context_scope"] == "full_context"
+                and payload["context"]["fallback_handoff"]["kind"] == "memory"
+                for name, payload in trace_decisions
+            )
+        )
 
     def test_prefetched_decision_skips_supervisor_decision_provider_roundtrip(self) -> None:
         supervisor = FakeSupervisorProvider()
@@ -588,6 +598,136 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertEqual(decision_provider.calls, [])
         self.assertEqual(supervisor.start_calls, [])
         self.assertEqual(specialist.start_calls, [])
+
+    def test_supervisor_loop_failure_uses_llm_recovery_reply(self) -> None:
+        class ExplodingSupervisorProvider(FakeSupervisorProvider):
+            def start_turn_streaming(self, *args, **kwargs):  # type: ignore[override]
+                raise RuntimeError("supervisor failed")
+
+        supervisor = ExplodingSupervisorProvider()
+        specialist = FakeSpecialistProvider()
+
+        class FailThenRecoverDecisionProvider:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def decide(self, prompt: str, *, conversation=None, instructions=None):
+                self.calls.append(
+                    {
+                        "prompt": prompt,
+                        "conversation": conversation,
+                        "instructions": instructions,
+                    }
+                )
+                if len(self.calls) == 1:
+                    raise RuntimeError("decision failed")
+                return SimpleNamespace(
+                    action="direct",
+                    spoken_ack=None,
+                    spoken_reply="Ich beantworte das jetzt direkt fuer dich.",
+                    kind=None,
+                    goal=None,
+                    allow_web_search=None,
+                    location_hint=None,
+                    date_context=None,
+                    context_scope=None,
+                    response_id="decision_2",
+                    request_id="req_decision_2",
+                    model="gpt-4o-mini",
+                    token_usage=None,
+                )
+
+        decision_provider = FailThenRecoverDecisionProvider()
+        streamed: list[str] = []
+        trace_events: list[tuple[str, dict[str, object]]] = []
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            supervisor_decision_provider=decision_provider,
+            tool_handlers={},
+            tool_schemas=[],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+            trace_event=lambda name, **kwargs: trace_events.append((name, kwargs)),
+        )
+
+        result = loop.run(
+            "Worueber haben wir heute gesprochen?",
+            supervisor_conversation=(("system", "voller kontext"),),
+            on_text_delta=streamed.append,
+        )
+
+        self.assertEqual(result.text, "Ich beantworte das jetzt direkt fuer dich.")
+        self.assertEqual(streamed, ["Ich beantworte das jetzt direkt fuer dich."])
+        self.assertEqual(len(decision_provider.calls), 2)
+        self.assertEqual(decision_provider.calls[0]["conversation"], (("system", "voller kontext"),))
+        self.assertEqual(decision_provider.calls[1]["conversation"], (("system", "voller kontext"),))
+        self.assertTrue(
+            any(
+                name == "dual_lane_supervisor_loop_failed"
+                and payload["details"]["error_type"] == "RuntimeError"
+                and payload["details"]["used_recovery_llm"] is True
+                for name, payload in trace_events
+            )
+        )
+
+    def test_handoff_only_specialist_failure_uses_llm_recovery_reply(self) -> None:
+        supervisor = FakeSupervisorProvider()
+        specialist = FakeSpecialistProvider()
+        decision_provider = FakeSupervisorDecisionProvider(
+            {
+                "action": "direct",
+                "spoken_reply": "Ich hole dir das kurz direkt aus unserem Kontext.",
+            }
+        )
+        lane_events: list[SpeechLaneDelta] = []
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            supervisor_decision_provider=decision_provider,
+            tool_handlers={
+                "search_live_info": lambda arguments: (_ for _ in ()).throw(RuntimeError(f"boom: {arguments}")),
+            },
+            tool_schemas=[{"type": "function", "name": "search_live_info"}],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+
+        result = loop.run_handoff_only(
+            "Worueber haben wir heute gesprochen?",
+            conversation=(("system", "reicher kontext"),),
+            handoff=SimpleNamespace(
+                action="handoff",
+                spoken_ack="Ich schaue kurz nach.",
+                kind="search",
+                goal="Recall today's conversation.",
+                allow_web_search=True,
+                response_id="prefetch_resp",
+                request_id="prefetch_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            ),
+            on_lane_text_delta=lane_events.append,
+        )
+
+        self.assertEqual(result.text, "Ich hole dir das kurz direkt aus unserem Kontext.")
+        self.assertEqual(
+            lane_events,
+            [
+                SpeechLaneDelta(
+                    text="Ich schaue kurz nach.",
+                    lane="filler",
+                    replace_current=False,
+                ),
+                SpeechLaneDelta(
+                    text="Ich hole dir das kurz direkt aus unserem Kontext.",
+                    lane="final",
+                    replace_current=True,
+                    atomic=True,
+                ),
+            ],
+        )
+        self.assertEqual(decision_provider.calls[-1]["conversation"], (("system", "reicher kontext"),))
 
     def test_run_handoff_only_emits_filler_then_atomic_final(self) -> None:
         supervisor = FakeSupervisorProvider()

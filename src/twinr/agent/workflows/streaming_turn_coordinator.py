@@ -146,8 +146,7 @@ class StreamingTurnLanePlan:
     generate_first_word: Callable[[], FirstWordReply | None] | None = None
     bridge_fallback_reply: FirstWordReply | None = None
     timeout_policy: StreamingTurnTimeoutPolicy | None = None
-    final_timeout_reply: str = ""
-    final_error_reply: str = ""
+    recover_final_lane_response: Callable[[str], StreamingToolLoopResult] | None = None
 
     @property
     def is_dual_lane(self) -> bool:
@@ -616,8 +615,7 @@ class StreamingTurnCoordinator:
             generate_first_word=lane_plan.generate_first_word,
             bridge_fallback_reply=lane_plan.bridge_fallback_reply,
             run_final_lane=lane_plan.run_final_lane,
-            final_timeout_reply=lane_plan.final_timeout_reply,
-            final_error_reply=lane_plan.final_error_reply,
+            recover_final_lane_response=lane_plan.recover_final_lane_response,
         )
 
     def _require_lane_plan(self) -> StreamingTurnLanePlan:

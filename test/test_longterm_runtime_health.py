@@ -59,11 +59,9 @@ class LongTermRemoteHealthProbeTests(unittest.TestCase):
         )
         object_state = _FakeRemoteState(
             {
-                "objects": {"schema": "manifest", "shards": ["objects__part_0000"]},
-                "objects__part_0000": {"schema": "object_shard", "objects": []},
+                "objects": {"schema": "twinr_memory_object_catalog_v2", "version": 2, "items": []},
                 "conflicts": {"schema": "conflicts", "conflicts": []},
-                "archive": {"schema": "manifest", "shards": ["archive__part_0000"]},
-                "archive__part_0000": {"schema": "archive_shard", "objects": []},
+                "archive": {"schema": "twinr_memory_archive_catalog_v2", "version": 2, "items": []},
             }
         )
         graph_state = _FakeRemoteState({"graph": {"schema": "graph", "nodes": [], "edges": []}})
@@ -83,10 +81,8 @@ class LongTermRemoteHealthProbeTests(unittest.TestCase):
                 "user_context",
                 "personality_context",
                 "objects",
-                "objects__part_0000",
                 "conflicts",
                 "archive",
-                "archive__part_0000",
                 "graph",
                 "midterm",
             ),
@@ -102,11 +98,9 @@ class LongTermRemoteHealthProbeTests(unittest.TestCase):
         )
         object_state = _FakeRemoteState(
             {
-                "objects": {"schema": "manifest", "shards": ["objects__part_0000"]},
-                "objects__part_0000": LongTermRemoteUnavailableError("objects shard unavailable"),
+                "objects": LongTermRemoteUnavailableError("objects catalog unavailable"),
                 "conflicts": {"schema": "conflicts", "conflicts": []},
-                "archive": {"schema": "manifest", "shards": ["archive__part_0000"]},
-                "archive__part_0000": {"schema": "archive_shard", "objects": []},
+                "archive": {"schema": "twinr_memory_archive_catalog_v2", "version": 2, "items": []},
             }
         )
         graph_state = _FakeRemoteState({"graph": {"schema": "graph", "nodes": [], "edges": []}})

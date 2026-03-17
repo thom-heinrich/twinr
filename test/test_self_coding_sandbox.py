@@ -19,6 +19,7 @@ from twinr.agent.self_coding import (
 from twinr.agent.self_coding.activation import SelfCodingActivationService
 from twinr.agent.self_coding.codex_driver import CodexCompileArtifact, CodexCompileResult
 from twinr.agent.self_coding.runtime import SelfCodingSkillExecutionService
+from twinr.agent.self_coding.sandbox import load_trusted_skill_module, validate_skill_source
 from twinr.agent.self_coding.worker import SelfCodingCompileWorker
 from twinr.automations import AutomationStore
 
@@ -104,6 +105,40 @@ class _Owner:
 
 
 class SelfCodingSandboxTests(unittest.TestCase):
+    def test_validator_allows_safe_getattr_and_hasattr_names(self) -> None:
+        tree = validate_skill_source(
+            """
+from __future__ import annotations
+
+def refresh(ctx):
+    answer = getattr(ctx, "answer", "")
+    if hasattr(ctx, "answer"):
+        ctx.store_json("payload", {"answer": answer})
+            """.strip(),
+            filename="skill_main.py",
+        )
+
+        self.assertIsNotNone(tree)
+
+    def test_trusted_loader_safe_getattr_blocks_private_attribute_access(self) -> None:
+        module = load_trusted_skill_module(
+            source_text="""
+from __future__ import annotations
+
+def refresh(ctx):
+    return getattr(ctx, "_secret", None)
+            """.strip(),
+            filename="skill_main.py",
+        )
+
+        handler = module.get_handler("refresh")
+
+        class _Context:
+            _secret = "top-secret"
+
+        with self.assertRaisesRegex(AttributeError, "private or introspection attribute access"):
+            handler(_Context())
+
     def test_runtime_rejects_unsafe_imports_inside_skill_package(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

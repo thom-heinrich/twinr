@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -51,6 +52,8 @@ _MAX_METADATA_ITEMS = 32
 _MAX_METADATA_STRING_CHARS = 512
 _MAX_MEDIA_TYPE_CHARS = 128
 _MAX_PROMPT_FIELD_CHARS = 4096
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -678,7 +681,7 @@ class SelfCodingCompileWorker:
                         diagnostics=validating_diagnostics,
                     )
                 except Exception:
-                    pass
+                    LOGGER.warning("Self-coding worker failed to persist validating status transition.", exc_info=True)
 
                 try:
                     job_with_logs, has_current_target_artifact = self._persist_driver_result(active_job, session, result)
@@ -717,7 +720,7 @@ class SelfCodingCompileWorker:
                             },
                         )
                     except Exception:
-                        pass
+                        LOGGER.warning("Self-coding worker failed to persist completed status transition.", exc_info=True)
                     return completed
                 if self._should_retry_compile(active_job, result_status=effective_result_status):
                     return self._queue_retry(job_with_logs, failure_message, compile_status=status_record)
@@ -730,7 +733,7 @@ class SelfCodingCompileWorker:
                     try:
                         return self._mark_failed(latest_job, safe_error, compile_status=status_record)
                     except Exception:
-                        pass
+                        LOGGER.warning("Self-coding worker failed to persist terminal failure state after unexpected exception.", exc_info=True)
                 raise CodexDriverError(safe_error) from exc
 
     def _load_job_session(self, job: CompileJobRecord) -> RequirementsDialogueSession:
@@ -921,7 +924,7 @@ class SelfCodingCompileWorker:
                     error_message=safe_error,
                 )
             except Exception:
-                pass
+                LOGGER.warning("Self-coding worker failed to persist failed status transition.", exc_info=True)
         return failed
 
     def _queue_retry(
@@ -948,7 +951,7 @@ class SelfCodingCompileWorker:
                     diagnostics={"retry_attempt": int(getattr(job, "attempt_count", 0) or 0)},
                 )
             except Exception:
-                pass
+                LOGGER.warning("Self-coding worker failed to persist retrying status transition.", exc_info=True)
         return self.run_job(retry_job.job_id)
 
     @staticmethod

@@ -3,11 +3,11 @@ name: storage
 path: src/twinr/memory/longterm/storage
 kind: python-package
 visibility: internal
-summary: Persist long-term object, conflict, archive, and midterm snapshots locally and mirror validated state through the remote-primary snapshot adapter.
+summary: Persist long-term object, conflict, archive, and midterm state locally while mirroring remote-primary object/conflict/archive data through fine-grained ChonkyDB documents plus small catalogs.
 owned_concerns:
   - Persist canonical long-term object, conflict, and archive snapshots under the configured memory path
   - Persist midterm reflection packets and expose bounded midterm lookup helpers
-  - Mirror validated snapshots to the remote ChonkyDB namespace and load safe local fallbacks when optional remote reads fail
+  - Mirror validated object/conflict/archive state to the remote ChonkyDB namespace as individual documents plus current catalogs and load safe local fallbacks when optional remote reads fail
   - Expose store-level mutation and review helpers used by long-term runtime, retrieval, and operator flows
 out_of_scope:
   - Define canonical long-term schemas or ontology normalization
@@ -24,8 +24,12 @@ files:
     role: Midterm packet snapshot store
     exports:
       - LongTermMidtermStore
+  - path: remote_catalog.py
+    role: Fine-grained remote object/conflict/archive document and catalog adapter
+    exports:
+      - LongTermRemoteCatalogStore
   - path: remote_state.py
-    role: Remote snapshot adapter and status types
+    role: Small remote snapshot/catalog adapter and status types
     exports:
       - LongTermRemoteStateStore
       - LongTermRemoteStatus

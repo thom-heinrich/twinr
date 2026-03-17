@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import logging
 from math import isfinite
 from zoneinfo import ZoneInfo
 
@@ -28,6 +29,8 @@ _DEFAULT_MAX_CANDIDATES = 4
 _CONCERNING_BODY_POSES = frozenset({"floor", "slumped"})
 _TRUE_VALUES = frozenset({"1", "true", "yes", "y", "on"})
 _FALSE_VALUES = frozenset({"", "0", "false", "no", "n", "off", "none", "null"})
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _normalize_text(value: object | None) -> str:
@@ -176,6 +179,7 @@ def _resolve_timezone(timezone_name: object | None) -> ZoneInfo:
         try:
             return ZoneInfo(candidate)
         except Exception:
+            LOGGER.warning("Failed to resolve proactive planner timezone %r; trying fallback.", candidate, exc_info=True)
             continue
     return ZoneInfo("UTC")
 
@@ -254,6 +258,7 @@ class LongTermProactivePlanner:
             try:
                 item = canonicalize() if callable(canonicalize) else raw_item
             except Exception:
+                LOGGER.warning("Skipping malformed long-term proactive object during canonicalization.", exc_info=True)
                 continue
             canonicalized_items.append(item)
         canonical_objects = tuple(canonicalized_items)
@@ -275,6 +280,7 @@ class LongTermProactivePlanner:
                 sensitivity = item.sensitivity
                 attributes = _attrs(item)
             except Exception:
+                LOGGER.warning("Skipping malformed long-term proactive object during planning.", exc_info=True)
                 continue
 
             if kind in {"event", "plan"} and valid_from == today:
@@ -589,6 +595,7 @@ class LongTermProactivePlanner:
                 if not predicate(item, attrs):
                     continue
             except Exception:
+                LOGGER.warning("Skipping proactive planner candidate because its predicate raised.", exc_info=True)
                 continue
             matches.append(
                 (

@@ -9,6 +9,7 @@ owned_concerns:
   - Validate the canonical realtime tool-name to handler binding map before live turns start
   - Run the generic streaming tool loop that alternates provider turns and tool execution
   - Run the dual-lane supervisor and specialist handoff loop with speech-lane events
+  - Generate LLM-only recovery replies when streaming lanes fail after the user has already started a turn
   - Define the focused broker policy for background automation `tool_call` execution
 out_of_scope:
   - Concrete tool-side business logic or runtime mutations inside src/twinr/agent/tools/handlers
@@ -49,6 +50,8 @@ files:
     exports:
       - DualLaneToolLoop
       - SpeechLaneDelta
+  - path: recovery_reply.py
+    role: LLM-only recovery reply builder for failed streaming runtime paths
 public_api:
   module: twinr.agent.tools.runtime
   exports:

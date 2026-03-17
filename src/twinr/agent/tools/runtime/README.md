@@ -12,7 +12,9 @@ streaming APIs.
 - validate the canonical tool-name to handler binding registry
 - dispatch learned-skill control tools and hidden self-coding runtime triggers through the same thin executor surface
 - run the generic streaming tool loop and the supervisor/specialist handoff loop
+- generate LLM-only recovery replies for streaming timeout/error paths
 - emit speech-lane deltas and serialize tool results safely
+- emit redacted semantic-answer branch forensics for supervisor decisions, handoffs, and recovery-path selection
 - enforce the focused broker policy for background automation `tool_call` execution
 
 The dual-lane handoff loop preserves optional explicit search hints such as a
@@ -35,6 +37,7 @@ handoff boundary.
 | [broker_policy.py](./broker_policy.py) | Background automation tool-call policy |
 | [streaming_loop.py](./streaming_loop.py) | Generic tool round loop |
 | [dual_lane_loop.py](./dual_lane_loop.py) | Supervisor/specialist handoff loop |
+| [recovery_reply.py](./recovery_reply.py) | LLM-only recovery replies for failed streaming paths |
 | [component.yaml](./component.yaml) | Structured package metadata |
 
 ## Usage

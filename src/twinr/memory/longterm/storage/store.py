@@ -7,7 +7,7 @@ this module or via ``twinr.memory.longterm``.
 
 from __future__ import annotations
 
-from collections.abc import Mapping  # AUDIT-FIX(#10): Import Mapping explicitly for Python 3.11 type-introspection safety.
+from collections.abc import Iterable, Mapping  # AUDIT-FIX(#10): Import Mapping explicitly for Python 3.11 type-introspection safety.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -31,6 +31,7 @@ from twinr.memory.longterm.core.models import (
     LongTermRetentionResultV1,
     LongTermReflectionResultV1,
 )
+from twinr.memory.longterm.storage.remote_catalog import LongTermRemoteCatalogStore
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore, LongTermRemoteUnavailableError
 from twinr.text_utils import retrieval_terms
 
@@ -156,12 +157,14 @@ class LongTermStructuredStore:
     base_path: Path
     remote_state: LongTermRemoteStateStore | None = None
     _lock: Lock = field(default_factory=RLock, repr=False)  # AUDIT-FIX(#3): Reentrant lock allows read/write serialization without deadlocking nested calls.
+    _remote_catalog: LongTermRemoteCatalogStore | None = field(init=False, repr=False, default=None)
 
     def __post_init__(self) -> None:
         """Normalize the configured base path once during construction."""
 
         # AUDIT-FIX(#1): Canonicalize the store root once so subsequent path validation is stable and absolute.
         self.base_path = Path(self.base_path).expanduser().resolve(strict=False)
+        self._remote_catalog = LongTermRemoteCatalogStore(self.remote_state)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermStructuredStore":
@@ -270,7 +273,44 @@ class LongTermStructuredStore:
             normalized = _normalize_text(memory_id)
             if not normalized:
                 return None
+            remote_objects = self.load_objects_by_ids((normalized,))
+            if remote_objects:
+                return remote_objects[0]
             return next((item for item in self.load_objects() if item.memory_id == normalized), None)
+
+    def load_objects_by_ids(
+        self,
+        memory_ids: Iterable[str],
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Load a bounded set of long-term objects by memory id when possible."""
+
+        normalized_ids = tuple(
+            normalized
+            for normalized in (_normalize_text(value) for value in memory_ids)
+            if normalized
+        )
+        if not normalized_ids:
+            return ()
+        remote_catalog = self._remote_catalog
+        if self._remote_catalog_enabled() and remote_catalog is not None:
+            try:
+                if remote_catalog.catalog_available(snapshot_kind="objects"):
+                    payloads = remote_catalog.load_item_payloads(snapshot_kind="objects", item_ids=normalized_ids)
+                    loaded = []
+                    for payload in payloads:
+                        try:
+                            loaded.append(LongTermMemoryObjectV1.from_payload(payload))
+                        except Exception:
+                            _LOG.warning("Skipping invalid remote long-term object payload during exact load.", exc_info=True)
+                    if loaded:
+                        by_id = {item.memory_id: item for item in loaded}
+                        return tuple(by_id[memory_id] for memory_id in normalized_ids if memory_id in by_id)
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                _LOG.warning("Failed loading fine-grained remote long-term objects; falling back to snapshot state.", exc_info=True)
+        objects_by_id = {item.memory_id: item for item in self.load_objects()}
+        return tuple(objects_by_id[memory_id] for memory_id in normalized_ids if memory_id in objects_by_id)
 
     def _validated_local_path(self, path: Path) -> Path:
         # AUDIT-FIX(#1): Reject any accidental/malicious path escape from the configured store root.
@@ -318,15 +358,35 @@ class LongTermStructuredStore:
         if remote_state is None or not remote_state.enabled:
             return None
         try:
-            if snapshot_kind in {"objects", "archive"}:
-                raw_payload = remote_state.load_snapshot(snapshot_kind=snapshot_kind)
+            raw_payload = remote_state.load_snapshot(snapshot_kind=snapshot_kind)
+            remote_catalog = self._remote_catalog
+            if (
+                snapshot_kind in {"objects", "conflicts", "archive"}
+                and remote_catalog is not None
+                and remote_catalog.is_catalog_payload(snapshot_kind=snapshot_kind, payload=raw_payload)
+            ):
+                candidate = remote_catalog.assemble_snapshot_from_catalog(
+                    snapshot_kind=snapshot_kind,
+                    payload=raw_payload,
+                )
+            elif snapshot_kind in {"objects", "archive"}:
                 resolved_payload = self._resolve_sharded_snapshot_payload(
                     snapshot_kind=snapshot_kind,
                     payload=raw_payload,
                 )
                 candidate = resolved_payload if resolved_payload is not None else raw_payload
+                self._maybe_migrate_remote_catalog(
+                    snapshot_kind=snapshot_kind,
+                    raw_payload=raw_payload,
+                    candidate=candidate,
+                )
             else:
-                candidate = remote_state.load_snapshot(snapshot_kind=snapshot_kind)
+                candidate = raw_payload
+                self._maybe_migrate_remote_catalog(
+                    snapshot_kind=snapshot_kind,
+                    raw_payload=raw_payload,
+                    candidate=candidate,
+                )
             if candidate is None:
                 return None
             if not isinstance(candidate, dict):
@@ -356,12 +416,35 @@ class LongTermStructuredStore:
             return True
         return bool(required)
 
+    def _remote_catalog_enabled(self) -> bool:
+        remote_catalog = self._remote_catalog
+        return bool(remote_catalog is not None and remote_catalog.enabled())
+
     def _should_attempt_remote_repair(self) -> bool:
         remote_state = self.remote_state
         if remote_state is None or not remote_state.enabled:
             return False
         config = getattr(remote_state, "config", None)
         return bool(getattr(config, "long_term_memory_migration_enabled", False))
+
+    def _maybe_migrate_remote_catalog(
+        self,
+        *,
+        snapshot_kind: str,
+        raw_payload: object,
+        candidate: object,
+    ) -> None:
+        remote_catalog = self._remote_catalog
+        if (
+            snapshot_kind not in {"objects", "conflicts", "archive"}
+            or remote_catalog is None
+            or remote_catalog.is_catalog_payload(snapshot_kind=snapshot_kind, payload=raw_payload if isinstance(raw_payload, Mapping) else None)
+            or not isinstance(candidate, dict)
+            or not self._is_valid_snapshot_payload(snapshot_kind=snapshot_kind, payload=candidate)
+            or not self._should_attempt_remote_repair()
+        ):
+            return
+        self._persist_remote_snapshot_payload(snapshot_kind=snapshot_kind, payload=candidate)
 
     def _load_snapshot_payload(
         self,
@@ -403,6 +486,14 @@ class LongTermStructuredStore:
             raise RuntimeError("Remote state store is required to ensure remote snapshots.")  # AUDIT-FIX(#6): Replace assert with a runtime guard that survives python -O.
         payload = self._load_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
         if payload is None:
+            if self._remote_is_required():
+                local_payload = self._read_local_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
+                if local_payload is not None and self._should_attempt_remote_repair():
+                    self._persist_remote_snapshot_payload(snapshot_kind=snapshot_kind, payload=local_payload)
+                    return True
+                raise LongTermRemoteUnavailableError(
+                    f"Required remote structured snapshot {snapshot_kind!r} is unavailable."
+                )
             self._persist_snapshot_payload(
                 snapshot_kind=snapshot_kind,
                 local_path=local_path,
@@ -594,8 +685,25 @@ class LongTermStructuredStore:
         if remote_state is None or not remote_state.enabled:
             return
         try:
-            if snapshot_kind in {"objects", "archive"}:
-                self._save_sharded_snapshot(snapshot_kind=snapshot_kind, payload=payload)
+            if snapshot_kind in {"objects", "conflicts", "archive"}:
+                remote_catalog = self._remote_catalog
+                if remote_catalog is None:
+                    raise RuntimeError("Fine-grained remote catalog store is required for structured remote state.")
+                remote_payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key != _SNAPSHOT_WRITTEN_AT_KEY
+                }
+                catalog_payload = remote_catalog.build_catalog_payload(
+                    snapshot_kind=snapshot_kind,
+                    item_payloads=self._iter_remote_item_payloads(snapshot_kind=snapshot_kind, payload=remote_payload),
+                    item_id_getter=lambda item: self._remote_item_id_for_payload(snapshot_kind=snapshot_kind, payload=item),
+                    metadata_builder=lambda item: self._remote_item_metadata(snapshot_kind=snapshot_kind, payload=item),
+                    content_builder=lambda item: self._remote_item_search_text(snapshot_kind=snapshot_kind, payload=item),
+                )
+                if isinstance(payload.get(_SNAPSHOT_WRITTEN_AT_KEY), str):
+                    catalog_payload[_SNAPSHOT_WRITTEN_AT_KEY] = payload.get(_SNAPSHOT_WRITTEN_AT_KEY)
+                remote_state.save_snapshot(snapshot_kind=snapshot_kind, payload=catalog_payload)
                 return
             remote_payload = {
                 key: value
@@ -607,6 +715,219 @@ class LongTermStructuredStore:
             if self._remote_is_required():
                 raise
             _LOG.warning("Failed persisting remote %s snapshot; keeping local snapshot as source of truth.", snapshot_kind, exc_info=True)
+
+    def _iter_remote_item_payloads(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object],
+    ) -> tuple[dict[str, object], ...]:
+        item_key = self._items_key_for_snapshot(snapshot_kind)
+        items = payload.get(item_key)
+        if not isinstance(items, list):
+            return ()
+        return tuple(item for item in items if isinstance(item, dict))
+
+    def _remote_item_id_for_payload(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object],
+    ) -> str | None:
+        if snapshot_kind in {"objects", "archive"}:
+            return _normalize_text(payload.get("memory_id") if isinstance(payload.get("memory_id"), str) else None)
+        if snapshot_kind == "conflicts":
+            try:
+                conflict = LongTermMemoryConflictV1.from_payload(payload)
+            except Exception:
+                return None
+            return self._conflict_doc_id(conflict)
+        raise ValueError(f"Unsupported structured snapshot kind {snapshot_kind!r}.")
+
+    def _remote_item_metadata(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        if snapshot_kind in {"objects", "archive"}:
+            metadata: dict[str, object] = {
+                "kind": payload.get("kind"),
+                "status": payload.get("status"),
+                "summary": payload.get("summary"),
+                "slot_key": payload.get("slot_key"),
+                "value_key": payload.get("value_key"),
+                "created_at": payload.get("created_at"),
+                "updated_at": payload.get("updated_at"),
+            }
+            if snapshot_kind == "archive":
+                metadata["archived_at"] = payload.get("archived_at")
+            return metadata
+        if snapshot_kind == "conflicts":
+            return {
+                "slot_key": payload.get("slot_key"),
+                "candidate_memory_id": payload.get("candidate_memory_id"),
+                "existing_memory_ids": payload.get("existing_memory_ids"),
+                "question": payload.get("question"),
+                "reason": payload.get("reason"),
+                "updated_at": payload.get("question") or payload.get("reason") or payload.get("slot_key"),
+            }
+        raise ValueError(f"Unsupported structured snapshot kind {snapshot_kind!r}.")
+
+    def _remote_item_search_text(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object],
+    ) -> str:
+        if snapshot_kind in {"objects", "archive"}:
+            try:
+                return self._object_search_text(LongTermMemoryObjectV1.from_payload(payload))
+            except Exception:
+                return _normalize_text(json.dumps(dict(payload), ensure_ascii=False))
+        if snapshot_kind == "conflicts":
+            try:
+                conflict = LongTermMemoryConflictV1.from_payload(payload)
+            except Exception:
+                return _normalize_text(json.dumps(dict(payload), ensure_ascii=False))
+            related_parts = [
+                conflict.slot_key,
+                conflict.question,
+                conflict.reason,
+                conflict.candidate_memory_id,
+                *conflict.existing_memory_ids,
+            ]
+            return _normalize_text(" ".join(part for part in related_parts if part))
+        raise ValueError(f"Unsupported structured snapshot kind {snapshot_kind!r}.")
+
+    def _load_remote_objects_from_entries(
+        self,
+        *,
+        entries: Iterable[object],
+        snapshot_kind: str,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        remote_catalog = self._remote_catalog
+        if remote_catalog is None:
+            return ()
+        item_ids = [
+            entry.item_id
+            for entry in entries
+            if hasattr(entry, "item_id") and isinstance(getattr(entry, "item_id"), str)
+        ]
+        payloads = remote_catalog.load_item_payloads(snapshot_kind=snapshot_kind, item_ids=item_ids)
+        loaded: list[LongTermMemoryObjectV1] = []
+        for payload in payloads:
+            try:
+                loaded.append(LongTermMemoryObjectV1.from_payload(payload))
+            except Exception:
+                _LOG.warning("Skipping invalid remote long-term object payload during selective load.", exc_info=True)
+        by_id = {item.memory_id: item for item in loaded}
+        return tuple(by_id[item_id] for item_id in item_ids if item_id in by_id)
+
+    def _remote_select_objects(
+        self,
+        *,
+        query_text: str | None,
+        limit: int,
+        include_episodes: bool,
+        fallback_limit: int,
+        require_query_match: bool,
+    ) -> tuple[LongTermMemoryObjectV1, ...] | None:
+        remote_catalog = self._remote_catalog
+        if not self._remote_catalog_enabled() or remote_catalog is None:
+            return None
+        bounded_limit = max(1, limit)
+        clean_query = _normalize_text(query_text)
+        try:
+            if not remote_catalog.catalog_available(snapshot_kind="objects"):
+                return None
+        except Exception:
+            if self._remote_is_required():
+                raise
+            return None
+
+        def eligible(entry: object) -> bool:
+            metadata = getattr(entry, "metadata", None)
+            if not isinstance(metadata, Mapping):
+                return False
+            kind = _normalize_text(metadata.get("kind") if isinstance(metadata.get("kind"), str) else None)
+            status = _normalize_text(metadata.get("status") if isinstance(metadata.get("status"), str) else None)
+            if status not in {"active", "candidate", "uncertain"}:
+                return False
+            if include_episodes:
+                return kind == "episode"
+            return kind != "episode"
+
+        if not clean_query:
+            if require_query_match:
+                return ()
+            entries = remote_catalog.top_catalog_entries(
+                snapshot_kind="objects",
+                limit=bounded_limit if fallback_limit <= 0 else min(bounded_limit, max(1, fallback_limit)),
+                eligible=eligible,
+            )
+            return self._load_remote_objects_from_entries(entries=entries, snapshot_kind="objects")
+
+        entries = remote_catalog.search_catalog_entries(
+            snapshot_kind="objects",
+            query_text=clean_query,
+            limit=bounded_limit,
+            eligible=eligible,
+        )
+        selected = list(self._load_remote_objects_from_entries(entries=entries, snapshot_kind="objects"))
+        filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
+        if filtered:
+            return tuple(filtered[:bounded_limit])
+        if require_query_match or fallback_limit <= 0:
+            return ()
+        fallback_entries = remote_catalog.top_catalog_entries(
+            snapshot_kind="objects",
+            limit=min(bounded_limit, max(1, fallback_limit)),
+            eligible=eligible,
+        )
+        return self._load_remote_objects_from_entries(entries=fallback_entries, snapshot_kind="objects")
+
+    def _remote_select_conflicts(
+        self,
+        *,
+        query_text: str | None,
+        limit: int,
+    ) -> tuple[LongTermMemoryConflictV1, ...] | None:
+        remote_catalog = self._remote_catalog
+        if not self._remote_catalog_enabled() or remote_catalog is None:
+            return None
+        bounded_limit = max(1, limit)
+        clean_query = _normalize_text(query_text)
+        try:
+            if not remote_catalog.catalog_available(snapshot_kind="conflicts"):
+                return None
+        except Exception:
+            if self._remote_is_required():
+                raise
+            return None
+        if not clean_query:
+            entries = remote_catalog.top_catalog_entries(
+                snapshot_kind="conflicts",
+                limit=bounded_limit,
+                preserve_order=True,
+            )
+        else:
+            entries = remote_catalog.search_catalog_entries(
+                snapshot_kind="conflicts",
+                query_text=clean_query,
+                limit=bounded_limit,
+            )
+        payloads = remote_catalog.load_item_payloads(
+            snapshot_kind="conflicts",
+            item_ids=(entry.item_id for entry in entries),
+        )
+        conflicts: list[LongTermMemoryConflictV1] = []
+        for payload in payloads:
+            try:
+                conflicts.append(LongTermMemoryConflictV1.from_payload(payload))
+            except Exception:
+                _LOG.warning("Skipping invalid remote long-term conflict payload during selective load.", exc_info=True)
+        return tuple(conflicts)
 
     def select_relevant_episodic_objects(
         self,
@@ -632,6 +953,15 @@ class LongTermStructuredStore:
         """
 
         with self._lock:  # AUDIT-FIX(#3): Keep retrieval consistent with concurrent writes.
+            remote_selected = self._remote_select_objects(
+                query_text=query_text,
+                limit=limit,
+                include_episodes=True,
+                fallback_limit=fallback_limit,
+                require_query_match=require_query_match,
+            )
+            if remote_selected is not None:
+                return remote_selected
             objects = tuple(
                 sorted(
                     (
@@ -1100,6 +1430,15 @@ class LongTermStructuredStore:
         """
 
         with self._lock:  # AUDIT-FIX(#3): Keep retrieval consistent with concurrent writes.
+            remote_selected = self._remote_select_objects(
+                query_text=query_text,
+                limit=limit,
+                include_episodes=False,
+                fallback_limit=0,
+                require_query_match=False,
+            )
+            if remote_selected is not None:
+                return remote_selected
             bounded_limit = max(1, limit)  # AUDIT-FIX(#9): Prevent negative/zero slicing quirks.
             objects = tuple(
                 sorted(
@@ -1145,6 +1484,12 @@ class LongTermStructuredStore:
         """
 
         with self._lock:  # AUDIT-FIX(#3): Keep retrieval consistent with concurrent writes.
+            remote_selected = self._remote_select_conflicts(
+                query_text=query_text,
+                limit=limit,
+            )
+            if remote_selected is not None:
+                return remote_selected
             conflicts = self.load_conflicts()
             if not conflicts:
                 return ()

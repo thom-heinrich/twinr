@@ -15,6 +15,7 @@ from queue import Empty, Queue
 from shutil import which
 from threading import Event as ThreadEvent, Lock, Thread
 from typing import Iterator
+import logging
 import select
 import subprocess
 import sys
@@ -38,6 +39,8 @@ except ImportError:  # pragma: no cover - handled at runtime on non-Pi systems
 
 _CLI_READ_TIMEOUT_S = 2.0
 _SAMPLE_INTERVAL_S = 0.01
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ButtonAction(StrEnum):
@@ -452,12 +455,18 @@ class GpioButtonMonitor:
                 try:
                     line.release()
                 except Exception:
-                    pass
+                    _LOGGER.warning(
+                        "Failed to release GPIO line during legacy button-monitor rollback.",
+                        exc_info=True,
+                    )
             if chip is not None:
                 try:
                     chip.close()
                 except Exception:
-                    pass
+                    _LOGGER.warning(
+                        "Failed to close GPIO chip during legacy button-monitor rollback.",
+                        exc_info=True,
+                    )
             raise
 
         self._chip = chip
@@ -497,19 +506,19 @@ class GpioButtonMonitor:
             try:
                 request.release()
             except Exception:
-                pass
+                _LOGGER.warning("Failed to release GPIO request during button-monitor shutdown.", exc_info=True)
 
         for line in line_by_offset.values():
             try:
                 line.release()
             except Exception:
-                pass
+                _LOGGER.warning("Failed to release GPIO line during button-monitor shutdown.", exc_info=True)
 
         if chip is not None:
             try:
                 chip.close()
             except Exception:
-                pass
+                _LOGGER.warning("Failed to close GPIO chip during button-monitor shutdown.", exc_info=True)
 
     def __enter__(self) -> "GpioButtonMonitor":
         return self.open()

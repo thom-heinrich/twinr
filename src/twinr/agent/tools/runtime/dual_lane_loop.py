@@ -10,6 +10,7 @@ finishes.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha1
 from typing import Any, Callable, Sequence
 import json
 import logging  # AUDIT-FIX(#1,#7,#13): Log guarded failures instead of letting provider/tool/callback errors crash the turn.
@@ -19,11 +20,13 @@ from twinr.agent.base_agent.contracts import (
     AgentToolCall,
     AgentToolResult,
     ConversationLike,
+    FirstWordProvider,
     SupervisorDecisionProvider,
     ToolCallingAgentProvider,
     supervisor_decision_requires_full_context,
 )
 from twinr.agent.base_agent.prompting.personality import merge_instructions
+from .recovery_reply import LLMRecoveryResponder
 from .streaming_loop import StreamingToolLoopResult, ToolCallingStreamingLoop
 
 
@@ -128,19 +131,20 @@ class DualLaneToolLoop:
         tool_handlers: dict[str, Callable[[dict[str, Any]], Any]],
         tool_schemas: Sequence[dict[str, Any]],
         supervisor_decision_provider: SupervisorDecisionProvider | None = None,
+        first_word_provider: FirstWordProvider | None = None,
         supervisor_tool_handlers: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
         supervisor_tool_schemas: Sequence[dict[str, Any]] | None = None,
         supervisor_instructions: str,
         specialist_instructions: str,
         max_rounds: int = 6,
-        default_spoken_ack: str = "Einen Moment bitte.",  # AUDIT-FIX(#9): Keep current behaviour by default but allow locale-safe deployment configuration.
-        default_end_reply: str = "Bis bald.",
-        default_error_reply: str = "Das hat gerade nicht geklappt. Bitte versuche es noch einmal.",
+        trace_event: Callable[..., None] | None = None,
+        trace_decision: Callable[..., None] | None = None,
     ) -> None:
-        """Store providers, tool surfaces, and locale-safe fallback strings."""
+        """Store providers, tool surfaces, and LLM-only recovery state."""
         self.supervisor_provider = supervisor_provider
         self.specialist_provider = specialist_provider
         self.supervisor_decision_provider = supervisor_decision_provider
+        self.first_word_provider = first_word_provider
         self.tool_handlers = dict(tool_handlers)
         self.tool_schemas = tuple(tool_schemas)
         self._has_supervisor_tool_handlers_override = supervisor_tool_handlers is not None  # AUDIT-FIX(#3): Preserve whether the caller intentionally supplied an override, even when it is empty.
@@ -152,12 +156,65 @@ class DualLaneToolLoop:
             logger.warning("Invalid max_rounds=%r; defaulting to 1.", max_rounds)  # AUDIT-FIX(#11): Clamp invalid runtime config instead of entering undefined loop behaviour.
             max_rounds = 1
         self.max_rounds = max_rounds
-        self.default_spoken_ack = _normalize_default_text(default_spoken_ack, "Einen Moment bitte.")  # AUDIT-FIX(#9): Remove hard-coded locale lock-in from user-facing fallbacks.
-        self.default_end_reply = _normalize_default_text(default_end_reply, "Bis bald.")
-        self.default_error_reply = _normalize_default_text(
-            default_error_reply,
-            "Das hat gerade nicht geklappt. Bitte versuche es noch einmal.",
+        self._trace_event_callback = trace_event
+        self._trace_decision_callback = trace_decision
+        self._recovery_responder = LLMRecoveryResponder(
+            supervisor_decision_provider=self.supervisor_decision_provider,
+            first_word_provider=self.first_word_provider,
+            supervisor_instructions=self.supervisor_instructions,
         )
+
+    def _trace_event(
+        self,
+        name: str,
+        *,
+        kind: str,
+        details: dict[str, Any] | None = None,
+        level: str | None = None,
+        kpi: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit a best-effort forensic event without exposing raw user text."""
+
+        callback = self._trace_event_callback
+        if callback is None:
+            return
+        try:
+            callback(
+                name,
+                kind=kind,
+                details=dict(details or {}),
+                level=level,
+                kpi=kpi,
+            )
+        except Exception:
+            logger.exception("dual-lane trace_event callback failed.")
+
+    def _trace_decision(
+        self,
+        name: str,
+        *,
+        question: str,
+        selected: dict[str, Any],
+        options: Sequence[dict[str, Any]],
+        context: dict[str, Any] | None = None,
+        guardrails: Sequence[str] | None = None,
+    ) -> None:
+        """Emit a best-effort forensic decision without aborting the turn."""
+
+        callback = self._trace_decision_callback
+        if callback is None:
+            return
+        try:
+            callback(
+                name,
+                question=question,
+                selected=dict(selected),
+                options=[dict(option) for option in options],
+                context=dict(context or {}),
+                guardrails=list(guardrails or ()),
+            )
+        except Exception:
+            logger.exception("dual-lane trace_decision callback failed.")
 
     def resolve_supervisor_decision(
         self,
@@ -169,20 +226,118 @@ class DualLaneToolLoop:
     ) -> Any | None:
         """Resolve the supervisor decision, preferring prefetched state when present."""
         if prefetched_decision is not None:
-            return prefetched_decision
+            if _supervisor_decision_has_required_user_reply(prefetched_decision):
+                self._trace_decision(
+                    "dual_lane_supervisor_decision_resolved",
+                    question="Which supervisor decision is active for this turn?",
+                    selected={
+                        "id": _normalize_decision_action(getattr(prefetched_decision, "action", None)),
+                        "summary": "Reuse prefetched supervisor decision",
+                    },
+                    options=[
+                        {"id": "prefetched", "summary": "Reuse prefetched decision"},
+                        {"id": "provider", "summary": "Resolve decision from provider"},
+                        {"id": "none", "summary": "Fall back to supervisor loop"},
+                    ],
+                    context={
+                        "source": "prefetched",
+                        "decision": _decision_summary(prefetched_decision),
+                        "conversation": _conversation_summary(conversation),
+                        "prompt": _text_summary(prompt),
+                    },
+                )
+                return prefetched_decision
+            logger.warning(
+                "Ignoring prefetched supervisor decision without the required user-facing reply field."
+            )
+            self._trace_event(
+                "dual_lane_prefetched_decision_rejected",
+                kind="exception",
+                level="WARN",
+                details={
+                    "reason": "missing_user_reply",
+                    "decision": _decision_summary(prefetched_decision),
+                    "conversation": _conversation_summary(conversation),
+                    "prompt": _text_summary(prompt),
+                },
+            )
         if self.supervisor_decision_provider is None:
             return None
         try:
-            return self.supervisor_decision_provider.decide(
+            decision = self.supervisor_decision_provider.decide(
                 prompt,
                 conversation=conversation,
                 instructions=merge_instructions(self.supervisor_instructions, instructions),
             )
-        except Exception:
+            if not _supervisor_decision_has_required_user_reply(decision):
+                raise ValueError("Supervisor decision omitted the required user-facing reply field.")
+            self._trace_decision(
+                "dual_lane_supervisor_decision_resolved",
+                question="Which supervisor decision is active for this turn?",
+                selected={
+                    "id": _normalize_decision_action(getattr(decision, "action", None)),
+                    "summary": "Use provider-resolved supervisor decision",
+                },
+                options=[
+                    {"id": "prefetched", "summary": "Reuse prefetched decision"},
+                    {"id": "provider", "summary": "Resolve decision from provider"},
+                    {"id": "none", "summary": "Fall back to supervisor loop"},
+                ],
+                context={
+                    "source": "provider",
+                    "decision": _decision_summary(decision),
+                    "conversation": _conversation_summary(conversation),
+                    "prompt": _text_summary(prompt),
+                },
+            )
+            return decision
+        except Exception as exc:
             logger.exception(
                 "Supervisor decision provider failed; falling back to the supervisor loop."
             )
+            self._trace_event(
+                "dual_lane_supervisor_decision_failed",
+                kind="exception",
+                level="WARN",
+                details={
+                    "error_type": type(exc).__name__,
+                    "conversation": _conversation_summary(conversation),
+                    "prompt": _text_summary(prompt),
+                },
+            )
             return None
+
+    def recover_with_llm(
+        self,
+        prompt: str,
+        *,
+        conversation: ConversationLike | None = None,
+        instructions: str | None = None,
+        failure_reason: str,
+        rounds: int = 1,
+        tool_calls: Sequence[AgentToolCall] = (),
+        tool_results: Sequence[AgentToolResult] = (),
+        used_web_search: bool = False,
+    ) -> StreamingToolLoopResult:
+        """Generate a recovery reply through LLM lanes only."""
+
+        reply = self._recovery_responder.recover(
+            prompt,
+            conversation=conversation,
+            instructions=instructions,
+            failure_reason=failure_reason,
+        )
+        return _make_loop_result(
+            text=reply.text,
+            rounds=max(1, int(rounds)),
+            tool_calls=tuple(tool_calls),
+            tool_results=tuple(tool_results),
+            response_id=reply.response_id,
+            request_id=reply.request_id,
+            model=reply.model,
+            token_usage=reply.token_usage,
+            used_web_search=bool(used_web_search),
+        )
 
     def _run_direct_search_handoff(
         self,
@@ -202,7 +357,17 @@ class DualLaneToolLoop:
         date_context = _strip_text(arguments.get("date_context"))
         if date_context:
             tool_arguments["date_context"] = date_context
-        output = search_handler(tool_arguments)
+        if getattr(search_handler, "_twinr_accepts_tool_call", False):
+            output = search_handler(
+                AgentToolCall(
+                    name="search_live_info",
+                    call_id=call_id,
+                    arguments=tool_arguments,
+                    raw_arguments=_safe_json_dumps(tool_arguments),
+                )
+            )
+        else:
+            output = search_handler(tool_arguments)
         answer_text = _strip_text(
             output.get("answer")
             or output.get("spoken_answer")
@@ -315,7 +480,17 @@ class DualLaneToolLoop:
         normalized_arguments = _normalize_handoff_arguments(
             raw_arguments,
             fallback_prompt=prompt,
-            default_spoken_ack=self.default_spoken_ack,
+        )
+        self._trace_event(
+            "dual_lane_handoff_only_started",
+            kind="branch",
+            details={
+                "handoff": _handoff_summary(normalized_arguments),
+                "conversation": _conversation_summary(conversation),
+                "specialist_conversation": _conversation_summary(resolved_specialist_conversation),
+                "prompt": _text_summary(prompt),
+                "emit_filler": bool(emit_filler),
+            },
         )
 
         def _emit_user_text(
@@ -353,18 +528,23 @@ class DualLaneToolLoop:
             )
             status = "ok"
             error_code: str | None = None
-        except Exception:
+        except Exception as exc:
             logger.exception("Specialist handoff failed.")
-            specialist_result = _make_loop_result(
-                text=self.default_error_reply,
-                rounds=0,
-                tool_calls=(),
-                tool_results=(),
-                response_id=None,
-                request_id=None,
-                model=None,
-                token_usage=None,
-                used_web_search=False,
+            self._trace_event(
+                "dual_lane_handoff_only_specialist_failed",
+                kind="exception",
+                level="WARN",
+                details={
+                    "error_type": type(exc).__name__,
+                    "handoff": _handoff_summary(normalized_arguments),
+                    "specialist_conversation": _conversation_summary(resolved_specialist_conversation),
+                },
+            )
+            specialist_result = self.recover_with_llm(
+                prompt,
+                conversation=resolved_specialist_conversation,
+                instructions=instructions,
+                failure_reason="handoff_only_specialist_failed",
             )
             status = "error"
             error_code = "specialist_worker_failed"
@@ -382,7 +562,7 @@ class DualLaneToolLoop:
         if error_code is not None:
             handoff_output["error"] = error_code
 
-        final_text = _strip_text(specialist_result.text) or self.default_error_reply
+        final_text = _strip_text(specialist_result.text)
         if on_text_delta is not None or on_lane_text_delta is not None:
             _emit_user_text(
                 final_text,
@@ -390,6 +570,17 @@ class DualLaneToolLoop:
                 replace_current=emit_filler and bool(spoken_ack),
                 atomic=True,
             )
+        self._trace_event(
+            "dual_lane_handoff_only_completed",
+            kind="observation",
+            details={
+                "status": status,
+                "handoff": _handoff_summary(normalized_arguments),
+                "result": _loop_result_summary(specialist_result),
+                "final_text": _text_summary(final_text),
+                "replaced_filler": bool(emit_filler and spoken_ack),
+            },
+        )
 
         call_id = _first_non_none(
             response_id,
@@ -470,7 +661,6 @@ class DualLaneToolLoop:
             normalized_arguments = _normalize_handoff_arguments(
                 arguments,
                 fallback_prompt=prompt,
-                default_spoken_ack=self.default_spoken_ack,
             )  # AUDIT-FIX(#12): Validate and normalize supervisor-provided handoff payloads consistently.
             spoken_ack = normalized_arguments["spoken_ack"]
             if spoken_ack and not supervisor_text_emitted:
@@ -491,16 +681,11 @@ class DualLaneToolLoop:
                 error_code: str | None = None
             except Exception:
                 logger.exception("Specialist handoff failed.")  # AUDIT-FIX(#1): Convert provider/tool failures into safe handoff error results.
-                specialist_result = _make_loop_result(
-                    text=self.default_error_reply,
-                    rounds=0,
-                    tool_calls=(),
-                    tool_results=(),
-                    response_id=None,
-                    request_id=None,
-                    model=None,
-                    token_usage=None,
-                    used_web_search=False,
+                specialist_result = self.recover_with_llm(
+                    prompt,
+                    conversation=resolved_supervisor_conversation,
+                    instructions=instructions,
+                    failure_reason="supervisor_handoff_specialist_failed",
                 )  # AUDIT-FIX(#2): Always materialize a specialist result so downstream code never indexes an empty record list.
                 status = "error"
                 error_code = "specialist_worker_failed"
@@ -530,13 +715,32 @@ class DualLaneToolLoop:
         if decision is not None:
             action = _normalize_decision_action(getattr(decision, "action", None))
             if action == "direct" and supervisor_decision_requires_full_context(decision):
+                fallback_handoff = _decision_fallback_handoff(
+                    decision,
+                    prompt=prompt,
+                )
+                self._trace_decision(
+                    "dual_lane_direct_downgraded_to_handoff",
+                    question="Why was a direct supervisor answer not spoken directly?",
+                    selected={
+                        "id": "handoff_with_full_context",
+                        "summary": "The direct answer required the full tool/memory context",
+                    },
+                    options=[
+                        {"id": "direct", "summary": "Speak the direct supervisor answer"},
+                        {"id": "handoff_with_full_context", "summary": "Re-run through the specialist with full context"},
+                    ],
+                    context={
+                        "decision": _decision_summary(decision),
+                        "fallback_handoff": _handoff_summary(fallback_handoff),
+                        "conversation": _conversation_summary(conversation),
+                        "specialist_conversation": _conversation_summary(resolved_specialist_conversation),
+                    },
+                    guardrails=["preserve_full_context"],
+                )
                 return self.run_handoff_only(
                     prompt,
-                    handoff=_decision_fallback_handoff(
-                        decision,
-                        prompt=prompt,
-                        default_spoken_ack=self.default_spoken_ack,
-                    ),
+                    handoff=fallback_handoff,
                     conversation=conversation,
                     specialist_conversation=resolved_specialist_conversation,
                     instructions=instructions,
@@ -546,9 +750,16 @@ class DualLaneToolLoop:
                     emit_filler=True,
                 )
             if action == "direct":
-                reply = _strip_text(getattr(decision, "spoken_reply", None) or getattr(decision, "spoken_ack", None))
-                if not reply:
-                    reply = self.default_error_reply  # AUDIT-FIX(#8): Never return a silent direct turn to a senior user.
+                reply = _strip_text(getattr(decision, "spoken_reply", None))
+                self._trace_event(
+                    "dual_lane_direct_reply_selected",
+                    kind="decision",
+                    details={
+                        "decision": _decision_summary(decision),
+                        "reply": _text_summary(reply),
+                        "conversation": _conversation_summary(resolved_supervisor_conversation),
+                    },
+                )
                 _emit_user_text(reply, lane="direct")
                 return _make_loop_result(
                     text=reply,
@@ -567,14 +778,31 @@ class DualLaneToolLoop:
                 if end_handler is None and not self._has_supervisor_tool_handlers_override:
                     end_handler = self.tool_handlers.get("end_conversation")  # AUDIT-FIX(#3): Do not silently re-enable shared handlers when an empty supervisor override was intentional.
                 end_result: Any = {"status": "ok"}
-                reply = _strip_text(getattr(decision, "spoken_reply", None)) or self.default_end_reply
+                reply = _strip_text(getattr(decision, "spoken_reply", None))
+                recovery_result = None
                 try:
                     if end_handler is not None:
                         end_result = end_handler({})
-                except Exception:
+                except Exception as exc:
                     logger.exception("end_conversation handler failed.")
+                    self._trace_event(
+                        "dual_lane_end_conversation_handler_failed",
+                        kind="exception",
+                        level="WARN",
+                        details={
+                            "error_type": type(exc).__name__,
+                            "decision": _decision_summary(decision),
+                            "conversation": _conversation_summary(resolved_supervisor_conversation),
+                        },
+                    )
                     end_result = {"status": "error", "error": "end_conversation_failed"}
-                    reply = self.default_error_reply
+                    recovery_result = self.recover_with_llm(
+                        prompt,
+                        conversation=resolved_supervisor_conversation,
+                        instructions=instructions,
+                        failure_reason="end_conversation_handler_failed",
+                    )
+                    reply = recovery_result.text
                 call_id = _first_non_none(
                     getattr(decision, "response_id", None),
                     _make_call_id("end_conversation"),
@@ -599,10 +827,22 @@ class DualLaneToolLoop:
                             serialized_output=_safe_json_dumps(end_result),
                         ),
                     ),  # AUDIT-FIX(#7): Serialize arbitrary handler outputs safely.
-                    response_id=getattr(decision, "response_id", None),
-                    request_id=getattr(decision, "request_id", None),
-                    model=getattr(decision, "model", None),
-                    token_usage=getattr(decision, "token_usage", None),
+                    response_id=_first_non_none(
+                        getattr(recovery_result, "response_id", None) if recovery_result is not None else None,
+                        getattr(decision, "response_id", None),
+                    ),
+                    request_id=_first_non_none(
+                        getattr(recovery_result, "request_id", None) if recovery_result is not None else None,
+                        getattr(decision, "request_id", None),
+                    ),
+                    model=_first_non_none(
+                        getattr(recovery_result, "model", None) if recovery_result is not None else None,
+                        getattr(decision, "model", None),
+                    ),
+                    token_usage=_merge_token_usage(
+                        getattr(decision, "token_usage", None),
+                        getattr(recovery_result, "token_usage", None) if recovery_result is not None else None,
+                    ),
                     used_web_search=False,
                 )
 
@@ -644,9 +884,9 @@ class DualLaneToolLoop:
                 allow_web_search=allow_web_search,
                 on_text_delta=_forward_supervisor_delta,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("Supervisor loop failed.")  # AUDIT-FIX(#1): Return the best available fallback instead of crashing the request.
-            fallback_text = self.default_error_reply
+            fallback_text = ""
             used_web_search = False
             token_usage = None
             if specialist_records:
@@ -654,6 +894,34 @@ class DualLaneToolLoop:
                 fallback_text = _strip_text(latest_specialist_result.text) or fallback_text
                 used_web_search = bool(latest_specialist_result.used_web_search)
                 token_usage = latest_specialist_result.token_usage
+            recovery_result = None
+            if not fallback_text:
+                recovery_result = self.recover_with_llm(
+                    prompt,
+                    conversation=resolved_supervisor_conversation,
+                    instructions=instructions,
+                    failure_reason="supervisor_loop_failed",
+                    rounds=1,
+                    tool_calls=tuple(_merge_handoff_items((), specialist_records, "tool_calls")),
+                    tool_results=tuple(_merge_handoff_items((), specialist_records, "tool_results")),
+                    used_web_search=used_web_search,
+                )
+                fallback_text = recovery_result.text
+                token_usage = _merge_token_usage(token_usage, recovery_result.token_usage)
+            self._trace_event(
+                "dual_lane_supervisor_loop_failed",
+                kind="exception",
+                level="WARN",
+                details={
+                    "error_type": type(exc).__name__,
+                    "conversation": _conversation_summary(resolved_supervisor_conversation),
+                    "prompt": _text_summary(prompt),
+                    "specialist_count": len(specialist_records),
+                    "specialist_tail": [_loop_result_summary(record.result) for record in specialist_records[-2:]],
+                    "fallback_text": _text_summary(fallback_text),
+                    "used_recovery_llm": recovery_result is not None,
+                },
+            )
             if not supervisor_text_emitted:
                 _emit_user_text(fallback_text)
             return _make_loop_result(
@@ -666,12 +934,15 @@ class DualLaneToolLoop:
                     _merge_handoff_items((), specialist_records, "tool_results")
                 ),
                 response_id=_first_non_none(
+                    getattr(recovery_result, "response_id", None) if recovery_result is not None else None,
                     *[record.result.response_id for record in specialist_records],
                 ),
                 request_id=_first_non_none(
+                    getattr(recovery_result, "request_id", None) if recovery_result is not None else None,
                     *[record.result.request_id for record in specialist_records],
                 ),
                 model=_first_non_none(
+                    getattr(recovery_result, "model", None) if recovery_result is not None else None,
                     *[record.result.model for record in specialist_records],
                 ),
                 token_usage=token_usage,
@@ -711,9 +982,46 @@ class DualLaneToolLoop:
 
         final_text = _strip_text(supervisor_result.text) or fallback_text
         if not final_text:
-            final_text = self.default_error_reply  # AUDIT-FIX(#8): Avoid silent empty completions on supervisor loop failures or blank model outputs.
+            self._trace_event(
+                "dual_lane_supervisor_result_empty",
+                kind="exception",
+                level="WARN",
+                details={
+                    "supervisor_result": _loop_result_summary(supervisor_result),
+                    "specialist_count": len(specialist_records),
+                    "merged_tool_calls": len(merged_tool_calls),
+                    "merged_tool_results": len(merged_tool_results),
+                },
+            )
+            recovery_result = self.recover_with_llm(
+                prompt,
+                conversation=resolved_supervisor_conversation,
+                instructions=instructions,
+                failure_reason="supervisor_result_empty",
+                rounds=1,
+                tool_calls=tuple(merged_tool_calls),
+                tool_results=tuple(merged_tool_results),
+                used_web_search=used_web_search,
+            )
+            final_text = recovery_result.text
+            response_id = _first_non_none(response_id, recovery_result.response_id)
+            request_id = _first_non_none(request_id, recovery_result.request_id)
+            model = _first_non_none(model, recovery_result.model)
+            token_usage = _merge_token_usage(token_usage, recovery_result.token_usage)
         if final_text and not supervisor_text_emitted:
             _emit_user_text(final_text)
+        self._trace_event(
+            "dual_lane_run_completed",
+            kind="observation",
+            details={
+                "decision": _decision_summary(decision),
+                "supervisor_result": _loop_result_summary(supervisor_result),
+                "final_text": _text_summary(final_text),
+                "specialist_count": len(specialist_records),
+                "used_web_search": used_web_search,
+                "supervisor_text_emitted": supervisor_text_emitted,
+            },
+        )
 
         return _make_loop_result(
             text=final_text,
@@ -819,6 +1127,96 @@ def _make_call_id(prefix: str) -> str:
     return f"{safe_prefix}_{uuid4().hex}"
 
 
+def _text_summary(value: Any) -> dict[str, Any]:
+    """Describe text safely for forensics without storing raw content."""
+
+    normalized = _strip_text(value)
+    if not normalized:
+        return {"present": False, "chars": 0, "words": 0, "sha12": None}
+    return {
+        "present": True,
+        "chars": len(normalized),
+        "words": len(normalized.split()),
+        "sha12": sha1(normalized.encode("utf-8")).hexdigest()[:12],
+    }
+
+
+def _conversation_summary(conversation: ConversationLike | None) -> dict[str, Any]:
+    """Summarize conversation context shape without leaking raw text."""
+
+    if not conversation:
+        return {"present": False, "messages": 0, "tail": []}
+    tail: list[dict[str, Any]] = []
+    total_chars = 0
+    for item in conversation:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            role = _strip_text(item[0]) or "unknown"
+            content = _coerce_text(item[1])
+        else:
+            role = "unknown"
+            content = _coerce_text(item)
+        total_chars += len(content.strip())
+        tail.append({"role": role, "content": _text_summary(content)})
+    return {
+        "present": True,
+        "messages": len(tail),
+        "total_chars": total_chars,
+        "tail": tail[-3:],
+    }
+
+
+def _decision_summary(decision: Any | None) -> dict[str, Any]:
+    """Summarize a supervisor decision for branch forensics."""
+
+    if decision is None:
+        return {"present": False}
+    return {
+        "present": True,
+        "action": _normalize_decision_action(getattr(decision, "action", None)),
+        "kind": _normalize_handoff_kind(getattr(decision, "kind", None)),
+        "context_scope": _strip_text(getattr(decision, "context_scope", None)) or None,
+        "allow_web_search": getattr(decision, "allow_web_search", None),
+        "spoken_ack": _text_summary(getattr(decision, "spoken_ack", None)),
+        "spoken_reply": _text_summary(getattr(decision, "spoken_reply", None)),
+        "goal": _text_summary(getattr(decision, "goal", None)),
+        "prompt": _text_summary(getattr(decision, "prompt", None)),
+        "location_hint": _text_summary(getattr(decision, "location_hint", None)),
+        "date_context": _text_summary(getattr(decision, "date_context", None)),
+    }
+
+
+def _handoff_summary(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Summarize a normalized handoff payload without raw user text."""
+
+    return {
+        "kind": _normalize_handoff_kind(arguments.get("kind")),
+        "goal": _text_summary(arguments.get("goal")),
+        "spoken_ack": _text_summary(arguments.get("spoken_ack")),
+        "prompt": _text_summary(arguments.get("prompt")),
+        "allow_web_search": arguments.get("allow_web_search"),
+        "location_hint": _text_summary(arguments.get("location_hint")),
+        "date_context": _text_summary(arguments.get("date_context")),
+    }
+
+
+def _loop_result_summary(result: StreamingToolLoopResult | None) -> dict[str, Any]:
+    """Summarize a loop result for branch-level forensic trace output."""
+
+    if result is None:
+        return {"present": False}
+    return {
+        "present": True,
+        "text": _text_summary(result.text),
+        "rounds": result.rounds,
+        "tool_calls": len(result.tool_calls),
+        "tool_results": len(result.tool_results),
+        "used_web_search": bool(result.used_web_search),
+        "response_id_present": bool(_strip_text(result.response_id)),
+        "request_id_present": bool(_strip_text(result.request_id)),
+        "model_present": bool(_strip_text(result.model)),
+    }
+
+
 def _merge_token_usage(base: Any, extra: Any) -> Any:
     """Merge provider token-usage payloads across supervisor and specialist work."""
     if base is None:
@@ -920,14 +1318,6 @@ def _strip_text(value: Any) -> str:
     return _coerce_text(value).strip()
 
 
-def _normalize_default_text(value: Any, fallback: str) -> str:
-    """Return a stripped non-empty string or the configured fallback."""
-    normalized = _strip_text(value)
-    if normalized:
-        return normalized
-    return fallback
-
-
 def _normalize_handoff_kind(value: Any) -> str:
     """Normalize the handoff kind to the supported specialist categories."""
     normalized = _strip_text(value).lower()
@@ -940,13 +1330,12 @@ def _normalize_handoff_arguments(
     arguments: dict[str, Any],
     *,
     fallback_prompt: str,
-    default_spoken_ack: str,
 ) -> dict[str, Any]:
     """Normalize a supervisor handoff payload into the canonical shape."""
     normalized: dict[str, Any] = {
         "kind": _normalize_handoff_kind(arguments.get("kind")),
         "goal": _strip_text(arguments.get("goal")) or fallback_prompt,
-        "spoken_ack": _normalize_spoken_ack(arguments, default_spoken_ack),
+        "spoken_ack": _normalize_spoken_ack(arguments),
     }
     prompt = _strip_text(arguments.get("prompt"))
     if prompt:
@@ -992,19 +1381,16 @@ def _specialist_handoff_context(arguments: dict[str, Any]) -> str:
     return " ".join(context_parts)  # AUDIT-FIX(#16): This helper always returns a string, so the type now matches runtime behaviour.
 
 
-def _normalize_spoken_ack(arguments: dict[str, Any], default: str) -> str:
-    """Return the spoken acknowledgement or a configured default."""
+def _normalize_spoken_ack(arguments: dict[str, Any]) -> str:
+    """Return the spoken acknowledgement exactly as provided by the supervisor."""
     raw = _strip_text(arguments.get("spoken_ack"))
-    if raw:
-        return raw
-    return default
+    return raw
 
 
 def _decision_fallback_handoff(
     decision: Any,
     *,
     prompt: str,
-    default_spoken_ack: str,
 ) -> dict[str, Any]:
     """Convert a full-context direct decision into a safe handoff payload."""
 
@@ -1014,7 +1400,7 @@ def _decision_fallback_handoff(
     fallback_arguments = {
         "kind": kind,
         "goal": _strip_text(getattr(decision, "goal", None)) or prompt,
-        "spoken_ack": _strip_text(getattr(decision, "spoken_ack", None)) or default_spoken_ack,
+        "spoken_ack": _strip_text(getattr(decision, "spoken_ack", None)),
         "prompt": _strip_text(getattr(decision, "prompt", None)),
         "allow_web_search": getattr(decision, "allow_web_search", None),
         "location_hint": _strip_text(getattr(decision, "location_hint", None)),
@@ -1025,3 +1411,12 @@ def _decision_fallback_handoff(
         "token_usage": getattr(decision, "token_usage", None),
     }
     return fallback_arguments
+
+
+def _supervisor_decision_has_required_user_reply(decision: Any) -> bool:
+    """Return whether the decision satisfies the user-facing reply contract."""
+
+    action = _normalize_decision_action(getattr(decision, "action", None))
+    if action == "handoff":
+        return bool(_strip_text(getattr(decision, "spoken_ack", None)))
+    return bool(_strip_text(getattr(decision, "spoken_reply", None)))

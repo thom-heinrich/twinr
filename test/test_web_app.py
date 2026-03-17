@@ -12,6 +12,7 @@ from unittest.mock import patch
 import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+import warnings
 
 from fastapi.testclient import TestClient
 from test.self_coding_test_utils import stable_sha256
@@ -38,6 +39,24 @@ from twinr.ops.remote_memory_watchdog import (
     RemoteMemoryWatchdogStore,
 )
 from twinr.web import create_app
+
+
+class _WarningQuietTestClient(TestClient):
+    """Suppress the known Task/Future cancel deprecation noise during requests."""
+
+    def request(self, *args, **kwargs):  # type: ignore[override]
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Passing 'msg' argument to Task\.cancel\(\) is deprecated since Python 3\.11, and scheduled for removal in Python 3\.14\.",
+                category=DeprecationWarning,
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Passing 'msg' argument to Future\.cancel\(\) is deprecated since Python 3\.11, and scheduled for removal in Python 3\.14\.",
+                category=DeprecationWarning,
+            )
+            return super().request(*args, **kwargs)
 
 
 def _voice_sample_wav_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0.35, duration_s: float = 1.8) -> bytes:
@@ -92,7 +111,7 @@ class WebAppTests(unittest.TestCase):
         (personality_dir / "SYSTEM.md").write_text("System text\n", encoding="utf-8")
         (personality_dir / "PERSONALITY.md").write_text("Personality text\n", encoding="utf-8")
         (personality_dir / "USER.md").write_text("User text\n", encoding="utf-8")
-        return TestClient(create_app(env_path), base_url=base_url, client=(client_host, 50000)), env_path
+        return _WarningQuietTestClient(create_app(env_path), base_url=base_url, client=(client_host, 50000)), env_path
 
     def test_dashboard_renders_summary(self) -> None:
         client, _env_path = self.make_client()

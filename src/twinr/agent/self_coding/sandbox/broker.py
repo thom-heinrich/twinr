@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 import inspect
+import logging
 import math
 import threading
 from typing import Any
@@ -15,6 +16,8 @@ from twinr.agent.self_coding.sandbox.policy import CapabilityBrokerManifest
 _DEFAULT_RPC_TIMEOUT_SECONDS = 60.0
 _TRUE_TEXT_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_TEXT_VALUES = frozenset({"0", "false", "no", "off"})
+
+LOGGER = logging.getLogger(__name__)
 
 
 class BrokerProtocolError(RuntimeError):
@@ -479,4 +482,4 @@ def _close_awaitable_result(result: object) -> None:
         try:
             close()
         except Exception:
-            pass
+            LOGGER.warning("Self-coding broker failed to close unexpected awaitable result.", exc_info=True)

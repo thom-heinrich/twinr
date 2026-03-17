@@ -7,6 +7,7 @@ summary: Orchestrate the active realtime and streaming Twinr hardware loops plus
 owned_concerns:
   - Orchestrate button, wakeword, and proactive entry points for Twinr hardware loops
   - Coordinate live conversation sessions, print delivery, and bounded speech output
+  - Keep turn-guidance context shaping and transcript-verifier gate policy outside the active loop classes
   - Serialize beep, feedback, and spoken playback under one priority-aware speaker coordinator
   - Keep required remote-memory fail-closed checks off the GPIO polling thread
   - Produce bounded forensic run packs for live button/session/audio investigation
@@ -31,13 +32,23 @@ files:
     exports:
       - TwinrHardwareLoop
   - path: realtime_runner.py
-    role: Realtime session loop with wakeword and print-lane orchestration
+    role: Realtime session loop with wakeword and print-lane orchestration that delegates guidance and transcript verification
     exports:
       - TwinrRealtimeHardwareLoop
   - path: streaming_runner.py
     role: Streaming loop entrypoint and turn orchestration shell that delegates capture, speculation, planning, and turn execution
     exports:
       - TwinrStreamingHardwareLoop
+  - path: turn_guidance.py
+    role: Bounded turn-controller context selection and turn-label guidance runtime
+    exports:
+      - TurnGuidanceContext
+      - TurnGuidanceRuntime
+  - path: streaming_transcript_verifier.py
+    role: Low-evidence transcript recovery and explicit verifier-gate runtime
+    exports:
+      - TranscriptVerifierGateDecision
+      - StreamingTranscriptVerifierRuntime
   - path: streaming_capture.py
     role: Streaming microphone-capture, timeout, and batch-STT fallback controller
     exports:
@@ -46,7 +57,7 @@ files:
   - path: streaming_speculation.py
     role: Speculative first-word and supervisor warmup controller for the streaming loop
   - path: streaming_lane_planner.py
-    role: Streaming lane-plan construction and final-lane path selection
+    role: Streaming lane-plan construction, final-lane path selection, and LLM recovery callback wiring
   - path: streaming_turn_coordinator.py
     role: Authoritative streaming turn state machine for speech lifecycle, deadlines, cancellation, and completion
     exports:
@@ -57,7 +68,7 @@ files:
       - StreamingTurnRequest
       - StreamingTurnSpeechServices
   - path: streaming_turn_orchestrator.py
-    role: Low-level bridge/final lane watchdog helper used by the streaming turn coordinator
+    role: Low-level bridge/final lane watchdog helper plus LLM recovery handoff for the streaming turn coordinator
     exports:
       - StreamingTurnOrchestrator
       - StreamingTurnTimeoutPolicy

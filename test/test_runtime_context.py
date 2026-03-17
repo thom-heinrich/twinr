@@ -214,6 +214,38 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
+    def test_supervisor_direct_context_uses_full_provider_memory_for_current_query(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=self._config(temp_dir))
+            try:
+                runtime.memory.remember("user", "Wir haben über Medikamente gesprochen.")
+                recorded_queries: list[str] = []
+
+                class _RecordingLongTermMemory:
+                    def build_provider_context(self, query_text):
+                        recorded_queries.append(str(query_text))
+                        return SimpleNamespace(
+                            system_messages=lambda: ("Structured memory for direct supervisor reply.",)
+                        )
+
+                    def build_tool_provider_context(self, query_text):
+                        raise AssertionError("direct supervisor context must use normal provider memory")
+
+                runtime.long_term_memory = _RecordingLongTermMemory()
+
+                context = runtime.supervisor_direct_provider_conversation_context(
+                    "Worüber haben wir heute gesprochen?"
+                )
+
+                self.assertEqual(recorded_queries, ["Worüber haben wir heute gesprochen?"])
+                self.assertIn(
+                    ("system", "Structured memory for direct supervisor reply."),
+                    context,
+                )
+                self.assertIn(("user", "Wir haben über Medikamente gesprochen."), context)
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
     def test_runtime_startup_degrades_when_remote_long_term_bootstrap_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir)

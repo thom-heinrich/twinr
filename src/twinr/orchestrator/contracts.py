@@ -7,6 +7,7 @@ crashing turn handling.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
@@ -22,6 +23,8 @@ _RECURSION_SENTINEL = "<recursive-ref>"
 _MAX_DEPTH_SENTINEL = "<max-depth-exceeded>"
 _TRUE_STRINGS = frozenset({"1", "true", "t", "yes", "y", "on"})
 _FALSE_STRINGS = frozenset({"0", "false", "f", "no", "n", "off", ""})
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +351,7 @@ def _coerce_tool_calls(value: Any) -> list[AgentToolCall]:
                 )
             )
         except Exception:
+            _LOGGER.warning("Skipping malformed orchestrator tool-call record during decode.", exc_info=True)
             continue
     return items
 
@@ -371,6 +375,7 @@ def _coerce_tool_results(value: Any) -> list[AgentToolResult]:
                 )
             )
         except Exception:
+            _LOGGER.warning("Skipping malformed orchestrator tool-result record during decode.", exc_info=True)
             continue
     return items
 

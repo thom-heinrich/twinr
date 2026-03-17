@@ -406,6 +406,23 @@ class TwinrDisplayDebugLogBuilder:
     ) -> str | None:
         if snapshot is None:
             return None
+        sample_status = compact_text(snapshot.current.status or "?", limit=10).lower() or "?"
+        if bool(getattr(snapshot.current, "ready", False)) and sample_status == "ok":
+            sampled_at = self._time_text(snapshot.current.captured_at or snapshot.last_ok_at)
+            return compact_text(
+                f"last ok {sampled_at} | fail {snapshot.failure_count}",
+                limit=_MAX_LINE_LENGTH,
+            )
+        if sample_status == "fail" or (
+            assessment is not None
+            and not assessment.ready
+            and not assessment.snapshot_stale
+            and sample_status not in {"starting", "disabled"}
+        ):
+            failed_at = self._time_text(snapshot.last_failure_at or snapshot.current.captured_at)
+            if failed_at != "--:--":
+                return compact_text(f"last fail {failed_at} | retrying", limit=_MAX_LINE_LENGTH)
+            return "remote fail | retrying"
         if bool(getattr(snapshot, "probe_inflight", False)):
             started_at = self._time_text(getattr(snapshot, "probe_started_at", None))
             return compact_text(
@@ -413,10 +430,7 @@ class TwinrDisplayDebugLogBuilder:
                 limit=_MAX_LINE_LENGTH,
             )
         sampled_at = self._time_text(snapshot.current.captured_at)
-        return compact_text(
-            f"sample {sampled_at} | fail {snapshot.failure_count}",
-            limit=_MAX_LINE_LENGTH,
-        )
+        return compact_text(f"sample {sampled_at} | {sample_status}", limit=_MAX_LINE_LENGTH)
 
     def _remote_detail_line(
         self,
@@ -459,9 +473,31 @@ class TwinrDisplayDebugLogBuilder:
     def _hardware_host_line(self, health: TwinrSystemHealth | None) -> str | None:
         if health is None:
             return None
-        cpu_text = self._format_bucketed_metric(health.cpu_temperature_c, bucket=5.0, suffix="C")
-        mem_text = self._format_bucketed_metric(health.memory_used_percent, bucket=5.0, suffix="%")
-        disk_text = self._format_bucketed_metric(health.disk_used_percent, bucket=5.0, suffix="%")
+        cpu_text = self._format_threshold_band(
+            health.cpu_temperature_c,
+            thresholds=(
+                (70.0, "<70C"),
+                (80.0, "70-79C"),
+            ),
+            fallback="80C+",
+        )
+        mem_text = self._format_threshold_band(
+            health.memory_used_percent,
+            thresholds=(
+                (40.0, "<40%"),
+                (60.0, "40-59%"),
+                (80.0, "60-79%"),
+            ),
+            fallback="80%+",
+        )
+        disk_text = self._format_threshold_band(
+            health.disk_used_percent,
+            thresholds=(
+                (70.0, "<70%"),
+                (85.0, "70-84%"),
+            ),
+            fallback="85%+",
+        )
         return compact_text(f"cpu {cpu_text} | mem {mem_text} | disk {disk_text}", limit=_MAX_LINE_LENGTH)
 
     def _service(self, services: tuple[ServiceHealth, ...], key: str) -> ServiceHealth | None:
@@ -502,3 +538,28 @@ class TwinrDisplayDebugLogBuilder:
         if suffix == "C":
             return f"{bucketed:.0f}{suffix}"
         return f"{bucketed:.0f}{suffix}"
+
+    def _format_range_band(self, value: float | None, *, bucket: float, suffix: str) -> str:
+        if value is None:
+            return "?"
+        if bucket <= 0.0:
+            return f"{value:.1f}{suffix}"
+        bucket_value = float(bucket)
+        lower = int((float(value) // bucket_value) * bucket_value)
+        upper = lower + int(bucket_value) - 1
+        return f"{lower}-{upper}{suffix}"
+
+    def _format_threshold_band(
+        self,
+        value: float | None,
+        *,
+        thresholds: tuple[tuple[float, str], ...],
+        fallback: str,
+    ) -> str:
+        if value is None:
+            return "?"
+        resolved = float(value)
+        for upper_bound, label in thresholds:
+            if resolved < upper_bound:
+                return label
+        return fallback

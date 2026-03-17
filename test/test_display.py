@@ -529,6 +529,91 @@ class WaveshareDisplayTests(unittest.TestCase):
                 ],
             )
 
+    def test_show_image_times_out_stuck_vendor_busy_wait(self) -> None:
+        sentinel_name = "__twinr_display_busy_timeout_events__"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            vendor_dir = Path(temp_dir) / "vendor" / "waveshare_epd"
+            vendor_dir.mkdir(parents=True)
+            (vendor_dir / "__init__.py").write_text("", encoding="utf-8")
+            (vendor_dir / "epdconfig.py").write_text(
+                textwrap.dedent(
+                    f"""
+                    import builtins
+
+                    _EVENTS = getattr(builtins, "{sentinel_name}", None)
+                    if _EVENTS is None:
+                        _EVENTS = []
+                        setattr(builtins, "{sentinel_name}", _EVENTS)
+                    RST_PIN = 17
+                    DC_PIN = 25
+                    CS_PIN = 8
+                    BUSY_PIN = 24
+                    PWR_PIN = 18
+
+                    def digital_read(pin):
+                        _EVENTS.append(("digital_read", pin))
+                        return 1
+
+                    def delay_ms(delay):
+                        _EVENTS.append(("delay_ms", delay))
+
+                    def module_exit(cleanup=False):
+                        _EVENTS.append(("module_exit", cleanup))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (vendor_dir / "epd4in2_V2.py").write_text(
+                textwrap.dedent(
+                    f"""
+                    import builtins
+
+                    _EVENTS = getattr(builtins, "{sentinel_name}", None)
+                    if _EVENTS is None:
+                        _EVENTS = []
+                        setattr(builtins, "{sentinel_name}", _EVENTS)
+
+                    class EPD:
+                        width = 400
+                        height = 300
+                        busy_pin = 24
+
+                        def init(self):
+                            _EVENTS.append("init")
+                            self.ReadBusy()
+
+                        def getbuffer(self, image):
+                            _EVENTS.append(("buffer", image))
+                            return image
+
+                        def display(self, buffer):
+                            _EVENTS.append(("display", buffer))
+
+                        def sleep(self):
+                            _EVENTS.append("sleep")
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            display = WaveshareEPD4In2V2(
+                project_root=Path(temp_dir),
+                vendor_dir=Path(temp_dir) / "vendor",
+                busy_timeout_s=0.01,
+            )
+
+            try:
+                with self.assertRaisesRegex(RuntimeError, "failed after one recovery attempt"):
+                    display.show_image(_prepared_image(), clear_first=False)
+
+                events = getattr(builtins, sentinel_name)
+                self.assertEqual(events.count("init"), 2)
+                self.assertEqual(events.count("sleep"), 2)
+                self.assertEqual(events.count(("module_exit", True)), 2)
+            finally:
+                if hasattr(builtins, sentinel_name):
+                    delattr(builtins, sentinel_name)
+
     def test_show_image_can_force_full_refresh_on_configured_interval(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             vendor_dir = Path(temp_dir) / "vendor" / "waveshare_epd"

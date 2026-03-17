@@ -445,18 +445,19 @@ sys.stdout.write(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens
         self.assertEqual(driver.fallback.model_reasoning_effort, "xhigh")
 
     def test_local_compile_driver_uses_codex_high_defaults_without_env_overrides(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {
-                "TWINR_SELF_CODING_CODEX_TIMEOUT_SECONDS": "",
-                "TWINR_SELF_CODING_CODEX_MODEL": "",
-                "TWINR_SELF_CODING_CODEX_MODEL_REASONING_EFFORT": "",
-                "TWINR_SELF_CODING_CODEX_SDK_TIMEOUT_SECONDS": "",
-                "TWINR_SELF_CODING_CODEX_EXEC_TIMEOUT_SECONDS": "",
-            },
-            clear=False,
-        ):
-            driver = LocalCodexCompileDriver()
+        with self.assertLogs("twinr.agent.self_coding.codex_driver.config", level="WARNING") as captured:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "TWINR_SELF_CODING_CODEX_TIMEOUT_SECONDS": "",
+                    "TWINR_SELF_CODING_CODEX_MODEL": "",
+                    "TWINR_SELF_CODING_CODEX_MODEL_REASONING_EFFORT": "",
+                    "TWINR_SELF_CODING_CODEX_SDK_TIMEOUT_SECONDS": "",
+                    "TWINR_SELF_CODING_CODEX_EXEC_TIMEOUT_SECONDS": "",
+                },
+                clear=False,
+            ):
+                driver = LocalCodexCompileDriver()
 
         self.assertEqual(driver.primary.timeout_seconds, 900.0)
         self.assertEqual(driver.fallback.timeout_seconds, 900.0)
@@ -464,6 +465,7 @@ sys.stdout.write(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens
         self.assertEqual(driver.fallback.model, "gpt-5-codex")
         self.assertEqual(driver.primary.model_reasoning_effort, "high")
         self.assertEqual(driver.fallback.model_reasoning_effort, "high")
+        self.assertTrue(any("Ignoring blank model value" in line for line in captured.output))
 
 
 if __name__ == "__main__":

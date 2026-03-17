@@ -1,3 +1,11 @@
+"""Expose the lazy top-level Twinr import surface.
+
+Import package-root symbols from ``twinr`` when callers need the canonical
+compatibility surface for runtime configuration and on-device memory types.
+The heavy implementations stay in focused child packages and are imported only
+on demand.
+"""
+
 from __future__ import annotations
 
 from importlib import import_module
@@ -20,6 +28,8 @@ _EXPORTS = {
 
 
 def __getattr__(name: str) -> object:
+    """Resolve a documented package-root export lazily."""
+
     module_name = _EXPORTS.get(name)
     if module_name is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -28,4 +38,6 @@ def __getattr__(name: str) -> object:
 
 
 def __dir__() -> list[str]:
+    """Return the stable package-root attribute list for introspection."""
+
     return sorted(set(globals()) | set(__all__))

@@ -22,12 +22,19 @@ adapter used by Twinr's Pi runtime.
   does not kill a live companion just because one Waveshare refresh runs longer
   than the idle heartbeat budget
 - render and upload Waveshare 4.2 V2 images with validated driver settings
+- bound Waveshare BUSY-pin waits so panel/driver stalls raise recoverable
+  errors instead of wedging the companion thread forever
 - prefer stable two-plane refresh paths on the Waveshare 4.2 V2 panel so live
   status animations do not invert panel polarity
 - keep debug-log lines stable between real state changes so operator screens do
   not churn the e-paper panel every poll cycle
 - keep debug-log hardware and ChonkyDB summary lines semantically current but
   bucketed/stable enough for e-paper refresh budgets
+- keep debug-log host metrics on operator thresholds rather than narrow raw
+  buckets so ordinary Pi temperature drift does not cause visual churn
+- keep watchdog probe transitions, even during repeated ChonkyDB failures, and
+  minor host-metric drift from retriggering debug-log rerenders every few
+  seconds on the panel
 - discard cached vendor imports after hardware faults so the next render starts cleanly
 - run the optional companion display loop beside hardware/runtime loops
 

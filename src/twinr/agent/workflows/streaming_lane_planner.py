@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from hashlib import sha1
+from typing import Any
+
 from twinr.agent.tools import (
     DualLaneToolLoop,
     build_compact_tool_agent_instructions,
     build_tool_agent_instructions,
 )
+from twinr.agent.base_agent.contracts import supervisor_decision_requires_full_context
 from twinr.agent.workflows.streaming_turn_coordinator import StreamingTurnLanePlan
 from twinr.agent.workflows.streaming_turn_orchestrator import StreamingTurnTimeoutPolicy
 
@@ -30,13 +34,29 @@ class StreamingLanePlanner:
             first_audio_gate_ms=max(0, int(loop.config.streaming_first_word_final_lane_wait_ms)),
         )
 
-    def dual_lane_error_reply(self) -> str:
-        """Return the localized fallback reply for bounded lane failures."""
+    def _recover_dual_lane_response(
+        self,
+        transcript: str,
+        *,
+        turn_instructions: str | None,
+        failure_reason: str,
+    ):
+        """Resolve a final spoken recovery reply through the dual-lane LLM path."""
 
         loop = self._loop
-        if isinstance(loop.streaming_turn_loop, DualLaneToolLoop):
-            return str(getattr(loop.streaming_turn_loop, "default_error_reply", "") or "").strip()
-        return "Das hat gerade nicht geklappt. Bitte versuche es noch einmal."
+        if not isinstance(loop.streaming_turn_loop, DualLaneToolLoop):
+            raise RuntimeError("dual-lane recovery requested without a dual-lane loop")
+        loop._trace_event(
+            "dual_lane_recovery_requested",
+            kind="branch",
+            details={"failure_reason": failure_reason, "transcript_len": len(transcript)},
+        )
+        return loop.streaming_turn_loop.recover_with_llm(
+            transcript,
+            conversation=loop.runtime.supervisor_direct_provider_conversation_context(transcript),
+            instructions=turn_instructions,
+            failure_reason=failure_reason,
+        )
 
     def build_turn_lane_plan(self, transcript: str) -> StreamingTurnLanePlan:
         """Build the full execution plan for one streaming turn."""
@@ -100,8 +120,13 @@ class StreamingLanePlanner:
                     ),
                     bridge_fallback_reply=None,
                     timeout_policy=loop._streaming_turn_timeout_policy(),
-                    final_timeout_reply=loop._dual_lane_error_reply(),
-                    final_error_reply=loop._dual_lane_error_reply(),
+                    recover_final_lane_response=(
+                        lambda failure_reason: self._recover_dual_lane_response(
+                            transcript,
+                            turn_instructions=turn_instructions,
+                            failure_reason=failure_reason,
+                        )
+                    ),
                 )
 
             turn_instructions = (
@@ -138,25 +163,90 @@ class StreamingLanePlanner:
         loop = self._loop
         if prefetched_decision is None:
             prefetched_decision = loop._consume_speculative_supervisor_decision(transcript)
-        search_context = loop.runtime.search_provider_conversation_context()
-        supervisor_context = loop.runtime.supervisor_provider_conversation_context()
+        resolved_decision = prefetched_decision
+        search_context = None
+        supervisor_context = None
+        supervisor_direct_context = None
+        tool_context = None
+
+        def _materialize_context(source: str, value):
+            loop._trace_event(
+                "dual_lane_context_materialized",
+                kind="observation",
+                details={
+                    "source": source,
+                    "transcript": _text_summary(transcript),
+                    "context": _conversation_summary(value),
+                },
+            )
+            return value
+
+        def _search_context():
+            nonlocal search_context
+            if search_context is None:
+                search_context = _materialize_context(
+                    "search",
+                    loop.runtime.search_provider_conversation_context(),
+                )
+            return search_context
+
+        def _supervisor_context():
+            nonlocal supervisor_context
+            if supervisor_context is None:
+                supervisor_context = _materialize_context(
+                    "supervisor",
+                    loop.runtime.supervisor_provider_conversation_context(),
+                )
+            return supervisor_context
+
+        def _supervisor_direct_context():
+            nonlocal supervisor_direct_context
+            if supervisor_direct_context is None:
+                supervisor_direct_context = _materialize_context(
+                    "supervisor_direct",
+                    loop.runtime.supervisor_direct_provider_conversation_context(transcript),
+                )
+            return supervisor_direct_context
+
+        def _tool_context():
+            nonlocal tool_context
+            if tool_context is None:
+                tool_context = _materialize_context(
+                    "tool",
+                    loop.runtime.tool_provider_conversation_context(),
+                )
+            return tool_context
+
+        def _handoff_context(decision):
+            kind = str(getattr(decision, "kind", "") or "").strip().lower()
+            return _search_context() if kind == "search" else _tool_context()
+
         if prefetched_decision is not None and getattr(prefetched_decision, "action", None) == "handoff":
+            handoff_kind = str(getattr(prefetched_decision, "kind", "") or "").strip().lower() or "general"
+            handoff_context = _handoff_context(prefetched_decision)
             loop._trace_decision(
                 "dual_lane_final_path_selected",
                 question="Which final-lane execution path should run?",
-                selected={"id": "prefetched_handoff", "summary": "Run one direct handoff-only search"},
+                selected={"id": "prefetched_handoff", "summary": f"Run one direct handoff-only {handoff_kind} path"},
                 options=[
-                    {"id": "prefetched_handoff", "summary": "Run one direct handoff-only search"},
+                    {"id": "prefetched_handoff", "summary": "Run one direct handoff-only path"},
                     {"id": "resolve_supervisor", "summary": "Resolve supervisor decision synchronously"},
                     {"id": "generic_tool_loop", "summary": "Run generic tool loop"},
                 ],
-                context={"transcript_len": len(transcript), "prefetched": True},
+                context={
+                    "transcript": _text_summary(transcript),
+                    "handoff_kind": handoff_kind,
+                    "prefetched": True,
+                    "decision": _decision_summary(prefetched_decision),
+                    "context_source": "search" if handoff_kind == "search" else "tool",
+                    "context": _conversation_summary(handoff_context),
+                },
                 guardrails=["single_search_execution"],
             )
             return loop.streaming_turn_loop.run_handoff_only(
                 transcript,
-                conversation=search_context,
-                specialist_conversation=search_context,
+                conversation=handoff_context,
+                specialist_conversation=handoff_context,
                 handoff=prefetched_decision,
                 instructions=turn_instructions,
                 allow_web_search=False,
@@ -167,11 +257,23 @@ class StreamingLanePlanner:
         if getattr(loop.streaming_turn_loop, "supervisor_decision_provider", None) is not None:
             resolved_decision = prefetched_decision or loop.streaming_turn_loop.resolve_supervisor_decision(
                 transcript,
-                conversation=supervisor_context,
+                conversation=_supervisor_context(),
                 instructions=turn_instructions,
             )
             if resolved_decision is not None:
                 action = str(getattr(resolved_decision, "action", "") or "").strip().lower()
+                if action == "direct":
+                    loop._trace_event(
+                        "dual_lane_direct_reply_reresolved_with_memory_context",
+                        kind="branch",
+                        details={"prefetched": prefetched_decision is not None},
+                    )
+                    resolved_decision = loop.streaming_turn_loop.resolve_supervisor_decision(
+                        transcript,
+                        conversation=_supervisor_direct_context(),
+                        instructions=turn_instructions,
+                    )
+                    action = str(getattr(resolved_decision, "action", "") or "").strip().lower()
                 if action == "handoff" and str(getattr(resolved_decision, "kind", "") or "").strip().lower() == "search":
                     loop._trace_decision(
                         "dual_lane_final_path_selected",
@@ -182,13 +284,19 @@ class StreamingLanePlanner:
                             {"id": "resolved_direct", "summary": "Run resolved direct reply"},
                             {"id": "generic_tool_loop", "summary": "Run generic tool loop"},
                         ],
-                        context={"transcript_len": len(transcript), "action": action},
+                        context={
+                            "transcript": _text_summary(transcript),
+                            "action": action,
+                            "decision": _decision_summary(resolved_decision),
+                            "context_source": "search",
+                            "context": _conversation_summary(_search_context()),
+                        },
                         guardrails=["search_handoff_short_path"],
                     )
                     return loop.streaming_turn_loop.run_handoff_only(
                         transcript,
-                        conversation=search_context,
-                        specialist_conversation=search_context,
+                        conversation=_search_context(),
+                        specialist_conversation=_search_context(),
                         handoff=resolved_decision,
                         instructions=turn_instructions,
                         allow_web_search=False,
@@ -206,12 +314,28 @@ class StreamingLanePlanner:
                             {"id": "end_conversation", "summary": "Speak answer and close session"},
                             {"id": "generic_tool_loop", "summary": "Run generic tool loop"},
                         ],
-                        context={"transcript_len": len(transcript), "action": action},
+                        context={
+                            "transcript": _text_summary(transcript),
+                            "action": action,
+                            "decision": _decision_summary(resolved_decision),
+                            "context_source": (
+                                "tool"
+                                if supervisor_decision_requires_full_context(resolved_decision)
+                                else "search"
+                            ),
+                        },
+                    )
+                    final_context = (
+                        _tool_context()
+                        if supervisor_decision_requires_full_context(resolved_decision)
+                        else _search_context()
                     )
                     return loop.streaming_turn_loop.run(
                         transcript,
-                        conversation=search_context,
-                        supervisor_conversation=supervisor_context,
+                        conversation=final_context,
+                        supervisor_conversation=(
+                            _supervisor_direct_context() if action == "direct" else _supervisor_context()
+                        ),
                         prefetched_decision=resolved_decision,
                         instructions=turn_instructions,
                         allow_web_search=False,
@@ -227,15 +351,78 @@ class StreamingLanePlanner:
                 {"id": "resolved_supervisor", "summary": "Resolve supervisor route"},
                 {"id": "generic_tool_loop", "summary": "Run generic tool loop"},
             ],
-            context={"transcript_len": len(transcript), "prefetched": prefetched_decision is not None},
+            context={
+                "transcript": _text_summary(transcript),
+                "prefetched": prefetched_decision is not None,
+                "decision": _decision_summary(resolved_decision),
+                "context_source": "tool",
+                "context": _conversation_summary(_tool_context()),
+            },
         )
         return loop.streaming_turn_loop.run(
             transcript,
-            conversation=loop.runtime.tool_provider_conversation_context(),
-            supervisor_conversation=supervisor_context,
-            prefetched_decision=prefetched_decision,
+            conversation=_tool_context(),
+            supervisor_conversation=_supervisor_context(),
+            prefetched_decision=resolved_decision,
             instructions=turn_instructions,
             allow_web_search=False,
             on_text_delta=None,
             on_lane_text_delta=None,
         )
+
+
+def _text_summary(value: Any) -> dict[str, Any]:
+    """Describe text safely for workflow forensics without raw content."""
+
+    normalized = str(value or "").strip()
+    if not normalized:
+        return {"present": False, "chars": 0, "words": 0, "sha12": None}
+    return {
+        "present": True,
+        "chars": len(normalized),
+        "words": len(normalized.split()),
+        "sha12": sha1(normalized.encode("utf-8")).hexdigest()[:12],
+    }
+
+
+def _conversation_summary(conversation) -> dict[str, Any]:
+    """Summarize one provider conversation context without leaking text."""
+
+    if not conversation:
+        return {"present": False, "messages": 0, "tail": []}
+    tail: list[dict[str, Any]] = []
+    total_chars = 0
+    for item in conversation:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            role = str(item[0] or "").strip() or "unknown"
+            content = str(item[1] or "")
+        else:
+            role = "unknown"
+            content = str(item or "")
+        total_chars += len(content.strip())
+        tail.append({"role": role, "content": _text_summary(content)})
+    return {
+        "present": True,
+        "messages": len(tail),
+        "total_chars": total_chars,
+        "tail": tail[-3:],
+    }
+
+
+def _decision_summary(decision) -> dict[str, Any]:
+    """Summarize the final-lane decision shape without raw prompt leakage."""
+
+    if decision is None:
+        return {"present": False}
+    return {
+        "present": True,
+        "action": str(getattr(decision, "action", "") or "").strip().lower() or None,
+        "kind": str(getattr(decision, "kind", "") or "").strip().lower() or None,
+        "context_scope": str(getattr(decision, "context_scope", "") or "").strip() or None,
+        "allow_web_search": getattr(decision, "allow_web_search", None),
+        "spoken_ack": _text_summary(getattr(decision, "spoken_ack", None)),
+        "spoken_reply": _text_summary(getattr(decision, "spoken_reply", None)),
+        "goal": _text_summary(getattr(decision, "goal", None)),
+        "location_hint": _text_summary(getattr(decision, "location_hint", None)),
+        "date_context": _text_summary(getattr(decision, "date_context", None)),
+    }

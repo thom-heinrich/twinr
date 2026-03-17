@@ -1,0 +1,88 @@
+schema_version: 1
+name: twinr
+path: src/twinr
+kind: python-package
+visibility: internal
+summary: Root Twinr package boundary, CLI bootstrap, compatibility shims, and shared helpers reused across subsystems.
+owned_concerns:
+  - Expose the lazy `twinr` import surface for runtime config, status, and on-device memory compatibility.
+  - Bootstrap `python -m twinr` and the installed `twinr` script, then dispatch into focused subsystem packages.
+  - Host small shared utility modules for text normalization, local date parsing, and structured JSON response handling.
+  - Define the package boundary around the agent, memory, providers, hardware, display, web, proactive, orchestrator, ops, automations, and integrations subsystems.
+out_of_scope:
+  - Deep runtime, provider, memory, hardware, or web behavior that belongs in a documented child package under `src/twinr/*`
+  - Raspberry Pi bootstrap and OS setup scripts in `hardware/`
+  - Repo workflow helpers in `agentic_tools/`
+files:
+  - path: __init__.py
+    role: Lazy root export surface
+    exports:
+      - OnDeviceMemory
+      - TwinrConfig
+      - TwinrRuntime
+      - TwinrStatus
+  - path: __main__.py
+    role: CLI bootstrap and command dispatch
+  - path: llm_json.py
+    role: Structured-response request and schema-validation helper
+  - path: temporal.py
+    role: Timezone-aware natural-language date parsing helper
+  - path: text_utils.py
+    role: Text, JSON, and identifier normalization helper
+  - path: config.py
+    role: Root-level config compatibility re-export
+  - path: contracts.py
+    role: Root-level contract compatibility re-export
+  - path: personality.py
+    role: Root-level personality compatibility re-export
+  - path: realtime_runner.py
+    role: Root-level realtime-loop compatibility re-export
+  - path: runner.py
+    role: Root-level classic-loop compatibility re-export
+  - path: runtime.py
+    role: Root-level runtime compatibility re-export
+  - path: state_machine.py
+    role: Root-level state-machine compatibility re-export
+subpackages:
+  - path: agent
+    role: Core runtime, tools, workflows, and self-coding packages
+  - path: automations
+    role: Automation scheduling and sensor-trigger helpers
+  - path: display
+    role: E-paper display rendering and status loop
+  - path: hardware
+    role: Runtime hardware adapters for audio, buttons, camera, PIR, and printer
+  - path: integrations
+    role: External integration adapters and catalogs
+  - path: memory
+    role: On-device, ChonkyDB, and long-term memory packages
+  - path: ops
+    role: Runtime locks, supervisors, watchdogs, and support operations
+  - path: orchestrator
+    role: Websocket orchestration service and session management
+  - path: proactive
+    role: Wakeword, monitoring, and proactive governance packages
+  - path: providers
+    role: Provider adapters and compatibility surfaces
+  - path: web
+    role: Local operator dashboard and presenters
+public_api:
+  module: twinr
+  exports:
+    - OnDeviceMemory
+    - TwinrConfig
+    - TwinrRuntime
+    - TwinrStatus
+entrypoints:
+  - command: PYTHONPATH=src python3 -m twinr --env-file .env
+    role: Package CLI entrypoint
+  - command: twinr
+    role: Installed CLI script
+tests:
+  - path: test/test_config.py
+  - path: test/test_llm_json.py
+  - path: test/test_main.py
+  - path: test/test_realtime_runner.py
+  - path: test/test_runner.py
+  - path: test/test_streaming_runner.py
+  - path: test/test_temporal.py

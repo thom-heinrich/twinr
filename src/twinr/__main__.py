@@ -1,3 +1,11 @@
+"""Bootstrap the Twinr command-line entrypoint.
+
+This module keeps argument parsing and high-level command dispatch at the
+package root so operators can launch Twinr via ``python -m twinr`` or the
+installed ``twinr`` script. Runtime behavior stays in the focused subsystem
+packages that this bootstrap imports on demand.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -15,6 +23,8 @@ _RUNTIME_SUPERVISOR_ENV_KEY = "TWINR_RUNTIME_SUPERVISOR_ACTIVE"
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the authoritative CLI parser for Twinr runtime commands."""
+
     parser = argparse.ArgumentParser(description="Twinr bootstrap runtime")
     parser.add_argument("--env-file", default=".env", help="Path to the .env file")
     parser.add_argument(
@@ -192,12 +202,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _uses_pi_runtime_root(env_file: str | Path) -> bool:
+    """Return whether the provided env file targets the Pi acceptance checkout."""
+
     env_path = Path(env_file).resolve()
     pi_root = Path("/twinr").resolve()
     return pi_root in env_path.parents or env_path == pi_root / ".env"
 
 
 def _is_raspberry_pi_host() -> bool:
+    """Detect whether the current machine reports itself as a Raspberry Pi."""
+
     model_path = Path("/proc/device-tree/model")
     try:
         return "Raspberry Pi" in model_path.read_text(encoding="utf-8", errors="ignore")
@@ -206,10 +220,14 @@ def _is_raspberry_pi_host() -> bool:
 
 
 def _should_enable_display_companion(env_file: str | Path) -> bool:
+    """Enable the display companion only on the Pi runtime checkout."""
+
     return _uses_pi_runtime_root(env_file) and _is_raspberry_pi_host()
 
 
 def _should_ensure_remote_watchdog_companion(config: TwinrConfig, env_file: str | Path) -> bool:
+    """Return whether the remote-memory watchdog companion must be started."""
+
     if str(os.environ.get(_RUNTIME_SUPERVISOR_ENV_KEY, "")).strip().lower() in {"1", "true", "yes", "on"}:
         return False
     if not _uses_pi_runtime_root(env_file):
@@ -224,6 +242,8 @@ def _should_ensure_remote_watchdog_companion(config: TwinrConfig, env_file: str 
 
 
 def _assert_pi_runtime_root(env_file: str | Path, *, command_name: str) -> None:
+    """Reject Pi-state commands launched from the development checkout."""
+
     if not _uses_pi_runtime_root(env_file):
         return
     pi_root = Path("/twinr").resolve()
@@ -308,6 +328,8 @@ def _print_morning_briefing_acceptance_result(result: Any) -> None:
 
 
 def main() -> int:
+    """Dispatch the requested Twinr CLI command and return its exit code."""
+
     prime_user_session_audio_env()
     args = build_parser().parse_args()
     config = TwinrConfig.from_env(Path(args.env_file))

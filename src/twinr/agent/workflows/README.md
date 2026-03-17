@@ -20,15 +20,19 @@ bounded.
 - only surface `answering` once spoken audio has actually started instead of when text is merely queued
 - rearm spoken follow-up turns directly from `answering` back to `listening` so the display and operator cues do not briefly fall through `waiting` between a reply and the reopened microphone window
 - start the post-response closure guard while streamed speech is still draining so follow-up beeps do not sit behind a second model wait after the audible answer ends
+- keep turn-controller context selection, label-aware guidance, and transcript-verifier gate policy in dedicated runtime components instead of inlining them into the active loop classes
 - recover suspicious or empty streaming transcripts with one bounded full-audio STT retry before surfacing a failed turn
 - wire the optional OpenAI streaming-transcript verifier from the provider bundle into the live streaming loop so suspicious short Deepgram turns, including empty results after a late speech start, are rechecked against the real captured audio before Twinr drops the turn
 - derive dual-lane bridge speech from the fast supervisor decision as the authoritative first spoken lane whenever a supervisor decision provider is available; use the standalone first-word model only as a fallback when that supervisor lane does not exist, and do not fall back to canned watchdog speech
 - downgrade fast-lane decisions that declare `full_context` needs into a filler-plus-final-lane handoff so conversation-recall turns do not get answered from a memory-blind bridge lane
+- route memory/general dual-lane fallbacks through full tool-provider context while keeping pure search handoffs on the bounded search-only context
 - only prefetch first-word speech once a partial transcript has enough shape to be meaningful; one dangling tail word must not trigger a filler line on its own
 - keep dual-lane search turns to one bounded final-lane search execution instead of launching a speculative background search worker that can outlive the turn
 - wait briefly for active filler playback to drain before replacing it with the final lane so the fast acknowledgement is not cut off mid-sentence
+- recover dual-lane final-lane errors and hard timeouts through an explicit LLM-only recovery callback instead of any canned runtime reply string
 - emit bounded pre-speech capture diagnostics on listen timeouts so Pi no-speech failures can be proven from first-run logs instead of guessed
 - emit a forensic run pack for live-runtime debugging when `TWINR_WORKFLOW_TRACE_ENABLED=1`
+- include redacted transcript, context-selection, and final-lane answer provenance in that forensic run pack so semantic answer failures can be proven from one Pi run
 - share workflow-local helpers for feedback tones, reference images, and safe background delivery
 - expose compatibility workflow imports for the top-level package without eager runner imports that can create runtime/ops import cycles
 
@@ -43,8 +47,10 @@ bounded.
 | File | Purpose |
 |---|---|
 | [runner.py](./runner.py) | Compatibility shim to the legacy classic loop in `src/twinr/agent/legacy/classic_hardware_loop.py` |
-| [realtime_runner.py](./realtime_runner.py) | Realtime session loop |
+| [realtime_runner.py](./realtime_runner.py) | Realtime session loop that delegates guidance and transcript-verifier policy to focused runtime helpers |
 | [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell |
+| [turn_guidance.py](./turn_guidance.py) | Bounded turn-controller context and label-aware conversation guidance |
+| [streaming_transcript_verifier.py](./streaming_transcript_verifier.py) | Streaming transcript recovery plus explicit verifier KPI gates |
 | [streaming_capture.py](./streaming_capture.py) | Streaming microphone capture, timeout handling, and batch-STT fallback |
 | [streaming_speculation.py](./streaming_speculation.py) | Speculative first-word and supervisor warmup controller |
 | [streaming_lane_planner.py](./streaming_lane_planner.py) | Streaming lane-plan and final-lane path selection |

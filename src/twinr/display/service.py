@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
 import math
 import os
 import socket
@@ -42,6 +43,8 @@ _STATUS_TEXT_MAX_LEN = 32
 _EMIT_LINE_MAX_LEN = 160
 _ERROR_LOG_THROTTLE_S = 30.0
 _HEARTBEAT_IDLE_REFRESH_S = 5.0
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _default_emit(line: str) -> None:
@@ -665,4 +668,4 @@ class TwinrStatusDisplayLoop:
         try:
             self.emit(compact)
         except Exception:
-            pass
+            _LOGGER.warning("Display emit sink failed.", exc_info=True)

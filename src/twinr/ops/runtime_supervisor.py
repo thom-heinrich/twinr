@@ -18,6 +18,7 @@ from pathlib import Path
 from collections.abc import Callable
 from typing import Protocol
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -49,6 +50,8 @@ _DEFAULT_MAX_SNAPSHOT_AGE_S = 45.0
 _DEFAULT_RESTART_BACKOFF_S = 5.0
 _DEFAULT_STOP_TIMEOUT_S = 10.0
 _STREAMING_HEALTH_FAILURE_THRESHOLD = 2
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProcessHandle(Protocol):
@@ -505,11 +508,20 @@ class TwinrRuntimeSupervisor:
             process.terminate()
             process.wait(timeout=self.stop_timeout_s)
         except Exception:
+            _LOGGER.warning(
+                "Runtime supervisor terminate/wait failed for child %s; escalating to kill.",
+                child.key,
+                exc_info=True,
+            )
             try:
                 process.kill()
                 process.wait(timeout=self.stop_timeout_s)
             except Exception:
-                pass
+                _LOGGER.warning(
+                    "Runtime supervisor kill/wait failed for child %s.",
+                    child.key,
+                    exc_info=True,
+                )
         child.process = None
         child.clear_health_issue()
 
@@ -793,6 +805,11 @@ class TwinrRuntimeSupervisor:
                 data=data,
             )
         except Exception:
+            _LOGGER.warning(
+                "Failed to append runtime supervisor ops event %s.",
+                event,
+                exc_info=True,
+            )
             return
 
     def _emit_payload(self, event: str, **data: object) -> None:

@@ -1,18 +1,12 @@
-"""Define canonical ack phrase IDs for the orchestrator protocol.
-
-This module keeps the short spoken acknowledgements used by the supervisor and
-the websocket transport in one stable mapping.
-"""
+"""Define canonical ack phrase IDs for the orchestrator protocol."""
 
 from __future__ import annotations
 
-from twinr.agent.tools import SUPERVISOR_FAST_ACK_PHRASES
-
 _ACK_PAIRS: tuple[tuple[str, str], ...] = (
-    ("one_moment", SUPERVISOR_FAST_ACK_PHRASES[0]),
-    ("checking_now", SUPERVISOR_FAST_ACK_PHRASES[1]),
-    ("checking_short", SUPERVISOR_FAST_ACK_PHRASES[2]),
-    ("one_second", SUPERVISOR_FAST_ACK_PHRASES[3]),
+    ("one_moment", "Einen Moment bitte."),
+    ("checking_now", "Ich schaue kurz nach."),
+    ("checking_short", "Ich prüfe das kurz."),
+    ("one_second", "Einen Augenblick bitte."),
 )
 
 ACK_ID_TO_TEXT: dict[str, str] = dict(_ACK_PAIRS)

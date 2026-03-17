@@ -1,10 +1,10 @@
 """Coordinate parallel bridge and final lanes for streaming turns.
 
 This helper keeps the streaming hardware loop thin by owning the concurrency,
-deadline handling, and bounded fallback behavior for the dual-lane speech path.
-It runs the short bridge lane and the slower final tool/search lane in
-parallel, emits a watchdog fallback when the bridge lane stalls, and returns a
-bounded synthetic result when the final lane exceeds its hard deadline.
+deadline handling, and LLM-only recovery behavior for the dual-lane speech
+path. It runs the short bridge lane and the slower final tool/search lane in
+parallel, emits a watchdog fallback when the bridge lane stalls, and triggers a
+recovery callback when the final lane fails or exceeds its hard deadline.
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ class StreamingTurnOrchestrator:
     in parallel when available, and emits a fallback filler if the bridge lane
     misses its deadline. It preserves the existing speech-lane contract by
     emitting filler deltas first and replacing them atomically with the final
-    lane answer or an explicit timeout reply.
+    lane answer or an LLM-generated recovery reply.
     """
 
     def __init__(
@@ -144,8 +144,7 @@ class StreamingTurnOrchestrator:
         generate_first_word: Callable[[], FirstWordReply | None] | None,
         bridge_fallback_reply: FirstWordReply | None,
         run_final_lane: Callable[[], StreamingToolLoopResult],
-        final_timeout_reply: str,
-        final_error_reply: str,
+        recover_final_lane_response: Callable[[str], StreamingToolLoopResult] | None,
     ) -> StreamingTurnLaneOutcome:
         """Run one streaming turn with a parallel bridge and final lane.
 
@@ -158,8 +157,8 @@ class StreamingTurnOrchestrator:
             bridge_fallback_reply: Fallback reply emitted when the bridge lane
                 misses its deadline.
             run_final_lane: Callable that computes the final lane result.
-            final_timeout_reply: User-facing reply for hard final-lane timeout.
-            final_error_reply: User-facing reply when the final lane fails.
+            recover_final_lane_response: Callback that must return an
+                LLM-generated recovery result for final-lane error or timeout.
 
         Returns:
             The coordinated turn result, including the chosen bridge reply.
@@ -284,7 +283,10 @@ class StreamingTurnOrchestrator:
                     response = final_task.result()
                 except Exception as exc:
                     self._emit(f"final_lane_failed={type(exc).__name__}")
-                    response = _fallback_result(final_error_reply)
+                    response = self._recover_final_response(
+                        recover_final_lane_response,
+                        failure_reason="final_lane_error",
+                    )
                 self._queue_final_response(
                     response,
                     bridge_reply=bridge_reply if bridge_emitted else None,
@@ -306,7 +308,10 @@ class StreamingTurnOrchestrator:
 
             if now >= final_hard_deadline:
                 self._emit("final_lane_timeout=true")
-                timeout_response = _fallback_result(final_timeout_reply)
+                timeout_response = self._recover_final_response(
+                    recover_final_lane_response,
+                    failure_reason="final_lane_timeout",
+                )
                 self._queue_final_response(
                     timeout_response,
                     bridge_reply=bridge_reply if bridge_emitted else None,
@@ -373,6 +378,20 @@ class StreamingTurnOrchestrator:
         if self.emit is not None:
             self.emit(message)
 
+    def _recover_final_response(
+        self,
+        recover_final_lane_response: Callable[[str], StreamingToolLoopResult] | None,
+        *,
+        failure_reason: str,
+    ) -> StreamingToolLoopResult:
+        """Resolve one recovery result for a failed final lane."""
+
+        if recover_final_lane_response is None:
+            raise RuntimeError(
+                f"final lane {failure_reason} without an LLM recovery callback"
+            )
+        return recover_final_lane_response(failure_reason)
+
     def _raise_if_interrupted(self) -> None:
         if self.should_stop is None:
             return
@@ -392,21 +411,5 @@ def _direct_reply_result(reply: FirstWordReply) -> StreamingToolLoopResult:
         request_id=reply.request_id,
         model=reply.model,
         token_usage=reply.token_usage,
-        used_web_search=False,
-    )
-
-
-def _fallback_result(text: str) -> StreamingToolLoopResult:
-    """Build a synthetic completed result for bounded timeout/error fallbacks."""
-
-    return StreamingToolLoopResult(
-        text=str(text or "").strip(),
-        rounds=0,
-        tool_calls=(),
-        tool_results=(),
-        response_id=None,
-        request_id=None,
-        model=None,
-        token_usage=None,
         used_web_search=False,
     )

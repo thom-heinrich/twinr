@@ -16,6 +16,7 @@ import importlib.util  # AUDIT-FIX(#1): Load vendor modules from exact files ins
 from pathlib import Path
 from threading import RLock  # AUDIT-FIX(#3): Serialise shared mutable state and global import mutations.
 import logging  # AUDIT-FIX(#4): Emit diagnosable recovery logs for hardware/display faults.
+import math
 import sys
 import time
 
@@ -27,6 +28,8 @@ _LOGGER = logging.getLogger(__name__)
 _IMPORT_LOCK = RLock()
 _SUPPORTED_ROTATIONS = {0, 90, 180, 270}
 _SUPPORTED_LAYOUT_MODES = {"default", "debug_log"}
+_DEFAULT_BUSY_TIMEOUT_S = 20.0
+_BUSY_POLL_DELAY_MS = 20
 
 
 @dataclass(slots=True)
@@ -71,6 +74,7 @@ class WaveshareEPD4In2V2:
     rotation_degrees: int = 270
     full_refresh_interval: int = 0
     layout_mode: str = "default"
+    busy_timeout_s: float = _DEFAULT_BUSY_TIMEOUT_S
     _driver_module: object | None = field(default=None, init=False, repr=False)
     _epdconfig_module: object | None = field(default=None, init=False, repr=False)  # AUDIT-FIX(#5): Keep vendor transport module for deterministic cleanup.
     _epd: object | None = field(default=None, init=False, repr=False)
@@ -90,6 +94,8 @@ class WaveshareEPD4In2V2:
             raise RuntimeError("Display width and height must be positive integers.")
         if self.full_refresh_interval < 0:
             raise RuntimeError("Display full_refresh_interval must be >= 0.")
+        if not isinstance(self.busy_timeout_s, (int, float)) or not math.isfinite(self.busy_timeout_s) or self.busy_timeout_s <= 0:
+            raise RuntimeError("Display busy_timeout_s must be a finite number > 0.")
         if self.rotation_degrees not in _SUPPORTED_ROTATIONS:
             raise RuntimeError(
                 "Display rotation must be one of 0, 90, 180, or 270 degrees."
@@ -133,6 +139,7 @@ class WaveshareEPD4In2V2:
             rotation_degrees=config.display_rotation_degrees,
             full_refresh_interval=config.display_full_refresh_interval,
             layout_mode=config.display_layout,
+            busy_timeout_s=config.display_busy_timeout_s,
         )
 
     @property
@@ -824,8 +831,56 @@ class WaveshareEPD4In2V2:
             module = self._load_driver_module()
             if not hasattr(module, "EPD"):
                 raise RuntimeError("Display driver module does not expose EPD().")
-            self._epd = module.EPD()
+            epd = module.EPD()
+            self._wrap_busy_wait(epd)
+            self._epd = epd
         return self._epd
+
+    def _wrap_busy_wait(self, epd: object) -> None:
+        """Bound vendor BUSY polling so transient panel faults fail closed.
+
+        Waveshare's generated Python driver loops forever in ``ReadBusy()`` if
+        the panel never releases the BUSY pin during init or refresh. On the Pi
+        that can strand the companion thread inside the first render and leave
+        the panel black until a full service restart. Twinr must convert that
+        path into a recoverable exception so the adapter's existing reset/retry
+        logic can run.
+        """
+
+        if getattr(epd, "_twinr_busy_wait_wrapped", False):
+            return
+        original = getattr(epd, "ReadBusy", None)
+        epdconfig = self._epdconfig_module
+        busy_pin = getattr(epd, "busy_pin", None)
+        if not callable(original) or epdconfig is None or busy_pin is None:
+            return
+        digital_read = getattr(epdconfig, "digital_read", None)
+        delay_ms = getattr(epdconfig, "delay_ms", None)
+        if not callable(digital_read) or not callable(delay_ms):
+            return
+
+        timeout_s = float(self.busy_timeout_s)
+        poll_delay_ms = _BUSY_POLL_DELAY_MS
+
+        def _bounded_readbusy() -> None:
+            started_at = time.monotonic()
+            sampled_states: list[tuple[float, int]] = []
+            while True:
+                value = int(digital_read(busy_pin))
+                if value == 0:
+                    return
+                if len(sampled_states) < 12:
+                    sampled_states.append((round(time.monotonic() - started_at, 3), value))
+                age_s = time.monotonic() - started_at
+                if age_s >= timeout_s:
+                    raise TimeoutError(
+                        "Display BUSY pin stayed active for "
+                        f"{age_s:.1f}s on GPIO {busy_pin}; samples={sampled_states}"
+                    )
+                delay_ms(poll_delay_ms)
+
+        setattr(epd, "ReadBusy", _bounded_readbusy)
+        setattr(epd, "_twinr_busy_wait_wrapped", True)
 
     def _init_full(self, epd: object) -> None:
         if not hasattr(epd, "init"):

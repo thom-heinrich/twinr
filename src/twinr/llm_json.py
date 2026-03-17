@@ -1,3 +1,10 @@
+"""Request structured JSON outputs from model backends with local validation.
+
+This module wraps backend structured-response calls with bounded retries,
+timeout handling, privacy-safe diagnostics, and a fallback path that extracts
+and validates JSON objects from raw model text.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -44,16 +51,22 @@ _RETRYABLE_ERROR_MESSAGE_MARKERS = (
 
 
 def _mapping_get_or_attr(container: Any, name: str, default: Any = None) -> Any:
+    """Read a named field from a mapping-like or attribute-bearing object."""
+
     if isinstance(container, Mapping):
         return container.get(name, default)
     return getattr(container, name, default)
 
 
 def _response_status(response: Any) -> str:
+    """Normalize a response status string for control-flow checks."""
+
     return str(_mapping_get_or_attr(response, "status", "") or "").strip().lower()
 
 
 def _incomplete_reason(response: Any) -> str:
+    """Normalize the response's incomplete reason for retry decisions."""
+
     details = _mapping_get_or_attr(response, "incomplete_details", None)
     if isinstance(details, Mapping):
         return str(details.get("reason", "") or "").strip().lower()
@@ -61,10 +74,14 @@ def _incomplete_reason(response: Any) -> str:
 
 
 def _next_retry_max_output_tokens(current: int) -> int:
+    """Grow the retry token budget without exceeding the hard ceiling."""
+
     return max(current, min(_MAX_STRUCTURED_RESPONSE_OUTPUT_TOKENS, max(current * 2, current + 400)))
 
 
 def _normalized_output_text(output_text: Any) -> str:
+    """Coerce extracted model output into a text string."""
+
     if output_text is None:
         return ""
     if isinstance(output_text, str):
@@ -75,6 +92,8 @@ def _normalized_output_text(output_text: Any) -> str:
 
 
 def _output_text_digest(output_text: str) -> str:
+    """Return a short stable digest for privacy-safe diagnostics."""
+
     return hashlib.sha256(output_text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
@@ -87,6 +106,8 @@ def _structured_response_error_message(
     attempted_output_token_limits: Sequence[int],
     error_detail: str | None = None,
 ) -> str:
+    """Format a redacted error message for structured-response failures."""
+
     status = _response_status(response) or "unknown"
     reason = _incomplete_reason(response) or "unknown"
     parts = [
@@ -104,6 +125,8 @@ def _structured_response_error_message(
 
 
 def _validated_schema_name(schema_name: str) -> str:
+    """Validate and normalize the logical schema name used in requests."""
+
     if not isinstance(schema_name, str):
         raise TypeError("schema_name must be a string")
     normalized_schema_name = schema_name.strip()
@@ -113,6 +136,8 @@ def _validated_schema_name(schema_name: str) -> str:
 
 
 def _validated_max_output_tokens(value: object) -> int:
+    """Validate the configured ``max_output_tokens`` value."""
+
     if isinstance(value, bool):
         raise TypeError("max_output_tokens must be an integer >= 1, not bool")
     try:
@@ -125,12 +150,16 @@ def _validated_max_output_tokens(value: object) -> int:
 
 
 def _validated_schema_object(schema: Mapping[str, object]) -> dict[str, object]:
+    """Validate and copy the schema mapping for downstream use."""
+
     if not isinstance(schema, Mapping):
         raise TypeError("schema must be a mapping")
     return dict(schema)
 
 
 def _request_timeout_seconds(backend: Any) -> float:
+    """Resolve the structured-response timeout from backend config."""
+
     config = getattr(backend, "config", None)
     raw_timeout = None
     for attr_name in (
@@ -162,6 +191,8 @@ def _merge_structured_text_format(
     schema_name: str,
     schema_payload: Mapping[str, object],
 ) -> dict[str, object]:
+    """Merge JSON-schema text formatting into a response request payload."""
+
     merged_request = dict(request)
     existing_text = merged_request.get("text")
     text_config: dict[str, object]
@@ -180,11 +211,15 @@ def _merge_structured_text_format(
 
 
 def _is_timeout_keyword_error(exc: TypeError) -> bool:
+    """Return whether a ``TypeError`` came from an unsupported timeout kwarg."""
+
     message = str(exc).lower()
     return "timeout" in message and ("unexpected keyword" in message or "got an unexpected keyword argument" in message)
 
 
 def _is_retryable_response_exception(exc: Exception) -> bool:
+    """Return whether a transport exception is worth retrying."""
+
     name = exc.__class__.__name__.lower()
     message = str(exc).lower()
     if any(marker in name for marker in _RETRYABLE_ERROR_NAME_MARKERS):
@@ -193,6 +228,8 @@ def _is_retryable_response_exception(exc: Exception) -> bool:
 
 
 def _call_structured_response_create(backend: Any, request: Mapping[str, object], *, timeout_seconds: float) -> Any:
+    """Call the backend structured-response API with bounded retry handling."""
+
     request_payload = dict(request)
     added_timeout = False
     if "timeout" not in request_payload:
@@ -217,6 +254,8 @@ def _call_structured_response_create(backend: Any, request: Mapping[str, object]
 
 
 def _coerce_parsed_object(value: Any) -> dict[str, object] | None:
+    """Coerce SDK-parsed output into a plain dict when possible."""
+
     if isinstance(value, Mapping):
         return dict(value)
     model_dump = getattr(value, "model_dump", None)
@@ -228,6 +267,8 @@ def _coerce_parsed_object(value: Any) -> dict[str, object] | None:
 
 
 def _resolve_local_json_pointer(root_schema: Mapping[str, object], ref: str) -> Mapping[str, object]:
+    """Resolve a local JSON Schema reference against the root schema."""
+
     if not ref.startswith("#/"):
         raise ValueError(f"Unsupported JSON schema reference: {ref!r}")
     current: Any = root_schema
@@ -242,6 +283,8 @@ def _resolve_local_json_pointer(root_schema: Mapping[str, object], ref: str) -> 
 
 
 def _normalized_schema_types(raw_types: object) -> tuple[str, ...] | None:
+    """Normalize a schema ``type`` declaration into a tuple of names."""
+
     if isinstance(raw_types, str):
         return (raw_types,)
     if isinstance(raw_types, list) and all(isinstance(item, str) for item in raw_types):
@@ -250,6 +293,8 @@ def _normalized_schema_types(raw_types: object) -> tuple[str, ...] | None:
 
 
 def _json_type_matches(value: object, expected_type: str) -> bool:
+    """Return whether a JSON-compatible value matches a schema type name."""
+
     if expected_type == "object":
         return isinstance(value, Mapping)
     if expected_type == "array":
@@ -268,12 +313,16 @@ def _json_type_matches(value: object, expected_type: str) -> bool:
 
 
 def _schema_path(path: str, key: str) -> str:
+    """Format a nested schema path for diagnostics."""
+
     if _SIMPLE_PATH_KEY_RE.match(key):
         return f"{path}.{key}"
     return f"{path}[{key!r}]"
 
 
 def _optional_non_negative_int(value: object) -> int | None:
+    """Coerce optional non-negative integer schema constraints."""
+
     if isinstance(value, bool):
         return None
     try:
@@ -286,6 +335,8 @@ def _optional_non_negative_int(value: object) -> int | None:
 
 
 def _optional_json_number(value: object) -> float | int | None:
+    """Coerce optional finite JSON numeric schema constraints."""
+
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -303,6 +354,8 @@ def _validate_embedded_schema(
     path: str,
     depth: int,
 ) -> None:
+    """Validate a nested schema fragment or boolean schema against a value."""
+
     if schema is True:
         return
     if schema is False:
@@ -313,6 +366,8 @@ def _validate_embedded_schema(
 
 
 def _validate_string_constraints(value: str, schema: Mapping[str, object], *, path: str) -> None:
+    """Validate string-specific JSON Schema constraints."""
+
     min_length = _optional_non_negative_int(schema.get("minLength"))
     max_length = _optional_non_negative_int(schema.get("maxLength"))
     if min_length is not None and len(value) < min_length:
@@ -325,6 +380,8 @@ def _validate_string_constraints(value: str, schema: Mapping[str, object], *, pa
 
 
 def _validate_numeric_constraints(value: int | float, schema: Mapping[str, object], *, path: str) -> None:
+    """Validate numeric JSON Schema constraints."""
+
     minimum = _optional_json_number(schema.get("minimum"))
     maximum = _optional_json_number(schema.get("maximum"))
     exclusive_minimum = _optional_json_number(schema.get("exclusiveMinimum"))
@@ -355,6 +412,8 @@ def _validate_object_constraints(
     path: str,
     depth: int,
 ) -> None:
+    """Validate object-specific JSON Schema constraints."""
+
     min_properties = _optional_non_negative_int(schema.get("minProperties"))
     max_properties = _optional_non_negative_int(schema.get("maxProperties"))
     if min_properties is not None and len(value) < min_properties:
@@ -394,6 +453,8 @@ def _validate_array_constraints(
     path: str,
     depth: int,
 ) -> None:
+    """Validate array-specific JSON Schema constraints."""
+
     min_items = _optional_non_negative_int(schema.get("minItems"))
     max_items = _optional_non_negative_int(schema.get("maxItems"))
     if min_items is not None and len(value) < min_items:
@@ -433,6 +494,8 @@ def _validate_json_against_schema(
     path: str,
     depth: int = 0,
 ) -> None:
+    """Validate a JSON-compatible value against a local JSON Schema subset."""
+
     if depth > 64:
         raise ValueError(f"{path}: schema validation exceeded maximum recursion depth")
 
@@ -525,6 +588,8 @@ def _validate_json_against_schema(
 
 
 def _validated_candidate_object(candidate: object, schema: Mapping[str, object]) -> dict[str, object]:
+    """Validate a candidate payload and require a top-level object."""
+
     _validate_json_against_schema(candidate, schema, root_schema=schema, path="$")
     if not isinstance(candidate, Mapping):
         raise ValueError(f"$: expected top-level object, got {type(candidate).__name__}")
@@ -542,6 +607,28 @@ def request_structured_json_object(
     reasoning_effort: str = "low",
     max_output_tokens: int = 512,
 ) -> dict[str, object]:
+    """Request one structured JSON object from a backend and validate it.
+
+    Args:
+        backend: Backend object that exposes `_build_response_request`,
+            `_client.responses.create`, and `_extract_output_text`.
+        prompt: User-facing prompt content sent to the backend.
+        instructions: System or developer instructions paired with the prompt.
+        schema_name: Logical name reported to the model for the JSON schema.
+        schema: JSON Schema object that the response must satisfy.
+        model: Optional explicit model override.
+        reasoning_effort: Backend reasoning-effort hint. Defaults to ``"low"``.
+        max_output_tokens: Initial response token budget before bounded retries.
+
+    Returns:
+        A validated JSON object that satisfies ``schema``.
+
+    Raises:
+        TypeError: If ``schema`` or ``max_output_tokens`` has an invalid type.
+        ValueError: If the backend response cannot be produced, parsed, or
+            validated against the schema.
+    """
+
     normalized_schema_name = _validated_schema_name(schema_name)  # AUDIT-FIX(#5): Fail fast on empty/invalid schema names instead of shipping malformed requests downstream.
     schema_payload = _validated_schema_object(schema)  # AUDIT-FIX(#1): Validate the schema container once and reuse it for request construction and fallback validation.
     current_max_output_tokens = _validated_max_output_tokens(max_output_tokens)  # AUDIT-FIX(#5): Reject silent coercions from bool/str/float config mistakes.

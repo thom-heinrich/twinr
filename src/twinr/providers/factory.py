@@ -9,6 +9,7 @@ transport and SDK logic stays in the sibling provider packages.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
 from typing import Final, TypeVar
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -27,6 +28,7 @@ _SUPPORTED_TTS_PROVIDERS: Final[tuple[str, ...]] = ("openai",)  # AUDIT-FIX(#2):
 _MISSING: Final[object] = object()  # AUDIT-FIX(#1): Distinguish a malformed config object from an unset provider value.
 
 _T = TypeVar("_T")
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProviderConfigurationError(RuntimeError):
@@ -202,7 +204,11 @@ def _close_if_possible(resource: object | None) -> None:
         try:
             close()
         except Exception:
-            pass  # AUDIT-FIX(#5): Cleanup is best-effort and must never hide the original initialization failure.
+            _LOGGER.warning(
+                "Provider-factory rollback failed to close %s.",
+                type(resource).__name__,
+                exc_info=True,
+            )  # AUDIT-FIX(#5): Cleanup is best-effort and must never hide the original initialization failure.
 
 
 def build_streaming_provider_bundle(

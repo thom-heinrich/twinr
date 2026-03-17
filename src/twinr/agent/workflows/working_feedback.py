@@ -6,11 +6,14 @@ import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import replace
+import logging
 from threading import Event, Lock, Thread, current_thread
 from typing import Literal
 from weakref import WeakKeyDictionary
 
 from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
+
+_LOGGER = logging.getLogger(__name__)
 
 WorkingFeedbackKind = Literal["processing", "answering", "printing"]
 
@@ -93,6 +96,11 @@ def _safe_emit(emit: Callable[[str], None] | None, message: str) -> None:
     try:
         emit(message)
     except Exception:
+        _LOGGER.warning(
+            "Working feedback emit failed for message %s.",
+            message,
+            exc_info=True,
+        )
         return
 
 
@@ -295,6 +303,11 @@ def _stop_player_playback(player) -> None:
             try:
                 method()
             except Exception:
+                _LOGGER.warning(
+                    "Working-feedback stop hook %s failed; trying the next fallback.",
+                    method_name,
+                    exc_info=True,
+                )
                 continue
 
 

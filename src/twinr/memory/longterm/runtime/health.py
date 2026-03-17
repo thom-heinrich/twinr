@@ -128,7 +128,7 @@ class LongTermRemoteHealthProbe:
 
             object_remote_state = self._require_remote_state(self.object_store.remote_state)
             self._ensure_state_ready(object_remote_state)
-            result = self._probe_sharded_snapshot_tree(
+            result = self._probe_snapshot(
                 store="object_store",
                 remote_state=object_remote_state,
                 snapshot_kind="objects",
@@ -146,7 +146,7 @@ class LongTermRemoteHealthProbe:
             )
             if not result.ready:
                 return result
-            result = self._probe_sharded_snapshot_tree(
+            result = self._probe_snapshot(
                 store="object_store",
                 remote_state=object_remote_state,
                 snapshot_kind="archive",
@@ -209,51 +209,6 @@ class LongTermRemoteHealthProbe:
             return result
         raise LongTermRemoteUnavailableError(
             str(result.detail or "Required remote long-term memory is unavailable.")
-        )
-
-    def _probe_sharded_snapshot_tree(
-        self,
-        *,
-        store: str,
-        remote_state: LongTermRemoteStateStore,
-        snapshot_kind: str,
-        checked: list[str],
-        checks: list[LongTermRemoteWarmCheck],
-    ) -> LongTermRemoteWarmResult:
-        """Load a manifest snapshot and then every shard it references."""
-
-        result = self._probe_snapshot(
-            store=store,
-            remote_state=remote_state,
-            snapshot_kind=snapshot_kind,
-            checked=checked,
-            checks=checks,
-        )
-        if not result.ready:
-            return result
-        manifest_payload = checks[-1].payload
-        shards = None if manifest_payload is None else manifest_payload.get("shards")
-        if not isinstance(shards, list):
-            return LongTermRemoteWarmResult(
-                checked_snapshots=tuple(checked),
-                ready=True,
-                checks=tuple(checks),
-            )
-        for shard_kind in shards:
-            if isinstance(shard_kind, str) and shard_kind:
-                shard_result = self._probe_snapshot(
-                    store=store,
-                    remote_state=remote_state,
-                    snapshot_kind=shard_kind,
-                    checked=checked,
-                    checks=checks,
-                )
-                if not shard_result.ready:
-                    return shard_result
-        return LongTermRemoteWarmResult(
-            checked_snapshots=tuple(checked),
-            ready=True,
-            checks=tuple(checks),
         )
 
     def _probe_snapshot(

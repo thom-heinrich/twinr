@@ -13,6 +13,7 @@ import asyncio
 import base64
 import inspect
 import json
+import logging
 import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ from twinr.agent.base_agent.settings.simple_settings import (
 from twinr.agent.base_agent.prompting.personality import load_personality_instructions, merge_instructions
 from twinr.ops.usage import TokenUsage, extract_model_name, extract_token_usage
 from twinr.providers.openai.core.client import _should_send_project_header
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_REALTIME_INSTRUCTIONS = (
     "Keep user-facing replies clear, warm, natural, concise, practical, and easy for a senior user to understand. "
@@ -281,7 +284,7 @@ class OpenAIRealtimeSession:
         try:
             self.close()
         except Exception:
-            pass
+            logger.warning("OpenAI realtime session cleanup failed during garbage collection.", exc_info=True)
 
     def run_audio_turn(
         self,
@@ -980,7 +983,10 @@ class OpenAIRealtimeSession:
                     timeout=self._close_timeout_seconds(),
                 )
             except Exception:
-                pass  # AUDIT-FIX(#6): cleanup must stay best-effort and must not mask the original failure.
+                logger.warning(
+                    "OpenAI realtime session cleanup failed while closing the provider manager.",
+                    exc_info=True,
+                )  # AUDIT-FIX(#6): cleanup must stay best-effort and must not mask the original failure.
 
         if loop is not None and loop.is_running():
             try:

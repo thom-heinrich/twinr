@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio  # AUDIT-FIX(#2): Support best-effort async instrumentation from a synchronous handler.
 import inspect  # AUDIT-FIX(#3): Detect unexpected awaitables returned by runtime hooks.
+import logging
 import re  # AUDIT-FIX(#5): Restrict free-form `kind` values to a stable token format.
 from collections.abc import Mapping  # AUDIT-FIX(#1): Validate that tool arguments are a mapping before reading them.
 from typing import Any
@@ -21,6 +22,7 @@ _MAX_REMINDER_ID_LENGTH = 128
 _MAX_EMIT_VALUE_LENGTH = 80
 
 _KIND_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+_LOGGER = logging.getLogger(__name__)
 
 
 class _ReminderToolError(RuntimeError):
@@ -231,7 +233,7 @@ def _call_schedule_reminder(schedule_reminder: Any, **kwargs: object) -> Any:
             try:
                 close()
             except Exception:
-                pass
+                _LOGGER.warning("Reminder handler failed to close unexpected awaitable result.", exc_info=True)
         raise _ReminderToolRuntimeError(
             "reminder scheduler returned an unsupported async result"
         )

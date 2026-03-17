@@ -156,6 +156,7 @@ class ChonkyDBClientTests(unittest.TestCase):
                 query_text="medication reminder",
                 result_limit=2,
                 allowed_indexes=("ccodex_memory_fulltext",),
+                allowed_doc_ids=("doc-1", "doc-2"),
             )
         )
 
@@ -167,6 +168,7 @@ class ChonkyDBClientTests(unittest.TestCase):
         request_body = json.loads(opener.calls[0]["body"])
         self.assertEqual(request_body["query_text"], "medication reminder")
         self.assertEqual(request_body["allowed_indexes"], ["ccodex_memory_fulltext"])
+        self.assertEqual(request_body["allowed_doc_ids"], ["doc-1", "doc-2"])
 
     def test_store_request_and_bulk_request_encode_cleanly(self) -> None:
         opener = FakeOpener()

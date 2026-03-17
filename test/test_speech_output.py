@@ -110,7 +110,7 @@ class InterruptibleSpeechOutputTests(unittest.TestCase):
                 lane="filler",
             )
         )
-        self.assertTrue(tts_provider.started.wait(timeout=1.0))
+        self.assertTrue(output.wait_for_first_audio(timeout_s=1.0))
         output.submit_lane_delta(
             SpeechLaneDelta(
                 text="Heute wird es trocken und kühl.",

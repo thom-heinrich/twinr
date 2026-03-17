@@ -19,13 +19,6 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.prompting.personality import merge_instructions
 from twinr.agent.base_agent.settings.simple_settings import adjustable_settings_context
 
-SUPERVISOR_FAST_ACK_PHRASES = (
-    "Einen Moment bitte.",
-    "Ich schaue kurz nach.",
-    "Ich prüfe das kurz.",
-    "Einen Augenblick bitte.",
-)
-
 FIRST_WORD_AGENT_INSTRUCTIONS = (
     "You are Twinr's instant first-word lane. "
     "Return one very short spoken line that can start immediately while the slower final lane continues in parallel. "
@@ -125,6 +118,7 @@ SUPERVISOR_TOOL_AGENT_INSTRUCTIONS = (
     "If answering correctly depends on broader memory than the tiny recent context, such as recalling earlier conversation topics, remembered facts, or what Twinr discussed before, use handoff_specialist_worker instead of answering directly. "
     "If the user needs fresh web information, any persistent save or update, exact lookup, printing, camera inspection, reminders, timers, scheduling, automation changes, settings changes, or a slower specialist pass, "
     "put one short spoken acknowledgement in handoff_specialist_worker.spoken_ack and call handoff_specialist_worker immediately. "
+    "That acknowledgement must be semantically grounded in the user's request, not a generic stock phrase or reusable template. "
     "When the handoff is about search or verification and the user already named a concrete place or date, copy that explicit place into location_hint and the resolved absolute date context into date_context. "
     "If the user named an unusual, partial, or uncertain place phrase, still copy the literal place phrase instead of dropping it. "
     "Do not wait for the specialist result before giving that short acknowledgement. "
@@ -146,13 +140,14 @@ SUPERVISOR_DECISION_AGENT_INSTRUCTIONS = (
     "Choose handoff for fresh web information, any persistent save or update, exact lookup, printing, camera inspection, reminders, timers, scheduling, automation changes, settings changes, or a slower specialist pass. "
     "When you choose handoff, set spoken_ack to a natural user-facing filler reply in the configured language that can be spoken immediately while the slower specialist work runs in parallel. "
     "That filler may be one or two short sentences, should sound warm and specific to the user's request, should buy a little time without sounding canned, and must describe progress only. "
+    "The filler must be concretely about the current request, not a generic stock phrase or reusable template. "
     "For web search or other slower verification work, the filler should usually be two short sentences that acknowledge the topic and say Twinr is checking now. "
     "It must not imply the task is already finished or verified. "
     "Set context_scope to tiny_recent only when the tiny recent context is enough for a safe direct answer. "
     "Set context_scope to full_context when the answer needs broader memory or richer provider context than the fast lane has. "
     "When the user named a concrete place, copy it into location_hint. If the place phrase is unusual or uncertain, keep the literal phrase instead of dropping it. "
     "When the user referred to a concrete or relative date that matters, resolve and copy that into date_context. "
-    "When you choose direct, put the full user-facing answer into spoken_reply and leave spoken_ack empty. "
+    "When you choose direct, put the full user-facing answer into spoken_reply and leave spoken_ack empty. Direct replies must always include spoken_reply. "
     "Do not wait for the specialist result before that acknowledgement. "
     "Never claim that something was saved, updated, scheduled, printed, looked up, or verified unless the specialist result has already returned. "
     "Choose end_conversation only when the user clearly wants to stop or pause for now, and include a short goodbye in spoken_reply. "

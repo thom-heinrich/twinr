@@ -234,6 +234,7 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                 tool_handlers=self._tool_handlers,
                 tool_schemas=tool_schemas,
                 supervisor_decision_provider=supervisor_decision_provider,
+                first_word_provider=self.first_word_provider,
                 supervisor_tool_handlers=supervisor_tool_handlers,
                 supervisor_tool_schemas=supervisor_tool_schemas,
                 supervisor_instructions=build_supervisor_decision_instructions(
@@ -245,6 +246,8 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
                     extra_instructions=self.config.openai_realtime_instructions,
                 ),
                 max_rounds=6,
+                trace_event=self._trace_event,
+                trace_decision=self._trace_decision,
             )
         return ToolCallingStreamingLoop(
             provider=self.tool_agent_provider,
@@ -377,9 +380,6 @@ class TwinrStreamingHardwareLoop(TwinrRealtimeHardwareLoop):
         prefetched_decision: SupervisorDecision | None,
     ) -> FirstWordReply | None:
         return self._streaming_speculation.dual_lane_bridge_reply_from_decision(prefetched_decision)
-
-    def _dual_lane_error_reply(self) -> str:
-        return self._streaming_lane_planner.dual_lane_error_reply()
 
     def _build_streaming_turn_lane_plan(self, transcript: str) -> StreamingTurnLanePlan:
         return self._streaming_lane_planner.build_turn_lane_plan(transcript)

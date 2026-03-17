@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
+import logging
 import mimetypes
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -19,6 +20,8 @@ if TYPE_CHECKING:
     from twinr.agent.base_agent.config import TwinrConfig
 else:
     TwinrConfig = Any  # AUDIT-FIX(#6): Stellt einen Runtime-Fallback für Annotation-Resolution via get_type_hints bereit.
+
+_LOGGER = logging.getLogger(__name__)
 
 
 ConversationLike = Sequence[object]
@@ -499,7 +502,11 @@ def _apply_config_atomically(
             try:
                 provider.config = previous_value
             except Exception:
-                pass
+                _LOGGER.warning(
+                    "Failed to roll back provider config for %s after composite apply_config failure.",
+                    type(provider).__name__,
+                    exc_info=True,
+                )
         raise RuntimeError("Failed to apply config consistently across providers") from exc
 
 

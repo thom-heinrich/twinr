@@ -14,6 +14,7 @@ from threading import Event, Lock, Thread
 from typing import Literal, Protocol
 import inspect
 import json
+import logging
 import math
 import time
 
@@ -38,6 +39,8 @@ _DEFAULT_EVALUATION_TIMEOUT_SECONDS = 2.5
 _DEFAULT_CIRCUIT_BREAKER_FAILURES = 3
 _DEFAULT_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 15.0
 _DEFAULT_EMIT_VALUE_MAX_CHARS = 256
+
+_LOGGER = logging.getLogger(__name__)
 
 _TURN_DECISION_TOOL_SCHEMA: dict[str, object] = {
     "type": "function",
@@ -241,6 +244,7 @@ def _compact_conversation(
     try:
         turns = list(conversation)
     except Exception:
+        _LOGGER.warning("Turn controller failed to snapshot conversation for compaction.", exc_info=True)
         return ()
     if max_turns > 0 and len(turns) > max_turns:
         turns = turns[-max_turns:]
@@ -254,6 +258,7 @@ def _compact_conversation(
                 role = _safe_getattr(item, "role", "")
                 content = _safe_getattr(item, "content", "")
         except Exception:
+            _LOGGER.warning("Turn controller skipped a malformed conversation item during compaction.", exc_info=True)
             continue
         role_text = _coerce_text(role, default="user", max_chars=64) or "user"
         content_text = _coerce_text(content, max_chars=max_item_chars)

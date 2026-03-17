@@ -5,6 +5,7 @@
 # Local workflow tooling.
 AGENTS.md
 !hardware/AGENTS.md
+!src/twinr/AGENTS.md
 !src/twinr/memory/longterm/runtime/AGENTS.md
 !src/twinr/proactive/governance/AGENTS.md
 !src/twinr/proactive/runtime/AGENTS.md

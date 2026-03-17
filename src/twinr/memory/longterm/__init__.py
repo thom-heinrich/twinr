@@ -1,3 +1,11 @@
+"""Expose Twinr's long-term memory package surface.
+
+Import from ``twinr.memory.longterm`` when callers need the supported
+long-term memory models, services, planners, and helpers without binding to
+the internal subpackage layout. Synthetic and multimodal evaluation exports
+stay lazy so normal runtime imports do not pull in the harness modules.
+"""
+
 from twinr.memory.longterm.reasoning.consolidator import LongTermMemoryConsolidator
 from twinr.memory.longterm.reasoning.conflicts import LongTermConflictResolver
 from twinr.memory.longterm.ingestion.extract import LongTermTurnExtractor
@@ -115,6 +123,18 @@ __all__ = [
 
 
 def __getattr__(name: str):
+    """Resolve lazily exported evaluation helpers on first access.
+
+    Args:
+        name: Export name requested from ``twinr.memory.longterm``.
+
+    Returns:
+        The requested evaluation type or runner.
+
+    Raises:
+        AttributeError: If ``name`` is not one of the supported lazy exports.
+    """
+
     if name in {
         "LongTermEvalCase",
         "LongTermEvalCaseResult",

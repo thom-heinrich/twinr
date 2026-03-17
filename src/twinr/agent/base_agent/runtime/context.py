@@ -263,7 +263,12 @@ class TwinrRuntimeContextMixin:
         with self._runtime_context_lock():
             return self._conversation_context_unlocked()
 
-    def _provider_context_messages(self, *, tool_context: bool) -> tuple[tuple[str, str], ...]:
+    def _provider_context_messages(
+        self,
+        *,
+        tool_context: bool,
+        query_text: str | None = None,
+    ) -> tuple[tuple[str, str], ...]:
         with self._runtime_context_lock():
             messages: list[tuple[str, str]] = []
             try:
@@ -281,12 +286,14 @@ class TwinrRuntimeContextMixin:
             if guidance:
                 messages.append(("system", guidance))
 
-            last_transcript = str(getattr(self, "last_transcript", "") or "")
+            retrieval_query = str(
+                query_text if query_text is not None else getattr(self, "last_transcript", "") or ""
+            )
             try:
                 context_builder = (
-                    self.long_term_memory.build_tool_provider_context(last_transcript)
+                    self.long_term_memory.build_tool_provider_context(retrieval_query)
                     if tool_context
-                    else self.long_term_memory.build_provider_context(last_transcript)
+                    else self.long_term_memory.build_provider_context(retrieval_query)
                 )
                 for context_message in context_builder.system_messages():
                     messages.append(("system", str(context_message)))
@@ -324,6 +331,23 @@ class TwinrRuntimeContextMixin:
         """Return provider context tailored for tool-calling turns."""
 
         return self._provider_context_messages(tool_context=True)
+
+    def supervisor_direct_provider_conversation_context(
+        self,
+        query_text: str | None = None,
+    ) -> tuple[tuple[str, str], ...]:
+        """Return a memory-aware supervisor context for final direct replies.
+
+        The speculative supervisor path stays latency-optimized and remote-free.
+        This dedicated final-answer path intentionally includes the broader
+        provider memory context so a direct supervisor reply is never generated
+        from the reduced fast-lane context alone.
+        """
+
+        return self._provider_context_messages(
+            tool_context=False,
+            query_text=query_text,
+        )
 
     def search_provider_conversation_context(self) -> tuple[tuple[str, str], ...]:
         """Return a bounded search context without remote long-term memory."""

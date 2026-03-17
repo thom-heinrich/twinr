@@ -9,6 +9,7 @@ parsing in adjacent modules.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 import os
 
@@ -109,7 +110,7 @@ def _parse_optional_int(value: str | None) -> int | None:
 
 
 def _parse_float(
-    value: str | None,
+    value: str | float | int | None,
     default: float,
     *,
     minimum: float | None = None,
@@ -117,8 +118,13 @@ def _parse_float(
 ) -> float:
     """Parse a float env value and clamp it to optional bounds."""
 
-    if value is None or not value.strip():
+    if value is None:
         parsed = default
+    elif isinstance(value, str):
+        if not value.strip():
+            parsed = default
+        else:
+            parsed = float(value)
     else:
         parsed = float(value)
     if minimum is not None:
@@ -488,6 +494,7 @@ class TwinrConfig:
     display_height: int = 300
     display_rotation_degrees: int = 270
     display_full_refresh_interval: int = 0
+    display_busy_timeout_s: float = 20.0
     display_poll_interval_s: float = 0.5
     display_layout: str = "default"
     printer_queue: str = "Thermal_GP58"
@@ -512,12 +519,17 @@ class TwinrConfig:
                 "display_layout must be one of: "
                 + ", ".join(SUPPORTED_DISPLAY_LAYOUTS)
             )
+        normalized_display_busy_timeout_s = float(self.display_busy_timeout_s)
+        if not math.isfinite(normalized_display_busy_timeout_s):
+            raise ValueError("display_busy_timeout_s must be finite")
+        normalized_display_busy_timeout_s = max(0.1, normalized_display_busy_timeout_s)
         object.__setattr__(self, "long_term_memory_mode", normalized_mode)
         object.__setattr__(
             self,
             "long_term_memory_remote_required",
             normalized_mode == "remote_primary",
         )
+        object.__setattr__(self, "display_busy_timeout_s", normalized_display_busy_timeout_s)
         object.__setattr__(self, "display_layout", normalized_display_layout)
 
     @property
@@ -1524,6 +1536,7 @@ class TwinrConfig:
             display_height=int(get_value("TWINR_DISPLAY_HEIGHT", "300") or "300"),
             display_rotation_degrees=int(get_value("TWINR_DISPLAY_ROTATION_DEGREES", "270") or "270"),
             display_full_refresh_interval=int(get_value("TWINR_DISPLAY_FULL_REFRESH_INTERVAL", "0") or "0"),
+            display_busy_timeout_s=_parse_float(get_value("TWINR_DISPLAY_BUSY_TIMEOUT_S"), 20.0, minimum=0.1),
             display_poll_interval_s=_parse_float(get_value("TWINR_DISPLAY_POLL_INTERVAL_S"), 0.5),
             display_layout=get_value("TWINR_DISPLAY_LAYOUT", "default") or "default",
             printer_queue=get_value("TWINR_PRINTER_QUEUE", "Thermal_GP58") or "Thermal_GP58",

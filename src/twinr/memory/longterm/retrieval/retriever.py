@@ -171,7 +171,19 @@ class LongTermRetriever:
             return ()
 
         try:  # AUDIT-FIX(#1): A failure to load supporting objects must not abort the whole memory path.
-            objects = self.object_store.load_objects()
+            related_memory_ids = tuple(
+                dict.fromkeys(
+                    memory_id
+                    for conflict in conflicts
+                    for memory_id in (conflict.candidate_memory_id, *conflict.existing_memory_ids)
+                    if isinstance(memory_id, str) and memory_id
+                )
+            )
+            objects = (
+                self.object_store.load_objects_by_ids(related_memory_ids)
+                if related_memory_ids
+                else ()
+            )
         except LongTermRemoteUnavailableError:
             raise
         except Exception:

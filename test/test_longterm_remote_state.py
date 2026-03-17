@@ -16,7 +16,10 @@ from test.longterm_test_program import make_test_extractor
 from twinr.config import TwinrConfig
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig
 from twinr.memory.context_store import PersistentMemoryMarkdownStore
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteStateStore,
+    LongTermRemoteUnavailableError,
+)
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
 
 
@@ -286,6 +289,137 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         pointer_body = json.loads(write_opener.calls[0]["body"])
         self.assertEqual(pointer_body["items"][0]["payload"]["snapshot_kind"], "__pointer__:objects")
         self.assertEqual(pointer_body["items"][0]["payload"]["body"]["document_id"], "new-doc")
+
+    def test_remote_snapshot_load_repairs_stale_pointer_document_from_origin_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            read_opener = FakeOpener()
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "pointer-doc",
+                    "origin_uri": "twinr://longterm/test-namespace/__pointer__:objects",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "__pointer__:objects",
+                            "updated_at": "2026-03-17T17:29:03+00:00",
+                            "body": {
+                                "schema": "twinr_remote_snapshot_pointer_v1",
+                                "version": 1,
+                                "snapshot_kind": "objects",
+                                "document_id": "stale-doc",
+                            },
+                        }
+                    ),
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "stale-doc",
+                    "chunk_count": 1,
+                    "chunks": [
+                        {
+                            "payload_id": "stale-doc",
+                            "content": "",
+                            "content_summary": "",
+                        }
+                    ],
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "fresh-doc",
+                    "origin_uri": "twinr://longterm/test-namespace/objects",
+                    "chunk_count": 1,
+                    "chunks": [
+                        {
+                            "payload_id": "fresh-doc",
+                            "content": json.dumps(
+                                {
+                                    "schema": "twinr_remote_snapshot_v1",
+                                    "namespace": "test-namespace",
+                                    "snapshot_kind": "objects",
+                                    "updated_at": "2026-03-17T17:29:04+00:00",
+                                    "body": {"schema": "object_store", "objects": [{"memory_id": "fact:fresh"}]},
+                                }
+                            ),
+                        }
+                    ],
+                }
+            )
+            write_opener = FakeOpener()
+            write_opener.queue_json({"success": True, "stored": 1})
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=write_opener,
+                ),
+            )
+
+            payload = state.load_snapshot(snapshot_kind="objects", local_path=Path(temp_dir) / "objects.json")
+
+        self.assertEqual(payload, {"schema": "object_store", "objects": [{"memory_id": "fact:fresh"}]})
+        self.assertEqual(len(read_opener.calls), 3)
+        first_query = parse_qs(urlparse(read_opener.calls[0]["full_url"]).query)
+        second_query = parse_qs(urlparse(read_opener.calls[1]["full_url"]).query)
+        third_query = parse_qs(urlparse(read_opener.calls[2]["full_url"]).query)
+        self.assertEqual(first_query["origin_uri"], ["twinr://longterm/test-namespace/__pointer__%3Aobjects"])
+        self.assertEqual(second_query["document_id"], ["stale-doc"])
+        self.assertEqual(third_query["origin_uri"], ["twinr://longterm/test-namespace/objects"])
+        pointer_body = json.loads(write_opener.calls[0]["body"])
+        self.assertEqual(pointer_body["items"][0]["payload"]["snapshot_kind"], "__pointer__:objects")
+        self.assertEqual(pointer_body["items"][0]["payload"]["body"]["document_id"], "fresh-doc")
+
+    def test_remote_snapshot_save_raises_when_pointer_persist_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=1,
+                long_term_memory_remote_retry_backoff_s=0.0,
+            )
+            write_opener = FakeOpener()
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "items": [
+                        {
+                            "success": True,
+                            "document_id": "doc-123",
+                            "payload_id": "doc-123",
+                        }
+                    ],
+                }
+            )
+            write_opener.queue_exception(TimeoutError("pointer write timed out"))
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=write_opener,
+                ),
+            )
+
+            with self.assertRaises(LongTermRemoteUnavailableError):
+                state.save_snapshot(snapshot_kind="objects", payload={"schema": "object_store", "objects": []})
+
+        self.assertEqual(len(write_opener.calls), 2)
+        first_body = json.loads(write_opener.calls[0]["body"])
+        second_body = json.loads(write_opener.calls[1]["body"])
+        self.assertEqual(first_body["items"][0]["payload"]["snapshot_kind"], "objects")
+        self.assertEqual(second_body["items"][0]["payload"]["snapshot_kind"], "__pointer__:objects")
 
     def test_remote_snapshot_save_retries_after_transient_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

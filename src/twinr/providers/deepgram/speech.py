@@ -264,12 +264,12 @@ class _DeepgramStreamingSession(StreamingSpeechToTextSession):
                 self._enqueue("CloseStream", ack=close_ack, allow_error=True, allow_closed=True)
                 close_ack.wait(timeout=self._send_timeout_s)
             except Exception:
-                pass
+                logger.warning("Deepgram CloseStream enqueue failed during session shutdown.", exc_info=True)
 
         try:
             self._connection.close()
         except Exception:
-            pass
+            logger.warning("Deepgram websocket close failed during session shutdown.", exc_info=True)
 
         self._done.set()
 

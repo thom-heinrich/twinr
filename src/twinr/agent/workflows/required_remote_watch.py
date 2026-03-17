@@ -10,7 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from threading import Event, Thread
 from typing import Callable
+import logging
 import time
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -71,7 +74,7 @@ class RequiredRemoteDependencyWatch:
             try:
                 self.emit("required_remote_watch_join_timeout=true")
             except Exception:
-                pass
+                _LOGGER.warning("Required-remote watch failed to emit join-timeout telemetry.", exc_info=True)
             self._trace("required_remote_watch_join_timeout", timeout_s=float(timeout_s))
 
     def _worker_main(self) -> None:
@@ -89,7 +92,7 @@ class RequiredRemoteDependencyWatch:
                     try:
                         self.emit(f"required_remote_watch_error={type(exc).__name__}")
                     except Exception:
-                        pass
+                        _LOGGER.warning("Required-remote watch failed to emit worker error telemetry.", exc_info=True)
                 self._trace(
                     "required_remote_watch_refresh_failed",
                     force=force,
@@ -117,4 +120,5 @@ class RequiredRemoteDependencyWatch:
         try:
             self.trace_event(msg, details)
         except Exception:
+            _LOGGER.warning("Required-remote watch trace sink failed for %s.", msg, exc_info=True)
             return

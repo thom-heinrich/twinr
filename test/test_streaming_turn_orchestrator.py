@@ -59,6 +59,57 @@ class StreamingTurnOrchestratorTests(unittest.TestCase):
             ],
         )
 
+    def test_final_lane_error_uses_recovery_callback(self) -> None:
+        lane_events: list[SpeechLaneDelta] = []
+        recovery_calls: list[str] = []
+        orchestrator = StreamingTurnOrchestrator(
+            timeout_policy=StreamingTurnTimeoutPolicy(
+                bridge_reply_timeout_ms=10,
+                final_lane_watchdog_timeout_ms=50,
+                final_lane_hard_timeout_ms=200,
+                first_audio_gate_ms=0,
+            ),
+            queue_lane_delta=lane_events.append,
+            wait_for_first_audio=lambda *, timeout_s=None: True,
+            ensure_processing_feedback=lambda: None,
+        )
+
+        def _failing_final_lane() -> StreamingToolLoopResult:
+            raise RuntimeError("boom")
+
+        outcome = orchestrator.execute(
+            prefetched_first_word=None,
+            prefetched_first_word_source="none",
+            generate_first_word=None,
+            bridge_fallback_reply=None,
+            run_final_lane=_failing_final_lane,
+            recover_final_lane_response=lambda failure_reason: recovery_calls.append(failure_reason) or StreamingToolLoopResult(
+                text="Ich antworte dir darauf jetzt direkt.",
+                rounds=1,
+                tool_calls=(),
+                tool_results=(),
+                response_id="resp_recovery",
+                request_id="req_recovery",
+                model="gpt-4o-mini",
+                token_usage=None,
+                used_web_search=False,
+            ),
+        )
+
+        self.assertEqual(recovery_calls, ["final_lane_error"])
+        self.assertEqual(outcome.response.text, "Ich antworte dir darauf jetzt direkt.")
+        self.assertEqual(
+            lane_events,
+            [
+                SpeechLaneDelta(
+                    text="Ich antworte dir darauf jetzt direkt.",
+                    lane="direct",
+                    replace_current=False,
+                    atomic=True,
+                )
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

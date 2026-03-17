@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 import pickle
 from pathlib import Path
@@ -20,6 +21,8 @@ from twinr.agent.self_coding.sandbox.trusted_loader import load_trusted_skill_mo
 
 
 _MAX_IPC_MESSAGE_BYTES = 1 * 1024 * 1024
+
+LOGGER = logging.getLogger(__name__)
 
 
 def sandbox_loader_child_main(
@@ -109,7 +112,7 @@ def _try_send_message(connection: Any, message: dict[str, Any]) -> None:
     try:
         _send_message(connection, message)
     except Exception:
-        pass
+        LOGGER.warning("Self-coding loader process failed to send IPC message.", exc_info=True)
 
 
 def _close_connection(connection: Any) -> None:
@@ -118,7 +121,7 @@ def _close_connection(connection: Any) -> None:
         try:
             close()
         except Exception:
-            pass
+            LOGGER.warning("Self-coding loader process failed to close IPC connection.", exc_info=True)
 
 
 def _normalize_error_text(exc: BaseException) -> str:

@@ -20,6 +20,7 @@ import atexit
 import hashlib   # AUDIT-FIX(#3): Redaktions-Summaries nutzen stabile Hashes ohne Rohtext zu speichern.
 import inspect
 import json
+import logging
 import math   # AUDIT-FIX(#11): Nicht-endliche Floats werden vor JSON-Serialisierung normalisiert.
 import os
 import platform
@@ -117,6 +118,8 @@ _ENV_WHITELIST: tuple[str, ...] = (
     "TWINR_LONG_TERM_MEMORY_MODE",
     "TWINR_LONG_TERM_MEMORY_REMOTE_REQUIRED",
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -654,7 +657,7 @@ class WorkflowForensics:
             )
             self._enqueue_record(record, critical=True)
         except Exception:
-            pass
+            self._safe_stderr("[twinr-workflow-trace] failed to build or enqueue final run_end record")
         self._enqueue_sentinel()
         if writer is not None:
             deadline = time.monotonic() + 3.0  # AUDIT-FIX(#7): Begrenzt drainen, bevor aufgegeben wird.
@@ -1148,4 +1151,8 @@ class WorkflowForensics:
             sys.stderr.write(f"{message}\n")
             sys.stderr.flush()
         except Exception:
-            pass
+            try:
+                sys.__stderr__.write(f"{message}\n")
+                sys.__stderr__.flush()
+            except Exception:
+                _LOGGER.warning("Workflow forensics failed to write to stderr fallback.", exc_info=True)

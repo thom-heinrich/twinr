@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+import logging
 import mimetypes
 import os
 import stat
@@ -48,6 +49,8 @@ _SUPPORTED_AUDIO_SUFFIXES = frozenset(
     }
 )
 
+logger = logging.getLogger(__name__)
+
 
 class _ClosableIterator(Iterator[bytes]):
     """Wrap an iterator so callers can close the underlying stream explicitly."""
@@ -81,7 +84,7 @@ class _ClosableIterator(Iterator[bytes]):
         try:
             self.close()
         except Exception:
-            pass
+            logger.warning("OpenAI speech iterator cleanup failed during garbage collection.", exc_info=True)
 
 
 class OpenAISpeechMixin:
@@ -403,7 +406,7 @@ class OpenAISpeechMixin:
                 try:
                     close()
                 except Exception:
-                    pass
+                    logger.warning("OpenAI speech response close failed after synthesis.", exc_info=True)
 
     # AUDIT-FIX(#2): Current STT models no longer share one universal response_format contract.
     def _transcription_response_format(self, normalized_model: str) -> str:

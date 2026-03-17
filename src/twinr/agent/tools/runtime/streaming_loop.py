@@ -29,10 +29,10 @@ ToolHandler = Callable[[dict[str, Any] | AgentToolCall], Any]
 
 # AUDIT-FIX(#1): Add internal logging so detailed failures stay server-side instead of leaking into tool outputs.
 LOGGER = logging.getLogger(__name__)
-_PROVIDER_FAILURE_MESSAGE = "The assistant could not complete this request."
-_UNSUPPORTED_TOOL_MESSAGE = "This action is not available."
-_TOOL_EXECUTION_ERROR_MESSAGE = "The action could not be completed."
-_UNSERIALIZABLE_TOOL_OUTPUT_MESSAGE = "The action returned data that could not be processed."
+_PROVIDER_FAILURE_CODE = "tool_loop_provider_failed"
+_UNSUPPORTED_TOOL_CODE = "unsupported_tool"
+_TOOL_EXECUTION_ERROR_CODE = "tool_execution_failed"
+_UNSERIALIZABLE_TOOL_OUTPUT_CODE = "unserializable_tool_output"
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +180,7 @@ class ToolCallingStreamingLoop:
                 tool_calls = _normalize_tool_calls(getattr(response, "tool_calls", ()))
             except Exception:
                 LOGGER.exception("Agent provider returned malformed response on round %s", round_index)
-                raise RuntimeError(_PROVIDER_FAILURE_MESSAGE) from None
+                raise RuntimeError(_PROVIDER_FAILURE_CODE) from None
             aggregate_text = _append_round_text(aggregate_text, response_text)
             used_web_search = used_web_search or bool(getattr(response, "used_web_search", False))
             all_tool_calls.extend(tool_calls)
@@ -212,12 +212,12 @@ class ToolCallingStreamingLoop:
                 LOGGER.error(
                     "Agent provider returned tool calls without a continuation token or response_id"
                 )
-                raise RuntimeError(_PROVIDER_FAILURE_MESSAGE)
+                raise RuntimeError(_PROVIDER_FAILURE_CODE)
             next_tool_results = tuple(self._execute_tool_call(call) for call in tool_calls)
             all_tool_results.extend(next_tool_results)
 
         LOGGER.error("Agent tool loop exceeded max_rounds=%s", self.max_rounds)
-        raise RuntimeError(_PROVIDER_FAILURE_MESSAGE)
+        raise RuntimeError(_PROVIDER_FAILURE_CODE)
 
     def _request_turn(
         self,
@@ -259,11 +259,11 @@ class ToolCallingStreamingLoop:
         except Exception:
             # AUDIT-FIX(#3): Keep provider exceptions out of user/model-facing strings while preserving diagnostics in logs.
             LOGGER.exception("Agent provider streaming failed on round %s", round_index)
-            raise RuntimeError(_PROVIDER_FAILURE_MESSAGE) from None
+            raise RuntimeError(_PROVIDER_FAILURE_CODE) from None
 
         if response is None:
             LOGGER.error("Agent provider returned no response on round %s", round_index)
-            raise RuntimeError(_PROVIDER_FAILURE_MESSAGE)
+            raise RuntimeError(_PROVIDER_FAILURE_CODE)
         return response
 
     def _execute_tool_call(self, tool_call: AgentToolCall) -> AgentToolResult:
@@ -274,7 +274,7 @@ class ToolCallingStreamingLoop:
             # AUDIT-FIX(#1): Return a sanitized, user-safe error envelope instead of exposing internal details.
             output: Any = {
                 "status": "error",
-                "message": _UNSUPPORTED_TOOL_MESSAGE,
+                "error_code": _UNSUPPORTED_TOOL_CODE,
                 "tool": tool_call.name,
             }
         else:
@@ -293,7 +293,7 @@ class ToolCallingStreamingLoop:
                 # AUDIT-FIX(#1): Keep raw exception text out of downstream tool outputs.
                 output = {
                     "status": "error",
-                    "message": _TOOL_EXECUTION_ERROR_MESSAGE,
+                    "error_code": _TOOL_EXECUTION_ERROR_CODE,
                     "tool": tool_call.name,
                 }
             else:
@@ -331,7 +331,7 @@ def _serialize_tool_output(output: Any) -> str:
         LOGGER.exception("Failed to serialize tool output of type %s", type(output).__name__)
         fallback_output = {
             "status": "error",
-            "message": _UNSERIALIZABLE_TOOL_OUTPUT_MESSAGE,
+            "error_code": _UNSERIALIZABLE_TOOL_OUTPUT_CODE,
             "output_type": type(output).__name__,
         }
         return json.dumps(fallback_output, ensure_ascii=False, allow_nan=False)

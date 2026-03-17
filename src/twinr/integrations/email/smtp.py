@@ -9,12 +9,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import make_msgid
+import logging
 import smtplib
 import ssl
 from typing import Callable
 
 from twinr.integrations.email.adapter import MailSender
 from twinr.integrations.email.models import EmailDraft, normalize_email
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,7 +175,7 @@ class SMTPMailSender(MailSender):
             if quit_method is not None and callable(quit_method):
                 quit_method()
         except Exception:
-            pass
+            LOGGER.warning("SMTP QUIT failed during connection cleanup.", exc_info=True)
 
         try:
             # AUDIT-FIX(#5): Always fall back to close() so failed or missing QUIT does not leave sockets behind.
@@ -180,7 +183,7 @@ class SMTPMailSender(MailSender):
             if close_method is not None and callable(close_method):
                 close_method()
         except Exception:
-            pass
+            LOGGER.warning("SMTP close failed during connection cleanup.", exc_info=True)
 
     def _call_optional(self, connection: object, method_name: str, *args):
         """Call an optional SMTP method when a test double exposes it."""

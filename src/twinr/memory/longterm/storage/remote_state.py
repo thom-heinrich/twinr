@@ -594,7 +594,7 @@ class LongTermRemoteStateStore:
             payload=_mapping_dict(payload) or {},
         )
         if document_id and not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
-            self._save_snapshot_pointer_best_effort(
+            self._save_snapshot_pointer(
                 write_client,
                 snapshot_kind=normalized_snapshot_kind,
                 document_id=document_id,
@@ -904,6 +904,7 @@ class LongTermRemoteStateStore:
         started = time.monotonic()
         attempt_records: list[LongTermRemoteFetchAttempt] = []
         pointer_document_id: str | None = None
+        pointer_result: _RemoteSnapshotFetchResult | None = None
         if not self._is_pointer_snapshot_kind(snapshot_kind):
             pointer_lookup_result = self._load_snapshot_via_uri(
                 client,
@@ -924,7 +925,7 @@ class LongTermRemoteStateStore:
                     source="pointer_document",
                 )
                 attempt_records.extend(pointer_result.attempts)
-                if pointer_result.payload is not None or pointer_result.status == "unavailable":
+                if pointer_result.payload is not None:
                     return LongTermRemoteSnapshotProbe(
                         snapshot_kind=snapshot_kind,
                         status=pointer_result.status,
@@ -936,6 +937,11 @@ class LongTermRemoteStateStore:
                         payload=pointer_result.payload,
                         attempts=tuple(attempt_records),
                     )
+                _LOGGER.warning(
+                    "Remote snapshot pointer %r targeted unreadable document %r; reloading the latest origin snapshot.",
+                    snapshot_kind,
+                    pointer_document_id,
+                )
 
         origin_result = self._load_snapshot_via_uri(
             client,
@@ -947,11 +953,18 @@ class LongTermRemoteStateStore:
         if origin_result.payload is not None and origin_result.document_id and not self._is_pointer_snapshot_kind(snapshot_kind):
             write_client = self.write_client
             if write_client is not None:
-                self._save_snapshot_pointer_best_effort(
-                    write_client,
-                    snapshot_kind=snapshot_kind,
-                    document_id=origin_result.document_id,
-                )
+                try:
+                    self._save_snapshot_pointer(
+                        write_client,
+                        snapshot_kind=snapshot_kind,
+                        document_id=origin_result.document_id,
+                    )
+                except LongTermRemoteUnavailableError as exc:
+                    _LOGGER.warning(
+                        "Remote snapshot pointer %r repair failed after a successful origin read: %s",
+                        snapshot_kind,
+                        self._safe_exception_text(exc),
+                    )
         return LongTermRemoteSnapshotProbe(
             snapshot_kind=snapshot_kind,
             status=origin_result.status,
@@ -1064,7 +1077,7 @@ class LongTermRemoteStateStore:
             self._remote_failure_detail("write", snapshot_kind, exc=last_error)  # AUDIT-FIX(#8): Keep outward-facing errors generic and secret-safe.
         ) from last_error
 
-    def _save_snapshot_pointer_best_effort(
+    def _save_snapshot_pointer(
         self,
         write_client: ChonkyDBClient,
         *,
@@ -1077,18 +1090,11 @@ class LongTermRemoteStateStore:
             "snapshot_kind": snapshot_kind,
             "document_id": document_id,
         }
-        try:
-            self._store_snapshot_record(
-                write_client,
-                snapshot_kind=self._pointer_snapshot_kind(snapshot_kind),
-                payload=pointer_payload,
-            )
-        except Exception as exc:
-            _LOGGER.warning(
-                "Failed to persist remote snapshot pointer %r: %s",
-                snapshot_kind,
-                self._safe_exception_text(exc),
-            )
+        self._store_snapshot_record(
+            write_client,
+            snapshot_kind=self._pointer_snapshot_kind(snapshot_kind),
+            payload=pointer_payload,
+        )
 
     def _candidate_document_id(self, payload: Mapping[str, object]) -> str | None:
         for field_name in ("document_id", "payload_id", "chonky_id"):

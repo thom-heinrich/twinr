@@ -1,0 +1,122 @@
+schema_version: 1
+name: longterm
+path: src/twinr/memory/longterm
+kind: python-package
+visibility: internal
+summary: Coordinate Twinr's long-term memory package surface, subsystem boundaries, and architecture overview across core models, ingestion, reasoning, retrieval, storage, runtime orchestration, proactive planning, and evaluation.
+owned_concerns:
+  - Expose the canonical `twinr.memory.longterm` import surface for long-term memory models, services, planners, and helpers
+  - Define the top-level boundaries between the core, ingestion, reasoning, retrieval, storage, runtime, proactive, and evaluation subpackages
+  - Hold the target-state architecture document for the long-term memory subsystem
+  - Provide lazy access to evaluation entry points without making normal runtime imports depend on the evaluation harnesses
+out_of_scope:
+  - Short-term or on-device memory outside this subsystem
+  - Low-level ChonkyDB client or graph-schema code outside long-term storage integration
+  - Top-level agent loops, web routes, display flows, or hardware orchestration
+files:
+  - path: __init__.py
+    role: Public long-term memory export surface and lazy evaluation bridge
+  - path: MEMORY_ARCHITECTURE.md
+    role: Target-state architecture and product constraints
+subpackages:
+  - path: core
+    role: Canonical long-term memory models and ontology helpers
+  - path: ingestion
+    role: Turn, proposition, multimodal, and sensor extraction
+  - path: reasoning
+    role: Consolidation, truth maintenance, reflection, conflicts, and retention
+  - path: retrieval
+    role: Retrieval, ranking, and silent personalization subtext assembly
+  - path: storage
+    role: Structured stores, midterm persistence, and remote-primary snapshots
+  - path: runtime
+    role: Runtime orchestration, fail-closed readiness, and bounded background writers
+  - path: proactive
+    role: Proactive candidate planning, policy, and state
+  - path: evaluation
+    role: Synthetic, multimodal, and response-level evaluation harnesses
+public_api:
+  module: twinr.memory.longterm
+  exports:
+    - AsyncLongTermMemoryWriter
+    - AsyncLongTermMultimodalWriter
+    - LongTermConsolidationResultV1
+    - LongTermConflictOptionV1
+    - LongTermConflictQueueItemV1
+    - LongTermConflictResolutionV1
+    - LongTermConflictResolver
+    - LongTermConversationTurn
+    - LongTermEnqueueResult
+    - LongTermEvalCase
+    - LongTermEvalCaseResult
+    - LongTermEvalResult
+    - LongTermEvalSeedStats
+    - LongTermEvalSummary
+    - LongTermGraphEdgeCandidateV1
+    - LongTermMemoryConflictV1
+    - LongTermMemoryConsolidator
+    - LongTermMemoryContext
+    - LongTermMemoryMutationResultV1
+    - LongTermMemoryObjectV1
+    - LongTermMemoryReviewItemV1
+    - LongTermMemoryReviewResultV1
+    - LongTermMemoryService
+    - LongTermMidtermPacketV1
+    - LongTermMidtermStore
+    - LongTermMultimodalEvidence
+    - LongTermMultimodalExtractor
+    - LongTermProactiveCandidateV1
+    - LongTermProactiveHistoryEntryV1
+    - LongTermProactivePlanV1
+    - LongTermProactivePlanner
+    - LongTermProactivePolicy
+    - LongTermProactiveReservationV1
+    - LongTermProactiveStateStore
+    - LongTermReflectionResultV1
+    - LongTermRetriever
+    - LongTermRetentionPolicy
+    - LongTermRetentionResultV1
+    - LongTermSensorMemoryCompiler
+    - LongTermSourceRefV1
+    - LongTermStructuredReflectionProgram
+    - LongTermStructuredStore
+    - LongTermSubtextBuilder
+    - LongTermTruthMaintainer
+    - LongTermTurnExtractionV1
+    - LongTermTurnExtractor
+    - LongTermTurnPropositionBundleV1
+    - LongTermTurnPropositionCompiler
+    - MultimodalEvalCase
+    - MultimodalEvalCaseResult
+    - MultimodalEvalResult
+    - MultimodalEvalSeedStats
+    - MultimodalEvalSummary
+    - OpenAIStructuredReflectionProgram
+    - run_multimodal_longterm_eval
+    - run_synthetic_longterm_eval
+    - structured_reflection_program_from_config
+compatibility_reexports:
+  - path: src/twinr/memory/__init__.py
+    names:
+      - AsyncLongTermMemoryWriter
+      - AsyncLongTermMultimodalWriter
+      - LongTermConversationTurn
+      - LongTermEnqueueResult
+      - LongTermMemoryContext
+      - LongTermMemoryService
+      - LongTermMultimodalEvidence
+      - LongTermMultimodalExtractor
+      - LongTermSubtextBuilder
+primary_callers:
+  - path: src/twinr/memory/__init__.py
+  - path: src/twinr/agent/base_agent/runtime/base.py
+  - path: src/twinr/agent/base_agent/runtime/context.py
+  - path: src/twinr/ops/remote_memory_watchdog.py
+  - path: test/test_longterm_memory.py
+tests:
+  - path: test/test_longterm_memory.py
+  - path: test/test_longterm_proactive.py
+  - path: test/test_longterm_remote_state.py
+  - path: test/test_longterm_retriever.py
+  - path: test/test_longterm_runtime_health.py
+  - path: test/test_longterm_worker.py

@@ -20,7 +20,6 @@ files:
       - COMPACT_TOOL_AGENT_INSTRUCTIONS
       - DEFAULT_TOOL_AGENT_INSTRUCTIONS
       - FIRST_WORD_AGENT_INSTRUCTIONS
-      - SUPERVISOR_FAST_ACK_PHRASES
       - RealtimeToolExecutor
       - StreamingToolLoopResult
       - ToolCallingStreamingLoop
@@ -44,7 +43,6 @@ public_api:
     - COMPACT_TOOL_AGENT_INSTRUCTIONS
     - DEFAULT_TOOL_AGENT_INSTRUCTIONS
     - FIRST_WORD_AGENT_INSTRUCTIONS
-    - SUPERVISOR_FAST_ACK_PHRASES
     - RealtimeToolExecutor
     - StreamingToolLoopResult
     - ToolCallingStreamingLoop

@@ -1,3 +1,10 @@
+"""Normalize free-form text and identifiers shared across Twinr subsystems.
+
+The helpers in this module keep user-facing text, lookup terms, JSON snippets,
+and stable identifiers in a bounded format that works across memory, provider,
+and operator-facing paths.
+"""
+
 from __future__ import annotations
 
 import json
@@ -25,14 +32,20 @@ _DEFAULT_IDENTIFIER_FALLBACK = "item"  # AUDIT-FIX(#5): Guarantee a safe, non-em
 
 
 def _coerce_optional_text(value: object | None) -> str:
+    """Convert optional values to text without dropping valid falsey inputs."""
+
     return "" if value is None else str(value)  # AUDIT-FIX(#3): Preserve valid falsey values like 0 instead of silently dropping them.
 
 
 def collapse_whitespace(value: str | None) -> str:
+    """Collapse internal whitespace and trim leading/trailing gaps."""
+
     return " ".join(_coerce_optional_text(value).split()).strip()  # AUDIT-FIX(#3): Only None becomes empty; other falsey values remain representable.
 
 
 def sanitize_text_fragment(value: str | None) -> str:
+    """Strip control characters and normalize whitespace for display-safe text."""
+
     normalized = collapse_whitespace(value)
     if not normalized:
         return ""
@@ -46,6 +59,8 @@ def sanitize_text_fragment(value: str | None) -> str:
 
 
 def truncate_text(value: str | None, *, limit: int | None = None) -> str:
+    """Truncate sanitized text to a bounded display or storage budget."""
+
     text = sanitize_text_fragment(value)
     if limit is None:
         return text
@@ -59,6 +74,8 @@ def truncate_text(value: str | None, *, limit: int | None = None) -> str:
 
 
 def folded_lookup_text(value: str | None) -> str:
+    """Normalize text into lowercase lookup tokens with German character folds."""
+
     raw = sanitize_text_fragment(value).translate(_GERMAN_FOLDS)  # AUDIT-FIX(#1): Strip control characters before lookup folding so invisible bytes do not split tokens unpredictably.
     parts: list[str] = []
     current: list[str] = []
@@ -75,6 +92,8 @@ def folded_lookup_text(value: str | None) -> str:
 
 
 def _ascii_identifier_tokens(value: str | None) -> tuple[str, ...]:
+    """Return ASCII-only identifier tokens derived from free-form input text."""
+
     raw = ascii_fold(value).lower()  # AUDIT-FIX(#5): Build identifier slugs from ASCII-only tokens to avoid unstable Unicode identifiers.
     parts: list[str] = []
     current: list[str] = []
@@ -91,6 +110,8 @@ def _ascii_identifier_tokens(value: str | None) -> tuple[str, ...]:
 
 
 def slugify_identifier(value: str | None, *, fallback: str) -> str:
+    """Build a stable ASCII identifier from free-form input."""
+
     slug = "_".join(_ascii_identifier_tokens(value))  # AUDIT-FIX(#5): Ensure generated identifiers are ASCII-safe and filesystem/URL-stable.
     if slug:
         return slug
@@ -102,6 +123,8 @@ def slugify_identifier(value: str | None, *, fallback: str) -> str:
 
 
 def retrieval_terms(value: str | None) -> tuple[str, ...]:
+    """Split normalized lookup text into retrieval terms."""
+
     normalized = folded_lookup_text(value)
     if not normalized:
         return ()
@@ -109,6 +132,8 @@ def retrieval_terms(value: str | None) -> tuple[str, ...]:
 
 
 def fts_match_query(value: str | None) -> str:
+    """Build a simple FTS query string from normalized retrieval terms."""
+
     alpha_terms = tuple(
         dict.fromkeys(
             term
@@ -134,6 +159,19 @@ def fts_match_query(value: str | None) -> str:
 
 
 def extract_json_object(text: str | None) -> dict[str, Any]:
+    """Extract the first valid JSON object from free-form model output text.
+
+    Args:
+        text: Raw text that may contain a standalone JSON object or extra prose.
+
+    Returns:
+        The decoded JSON object.
+
+    Raises:
+        ValueError: If the input is empty, too large, or does not contain a
+            valid JSON object.
+    """
+
     stripped = _coerce_optional_text(text).strip()  # AUDIT-FIX(#3): Treat None as empty input without erasing valid falsey payloads.
     if not stripped:
         raise ValueError("No JSON object found in empty text.")
@@ -152,6 +190,8 @@ def extract_json_object(text: str | None) -> dict[str, Any]:
 
 
 def _balanced_json_slice(text: str) -> str:
+    """Return the first balanced JSON-object slice found in the input text."""
+
     decoder = json.JSONDecoder()  # AUDIT-FIX(#2): Scan every object start so prose braces before the real JSON do not break extraction.
     for index, char in enumerate(text):
         if char != "{":
@@ -166,6 +206,8 @@ def _balanced_json_slice(text: str) -> str:
 
 
 def is_valid_identifier_namespace(value: str) -> bool:
+    """Return whether a namespace token satisfies Twinr's ASCII rules."""
+
     if not value:
         return False
     if value[0] not in _NAMESPACE_START_CHARS:  # AUDIT-FIX(#6): Enforce ASCII lowercase namespace starts to block homoglyph and non-portable identifiers.
@@ -177,6 +219,8 @@ def is_valid_identifier_namespace(value: str) -> bool:
 
 
 def is_valid_stable_identifier(value: str) -> bool:
+    """Return whether a stable identifier satisfies Twinr's ASCII rules."""
+
     if not value:
         return False
     if value[0] not in _STABLE_START_CHARS:  # AUDIT-FIX(#6): Enforce ASCII starts so identifiers behave consistently across stores and transports.
@@ -188,6 +232,8 @@ def is_valid_stable_identifier(value: str) -> bool:
 
 
 def is_valid_namespaced_identifier(value: str) -> bool:
+    """Return whether a value matches ``namespace:stable_id`` form."""
+
     namespace, separator, stable_id = str(value or "").partition(":")
     if separator != ":":
         return False
@@ -195,6 +241,8 @@ def is_valid_namespaced_identifier(value: str) -> bool:
 
 
 def ascii_fold(value: str | None) -> str:
+    """Fold sanitized text to ASCII for stable storage and comparisons."""
+
     folded = sanitize_text_fragment(value).translate(_GERMAN_FOLDS)  # AUDIT-FIX(#1): Remove control characters before ASCII folding so escape bytes cannot survive into logs, terminals, or printers.
     normalized = unicodedata.normalize("NFKD", folded)
     return collapse_whitespace(normalized.encode("ascii", errors="ignore").decode("ascii"))  # AUDIT-FIX(#1): Re-collapse whitespace after folding for stable downstream comparisons.

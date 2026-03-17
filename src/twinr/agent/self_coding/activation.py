@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
+import logging
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +35,8 @@ _ROLLBACK_READY_STATUSES = frozenset(
         LearnedSkillStatus.PAUSED,
     }
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 class SelfCodingActivationService:
@@ -516,6 +519,11 @@ class SelfCodingActivationService:
             except KeyError:
                 continue
             except Exception:
+                LOGGER.warning(
+                    "Self-coding activation failed to restore automation entry %s during rollback.",
+                    automation_id,
+                    exc_info=True,
+                )
                 continue
 
     # AUDIT-FIX(#1): Restore persisted activation records after partial failures so status storage matches automation state again.
@@ -524,6 +532,12 @@ class SelfCodingActivationService:
             try:
                 self.store.save_activation(record)
             except Exception:
+                LOGGER.warning(
+                    "Self-coding activation failed to restore activation record %s v%s during rollback.",
+                    record.skill_id,
+                    record.version,
+                    exc_info=True,
+                )
                 continue
 
     @staticmethod

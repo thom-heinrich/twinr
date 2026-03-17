@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from typing import Callable, Protocol
+import logging
 import time
 
 from twinr.agent.tools.runtime.dual_lane_loop import SpeechLaneDelta
@@ -51,6 +52,8 @@ _QUEUE_SENTINEL = object()
 _TTS_CHUNK_POLL_TIMEOUT_SECONDS = 0.02
 _TTS_PUMP_JOIN_TIMEOUT_SECONDS = 0.05
 _INTERRUPTED_TTS_PUMP_JOIN_TIMEOUT_SECONDS = 0.01
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class _TTSChunkPump:
@@ -100,7 +103,7 @@ class _TTSChunkPump:
             try:
                 close()
             except Exception:
-                pass
+                _LOGGER.warning("Streaming speech output failed to close the live TTS stream.", exc_info=True)
 
     def join(self, *, timeout_s: float | None = None) -> bool:
         """Wait briefly for the pump thread and report whether it stopped."""
@@ -172,7 +175,7 @@ class _TTSChunkPump:
                 try:
                     close()
                 except Exception:
-                    pass
+                    _LOGGER.warning("Streaming speech output failed to close the finished TTS stream.", exc_info=True)
             self._done.set()
             self._queue.put(_QUEUE_SENTINEL)
             self._trace("tts_chunk_pump_finished", has_error=self._error is not None)
@@ -183,6 +186,7 @@ class _TTSChunkPump:
         try:
             self._trace_event(msg, details)
         except Exception:
+            _LOGGER.warning("Streaming speech-output trace sink failed for %s.", msg, exc_info=True)
             return
 
 
@@ -503,6 +507,11 @@ class InterruptibleSpeechOutput:
         try:
             self._trace_event(msg, details)
         except Exception:
+            _LOGGER.warning(
+                "Speech output trace callback failed for %s.",
+                msg,
+                exc_info=True,
+            )
             return
 
     def _pump_join_timeout(self, item: _PlaybackItem) -> float:
@@ -515,6 +524,10 @@ class InterruptibleSpeechOutput:
                 if bool(self.should_stop()):
                     return _INTERRUPTED_TTS_PUMP_JOIN_TIMEOUT_SECONDS
             except Exception:
+                _LOGGER.warning(
+                    "Speech output should_stop callback failed; using interrupted join timeout.",
+                    exc_info=True,
+                )
                 return _INTERRUPTED_TTS_PUMP_JOIN_TIMEOUT_SECONDS
         return _TTS_PUMP_JOIN_TIMEOUT_SECONDS
 

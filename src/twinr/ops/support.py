@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 import json
+import logging
 import os
 import re
 import stat
@@ -43,6 +44,8 @@ _SECRET_MARKERS = (
 _MAX_EVENT_LIMIT = 1000  # AUDIT-FIX(#5): Clamp user-supplied limits to protect RPi resources.
 _MAX_SELF_TEST_ARTIFACTS = 4
 _MAX_SELF_TEST_ARTIFACT_BYTES = 5 * 1024 * 1024  # AUDIT-FIX(#10): Skip oversized artifacts that could bloat the bundle.
+
+_LOGGER = logging.getLogger(__name__)
 
 _RUNTIME_SNAPSHOT_DROP_KEYS = {
     "user_voice_status",
@@ -266,7 +269,10 @@ def build_support_bundle(
                 data={"bundle_name": bundle_name, "file_count": len(includes)},
             )
         except Exception:
-            pass  # AUDIT-FIX(#7): Telemetry logging is best-effort and must not convert a successful bundle build into an exception.
+            _LOGGER.warning(
+                "Support bundle telemetry append failed after bundle creation.",
+                exc_info=True,
+            )  # AUDIT-FIX(#7): Telemetry logging is best-effort and must not convert a successful bundle build into an exception.
 
     return SupportBundleInfo(
         bundle_name=bundle_name,

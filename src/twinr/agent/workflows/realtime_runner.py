@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-from difflib import SequenceMatcher
+from hashlib import sha1
 from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -39,7 +39,6 @@ from twinr.hardware.audio import (
     SilenceDetectedRecorder,
     SpeechCaptureResult,
     WaveAudioPlayer,
-    pcm16_duration_ms,
     pcm16_to_wav_bytes,
 )
 from twinr.hardware.buttons import ButtonAction, configured_button_monitor
@@ -63,6 +62,8 @@ from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, Play
 from twinr.agent.workflows.print_lane import PrintLaneRequest, TwinrPrintLane
 from twinr.agent.workflows.realtime_runtime.support import TwinrRealtimeSupportMixin, _default_emit
 from twinr.agent.workflows.realtime_runner_tools import TwinrRealtimeToolDelegatesMixin
+from twinr.agent.workflows.streaming_transcript_verifier import StreamingTranscriptVerifierRuntime
+from twinr.agent.workflows.turn_guidance import TurnGuidanceRuntime
 
 
 class TwinrRealtimeHardwareLoop(
@@ -194,6 +195,8 @@ class TwinrRealtimeHardwareLoop(
             tool_handlers=bind_realtime_tool_handlers(self.tool_executor),
         )
         self.emit = emit or _default_emit
+        self.turn_guidance_runtime = TurnGuidanceRuntime(self)
+        self.streaming_transcript_verifier_runtime = StreamingTranscriptVerifierRuntime(self)
         self.sleep = sleep
         self.error_reset_seconds = error_reset_seconds
         self._last_status: str | None = None
@@ -260,7 +263,12 @@ class TwinrRealtimeHardwareLoop(
                 try:
                     emit(f"record_event_failed={type(exc).__name__}")  # AUDIT-FIX(#5): Telemetry persistence is secondary and must never abort user-facing flows.
                 except Exception:
-                    pass
+                    self._trace_event(
+                        "record_event_emit_failed",
+                        kind="error",
+                        level="ERROR",
+                        details={"error_type": type(exc).__name__},
+                    )
             return None
 
     def _record_usage(self, *args, **kwargs):
@@ -272,7 +280,12 @@ class TwinrRealtimeHardwareLoop(
                 try:
                     emit(f"record_usage_failed={type(exc).__name__}")  # AUDIT-FIX(#5): Usage accounting failures must degrade quietly instead of surfacing as interaction errors.
                 except Exception:
-                    pass
+                    self._trace_event(
+                        "record_usage_emit_failed",
+                        kind="error",
+                        level="ERROR",
+                        details={"error_type": type(exc).__name__},
+                    )
             return None
 
     def run(self, *, duration_s: float | None = None, poll_timeout: float = 0.25) -> int:
@@ -800,36 +813,24 @@ class TwinrRealtimeHardwareLoop(
         )
 
     def _turn_controller_conversation(self) -> tuple[tuple[str, str], ...]:
-        max_turns = max(0, int(self.config.turn_controller_context_turns))
-        conversation = self.runtime.conversation_context()
-        if max_turns <= 0 or len(conversation) <= max_turns:
-            return conversation
-        return conversation[-max_turns:]
+        """Return the bounded turn-controller conversation from the guidance runtime."""
+
+        return self.turn_guidance_runtime.controller_conversation()
 
     def _build_streaming_turn_controller(self) -> StreamingTurnController | None:
-        if self.turn_decision_evaluator is None or not self.config.turn_controller_enabled:
-            return None
-        return StreamingTurnController(
-            config=self.config,
-            evaluator=self.turn_decision_evaluator,
-            conversation_factory=self._turn_controller_conversation,
-            emit=self.emit,
-        )
+        """Build the turn controller through the extracted guidance runtime."""
+
+        return self.turn_guidance_runtime.build_streaming_turn_controller()
 
     def _turn_guidance_messages(self, turn_label: str | None) -> tuple[tuple[str, str], ...]:
-        normalized = str(turn_label or "").strip().lower()
-        if normalized != "backchannel":
-            return ()
-        return (
-            (
-                "system",
-                "The current user turn is a short backchannel or direct answer to the latest assistant prompt. "
-                "If you answer, keep it very short, direct, and do not restate the whole context.",
-            ),
-        )
+        """Return label-specific guidance through the extracted guidance runtime."""
+
+        return self.turn_guidance_runtime.guidance_messages(turn_label)
 
     def _conversation_context_for_turn_label(self, turn_label: str | None) -> tuple[tuple[str, str], ...]:
-        return self.runtime.provider_conversation_context() + self._turn_guidance_messages(turn_label)
+        """Return guided conversation context through the extracted guidance runtime."""
+
+        return self.turn_guidance_runtime.conversation_context_for_turn_label(turn_label)
 
     def _interrupt_stt_provider(self) -> SpeechToTextProvider | None:
         provider = self.turn_stt_provider or self.stt_provider
@@ -850,12 +851,12 @@ class TwinrRealtimeHardwareLoop(
         partial_text: str,
         controller: StreamingTurnController | None,
     ) -> str:
-        transcript_hint = partial_text.strip()
-        if controller is not None:
-            controller_hint = controller.latest_transcript()
-            if controller_hint:
-                transcript_hint = controller_hint.strip()
-        return transcript_hint
+        """Return the current best transcript hint from the verifier runtime."""
+
+        return self.streaming_transcript_verifier_runtime.best_effort_streaming_transcript_hint(
+            partial_text=partial_text,
+            controller=controller,
+        )
 
     def _maybe_recover_low_evidence_streaming_transcript(
         self,
@@ -866,70 +867,25 @@ class TwinrRealtimeHardwareLoop(
         saw_interim: bool,
         capture_ms: int,
     ) -> str:
-        """Retry short or empty streaming transcripts against the full capture.
+        """Recover weak streaming transcripts through the verifier runtime."""
 
-        Streaming endpoint events can occasionally mark a turn complete before a
-        usable transcript arrives. In that case we preserve the captured audio
-        and run one bounded file-style transcription pass instead of surfacing an
-        empty turn back to the workflow.
-        """
-
-        cleaned = str(transcript or "").strip()
-        if capture_result is None or not capture_result.pcm_bytes:
-            return cleaned
-
-        if cleaned:
-            word_count = len(cleaned.split())
-            min_chars = max(8, int(self.config.streaming_early_transcript_min_chars))
-            looks_complete = len(cleaned) >= min_chars and word_count >= 3
-            if looks_complete:
-                return cleaned
-            if saw_interim and capture_ms < 1200 and word_count >= 2:
-                return cleaned
-        else:
-            word_count = 0
-
-        try:
-            audio_bytes = pcm16_to_wav_bytes(
-                capture_result.pcm_bytes,
-                sample_rate=self._recorder_sample_rate(),
-                channels=self.config.audio_channels,
-            )
-            recovered = stt_provider.transcribe(
-                audio_bytes,
-                filename="twinr-streaming-recover.wav",
-                content_type="audio/wav",
-                language=self.config.deepgram_stt_language,
-            ).strip()
-        except Exception as exc:
-            self.emit(f"stt_streaming_recover_failed={type(exc).__name__}")
-            return cleaned
-
-        if not recovered:
-            return cleaned
-        if not cleaned:
-            self.emit("stt_streaming_recovered_via_batch=true")
-            return recovered
-        recovered_words = len(recovered.split())
-        if len(recovered) <= len(cleaned) and recovered_words <= word_count:
-            return cleaned
-
-        self.emit("stt_streaming_recovered_via_batch=true")
-        return recovered
+        return self.streaming_transcript_verifier_runtime.maybe_recover_low_evidence_streaming_transcript(
+            stt_provider=stt_provider,
+            capture_result=capture_result,
+            transcript=transcript,
+            saw_interim=saw_interim,
+            capture_ms=capture_ms,
+        )
 
     def _captured_audio_duration_ms(
         self,
         *,
         capture_result: SpeechCaptureResult | None,
     ) -> int:
-        """Measure real captured speech duration instead of wall-clock listen time."""
+        """Return the PCM-derived audio duration through the verifier runtime."""
 
-        if capture_result is None or not capture_result.pcm_bytes:
-            return 0
-        return pcm16_duration_ms(
-            capture_result.pcm_bytes,
-            sample_rate=self._recorder_sample_rate(),
-            channels=self.config.audio_channels,
+        return self.streaming_transcript_verifier_runtime.captured_audio_duration_ms(
+            capture_result=capture_result,
         )
 
     def _should_verify_streaming_transcript(
@@ -942,56 +898,27 @@ class TwinrRealtimeHardwareLoop(
         saw_utterance_end: bool,
         confidence: float | None,
     ) -> bool:
-        verifier = getattr(self, "transcript_verifier_provider", None)
-        if verifier is None or not callable(getattr(verifier, "transcribe", None)):
-            return False
-        if capture_result is None or not capture_result.pcm_bytes:
-            return False
-        cleaned = str(transcript or "").strip()
-        effective_audio_ms = self._captured_audio_duration_ms(capture_result=capture_result) or max(0, int(capture_ms))
-        if effective_audio_ms > max(1000, int(self.config.streaming_transcript_verifier_max_capture_ms)):
-            return False
-        if not cleaned:
-            return True
-        word_count = len(cleaned.split())
-        if (
-            word_count > max(1, int(self.config.streaming_transcript_verifier_max_words))
-            and len(cleaned) > max(8, int(self.config.streaming_transcript_verifier_max_chars))
-        ):
-            return False
-        if saw_utterance_end and not saw_speech_final:
-            return True
-        if confidence is None:
-            return word_count <= max(1, int(self.config.streaming_transcript_verifier_max_words))
-        return confidence < float(self.config.streaming_transcript_verifier_min_confidence)
+        """Return the verifier-runtime gate result as a compatibility boolean."""
+
+        return self.streaming_transcript_verifier_runtime.verification_gate(
+            transcript=transcript,
+            capture_result=capture_result,
+            capture_ms=capture_ms,
+            saw_speech_final=saw_speech_final,
+            saw_utterance_end=saw_utterance_end,
+            confidence=confidence,
+        ).should_verify
 
     def _build_streaming_transcript_verifier_prompt(
         self,
         *,
         transcript_hint: str,
     ) -> str:
-        conversation = self.runtime.supervisor_provider_conversation_context()
-        tail_lines: list[str] = []
-        for role, content in conversation[-2:]:
-            role_text = str(role or "").strip()
-            content_text = str(content or "").strip()
-            if not role_text or not content_text:
-                continue
-            tail_lines.append(f"{role_text}: {content_text}")
-        context_block = "\n".join(tail_lines).strip()
-        prompt_lines = [
-            "Die Audiodatei enthält eine kurze deutsche Äußerung an einen Sprachassistenten.",
-            "Transkribiere wörtlich auf Deutsch.",
-            "Behalte umgangssprachliche Kurzformen wie 'geht's', 'hab's' oder 'wie wär's' korrekt bei.",
-            "Rate nicht. Wenn ein Streaming-Hinweis unten steht, nutze ihn nur als schwachen Kontext, nicht als Wahrheit.",
-        ]
-        if context_block:
-            prompt_lines.append("Letzter Gesprächskontext:")
-            prompt_lines.append(context_block)
-        normalized_hint = str(transcript_hint or "").strip()
-        if normalized_hint:
-            prompt_lines.append(f"Streaming-Hinweis: {normalized_hint}")
-        return "\n".join(prompt_lines)
+        """Build the verifier prompt through the extracted verifier runtime."""
+
+        return self.streaming_transcript_verifier_runtime.build_streaming_transcript_verifier_prompt(
+            transcript_hint=transcript_hint,
+        )
 
     def _maybe_verify_streaming_transcript(
         self,
@@ -1003,59 +930,16 @@ class TwinrRealtimeHardwareLoop(
         saw_utterance_end: bool,
         confidence: float | None,
     ) -> str:
-        if not self._should_verify_streaming_transcript(
-            transcript=transcript,
+        """Run the verifier through the extracted verifier runtime."""
+
+        return self.streaming_transcript_verifier_runtime.maybe_verify_streaming_transcript(
             capture_result=capture_result,
+            transcript=transcript,
             capture_ms=capture_ms,
             saw_speech_final=saw_speech_final,
             saw_utterance_end=saw_utterance_end,
             confidence=confidence,
-        ):
-            return str(transcript or "").strip()
-
-        verifier = getattr(self, "transcript_verifier_provider", None)
-        if verifier is None:
-            return str(transcript or "").strip()
-
-        try:
-            audio_bytes = pcm16_to_wav_bytes(
-                capture_result.pcm_bytes,
-                sample_rate=self._recorder_sample_rate(),
-                channels=self.config.audio_channels,
-            )
-            verified = verifier.transcribe(
-                audio_bytes,
-                filename="twinr-streaming-verify.wav",
-                content_type="audio/wav",
-                language=self.config.deepgram_stt_language,
-                prompt=self._build_streaming_transcript_verifier_prompt(
-                    transcript_hint=transcript,
-                ),
-            ).strip()
-        except Exception as exc:
-            self.emit(f"stt_streaming_verify_failed={type(exc).__name__}")
-            return str(transcript or "").strip()
-
-        cleaned = str(transcript or "").strip()
-        if not verified:
-            return cleaned
-        if not cleaned:
-            self.emit("stt_streaming_verified_via_openai=true")
-            return verified
-        if _normalize_turn_text(verified) == _normalize_turn_text(cleaned):
-            self.emit("stt_streaming_verified_via_openai=true")
-            return verified
-
-        similarity = SequenceMatcher(
-            None,
-            _normalize_turn_text(cleaned),
-            _normalize_turn_text(verified),
-        ).ratio()
-        if similarity < 0.9 or len(verified) > len(cleaned):
-            self.emit("stt_streaming_verifier_disagreement=true")
-            self.emit("stt_streaming_verified_via_openai=true")
-            return verified
-        return cleaned
+        )
 
     def _on_streaming_stt_interim(self, text: str) -> None:
         del text
@@ -1316,7 +1200,16 @@ class TwinrRealtimeHardwareLoop(
             self._trace_event(
                 "turn_controller_transcript_ready",
                 kind="observation",
-                details={"transcript_len": len(transcript), "turn_label": current_turn_label()},
+                details={
+                    "turn_label": current_turn_label(),
+                    "transcript_chars": len(transcript),
+                    "transcript_words": len(transcript.split()) if transcript else 0,
+                    "transcript_sha12": (
+                        sha1(transcript.encode("utf-8")).hexdigest()[:12]
+                        if transcript
+                        else None
+                    ),
+                },
                 kpi={"capture_ms": capture_ms, "stt_ms": stt_ms},
             )
             return capture_result, transcript, capture_ms, stt_ms, current_turn_label()
@@ -1650,8 +1543,13 @@ class TwinrRealtimeHardwareLoop(
                     if callable(on_interrupt):
                         try:
                             on_interrupt()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            self._trace_event(
+                                "interrupt_callback_failed",
+                                kind="error",
+                                level="ERROR",
+                                details={"error_type": type(exc).__name__},
+                            )
                     self.emit("user_interrupt_detected=true")
                     return
                 if stop_event.wait(poll_s):

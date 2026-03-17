@@ -144,9 +144,13 @@ class RequestStructuredJsonObjectTests(unittest.TestCase):
 
         self.assertIn("status=incomplete", str(ctx.exception))
         self.assertIn("incomplete_reason=max_output_tokens", str(ctx.exception))
+        self.assertIn(
+            "attempted_output_token_limits=[512, 1024, 2048, 4096]",
+            str(ctx.exception),
+        )
         self.assertEqual(
             [call["max_output_tokens"] for call in backend.responses_api.calls],
-            [512, 1024, 2048],
+            [512, 1024, 2048, 4096],
         )
 
 

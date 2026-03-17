@@ -1045,6 +1045,55 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("timing_stt_ms=", "\n".join(lines))
         self.assertEqual(realtime_session.calls, [b"PCMINPUT"])
 
+    def test_turn_guidance_runtime_caps_controller_context_and_traces_gate(self) -> None:
+        config = TwinrConfig(
+            turn_controller_context_turns=2,
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+        )
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+        conversation = (
+            ("user", "eins"),
+            ("assistant", "zwei"),
+            ("user", "drei"),
+            ("assistant", "vier"),
+        )
+
+        with (
+            mock.patch.object(loop.runtime, "conversation_context", return_value=conversation),
+            mock.patch.object(loop, "_trace_event") as trace_event,
+        ):
+            selected = loop._turn_controller_conversation()
+
+        self.assertEqual(selected, conversation[-2:])
+        self.assertEqual(trace_event.call_count, 1)
+        self.assertEqual(trace_event.call_args.args[0], "turn_guidance_controller_context_gate")
+        self.assertEqual(trace_event.call_args.kwargs["details"]["available_turns"], 4)
+        self.assertEqual(trace_event.call_args.kwargs["details"]["selected_turns"], 2)
+        self.assertEqual(trace_event.call_args.kwargs["kpi"]["selected_turns"], 2)
+
+    def test_turn_guidance_runtime_traces_backchannel_context_gate(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        conversation = (("user", "Wie spät ist es?"), ("assistant", "Es ist kurz nach acht."))
+
+        with (
+            mock.patch.object(loop.runtime, "provider_conversation_context", return_value=conversation),
+            mock.patch.object(loop, "_trace_event") as trace_event,
+        ):
+            context = loop.turn_guidance_runtime.context_for_turn_label("backchannel")
+
+        self.assertEqual(context.turn_label, "backchannel")
+        self.assertEqual(context.available_context_turns, 2)
+        self.assertEqual(context.guidance_message_count, 1)
+        self.assertEqual(context.conversation[:-1], conversation)
+        self.assertEqual(context.conversation[-1][0], "system")
+        self.assertIn("short backchannel", context.conversation[-1][1])
+        self.assertEqual(trace_event.call_count, 1)
+        self.assertEqual(trace_event.call_args.args[0], "turn_guidance_context_gate")
+        self.assertEqual(trace_event.call_args.kwargs["details"]["guidance_message_count"], 1)
+        self.assertEqual(trace_event.call_args.kwargs["kpi"]["conversation_turns"], 3)
+
     def test_green_button_recovers_when_streaming_stt_hears_speech_before_local_threshold(self) -> None:
         config = TwinrConfig(
             turn_controller_enabled=True,
@@ -1159,6 +1208,75 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         assert conversation is not None
         self.assertTrue(any("short backchannel" in message for role, message in conversation if role == "system"))
 
+    def test_streaming_transcript_verifier_gate_opens_for_empty_short_audio(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+            streaming_transcript_verifier_enabled=True,
+            streaming_transcript_verifier_max_capture_ms=6500,
+        )
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=config,
+        )
+        loop.transcript_verifier_provider = FakePrintBackend()
+
+        with mock.patch.object(loop, "_trace_event") as trace_event:
+            decision = loop.streaming_transcript_verifier_runtime.verification_gate(
+                capture_result=SpeechCaptureResult(
+                    pcm_bytes=_voice_sample_pcm_bytes(duration_s=2.1),
+                    speech_started_after_ms=10128,
+                    resumed_after_pause_count=0,
+                ),
+                transcript="",
+                capture_ms=12027,
+                saw_speech_final=True,
+                saw_utterance_end=False,
+                confidence=None,
+            )
+
+        self.assertTrue(decision.should_verify)
+        self.assertEqual(decision.reason, "empty_transcript")
+        self.assertEqual(trace_event.call_count, 1)
+        self.assertEqual(trace_event.call_args.args[0], "streaming_transcript_verifier_gate")
+        self.assertEqual(trace_event.call_args.kwargs["details"]["reason"], "empty_transcript")
+        self.assertEqual(trace_event.call_args.kwargs["kpi"]["effective_audio_ms"], decision.effective_audio_ms)
+
+    def test_streaming_transcript_verifier_gate_closes_for_long_audio(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+            streaming_transcript_verifier_enabled=True,
+            streaming_transcript_verifier_max_capture_ms=6500,
+        )
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=config,
+        )
+        loop.transcript_verifier_provider = FakePrintBackend()
+
+        with mock.patch.object(loop, "_trace_event") as trace_event:
+            decision = loop.streaming_transcript_verifier_runtime.verification_gate(
+                capture_result=SpeechCaptureResult(
+                    pcm_bytes=_voice_sample_pcm_bytes(duration_s=7.0),
+                    speech_started_after_ms=1500,
+                    resumed_after_pause_count=0,
+                ),
+                transcript="",
+                capture_ms=12027,
+                saw_speech_final=True,
+                saw_utterance_end=False,
+                confidence=None,
+            )
+
+        self.assertFalse(decision.should_verify)
+        self.assertEqual(decision.reason, "capture_too_long")
+        self.assertGreater(decision.effective_audio_ms, 6500)
+        self.assertEqual(trace_event.call_count, 1)
+        self.assertEqual(trace_event.call_args.args[0], "streaming_transcript_verifier_gate")
+        self.assertEqual(trace_event.call_args.kwargs["details"]["reason"], "capture_too_long")
+        self.assertEqual(trace_event.call_args.kwargs["kpi"]["effective_audio_ms"], decision.effective_audio_ms)
+
     def test_streaming_transcript_verifier_recovers_empty_short_audio_after_late_start(self) -> None:
         config = TwinrConfig(
             openai_api_key="test-key",
@@ -1190,6 +1308,46 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(transcript, "Wie geht es dir heute?")
         self.assertEqual(len(verifier_provider.transcribe_calls), 1)
         self.assertIn("stt_streaming_verified_via_openai=true", lines)
+
+    def test_streaming_transcript_verifier_traces_selected_source_when_replacing_transcript(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+            streaming_transcript_verifier_enabled=True,
+            streaming_transcript_verifier_max_capture_ms=6500,
+        )
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=config,
+        )
+        verifier_provider = FakePrintBackend()
+        verifier_provider.transcribe_result = "Worüber haben wir heute gesprochen?"
+        loop.transcript_verifier_provider = verifier_provider
+
+        with mock.patch.object(loop, "_trace_event") as trace_event:
+            transcript = loop._maybe_verify_streaming_transcript(
+                capture_result=SpeechCaptureResult(
+                    pcm_bytes=_voice_sample_pcm_bytes(duration_s=2.1),
+                    speech_started_after_ms=1400,
+                    resumed_after_pause_count=0,
+                ),
+                transcript="wir heute",
+                capture_ms=2100,
+                saw_speech_final=True,
+                saw_utterance_end=False,
+                confidence=0.41,
+            )
+
+        self.assertEqual(transcript, "Worüber haben wir heute gesprochen?")
+        selected_events = [
+            call.kwargs["details"]
+            for call in trace_event.call_args_list
+            if call.args and call.args[0] == "streaming_transcript_verifier_selected"
+        ]
+        self.assertTrue(selected_events)
+        self.assertEqual(selected_events[-1]["selected_source"], "verifier")
+        self.assertEqual(selected_events[-1]["reason"], "verifier_more_informative")
+        self.assertTrue(selected_events[-1]["verified"]["present"])
 
     def test_streaming_transcript_verifier_skips_empty_long_audio(self) -> None:
         config = TwinrConfig(

@@ -586,6 +586,7 @@ class ChonkyDBRetrieveRequest:
     temporal_end: str | None = None
     client_request_id: str | None = None
     allowed_indexes: tuple[str, ...] | None = None
+    allowed_doc_ids: tuple[str, ...] | None = None
     extra: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
@@ -612,6 +613,7 @@ class ChonkyDBRetrieveRequest:
             raise ChonkyDBValidationError("temporal_start must be <= temporal_end")
         object.__setattr__(self, "client_request_id", _coerce_optional_str(self.client_request_id, field_name="client_request_id", empty_as_none=True))  # AUDIT-FIX(#5)
         object.__setattr__(self, "allowed_indexes", _coerce_optional_str_tuple(self.allowed_indexes, field_name="allowed_indexes"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "allowed_doc_ids", _coerce_optional_str_tuple(self.allowed_doc_ids, field_name="allowed_doc_ids"))  # AUDIT-FIX(#5)
         object.__setattr__(self, "extra", _normalize_extra_mapping(self.extra) if self.extra is not None else None)  # AUDIT-FIX(#1)
 
     def to_payload(self) -> JsonDict:
@@ -632,6 +634,7 @@ class ChonkyDBRetrieveRequest:
                 "temporal_end": self.temporal_end,
                 "client_request_id": self.client_request_id,
                 "allowed_indexes": list(self.allowed_indexes) if self.allowed_indexes is not None else None,
+                "allowed_doc_ids": list(self.allowed_doc_ids) if self.allowed_doc_ids is not None else None,
             }
         )
         return _merge_extra(payload, self.extra, reserved_keys=_reserved_payload_keys(self))
