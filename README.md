@@ -44,7 +44,7 @@ So if you are a builder, UX person, maker… and want to join add me on LinkedIn
 
 1 x Power for the Termal-Printer (9-24V/2,5A)
 
-1 x Mic/Speaker (I used a old Jabra-Device)
+1 x Mic/Speaker (I used an old Jabra-Device)
 
 1 x e-Ink Display (I used Waveshare 4.2 Inch)
 
