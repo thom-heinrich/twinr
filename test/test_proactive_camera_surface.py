@@ -10,7 +10,10 @@ from twinr.proactive.social.camera_surface import ProactiveCameraSurface, Proact
 from twinr.proactive.social.engine import (
     SocialAudioObservation,
     SocialBodyPose,
+    SocialDetectedObject,
+    SocialGestureEvent,
     SocialPersonZone,
+    SocialSpatialBox,
     SocialTriggerEngine,
     SocialVisionObservation,
 )
@@ -55,7 +58,11 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
 
         self.assertEqual(
             first.event_names,
-            ("camera.person_visible", "camera.hand_or_object_near_camera"),
+            (
+                "camera.person_visible",
+                "camera.hand_or_object_near_camera",
+                "camera.attention_window_opened",
+            ),
         )
         self.assertTrue(first.snapshot.person_visible)
         self.assertEqual(first.snapshot.person_count, 2)
@@ -278,6 +285,166 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
 
         self.assertEqual(returned.event_names, ("camera.person_visible",))
         self.assertFalse(returned.snapshot.person_returned_after_absence)
+
+    def test_surface_projects_health_anchor_attention_gesture_and_object_signals(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                person_visible_event_cooldown_s=0.0,
+                hand_or_object_near_camera_event_cooldown_s=0.0,
+                showing_intent_event_cooldown_s=0.0,
+                gesture_event_cooldown_s=0.0,
+                object_on_samples=1,
+            )
+        )
+
+        update = surface.observe(
+            inspected=True,
+            observed_at=10.0,
+            observation=SocialVisionObservation(
+                camera_online=True,
+                camera_ready=True,
+                camera_ai_ready=True,
+                last_camera_frame_at=9.5,
+                last_camera_health_change_at=9.0,
+                person_visible=True,
+                person_count=1,
+                primary_person_zone=SocialPersonZone.CENTER,
+                primary_person_box=SocialSpatialBox(top=0.1, left=0.2, bottom=0.8, right=0.7),
+                looking_toward_device=True,
+                person_near_device=True,
+                engaged_with_device=True,
+                visual_attention_score=0.83,
+                body_pose=SocialBodyPose.SEATED,
+                pose_confidence=0.72,
+                hand_or_object_near_camera=True,
+                showing_intent_likely=True,
+                gesture_event=SocialGestureEvent.STOP,
+                gesture_confidence=0.75,
+                objects=(
+                    SocialDetectedObject(
+                        label="cup",
+                        confidence=0.91,
+                        zone=SocialPersonZone.RIGHT,
+                        stable=False,
+                        box=SocialSpatialBox(top=0.3, left=0.6, bottom=0.7, right=0.9),
+                    ),
+                ),
+            ),
+        )
+
+        self.assertTrue(update.snapshot.camera_ready)
+        self.assertTrue(update.snapshot.camera_ai_ready)
+        self.assertEqual(update.snapshot.primary_person_zone, SocialPersonZone.CENTER)
+        self.assertAlmostEqual(update.snapshot.primary_person_center_x or 0.0, 0.45, places=3)
+        self.assertTrue(update.snapshot.person_near_device)
+        self.assertTrue(update.snapshot.engaged_with_device)
+        self.assertAlmostEqual(update.snapshot.visual_attention_score or 0.0, 0.83, places=3)
+        self.assertEqual(update.snapshot.body_pose, SocialBodyPose.SEATED)
+        self.assertAlmostEqual(update.snapshot.pose_confidence or 0.0, 0.72, places=3)
+        self.assertTrue(update.snapshot.showing_intent_likely)
+        self.assertEqual(update.snapshot.gesture_event, SocialGestureEvent.STOP)
+        self.assertEqual(len(update.snapshot.objects), 1)
+        self.assertTrue(update.snapshot.objects[0].stable)
+        self.assertEqual(
+            update.event_names,
+            (
+                "camera.person_visible",
+                "camera.hand_or_object_near_camera",
+                "camera.attention_window_opened",
+                "camera.showing_intent_started",
+                "camera.gesture_detected",
+                "camera.object_detected_stable",
+            ),
+        )
+
+    def test_surface_holds_health_and_stable_objects_through_brief_unknown_gap(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                object_on_samples=1,
+                secondary_unknown_hold_s=8.0,
+                person_visible_unknown_hold_s=8.0,
+                looking_toward_device_unknown_hold_s=8.0,
+                person_near_device_unknown_hold_s=8.0,
+                engaged_with_device_unknown_hold_s=8.0,
+                showing_intent_unknown_hold_s=8.0,
+                hand_or_object_near_camera_unknown_hold_s=8.0,
+                object_unknown_hold_s=8.0,
+            )
+        )
+
+        surface.observe(
+            inspected=True,
+            observed_at=0.0,
+            observation=SocialVisionObservation(
+                camera_online=True,
+                camera_ready=True,
+                camera_ai_ready=True,
+                person_visible=True,
+                person_count=1,
+                primary_person_zone=SocialPersonZone.LEFT,
+                primary_person_box=SocialSpatialBox(top=0.15, left=0.05, bottom=0.85, right=0.45),
+                looking_toward_device=True,
+                person_near_device=True,
+                engaged_with_device=True,
+                body_pose=SocialBodyPose.UPRIGHT,
+                hand_or_object_near_camera=True,
+                showing_intent_likely=True,
+                objects=(
+                    SocialDetectedObject(
+                        label="medication_box",
+                        confidence=0.88,
+                        zone=SocialPersonZone.CENTER,
+                        stable=False,
+                    ),
+                ),
+            ),
+        )
+
+        update = surface.observe(
+            inspected=False,
+            observed_at=6.0,
+            observation=SocialVisionObservation(),
+        )
+
+        self.assertTrue(update.snapshot.camera_ready)
+        self.assertTrue(update.snapshot.camera_ready_unknown)
+        self.assertTrue(update.snapshot.person_visible)
+        self.assertTrue(update.snapshot.person_visible_unknown)
+        self.assertTrue(update.snapshot.person_near_device)
+        self.assertTrue(update.snapshot.person_near_device_unknown)
+        self.assertTrue(update.snapshot.showing_intent_likely)
+        self.assertTrue(update.snapshot.showing_intent_likely_unknown)
+        self.assertEqual(len(update.snapshot.objects), 1)
+        self.assertTrue(update.snapshot.objects_unknown)
+        self.assertEqual(update.snapshot.objects[0].label, "medication_box")
+
+    def test_surface_tracks_person_appearance_and_disappearance_timestamps(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                person_visible_off_samples=1,
+                person_visible_event_cooldown_s=0.0,
+            )
+        )
+
+        appeared = surface.observe(
+            inspected=True,
+            observed_at=3.0,
+            observation=SocialVisionObservation(person_visible=True, body_pose=SocialBodyPose.UPRIGHT),
+        )
+        disappeared = surface.observe(
+            inspected=True,
+            observed_at=9.0,
+            observation=SocialVisionObservation(person_visible=False),
+        )
+        repeated_absence = surface.observe(
+            inspected=True,
+            observed_at=15.0,
+            observation=SocialVisionObservation(person_visible=False),
+        )
+
+        self.assertEqual(appeared.snapshot.person_appeared_at, 3.0)
+        self.assertEqual(disappeared.snapshot.person_disappeared_at, 9.0)
+        self.assertEqual(repeated_absence.snapshot.person_disappeared_at, 9.0)
 
 
 class ProactiveCameraCoordinatorIntegrationTest(unittest.TestCase):

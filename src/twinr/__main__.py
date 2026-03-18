@@ -160,6 +160,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compile and execute the minimum self_coding morning-briefing acceptance flow.",
     )
     parser.add_argument(
+        "--long-term-memory-live-acceptance",
+        action="store_true",
+        help="Run the live synthetic-memory acceptance matrix against the real OpenAI and ChonkyDB path.",
+    )
+    parser.add_argument(
         "--self-coding-acceptance-capture-only",
         action="store_true",
         help="Capture morning-briefing speech in memory instead of playing it aloud during acceptance.",
@@ -327,6 +332,28 @@ def _print_morning_briefing_acceptance_result(result: Any) -> None:
         print(f"self_coding_acceptance_last_summary={result.last_summary_text}")
 
 
+def _print_long_term_memory_live_acceptance_result(result: Any) -> None:
+    """Emit the live synthetic-memory acceptance result as key/value lines."""
+
+    passed_cases = getattr(result, "passed_cases", 0)
+    total_cases = getattr(result, "total_cases", 0)
+    print("long_term_memory_live_acceptance_case=synthetic_memory")
+    print(f"long_term_memory_live_acceptance_probe_id={getattr(result, 'probe_id', '')}")
+    print(f"long_term_memory_live_acceptance_status={getattr(result, 'status', 'unknown')}")
+    print(f"long_term_memory_live_acceptance_ready={str(bool(getattr(result, 'ready', False))).lower()}")
+    print(f"long_term_memory_live_acceptance_passed_cases={passed_cases}")
+    print(f"long_term_memory_live_acceptance_total_cases={total_cases}")
+    print(f"long_term_memory_live_acceptance_queue_before={getattr(result, 'queue_before_count', 0)}")
+    print(f"long_term_memory_live_acceptance_queue_after={getattr(result, 'queue_after_count', 0)}")
+    print(f"long_term_memory_live_acceptance_restart_queue={getattr(result, 'restart_queue_count', 0)}")
+    if getattr(result, "artifact_path", None):
+        print(f"long_term_memory_live_acceptance_artifact_path={result.artifact_path}")
+    if getattr(result, "report_path", None):
+        print(f"long_term_memory_live_acceptance_report_path={result.report_path}")
+    if getattr(result, "error_message", None):
+        print(f"long_term_memory_live_acceptance_error={result.error_message}")
+
+
 def _run_web_server(config: TwinrConfig, env_file: str | Path) -> int:
     """Start the local web control plane without bootstrapping the runtime."""
 
@@ -414,6 +441,14 @@ def main() -> int:
         )
         _print_morning_briefing_acceptance_result(result)
         return 0 if getattr(result, "delivery_delivered", False) else 1
+
+    if args.long_term_memory_live_acceptance:
+        _assert_pi_runtime_root(args.env_file, command_name="long-term-memory-live-acceptance")
+        from twinr.memory.longterm.evaluation.live_memory_acceptance import run_live_memory_acceptance
+
+        result = run_live_memory_acceptance(env_path=args.env_file)
+        _print_long_term_memory_live_acceptance_result(result)
+        return 0 if getattr(result, "ready", False) else 1
 
     if args.run_web:
         return _run_web_server(config, args.env_file)
@@ -619,17 +654,25 @@ def main() -> int:
             print(f"camera_input_format={capture.input_format or 'default'}")
 
         if args.proactive_observe_once:
-            if backend is None or camera is None:
-                raise RuntimeError("Proactive observation requires configured OpenAI and camera access")
-            from twinr.proactive import OpenAIVisionObservationProvider
+            provider_name = (getattr(config, "proactive_vision_provider", "local_first") or "local_first").strip().lower()
+            if provider_name == "openai":
+                if backend is None or camera is None:
+                    raise RuntimeError("OpenAI proactive observation requires configured OpenAI and camera access")
+                from twinr.proactive import OpenAIVisionObservationProvider
 
-            observer = OpenAIVisionObservationProvider(
-                backend=backend,
-                camera=camera,
-                camera_lock=Lock(),
-            )
+                observer = OpenAIVisionObservationProvider(
+                    backend=backend,
+                    camera=camera,
+                    camera_lock=Lock(),
+                )
+            else:
+                from twinr.proactive.social.local_camera_provider import LocalAICameraObservationProvider
+
+                observer = LocalAICameraObservationProvider.from_config(config)
             snapshot = observer.observe()
             print(f"proactive_person_visible={str(snapshot.observation.person_visible).lower()}")
+            print(f"proactive_camera_ready={str(snapshot.observation.camera_ready).lower()}")
+            print(f"proactive_camera_ai_ready={str(snapshot.observation.camera_ai_ready).lower()}")
             print(f"proactive_looking_toward_device={str(snapshot.observation.looking_toward_device).lower()}")
             print(f"proactive_body_pose={snapshot.observation.body_pose.value}")
             print(f"proactive_smiling={str(snapshot.observation.smiling).lower()}")
@@ -637,6 +680,8 @@ def main() -> int:
                 "proactive_hand_or_object_near_camera="
                 f"{str(snapshot.observation.hand_or_object_near_camera).lower()}"
             )
+            print(f"proactive_gesture_event={snapshot.observation.gesture_event.value}")
+            print(f"proactive_person_count={snapshot.observation.person_count}")
             if snapshot.response_id:
                 print(f"proactive_response_id={snapshot.response_id}")
             if snapshot.request_id:

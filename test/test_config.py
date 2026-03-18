@@ -133,6 +133,25 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_face_cue_path, "state/custom/face.json")
         self.assertEqual(config.display_face_cue_ttl_s, 7.5)
 
+    def test_from_env_reads_display_presentation_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_DISPLAY_PRESENTATION_PATH=state/custom/presentation.json",
+                        "TWINR_DISPLAY_PRESENTATION_TTL_S=18.0",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_presentation_path, "state/custom/presentation.json")
+        self.assertEqual(config.display_presentation_ttl_s, 18.0)
+
     def test_reads_openai_button_and_printer_settings_from_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"

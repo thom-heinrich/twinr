@@ -21,12 +21,15 @@ import time
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware import GpioPirMonitor, V4L2StillCamera, configured_pir_monitor
 from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioSampler, pcm16_to_wav_bytes
+from twinr.hardware.respeaker import config_targets_respeaker
+from twinr.hardware.respeaker.signal_provider import ReSpeakerSignalProvider
 from twinr.ops.paths import resolve_ops_paths_for_config
 from twinr.providers.openai import OpenAIBackend
 
 from ..social.camera_surface import ProactiveCameraSnapshot, ProactiveCameraSurface, ProactiveCameraSurfaceUpdate
 from ..social.engine import SocialAudioObservation, SocialObservation, SocialTriggerDecision, SocialTriggerEngine, SocialVisionObservation
-from ..social.observers import AmbientAudioObservationProvider, NullAudioObservationProvider, OpenAIVisionObservationProvider
+from ..social.local_camera_provider import LocalAICameraObservationProvider
+from ..social.observers import AmbientAudioObservationProvider, NullAudioObservationProvider, OpenAIVisionObservationProvider, ReSpeakerAudioObservationProvider
 from ..social.vision_review import (
     OpenAIProactiveVisionReviewer,
     ProactiveVisionFrameBuffer,
@@ -132,6 +135,22 @@ def _normalize_text_tuple(values: Any) -> tuple[str, ...]:
         if text:
             normalized.append(text)
     return tuple(normalized)
+
+
+def _round_optional_seconds(value: float | None) -> float | None:
+    """Round one optional duration to milliseconds for ops-safe payloads."""
+
+    if value is None:
+        return None
+    return round(max(0.0, float(value)), 3)
+
+
+def _format_firmware_version(version: tuple[int, int, int] | None) -> str | None:
+    """Format one optional firmware tuple for ops/event payloads."""
+
+    if version is None:
+        return None
+    return ".".join(str(int(part)) for part in version)
 
 
 # AUDIT-FIX(#7): Refuse obviously unsafe capture directories and require the final path to stay under artifacts_root.
@@ -1156,6 +1175,11 @@ class ProactiveCoordinator:
             observation.vision.hand_or_object_near_camera,
             observation.audio.speech_detected,
             observation.audio.distress_detected,
+            observation.audio.device_runtime_mode,
+            observation.audio.host_control_ready,
+            observation.audio.transport_reason,
+            observation.audio.signal_source,
+            observation.audio.mute_active,
             None if presence_snapshot is None else presence_snapshot.armed,
             None if presence_snapshot is None else presence_snapshot.reason,
             presence_session_id,
@@ -1177,6 +1201,14 @@ class ProactiveCoordinator:
             "hand_or_object_near_camera": observation.vision.hand_or_object_near_camera,
             "speech_detected": observation.audio.speech_detected,
             "distress_detected": observation.audio.distress_detected,
+            "audio_room_quiet": observation.audio.room_quiet,
+            "audio_recent_speech_age_s": _round_optional_seconds(observation.audio.recent_speech_age_s),
+            "audio_azimuth_deg": observation.audio.azimuth_deg,
+            "audio_signal_source": observation.audio.signal_source,
+            "audio_device_runtime_mode": observation.audio.device_runtime_mode,
+            "audio_host_control_ready": observation.audio.host_control_ready,
+            "audio_transport_reason": observation.audio.transport_reason,
+            "audio_mute_active": observation.audio.mute_active,
         }
         if presence_snapshot is not None:
             data.update(
@@ -1202,6 +1234,14 @@ class ProactiveCoordinator:
                     "audio_active_ratio": audio_snapshot.sample.active_ratio,
                     "audio_active_chunks": audio_snapshot.sample.active_chunk_count,
                     "audio_chunk_count": audio_snapshot.sample.chunk_count,
+                }
+            )
+        if audio_snapshot is not None and audio_snapshot.signal_snapshot is not None:
+            data.update(
+                {
+                    "audio_requires_elevated_permissions": audio_snapshot.signal_snapshot.requires_elevated_permissions,
+                    "audio_firmware_version": _format_firmware_version(audio_snapshot.signal_snapshot.firmware_version),
+                    "audio_gpo_logic_levels": audio_snapshot.signal_snapshot.gpo_logic_levels,
                 }
             )
         top_evaluation = self.engine.best_evaluation
@@ -1575,6 +1615,16 @@ class ProactiveCoordinator:
                 "quiet": quiet,
                 "quiet_for_s": round(self._duration_since(self._quiet_since, now), 3),
                 "distress_detected": audio.distress_detected is True,
+                "room_quiet": audio.room_quiet,
+                "recent_speech_age_s": _round_optional_seconds(audio.recent_speech_age_s),
+                "signal_source": audio.signal_source,
+            },
+            "respeaker": {
+                "runtime_mode": audio.device_runtime_mode,
+                "host_control_ready": audio.host_control_ready,
+                "transport_reason": audio.transport_reason,
+                "azimuth_deg": audio.azimuth_deg,
+                "mute_active": audio.mute_active,
             },
         }
 
@@ -2005,14 +2055,63 @@ def build_default_proactive_monitor(
                 )
                 audio_observer = NullAudioObservationProvider()
 
+    respeaker_targeted = config_targets_respeaker(
+        getattr(config, "audio_input_device", None),
+        getattr(config, "proactive_audio_input_device", None),
+    )
+    if respeaker_targeted and (config.proactive_audio_enabled or config.wakeword_enabled):
+        try:
+            signal_provider = ReSpeakerSignalProvider(sensor_window_ms=config.proactive_audio_sample_ms)
+            initial_signal = signal_provider.observe()
+            if not initial_signal.host_control_ready:
+                reason = initial_signal.transport_reason or "unknown_transport_state"
+                detail = (
+                    "ReSpeaker XVF3800 is configured for proactive/runtime audio, "
+                    f"but host-control signals are degraded at startup: {reason}."
+                )
+                if initial_signal.requires_elevated_permissions:
+                    detail += " USB permissions are likely missing for the runtime user."
+                _record_component_warning(
+                    runtime=runtime,
+                    emit=emit,
+                    reason="respeaker_signal_provider_degraded",
+                    detail=detail,
+                )
+            base_audio_observer = audio_observer
+            audio_observer = ReSpeakerAudioObservationProvider(
+                signal_provider=signal_provider,
+                fallback_observer=base_audio_observer,
+            )
+            previous_factory = audio_observer_fallback_factory
+            if previous_factory is not None:
+                def _fallback_respeaker_audio_observer_factory() -> Any:
+                    fallback_observer = previous_factory()
+                    return ReSpeakerAudioObservationProvider(
+                        signal_provider=signal_provider,
+                        fallback_observer=fallback_observer,
+                    )
+
+                audio_observer_fallback_factory = _fallback_respeaker_audio_observer_factory
+        except Exception as exc:
+            _record_component_warning(
+                runtime=runtime,
+                emit=emit,
+                reason="respeaker_signal_provider_init_failed",
+                detail=f"ReSpeaker signal-provider initialization failed: {_exception_text(exc)}",
+            )
+
     vision_observer = None
     if config.proactive_enabled:
         try:
-            vision_observer = OpenAIVisionObservationProvider(
-                backend=backend,
-                camera=camera,
-                camera_lock=camera_lock,
-            )
+            provider_name = (getattr(config, "proactive_vision_provider", "local_first") or "local_first").strip().lower()
+            if provider_name == "openai":
+                vision_observer = OpenAIVisionObservationProvider(
+                    backend=backend,
+                    camera=camera,
+                    camera_lock=camera_lock,
+                )
+            else:
+                vision_observer = LocalAICameraObservationProvider.from_config(config)
         except Exception as exc:
             _record_component_warning(
                 runtime=runtime,

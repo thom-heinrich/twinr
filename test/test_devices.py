@@ -11,10 +11,85 @@ from twinr.ops.devices import collect_device_overview
 from twinr.ops.events import TwinrOpsEventStore
 
 
+def _fake_respeaker_snapshot(
+    *,
+    capture_ready: bool,
+    usb_visible: bool,
+    host_control_ready: bool,
+    transport_reason: str | None = None,
+    requires_elevated_permissions: bool = False,
+):
+    capture_device = (
+        type("Capture", (), {"hw_identifier": "hw:CARD=Array,DEV=0", "card_label": "reSpeaker XVF3800 4-Mic Array"})()
+        if capture_ready
+        else None
+    )
+    usb_device = (
+        type("Usb", (), {"description": "Seeed Technology Co., Ltd. reSpeaker XVF3800 4-Mic Array"})()
+        if usb_visible
+        else None
+    )
+    probe = type(
+        "FakeProbe",
+        (),
+        {
+            "capture_ready": capture_ready,
+            "capture_device": capture_device,
+            "usb_visible": usb_visible,
+            "usb_device": usb_device,
+            "arecord_available": True,
+            "lsusb_available": True,
+            "state": (
+                "audio_ready"
+                if capture_ready
+                else "usb_visible_no_capture"
+                if usb_visible
+                else "not_detected"
+            ),
+        },
+    )()
+    return type(
+        "FakeSnapshot",
+        (),
+        {
+            "probe": probe,
+            "host_control_ready": host_control_ready,
+            "transport": type(
+                "Transport",
+                (),
+                {
+                    "reason": transport_reason,
+                    "requires_elevated_permissions": requires_elevated_permissions,
+                },
+            )(),
+            "firmware_version": (2, 0, 7),
+            "direction": type(
+                "Direction",
+                (),
+                {
+                    "doa_degrees": 277,
+                    "speech_detected": True,
+                    "room_quiet": False,
+                    "beam_speech_energies": (0.1, 0.2, 0.0, 0.0),
+                },
+            )(),
+            "mute": type(
+                "Mute",
+                (),
+                {
+                    "mute_active": None,
+                    "gpo_logic_levels": (0, 0, 0, 1, 0),
+                },
+            )(),
+        },
+    )()
+
+
 class DeviceOverviewTests(unittest.TestCase):
     def test_collect_device_overview_reports_unknown_printer_paper_status(self) -> None:
-        def fake_run(command, *, capture_output: bool, text: bool, check: bool, timeout: float):
-            if command[:3] == ["lpstat", "-l", "-p"]:
+        def fake_run(command, *, capture_output: bool, text: bool, check: bool, timeout: float, **_kwargs):
+            executable = Path(command[0]).name
+            if executable == "lpstat" and command[1:3] == ["-l", "-p"]:
                 return type(
                     "CompletedProcess",
                     (),
@@ -29,7 +104,7 @@ class DeviceOverviewTests(unittest.TestCase):
                         "stderr": "",
                     },
                 )()
-            if command[:2] == ["lpoptions", "-p"]:
+            if executable == "lpoptions" and command[1:2] == ["-p"]:
                 return type(
                     "CompletedProcess",
                     (),
@@ -43,7 +118,7 @@ class DeviceOverviewTests(unittest.TestCase):
                         "stderr": "",
                     },
                 )()
-            if command[:2] == ["arecord", "-l"]:
+            if executable == "arecord" and command[1:2] == ["-l"]:
                 return type(
                     "CompletedProcess",
                     (),
@@ -57,15 +132,11 @@ class DeviceOverviewTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            camera_path = root / "video0"
-            ffmpeg_path = root / "ffmpeg"
-            camera_path.write_text("", encoding="utf-8")
-            ffmpeg_path.write_text("", encoding="utf-8")
             config = TwinrConfig(
                 project_root=temp_dir,
                 printer_queue="Thermal_GP58",
-                camera_device=str(camera_path),
-                camera_ffmpeg_path=str(ffmpeg_path),
+                camera_device="/dev/null",
+                camera_ffmpeg_path="/bin/sh",
                 audio_input_device="default",
                 audio_output_device="default",
                 green_button_gpio=23,
@@ -108,6 +179,34 @@ class DeviceOverviewTests(unittest.TestCase):
             {fact.label: fact.value for fact in devices["pir"].facts}["Last motion seen"],
             "not recorded in recent ops events",
         )
+
+    def test_collect_device_overview_includes_respeaker_runtime_state(self) -> None:
+        fake_snapshot = _fake_respeaker_snapshot(
+            capture_ready=False,
+            usb_visible=True,
+            host_control_ready=False,
+            transport_reason="permission_denied_or_transport_blocked",
+            requires_elevated_permissions=True,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                audio_input_device="plughw:CARD=Array,DEV=0",
+                proactive_audio_enabled=True,
+                proactive_audio_input_device="plughw:CARD=Array,DEV=0",
+            )
+            with patch("twinr.ops.devices.capture_respeaker_primitive_snapshot", return_value=fake_snapshot):
+                overview = collect_device_overview(config, event_store=TwinrOpsEventStore(Path(temp_dir) / "events.jsonl"))
+
+        devices = {device.key: device for device in overview.devices}
+        self.assertIn("respeaker", devices)
+        self.assertEqual(devices["respeaker"].status, "warn")
+        facts = {fact.label: fact.value for fact in devices["respeaker"].facts}
+        self.assertEqual(facts["Probe state"], "usb_visible_no_capture")
+        self.assertEqual(facts["Host control"], "no")
+        self.assertEqual(facts["Transport reason"], "permission_denied_or_transport_blocked")
+        self.assertIn("reSpeaker XVF3800", facts["USB device"])
 
 
 if __name__ == "__main__":

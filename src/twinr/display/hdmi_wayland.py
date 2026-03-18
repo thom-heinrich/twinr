@@ -15,6 +15,7 @@ from twinr.display.hdmi_fbdev import (
     HdmiFramebufferDisplay,
 )
 from twinr.display.wayland_env import apply_wayland_environment
+from twinr.display.wayland_surface_host import HdmiWaylandSurfaceHost
 
 
 @dataclass(slots=True)
@@ -29,6 +30,7 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
     _qt_window: Any | None = field(default=None, init=False, repr=False)
     _qt_image_label: Any | None = field(default=None, init=False, repr=False)
     _qt_image_bytes: bytes | None = field(default=None, init=False, repr=False)
+    _surface_host: HdmiWaylandSurfaceHost | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.framebuffer_path = self.framebuffer_path.expanduser()
@@ -46,6 +48,7 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
             raise RuntimeError(f"HdmiWaylandDisplay does not support driver `{self.driver}`.")
         if self.rotation_degrees not in _SUPPORTED_ROTATIONS:
             raise RuntimeError("Display rotation must be one of 0, 90, 180, or 270 degrees.")
+        self._surface_host = HdmiWaylandSurfaceHost(emit=self.emit)
 
     @classmethod
     def from_config(
@@ -91,55 +94,53 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
         with self._lock:
             prepared = self._prepare_image(image)
             qt_core, qt_gui, qt_widgets = self._load_qt()
-            app, _window, image_label = self._ensure_window(qt_core, qt_widgets, prepared.size)
+            host = self._surface_host or HdmiWaylandSurfaceHost(emit=self.emit)
+            self._surface_host = host
             width, height = prepared.size
             self._qt_image_bytes = prepared.tobytes("raw", "RGBA")
-            qimage = qt_gui.QImage(
-                self._qt_image_bytes,
-                width,
-                height,
-                width * 4,
-                qt_gui.QImage.Format_RGBA8888,
+            socket_path = apply_wayland_environment(
+                self.wayland_display,
+                configured_runtime_dir=self.wayland_runtime_dir,
             )
-            pixmap = qt_gui.QPixmap.fromImage(qimage)
-            image_label.setPixmap(pixmap)
-            image_label.resize(width, height)
-            image_label.show()
-            if hasattr(app, "processEvents"):
-                app.processEvents()
+            host.show_raster_image(
+                qt_core=qt_core,
+                qt_gui=qt_gui,
+                qt_widgets=qt_widgets,
+                rgba_bytes=self._qt_image_bytes,
+                size=(width, height),
+                socket_path=socket_path,
+            )
+            self._qt_app = host.app
+            self._qt_window = host.window
+            self._qt_image_label = host.image_label
             self.tick()
 
     def tick(self) -> None:
         """Keep the Wayland event queue responsive between rerenders."""
 
         app = self._qt_app
-        if app is None:
+        if app is None and self._surface_host is None:
             return
         try:
-            app.processEvents()
+            if self._surface_host is not None:
+                self._surface_host.tick()
+            elif app is not None:
+                app.processEvents()
         except Exception:
             return
 
     def close(self) -> None:
         """Release the Wayland window cleanly."""
 
-        window = self._qt_window
-        if window is not None and hasattr(window, "close"):
-            try:
-                window.close()
-            except Exception:
-                pass
-        app = self._qt_app
-        if app is not None and hasattr(app, "processEvents"):
-            try:
-                app.processEvents()
-            except Exception:
-                pass
+        host = self._surface_host
+        if host is not None:
+            host.close()
         self._qt_modules = None
         self._qt_app = None
         self._qt_window = None
         self._qt_image_label = None
         self._qt_image_bytes = None
+        self._surface_host = None
         HdmiFramebufferDisplay.close(self)
 
     def _load_qt(self) -> tuple[Any, Any, Any]:
@@ -156,57 +157,3 @@ class HdmiWaylandDisplay(HdmiFramebufferDisplay):
             raise RuntimeError("PyQt5 is required for the hdmi_wayland display backend.") from exc
         self._qt_modules = (QtCore, QtGui, QtWidgets)
         return self._qt_modules
-
-    def _ensure_window(self, qt_core: Any, qt_widgets: Any, size: tuple[int, int]):
-        window = self._qt_window
-        current_size = tuple(int(part) for part in size)
-        image_label = self._qt_image_label
-        if window is not None and image_label is not None:
-            return (self._qt_app, window, image_label)
-
-        app = qt_widgets.QApplication.instance()
-        if app is None:
-            app = qt_widgets.QApplication([])
-            if hasattr(app, "setQuitOnLastWindowClosed"):
-                app.setQuitOnLastWindowClosed(False)
-
-        window = qt_widgets.QWidget()
-        window.setWindowTitle("TWINR")
-        flags = qt_core.Qt.Window | qt_core.Qt.FramelessWindowHint | qt_core.Qt.WindowStaysOnTopHint
-        if hasattr(window, "setWindowFlags"):
-            window.setWindowFlags(flags)
-        if hasattr(window, "setStyleSheet"):
-            window.setStyleSheet("background: rgb(10, 18, 32);")
-
-        image_label = qt_widgets.QLabel(window)
-        if hasattr(image_label, "setScaledContents"):
-            image_label.setScaledContents(True)
-        if hasattr(image_label, "setAlignment"):
-            image_label.setAlignment(qt_core.Qt.AlignCenter)
-        image_label.setGeometry(0, 0, current_size[0], current_size[1])
-        if hasattr(window, "resize"):
-            window.resize(current_size[0], current_size[1])
-        window.showFullScreen()
-        if hasattr(window, "raise_"):
-            window.raise_()
-        if hasattr(window, "activateWindow"):
-            window.activateWindow()
-
-        self._qt_app = app
-        self._qt_window = window
-        self._qt_image_label = image_label
-        socket_path = apply_wayland_environment(
-            self.wayland_display,
-            configured_runtime_dir=self.wayland_runtime_dir,
-        )
-        self._safe_emit(
-            " ".join(
-                (
-                    "display_wayland=ready",
-                    f"socket={socket_path}",
-                    f"size={current_size[0]}x{current_size[1]}",
-                    "toolkit=pyqt5",
-                )
-            )
-        )
-        return (app, window, image_label)

@@ -593,6 +593,66 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIn("Aprikosenmarmelade", tool_context.durable_context or "")
         self.assertIn('"slot_key": "preference:breakfast:jam"', tool_context.durable_context or "")
 
+    def test_provider_context_omits_off_topic_conflict_memory_for_control_query(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_recall_limit=3,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.query_rewriter = _StaticQueryRewriter(
+                {
+                    "Was ist ein Regenbogen?": "What is a rainbow?",
+                }
+            )
+            service.object_store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        details="Aeltere Vorliebe fuer das Fruehstueck.",
+                        source=self._source("turn:jam_old"),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        details="Neuere Vorliebe fuer das Fruehstueck.",
+                        source=self._source("turn:jam_new"),
+                        status="uncertain",
+                        confidence=0.95,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                    ),
+                ),
+                conflicts=(
+                    LongTermMemoryConflictV1(
+                        slot_key="preference:breakfast:jam",
+                        candidate_memory_id="fact:jam_preference_new",
+                        existing_memory_ids=("fact:jam_preference_old",),
+                        question="Welche Marmelade stimmt gerade?",
+                        reason="Widerspruechliche Marmeladenpraeferenzen liegen vor.",
+                    ),
+                ),
+                archived_objects=(),
+            )
+
+            context = service.build_provider_context("Was ist ein Regenbogen?")
+            service.shutdown()
+
+        self.assertIsNone(context.durable_context)
+        self.assertIsNone(context.conflict_context)
+
     def test_explicit_memory_and_profile_updates_route_through_service(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             personality_dir = Path(temp_dir) / "personality"

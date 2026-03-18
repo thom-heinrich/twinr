@@ -26,6 +26,62 @@ from twinr.ops import (
 from twinr.ops.locks import loop_instance_lock
 
 
+def _fake_respeaker_snapshot(
+    *,
+    capture_ready: bool,
+    usb_visible: bool,
+    host_control_ready: bool,
+    arecord_available: bool = True,
+    lsusb_available: bool = True,
+    transport_reason: str | None = None,
+    requires_elevated_permissions: bool = False,
+):
+    capture_device = (
+        SimpleNamespace(card_label="reSpeaker XVF3800 4-Mic Array")
+        if capture_ready
+        else None
+    )
+    usb_device = (
+        SimpleNamespace(description="Seeed Technology Co., Ltd. reSpeaker XVF3800 4-Mic Array")
+        if usb_visible
+        else None
+    )
+    probe = SimpleNamespace(
+        capture_ready=capture_ready,
+        capture_device=capture_device,
+        usb_visible=usb_visible,
+        usb_device=usb_device,
+        arecord_available=arecord_available,
+        lsusb_available=lsusb_available,
+        state=(
+            "audio_ready"
+            if capture_ready
+            else "usb_visible_no_capture"
+            if usb_visible and arecord_available
+            else "not_detected"
+        ),
+    )
+    return SimpleNamespace(
+        probe=probe,
+        host_control_ready=host_control_ready,
+        transport=SimpleNamespace(
+            reason=transport_reason,
+            requires_elevated_permissions=requires_elevated_permissions,
+        ),
+        firmware_version=(2, 0, 7),
+        direction=SimpleNamespace(
+            doa_degrees=277,
+            speech_detected=True,
+            room_quiet=False,
+            beam_speech_energies=(0.1, 0.2, 0.0, 0.0),
+        ),
+        mute=SimpleNamespace(
+            mute_active=None,
+            gpo_logic_levels=(0, 0, 0, 1, 0),
+        ),
+    )
+
+
 class OpsModuleTests(unittest.TestCase):
     def test_event_store_tail_returns_latest_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -184,6 +240,68 @@ class OpsModuleTests(unittest.TestCase):
         by_key = {check.key: check for check in checks}
         self.assertEqual(by_key["proactive_audio_input"].status, "ok")
         self.assertIn("CameraB409241", by_key["proactive_audio_input"].detail)
+
+    def test_run_config_checks_reports_respeaker_runtime_ready(self) -> None:
+        config = TwinrConfig(
+            audio_input_device="plughw:CARD=Array,DEV=0",
+            proactive_audio_enabled=True,
+            proactive_audio_input_device="plughw:CARD=Array,DEV=0",
+        )
+
+        fake_snapshot = _fake_respeaker_snapshot(
+            capture_ready=True,
+            usb_visible=True,
+            host_control_ready=True,
+        )
+
+        with patch("twinr.ops.checks.capture_respeaker_primitive_snapshot", return_value=fake_snapshot):
+            checks = run_config_checks(config)
+
+        by_key = {check.key: check for check in checks}
+        self.assertEqual(by_key["respeaker_xvf3800"].status, "ok")
+        self.assertIn("host-control primitives are readable", by_key["respeaker_xvf3800"].detail)
+
+    def test_run_config_checks_warns_when_respeaker_is_usb_visible_without_capture(self) -> None:
+        config = TwinrConfig(
+            audio_input_device="plughw:CARD=Array,DEV=0",
+            proactive_audio_enabled=True,
+            proactive_audio_input_device="plughw:CARD=Array,DEV=0",
+        )
+
+        fake_snapshot = _fake_respeaker_snapshot(
+            capture_ready=False,
+            usb_visible=True,
+            host_control_ready=False,
+        )
+
+        with patch("twinr.ops.checks.capture_respeaker_primitive_snapshot", return_value=fake_snapshot):
+            checks = run_config_checks(config)
+
+        by_key = {check.key: check for check in checks}
+        self.assertEqual(by_key["respeaker_xvf3800"].status, "warn")
+        self.assertIn("DFU/safe mode", by_key["respeaker_xvf3800"].detail)
+
+    def test_run_config_checks_warns_when_host_control_permissions_are_missing(self) -> None:
+        config = TwinrConfig(
+            audio_input_device="plughw:CARD=Array,DEV=0",
+            proactive_audio_enabled=True,
+            proactive_audio_input_device="plughw:CARD=Array,DEV=0",
+        )
+
+        fake_snapshot = _fake_respeaker_snapshot(
+            capture_ready=True,
+            usb_visible=True,
+            host_control_ready=False,
+            transport_reason="permission_denied_or_transport_blocked",
+            requires_elevated_permissions=True,
+        )
+
+        with patch("twinr.ops.checks.capture_respeaker_primitive_snapshot", return_value=fake_snapshot):
+            checks = run_config_checks(config)
+
+        by_key = {check.key: check for check in checks}
+        self.assertEqual(by_key["respeaker_xvf3800"].status, "warn")
+        self.assertIn("runtime user likely lacks", by_key["respeaker_xvf3800"].detail.lower())
 
     def test_run_config_checks_rejects_pir_button_collision(self) -> None:
         config = TwinrConfig(

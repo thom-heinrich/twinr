@@ -15,10 +15,13 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 - load compact remote catalog segment documents through bounded-parallel reads so required startup does not serialize every segment fetch
 - keep required-readiness probes read-only even for sparse legacy object catalogs, so watchdog startup never blocks on catalog rewrites
 - reuse successful remote snapshot probes within one readiness cycle so store bootstrap and health attestation do not refetch the same snapshot twice
-- allow opt-in stores to reuse the last successful remote document id across readiness cycles, so steady-state probes can skip repeat pointer resolution and still fall back safely when the hint goes stale
+- prefer the last successful remote document id on ordinary snapshot reads, so steady-state loads skip repeat pointer resolution while still falling back safely when the hint goes stale
+- skip `retrieve_search` entirely when the current remote catalog candidate set already fits inside the caller's requested limit, so small conflict/object lookups do not burn an extra timeout-prone backend roundtrip
 - overlap the independent `objects` / `conflicts` / `archive` required-startup reads so object-store readiness is bounded by the slowest current snapshot instead of the sum of all three
+- emit structured ops diagnostics for remote ChonkyDB read and write failures plus recoverable retrieve-batch fallbacks so DNS issues, timeouts, backend flakes, and client-contract payload problems can be separated after live incidents
 - project structured memory-state semantics such as `confirmed`, `aktuell`, `gespeichert`, and `superseded` into durable-object search text so meta-memory queries can retrieve the right fact instead of a generic sibling
 - rank selected durable objects by combined query overlap, confirmation state, and recency before returning them to retrieval/runtime callers
+- gate durable-object and conflict recall on content-bearing query terms so control questions do not pull in off-topic memory just because they share auxiliary words like `ist`
 - keep fine-grained remote bulk writes bounded by item count and request bytes before they hit ChonkyDB
 - bootstrap fresh required remote namespaces with empty structured snapshots instead of failing before the first live write
 - treat missing local/remote midterm baselines as empty bootstrap state, not as malformed payload warnings
@@ -38,6 +41,7 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 | `store.py` | Object/conflict/archive store |
 | `midterm_store.py` | Midterm packet store |
 | `remote_catalog.py` | Fine-grained remote object/conflict/archive catalog adapter |
+| `remote_read_diagnostics.py` | Structured ops-event diagnostics for remote long-term I/O failures and fallbacks |
 | `remote_state.py` | Small remote snapshot/catalog adapter |
 | `component.yaml` | Structured ownership metadata |
 | `AGENTS.md` | Local editing rules |

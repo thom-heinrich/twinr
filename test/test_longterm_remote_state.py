@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 import logging
 from pathlib import Path
+import socket
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ from twinr.memory.longterm.storage.remote_state import (
     LongTermRemoteUnavailableError,
 )
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
+from twinr.ops.events import TwinrOpsEventStore
 
 
 class FakeHTTPResponse:
@@ -598,6 +600,78 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertEqual(second_query["document_id"], ["doc-123"])
         self.assertNotIn("origin_uri", second_query)
 
+    def test_remote_snapshot_load_reuses_cached_document_id_hint_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            read_opener = FakeOpener()
+            graph_payload = {
+                "schema": "twinr_remote_snapshot_v1",
+                "namespace": "test-namespace",
+                "snapshot_kind": "graph",
+                "updated_at": "2026-03-18T13:00:01+00:00",
+                "body": {"schema": "graph", "nodes": [{"id": "user:main"}], "edges": []},
+            }
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "pointer-doc",
+                    "origin_uri": "twinr://longterm/test-namespace/__pointer__:graph",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "__pointer__:graph",
+                            "updated_at": "2026-03-18T13:00:00+00:00",
+                            "body": {
+                                "schema": "twinr_remote_snapshot_pointer_v1",
+                                "version": 1,
+                                "snapshot_kind": "graph",
+                                "document_id": "graph-doc-123",
+                            },
+                        }
+                    ),
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "graph-doc-123",
+                    "content": json.dumps(graph_payload),
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "graph-doc-123",
+                    "content": json.dumps(graph_payload),
+                }
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+
+            first = state.load_snapshot(snapshot_kind="graph", local_path=Path(temp_dir) / "graph.json")
+            second = state.load_snapshot(snapshot_kind="graph", local_path=Path(temp_dir) / "graph.json")
+
+        self.assertEqual(first, {"schema": "graph", "nodes": [{"id": "user:main"}], "edges": []})
+        self.assertEqual(second, first)
+        self.assertEqual(len(read_opener.calls), 3)
+        first_query = parse_qs(urlparse(read_opener.calls[0]["full_url"]).query)
+        second_query = parse_qs(urlparse(read_opener.calls[1]["full_url"]).query)
+        third_query = parse_qs(urlparse(read_opener.calls[2]["full_url"]).query)
+        self.assertEqual(first_query["origin_uri"], ["twinr://longterm/test-namespace/__pointer__%3Agraph"])
+        self.assertEqual(second_query["document_id"], ["graph-doc-123"])
+        self.assertEqual(third_query["document_id"], ["graph-doc-123"])
+        self.assertNotIn("origin_uri", third_query)
+
     def test_remote_snapshot_load_reuses_cached_document_id_hint_when_opted_in(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir)
@@ -1066,6 +1140,49 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
             state.save_snapshot(snapshot_kind="objects", payload={"schema": "object_store", "objects": []})
 
         self.assertEqual(len(write_opener.calls), 2)
+
+    def test_remote_snapshot_save_logs_dns_write_diagnostic_on_final_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=1,
+                long_term_memory_remote_retry_backoff_s=0.0,
+                long_term_memory_remote_write_timeout_s=17.0,
+            )
+            write_opener = FakeOpener()
+            write_opener.queue_exception(socket.gaierror(-3, "Temporary failure in name resolution"))
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=write_opener,
+                ),
+            )
+
+            with self.assertRaises(LongTermRemoteUnavailableError):
+                state.save_snapshot(snapshot_kind="objects", payload={"schema": "object_store", "objects": []})
+
+            events = TwinrOpsEventStore.from_project_root(temp_dir).tail(limit=5)
+
+        self.assertTrue(events)
+        last_event = events[-1]
+        self.assertEqual(last_event["event"], "longterm_remote_write_failed")
+        self.assertEqual(last_event["level"], "warning")
+        self.assertIn("dns_resolution_error", last_event["message"])
+        data = dict(last_event["data"])
+        self.assertEqual(data["request_kind"], "write")
+        self.assertEqual(data["snapshot_kind"], "objects")
+        self.assertEqual(data["operation"], "store_snapshot_record")
+        self.assertEqual(data["classification"], "dns_resolution_error")
+        self.assertEqual(data["attempt_count"], 1)
+        self.assertEqual(data["request_item_count"], 1)
+        self.assertEqual(data["write_timeout_s"], 17.0)
+        self.assertEqual(data["error_type"], "ChonkyDBError")
+        self.assertEqual(data["root_cause_type"], "gaierror")
 
     def test_remote_snapshot_loads_from_documents_full_chunk_content(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

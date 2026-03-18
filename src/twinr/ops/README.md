@@ -14,6 +14,7 @@ support exports for the web UI and operator tools.
 - collect config, device, and system-health snapshots
 - run a dedicated rolling ChonkyDB remote-memory watchdog
 - persist structured remote-readiness probe evidence and supervisor-seeded watchdog bootstrap snapshots so restart phases do not look like dead/stale watchdog failures
+- persist structured long-term remote-read diagnostics when ChonkyDB retrieve/fetch paths fail or degrade to bounded fallback, so operators can separate backend HTTP flakes, timeouts, and client-contract issues
 - ensure the dedicated remote-memory watchdog process is running for live Pi runtimes
 - seed detached Pi runtime processes with the user-session audio env they need for Pulse/ALSA default playback
 - supervise the productive Pi streaming loop plus remote watchdog under one authoritative owner and prime child audio-session env before each spawn
@@ -56,6 +57,11 @@ support exports for the web UI and operator tools.
 | [support.py](./support.py) | Support bundle export |
 | [component.yaml](./component.yaml) | Structured package metadata |
 
+The device overview and config checks now also surface ReSpeaker XVF3800
+runtime and host-control state separately from generic audio-device listings,
+so operators can see the difference between `USB-visible`, `capture-ready`,
+host-control degradation, and `not detected`.
+
 ## Usage
 
 ```python
@@ -97,6 +103,7 @@ PYTHONPATH=src python3 -m twinr.ops.remote_memory_watchdog_soak --project-root /
 ```bash
 python3 hardware/ops/bootstrap_self_coding_pi.py
 PYTHONPATH=src python3 -m twinr --env-file .env --self-coding-codex-self-test --self-coding-live-auth-check
+PYTHONPATH=src python3 -m twinr --env-file .env --long-term-memory-live-acceptance
 ```
 
 ## See also

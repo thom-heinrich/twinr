@@ -26,6 +26,10 @@ from urllib.parse import quote  # AUDIT-FIX(#6): Encode URI path segments safely
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig, ChonkyDBError
 from twinr.memory.chonkydb.models import ChonkyDBRecordRequest
+from twinr.memory.longterm.storage.remote_read_diagnostics import (
+    LongTermRemoteWriteContext,
+    record_remote_write_diagnostic,
+)
 
 
 _LOGGER = logging.getLogger(__name__)  # AUDIT-FIX(#5): Keep operational visibility for degraded-mode events.
@@ -477,7 +481,7 @@ class LongTermRemoteStateStore:
         *,
         snapshot_kind: str,
         local_path: Path | None = None,
-        prefer_cached_document_id: bool = False,
+        prefer_cached_document_id: bool = True,
     ) -> dict[str, object] | None:
         """Load one snapshot from remote storage or a safe local fallback.
 
@@ -487,9 +491,10 @@ class LongTermRemoteStateStore:
             local_path: Optional local recovery snapshot path used in
                 non-required mode when the remote backend is missing or flaky.
             prefer_cached_document_id: Reuse a previously successful remote
-                document id before resolving snapshot pointers again. Callers
-                should opt in only when a stale-but-readable snapshot can serve
-                as a bounded readiness proof until normal fallback runs.
+                document id before resolving snapshot pointers again. This is
+                enabled by default for ordinary snapshot reads because exact
+                document ids are both faster and more deterministic after fresh
+                writes; stale hints still fall back to pointer/origin lookup.
 
         Returns:
             The loaded snapshot payload, or ``None`` when no usable payload is
@@ -1177,6 +1182,7 @@ class LongTermRemoteStateStore:
     ) -> str | None:
         namespace = self.namespace or _REMOTE_NAMESPACE_PREFIX
         updated_at = _utcnow_iso()
+        started = time.monotonic()
         snapshot_document = {
             "schema": _SNAPSHOT_SCHEMA,
             "namespace": namespace,
@@ -1220,6 +1226,19 @@ class LongTermRemoteStateStore:
                 if backoff_s > 0:
                     time.sleep(backoff_s)
         if last_error is not None:
+            record_remote_write_diagnostic(
+                remote_state=self,
+                context=LongTermRemoteWriteContext(
+                    snapshot_kind=snapshot_kind,
+                    operation="store_snapshot_record",
+                    uri_hint=record.uri,
+                    attempt_count=attempts,
+                    request_item_count=1,
+                ),
+                exc=last_error,
+                started_monotonic=started,
+                outcome="failed",
+            )
             _LOGGER.warning(
                 "Failed to write remote long-term snapshot %r: %s",
                 snapshot_kind,

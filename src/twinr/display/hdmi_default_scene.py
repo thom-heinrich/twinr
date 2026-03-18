@@ -10,10 +10,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from twinr.display.contracts import DisplayStateFields
 from twinr.display.face_cues import DisplayFaceCue
+from twinr.display.hdmi_presentation_graph import (
+    HdmiPresentationNode,
+    HdmiPresentationSceneGraph,
+    HdmiPresentationSceneGraphBuilder,
+)
+from twinr.display.presentation_cues import DisplayPresentationCue
 
 
 _STATE_CARD_ORDER = ("Status", "Internet", "AI", "System", "Zeit", "Hinweis")
@@ -88,6 +95,7 @@ class HdmiDefaultScene:
     time_value: str
     panel: HdmiStatusPanelModel
     face_cue: DisplayFaceCue | None = None
+    presentation_graph: HdmiPresentationSceneGraph | None = None
 
 
 def order_state_fields(
@@ -247,6 +255,7 @@ class HdmiDefaultSceneRenderer:
 
     def draw(
         self,
+        image: object,
         draw: object,
         *,
         width: int,
@@ -257,6 +266,8 @@ class HdmiDefaultSceneRenderer:
         state_fields: DisplayStateFields,
         animation_frame: int,
         face_cue: DisplayFaceCue | None = None,
+        presentation_cue: DisplayPresentationCue | None = None,
+        presentation_now: datetime | None = None,
     ) -> None:
         """Draw one full default HDMI scene onto the provided canvas."""
 
@@ -269,6 +280,8 @@ class HdmiDefaultSceneRenderer:
             state_fields=state_fields,
             animation_frame=animation_frame,
             face_cue=face_cue,
+            presentation_cue=presentation_cue,
+            presentation_now=presentation_now,
         )
         draw.rectangle((0, 0, width, height), fill=(0, 0, 0))
         self._draw_twinr_header(draw, box=scene.layout.header_box, time_value=scene.time_value)
@@ -279,6 +292,15 @@ class HdmiDefaultSceneRenderer:
             animation_frame=scene.animation_frame,
             face_cue=scene.face_cue,
         )
+        graph = scene.presentation_graph
+        if graph is not None and graph.active_node is not None:
+            self._draw_presentation_surface(
+                image,
+                draw,
+                presentation=graph.active_node,
+                queued_count=len(graph.queued_cards),
+            )
+            return
         self._draw_status_panel(draw, box=scene.layout.panel_box, panel=scene.panel, compact=scene.layout.compact_panel)
 
     def build_scene(
@@ -292,13 +314,21 @@ class HdmiDefaultSceneRenderer:
         state_fields: DisplayStateFields,
         animation_frame: int,
         face_cue: DisplayFaceCue | None = None,
+        presentation_cue: DisplayPresentationCue | None = None,
+        presentation_now: datetime | None = None,
     ) -> HdmiDefaultScene:
         """Build the scene model so layout and content can evolve independently."""
 
+        layout = self._layout_for_size(width=width, height=height)
+        presentation_graph = self._presentation_graph(
+            cue=presentation_cue,
+            layout=layout,
+            now=presentation_now,
+        )
         return HdmiDefaultScene(
             status=status,
             animation_frame=animation_frame,
-            layout=self._layout_for_size(width=width, height=height),
+            layout=layout,
             time_value=time_value(state_fields),
             panel=self._build_panel_model(
                 status=status,
@@ -306,7 +336,8 @@ class HdmiDefaultSceneRenderer:
                 helper_text=helper_text,
                 state_fields=state_fields,
             ),
-            face_cue=face_cue,
+            face_cue=face_cue if face_cue is not None else (presentation_graph.face_cue if presentation_graph is not None else None),
+            presentation_graph=presentation_graph,
         )
 
     def _layout_for_size(self, *, width: int, height: int) -> HdmiDefaultSceneLayout:
@@ -373,6 +404,23 @@ class HdmiDefaultSceneRenderer:
             cards=cards,
         )
 
+    def _presentation_graph(
+        self,
+        *,
+        cue: DisplayPresentationCue | None,
+        layout: HdmiDefaultSceneLayout,
+        now: datetime | None,
+    ) -> HdmiPresentationSceneGraph | None:
+        """Resolve the optional presentation cue into a dedicated scene graph."""
+
+        builder = HdmiPresentationSceneGraphBuilder()
+        return builder.build(
+            cue=cue,
+            face_box=layout.face_box,
+            panel_box=layout.panel_box,
+            now=now,
+        )
+
     def _draw_twinr_header(self, draw: object, *, box: tuple[int, int, int, int], time_value: str) -> None:
         left, top, right, bottom = box
         box_height = max(32, bottom - top)
@@ -435,6 +483,185 @@ class HdmiDefaultSceneRenderer:
             self._draw_compact_cards(draw, box=rows_box, cards=panel.cards)
             return
         self._draw_cards(draw, box=rows_box, cards=panel.cards)
+
+    def _draw_presentation_surface(
+        self,
+        image: object,
+        draw: object,
+        *,
+        presentation: HdmiPresentationNode,
+        queued_count: int,
+    ) -> None:
+        """Draw one expanding presentation surface over the default scene."""
+
+        left, top, right, bottom = presentation.box
+        compact = (right - left) < 360 or (bottom - top) < 240
+        padding = 16 if compact else 24
+        eyebrow_font = self.tools._font(14 if compact else 17, bold=True)
+        title_font = self.tools._font(22 if compact else 40, bold=True)
+        subtitle_font = self.tools._font(13 if compact else 18, bold=False)
+        body_font = self.tools._font(14 if compact else 20, bold=False)
+        label = "SHOWING" if presentation.kind == "image" else "FOCUS"
+        label = label if queued_count <= 0 else f"{label} +{queued_count}"
+
+        draw.rounded_rectangle(
+            presentation.box,
+            radius=32 if not compact else 20,
+            fill=(2, 2, 2),
+            outline=presentation.accent,
+            width=3,
+        )
+        draw.rounded_rectangle(
+            (left + 12, top + 12, left + 20, top + 20),
+            radius=4,
+            fill=presentation.accent,
+        )
+        text_left = left + padding
+        text_top = top + padding
+        inner_width = max(80, right - left - (padding * 2))
+        draw.text((text_left + 18, text_top), label, fill=(176, 176, 176), font=eyebrow_font)
+        text_top += self.tools._text_height(draw, font=eyebrow_font) + (10 if compact else 14)
+
+        if presentation.title and presentation.chrome_progress >= 0.12:
+            wrapped_title = self.tools._wrapped_lines(
+                draw,
+                (presentation.title,),
+                max_width=inner_width,
+                font=title_font,
+                max_lines=2,
+            )
+            title_line_height = self.tools._text_height(draw, font=title_font) + 6
+            for line in wrapped_title:
+                draw.text((text_left, text_top), line, fill=(255, 255, 255), font=title_font)
+                text_top += title_line_height
+
+        if presentation.subtitle and presentation.content_progress > 0.0:
+            subtitle_lines = self.tools._wrapped_lines(
+                draw,
+                (presentation.subtitle,),
+                max_width=inner_width,
+                font=subtitle_font,
+                max_lines=2,
+            )
+            subtitle_line_height = self.tools._text_height(draw, font=subtitle_font) + 4
+            for line in subtitle_lines:
+                draw.text((text_left, text_top), line, fill=(214, 214, 214), font=subtitle_font)
+                text_top += subtitle_line_height
+            text_top += 4
+
+        content_bottom = bottom - padding
+        if presentation.kind == "image" and presentation.content_progress > 0.0:
+            text_top = self._draw_presentation_image_block(
+                image,
+                draw,
+                presentation=presentation,
+                box=(text_left, text_top, right - padding, content_bottom),
+                compact=compact,
+            )
+
+        remaining_top = min(text_top + (8 if compact else 14), content_bottom)
+        remaining_box = (text_left, remaining_top, right - padding, content_bottom)
+        self._draw_presentation_body(
+            draw,
+            body_lines=presentation.body_lines,
+            box=remaining_box,
+            font=body_font,
+            compact=compact,
+            reveal_progress=presentation.body_progress,
+        )
+
+    def _draw_presentation_image_block(
+        self,
+        image: object,
+        draw: object,
+        *,
+        presentation: HdmiPresentationNode,
+        box: tuple[int, int, int, int],
+        compact: bool,
+    ) -> int:
+        """Paste one local image into the presentation surface and return the next text Y."""
+
+        left, top, right, bottom = box
+        available_width = max(60, right - left)
+        available_height = max(60, bottom - top)
+        image_height = int(available_height * (0.62 if not compact else 0.54))
+        image_box = (left, top, right, min(bottom, top + image_height))
+        draw.rounded_rectangle(image_box, radius=18 if not compact else 12, fill=(8, 8, 8), outline=(84, 84, 84), width=2)
+        pasted = self._paste_local_image(image, box=image_box, image_path=presentation.image_path)
+        if not pasted:
+            placeholder_font = self.tools._font(16 if compact else 24, bold=True)
+            placeholder = "IMAGE UNAVAILABLE"
+            placeholder_width = self.tools._text_width(draw, placeholder, font=placeholder_font)
+            placeholder_height = self.tools._text_height(draw, font=placeholder_font)
+            draw.text(
+                (
+                    left + max(0, (available_width - placeholder_width) // 2),
+                    top + max(0, ((image_box[3] - image_box[1]) - placeholder_height) // 2),
+                ),
+                placeholder,
+                fill=(170, 170, 170),
+                font=placeholder_font,
+            )
+        return image_box[3]
+
+    def _draw_presentation_body(
+        self,
+        draw: object,
+        *,
+        body_lines: tuple[str, ...],
+        box: tuple[int, int, int, int],
+        font: object,
+        compact: bool,
+        reveal_progress: float,
+    ) -> None:
+        """Draw the bounded body copy for a fullscreen presentation."""
+
+        left, top, right, bottom = box
+        if top >= bottom or right <= left or reveal_progress <= 0.0:
+            return
+        max_lines = 3 if compact else 4
+        wrapped = self.tools._wrapped_lines(
+            draw,
+            body_lines,
+            max_width=max(60, right - left),
+            font=font,
+            max_lines=max_lines,
+        )
+        line_height = self.tools._text_height(draw, font=font) + (4 if compact else 8)
+        visible_lines = max(1, min(max_lines, int(round(reveal_progress * max_lines))))
+        for index, line in enumerate(wrapped[:visible_lines]):
+            y = top + (index * line_height)
+            if y + line_height > bottom:
+                break
+            draw.text((left, y), line, fill=(236, 236, 236), font=font)
+
+    def _paste_local_image(
+        self,
+        image: object,
+        *,
+        box: tuple[int, int, int, int],
+        image_path: str | None,
+    ) -> bool:
+        """Paste one bounded local image into the target box."""
+
+        if not image_path:
+            return False
+        try:
+            from PIL import Image, ImageOps
+        except ImportError:
+            return False
+        try:
+            with Image.open(image_path) as opened:
+                prepared = ImageOps.contain(
+                    opened.convert("RGB"),
+                    (max(1, box[2] - box[0] - 12), max(1, box[3] - box[1] - 12)),
+                )
+        except Exception:
+            return False
+        target_left = box[0] + max(0, ((box[2] - box[0]) - prepared.width) // 2)
+        target_top = box[1] + max(0, ((box[3] - box[1]) - prepared.height) // 2)
+        image.paste(prepared, (target_left, target_top))
+        return True
 
     def _draw_cards(
         self,

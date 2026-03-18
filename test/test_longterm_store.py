@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import os
 from pathlib import Path
+import socket
 import sys
 import tempfile
 from threading import Event, Lock, Thread
@@ -15,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from test.longterm_test_program import make_test_extractor
 from twinr.config import TwinrConfig
+from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.longterm.reasoning.consolidator import LongTermMemoryConsolidator
 from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
@@ -23,9 +26,15 @@ from twinr.memory.longterm.core.models import (
     LongTermMemoryObjectV1,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.storage.remote_read_diagnostics import (
+    LongTermRemoteReadContext,
+    _classify_remote_read_exception,
+    record_remote_read_diagnostic,
+)
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.longterm.storage.store import LongTermStructuredStore, _write_json_atomic
 from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
+from twinr.ops.events import TwinrOpsEventStore
 from twinr.text_utils import retrieval_terms
 
 
@@ -322,6 +331,21 @@ class _NoItemFetchChonkyClient(_FakeChonkyClient):
         )
 
 
+class _RetrieveErrorChonkyClient:
+    def __init__(self, exc: BaseException, *, fallback_client: object | None = None) -> None:
+        self.exc = exc
+        self.fallback_client = fallback_client
+
+    def retrieve(self, request):
+        del request
+        raise self.exc
+
+    def fetch_full_document(self, **kwargs):
+        if self.fallback_client is None:
+            raise AttributeError("fetch_full_document")
+        return self.fallback_client.fetch_full_document(**kwargs)
+
+
 class _CorruptingRewriteChonkyClient(_LiveShapeChonkyClient):
     def store_records_bulk(self, request):
         items = tuple(getattr(request, "items", ()))
@@ -416,6 +440,34 @@ class _TermOverlapChonkyClient(_FakeChonkyClient):
             mode="advanced",
             results=tuple(SimpleNamespace(**item) for item in ranked),
             indexes_used=("fulltext",),
+            raw={"results": [dict(item) for item in ranked]},
+        )
+
+
+class _SemanticDriftChonkyClient(_FakeChonkyClient):
+    def retrieve(self, request):
+        payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        allowed = set(str(value) for value in payload.get("allowed_doc_ids", ()) if str(value))
+        self.retrieve_calls += 1
+        ranked = []
+        for document_id, record in self.records_by_document_id.items():
+            if allowed and document_id not in allowed:
+                continue
+            ranked.append(
+                {
+                    "payload_id": document_id,
+                    "relevance_score": 1.0,
+                    "metadata": dict(record.get("metadata") or {}),
+                    "content": record.get("content"),
+                    "source_index": "semantic",
+                    "candidate_origin": "semantic",
+                }
+            )
+        return SimpleNamespace(
+            success=True,
+            mode="advanced",
+            results=tuple(SimpleNamespace(**item) for item in ranked),
+            indexes_used=("semantic",),
             raw={"results": [dict(item) for item in ranked]},
         )
 
@@ -675,6 +727,369 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(len(remote_state.snapshots["conflicts"]["segments"]), 1)
         self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_conflict_record_v2"), 1)
         self.assertEqual(_count_remote_records_with_schema(remote_state.client, "twinr_memory_conflict_catalog_segment_v1"), 1)
+
+    def test_remote_read_diagnostics_classify_timeout_backend_and_contract_failures(self) -> None:
+        timeout_exc = TimeoutError("retrieve timed out")
+        backend_exc = ChonkyDBError("ChonkyDB request failed for POST /v1/external/retrieve", status_code=503)
+        contract_exc = ChonkyDBError(
+            "ChonkyDB returned an invalid payload for retrieve()",
+            response_json={"results": []},
+        )
+        try:
+            try:
+                raise socket.gaierror(-3, "Temporary failure in name resolution")
+            except socket.gaierror as inner:
+                raise ChonkyDBError("ChonkyDB request failed for POST /v1/external/retrieve: dns") from inner
+        except ChonkyDBError as dns_exc:
+            classified_dns = _classify_remote_read_exception(dns_exc)
+
+        self.assertEqual(_classify_remote_read_exception(timeout_exc), "timeout")
+        self.assertEqual(_classify_remote_read_exception(backend_exc), "backend_http_error")
+        self.assertEqual(_classify_remote_read_exception(contract_exc), "client_contract_error")
+        self.assertEqual(classified_dns, "dns_resolution_error")
+
+    def test_remote_read_diagnostics_can_override_ops_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with tempfile.TemporaryDirectory() as override_dir:
+                remote_state = _FakeRemoteState()
+                remote_state.config.project_root = str(Path(temp_dir))
+                previous_override = os.environ.get("TWINR_REMOTE_READ_DIAGNOSTICS_PROJECT_ROOT")
+                os.environ["TWINR_REMOTE_READ_DIAGNOSTICS_PROJECT_ROOT"] = override_dir
+                try:
+                    record_remote_read_diagnostic(
+                        remote_state=remote_state,
+                        context=LongTermRemoteReadContext(
+                            snapshot_kind="conflicts",
+                            operation="retrieve_search",
+                            query_text="Corinna phone number",
+                            allowed_doc_count=1,
+                            catalog_entry_count=1,
+                            result_limit=1,
+                        ),
+                        exc=TimeoutError("retrieve timed out"),
+                        started_monotonic=time.monotonic(),
+                        outcome="failed",
+                    )
+                finally:
+                    if previous_override is None:
+                        os.environ.pop("TWINR_REMOTE_READ_DIAGNOSTICS_PROJECT_ROOT", None)
+                    else:
+                        os.environ["TWINR_REMOTE_READ_DIAGNOSTICS_PROJECT_ROOT"] = previous_override
+
+                default_events = TwinrOpsEventStore.from_project_root(temp_dir).tail(limit=5)
+                override_events = TwinrOpsEventStore.from_project_root(override_dir).tail(limit=5)
+
+        self.assertFalse(default_events)
+        self.assertTrue(override_events)
+        self.assertEqual(override_events[-1]["event"], "longterm_remote_read_failed")
+        self.assertEqual(override_events[-1]["data"]["snapshot_kind"], "conflicts")
+
+    def test_select_open_conflicts_logs_remote_retrieve_failure_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.config.project_root = str(project_root)
+            remote_state.config.long_term_memory_remote_read_timeout_s = 9.0
+            writer_store = LongTermStructuredStore(
+                base_path=project_root / "writer" / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            reader_store = LongTermStructuredStore(
+                base_path=project_root / "reader" / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            old_phone = LongTermMemoryObjectV1(
+                memory_id="fact:corinna_phone_old",
+                kind="contact_method_fact",
+                summary="Corinna Maier can be reached at +491761234.",
+                source=_source(),
+                status="active",
+                confidence=0.95,
+                slot_key="contact:person:corinna_maier:phone",
+                value_key="+491761234",
+            )
+            new_phone = LongTermMemoryObjectV1(
+                memory_id="fact:corinna_phone_new",
+                kind="contact_method_fact",
+                summary="Corinna Maier can be reached at +4940998877.",
+                source=_source(),
+                status="uncertain",
+                confidence=0.92,
+                slot_key="contact:person:corinna_maier:phone",
+                value_key="+4940998877",
+            )
+            conflict = LongTermMemoryConflictV1(
+                slot_key="contact:person:corinna_maier:phone",
+                candidate_memory_id="fact:corinna_phone_new",
+                existing_memory_ids=("fact:corinna_phone_old",),
+                question="Which phone number should I use for Corinna Maier?",
+                reason="Conflicting phone numbers exist.",
+            )
+            old_marta_phone = LongTermMemoryObjectV1(
+                memory_id="fact:marta_phone_old",
+                kind="contact_method_fact",
+                summary="Marta Schulz can be reached at +49170111222.",
+                source=_source(),
+                status="active",
+                confidence=0.95,
+                slot_key="contact:person:marta_schulz:phone",
+                value_key="+49170111222",
+            )
+            new_marta_phone = LongTermMemoryObjectV1(
+                memory_id="fact:marta_phone_new",
+                kind="contact_method_fact",
+                summary="Marta Schulz can be reached at +4930123456.",
+                source=_source(),
+                status="uncertain",
+                confidence=0.9,
+                slot_key="contact:person:marta_schulz:phone",
+                value_key="+4930123456",
+            )
+            second_conflict = LongTermMemoryConflictV1(
+                slot_key="contact:person:marta_schulz:phone",
+                candidate_memory_id="fact:marta_phone_new",
+                existing_memory_ids=("fact:marta_phone_old",),
+                question="Which phone number should I use for Marta Schulz?",
+                reason="Conflicting phone numbers exist.",
+            )
+
+            writer_store.write_snapshot(
+                objects=(old_phone, new_phone, old_marta_phone, new_marta_phone),
+                conflicts=(conflict, second_conflict),
+                archived_objects=(),
+            )
+            remote_state.read_client = _RetrieveErrorChonkyClient(
+                TimeoutError("retrieve timed out"),
+                fallback_client=remote_state.client,
+            )
+
+            conflicts = reader_store.select_open_conflicts(query_text="phone number", limit=1)
+            events = TwinrOpsEventStore.from_project_root(project_root).tail(limit=5)
+
+        self.assertTrue(events)
+        self.assertEqual(len(conflicts), 1)
+        search_event = next(
+            event
+            for event in events
+            if event.get("event") == "longterm_remote_read_degraded"
+            and dict(event.get("data") or {}).get("operation") == "retrieve_search"
+        )
+        self.assertEqual(search_event["level"], "warning")
+        self.assertIn("conflicts", search_event["message"])
+        data = dict(search_event["data"])
+        self.assertEqual(data["snapshot_kind"], "conflicts")
+        self.assertEqual(data["operation"], "retrieve_search")
+        self.assertEqual(data["classification"], "timeout")
+        self.assertEqual(data["allowed_doc_count"], 2)
+        self.assertEqual(data["catalog_entry_count"], 2)
+        self.assertEqual(data["result_limit"], 1)
+        self.assertEqual(data["read_timeout_s"], 9.0)
+        self.assertEqual(data["error_type"], "TimeoutError")
+        self.assertEqual(data["root_cause_type"], "TimeoutError")
+
+    def test_select_relevant_objects_degrades_remote_search_timeout_to_local_catalog_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.project_root = str(project_root)
+            remote_state.config.long_term_memory_remote_read_timeout_s = 9.0
+            writer_store = LongTermStructuredStore(
+                base_path=project_root / "writer" / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            reader_store = LongTermStructuredStore(
+                base_path=project_root / "reader" / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            thermos = LongTermMemoryObjectV1(
+                memory_id="fact:thermos_location_old",
+                kind="fact",
+                summary="Früher stand deine rote Thermoskanne im Flurschrank.",
+                source=_source(),
+                status="active",
+                confidence=0.96,
+                slot_key="location:thermos",
+                value_key="flurschrank",
+            )
+            jam_old = LongTermMemoryObjectV1(
+                memory_id="fact:jam_preference_old",
+                kind="fact",
+                summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                source=_source(),
+                status="active",
+                confidence=0.94,
+                slot_key="preference:breakfast:jam",
+                value_key="strawberry",
+            )
+            jam_new = LongTermMemoryObjectV1(
+                memory_id="fact:jam_preference_new",
+                kind="fact",
+                summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                source=_source(),
+                status="uncertain",
+                confidence=0.95,
+                slot_key="preference:breakfast:jam",
+                value_key="apricot",
+            )
+            breakfast = LongTermMemoryObjectV1(
+                memory_id="fact:jam_breakfast",
+                kind="fact",
+                summary="Du isst gern Marmelade auf Brot zum Frühstück.",
+                source=_source(),
+                status="active",
+                confidence=0.84,
+                slot_key="fact:user:breakfast:jam",
+                value_key="jam_on_bread_at_breakfast",
+            )
+
+            writer_store.write_snapshot(
+                objects=(thermos, jam_old, jam_new, breakfast),
+                conflicts=(),
+                archived_objects=(),
+            )
+            remote_state.read_client = _RetrieveErrorChonkyClient(
+                TimeoutError("retrieve timed out"),
+                fallback_client=remote_state.client,
+            )
+
+            relevant = reader_store.select_relevant_objects(
+                query_text="Wo stand früher meine rote Thermoskanne?",
+                limit=3,
+            )
+            events = TwinrOpsEventStore.from_project_root(project_root).tail(limit=8)
+
+        self.assertEqual([item.memory_id for item in relevant], ["fact:thermos_location_old"])
+        search_event = next(
+            event
+            for event in events
+            if event.get("event") == "longterm_remote_read_degraded"
+            and dict(event.get("data") or {}).get("operation") == "retrieve_search"
+            and dict(event.get("data") or {}).get("snapshot_kind") == "objects"
+        )
+        data = dict(search_event["data"])
+        self.assertEqual(data["classification"], "timeout")
+        self.assertEqual(data["allowed_doc_count"], 4)
+        self.assertEqual(data["catalog_entry_count"], 4)
+        self.assertEqual(data["result_limit"], 3)
+
+    def test_select_open_conflicts_skips_remote_search_when_candidate_set_already_fits_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.project_root = str(project_root)
+            writer_store = LongTermStructuredStore(
+                base_path=project_root / "writer" / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            reader_store = LongTermStructuredStore(
+                base_path=project_root / "reader" / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            old_phone = LongTermMemoryObjectV1(
+                memory_id="fact:corinna_phone_old",
+                kind="contact_method_fact",
+                summary="Corinna Maier can be reached at +491761234.",
+                source=_source(),
+                status="active",
+                confidence=0.95,
+                slot_key="contact:person:corinna_maier:phone",
+                value_key="+491761234",
+            )
+            new_phone = LongTermMemoryObjectV1(
+                memory_id="fact:corinna_phone_new",
+                kind="contact_method_fact",
+                summary="Corinna Maier can be reached at +4940998877.",
+                source=_source(),
+                status="uncertain",
+                confidence=0.92,
+                slot_key="contact:person:corinna_maier:phone",
+                value_key="+4940998877",
+            )
+            conflict = LongTermMemoryConflictV1(
+                slot_key="contact:person:corinna_maier:phone",
+                candidate_memory_id="fact:corinna_phone_new",
+                existing_memory_ids=("fact:corinna_phone_old",),
+                question="Which phone number should I use for Corinna Maier?",
+                reason="Conflicting phone numbers exist.",
+            )
+
+            writer_store.write_snapshot(
+                objects=(old_phone, new_phone),
+                conflicts=(conflict,),
+                archived_objects=(),
+            )
+            remote_state.read_client = _RetrieveErrorChonkyClient(
+                TimeoutError("retrieve timed out"),
+                fallback_client=remote_state.client,
+            )
+
+            conflicts = reader_store.select_open_conflicts(query_text="Corinna phone number", limit=3)
+            events = TwinrOpsEventStore.from_project_root(project_root).tail(limit=5)
+
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].slot_key, "contact:person:corinna_maier:phone")
+        self.assertFalse(any(event.get("event") == "longterm_remote_read_failed" for event in events))
+
+    def test_write_snapshot_logs_remote_bulk_write_failure_diagnostic(self) -> None:
+        class _BulkWriteFailingClient(_FakeChonkyClient):
+            def store_records_bulk(self, request):
+                del request
+                try:
+                    raise socket.gaierror(-3, "Temporary failure in name resolution")
+                except socket.gaierror as inner:
+                    raise ChonkyDBError(
+                        "ChonkyDB request failed for POST /v1/external/records/bulk: dns"
+                    ) from inner
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.project_root = str(project_root)
+            remote_state.config.long_term_memory_remote_write_timeout_s = 15.0
+            failing_client = _BulkWriteFailingClient()
+            remote_state.client = failing_client
+            remote_state.read_client = failing_client
+            remote_state.write_client = failing_client
+            store = LongTermStructuredStore(
+                base_path=project_root / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            object_fact = LongTermMemoryObjectV1(
+                memory_id="fact:jam_preference_old",
+                kind="fact",
+                summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                source=_source(),
+                status="active",
+                confidence=0.94,
+                slot_key="preference:breakfast:jam",
+                value_key="strawberry",
+            )
+
+            with self.assertRaises(LongTermRemoteUnavailableError):
+                store.write_snapshot(objects=(object_fact,), conflicts=(), archived_objects=())
+
+            events = TwinrOpsEventStore.from_project_root(project_root).tail(limit=5)
+
+        self.assertTrue(events)
+        last_event = events[-1]
+        self.assertEqual(last_event["event"], "longterm_remote_write_failed")
+        self.assertEqual(last_event["level"], "warning")
+        self.assertIn("dns_resolution_error", last_event["message"])
+        data = dict(last_event["data"])
+        self.assertEqual(data["snapshot_kind"], "objects")
+        self.assertEqual(data["operation"], "store_records_bulk")
+        self.assertEqual(data["classification"], "dns_resolution_error")
+        self.assertEqual(data["request_kind"], "write")
+        self.assertEqual(data["request_item_count"], 1)
+        self.assertEqual(data["write_timeout_s"], 15.0)
+        self.assertEqual(data["error_type"], "ChonkyDBError")
+        self.assertEqual(data["root_cause_type"], "gaierror")
 
     def test_ensure_remote_snapshots_seeds_empty_remote_documents(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1119,6 +1534,31 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertIn("Janina is the user's wife.", summaries)
         self.assertTrue(any("eye laser treatment" in summary for summary in summaries))
 
+    def test_select_relevant_objects_ignores_auxiliary_only_overlap_for_control_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LongTermStructuredStore.from_config(_config(temp_dir))
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        details="Aeltere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                ),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            relevant = store.select_relevant_objects(query_text="Was ist ein Regenbogen?", limit=3)
+
+        self.assertEqual(relevant, ())
+
     def test_select_relevant_objects_prefers_confirmed_fact_for_meta_memory_queries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = LongTermStructuredStore.from_config(_config(temp_dir))
@@ -1180,6 +1620,56 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertEqual(relevant[0].memory_id, "fact:jam_preference_new")
         self.assertTrue(relevant[0].confirmed_by_user)
+
+    def test_remote_primary_store_filters_semantic_drift_for_control_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _SemanticDriftChonkyClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        details="Aeltere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        details="Neuere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="uncertain",
+                        confidence=0.95,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                    ),
+                ),
+                conflicts=(
+                    LongTermMemoryConflictV1(
+                        slot_key="preference:breakfast:jam",
+                        candidate_memory_id="fact:jam_preference_new",
+                        existing_memory_ids=("fact:jam_preference_old",),
+                        question="Welche Marmelade stimmt gerade?",
+                        reason="Widerspruechliche Marmeladenpraeferenzen liegen vor.",
+                    ),
+                ),
+                archived_objects=(),
+            )
+
+            relevant = store.select_relevant_objects(query_text="Was ist ein Regenbogen?", limit=3)
+            conflicts = store.select_open_conflicts(query_text="Was ist ein Regenbogen?", limit=3)
+
+        self.assertEqual(relevant, ())
+        self.assertEqual(conflicts, ())
 
     def test_remote_primary_store_prefers_confirmed_fact_for_meta_memory_queries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

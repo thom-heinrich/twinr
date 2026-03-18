@@ -8,6 +8,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.hardware.respeaker.models import ReSpeakerSignalSnapshot
 from twinr.hardware.audio import AmbientAudioLevelSample
 from twinr.proactive import (
     AmbientAudioObservationProvider,
@@ -27,6 +28,7 @@ from twinr.proactive import (
     build_default_proactive_monitor,
     parse_vision_observation_text,
 )
+from twinr.proactive.social.observers import ReSpeakerAudioObservationProvider
 from twinr.proactive.social.vision_review import ProactiveVisionReview
 from twinr.runtime import TwinrRuntime
 
@@ -130,6 +132,20 @@ class FakeAudioObserver:
     def observe(self):
         self.calls += 1
         return self.snapshot
+
+
+class FakeReSpeakerSignalProvider:
+    def __init__(self, snapshot: ReSpeakerSignalSnapshot) -> None:
+        self.snapshot = snapshot
+        self.calls = 0
+        self.closed = False
+
+    def observe(self) -> ReSpeakerSignalSnapshot:
+        self.calls += 1
+        return self.snapshot
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeWakewordStream:
@@ -316,6 +332,51 @@ class ProactiveMonitorTests(unittest.TestCase):
 
         self.assertTrue(snapshot.observation.speech_detected)
         self.assertFalse(snapshot.observation.distress_detected)
+
+    def test_respeaker_audio_observer_overlays_signal_fields_on_fallback_audio(self) -> None:
+        signal_provider = FakeReSpeakerSignalProvider(
+            ReSpeakerSignalSnapshot(
+                captured_at=10.0,
+                source="respeaker_xvf3800",
+                source_type="observed",
+                sensor_window_ms=1000,
+                device_runtime_mode="audio_ready",
+                host_control_ready=True,
+                speech_detected=True,
+                room_quiet=False,
+                recent_speech_age_s=0.0,
+                azimuth_deg=277,
+            )
+        )
+        fallback = FakeAudioObserver(
+            SocialAudioObservation(
+                speech_detected=False,
+                distress_detected=True,
+            ),
+            sample=AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=5,
+                active_chunk_count=3,
+                average_rms=980,
+                peak_rms=2200,
+                active_ratio=0.6,
+            ),
+        )
+        observer = ReSpeakerAudioObservationProvider(
+            signal_provider=signal_provider,
+            fallback_observer=fallback,
+        )
+
+        snapshot = observer.observe()
+
+        self.assertTrue(snapshot.observation.speech_detected)
+        self.assertTrue(snapshot.observation.distress_detected)
+        self.assertEqual(snapshot.observation.azimuth_deg, 277)
+        self.assertEqual(snapshot.observation.device_runtime_mode, "audio_ready")
+        self.assertEqual(snapshot.observation.signal_source, "respeaker_xvf3800")
+        self.assertTrue(snapshot.observation.host_control_ready)
+        self.assertIsNotNone(snapshot.sample)
+        self.assertIs(snapshot.signal_snapshot, signal_provider.snapshot)
 
     def test_coordinator_triggers_person_returned_after_absence(self) -> None:
         config = TwinrConfig(
@@ -1153,6 +1214,98 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(warning["data"]["reason"], "openwakeword_models_missing")
         self.assertEqual(warning["data"]["fallback_backend"], "stt")
 
+    def test_build_default_monitor_prefers_local_camera_provider_by_default(self) -> None:
+        config = TwinrConfig(
+            proactive_enabled=True,
+            pir_motion_gpio=26,
+        )
+        runtime = TwinrRuntime(config=config)
+        local_provider = FakeVisionObserver([SocialVisionObservation(person_visible=False)])
+
+        with (
+            patch("twinr.proactive.runtime.service.configured_pir_monitor", return_value=FakePirMonitor()),
+            patch(
+                "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
+                return_value=local_provider,
+            ) as build_local_provider,
+        ):
+            monitor = build_default_proactive_monitor(
+                config=config,
+                runtime=runtime,
+                backend=FakeBackend("person_visible=no"),
+                camera=FakeCamera(),
+                camera_lock=None,
+                audio_lock=None,
+                trigger_handler=lambda _decision: True,
+                emit=lambda _line: None,
+            )
+
+        self.assertIsNotNone(monitor)
+        self.assertIs(monitor.coordinator.vision_observer, local_provider)
+        build_local_provider.assert_called_once_with(config)
+
+    def test_build_default_monitor_wraps_audio_with_respeaker_signals_and_warns_on_permission_issue(self) -> None:
+        config = TwinrConfig(
+            wakeword_enabled=True,
+            wakeword_backend="stt",
+            pir_motion_gpio=26,
+            audio_input_device="plughw:CARD=Array,DEV=0",
+            proactive_audio_enabled=True,
+            proactive_audio_input_device="plughw:CARD=Array,DEV=0",
+        )
+        runtime = TwinrRuntime(config=config)
+        fake_signal_provider = FakeReSpeakerSignalProvider(
+            ReSpeakerSignalSnapshot(
+                captured_at=10.0,
+                source="respeaker_xvf3800",
+                source_type="observed",
+                sensor_window_ms=config.proactive_audio_sample_ms,
+                device_runtime_mode="audio_ready",
+                host_control_ready=False,
+                transport_reason="permission_denied_or_transport_blocked",
+                requires_elevated_permissions=True,
+            )
+        )
+        fake_sampler = FakeAudioSampler(
+            AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=5,
+                active_chunk_count=1,
+                average_rms=200,
+                peak_rms=500,
+                active_ratio=0.2,
+            )
+        )
+
+        with (
+            patch("twinr.proactive.runtime.service.configured_pir_monitor", return_value=FakePirMonitor()),
+            patch("twinr.proactive.runtime.service.AmbientAudioSampler.from_config", return_value=fake_sampler),
+            patch("twinr.proactive.runtime.service.ReSpeakerSignalProvider", return_value=fake_signal_provider),
+        ):
+            monitor = build_default_proactive_monitor(
+                config=config,
+                runtime=runtime,
+                backend=FakeBackend("person_visible=no"),
+                camera=FakeCamera(),
+                camera_lock=None,
+                audio_lock=None,
+                trigger_handler=lambda _decision: True,
+                emit=lambda _line: None,
+            )
+
+        self.assertIsNotNone(monitor)
+        self.assertIsInstance(monitor.coordinator.audio_observer, ReSpeakerAudioObservationProvider)
+        self.assertIs(monitor.coordinator.audio_observer.signal_provider, fake_signal_provider)
+        events = runtime.ops_events.tail(limit=10)
+        warning = next(
+            entry
+            for entry in events
+            if entry.get("event") == "proactive_component_warning"
+            and entry.get("data", {}).get("reason") == "respeaker_signal_provider_degraded"
+        )
+        self.assertEqual(warning["data"]["reason"], "respeaker_signal_provider_degraded")
+        self.assertIn("USB permissions are likely missing", warning["data"]["detail"])
+
     def test_coordinator_emits_sensor_facts_and_events_for_automations(self) -> None:
         config = TwinrConfig(
             proactive_enabled=True,
@@ -1184,7 +1337,17 @@ class ProactiveMonitorTests(unittest.TestCase):
                 ]
             ),
             pir_monitor=FakePirMonitor(events=[True], level=True),
-            audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=True)),
+            audio_observer=FakeAudioObserver(
+                SocialAudioObservation(
+                    speech_detected=True,
+                    room_quiet=False,
+                    recent_speech_age_s=0.0,
+                    azimuth_deg=277,
+                    device_runtime_mode="audio_ready",
+                    signal_source="respeaker_xvf3800",
+                    host_control_ready=True,
+                )
+            ),
             observation_handler=lambda facts, event_names: observations.append((facts, event_names)),
             emit=lambda _line: None,
             clock=clock,
@@ -1203,6 +1366,10 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertIn("vad.speech_detected", first_events)
         self.assertEqual(first_facts["camera"]["person_visible"], True)
         self.assertEqual(first_facts["vad"]["speech_detected"], True)
+        self.assertEqual(first_facts["vad"]["signal_source"], "respeaker_xvf3800")
+        self.assertEqual(first_facts["respeaker"]["runtime_mode"], "audio_ready")
+        self.assertEqual(first_facts["respeaker"]["azimuth_deg"], 277)
+        self.assertEqual(first_facts["respeaker"]["host_control_ready"], True)
         self.assertEqual(second_events, ())
         self.assertGreaterEqual(second_facts["camera"]["person_visible_for_s"], 6.0)
 

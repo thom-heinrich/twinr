@@ -1,3 +1,4 @@
+from datetime import datetime
 from io import BytesIO
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ from twinr.display.hdmi_fbdev import (
 )
 from twinr.display.hdmi_default_scene import HdmiDefaultSceneRenderer
 from twinr.display.hdmi_wayland import HdmiWaylandDisplay
+from twinr.display.presentation_cues import DisplayPresentationCardCue, DisplayPresentationCue
 from twinr.display.wayland_env import apply_wayland_environment, resolve_wayland_socket
 
 
@@ -364,6 +366,140 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertEqual(scene.panel.cards[2].accent, (228, 152, 34))
         self.assertEqual(scene.panel.cards[3].value, "12:34")
         self.assertGreater(scene.layout.panel_box[0], scene.layout.face_box[2])
+
+    def test_default_scene_builds_morphing_presentation_overlay(self) -> None:
+        display = self.make_display()
+        renderer = display._scene_renderer()
+        cue = DisplayPresentationCue(
+            kind="rich_card",
+            title="Family Call",
+            subtitle="Marta is waiting",
+            body_lines=("Tap green to answer",),
+            accent="warm",
+            updated_at="2026-03-18T16:00:00+00:00",
+            expires_at="2026-03-18T16:00:20+00:00",
+        )
+
+        scene = renderer.build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Ready",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "warm"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+            presentation_cue=cue,
+            presentation_now=datetime.fromisoformat("2026-03-18T16:00:00.400000+00:00"),
+        )
+
+        assert scene.presentation_graph is not None
+        assert scene.presentation_graph.active_node is not None
+        active = scene.presentation_graph.active_node
+        self.assertGreater(active.progress, 0.4)
+        self.assertLess(active.progress, 0.6)
+        self.assertLess(active.box[0], scene.layout.panel_box[0])
+        self.assertEqual(active.box[1], scene.layout.panel_box[1])
+        self.assertEqual(active.box[2], scene.layout.panel_box[2])
+        self.assertEqual(active.box[3], scene.layout.panel_box[3])
+
+    def test_presentation_graph_prefers_highest_priority_card_and_face_sync(self) -> None:
+        display = self.make_display()
+        renderer = display._scene_renderer()
+        cue = DisplayPresentationCue(
+            cards=(
+                DisplayPresentationCardCue(key="summary", title="Summary", priority=20, accent="info"),
+                DisplayPresentationCardCue(
+                    key="family_photo",
+                    kind="image",
+                    title="Family Photo",
+                    priority=90,
+                    accent="warm",
+                    face_emotion="happy",
+                ),
+            ),
+            updated_at="2026-03-18T16:00:00+00:00",
+            expires_at="2026-03-18T16:00:20+00:00",
+        )
+
+        scene = renderer.build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Ready",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "warm"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+            presentation_cue=cue,
+            presentation_now=datetime.fromisoformat("2026-03-18T16:00:00.400000+00:00"),
+        )
+
+        assert scene.presentation_graph is not None
+        assert scene.presentation_graph.active_node is not None
+        assert scene.face_cue is not None
+        self.assertEqual(scene.presentation_graph.active_node.key, "family_photo")
+        self.assertEqual(len(scene.presentation_graph.queued_cards), 1)
+        self.assertEqual(scene.face_cue.gaze_x, 2)
+        self.assertEqual(scene.face_cue.mouth, "smile")
+        self.assertEqual(scene.face_cue.brows, "raised")
+
+    def test_render_status_image_draws_image_presentation_surface(self) -> None:
+        display = self.make_display()
+        state_fields = (
+            ("Status", "Waiting"),
+            ("Internet", "ok"),
+            ("AI", "ok"),
+            ("System", "ok"),
+            ("Zeit", "12:34"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "family.png"
+            Image.new("RGB", (120, 120), (240, 220, 180)).save(image_path)
+            cue = DisplayPresentationCue(
+                kind="image",
+                title="Marta",
+                subtitle="Photo received",
+                body_lines=("Tap green to answer",),
+                image_path=str(image_path),
+                accent="success",
+                updated_at="2026-03-18T15:59:00+00:00",
+                expires_at="2026-03-18T16:01:00+00:00",
+            )
+
+            base = display.render_status_image(
+                status="waiting",
+                headline="Waiting",
+                details=("Internet ok", "AI ok"),
+                state_fields=state_fields,
+                log_sections=(),
+                animation_frame=0,
+            )
+            presented = display.render_status_image(
+                status="waiting",
+                headline="Waiting",
+                details=("Internet ok", "AI ok"),
+                state_fields=state_fields,
+                log_sections=(),
+                animation_frame=0,
+                presentation_cue=cue,
+            )
+
+        diff = ImageChops.difference(base, presented)
+        changed_pixels = sum(1 for pixel in diff.getdata() if max(pixel) >= 24)
+
+        self.assertIsNotNone(diff.getbbox())
+        self.assertGreater(changed_pixels, 25000)
 
     def test_wrapped_lines_truncate_oversized_first_token(self) -> None:
         display = self.make_display()

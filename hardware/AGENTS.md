@@ -19,6 +19,7 @@ Out of scope:
 - `display/display_test.py` - render a one-shot display test pattern
 - `display/run_display_loop.py` - run the standalone display loop
 - `mic/setup_audio.sh` - configure ALSA or PipeWire playback/capture defaults and proactive audio env
+- `mic/setup_respeaker_access.sh` - install the XVF3800 udev rule so the runtime user can read host-control without sudo
 - `piaicam/smoke_piaicam.py` - run bounded Pi AI Camera enumeration, capture, and IMX500 smoke phases
 - `pir/setup_pir.sh` - persist PIR GPIO env settings and optional probe
 - `pir/probe_pir.py` - print PIR state and motion events
@@ -39,7 +40,7 @@ Out of scope:
 After any edit in this directory, run:
 
 ```bash
-bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
+bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/mic/setup_respeaker_access.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
 PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/piaicam/smoke_piaicam.py hardware/pir/probe_pir.py
 ```
 
@@ -69,8 +70,9 @@ python3 hardware/display/display_test.py --env-file .env
 - `hardware/display/README.md`
 - `state/display/vendor/` path assumptions
 
-`mic/setup_audio.sh` changes -> also check:
+`mic/setup_audio.sh` or `mic/setup_respeaker_access.sh` changes -> also check:
 - `src/twinr/hardware/audio.py`
+- `src/twinr/hardware/respeaker/`
 - `hardware/mic/README.md`
 
 `piaicam/smoke_piaicam.py` changes -> also check:

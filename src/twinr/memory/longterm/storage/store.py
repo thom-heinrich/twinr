@@ -959,7 +959,13 @@ class LongTermStructuredStore:
                 conflicts.append(LongTermMemoryConflictV1.from_payload(payload))
             except Exception:
                 _LOG.warning("Skipping invalid remote long-term conflict payload during selective load.", exc_info=True)
-        return tuple(conflicts)
+        if not clean_query:
+            return tuple(conflicts[:bounded_limit])
+        return self._filter_query_relevant_conflicts(
+            clean_query,
+            selected=conflicts,
+            limit=bounded_limit,
+        )
 
     def select_relevant_episodic_objects(
         self,
@@ -1547,7 +1553,13 @@ class LongTermStructuredStore:
             )
             selected_doc_ids = selector.search(clean_query, limit=bounded_limit, category="conflict")
             by_doc_id = {self._conflict_doc_id(item): item for item in conflicts}
-            return tuple(by_doc_id[doc_id] for doc_id in selected_doc_ids if doc_id in by_doc_id)
+            selected = [by_doc_id[doc_id] for doc_id in selected_doc_ids if doc_id in by_doc_id]
+            return self._filter_query_relevant_conflicts(
+                clean_query,
+                selected=selected,
+                limit=bounded_limit,
+                objects_by_id=objects_by_id,
+            )
 
     def _load_memory_objects_from_payload(
         self,
@@ -1788,16 +1800,34 @@ class LongTermStructuredStore:
             query_terms.update(retrieval_terms(query_text))
         return query_terms
 
+    def _query_match_terms(self, query_terms: Iterable[str]) -> set[str]:
+        """Prefer content-bearing query terms over auxiliary-word-only overlap."""
+
+        normalized = {
+            str(term).strip()
+            for term in query_terms
+            if isinstance(term, str) and str(term).strip()
+        }
+        if not normalized:
+            return set()
+        informative = {
+            term
+            for term in normalized
+            if term.isdigit() or len(term) >= 4
+        }
+        return informative or normalized
+
     def _object_query_overlap_score(
         self,
         *,
         item: LongTermMemoryObjectV1,
         query_terms: set[str],
     ) -> int:
-        if not query_terms:
+        match_terms = self._query_match_terms(query_terms)
+        if not match_terms:
             return 0
         object_terms = set(retrieval_terms(self._object_search_text(item)))
-        return len(query_terms.intersection(object_terms))
+        return len(match_terms.intersection(object_terms))
 
     def _object_status_priority(self, status: str) -> int:
         if status == "active":
@@ -1834,14 +1864,40 @@ class LongTermStructuredStore:
         selected: list[LongTermMemoryObjectV1],
         limit: int,
     ) -> tuple[LongTermMemoryObjectV1, ...]:
-        query_terms = set(retrieval_terms(query_text))
-        semantic_query_terms = {term for term in query_terms if not term.isdigit()}
-        if not semantic_query_terms:
+        query_terms = self._query_match_terms(retrieval_terms(query_text))
+        if not query_terms:
             return tuple(selected[: max(1, limit)])
         filtered = [
             item
             for item in selected
-            if semantic_query_terms.intersection(retrieval_terms(self._object_search_text(item)))
+            if query_terms.intersection(retrieval_terms(self._object_search_text(item)))
+        ]
+        return tuple(filtered[: max(1, limit)])
+
+    def _filter_query_relevant_conflicts(
+        self,
+        query_text: str,
+        *,
+        selected: Iterable[LongTermMemoryConflictV1],
+        limit: int,
+        objects_by_id: Mapping[str, LongTermMemoryObjectV1] | None = None,
+    ) -> tuple[LongTermMemoryConflictV1, ...]:
+        query_terms = self._query_match_terms(retrieval_terms(query_text))
+        selected_conflicts = list(selected)
+        if not query_terms:
+            return tuple(selected_conflicts[: max(1, limit)])
+        related_objects = objects_by_id or {}
+        filtered = [
+            conflict
+            for conflict in selected_conflicts
+            if query_terms.intersection(
+                retrieval_terms(
+                    self._conflict_search_text(
+                        conflict,
+                        objects_by_id=related_objects,
+                    )
+                )
+            )
         ]
         return tuple(filtered[: max(1, limit)])
 

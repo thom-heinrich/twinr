@@ -25,6 +25,7 @@ from twinr.display.debug_log import LogSections, TwinrDisplayDebugLogBuilder
 from twinr.display.face_cues import DisplayFaceCue, DisplayFaceCueStore
 from twinr.display.factory import create_display_adapter
 from twinr.display.heartbeat import DisplayHeartbeatStore, save_display_heartbeat
+from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPresentationStore
 from twinr.ops.health import TwinrSystemHealth, collect_system_health
 
 _STATUS_ANIMATION_SPECS: dict[str, tuple[int, float]] = {
@@ -113,6 +114,7 @@ class TwinrStatusDisplayLoop:
     debug_log_builder: TwinrDisplayDebugLogBuilder | None = None
     heartbeat_store: DisplayHeartbeatStore | None = None
     face_cue_store: DisplayFaceCueStore | None = None
+    presentation_cue_store: DisplayPresentationStore | None = None
     _cached_health: TwinrSystemHealth | None = field(default=None, init=False, repr=False)
     _cached_health_error: str | None = field(default=None, init=False, repr=False)
     _cached_health_status: str | None = field(default=None, init=False, repr=False)
@@ -128,6 +130,7 @@ class TwinrStatusDisplayLoop:
     _last_render_completed_at: datetime | None = field(default=None, init=False, repr=False)
     _last_render_status: str | None = field(default=None, init=False, repr=False)
     _last_render_monotonic_s: float = field(default=0.0, init=False, repr=False)
+    _last_display_telemetry_signature: tuple[object, ...] | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_config(
@@ -157,6 +160,7 @@ class TwinrStatusDisplayLoop:
             debug_log_builder=TwinrDisplayDebugLogBuilder.from_config(config),
             heartbeat_store=DisplayHeartbeatStore.from_config(config),
             face_cue_store=DisplayFaceCueStore.from_config(config),
+            presentation_cue_store=DisplayPresentationStore.from_config(config),
         )
 
     def run(self, *, duration_s: float | None = None, max_cycles: int | None = None) -> int:
@@ -187,6 +191,7 @@ class TwinrStatusDisplayLoop:
                 status = self._snapshot_status(snapshot)
                 frame = self._display_animation_frame(status)
                 face_cue = self._active_face_cue()
+                presentation_cue = self._active_presentation_cue()
                 signature = self._render_signature(
                     status=status,
                     headline=headline,
@@ -195,6 +200,7 @@ class TwinrStatusDisplayLoop:
                     log_sections=log_sections,
                     animation_frame=frame,
                     face_cue=face_cue,
+                    presentation_cue=presentation_cue,
                 )
                 if self._should_render_signature(status=status, signature=signature, last_signature=last_signature):
                     self._last_render_started_at = datetime.now(timezone.utc)
@@ -207,8 +213,9 @@ class TwinrStatusDisplayLoop:
                         log_sections=log_sections,
                         animation_frame=frame,
                         face_cue=face_cue,
+                        presentation_cue=presentation_cue,
                     ):
-                        self._safe_emit(f"display_status={status}")
+                        self._emit_display_status(status=status, presentation_cue=presentation_cue)
                         last_signature = signature
                         self._last_render_completed_at = datetime.now(timezone.utc)
                         self._last_render_status = status
@@ -517,6 +524,7 @@ class TwinrStatusDisplayLoop:
         log_sections: LogSections,
         animation_frame: int,
         face_cue: DisplayFaceCue | None,
+        presentation_cue: DisplayPresentationCue | None,
     ) -> bool:
         try:
             self.display.show_status(
@@ -527,6 +535,7 @@ class TwinrStatusDisplayLoop:
                 log_sections=log_sections,
                 animation_frame=animation_frame,
                 face_cue=face_cue,
+                presentation_cue=presentation_cue,
             )
             return True
         except Exception as exc:
@@ -543,6 +552,7 @@ class TwinrStatusDisplayLoop:
                     log_sections=log_sections,
                     animation_frame=animation_frame,
                     face_cue=face_cue,
+                    presentation_cue=presentation_cue,
                 )
                 return True
             except Exception as retry_exc:
@@ -597,6 +607,7 @@ class TwinrStatusDisplayLoop:
                 if last_rendered_status is not None and hasattr(reopened, "_last_rendered_status"):
                     setattr(reopened, "_last_rendered_status", last_rendered_status)
                 self.display = reopened
+                self._last_display_telemetry_signature = None
                 return True
             except Exception as exc:
                 self._emit_error("display_reopen_failed", exc)
@@ -699,12 +710,26 @@ class TwinrStatusDisplayLoop:
         log_sections: LogSections,
         animation_frame: int,
         face_cue: DisplayFaceCue | None,
+        presentation_cue: DisplayPresentationCue | None,
     ) -> tuple[object, ...]:
         layout_mode = self._display_layout()
         if layout_mode == "debug_log":
             return (layout_mode, status, headline, log_sections)
         cue_signature = face_cue.signature() if face_cue is not None else None
-        return (layout_mode, status, headline, details, state_fields, log_sections, animation_frame, cue_signature)
+        presentation_signature = presentation_cue.signature() if presentation_cue is not None else None
+        presentation_bucket = presentation_cue.transition_bucket() if presentation_cue is not None else None
+        return (
+            layout_mode,
+            status,
+            headline,
+            details,
+            state_fields,
+            log_sections,
+            animation_frame,
+            cue_signature,
+            presentation_signature,
+            presentation_bucket,
+        )
 
     def _should_render_signature(
         self,
@@ -724,6 +749,45 @@ class TwinrStatusDisplayLoop:
     def _display_layout(self) -> str:
         return self._compact_text(getattr(self.config, "display_layout", "default")).lower() or "default"
 
+    def _emit_display_status(
+        self,
+        *,
+        status: str,
+        presentation_cue: DisplayPresentationCue | None,
+    ) -> None:
+        """Emit one bounded semantic display-status line without render spam."""
+
+        signature = self._display_telemetry_signature(status=status, presentation_cue=presentation_cue)
+        if signature == self._last_display_telemetry_signature:
+            return
+        self._last_display_telemetry_signature = signature
+        parts = [f"display_status={status}"]
+        layout_mode = self._display_layout()
+        if layout_mode != "default":
+            parts.append(f"layout={layout_mode}")
+        if presentation_cue is not None:
+            presentation_signature = presentation_cue.telemetry_signature()
+            active_card = presentation_cue.active_card()
+            if presentation_signature is not None and active_card is not None:
+                parts.append(f"presentation={active_card.kind}:{presentation_cue.transition_stage()}")
+                parts.append(f"presentation_key={active_card.key}")
+                queued_count = len(presentation_cue.queued_cards())
+                if queued_count > 0:
+                    parts.append(f"presentation_queue={queued_count}")
+        self._safe_emit(" ".join(parts))
+
+    def _display_telemetry_signature(
+        self,
+        *,
+        status: str,
+        presentation_cue: DisplayPresentationCue | None,
+    ) -> tuple[object, ...]:
+        """Return one semantic signature for low-noise display telemetry."""
+
+        layout_mode = self._display_layout()
+        presentation_signature = presentation_cue.telemetry_signature() if presentation_cue is not None else None
+        return (layout_mode, status, presentation_signature)
+
     def _active_face_cue(self) -> DisplayFaceCue | None:
         if self._display_layout() != "default":
             return None
@@ -734,6 +798,18 @@ class TwinrStatusDisplayLoop:
             return store.load_active()
         except Exception as exc:
             self._emit_error("display_face_cue_load_failed", exc)
+            return None
+
+    def _active_presentation_cue(self) -> DisplayPresentationCue | None:
+        if self._display_layout() != "default":
+            return None
+        store = self.presentation_cue_store
+        if store is None:
+            return None
+        try:
+            return store.load_active()
+        except Exception as exc:
+            self._emit_error("display_presentation_cue_load_failed", exc)
             return None
 
     def _debug_log_builder(self) -> TwinrDisplayDebugLogBuilder:

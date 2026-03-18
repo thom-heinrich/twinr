@@ -26,8 +26,12 @@ files:
     role: Render a one-shot display test card
   - path: display/run_display_loop.py
     role: Run the standalone status display loop for manual validation
+  - path: display/run_visual_qc.py
+    role: Capture the visible HDMI scene set, diff it, and persist report-backed QC artifacts
   - path: mic/setup_audio.sh
     role: Configure ALSA or PipeWire defaults and optional proactive-audio env keys
+  - path: mic/setup_respeaker_access.sh
+    role: Install the XVF3800 udev rule so the runtime user can read libusb host-control without sudo
   - path: ops/bootstrap_self_coding_pi.py
     role: Reproducibly sync the pinned self-coding Codex bridge/auth to the Pi and run the remote readiness self-test
   - path: ops/twinr-runtime-supervisor.service
@@ -44,5 +48,5 @@ related_runtime_packages:
   - path: src/twinr/hardware
   - path: src/twinr/display
 manual_checks:
-  - command: bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
-  - command: PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/piaicam/smoke_piaicam.py hardware/pir/probe_pir.py
+  - command: bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/mic/setup_respeaker_access.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
+  - command: PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/display/run_visual_qc.py hardware/piaicam/smoke_piaicam.py hardware/pir/probe_pir.py

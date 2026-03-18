@@ -18,6 +18,8 @@ import time
 
 from twinr.hardware.audio import AmbientAudioLevelSample, AmbientAudioSampler
 from twinr.hardware.camera import V4L2StillCamera
+from twinr.hardware.respeaker.models import ReSpeakerSignalSnapshot
+from twinr.hardware.respeaker.signal_provider import ReSpeakerSignalProvider
 from twinr.providers.openai import OpenAIBackend, OpenAIImageInput
 
 from .engine import SocialAudioObservation, SocialBodyPose, SocialPersonZone, SocialVisionObservation
@@ -73,6 +75,7 @@ class ProactiveAudioSnapshot:
     pcm_bytes: bytes | None = None
     sample_rate: int | None = None
     channels: int | None = None
+    signal_snapshot: ReSpeakerSignalSnapshot | None = None
 
 
 class NullAudioObservationProvider:
@@ -186,6 +189,70 @@ class AmbientAudioObservationProvider:
             return _unavailable_audio_snapshot()
         finally:
             self.audio_lock.release()
+
+
+class ReSpeakerAudioObservationProvider:
+    """Overlay XVF3800 host-control signals onto a fallback audio snapshot.
+
+    This wrapper keeps the existing PCM/sample-based wakeword path available
+    while upgrading the normalized audio observation with direct XVF3800 facts
+    such as current speech detection, runtime mode, and direction hint.
+    """
+
+    def __init__(
+        self,
+        *,
+        signal_provider: ReSpeakerSignalProvider,
+        fallback_observer: object | None = None,
+    ) -> None:
+        """Initialize one wrapper from a signal provider and optional fallback."""
+
+        self.signal_provider = signal_provider
+        self.fallback_observer = fallback_observer
+
+    def observe(self) -> ProactiveAudioSnapshot:
+        """Return one audio snapshot with ReSpeaker signals overlaid when available."""
+
+        signal_snapshot = self.signal_provider.observe()
+        fallback_snapshot = _observe_fallback_audio(self.fallback_observer)
+        fallback_observation = (
+            fallback_snapshot.observation if fallback_snapshot is not None else SocialAudioObservation()
+        )
+        observation = SocialAudioObservation(
+            speech_detected=(
+                signal_snapshot.speech_detected
+                if signal_snapshot.speech_detected is not None
+                else fallback_observation.speech_detected
+            ),
+            distress_detected=fallback_observation.distress_detected,
+            room_quiet=signal_snapshot.room_quiet,
+            recent_speech_age_s=signal_snapshot.recent_speech_age_s,
+            azimuth_deg=signal_snapshot.azimuth_deg,
+            device_runtime_mode=signal_snapshot.device_runtime_mode,
+            signal_source=signal_snapshot.source,
+            host_control_ready=signal_snapshot.host_control_ready,
+            transport_reason=signal_snapshot.transport_reason,
+            mute_active=signal_snapshot.mute_active,
+        )
+        if fallback_snapshot is None:
+            return ProactiveAudioSnapshot(
+                observation=observation,
+                signal_snapshot=signal_snapshot,
+            )
+        return ProactiveAudioSnapshot(
+            observation=observation,
+            sample=fallback_snapshot.sample,
+            pcm_bytes=fallback_snapshot.pcm_bytes,
+            sample_rate=fallback_snapshot.sample_rate,
+            channels=fallback_snapshot.channels,
+            signal_snapshot=signal_snapshot,
+        )
+
+    def close(self) -> None:
+        """Close nested resources when the monitor shuts down."""
+
+        _close_if_supported(self.signal_provider)
+        _close_if_supported(self.fallback_observer)
 
 
 class OpenAIVisionObservationProvider:
@@ -658,6 +725,34 @@ def _unavailable_audio_snapshot() -> ProactiveAudioSnapshot:
     )
 
 
+def _observe_fallback_audio(observer: object | None) -> ProactiveAudioSnapshot | None:
+    """Observe one fallback audio snapshot and degrade safely on failure."""
+
+    if observer is None or not hasattr(observer, "observe"):
+        return None
+    try:
+        snapshot = observer.observe()
+    except Exception:
+        logger.exception(
+            "Fallback audio observation failed while overlaying ReSpeaker signals."
+        )
+        return _unavailable_audio_snapshot()
+    if isinstance(snapshot, ProactiveAudioSnapshot):
+        return snapshot
+    return _unavailable_audio_snapshot()
+
+
+def _close_if_supported(resource: object | None) -> None:
+    """Close one nested provider when it exposes a ``close`` method."""
+
+    if resource is None or not hasattr(resource, "close"):
+        return
+    try:
+        resource.close()  # type: ignore[call-arg]
+    except Exception:
+        logger.exception("Failed to close proactive observer resource cleanly.")
+
+
 _VISION_CLASSIFIER_PROMPT = (
     "You classify a single live camera frame for Twinr's proactive trigger engine. "
     "Return only ASCII lines in this exact key=value format:\n"
@@ -687,5 +782,6 @@ __all__ = [
     "OpenAIVisionObservationProvider",
     "ProactiveAudioSnapshot",
     "ProactiveVisionSnapshot",
+    "ReSpeakerAudioObservationProvider",
     "parse_vision_observation_text",
 ]

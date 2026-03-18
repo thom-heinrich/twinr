@@ -8,6 +8,7 @@ Pi-side audio setup script for Twinr playback, capture, and proactive listening 
 - select ALSA and PipeWire/Pulse default devices for Twinr
 - support split playback/capture defaults when output and microphone hardware differ
 - persist proactive-audio env keys used by the runtime
+- install the XVF3800 USB-access rule needed for non-root host-control reads
 - run bounded playback and capture smoke checks
 
 `mic` does **not** own:
@@ -20,6 +21,7 @@ Pi-side audio setup script for Twinr playback, capture, and proactive listening 
 | File | Purpose |
 |---|---|
 | [setup_audio.sh](./setup_audio.sh) | Configure audio defaults and smoke test |
+| [setup_respeaker_access.sh](./setup_respeaker_access.sh) | Install the XVF3800 udev rule for non-root host-control access |
 
 ## Usage
 
@@ -27,6 +29,7 @@ Pi-side audio setup script for Twinr playback, capture, and proactive listening 
 sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match Jabra --test
 sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match Jabra --capture-device-match reSpeaker --proactive-device-match reSpeaker
 sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match Jabra --proactive-device-match PlayStation
+sudo ./hardware/mic/setup_respeaker_access.sh
 ```
 
 ## See also

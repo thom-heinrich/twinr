@@ -8,6 +8,7 @@ owned_concerns:
   - Maintain wakeword presence-session state from camera, PIR, and speech activity
   - Coordinate proactive monitor ticks across vision, PIR, ambient audio, and wakeword policy paths
   - Export normalized observation facts and ops telemetry from runtime monitoring
+  - Wrap targeted ReSpeaker XVF3800 audio paths with direct signal facts and startup degradation warnings
   - Open and close monitor resources and the bounded worker thread safely
 out_of_scope:
   - Social trigger scoring thresholds, evidence rules, or prompt content

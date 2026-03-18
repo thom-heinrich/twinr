@@ -705,6 +705,55 @@ class MainCliTests(unittest.TestCase):
         self.assertFalse(calls[0]["speak_out_loud"])
         self.assertEqual(calls[0]["live_e2e_environment"], "local")
 
+    def test_long_term_memory_live_acceptance_dispatches_without_runtime_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("", encoding="utf-8")
+            calls: list[dict[str, object]] = []
+            fake_acceptance_module = ModuleType("twinr.memory.longterm.evaluation.live_memory_acceptance")
+
+            def _run_live_memory_acceptance(**kwargs):
+                calls.append(kwargs)
+                return SimpleNamespace(
+                    probe_id="probe_live_memory",
+                    status="ok",
+                    ready=True,
+                    passed_cases=8,
+                    total_cases=8,
+                    queue_before_count=1,
+                    queue_after_count=0,
+                    restart_queue_count=0,
+                    artifact_path=str(root / "artifacts" / "stores" / "ops" / "memory_live_acceptance.json"),
+                    report_path=str(root / "artifacts" / "reports" / "memory_live_acceptance" / "probe_live_memory.json"),
+                )
+
+            fake_acceptance_module.run_live_memory_acceptance = _run_live_memory_acceptance
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {"twinr.memory.longterm.evaluation.live_memory_acceptance": fake_acceptance_module},
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_build_runtime", side_effect=AssertionError("runtime must not be created")):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--long-term-memory-live-acceptance",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["env_path"], str(env_path))
+
     def test_wakeword_label_capture_dispatches_to_proactive_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

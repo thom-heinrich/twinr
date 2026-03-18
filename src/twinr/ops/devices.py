@@ -16,6 +16,7 @@ import subprocess
 from urllib.parse import urlsplit, urlunsplit
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.hardware.respeaker import capture_respeaker_primitive_snapshot, config_targets_respeaker
 from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.locks import loop_lock_owner
 
@@ -122,6 +123,8 @@ def collect_device_overview(
             _safe_collect_device_status("audio_input", "Primary Audio", lambda: _collect_primary_audio_status(config, latest_self_tests)),
             # AUDIT-FIX(#1): Isolate each probe so one broken subsystem does not blank the full dashboard.
             _safe_collect_device_status("proactive_audio", "Background Audio", lambda: _collect_proactive_audio_status(config, latest_self_tests)),
+            # AUDIT-FIX(#1): Isolate each probe so one broken subsystem does not blank the full dashboard.
+            _safe_collect_device_status("respeaker", "ReSpeaker XVF3800", lambda: _collect_respeaker_status(config, latest_self_tests)),
             # AUDIT-FIX(#1): Isolate each probe so one broken subsystem does not blank the full dashboard.
             _safe_collect_device_status("pir", "PIR Motion", lambda: _collect_pir_status(config, latest_self_tests, last_motion_at=last_motion_at)),
             # AUDIT-FIX(#1): Isolate each probe so one broken subsystem does not blank the full dashboard.
@@ -329,6 +332,87 @@ def _collect_proactive_audio_status(
             DeviceFact("Distress detector", "enabled" if config.proactive_audio_distress_enabled else "disabled"),
             DeviceFact("Last self-test", _self_test_label(latest_self_tests, "proactive_mic")),
         ),
+    )
+
+
+def _collect_respeaker_status(
+    config: TwinrConfig,
+    latest_self_tests: dict[str, _SelfTestSnapshot] | None,
+) -> DeviceStatus:
+    primary_device = _strip_text(getattr(config, "audio_input_device", ""))
+    proactive_device = _strip_text(getattr(config, "proactive_audio_input_device", ""))
+    configured = config_targets_respeaker(primary_device, proactive_device)
+    snapshot = capture_respeaker_primitive_snapshot()
+    probe = snapshot.probe
+
+    usb_label = "not detected"
+    if probe.usb_device is not None:
+        usb_label = probe.usb_device.description or probe.usb_device.raw_line
+    elif not probe.lsusb_available:
+        usb_label = "lsusb unavailable"
+
+    alsa_label = "not detected"
+    if probe.capture_device is not None:
+        capture = probe.capture_device
+        alsa_label = capture.hw_identifier or capture.card_label or capture.raw_line
+    elif not probe.arecord_available:
+        alsa_label = "arecord unavailable"
+
+    status = "muted"
+    summary = "No ReSpeaker XVF3800 is configured or detected."
+    notes: list[str] = []
+    if probe.capture_ready and snapshot.host_control_ready:
+        status = "ok"
+        summary = "ReSpeaker XVF3800 is visible, ALSA capture is ready, and host-control primitives are readable."
+    elif probe.capture_ready:
+        status = "warn"
+        summary = "ReSpeaker XVF3800 is ALSA capture-ready, but host-control primitives are degraded."
+        if snapshot.transport.requires_elevated_permissions:
+            notes.append("The runtime user likely lacks the USB permissions required for XVF3800 host-control reads.")
+    elif probe.usb_visible and probe.arecord_available:
+        status = "warn"
+        summary = "ReSpeaker XVF3800 is USB-visible, but no ALSA capture card is ready."
+    elif probe.usb_visible:
+        status = "warn"
+        summary = "ReSpeaker XVF3800 is USB-visible, but ALSA capture readiness could not be verified."
+    elif configured:
+        status = "fail"
+        summary = "Twinr is configured for ReSpeaker XVF3800 capture, but the device is not detected."
+
+    firmware_label = _respeaker_firmware_label(snapshot.firmware_version)
+    azimuth_label = _display_optional_number(snapshot.direction.doa_degrees, default="unknown")
+    beam_energy_label = _display_float_tuple(snapshot.direction.beam_speech_energies)
+    gpo_label = _display_int_tuple(snapshot.mute.gpo_logic_levels)
+    host_control_label = "yes" if snapshot.host_control_ready else "no"
+    transport_reason = _display_text(snapshot.transport.reason, default="none")
+
+    if probe.usb_visible and not probe.capture_ready and probe.arecord_available:
+        notes.append("USB-visible without ALSA capture usually means DFU/safe mode or incomplete runtime.")
+
+    return DeviceStatus(
+        key="respeaker",
+        label="ReSpeaker XVF3800",
+        status=status,
+        summary=summary,
+        facts=(
+            DeviceFact("Configured for Twinr", "yes" if configured else "no"),
+            DeviceFact("Primary route", primary_device or "not configured"),
+            DeviceFact("Background route", proactive_device or "not configured"),
+            DeviceFact("Probe state", probe.state),
+            DeviceFact("Host control", host_control_label),
+            DeviceFact("Transport reason", transport_reason),
+            DeviceFact("Firmware", firmware_label or "unknown"),
+            DeviceFact("Speech detected", _display_optional_bool(snapshot.direction.speech_detected)),
+            DeviceFact("Room quiet", _display_optional_bool(snapshot.direction.room_quiet)),
+            DeviceFact("DOA azimuth", azimuth_label),
+            DeviceFact("Beam speech energy", beam_energy_label),
+            DeviceFact("Mute state", _display_optional_bool(snapshot.mute.mute_active)),
+            DeviceFact("GPO levels", gpo_label),
+            DeviceFact("USB device", usb_label),
+            DeviceFact("ALSA capture", alsa_label),
+            DeviceFact("Last self-test", _self_test_label(latest_self_tests, "proactive_mic")),
+        ),
+        notes=tuple(notes),
     )
 
 
@@ -691,6 +775,56 @@ def _display_text(value: object, *, default: str = "—", max_length: int = 240)
     if len(text) > max_length:
         return f"{text[: max_length - 1].rstrip()}…"
     return text
+
+
+def _display_optional_bool(value: object, *, default: str = "unknown") -> str:
+    """Render one tri-state boolean for device facts."""
+
+    normalized = _as_bool(value)
+    if normalized is None:
+        return default
+    return "yes" if normalized else "no"
+
+
+def _display_optional_number(value: object, *, default: str = "—") -> str:
+    """Render one optional integer-like device fact."""
+
+    if value is None:
+        return default
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _display_float_tuple(values: tuple[float | None, ...] | None, *, default: str = "unknown") -> str:
+    """Render one bounded tuple of floats for dashboard facts."""
+
+    if not values:
+        return default
+    rendered: list[str] = []
+    for value in values:
+        if value is None:
+            rendered.append("—")
+            continue
+        rendered.append(f"{float(value):.3f}")
+    return ", ".join(rendered)
+
+
+def _display_int_tuple(values: tuple[int, ...] | None, *, default: str = "unknown") -> str:
+    """Render one bounded tuple of integers for dashboard facts."""
+
+    if not values:
+        return default
+    return ", ".join(str(int(value)) for value in values)
+
+
+def _respeaker_firmware_label(version: tuple[int, int, int] | None) -> str | None:
+    """Render one XVF3800 firmware tuple for the dashboard."""
+
+    if version is None or len(version) != 3:
+        return None
+    return ".".join(str(int(part)) for part in version)
 
 
 def _as_bool(value: object) -> bool | None:

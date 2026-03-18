@@ -1,0 +1,297 @@
+# ReSpeaker XVF3800 Requirements
+
+## Purpose
+
+This document defines what Twinr must integrate from the ReSpeaker XVF3800 so
+later product work can safely implement the prioritized roadmap around:
+
+- presence-aware behavior
+- conservative proactive policy
+- resume and turn-taking quality
+- audio-side friction detection
+- confidence-bearing speaker-track association
+- calm, readable device state
+
+This is not a generic microphone checklist. It is the concrete requirements and
+todo list for turning the XVF3800 into a first-class Twinr sensor.
+
+## Product Rule
+
+The ReSpeaker should be treated as:
+
+- an `audio presence sensor`
+- a `speech activity and interruption sensor`
+- a `direction / azimuth hint source`
+- a `mute and device-state signal source`
+
+The ReSpeaker should not be treated as:
+
+- an identity sensor
+- an emotion detector
+- an object detector
+- a gesture sensor
+- a standalone basis for sensitive personalization
+
+## Capability Boundary
+
+The XVF3800 is useful for Twinr because it can plausibly support or expose:
+
+- bounded microphone capture
+- speech activity / VAD-like signals
+- direction-of-arrival / azimuth-style hints
+- beamformed audio paths
+- mute state and mute button semantics
+- LED ring status output
+
+The XVF3800 does not by itself provide:
+
+- object detection
+- gesture recognition
+- head pose or dwell time
+- person identity
+- safe private-content routing between multiple nearby people
+
+## What Twinr Already Has
+
+The current Twinr stack already has useful foundations that the ReSpeaker path
+should plug into instead of bypassing:
+
+- presence-session arming and grace windows
+- proactive cooldown and reservation governance
+- bounded ambient audio observation
+- long-term sensor routine ingestion
+- wakeword monitoring and proactive audio-device selection
+
+Relevant current paths:
+
+- `src/twinr/proactive/runtime/`
+- `src/twinr/proactive/governance/`
+- `src/twinr/proactive/social/`
+- `src/twinr/memory/longterm/ingestion/`
+- `hardware/mic/`
+
+## Required Integration Layers
+
+### 1. Device And Runtime Contract
+
+Twinr must have a stable ReSpeaker runtime contract on the Raspberry Pi.
+
+Requirements:
+
+- [x] Detect XVF3800 runtime mode versus DFU / safe mode during startup.
+- [ ] Fail clearly when the board is visible only in DFU mode.
+- [ ] Keep a stable input-device selection path for both conversation audio and proactive audio.
+- [ ] Expose one operator-visible health view with device mode, mute state, and capture readiness.
+- [ ] Ensure hotplug / reboot recovery does not leave Twinr on a dead audio device.
+- [x] Bound all audio waits and lock contention so the runtime cannot wedge.
+- [ ] Keep playback and capture separation intact when Jabra remains the output sink.
+
+Acceptance:
+
+- [x] Pi reboot proof
+- [ ] unplug / replug proof
+- [x] supervisor restart proof
+- [x] health page or self-test evidence
+
+### 2. ReSpeaker Signal Provider
+
+Twinr needs one focused adapter that converts XVF3800-specific state into
+structured facts. This should not live as scattered shell calls or ad-hoc code
+inside orchestration loops.
+
+Required outputs:
+
+- [x] `speech_detected`
+- [x] `room_quiet`
+- [x] `recent_speech_age_s`
+- [x] `azimuth_deg` or equivalent directional bucket
+- [ ] `direction_confidence`
+- [x] `beam_activity` or equivalent beam-energy summary
+- [ ] `barge_in_detected`
+- [ ] `speech_overlap_likely`
+- [ ] `mute_active`
+- [x] `device_runtime_mode`
+
+Signal-quality rules:
+
+- [ ] Every field must carry `captured_at`.
+- [ ] Every inferred field must carry `confidence`.
+- [ ] The provider must degrade to explicit `unknown`, not guessed defaults.
+- [ ] The provider must never emit raw PCM into long-term memory objects.
+
+### 3. Confidence And Source Contract
+
+Every ReSpeaker-derived claim must remain inspectable.
+
+Required metadata:
+
+- [x] `source = respeaker_xvf3800`
+- [x] `source_type = observed`
+- [ ] `confidence`
+- [x] `sensor_window_ms`
+- [ ] `session_id` when tied to an active conversation or presence session
+- [ ] `requires_confirmation` for anything user-facing beyond direct local state
+
+Required memory classes:
+
+- [ ] `ephemeral_state`
+- [ ] `session_memory`
+- [ ] `observed_preference`
+- [ ] `confirmed_preference`
+
+Rules:
+
+- [ ] `observed_preference` must never be treated as equivalent to `confirmed_preference`.
+- [ ] Multi-person or low-confidence audio evidence must not drive sensitive behavior.
+
+### 4. Policy Hooks
+
+The ReSpeaker must feed the policy layer, not replace it.
+
+Required policy inputs:
+
+- [ ] `presence_audio_active`
+- [ ] `recent_follow_up_speech`
+- [ ] `room_busy_or_overlapping`
+- [ ] `quiet_window_open`
+- [ ] `barge_in_recent`
+- [ ] `speaker_direction_stable`
+- [ ] `mute_blocks_voice_capture`
+
+Required suppression gates:
+
+- [ ] Never speak proactively when overlap or multi-speaker audio is likely.
+- [ ] After ignored or interrupted proactive speech, fall back to display-first.
+- [ ] Enforce global cooldown and per-source repeat cooldown on audio-triggered initiatives.
+- [ ] Keep quiet-hour behavior visual-first unless explicitly safety-related.
+
+### 5. HCI And Awareness
+
+The device must make ReSpeaker-driven state legible.
+
+Required operator- and user-visible states:
+
+- [ ] `mic_muted`
+- [ ] `listening`
+- [ ] `heard_speech`
+- [ ] `noise_blocked`
+- [ ] `resume_window_open`
+- [ ] `direction_hint_available`
+- [ ] `respeaker_unavailable`
+- [ ] `respeaker_dfu_mode`
+
+Required HCI hooks:
+
+- [ ] Map mute state clearly into display / status wording.
+- [ ] Decide whether the LED ring mirrors listening state, direction hint, or stays unused.
+- [ ] Keep status semantics calm and deterministic; never flicker between states on weak audio evidence.
+
+### 6. Memory And Learning
+
+The ReSpeaker should support learning only where the signal is defensible.
+
+Allowed long-term learning targets:
+
+- [ ] typical conversation-start dayparts
+- [ ] typical quiet windows
+- [ ] typical response-channel preferences when later confirmed
+- [ ] repeated friction patterns around wakeword or interruptions
+- [ ] repeated resume behavior after short pauses
+
+Disallowed from ReSpeaker alone:
+
+- [ ] identity memory
+- [ ] emotional state memory
+- [ ] wellbeing claims
+- [ ] private-content routing by assumed person identity
+
+### 7. Runtime Scheduling
+
+The XVF3800 path must stay Pi-friendly.
+
+Requirements:
+
+- [ ] Keep cheap audio sensing available continuously only when bounded.
+- [ ] Keep any heavier direction or host-control polling out of the hot path when possible.
+- [ ] Prefer event-driven or low-frequency polling over constant expensive inspection.
+- [ ] Make the ReSpeaker path composable with PIR and camera gating rather than always-on maximal processing.
+
+## Feature Mapping
+
+This section maps the product roadmap to the ReSpeaker contribution.
+
+| Target feature | ReSpeaker contribution | Additional dependencies |
+|---|---|---|
+| Presence Ladder | Strong | PIR, camera, policy |
+| Initiative Score | Strong as feature source | Governor, suppression logic |
+| Resume Engine | Strong | Conversation state and follow-up policy |
+| Friction Detector | Strong for audio-side friction | Runtime event aggregation |
+| Mikro-Consent | Indirect trigger only | LLM policy and memory typing |
+| Awareness State Machine | Partial but important | Display and runtime state machine |
+| Speaker-track association | Partial with confidence only | Camera tracks and fusion |
+| Engagement adaptivity | Audio subset only | Vision for gaze/head pose |
+| Object-based proactivity | None | Camera / vision stack |
+| Gestural interface | None | Camera / gesture stack |
+| Passive routine learning | Partial for audio routines | Long-term memory planner |
+| Confidence Layer | Strong requirement | Shared schema across sensors |
+| Cooldown / suppression logic | Strong input provider | Governor and runtime policy |
+| Memory typing | Indirect | Memory model and policy |
+| Runtime scheduler | Strong constraint | Proactive runtime orchestration |
+
+## Build Order
+
+### V1 Foundation
+
+These items are mandatory before any ambitious proactive behavior.
+
+- [x] Implement a dedicated XVF3800 capability probe and runtime-mode detector.
+- [x] Implement one `ReSpeakerSignalProvider` module under `src/twinr/...`.
+- [ ] Emit structured audio-direction facts with confidence and timestamps.
+- [ ] Feed those facts into presence sessions and proactive governor inputs.
+- [x] Add mute-state and device-mode visibility to operator diagnostics.
+- [ ] Add Pi acceptance proofs for runtime mode, capture, restart, and hotplug recovery.
+
+### V2 Product Hooks
+
+- [ ] Use ReSpeaker facts for initiative scoring and resume decisions.
+- [ ] Add audio-side friction signals such as barge-in and overlap.
+- [ ] Add awareness-state transitions such as `noise_blocked` and `resume_window_open`.
+- [ ] Add bounded memory ingestion for audio interaction routines.
+
+### V3 Sensor Fusion
+
+- [ ] Fuse azimuth hints with camera tracks for conservative speaker-track association.
+- [ ] Use ReSpeaker as one confidence-bearing input to richer multimodal initiative policy.
+- [ ] Gate later proactive behaviors on explicit confidence and suppression rules.
+
+## Explicit Non-Goals For This Path
+
+These are not valid reasons to extend the ReSpeaker path on its own:
+
+- emotion detection
+- medical-state inference
+- hidden-person identity claims
+- broad surveillance summaries
+- gesture support without a dedicated non-audio sensor
+
+## Pi Acceptance Checklist
+
+The ReSpeaker path is not done until these pass on `/twinr`.
+
+- [ ] Twinr starts with Jabra output and ReSpeaker input without manual fixes.
+- [ ] Device diagnostics show XVF3800 mode and capture readiness.
+- [ ] Proactive runtime reads ReSpeaker signals without blocking the main loop.
+- [ ] Wakeword / presence / proactive audio path recovers after supervisor restart.
+- [ ] Disconnect / reconnect errors are explicit and operator-readable.
+- [ ] Long-term memory stores only structured facts, not raw audio.
+
+## Documentation Follow-Up
+
+When implementation starts, update these paths together:
+
+- `hardware/mic/README.md`
+- `src/twinr/proactive/README.md`
+- `src/twinr/proactive/runtime/README.md`
+- `src/twinr/memory/longterm/README.md`
+
+This keeps the hardware contract, runtime contract, and memory contract aligned.

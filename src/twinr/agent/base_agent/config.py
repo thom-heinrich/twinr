@@ -328,6 +328,23 @@ class TwinrConfig:
     vision_reference_image_path: str | None = None
     openai_vision_detail: str = "auto"
     proactive_enabled: bool = False
+    proactive_vision_provider: str = "local_first"
+    proactive_local_camera_detection_network_path: str = "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk"
+    proactive_local_camera_pose_network_path: str = "/usr/share/imx500-models/imx500_network_posenet.rpk"
+    proactive_local_camera_source_device: str = "imx500"
+    proactive_local_camera_frame_rate: int = 10
+    proactive_local_camera_lock_timeout_s: float = 5.0
+    proactive_local_camera_startup_warmup_s: float = 0.8
+    proactive_local_camera_metadata_wait_s: float = 3.0
+    proactive_local_camera_person_confidence_threshold: float = 0.40
+    proactive_local_camera_object_confidence_threshold: float = 0.55
+    proactive_local_camera_person_near_area_threshold: float = 0.20
+    proactive_local_camera_person_near_height_threshold: float = 0.55
+    proactive_local_camera_object_near_area_threshold: float = 0.08
+    proactive_local_camera_attention_score_threshold: float = 0.62
+    proactive_local_camera_engaged_score_threshold: float = 0.45
+    proactive_local_camera_pose_confidence_threshold: float = 0.30
+    proactive_local_camera_pose_refresh_s: float = 12.0
     proactive_poll_interval_s: float = 4.0
     proactive_capture_interval_s: float = 6.0
     proactive_motion_window_s: float = 20.0
@@ -495,6 +512,8 @@ class TwinrConfig:
     display_wayland_runtime_dir: str | None = None
     display_face_cue_path: str = "artifacts/stores/ops/display_face_cue.json"
     display_face_cue_ttl_s: float = 4.0
+    display_presentation_path: str = "artifacts/stores/ops/display_presentation.json"
+    display_presentation_ttl_s: float = 20.0
     display_vendor_dir: str = "state/display/vendor"
     display_spi_bus: int = 0
     display_spi_device: int = 0
@@ -546,9 +565,17 @@ class TwinrConfig:
         if not math.isfinite(normalized_display_face_cue_ttl_s):
             raise ValueError("display_face_cue_ttl_s must be finite")
         normalized_display_face_cue_ttl_s = max(0.1, normalized_display_face_cue_ttl_s)
+        normalized_display_presentation_ttl_s = float(self.display_presentation_ttl_s)
+        if not math.isfinite(normalized_display_presentation_ttl_s):
+            raise ValueError("display_presentation_ttl_s must be finite")
+        normalized_display_presentation_ttl_s = max(0.1, normalized_display_presentation_ttl_s)
         normalized_display_face_cue_path = (
             str(self.display_face_cue_path or "artifacts/stores/ops/display_face_cue.json").strip()
             or "artifacts/stores/ops/display_face_cue.json"
+        )
+        normalized_display_presentation_path = (
+            str(self.display_presentation_path or "artifacts/stores/ops/display_presentation.json").strip()
+            or "artifacts/stores/ops/display_presentation.json"
         )
         object.__setattr__(self, "long_term_memory_mode", normalized_mode)
         object.__setattr__(
@@ -560,6 +587,8 @@ class TwinrConfig:
         object.__setattr__(self, "display_busy_timeout_s", normalized_display_busy_timeout_s)
         object.__setattr__(self, "display_face_cue_path", normalized_display_face_cue_path)
         object.__setattr__(self, "display_face_cue_ttl_s", normalized_display_face_cue_ttl_s)
+        object.__setattr__(self, "display_presentation_path", normalized_display_presentation_path)
+        object.__setattr__(self, "display_presentation_ttl_s", normalized_display_presentation_ttl_s)
         object.__setattr__(self, "display_layout", normalized_display_layout)
 
     @property
@@ -1063,6 +1092,75 @@ class TwinrConfig:
             vision_reference_image_path=get_value("TWINR_VISION_REFERENCE_IMAGE"),
             openai_vision_detail=get_value("OPENAI_VISION_DETAIL", "auto") or "auto",
             proactive_enabled=_parse_bool(get_value("TWINR_PROACTIVE_ENABLED"), False),
+            proactive_vision_provider=(get_value("TWINR_PROACTIVE_VISION_PROVIDER", "local_first") or "local_first").strip().lower(),
+            proactive_local_camera_detection_network_path=(
+                get_value(
+                    "TWINR_PROACTIVE_LOCAL_CAMERA_DETECTION_NETWORK_PATH",
+                    "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk",
+                )
+                or "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk"
+            ),
+            proactive_local_camera_pose_network_path=(
+                get_value(
+                    "TWINR_PROACTIVE_LOCAL_CAMERA_POSE_NETWORK_PATH",
+                    "/usr/share/imx500-models/imx500_network_posenet.rpk",
+                )
+                or "/usr/share/imx500-models/imx500_network_posenet.rpk"
+            ),
+            proactive_local_camera_source_device=(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_SOURCE_DEVICE", "imx500") or "imx500"
+            ),
+            proactive_local_camera_frame_rate=int(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_FRAME_RATE", "10") or "10"
+            ),
+            proactive_local_camera_lock_timeout_s=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_LOCK_TIMEOUT_S"),
+                5.0,
+            ),
+            proactive_local_camera_startup_warmup_s=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_STARTUP_WARMUP_S"),
+                0.8,
+            ),
+            proactive_local_camera_metadata_wait_s=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_METADATA_WAIT_S"),
+                3.0,
+            ),
+            proactive_local_camera_person_confidence_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_PERSON_CONFIDENCE_THRESHOLD"),
+                0.40,
+            ),
+            proactive_local_camera_object_confidence_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_OBJECT_CONFIDENCE_THRESHOLD"),
+                0.55,
+            ),
+            proactive_local_camera_person_near_area_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_PERSON_NEAR_AREA_THRESHOLD"),
+                0.20,
+            ),
+            proactive_local_camera_person_near_height_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_PERSON_NEAR_HEIGHT_THRESHOLD"),
+                0.55,
+            ),
+            proactive_local_camera_object_near_area_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_OBJECT_NEAR_AREA_THRESHOLD"),
+                0.08,
+            ),
+            proactive_local_camera_attention_score_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_ATTENTION_SCORE_THRESHOLD"),
+                0.62,
+            ),
+            proactive_local_camera_engaged_score_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_ENGAGED_SCORE_THRESHOLD"),
+                0.45,
+            ),
+            proactive_local_camera_pose_confidence_threshold=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_POSE_CONFIDENCE_THRESHOLD"),
+                0.30,
+            ),
+            proactive_local_camera_pose_refresh_s=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_POSE_REFRESH_S"),
+                12.0,
+            ),
             proactive_poll_interval_s=_parse_float(get_value("TWINR_PROACTIVE_POLL_INTERVAL_S"), 4.0),
             proactive_capture_interval_s=_parse_float(get_value("TWINR_PROACTIVE_CAPTURE_INTERVAL_S"), 6.0),
             proactive_motion_window_s=_parse_float(get_value("TWINR_PROACTIVE_MOTION_WINDOW_S"), 20.0),
@@ -1583,6 +1681,16 @@ class TwinrConfig:
             )
             or "artifacts/stores/ops/display_face_cue.json",
             display_face_cue_ttl_s=_parse_float(get_value("TWINR_DISPLAY_FACE_CUE_TTL_S"), 4.0, minimum=0.1),
+            display_presentation_path=get_value(
+                "TWINR_DISPLAY_PRESENTATION_PATH",
+                "artifacts/stores/ops/display_presentation.json",
+            )
+            or "artifacts/stores/ops/display_presentation.json",
+            display_presentation_ttl_s=_parse_float(
+                get_value("TWINR_DISPLAY_PRESENTATION_TTL_S"),
+                20.0,
+                minimum=0.1,
+            ),
             display_vendor_dir=get_value("TWINR_DISPLAY_VENDOR_DIR", "state/display/vendor")
             or "state/display/vendor",
             display_spi_bus=int(get_value("TWINR_DISPLAY_SPI_BUS", "0") or "0"),

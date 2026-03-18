@@ -11,6 +11,7 @@ and presence-session state used to arm wakeword listening and proactive checks.
 - Coordinate proactive monitor ticks across PIR, camera, ambient audio, and wakeword policy paths
 - Maintain wakeword presence-session state from recent sensor activity
 - Export normalized observation facts and ops telemetry from proactive monitoring
+- Inject ReSpeaker XVF3800 signal facts into runtime audio observations when that device is targeted
 - Open and close the bounded proactive monitor worker and its resources
 
 `runtime` does **not** own:

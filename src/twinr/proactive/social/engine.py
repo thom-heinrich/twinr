@@ -87,6 +87,43 @@ def _normalize_non_negative_float(value: object, *, default: float = 0.0) -> flo
     return number
 
 
+def _coerce_recent_age(value: object) -> float | None:
+    """Coerce one age-like value to a non-negative finite float."""
+
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0.0:
+        return None
+    return number
+
+
+def _coerce_optional_text(value: object, *, limit: int) -> str | None:
+    """Coerce one optional text field into bounded ASCII-safe text."""
+
+    if value is None:
+        return None
+    text = " ".join(str(value).split()).strip()
+    if not text:
+        return None
+    return text[:limit]
+
+
+def _coerce_optional_azimuth(value: object) -> int | None:
+    """Coerce one azimuth value into ``0..359`` or ``None``."""
+
+    if value is None:
+        return None
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return number % 360
+
+
 def _normalize_unit_interval(value: object, *, default: float) -> float:
     """Clamp one numeric value into ``[0.0, 1.0]`` with fallback."""
 
@@ -108,7 +145,9 @@ class SocialBodyPose(StrEnum):
 
     UNKNOWN = "unknown"
     UPRIGHT = "upright"
+    SEATED = "seated"
     SLUMPED = "slumped"
+    LYING_LOW = "lying_low"
     FLOOR = "floor"
 
 
@@ -119,6 +158,83 @@ class SocialPersonZone(StrEnum):
     LEFT = "left"
     CENTER = "center"
     RIGHT = "right"
+
+
+class SocialGestureEvent(StrEnum):
+    """Describe the tiny gesture vocabulary exposed to policy consumers."""
+
+    NONE = "none"
+    STOP = "stop"
+    DISMISS = "dismiss"
+    CONFIRM = "confirm"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class SocialSpatialBox:
+    """Describe one normalized bounding box in ``top,left,bottom,right`` order."""
+
+    top: float
+    left: float
+    bottom: float
+    right: float
+
+    def __post_init__(self) -> None:
+        """Clamp coordinates into bounds and enforce monotonic edges."""
+
+        top = _normalize_unit_interval(self.top, default=0.0)
+        left = _normalize_unit_interval(self.left, default=0.0)
+        bottom = _normalize_unit_interval(self.bottom, default=top)
+        right = _normalize_unit_interval(self.right, default=left)
+        if bottom < top:
+            bottom = top
+        if right < left:
+            right = left
+        object.__setattr__(self, "top", top)
+        object.__setattr__(self, "left", left)
+        object.__setattr__(self, "bottom", bottom)
+        object.__setattr__(self, "right", right)
+
+    @property
+    def center_x(self) -> float:
+        """Return the normalized horizontal center."""
+
+        return (self.left + self.right) / 2.0
+
+    @property
+    def center_y(self) -> float:
+        """Return the normalized vertical center."""
+
+        return (self.top + self.bottom) / 2.0
+
+    @property
+    def area(self) -> float:
+        """Return the normalized area."""
+
+        return max(0.0, self.bottom - self.top) * max(0.0, self.right - self.left)
+
+
+@dataclass(frozen=True, slots=True)
+class SocialDetectedObject:
+    """Describe one explicit object detection for downstream policy consumers."""
+
+    label: str
+    confidence: float
+    zone: SocialPersonZone = SocialPersonZone.UNKNOWN
+    stable: bool = False
+    box: SocialSpatialBox | None = None
+
+    def __post_init__(self) -> None:
+        """Normalize object metadata into bounded, inspectable values."""
+
+        label = str(self.label or "").strip().lower().replace(" ", "_")
+        if not label:
+            label = "unknown"
+        object.__setattr__(self, "label", label[:64])
+        object.__setattr__(self, "confidence", _normalize_unit_interval(self.confidence, default=0.0))
+        object.__setattr__(self, "zone", _coerce_person_zone(self.zone))
+        object.__setattr__(self, "stable", _coerce_bool(self.stable))
+        object.__setattr__(self, "box", _coerce_spatial_box(self.box))
 
 
 def _coerce_body_pose(value: object) -> SocialBodyPose:
@@ -133,6 +249,20 @@ def _coerce_body_pose(value: object) -> SocialBodyPose:
         except ValueError:
             return SocialBodyPose.UNKNOWN
     return SocialBodyPose.UNKNOWN
+
+
+def _coerce_gesture_event(value: object) -> SocialGestureEvent:
+    """Coerce one value to a known gesture event."""
+
+    if isinstance(value, SocialGestureEvent):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        try:
+            return SocialGestureEvent(normalized)
+        except ValueError:
+            return SocialGestureEvent.UNKNOWN
+    return SocialGestureEvent.UNKNOWN
 
 
 def _coerce_person_zone(value: object) -> SocialPersonZone:
@@ -163,6 +293,95 @@ def _coerce_non_negative_int(value: object, *, default: int) -> int:
     return number
 
 
+def _coerce_bounded_text(value: object, *, max_length: int = 160) -> str | None:
+    """Coerce one value to bounded operator-safe text."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:max_length]
+
+
+def _coerce_spatial_box(value: object) -> SocialSpatialBox | None:
+    """Coerce one value to one normalized spatial box."""
+
+    if isinstance(value, SocialSpatialBox):
+        return value
+    if isinstance(value, dict):
+        candidate = (
+            value.get("top"),
+            value.get("left"),
+            value.get("bottom"),
+            value.get("right"),
+        )
+    elif isinstance(value, (tuple, list)) and len(value) == 4:
+        candidate = tuple(value)
+    else:
+        candidate = None
+    if candidate is None:
+        return None
+    try:
+        top, left, bottom, right = (float(item) for item in candidate)
+    except (TypeError, ValueError):
+        return None
+    return SocialSpatialBox(top=top, left=left, bottom=bottom, right=right)
+
+
+def _coerce_optional_ratio(value: object) -> float | None:
+    """Coerce one optional ratio value into ``[0.0, 1.0]``."""
+
+    if value is None:
+        return None
+    return _normalize_unit_interval(value, default=0.0)
+
+
+def _coerce_detected_object(value: object) -> SocialDetectedObject | None:
+    """Coerce one object-like payload to ``SocialDetectedObject``."""
+
+    if isinstance(value, SocialDetectedObject):
+        return value
+    if isinstance(value, dict):
+        return SocialDetectedObject(
+            label=value.get("label", ""),
+            confidence=value.get("confidence", 0.0),
+            zone=value.get("zone", SocialPersonZone.UNKNOWN),
+            stable=value.get("stable", False),
+            box=value.get("box"),
+        )
+    return None
+
+
+def _coerce_detected_objects(value: object) -> tuple[SocialDetectedObject, ...]:
+    """Coerce one iterable payload to a tuple of detected objects."""
+
+    if value is None:
+        return ()
+    if isinstance(value, tuple) and all(isinstance(item, SocialDetectedObject) for item in value):
+        return value
+    if not isinstance(value, (tuple, list)):
+        return ()
+    items: list[SocialDetectedObject] = []
+    for item in value:
+        detected = _coerce_detected_object(item)
+        if detected is not None:
+            items.append(detected)
+    return tuple(items)
+
+
+def _is_floor_like_pose(body_pose: SocialBodyPose) -> bool:
+    """Return whether one coarse pose should count as floor-like."""
+
+    return body_pose in {SocialBodyPose.LYING_LOW, SocialBodyPose.FLOOR}
+
+
+def _is_upright_like_pose(body_pose: SocialBodyPose) -> bool:
+    """Return whether one pose should count as upright for transitions."""
+
+    return body_pose in {SocialBodyPose.UPRIGHT, SocialBodyPose.SEATED, SocialBodyPose.SLUMPED}
+
+
 class SocialTriggerPriority(IntEnum):
     """Order social triggers from least to most urgent."""
 
@@ -182,11 +401,33 @@ class SocialVisionObservation:
 
     person_visible: bool = False
     person_count: int = 0
+    person_recently_visible: bool | None = None
+    person_appeared_at: float | None = None
+    person_disappeared_at: float | None = None
     primary_person_zone: SocialPersonZone = SocialPersonZone.UNKNOWN
+    primary_person_box: SocialSpatialBox | None = None
+    primary_person_center_x: float | None = None
+    primary_person_center_y: float | None = None
     looking_toward_device: bool = False
+    person_near_device: bool | None = None
+    engaged_with_device: bool | None = None
+    visual_attention_score: float | None = None
     body_pose: SocialBodyPose = SocialBodyPose.UNKNOWN
+    pose_confidence: float | None = None
+    body_state_changed_at: float | None = None
     smiling: bool = False
     hand_or_object_near_camera: bool = False
+    showing_intent_likely: bool | None = None
+    showing_intent_started_at: float | None = None
+    gesture_event: SocialGestureEvent = SocialGestureEvent.NONE
+    gesture_confidence: float | None = None
+    objects: tuple[SocialDetectedObject, ...] = ()
+    camera_online: bool = False
+    camera_ready: bool = False
+    camera_ai_ready: bool = False
+    camera_error: str | None = None
+    last_camera_frame_at: float | None = None
+    last_camera_health_change_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +436,14 @@ class SocialAudioObservation:
 
     speech_detected: bool | None = None
     distress_detected: bool | None = None
+    room_quiet: bool | None = None
+    recent_speech_age_s: float | None = None
+    azimuth_deg: int | None = None
+    device_runtime_mode: str | None = None
+    signal_source: str | None = None
+    host_control_ready: bool | None = None
+    transport_reason: str | None = None
+    mute_active: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -526,13 +775,18 @@ class SocialTriggerEngine:
             now,
         )
         self._floor_since = self._next_since(
-            inspected and vision.person_visible and vision.body_pose == SocialBodyPose.FLOOR,
+            inspected and vision.person_visible and _is_floor_like_pose(vision.body_pose),
             self._floor_since,
             now,
         )
         self._low_motion_since = self._next_since(low_motion, self._low_motion_since, now)
         self._showing_since = self._next_since(
-            inspected and vision.person_visible and vision.looking_toward_device and vision.hand_or_object_near_camera,
+            inspected
+            and vision.person_visible
+            and (
+                vision.showing_intent_likely is True
+                or (vision.looking_toward_device and vision.hand_or_object_near_camera)
+            ),
             self._showing_since,
             now,
         )
@@ -1015,14 +1269,14 @@ class SocialTriggerEngine:
         # AUDIT-FIX(#1): Only inspected, person-present frames may mutate pose state; otherwise stale/unknown vision drops can fabricate transitions.
         if not inspected or not person_visible:
             return
-        if body_pose in {SocialBodyPose.UPRIGHT, SocialBodyPose.SLUMPED}:
+        if _is_upright_like_pose(body_pose):
             self._last_non_floor_pose_at = now
         if body_pose == SocialBodyPose.SLUMPED:
             self._last_slumped_at = now
         if body_pose == self._current_pose:
             return
         self._current_pose = body_pose
-        if body_pose == SocialBodyPose.FLOOR:
+        if _is_floor_like_pose(body_pose):
             if (
                 self._last_non_floor_pose_at is not None
                 and (now - self._last_non_floor_pose_at) <= self.thresholds.fall_transition_window_s
@@ -1161,7 +1415,7 @@ class SocialTriggerEngine:
             return 0.0
         if self._possible_fall_loss_pose == SocialBodyPose.SLUMPED:
             return 0.9
-        if self._possible_fall_loss_pose == SocialBodyPose.UPRIGHT:
+        if self._possible_fall_loss_pose in {SocialBodyPose.UPRIGHT, SocialBodyPose.SEATED}:
             return 0.75
         return 0.55
 
@@ -1260,6 +1514,14 @@ class SocialTriggerEngine:
         return SocialAudioObservation(
             speech_detected=_coerce_optional_bool(audio.speech_detected),
             distress_detected=_coerce_optional_bool(audio.distress_detected),
+            room_quiet=_coerce_optional_bool(getattr(audio, "room_quiet", None)),
+            recent_speech_age_s=_coerce_recent_age(getattr(audio, "recent_speech_age_s", None)),
+            azimuth_deg=_coerce_optional_azimuth(getattr(audio, "azimuth_deg", None)),
+            device_runtime_mode=_coerce_optional_text(getattr(audio, "device_runtime_mode", None), limit=64),
+            signal_source=_coerce_optional_text(getattr(audio, "signal_source", None), limit=64),
+            host_control_ready=_coerce_optional_bool(getattr(audio, "host_control_ready", None)),
+            transport_reason=_coerce_optional_text(getattr(audio, "transport_reason", None), limit=120),
+            mute_active=_coerce_optional_bool(getattr(audio, "mute_active", None)),
         )
 
     def _normalize_vision(
@@ -1275,23 +1537,61 @@ class SocialTriggerEngine:
             return SocialVisionObservation()
 
         person_visible = _coerce_bool(vision.person_visible)
-        if not person_visible:
-            return SocialVisionObservation(
-                person_visible=False,
-                person_count=0,
-                primary_person_zone=SocialPersonZone.UNKNOWN,
-            )
-
+        primary_person_box = (
+            _coerce_spatial_box(getattr(vision, "primary_person_box", None))
+            if person_visible
+            else None
+        )
+        primary_person_center_x = (
+            primary_person_box.center_x
+            if primary_person_box is not None
+            else _coerce_optional_ratio(getattr(vision, "primary_person_center_x", None))
+        )
+        primary_person_center_y = (
+            primary_person_box.center_y
+            if primary_person_box is not None
+            else _coerce_optional_ratio(getattr(vision, "primary_person_center_y", None))
+        )
         return SocialVisionObservation(
-            person_visible=True,
-            person_count=max(1, _coerce_non_negative_int(getattr(vision, "person_count", 1), default=1)),
-            primary_person_zone=_coerce_person_zone(
-                getattr(vision, "primary_person_zone", SocialPersonZone.UNKNOWN)
+            person_visible=person_visible,
+            person_count=(
+                max(1, _coerce_non_negative_int(getattr(vision, "person_count", 1), default=1))
+                if person_visible
+                else 0
             ),
-            looking_toward_device=_coerce_bool(vision.looking_toward_device),
-            body_pose=_coerce_body_pose(vision.body_pose),
-            smiling=_coerce_bool(vision.smiling),
+            person_recently_visible=_coerce_optional_bool(getattr(vision, "person_recently_visible", None)),
+            person_appeared_at=_coerce_timestamp(getattr(vision, "person_appeared_at", None)),
+            person_disappeared_at=_coerce_timestamp(getattr(vision, "person_disappeared_at", None)),
+            primary_person_zone=(
+                _coerce_person_zone(getattr(vision, "primary_person_zone", SocialPersonZone.UNKNOWN))
+                if person_visible
+                else SocialPersonZone.UNKNOWN
+            ),
+            primary_person_box=primary_person_box,
+            primary_person_center_x=(primary_person_center_x if person_visible else None),
+            primary_person_center_y=(primary_person_center_y if person_visible else None),
+            looking_toward_device=person_visible and _coerce_bool(vision.looking_toward_device),
+            person_near_device=_coerce_optional_bool(getattr(vision, "person_near_device", None)),
+            engaged_with_device=_coerce_optional_bool(getattr(vision, "engaged_with_device", None)),
+            visual_attention_score=_coerce_optional_ratio(getattr(vision, "visual_attention_score", None)),
+            body_pose=(_coerce_body_pose(vision.body_pose) if person_visible else SocialBodyPose.UNKNOWN),
+            pose_confidence=_coerce_optional_ratio(getattr(vision, "pose_confidence", None)),
+            body_state_changed_at=_coerce_timestamp(getattr(vision, "body_state_changed_at", None)),
+            smiling=person_visible and _coerce_bool(vision.smiling),
             hand_or_object_near_camera=_coerce_bool(vision.hand_or_object_near_camera),
+            showing_intent_likely=_coerce_optional_bool(getattr(vision, "showing_intent_likely", None)),
+            showing_intent_started_at=_coerce_timestamp(getattr(vision, "showing_intent_started_at", None)),
+            gesture_event=_coerce_gesture_event(getattr(vision, "gesture_event", SocialGestureEvent.NONE)),
+            gesture_confidence=_coerce_optional_ratio(getattr(vision, "gesture_confidence", None)),
+            objects=_coerce_detected_objects(getattr(vision, "objects", ())),
+            camera_online=_coerce_bool(getattr(vision, "camera_online", False)),
+            camera_ready=_coerce_bool(getattr(vision, "camera_ready", False)),
+            camera_ai_ready=_coerce_bool(getattr(vision, "camera_ai_ready", False)),
+            camera_error=_coerce_bounded_text(getattr(vision, "camera_error", None)),
+            last_camera_frame_at=_coerce_timestamp(getattr(vision, "last_camera_frame_at", None)),
+            last_camera_health_change_at=_coerce_timestamp(
+                getattr(vision, "last_camera_health_change_at", None)
+            ),
         )
 
     def _normalize_evidence(
@@ -1328,7 +1628,11 @@ class SocialTriggerEngine:
 __all__ = [
     "SocialAudioObservation",
     "SocialBodyPose",
+    "SocialDetectedObject",
+    "SocialGestureEvent",
     "SocialObservation",
+    "SocialPersonZone",
+    "SocialSpatialBox",
     "SocialTriggerDecision",
     "SocialTriggerEngine",
     "SocialTriggerEvaluation",

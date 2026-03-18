@@ -8,6 +8,8 @@ owned_concerns:
   - Define social-trigger domain models, priorities, and configurable thresholds
   - Score stateful trigger candidates from normalized observation ticks
   - Capture bounded audio and vision observations for proactive monitoring
+  - Overlay direct ReSpeaker XVF3800 signal facts onto normalized audio observations
+  - Map the local-first IMX500 adapter onto the normalized social vision contract
   - Stabilize automation-facing camera snapshots, person-count/zone anchors, and rising-edge events
   - Route prompt mode and render bounded evidence facts for proactive prompting
   - Buffer recent frames and request conservative visual second opinions
@@ -55,8 +57,11 @@ files:
     exports:
       - SocialAudioObservation
       - SocialBodyPose
+      - SocialDetectedObject
+      - SocialGestureEvent
       - SocialObservation
       - SocialPersonZone
+      - SocialSpatialBox
       - SocialTriggerDecision
       - SocialTriggerEngine
       - SocialTriggerEvaluation
@@ -70,14 +75,20 @@ files:
       - ProactiveCameraSurface
       - ProactiveCameraSurfaceConfig
       - ProactiveCameraSurfaceUpdate
+  - path: local_camera_provider.py
+    role: Local-first IMX500 provider mapped onto the social vision contract
+    exports:
+      - LocalAICameraObservationProvider
+      - LocalAICameraProviderConfig
   - path: observers.py
-    role: Ambient-audio and still-camera observation providers
+    role: Ambient-audio, ReSpeaker-overlay, and still-camera observation providers
     exports:
       - AmbientAudioObservationProvider
       - NullAudioObservationProvider
       - OpenAIVisionObservationProvider
       - ProactiveAudioSnapshot
       - ProactiveVisionSnapshot
+      - ReSpeakerAudioObservationProvider
       - parse_vision_observation_text
   - path: prompting.py
     role: Prompt-mode routing and bounded evidence rendering
@@ -176,6 +187,7 @@ primary_callers:
   - path: src/twinr/__main__.py
   - path: src/twinr/proactive/__init__.py
 tests:
+  - path: test/test_local_ai_camera_provider.py
   - path: test/test_proactive_camera_surface.py
   - path: test/test_social_triggers.py
   - path: test/test_proactive_vision_review.py

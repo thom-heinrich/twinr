@@ -8,7 +8,9 @@ owned_concerns:
   - Capture and play bounded audio for conversation, ambient sensing, and wakeword flows
   - Monitor GPIO buttons and PIR motion across supported Pi backends
   - Capture still photos via ffmpeg-backed V4L2 integration
+  - Run bounded local-first IMX500 health, detection, pose, and gesture inference
   - Format and submit bounded receipt print jobs
+  - Probe ReSpeaker XVF3800 USB/ALSA readiness and capture typed host-control primitives
   - Persist and assess local on-device voice profiles
 out_of_scope:
   - Hardware-loop orchestration in src/twinr/agent/workflows
@@ -44,6 +46,25 @@ files:
       - pcm16_to_wav_bytes
       - resolve_dynamic_pause_thresholds
       - resolve_pause_resume_confirmation
+  - path: ai_camera.py
+    role: Local-first IMX500 health, detection, and support-aware sparse-keypoint pose/gesture adapter
+    exports:
+      - AICameraAdapterConfig
+      - AICameraBodyPose
+      - AICameraBox
+      - AICameraGestureEvent
+      - AICameraObjectDetection
+      - AICameraObservation
+      - AICameraZone
+      - LocalAICameraAdapter
+  - path: ai_camera_diagnostics.py
+    role: Bounded diagnostics for IMX500 pose candidate selection and keypoint support on the Pi
+    exports:
+      - AICameraPoseCandidateDiagnostic
+      - AICameraPoseProbeDiagnostic
+      - AICameraPoseSupportDiagnostic
+      - capture_pose_probe
+      - capture_pose_probe_sequence
   - path: buttons.py
     role: GPIO button monitoring across libgpiod and CLI fallbacks
     exports:
@@ -79,6 +100,47 @@ files:
     exports:
       - PrinterError
       - RawReceiptPrinter
+  - path: respeaker/__init__.py
+    role: Stable package export surface for XVF3800 probe and primitive helpers
+    exports:
+      - AEC_AZIMUTH_VALUES_PARAMETER
+      - AEC_SPENERGY_VALUES_PARAMETER
+      - AUDIO_MGR_SELECTED_AZIMUTHS_PARAMETER
+      - DEFAULT_RESPEAKER_PARAMETER_SPECS
+      - DOA_VALUE_PARAMETER
+      - GPO_READ_VALUES_PARAMETER
+      - VERSION_PARAMETER
+      - ReSpeakerCaptureDevice
+      - ReSpeakerDirectionSnapshot
+      - ReSpeakerLibusbTransport
+      - ReSpeakerMuteSnapshot
+      - ReSpeakerParameterRead
+      - ReSpeakerParameterSpec
+      - ReSpeakerParameterType
+      - ReSpeakerPrimitiveSnapshot
+      - ReSpeakerProbeResult
+      - ReSpeakerSignalProvider
+      - ReSpeakerSignalSnapshot
+      - ReSpeakerTransportAvailability
+      - ReSpeakerUsbDevice
+      - capture_respeaker_primitive_snapshot
+      - config_targets_respeaker
+      - probe_respeaker_xvf3800
+      - read_default_respeaker_parameters
+  - path: respeaker/models.py
+    role: Typed XVF3800 probe, host-control, and primitive snapshot models
+  - path: respeaker/probe.py
+    role: ReSpeaker XVF3800 USB and ALSA capture-readiness probe helpers
+  - path: respeaker/raw_reads.py
+    role: Official XVF3800 primitive parameter specs and bounded raw-read batch
+  - path: respeaker/snapshot_service.py
+    role: Typed XVF3800 primitive snapshot capture and interpretation
+  - path: respeaker/signal_provider.py
+    role: Runtime-facing XVF3800 signal adapter with recent-speech tracking
+  - path: respeaker/transport.py
+    role: Dependency-light libusb host-control transport for XVF3800 reads
+    exports:
+      - ReSpeakerLibusbTransport
   - path: voice_profile.py
     role: Local voice profile store, enrollment, and assessment helpers
     exports:
@@ -107,6 +169,8 @@ public_api:
     - configured_pir_monitor
     - voice_profile_store_path
 primary_callers:
+  - path: src/twinr/ops/checks.py
+  - path: src/twinr/ops/devices.py
   - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
   - path: src/twinr/agent/workflows/streaming_runner.py
@@ -117,11 +181,14 @@ primary_callers:
   - path: src/twinr/web/viewmodels_voice.py
   - path: src/twinr/ops/self_test.py
 tests:
+  - path: test/test_ai_camera.py
   - path: test/test_audio.py
   - path: test/test_button_helpers.py
   - path: test/test_camera.py
+  - path: test/test_local_ai_camera_provider.py
   - path: test/test_pir.py
   - path: test/test_printer.py
+  - path: test/test_respeaker.py
   - path: test/test_voice_profile.py
   - path: test/test_runner.py
   - path: test/test_realtime_runner.py

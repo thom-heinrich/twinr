@@ -15,6 +15,7 @@ import subprocess
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.wayland_env import resolve_wayland_socket
+from twinr.hardware.respeaker import capture_respeaker_primitive_snapshot, config_targets_respeaker
 
 
 _VALID_STATUSES = frozenset({"ok", "warn", "fail"})
@@ -58,6 +59,7 @@ def run_config_checks(config: TwinrConfig) -> tuple[ConfigCheck, ...]:
         ("openai_key", "OpenAI key", _openai_key_check),
         ("audio_input", "Audio input", _audio_input_check),
         ("proactive_audio_input", "Proactive audio input", _proactive_audio_input_check),
+        ("respeaker_xvf3800", "ReSpeaker XVF3800", _respeaker_xvf3800_check),
         ("audio_output", "Audio output", _audio_output_check),
         ("printer_queue", "Printer queue", _printer_check),
         ("camera", "Camera", _camera_check),
@@ -173,6 +175,76 @@ def _proactive_audio_input_check(config: TwinrConfig) -> ConfigCheck:
         "Proactive audio input",
         "ok",
         f"Proactive audio reuses the primary input device `{_display_value(primary_device)}`.",
+    )
+
+
+def _respeaker_xvf3800_check(config: TwinrConfig) -> ConfigCheck:
+    """Check whether a configured or attached XVF3800 is capture-ready."""
+
+    primary_device = _clean_config_text(getattr(config, "audio_input_device", ""))
+    proactive_device = _clean_config_text(getattr(config, "proactive_audio_input_device", ""))
+    configured = config_targets_respeaker(primary_device, proactive_device)
+    snapshot = capture_respeaker_primitive_snapshot()
+    probe = snapshot.probe
+
+    if probe.capture_ready and snapshot.host_control_ready:
+        capture = probe.capture_device
+        capture_label = capture.card_label if capture is not None else "capture ready"
+        detail = (
+            f"ReSpeaker XVF3800 is capture-ready as `{_display_value(capture_label)}` "
+            "and host-control primitives are readable."
+        )
+        firmware_label = _respeaker_firmware_label(snapshot.firmware_version)
+        if firmware_label is not None:
+            detail += f" Firmware `{firmware_label}` is visible."
+        return ConfigCheck("respeaker_xvf3800", "ReSpeaker XVF3800", "ok", detail)
+
+    if probe.capture_ready and not snapshot.host_control_ready:
+        reason = _display_value(snapshot.transport.reason, unset="unknown_transport_state")
+        detail = (
+            "ReSpeaker XVF3800 is ALSA capture-ready, but host-control primitives are degraded "
+            f"(`{reason}`)."
+        )
+        if snapshot.transport.requires_elevated_permissions:
+            detail += " The runtime user likely lacks the required USB permissions."
+        return ConfigCheck("respeaker_xvf3800", "ReSpeaker XVF3800", "warn", detail)
+
+    if probe.usb_visible and probe.arecord_available:
+        return ConfigCheck(
+            "respeaker_xvf3800",
+            "ReSpeaker XVF3800",
+            "warn",
+            "ReSpeaker XVF3800 is USB-visible, but no ALSA capture card was reported. This usually means DFU/safe mode or incomplete runtime.",
+        )
+
+    if probe.usb_visible:
+        return ConfigCheck(
+            "respeaker_xvf3800",
+            "ReSpeaker XVF3800",
+            "warn",
+            "ReSpeaker XVF3800 is USB-visible, but `arecord` is unavailable, so capture readiness cannot be verified.",
+        )
+
+    if configured:
+        if not probe.lsusb_available and not probe.arecord_available:
+            return ConfigCheck(
+                "respeaker_xvf3800",
+                "ReSpeaker XVF3800",
+                "warn",
+                "A ReSpeaker XVF3800 path is configured, but neither `lsusb` nor `arecord` is available for verification.",
+            )
+        return ConfigCheck(
+            "respeaker_xvf3800",
+            "ReSpeaker XVF3800",
+            "fail",
+            "A ReSpeaker XVF3800 capture path is configured, but the device was not detected.",
+        )
+
+    return ConfigCheck(
+        "respeaker_xvf3800",
+        "ReSpeaker XVF3800",
+        "ok",
+        "No ReSpeaker XVF3800 capture path is configured or detected.",
     )
 
 
@@ -668,6 +740,14 @@ def _display_value(value: object, unset: str = "<unset>") -> str:
     if not text:
         return unset
     return _sanitize_detail(text, default=unset)
+
+
+def _respeaker_firmware_label(version: tuple[int, int, int] | None) -> str | None:
+    """Render one XVF3800 firmware tuple for operator-visible detail text."""
+
+    if version is None or len(version) != 3:
+        return None
+    return ".".join(str(int(part)) for part in version)
 
 
 def _coerce_bool(value: object) -> bool:

@@ -29,6 +29,7 @@ from twinr.display.hdmi_default_scene import (
     status_helper_text,
     time_value,
 )
+from twinr.display.presentation_cues import DisplayPresentationCue
 
 
 _FBIOGET_VSCREENINFO = 0x4600
@@ -170,6 +171,7 @@ class HdmiFramebufferDisplay:
         log_sections: DisplayLogSections = (),
         animation_frame: int = 0,
         face_cue: DisplayFaceCue | None = None,
+        presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
         """Render and display one runtime status frame."""
 
@@ -181,6 +183,7 @@ class HdmiFramebufferDisplay:
             log_sections=log_sections,
             animation_frame=animation_frame,
             face_cue=face_cue,
+            presentation_cue=presentation_cue,
         )
         self.show_image(image)
         self._last_rendered_status = self._normalise_text(status, fallback="status").lower() or "status"
@@ -249,6 +252,7 @@ class HdmiFramebufferDisplay:
         log_sections: DisplayLogSections,
         animation_frame: int,
         face_cue: DisplayFaceCue | None = None,
+        presentation_cue: DisplayPresentationCue | None = None,
     ):
         """Render one HDMI-friendly status frame."""
 
@@ -281,6 +285,7 @@ class HdmiFramebufferDisplay:
             return image
 
         self._draw_default_screen(
+            image,
             draw,
             width=width,
             height=height,
@@ -290,6 +295,7 @@ class HdmiFramebufferDisplay:
             state_fields=ordered_fields,
             animation_frame=animation_frame,
             face_cue=face_cue,
+            presentation_cue=presentation_cue,
         )
         return image
 
@@ -314,6 +320,7 @@ class HdmiFramebufferDisplay:
 
     def _draw_default_screen(
         self,
+        image: object,
         draw: object,
         *,
         width: int,
@@ -324,9 +331,11 @@ class HdmiFramebufferDisplay:
         state_fields: DisplayStateFields,
         animation_frame: int,
         face_cue: DisplayFaceCue | None = None,
+        presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
         self._scene_renderer().draw(
-            draw,
+            image=image,
+            draw=draw,
             width=width,
             height=height,
             status=status,
@@ -335,6 +344,7 @@ class HdmiFramebufferDisplay:
             state_fields=state_fields,
             animation_frame=animation_frame,
             face_cue=face_cue,
+            presentation_cue=presentation_cue,
         )
 
     def _state_field_value(

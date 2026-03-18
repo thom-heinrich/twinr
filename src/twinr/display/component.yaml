@@ -8,9 +8,13 @@ owned_concerns:
   - Translate runtime snapshots and health signals into bounded status frames for the active display backend
   - Persist and load optional HDMI face-expression cues so external triggers can steer gaze, brows, mouth, and subtle head drift without changing the generic runtime snapshot schema
   - Expose a producer-facing HDMI face-expression API so camera, proactive, or other runtime modules can set combinable gaze, brow, mouth, and blink cues without writing raw JSON
+  - Persist and load optional HDMI presentation cues so capabilities can expand the right-hand panel into a fullscreen image or rich card without changing the generic runtime snapshot schema
+  - Resolve prioritized HDMI presentation cards into a calm scene graph with eased morph stages and default face-sync reactions
+  - Run bounded HDMI visual QC scene sets that capture screenshots, diff metrics, and report-ready artifacts for the visible monitor surface
   - Compose operator-friendly layout variants such as the grouped debug log display
   - Derive bounded debug-log sections from persisted ops events, usage telemetry, host health, and the remote-memory watchdog artifact without poll-to-poll timer churn or raw high-frequency metric jitter
   - Render a visible full-screen HDMI Wayland UI for the Pi monitor path and keep a framebuffer fallback for non-Wayland setups
+  - Keep native Wayland surface hosting separate from framebuffer rendering so richer HDMI-only content surfaces can evolve without polluting the generic renderer
   - Validate and load the configured Waveshare vendor driver with Twinr GPIO and SPI expectations
   - Persist authoritative display forward-progress heartbeats so ops health and supervision can detect hung companion threads
   - Manage the optional companion display loop that shadows other runtime loops
@@ -30,6 +34,10 @@ files:
       - DisplayFaceExpressionController
       - DisplayFaceGazeDirection
       - DisplayFaceMouthStyle
+      - DisplayPresentationCardCue
+      - DisplayPresentationController
+      - DisplayPresentationCue
+      - DisplayPresentationStore
       - HdmiFramebufferDisplay
       - HdmiWaylandDisplay
       - TwinrStatusDisplayLoop
@@ -58,14 +66,27 @@ files:
       - DisplayFaceExpressionController
       - DisplayFaceGazeDirection
       - DisplayFaceMouthStyle
+  - path: presentation_cues.py
+    role: Persist and normalize optional fullscreen HDMI presentation cues and expose producer-facing single-card and scene-card controllers
+    exports:
+      - DisplayPresentationCardCue
+      - DisplayPresentationController
+      - DisplayPresentationCue
+      - DisplayPresentationStore
   - path: heartbeat.py
     role: Persist display forward-progress heartbeats and expose the shared companion-health contract for ops health and supervision
   - path: hdmi_default_scene.py
     role: Compose the modular senior-facing HDMI default scene, including layout, face animation, and status cards
+  - path: hdmi_presentation_graph.py
+    role: Resolve prioritized HDMI presentation cards into eased graph nodes and face-sync defaults
+  - path: visual_qc.py
+    role: Drive bounded HDMI visual-QC scenes, capture screenshots, compute diffs, and build report-ready artifacts
   - path: hdmi_wayland.py
     role: Visible fullscreen HDMI Wayland adapter
     exports:
       - HdmiWaylandDisplay
+  - path: wayland_surface_host.py
+    role: Own the native fullscreen Wayland/Qt surface separately from rendering logic
   - path: hdmi_fbdev.py
     role: HDMI framebuffer fallback adapter and scene host/transport utilities
     exports:
@@ -86,9 +107,12 @@ primary_callers:
   - path: src/twinr/__main__.py
   - path: hardware/display/display_test.py
   - path: hardware/display/run_display_loop.py
+  - path: hardware/display/run_visual_qc.py
 tests:
   - path: test/test_display.py
   - path: test/test_display_face_cues.py
+  - path: test/test_display_presentation_cues.py
   - path: test/test_display_service.py
+  - path: test/test_display_visual_qc.py
   - path: test/test_display_companion.py
   - path: test/test_main.py

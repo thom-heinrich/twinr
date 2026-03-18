@@ -40,6 +40,7 @@ _OPS_ARTIFACT_NAME = "memory_live_acceptance.json"
 _REPORT_DIR_NAME = "memory_live_acceptance"
 _MODEL_TIMEOUT_S = 45.0
 _MODEL_MAX_RETRIES = 1
+_REMOTE_READ_DIAGNOSTICS_ROOT_ENV = "TWINR_REMOTE_READ_DIAGNOSTICS_PROJECT_ROOT"
 
 
 def _coerce_text(value: object | None) -> str:
@@ -86,6 +87,24 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
     finally:
         os.close(fd)
     os.replace(tmp_path, path)
+
+
+def _push_project_root_override(project_root: Path) -> tuple[str, str | None]:
+    """Point remote-read diagnostics at the durable base project root."""
+
+    previous = os.environ.get(_REMOTE_READ_DIAGNOSTICS_ROOT_ENV)
+    os.environ[_REMOTE_READ_DIAGNOSTICS_ROOT_ENV] = str(project_root)
+    return _REMOTE_READ_DIAGNOSTICS_ROOT_ENV, previous
+
+
+def _restore_project_root_override(state: tuple[str, str | None]) -> None:
+    """Restore the previous remote-read diagnostics project-root override."""
+
+    key, previous = state
+    if previous is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = previous
 
 
 def _utc_now_iso() -> str:
@@ -549,6 +568,7 @@ def run_live_memory_acceptance(
             raise RuntimeError("ChonkyDB credentials are required for live memory acceptance.")
 
         with ExitStack() as stack:
+            stack.callback(_restore_project_root_override, _push_project_root_override(base_project_root))
             writer_temp_dir = stack.enter_context(tempfile.TemporaryDirectory(prefix=f"{effective_probe_id}_writer_"))
             fresh_reader_temp_dir = stack.enter_context(tempfile.TemporaryDirectory(prefix=f"{effective_probe_id}_reader_"))
             writer_root = Path(writer_temp_dir).resolve(strict=False)

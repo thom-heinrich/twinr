@@ -17,6 +17,10 @@ __all__ = [
     "DisplayFaceExpressionController",
     "DisplayFaceGazeDirection",
     "DisplayFaceMouthStyle",
+    "DisplayPresentationController",
+    "DisplayPresentationCardCue",
+    "DisplayPresentationCue",
+    "DisplayPresentationStore",
     "HdmiFramebufferDisplay",
     "HdmiWaylandDisplay",
     "TwinrStatusDisplayLoop",
@@ -60,6 +64,22 @@ def __getattr__(name: str) -> Any:
         from twinr.display.face_expressions import DisplayFaceExpressionController
 
         return DisplayFaceExpressionController
+    if name == "DisplayPresentationCardCue":
+        from twinr.display.presentation_cues import DisplayPresentationCardCue
+
+        return DisplayPresentationCardCue
+    if name == "DisplayPresentationCue":
+        from twinr.display.presentation_cues import DisplayPresentationCue
+
+        return DisplayPresentationCue
+    if name == "DisplayPresentationStore":
+        from twinr.display.presentation_cues import DisplayPresentationStore
+
+        return DisplayPresentationStore
+    if name == "DisplayPresentationController":
+        from twinr.display.presentation_cues import DisplayPresentationController
+
+        return DisplayPresentationController
     if name == "TwinrStatusDisplayLoop":
         from twinr.display.service import TwinrStatusDisplayLoop
 

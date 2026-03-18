@@ -115,6 +115,7 @@ Sensor-triggered automations currently support the following operator-facing tri
 
 The proactive monitor now feeds stable PIR, camera, and VAD facts into the automation engine while Twinr is idle. This lets voice-created if-then automations react to sensor facts without exposing raw camera frames or raw audio chunks as tool-level inputs.
 The target-state map for what Twinr should try to derive from PIR, audio, and camera lives in [`SENSOR_FUSION.md`](SENSOR_FUSION.md).
+The ReSpeaker-specific requirements and build checklist for turning the XVF3800 into a first-class Twinr sensor live in [`RESPEAKER_REQUIREMENTS.md`](RESPEAKER_REQUIREMENTS.md).
 The camera-side output contract for later runtime integration lives in [`AI_CAMERA_INTEGRATION_CONTRACT.md`](AI_CAMERA_INTEGRATION_CONTRACT.md).
 
 Explicit requests to change future user-profile context or future speaking/behavior rules are written into managed sections inside `personality/USER.md` and `personality/PERSONALITY.md`. Twinr reloads those files on the next provider request instead of baking them permanently into code.

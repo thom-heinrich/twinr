@@ -34,6 +34,10 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
 - allow optional external face-expression cues on HDMI so other Twinr
   capabilities can steer gaze, brows, mouth, or tiny head drift without
   coupling those semantics into the generic runtime snapshot schema
+- allow optional external HDMI presentation cues so other capabilities can
+  expand the default right-hand panel into a bounded fullscreen image or rich
+  card without teaching the generic runtime snapshot schema about
+  presentation-only payloads
 - allow optional periodic full-refresh cleanup after a bounded number of fast
   incremental updates instead of running indefinitely on fast refresh alone
 - emit bounded display-driver telemetry lines for refresh mode, clear, retry,
@@ -136,6 +140,27 @@ capabilities such as expanded cards, morph transitions, or richer per-capability
 panels can be added without pushing presentation logic back into the transport
 backend.
 
+The first presentation-capability slice now resolves through a dedicated HDMI
+scene graph instead of directly from one cue to one overlay. The graph builder
+selects the highest-priority active card, keeps other cards queued, applies
+eased intermediate morph states, and derives a calm face-sync cue while the
+card is still expanding. That keeps future capability growth in a dedicated
+graph layer instead of embedding priority or morph policy inside the renderer.
+
+For acceptance on the real visible monitor surface, `visual_qc.py` now adds a
+bounded HDMI visual-QC runner. It drives the public face and presentation
+controllers through a deterministic scene set, captures the visible Wayland
+surface with `grim`, computes per-transition diff metrics, and assembles a
+report-backed artifact bundle instead of relying on one-off screenshots in
+`/tmp`.
+
+The visible Wayland window is also split away from image rendering now.
+`hdmi_wayland.py` stays responsible for the `hdmi_wayland` adapter contract and
+environment wiring, while `wayland_surface_host.py` owns the actual Qt
+fullscreen surface. That keeps Wayland-only presentation capabilities isolated
+from the generic framebuffer renderer instead of mixing browser or window-host
+logic into `hdmi_fbdev.py`.
+
 External HDMI face triggers flow through `face_cues.py`. The runtime display
 loop loads one optional cue artifact and merges it only into the `default`
 HDMI face. That keeps `debug_log`, Waveshare, and the generic runtime snapshot
@@ -198,6 +223,91 @@ controller.show(
 )
 ```
 
+Fullscreen HDMI presentations flow through `presentation_cues.py`. That path is
+deliberately separate from face cues because a fullscreen card or image belongs
+to the presentation layer, not to the generic runtime snapshot schema. The
+default artifact path is `artifacts/stores/ops/display_presentation.json` and
+the default cue TTL is `20.0` seconds:
+
+```dotenv
+TWINR_DISPLAY_PRESENTATION_PATH=artifacts/stores/ops/display_presentation.json
+TWINR_DISPLAY_PRESENTATION_TTL_S=20.0
+```
+
+The producer-facing path is:
+
+```python
+from twinr.display import DisplayPresentationController
+
+controller = DisplayPresentationController.from_config(config, default_source="camera_surface")
+controller.show_rich_card(
+    title="Family call",
+    subtitle="Marta is waiting",
+    body_lines=("Press the green button to answer.",),
+    accent="warm",
+    hold_seconds=15.0,
+)
+```
+
+Or for a fullscreen image surface:
+
+```python
+from twinr.display import DisplayPresentationController
+
+controller = DisplayPresentationController.from_config(config, default_source="operator")
+controller.show_image(
+    image_path="/tmp/marta_photo.png",
+    title="New photo",
+    subtitle="Delivered just now",
+    body_lines=("The photo fills the presentation surface.",),
+    accent="success",
+    hold_seconds=20.0,
+)
+```
+
+For multiple competing cards, use the scene-capable producer path. Each card
+gets its own `key`, `priority`, and optional `face_emotion`; the highest
+priority card becomes active while the others stay queued in the graph:
+
+```python
+from twinr.display import DisplayPresentationCardCue, DisplayPresentationController
+
+controller = DisplayPresentationController.from_config(config, default_source="operator")
+controller.show_scene(
+    cards=(
+        DisplayPresentationCardCue(key="summary", title="Daily summary", priority=20, accent="info"),
+        DisplayPresentationCardCue(
+            key="family_photo",
+            kind="image",
+            title="Family photo",
+            image_path="/tmp/family_photo.png",
+            priority=90,
+            accent="warm",
+            face_emotion="happy",
+        ),
+    ),
+    hold_seconds=20.0,
+)
+```
+
+`service.py` also keeps display telemetry semantic now: `display_status=...`
+is emitted only when the user-meaningful display state changes, such as a real
+runtime status transition or a presentation stage change. Idle HDMI animation
+frames no longer spam identical status lines into the supervisor journal.
+
+For screenshot-backed HDMI validation on the Pi, run:
+
+```bash
+python3 hardware/display/run_visual_qc.py --env-file .env
+```
+
+The current default scene set covers:
+- `idle_home`
+- `face_react`
+- `presentation_mid`
+- `presentation_focused`
+- `restored_home`
+
 ## Key files
 
 | File | Purpose |
@@ -210,10 +320,14 @@ controller.show(
 | [face_expressions.py](./face_expressions.py) | Producer-facing combinable expression API for the HDMI face |
 | [heartbeat.py](./heartbeat.py) | Persist display forward-progress heartbeats and expose the shared companion-health contract for ops/supervision |
 | [hdmi_default_scene.py](./hdmi_default_scene.py) | Modular default HDMI scene model, face renderer, and status-card composition |
+| [hdmi_presentation_graph.py](./hdmi_presentation_graph.py) | Resolve prioritized HDMI presentation cards into eased morph stages and face-sync reactions |
 | [hdmi_wayland.py](./hdmi_wayland.py) | Visible fullscreen HDMI Wayland adapter |
 | [hdmi_fbdev.py](./hdmi_fbdev.py) | HDMI framebuffer fallback adapter and scene host/transport layer |
+| [presentation_cues.py](./presentation_cues.py) | Optional fullscreen HDMI presentation-cue contract, store, and producer-facing controller |
 | [wayland_env.py](./wayland_env.py) | Resolve and export Wayland socket/runtime details |
+| [wayland_surface_host.py](./wayland_surface_host.py) | Native Wayland/Qt surface host kept separate from rendering and scene composition |
 | [service.py](./service.py) | Snapshot-driven status loop |
+| [visual_qc.py](./visual_qc.py) | Screenshot-backed HDMI visual-QC runner and report-artefact builder |
 | [layouts.py](./layouts.py) | Status-card layout composition |
 | [waveshare_v2.py](./waveshare_v2.py) | Panel adapter and rendering |
 | [companion.py](./companion.py) | Optional sidecar loop |

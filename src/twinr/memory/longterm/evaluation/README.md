@@ -44,6 +44,16 @@ attest = run_live_midterm_acceptance(env_path=".env")
 acceptance = run_live_memory_acceptance(env_path=".env")
 ```
 
+Standard ops command:
+
+```bash
+PYTHONPATH=src python3 -m twinr --env-file .env --long-term-memory-live-acceptance
+```
+
+The standard command persists the latest result to
+`artifacts/stores/ops/memory_live_acceptance.json` and a per-run snapshot under
+`artifacts/reports/memory_live_acceptance/`.
+
 ## See also
 
 - [component.yaml](./component.yaml)

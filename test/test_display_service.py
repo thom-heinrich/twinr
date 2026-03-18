@@ -3,7 +3,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -12,6 +12,7 @@ from twinr.config import TwinrConfig
 from twinr.display import service as display_service_mod
 from twinr.display.face_cues import DisplayFaceCue, DisplayFaceCueStore
 from twinr.display.heartbeat import DisplayHeartbeatStore
+from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPresentationStore
 from twinr.display.service import TwinrStatusDisplayLoop
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
 from twinr.ops.health import ServiceHealth, TwinrSystemHealth
@@ -28,6 +29,7 @@ class FakeDisplay:
                 tuple[tuple[str, tuple[str, ...]], ...],
                 int,
                 DisplayFaceCue | None,
+                DisplayPresentationCue | None,
             ]
         ] = []
 
@@ -41,8 +43,9 @@ class FakeDisplay:
         log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
         animation_frame: int = 0,
         face_cue: DisplayFaceCue | None = None,
+        presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
-        self.calls.append((status, headline, details, state_fields, log_sections, animation_frame, face_cue))
+        self.calls.append((status, headline, details, state_fields, log_sections, animation_frame, face_cue, presentation_cue))
 
 
 class IdleAnimatedDisplay(FakeDisplay):
@@ -81,8 +84,9 @@ class ReopenableDisplay:
         log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
         animation_frame: int = 0,
         face_cue: DisplayFaceCue | None = None,
+        presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
-        del status, headline, details, state_fields, log_sections, animation_frame, face_cue
+        del status, headline, details, state_fields, log_sections, animation_frame, face_cue, presentation_cue
         if self.fail:
             raise RuntimeError("boom")
         if self.emit is not None:
@@ -178,7 +182,10 @@ class DisplayServiceTests(unittest.TestCase):
             loop.run(max_cycles=1)
 
             self.assertEqual(
-                [(status, headline, details) for status, headline, details, _fields, _logs, _frame, _cue in display.calls],
+                [
+                    (status, headline, details)
+                    for status, headline, details, _fields, _logs, _frame, _cue, _presentation in display.calls
+                ],
                 [
                     ("waiting", "Waiting", ("Internet ok", "AI ok", "System ok", "Zeit 12:34")),
                     ("printing", "Printing", ("Internet ok", "AI ok", "System ok", "Zeit 12:34")),
@@ -320,6 +327,7 @@ class DisplayServiceTests(unittest.TestCase):
             log_sections=(),
             animation_frame=0,
             face_cue=None,
+            presentation_cue=None,
         )
 
         self.assertTrue(rendered)
@@ -468,6 +476,7 @@ class DisplayServiceTests(unittest.TestCase):
             ),
             animation_frame=0,
             face_cue=None,
+            presentation_cue=None,
         )
         second_signature = loop._render_signature(
             status="waiting",
@@ -487,6 +496,7 @@ class DisplayServiceTests(unittest.TestCase):
             ),
             animation_frame=0,
             face_cue=DisplayFaceCue(mouth="smile"),
+            presentation_cue=None,
         )
 
         self.assertEqual(first_signature, second_signature)
@@ -615,6 +625,53 @@ class DisplayServiceTests(unittest.TestCase):
 
         self.assertNotEqual(first, second)
 
+    def test_display_status_telemetry_suppresses_duplicate_idle_lines(self) -> None:
+        emit_lines: list[str] = []
+        loop = TwinrStatusDisplayLoop(
+            config=TwinrConfig(display_poll_interval_s=0.0, display_driver="hdmi_wayland"),
+            display=IdleAnimatedDisplay(),
+            snapshot_store=RuntimeSnapshotStore("/tmp/nonexistent"),
+            emit=emit_lines.append,
+            sleep=lambda _seconds: None,
+        )
+
+        loop._emit_display_status(status="waiting", presentation_cue=None)
+        loop._emit_display_status(status="waiting", presentation_cue=None)
+
+        self.assertEqual(emit_lines, ["display_status=waiting"])
+
+    def test_display_status_telemetry_emits_when_presentation_stage_changes(self) -> None:
+        emit_lines: list[str] = []
+        loop = TwinrStatusDisplayLoop(
+            config=TwinrConfig(display_poll_interval_s=0.0, display_driver="hdmi_wayland"),
+            display=IdleAnimatedDisplay(),
+            snapshot_store=RuntimeSnapshotStore("/tmp/nonexistent"),
+            emit=emit_lines.append,
+            sleep=lambda _seconds: None,
+        )
+        now = datetime.now(timezone.utc)
+        lifting = DisplayPresentationCue(
+            kind="image",
+            title="Photo",
+            updated_at=now.isoformat(),
+            expires_at=(now + timedelta(seconds=10)).isoformat(),
+        )
+        focused = DisplayPresentationCue(
+            kind="image",
+            title="Photo",
+            updated_at=(now - timedelta(seconds=2)).isoformat(),
+            expires_at=(now + timedelta(seconds=10)).isoformat(),
+        )
+
+        loop._emit_display_status(status="waiting", presentation_cue=lifting)
+        loop._emit_display_status(status="waiting", presentation_cue=focused)
+
+        self.assertEqual(len(emit_lines), 2)
+        self.assertTrue(all(line.startswith("display_status=waiting") for line in emit_lines))
+        self.assertNotEqual(emit_lines[0], emit_lines[1])
+        self.assertIn("presentation=image:", emit_lines[0])
+        self.assertIn("presentation=image:focused", emit_lines[1])
+
     def test_display_loop_forwards_active_face_cue_to_default_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -661,6 +718,59 @@ class DisplayServiceTests(unittest.TestCase):
         self.assertEqual(cue.gaze_y, -1)
         self.assertEqual(cue.mouth, "smile")
         self.assertEqual(cue.brows, "inward_tilt")
+
+    def test_display_loop_forwards_active_presentation_cue_to_default_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            snapshot_path = root / "state" / "runtime-state.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            store = RuntimeSnapshotStore(snapshot_path)
+            store.save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Hallo Thom",
+            )
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(snapshot_path),
+                display_poll_interval_s=0.0,
+                openai_api_key="sk-test",
+            )
+            presentation_store = DisplayPresentationStore.from_config(config)
+            presentation_store.save(
+                DisplayPresentationCue(
+                    kind="rich_card",
+                    title="Family Call",
+                    subtitle="Marta is waiting",
+                    body_lines=("Tap green and answer",),
+                    accent="warm",
+                ),
+                hold_seconds=15.0,
+            )
+            display = FakeDisplay()
+            loop = TwinrStatusDisplayLoop(
+                config=config,
+                display=display,
+                snapshot_store=store,
+                emit=lambda _line: None,
+                sleep=lambda _seconds: None,
+                health_collector=lambda _config, *, snapshot=None: self.make_health(),
+                internet_probe=lambda: True,
+                clock=self.make_clock(),
+                presentation_cue_store=presentation_store,
+            )
+
+            loop.run(max_cycles=1)
+
+        self.assertEqual(len(display.calls), 1)
+        cue = display.calls[0][7]
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertEqual(cue.kind, "rich_card")
+        self.assertEqual(cue.title, "Family Call")
+        self.assertEqual(cue.body_lines, ("Tap green and answer",))
+        self.assertEqual(cue.accent, "warm")
 
     def test_all_statuses_have_six_to_twelve_frames(self) -> None:
         loop = TwinrStatusDisplayLoop(

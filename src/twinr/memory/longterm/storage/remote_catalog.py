@@ -15,10 +15,18 @@ from dataclasses import dataclass
 import hashlib
 import json
 import logging
+import time
 from urllib.parse import quote
 
 from twinr.memory.chonkydb.models import ChonkyDBBulkRecordRequest, ChonkyDBRecordItem, ChonkyDBRetrieveRequest
+from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1, LongTermSourceRefV1
+from twinr.memory.longterm.storage.remote_read_diagnostics import (
+    LongTermRemoteReadContext,
+    LongTermRemoteWriteContext,
+    record_remote_read_diagnostic,
+    record_remote_write_diagnostic,
+)
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore, LongTermRemoteUnavailableError
 
 
@@ -295,6 +303,7 @@ class LongTermRemoteCatalogStore:
         if not normalized_item_id:
             return None
         resolved_uri = uri or self.item_uri(snapshot_kind=snapshot_kind, item_id=normalized_item_id)
+        started_monotonic = time.monotonic()
         try:
             envelope = read_client.fetch_full_document(
                 document_id=document_id,
@@ -311,10 +320,36 @@ class LongTermRemoteCatalogStore:
                         max_content_chars=self._max_content_chars(),
                     )
                 except Exception as fallback_exc:
+                    record_remote_read_diagnostic(
+                        remote_state=remote_state,
+                        context=LongTermRemoteReadContext(
+                            snapshot_kind=snapshot_kind,
+                            operation="fetch_item_document",
+                            item_id=normalized_item_id,
+                            document_id_hint=document_id,
+                            uri_hint=resolved_uri,
+                        ),
+                        exc=fallback_exc,
+                        started_monotonic=started_monotonic,
+                        outcome="failed",
+                    )
                     raise LongTermRemoteUnavailableError(
                         f"Failed to read remote long-term {snapshot_kind!r} item {normalized_item_id!r}."
                     ) from fallback_exc
             else:
+                record_remote_read_diagnostic(
+                    remote_state=remote_state,
+                    context=LongTermRemoteReadContext(
+                        snapshot_kind=snapshot_kind,
+                        operation="fetch_item_document",
+                        item_id=normalized_item_id,
+                        document_id_hint=document_id,
+                        uri_hint=resolved_uri,
+                    ),
+                    exc=exc,
+                    started_monotonic=started_monotonic,
+                    outcome="failed",
+                )
                 raise LongTermRemoteUnavailableError(
                     f"Failed to read remote long-term {snapshot_kind!r} item {normalized_item_id!r}."
                 ) from exc
@@ -384,20 +419,40 @@ class LongTermRemoteCatalogStore:
         ]
         if not allowed_doc_ids:
             return ()
+        result_limit = max(1, int(limit))
+        if len(entries) <= result_limit:
+            return tuple(entries[:result_limit])
+        started_monotonic = time.monotonic()
         try:
             response = read_client.retrieve(
                 ChonkyDBRetrieveRequest(
                     query_text=query_text,
-                    result_limit=max(1, int(limit)),
+                    result_limit=result_limit,
                     include_content=False,
                     include_metadata=True,
                     allowed_doc_ids=tuple(allowed_doc_ids),
                 )
             )
         except Exception as exc:
-            raise LongTermRemoteUnavailableError(
-                f"Failed to retrieve remote long-term {snapshot_kind!r} items."
-            ) from exc
+            record_remote_read_diagnostic(
+                remote_state=remote_state,
+                context=LongTermRemoteReadContext(
+                    snapshot_kind=snapshot_kind,
+                    operation="retrieve_search",
+                    query_text=query_text,
+                    catalog_entry_count=len(entries),
+                    allowed_doc_count=len(allowed_doc_ids),
+                    result_limit=result_limit,
+                ),
+                exc=exc,
+                started_monotonic=started_monotonic,
+                outcome="degraded",
+            )
+            return self._local_search_catalog_entries(
+                entries=entries,
+                query_text=query_text,
+                limit=result_limit,
+            )
 
         selected: list[LongTermRemoteCatalogEntry] = []
         seen: set[str] = set()
@@ -416,6 +471,49 @@ class LongTermRemoteCatalogStore:
             if len(selected) >= max(1, int(limit)):
                 break
         return tuple(selected)
+
+    def _local_search_catalog_entries(
+        self,
+        *,
+        entries: tuple[LongTermRemoteCatalogEntry, ...],
+        query_text: str,
+        limit: int,
+    ) -> tuple[LongTermRemoteCatalogEntry, ...]:
+        """Rank already-loaded catalog entries locally when remote search fails."""
+
+        bounded_limit = max(1, int(limit))
+        selector = FullTextSelector(
+            tuple(
+                FullTextDocument(
+                    doc_id=entry.item_id,
+                    category="remote_catalog",
+                    content=self._catalog_entry_search_text(entry),
+                )
+                for entry in entries
+            )
+        )
+        selected_ids = selector.search(
+            query_text,
+            limit=bounded_limit,
+            category="remote_catalog",
+            allow_fallback=False,
+        )
+        by_item_id = {entry.item_id: entry for entry in entries}
+        return tuple(by_item_id[item_id] for item_id in selected_ids if item_id in by_item_id)
+
+    def _catalog_entry_search_text(self, entry: LongTermRemoteCatalogEntry) -> str:
+        """Build one local fallback search document from catalog metadata."""
+
+        parts: list[str] = [entry.item_id]
+        for field_name in _CATALOG_ENTRY_TEXT_FIELDS:
+            value = self._normalize_text(entry.metadata.get(field_name))
+            if value:
+                parts.append(value)
+        for field_name in _CATALOG_ENTRY_LIST_FIELDS:
+            values = self._normalize_text_list(entry.metadata.get(field_name))
+            if values:
+                parts.extend(values)
+        return " ".join(parts)
 
     def top_catalog_entries(
         self,
@@ -519,7 +617,11 @@ class LongTermRemoteCatalogStore:
                 )
             )
             staged.append((item_id, catalog_metadata, payload_sha256))
-        document_ids = self._store_record_items(write_client, record_items=record_items)
+        document_ids = self._store_record_items(
+            write_client,
+            snapshot_kind=definition.snapshot_kind,
+            record_items=record_items,
+        )
         for index, (item_id, metadata, _payload_sha256) in enumerate(staged):
             catalog_entries.append(
                 self._build_catalog_entry(
@@ -766,6 +868,7 @@ class LongTermRemoteCatalogStore:
             snapshot_kind=definition.snapshot_kind,
             segment_index=segment_index or 0,
         )
+        started_monotonic = time.monotonic()
         try:
             return read_client.fetch_full_document(
                 document_id=document_id,
@@ -782,9 +885,35 @@ class LongTermRemoteCatalogStore:
                         max_content_chars=self._max_content_chars(),
                     )
                 except Exception as fallback_exc:
+                    record_remote_read_diagnostic(
+                        remote_state=remote_state,
+                        context=LongTermRemoteReadContext(
+                            snapshot_kind=definition.snapshot_kind,
+                            operation="fetch_catalog_segment",
+                            document_id_hint=document_id,
+                            uri_hint=fallback_uri,
+                            segment_index=segment_index,
+                        ),
+                        exc=fallback_exc,
+                        started_monotonic=started_monotonic,
+                        outcome="failed",
+                    )
                     raise LongTermRemoteUnavailableError(
                         f"Failed to read remote long-term {definition.snapshot_kind!r} catalog segment."
                     ) from fallback_exc
+            record_remote_read_diagnostic(
+                remote_state=remote_state,
+                context=LongTermRemoteReadContext(
+                    snapshot_kind=definition.snapshot_kind,
+                    operation="fetch_catalog_segment",
+                    document_id_hint=document_id,
+                    uri_hint=fallback_uri,
+                    segment_index=segment_index,
+                ),
+                exc=exc,
+                started_monotonic=started_monotonic,
+                outcome="failed",
+            )
             raise LongTermRemoteUnavailableError(
                 f"Failed to read remote long-term {definition.snapshot_kind!r} catalog segment."
             ) from exc
@@ -857,7 +986,11 @@ class LongTermRemoteCatalogStore:
                     include_insights_in_response=False,
                 )
             )
-        document_ids = self._store_record_items(write_client, record_items=record_items)
+        document_ids = self._store_record_items(
+            write_client,
+            snapshot_kind=definition.snapshot_kind,
+            record_items=record_items,
+        )
         refs: list[dict[str, object]] = []
         for segment_index, segment_entries in enumerate(segment_batches):
             refs.append(
@@ -919,6 +1052,7 @@ class LongTermRemoteCatalogStore:
         self,
         write_client: object,
         *,
+        snapshot_kind: str,
         record_items: list[ChonkyDBRecordItem],
     ) -> tuple[str | None, ...]:
         if not record_items:
@@ -933,6 +1067,19 @@ class LongTermRemoteCatalogStore:
             try:
                 result = getattr(write_client, "store_records_bulk")(request)
             except Exception as exc:
+                remote_state = self._require_remote_state()
+                record_remote_write_diagnostic(
+                    remote_state=remote_state,
+                    context=LongTermRemoteWriteContext(
+                        snapshot_kind=snapshot_kind,
+                        operation="store_records_bulk",
+                        attempt_count=1,
+                        request_item_count=len(batch),
+                    ),
+                    exc=exc,
+                    started_monotonic=time.monotonic(),
+                    outcome="failed",
+                )
                 raise LongTermRemoteUnavailableError("Failed to persist fine-grained remote long-term memory items.") from exc
             document_ids.extend(self._extract_document_ids(result, expected=len(batch)))
         return tuple(document_ids)
@@ -1029,6 +1176,7 @@ class LongTermRemoteCatalogStore:
             return {}
         loaded: dict[str, dict[str, object]] = {}
         for batch, candidates in self._load_retrieve_batch_candidates(
+            snapshot_kind=snapshot_kind,
             read_client=read_client,
             batches=self._split_retrieve_doc_id_batches(tuple(entries_by_document_id)),
         ):
@@ -1052,6 +1200,7 @@ class LongTermRemoteCatalogStore:
     def _load_retrieve_batch_candidates(
         self,
         *,
+        snapshot_kind: str,
         read_client: object,
         batches: tuple[tuple[str, ...], ...],
     ) -> tuple[tuple[tuple[str, ...], tuple[Mapping[str, object], ...]], ...]:
@@ -1059,8 +1208,10 @@ class LongTermRemoteCatalogStore:
 
         if not batches:
             return ()
+        remote_state = self._require_remote_state()
 
         def load_one(batch: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...]]:
+            started_monotonic = time.monotonic()
             try:
                 response = read_client.retrieve(
                     ChonkyDBRetrieveRequest(
@@ -1073,7 +1224,20 @@ class LongTermRemoteCatalogStore:
                         allowed_doc_ids=batch,
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                record_remote_read_diagnostic(
+                    remote_state=remote_state,
+                    context=LongTermRemoteReadContext(
+                        snapshot_kind=snapshot_kind,
+                        operation="retrieve_batch",
+                        allowed_doc_count=len(batch),
+                        result_limit=len(batch),
+                        batch_size=len(batch),
+                    ),
+                    exc=exc,
+                    started_monotonic=started_monotonic,
+                    outcome="degraded",
+                )
                 return batch, ()
             return batch, tuple(self._iter_retrieve_result_candidates(response))
 
