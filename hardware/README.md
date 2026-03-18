@@ -20,9 +20,10 @@ Pi-side setup, probe, and smoke-test scripts for Twinr peripherals.
 | File | Purpose |
 |---|---|
 | [buttons/](./buttons) | Button setup and GPIO probe |
-| [display/](./display) | E-paper setup and smoke tests |
+| [display/](./display) | Display backend setup and smoke tests |
 | [mic/](./mic) | Audio default-device setup |
 | [ops/](./ops) | Pi-side productive systemd units plus Pi bootstrap helpers |
+| [piaicam/](./piaicam) | Pi AI Camera smoke tests |
 | [pir/](./pir) | PIR setup and motion probe |
 | [printer/](./printer) | Thermal-printer CUPS setup |
 | [component.yaml](./component.yaml) | Structured directory metadata |
@@ -35,7 +36,8 @@ Retired standalone break-glass units now live only under the ignored top-level `
 ```bash
 ./hardware/buttons/setup_buttons.sh --env-file .env --green 23 --yellow 22 --probe
 python3 hardware/display/display_test.py --env-file .env
-sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match Jabra --test
+sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match Jabra --capture-device-match reSpeaker --proactive-device-match reSpeaker --test
+python3 hardware/piaicam/smoke_piaicam.py --profile quick
 python3 hardware/ops/bootstrap_self_coding_pi.py
 ```
 

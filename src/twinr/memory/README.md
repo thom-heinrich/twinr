@@ -10,6 +10,7 @@ subpackages.
 `memory` owns:
 - expose the canonical `twinr.memory` import surface
 - persist durable prompt memory, managed user/personality context, and reminders
+- overlap independent prompt/user/personality remote snapshot bootstrap reads so required-remote readiness is bounded by the slowest prompt-context snapshot instead of the sum of all three
 - provide shared full-text and query-normalization helpers reused by memory stores
 - host the `on_device`, `chonkydb`, and `longterm` subpackages
 

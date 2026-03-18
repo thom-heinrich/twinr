@@ -251,12 +251,15 @@ class LongTermMemoryReflector:
         self,
         *,
         objects: tuple[LongTermMemoryObjectV1, ...],
+        include_midterm: bool = True,
     ) -> LongTermReflectionResultV1:
         """Reflect over the current long-term memory snapshot.
 
         Args:
             objects: Current long-term memory objects to canonicalize and
                 inspect for promotions, summaries, and midterm compilation.
+            include_midterm: Whether to run the optional midterm compiler after
+                deterministic promotions and thread-summary synthesis.
 
         Returns:
             A reflection result containing promoted objects, newly created
@@ -311,7 +314,7 @@ class LongTermMemoryReflector:
             if summary is not None:
                 created_summaries.append(summary)
 
-        if self.program is not None and self.midterm_packet_limit > 0:
+        if include_midterm and self.program is not None and self.midterm_packet_limit > 0:
             try:
                 # AUDIT-FIX(#5): Optional midterm enrichment must degrade gracefully instead of crashing the caller on external/program errors.
                 payload = self.program.compile_reflection(

@@ -3,12 +3,14 @@ name: retrieval
 path: src/twinr/memory/longterm/retrieval
 kind: python-package
 visibility: internal
-summary: Assemble prompt-ready long-term memory recall context and silent personalization cues from durable, episodic, mid-term, graph, and conflict state.
+summary: Assemble prompt-ready long-term memory recall context, adaptive policy hints, and silent personalization cues from durable, episodic, mid-term, graph, conflict, and proactive state.
 owned_concerns:
   - Assemble `LongTermMemoryContext` sections from long-term memory stores
   - Render bounded durable, episodic, mid-term, graph, and conflict prompt payloads
+  - Compile adaptive mid-term policy hints from confirmed memory, recurring routines, and proactive outcome history
   - Compile and render silent personalization subtext from graph and episodic cues
   - Sanitize retrieved memory payloads before JSON serialization or optional LLM compilation
+  - Expose a read-only operator search view over the same durable, episodic, mid-term, graph, and conflict stores used for recall
 out_of_scope:
   - Persist or mutate long-term memory state
   - Extract, consolidate, or resolve new memory objects
@@ -20,6 +22,10 @@ files:
     role: Context assembly across long-term memory stores
     exports:
       - LongTermRetriever
+  - path: adaptive_policy.py
+    role: Adaptive prompt-policy compiler from stored memory and proactive history
+  - path: operator_search.py
+    role: Read-only operator search over the real long-term retrieval stack for portal inspection
   - path: subtext.py
     role: Silent personalization compiler and subtext renderer
     exports:
@@ -35,5 +41,7 @@ primary_callers:
   - path: src/twinr/memory/longterm/__init__.py
 tests:
   - path: test/test_longterm_retriever.py
+  - path: test/test_longterm_operator_search.py
+  - path: test/test_longterm_memory.py
   - path: test/test_longterm_subtext.py
   - path: test/test_longterm_midterm.py

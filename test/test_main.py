@@ -209,6 +209,58 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(payload["status"], "waiting")
         self.assertIsNone(payload["error_message"])
 
+    def test_run_web_skips_runtime_bootstrap_before_uvicorn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    (
+                        f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
+                        "TWINR_WEB_HOST=127.0.0.1",
+                        "TWINR_WEB_PORT=1447",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_app = object()
+            uvicorn_calls: list[tuple[object, str, int]] = []
+            fake_uvicorn = ModuleType("uvicorn")
+            fake_uvicorn.run = lambda app, host, port: uvicorn_calls.append((app, host, port))
+            fake_web_module = ModuleType("twinr.web")
+            fake_web_module.create_app = lambda provided_env: fake_app if Path(provided_env) == env_path else None
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.web": fake_web_module,
+                        "uvicorn": fake_uvicorn,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(
+                        main_mod,
+                        "_build_runtime",
+                        side_effect=AssertionError("run-web must not bootstrap the runtime"),
+                    ):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--run-web",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(uvicorn_calls, [(fake_app, "127.0.0.1", 1447)])
+
     def test_run_hardware_loop_enables_display_companion_for_pi_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -158,6 +158,10 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
 def _validate_payload(payload: object, *, source: str) -> dict[str, object] | None:
     """Validate one raw midterm payload before model deserialization."""
 
+    if payload is None:
+        # Missing local caches or fresh remote namespaces are absence, not malformed payloads.
+        return None
+
     # AUDIT-FIX(#3): Validate container type and schema metadata before handing data to model loaders.
     if not isinstance(payload, dict):
         LOGGER.warning("Ignoring invalid midterm payload from %s because it is not a JSON object", source)

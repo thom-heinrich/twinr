@@ -3,11 +3,14 @@ name: display
 path: src/twinr/display
 kind: python-package
 visibility: internal
-summary: Render Twinr runtime state on the Waveshare 4.2 V2 e-paper panel and optionally keep the display loop running beside other hardware loops.
+summary: Render Twinr runtime state on the configured Twinr display backend and optionally keep the display loop running beside other hardware loops.
 owned_concerns:
-  - Translate runtime snapshots and health signals into bounded e-paper status frames
+  - Translate runtime snapshots and health signals into bounded status frames for the active display backend
+  - Persist and load optional HDMI face-expression cues so external triggers can steer gaze, brows, mouth, and subtle head drift without changing the generic runtime snapshot schema
+  - Expose a producer-facing HDMI face-expression API so camera, proactive, or other runtime modules can set combinable gaze, brow, mouth, and blink cues without writing raw JSON
   - Compose operator-friendly layout variants such as the grouped debug log display
   - Derive bounded debug-log sections from persisted ops events, usage telemetry, host health, and the remote-memory watchdog artifact without poll-to-poll timer churn or raw high-frequency metric jitter
+  - Render a visible full-screen HDMI Wayland UI for the Pi monitor path and keep a framebuffer fallback for non-Wayland setups
   - Validate and load the configured Waveshare vendor driver with Twinr GPIO and SPI expectations
   - Persist authoritative display forward-progress heartbeats so ops health and supervision can detect hung companion threads
   - Manage the optional companion display loop that shadows other runtime loops
@@ -19,16 +22,56 @@ files:
   - path: __init__.py
     role: Public display package export surface
     exports:
+      - DisplayFaceBrowStyle
+      - DisplayFaceCue
+      - DisplayFaceCueStore
+      - DisplayFaceEmotion
+      - DisplayFaceExpression
+      - DisplayFaceExpressionController
+      - DisplayFaceGazeDirection
+      - DisplayFaceMouthStyle
+      - HdmiFramebufferDisplay
+      - HdmiWaylandDisplay
       - TwinrStatusDisplayLoop
       - WaveshareEPD4In2V2
+      - create_display_adapter
+  - path: contracts.py
+    role: Shared adapter and payload contracts for display backends
+  - path: factory.py
+    role: Select the configured display backend
+    exports:
+      - create_display_adapter
   - path: service.py
-    role: Snapshot-driven e-paper status loop orchestration
+    role: Snapshot-driven status loop orchestration across display backends
     exports:
       - TwinrStatusDisplayLoop
   - path: debug_log.py
     role: Group recent system, llm, hardware, and ChonkyDB watchdog telemetry into display-safe log sections
+  - path: face_cues.py
+    role: Persist and normalize optional external HDMI face-expression cues
+  - path: face_expressions.py
+    role: Provide a producer-facing API for combinable HDMI gaze, brow, mouth, and blink expressions
+    exports:
+      - DisplayFaceBrowStyle
+      - DisplayFaceEmotion
+      - DisplayFaceExpression
+      - DisplayFaceExpressionController
+      - DisplayFaceGazeDirection
+      - DisplayFaceMouthStyle
   - path: heartbeat.py
     role: Persist display forward-progress heartbeats and expose the shared companion-health contract for ops health and supervision
+  - path: hdmi_default_scene.py
+    role: Compose the modular senior-facing HDMI default scene, including layout, face animation, and status cards
+  - path: hdmi_wayland.py
+    role: Visible fullscreen HDMI Wayland adapter
+    exports:
+      - HdmiWaylandDisplay
+  - path: hdmi_fbdev.py
+    role: HDMI framebuffer fallback adapter and scene host/transport utilities
+    exports:
+      - HdmiFramebufferDisplay
+  - path: wayland_env.py
+    role: Resolve and export Wayland socket/runtime details for HDMI fullscreen output
   - path: layouts.py
     role: Status-card layout composition for default and debug display variants
   - path: waveshare_v2.py
@@ -45,6 +88,7 @@ primary_callers:
   - path: hardware/display/run_display_loop.py
 tests:
   - path: test/test_display.py
+  - path: test/test_display_face_cues.py
   - path: test/test_display_service.py
   - path: test/test_display_companion.py
   - path: test/test_main.py

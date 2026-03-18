@@ -18,6 +18,7 @@ from twinr.proactive import (
     PresenceSessionSnapshot,
     SocialAudioObservation,
     SocialBodyPose,
+    SocialPersonZone,
     SocialTriggerEngine,
     SocialVisionObservation,
     WakewordMatch,
@@ -188,6 +189,8 @@ class ProactiveMonitorTests(unittest.TestCase):
             "\n".join(
                 [
                     "person_visible=yes",
+                    "person_count=2",
+                    "primary_person_zone=right",
                     "looking_toward_device=yes",
                     "body_pose=slumped",
                     "smiling=no",
@@ -197,16 +200,56 @@ class ProactiveMonitorTests(unittest.TestCase):
         )
 
         self.assertTrue(observation.person_visible)
+        self.assertEqual(observation.person_count, 2)
+        self.assertEqual(observation.primary_person_zone, SocialPersonZone.RIGHT)
         self.assertTrue(observation.looking_toward_device)
         self.assertEqual(observation.body_pose, SocialBodyPose.SLUMPED)
         self.assertFalse(observation.smiling)
         self.assertTrue(observation.hand_or_object_near_camera)
+
+    def test_parse_vision_observation_text_defaults_visible_person_to_one_person_unknown_zone(self) -> None:
+        observation = parse_vision_observation_text(
+            "\n".join(
+                [
+                    "person_visible=yes",
+                    "looking_toward_device=no",
+                    "body_pose=upright",
+                    "smiling=no",
+                    "hand_or_object_near_camera=no",
+                ]
+            )
+        )
+
+        self.assertTrue(observation.person_visible)
+        self.assertEqual(observation.person_count, 1)
+        self.assertEqual(observation.primary_person_zone, SocialPersonZone.UNKNOWN)
+
+    def test_parse_vision_observation_text_forces_hidden_person_to_zero_count_and_unknown_zone(self) -> None:
+        observation = parse_vision_observation_text(
+            "\n".join(
+                [
+                    "person_visible=no",
+                    "person_count=2",
+                    "primary_person_zone=left",
+                    "looking_toward_device=no",
+                    "body_pose=unknown",
+                    "smiling=no",
+                    "hand_or_object_near_camera=no",
+                ]
+            )
+        )
+
+        self.assertFalse(observation.person_visible)
+        self.assertEqual(observation.person_count, 0)
+        self.assertEqual(observation.primary_person_zone, SocialPersonZone.UNKNOWN)
 
     def test_openai_vision_observer_parses_backend_response(self) -> None:
         backend = FakeBackend(
             "\n".join(
                 [
                     "person_visible=yes",
+                    "person_count=2",
+                    "primary_person_zone=center",
                     "looking_toward_device=no",
                     "body_pose=upright",
                     "smiling=yes",
@@ -222,7 +265,11 @@ class ProactiveMonitorTests(unittest.TestCase):
         snapshot = observer.observe()
 
         self.assertEqual(len(backend.calls), 1)
+        self.assertIn("person_count=0|1|2|...", backend.calls[0][0])
+        self.assertIn("primary_person_zone=left|center|right|unknown", backend.calls[0][0])
         self.assertTrue(snapshot.observation.person_visible)
+        self.assertEqual(snapshot.observation.person_count, 2)
+        self.assertEqual(snapshot.observation.primary_person_zone, SocialPersonZone.CENTER)
         self.assertEqual(snapshot.observation.body_pose, SocialBodyPose.UPRIGHT)
         self.assertTrue(snapshot.observation.smiling)
 

@@ -5,6 +5,7 @@ import tempfile
 import textwrap
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from PIL import Image
 
@@ -359,9 +360,11 @@ class WaveshareDisplayTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            telemetry: list[str] = []
             display = WaveshareEPD4In2V2(
                 project_root=Path(temp_dir),
                 vendor_dir=Path(temp_dir) / "vendor",
+                emit=telemetry.append,
             )
             token = _prepared_image()
 
@@ -375,6 +378,13 @@ class WaveshareDisplayTests(unittest.TestCase):
                     "clear",
                     ("buffer", token),
                     ("display", b"buffer"),
+                ],
+            )
+            self.assertEqual(
+                telemetry,
+                [
+                    "display_refresh=full reason=clear render_count=0",
+                    "display_clear=true",
                 ],
             )
 
@@ -455,7 +465,7 @@ class WaveshareDisplayTests(unittest.TestCase):
                 ],
             )
 
-    def test_show_image_falls_back_to_fast_when_partial_missing(self) -> None:
+    def test_show_image_avoids_partial_refresh_when_fast_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             vendor_dir = Path(temp_dir) / "vendor" / "waveshare_epd"
             vendor_dir.mkdir(parents=True)
@@ -480,13 +490,9 @@ class WaveshareDisplayTests(unittest.TestCase):
                     class EPD:
                         width = 400
                         height = 300
-                        Seconds_1_5S = 7
 
                         def init(self):
                             EVENTS.append("init")
-
-                        def init_fast(self, mode):
-                            EVENTS.append(("init_fast", mode))
 
                         def getbuffer(self, image):
                             EVENTS.append(("buffer", image))
@@ -495,8 +501,8 @@ class WaveshareDisplayTests(unittest.TestCase):
                         def display(self, buffer):
                             EVENTS.append(("display", buffer))
 
-                        def display_Fast(self, buffer):
-                            EVENTS.append(("display_fast", buffer))
+                        def display_Partial(self, buffer):
+                            EVENTS.append(("display_partial", buffer))
 
                         def sleep(self):
                             EVENTS.append("sleep")
@@ -523,11 +529,186 @@ class WaveshareDisplayTests(unittest.TestCase):
                     "init",
                     ("buffer", first),
                     ("display", first),
-                    ("init_fast", 7),
+                    "init",
                     ("buffer", second),
-                    ("display_fast", second),
+                    ("display", second),
                 ],
             )
+
+    def test_show_status_runtime_trace_emits_phase_command_and_busy_context(self) -> None:
+        sentinel_name = "__twinr_display_runtime_trace_events__"
+        busy_name = "__twinr_display_runtime_trace_busy__"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            vendor_dir = Path(temp_dir) / "vendor" / "waveshare_epd"
+            vendor_dir.mkdir(parents=True)
+            (vendor_dir / "__init__.py").write_text("", encoding="utf-8")
+            (vendor_dir / "epdconfig.py").write_text(
+                textwrap.dedent(
+                    f"""
+                    import builtins
+
+                    _EVENTS = getattr(builtins, "{sentinel_name}", None)
+                    if _EVENTS is None:
+                        _EVENTS = []
+                        setattr(builtins, "{sentinel_name}", _EVENTS)
+                    _BUSY = getattr(builtins, "{busy_name}", None)
+                    if _BUSY is None:
+                        _BUSY = [0, 1, 0]
+                        setattr(builtins, "{busy_name}", _BUSY)
+
+                    RST_PIN = 17
+                    DC_PIN = 25
+                    CS_PIN = 8
+                    BUSY_PIN = 24
+                    PWR_PIN = 18
+
+                    def module_init():
+                        _EVENTS.append("module_init")
+                        return 0
+
+                    def digital_write(pin, value):
+                        _EVENTS.append(("digital_write", pin, value))
+
+                    def digital_read(pin):
+                        _EVENTS.append(("digital_read", pin))
+                        busy = getattr(builtins, "{busy_name}")
+                        if busy:
+                            return busy.pop(0)
+                        return 0
+
+                    def delay_ms(delay):
+                        _EVENTS.append(("delay_ms", delay))
+
+                    def module_exit(cleanup=False):
+                        _EVENTS.append(("module_exit", cleanup))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (vendor_dir / "epd4in2_V2.py").write_text(
+                textwrap.dedent(
+                    f"""
+                    import builtins
+
+                    _EVENTS = getattr(builtins, "{sentinel_name}", None)
+                    if _EVENTS is None:
+                        _EVENTS = []
+                        setattr(builtins, "{sentinel_name}", _EVENTS)
+
+                    class EPD:
+                        width = 400
+                        height = 300
+                        busy_pin = 24
+
+                        def ReadBusy(self):
+                            _EVENTS.append("readbusy-original")
+
+                        def init(self):
+                            _EVENTS.append("init")
+                            self.ReadBusy()
+
+                        def getbuffer(self, image):
+                            _EVENTS.append(("buffer", getattr(image, "size", None)))
+                            return bytearray([0xAA, 0x55, 0x00, 0xFF])
+
+                        def send_command(self, command):
+                            _EVENTS.append(("command", command))
+
+                        def send_data(self, data):
+                            _EVENTS.append(("data", data))
+
+                        def send_data2(self, data):
+                            _EVENTS.append(("bulk", len(data)))
+
+                        def TurnOnDisplay(self):
+                            _EVENTS.append("turn_on")
+                            self.send_command(0x20)
+                            self.ReadBusy()
+
+                        def display(self, buffer):
+                            _EVENTS.append(("display", tuple(buffer)))
+                            self.send_data2(buffer)
+                            self.TurnOnDisplay()
+
+                        def sleep(self):
+                            _EVENTS.append("sleep")
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            telemetry: list[str] = []
+            display = WaveshareEPD4In2V2(
+                project_root=Path(temp_dir),
+                vendor_dir=Path(temp_dir) / "vendor",
+                runtime_trace_enabled=True,
+                emit=telemetry.append,
+            )
+
+            try:
+                with (
+                    mock.patch.object(
+                        WaveshareEPD4In2V2,
+                        "_trace_gpio_snapshot",
+                        return_value="rst=op/lo pwr=op/lo busy=ip/lo dc=op/lo cs=op/hi",
+                    ),
+                    mock.patch.object(
+                        WaveshareEPD4In2V2,
+                        "_trace_supply_snapshot",
+                        return_value="throttled=0x0",
+                    ),
+                ):
+                    display.show_status(
+                        status="waiting",
+                        headline="Waiting",
+                        details=(),
+                    )
+
+                self.assertTrue(
+                    any(
+                        line.startswith("display_trace=phase_start")
+                        and "phase=initial_full" in line
+                        and "status=waiting" in line
+                        and "prev=none" in line
+                        for line in telemetry
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        line.startswith("display_trace=epd_command")
+                        and "cmd=0x20" in line
+                        for line in telemetry
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        line.startswith("display_trace=busy_wait_start")
+                        and "caller=TurnOnDisplay" in line
+                        and "cmd=0x20" in line
+                        for line in telemetry
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        line.startswith("display_trace=phase_ok")
+                        and "spi_calls=1" in line
+                        and "spi_bytes=4" in line
+                        for line in telemetry
+                    )
+                )
+                self.assertIn(
+                    "display_trace_gpio=phase_start rst=op/lo pwr=op/lo busy=ip/lo dc=op/lo cs=op/hi",
+                    telemetry,
+                )
+                self.assertIn(
+                    "display_trace_supply=phase_start detail=throttled=0x0",
+                    telemetry,
+                )
+            finally:
+                if hasattr(builtins, sentinel_name):
+                    delattr(builtins, sentinel_name)
+                if hasattr(builtins, busy_name):
+                    delattr(builtins, busy_name)
 
     def test_show_image_times_out_stuck_vendor_busy_wait(self) -> None:
         sentinel_name = "__twinr_display_busy_timeout_events__"
@@ -578,6 +759,9 @@ class WaveshareDisplayTests(unittest.TestCase):
                         height = 300
                         busy_pin = 24
 
+                        def ReadBusy(self):
+                            _EVENTS.append("readbusy-original")
+
                         def init(self):
                             _EVENTS.append("init")
                             self.ReadBusy()
@@ -596,20 +780,58 @@ class WaveshareDisplayTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            telemetry: list[str] = []
             display = WaveshareEPD4In2V2(
                 project_root=Path(temp_dir),
                 vendor_dir=Path(temp_dir) / "vendor",
                 busy_timeout_s=0.01,
+                runtime_trace_enabled=True,
+                emit=telemetry.append,
             )
 
             try:
-                with self.assertRaisesRegex(RuntimeError, "failed after one recovery attempt"):
-                    display.show_image(_prepared_image(), clear_first=False)
+                with (
+                    mock.patch.object(
+                        WaveshareEPD4In2V2,
+                        "_trace_gpio_snapshot",
+                        return_value="rst=op/lo pwr=op/lo busy=ip/hi dc=op/lo cs=op/hi",
+                    ),
+                    mock.patch.object(
+                        WaveshareEPD4In2V2,
+                        "_trace_supply_snapshot",
+                        return_value="throttled=0x0",
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "failed after one recovery attempt"):
+                        display.show_image(_prepared_image(), clear_first=False)
 
                 events = getattr(builtins, sentinel_name)
                 self.assertEqual(events.count("init"), 2)
                 self.assertEqual(events.count("sleep"), 2)
                 self.assertEqual(events.count(("module_exit", True)), 2)
+                self.assertTrue(any(line.startswith("display_busy_timeout=true") for line in telemetry))
+                self.assertTrue(any(line.startswith("display_retry=true") for line in telemetry))
+                self.assertGreaterEqual(telemetry.count("display_driver_reset=true"), 2)
+                self.assertTrue(
+                    any(
+                        line.startswith("display_trace=busy_wait_timeout")
+                        and "caller=init" in line
+                        and "phase=initial_full" in line
+                        for line in telemetry
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        line.startswith("display_trace=phase_error")
+                        and "phase=initial_full" in line
+                        and "err=TimeoutError" in line
+                        for line in telemetry
+                    )
+                )
+                self.assertIn(
+                    "display_trace_gpio=busy_wait_timeout rst=op/lo pwr=op/lo busy=ip/hi dc=op/lo cs=op/hi",
+                    telemetry,
+                )
             finally:
                 if hasattr(builtins, sentinel_name):
                     delattr(builtins, sentinel_name)
@@ -639,9 +861,13 @@ class WaveshareDisplayTests(unittest.TestCase):
                     class EPD:
                         width = 400
                         height = 300
+                        Seconds_1_5S = 7
 
                         def init(self):
                             EVENTS.append("init")
+
+                        def init_fast(self, mode):
+                            EVENTS.append(("init_fast", mode))
 
                         def getbuffer(self, image):
                             EVENTS.append(("buffer", image))
@@ -650,8 +876,8 @@ class WaveshareDisplayTests(unittest.TestCase):
                         def display(self, buffer):
                             EVENTS.append(("display", buffer))
 
-                        def display_Partial(self, buffer):
-                            EVENTS.append(("display_partial", buffer))
+                        def display_Fast(self, buffer):
+                            EVENTS.append(("display_fast", buffer))
                     """
                 ),
                 encoding="utf-8",
@@ -678,15 +904,16 @@ class WaveshareDisplayTests(unittest.TestCase):
                     "init",
                     ("buffer", first),
                     ("display", first),
+                    ("init_fast", 7),
                     ("buffer", second),
-                    ("display_partial", second),
+                    ("display_fast", second),
                     "init",
                     ("buffer", third),
                     ("display", third),
                 ],
             )
 
-    def test_show_image_debug_log_uses_fast_refresh_after_first_render(self) -> None:
+    def test_show_image_debug_log_uses_full_refresh_after_first_render(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             vendor_dir = Path(temp_dir) / "vendor" / "waveshare_epd"
             vendor_dir.mkdir(parents=True)
@@ -755,9 +982,9 @@ class WaveshareDisplayTests(unittest.TestCase):
                     "init",
                     ("buffer", first),
                     ("display", first),
-                    ("init_fast", 7),
+                    "init",
                     ("buffer", second),
-                    ("display_fast", second),
+                    ("display", second),
                 ],
             )
 

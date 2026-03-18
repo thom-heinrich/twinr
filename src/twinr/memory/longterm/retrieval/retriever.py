@@ -7,7 +7,7 @@ subtext retrieval into ``LongTermMemoryContext``. Import
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from enum import Enum
@@ -24,6 +24,7 @@ from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.core.models import LongTermConflictQueueItemV1, LongTermMemoryContext
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
+from twinr.memory.longterm.retrieval.adaptive_policy import LongTermAdaptivePolicyBuilder
 from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder
 from twinr.memory.query_normalization import LongTermQueryProfile
 from twinr.text_utils import collapse_whitespace
@@ -55,6 +56,7 @@ class LongTermRetriever:
     midterm_store: LongTermMidtermStore
     conflict_resolver: LongTermConflictResolver
     subtext_builder: LongTermSubtextBuilder
+    adaptive_policy_builder: LongTermAdaptivePolicyBuilder | None = None
 
     def build_context(
         self,
@@ -83,13 +85,21 @@ class LongTermRetriever:
             query,
             fallback_text=original_query_text,
         )
-        if not retrieval_text:  # AUDIT-FIX(#2): Blank or garbled input must not trigger broad accidental recall.
+        query_texts = self._query_text_variants(
+            query,
+            fallback_text=original_query_text,
+        )
+        if not query_texts:  # AUDIT-FIX(#2): Blank or garbled input must not trigger broad accidental recall.
             return self._empty_context()
         try:  # AUDIT-FIX(#1): A single broken store or malformed record must not crash the whole turn.
-            episodic_entries = self._select_episodic_entries(retrieval_text, fallback_limit=0)
-            midterm_packets = self._select_midterm_packets(retrieval_text)
-            durable_objects = self._select_durable_objects(retrieval_text)
-            conflict_queue = self._select_conflict_queue_for_text(retrieval_text)
+            episodic_entries = self._select_episodic_entries(query_texts, fallback_limit=0)
+            midterm_packets = self._select_midterm_packets(query_texts)
+            durable_objects = self._select_durable_objects(query_texts)
+            adaptive_packets = self._build_adaptive_packets(
+                retrieval_text=self._combine_query_texts(query_texts),
+                durable_objects=durable_objects,
+            )
+            conflict_queue = self._select_conflict_queue_for_texts(query_texts)
             graph_context = self._build_graph_context(retrieval_text)
             durable_context = self._render_durable_context(durable_objects)
             episodic_context = self._render_episodic_context(episodic_entries)
@@ -98,7 +108,7 @@ class LongTermRetriever:
                 query_text=original_query_text,
                 retrieval_query_text=retrieval_text,
                 episodic_entries=self._select_episodic_entries(
-                    retrieval_text,
+                    query_texts,
                     fallback_limit=self._coerce_limit(
                         self.config.long_term_memory_recall_limit,
                         default=1,
@@ -109,7 +119,7 @@ class LongTermRetriever:
             )
             return LongTermMemoryContext(
                 subtext_context=subtext_context,
-                midterm_context=self._render_midterm_context(midterm_packets),
+                midterm_context=self._render_midterm_context(tuple((*adaptive_packets, *midterm_packets))),
                 durable_context=durable_context,
                 episodic_context=episodic_context,
                 graph_context=graph_context,
@@ -137,20 +147,33 @@ class LongTermRetriever:
             A tuple of conflict queue items ordered by the underlying store.
         """
 
-        return self._select_conflict_queue_for_text(
-            self._normalize_query_text(query),
+        return self._select_conflict_queue_for_texts(
+            self._query_text_variants(query),
             limit=limit,
         )
 
-    def _select_conflict_queue_for_text(
+    def select_durable_objects(
         self,
-        retrieval_text: str,
+        *,
+        query: LongTermQueryProfile,
+        limit: int | None = None,
+    ) -> tuple[object, ...]:
+        """Select relevant durable objects across original and canonical queries."""
+
+        return self._select_durable_objects(
+            self._query_text_variants(query),
+            limit=limit,
+        )
+
+    def _select_conflict_queue_for_texts(
+        self,
+        query_texts: tuple[str, ...],
         *,
         limit: int | None = None,
     ) -> tuple[LongTermConflictQueueItemV1, ...]:
-        """Load conflict queue items for normalized retrieval text."""
+        """Load conflict queue items for one or more normalized retrieval texts."""
 
-        if not retrieval_text:
+        if not query_texts:
             return ()
         if limit is not None and self._coerce_limit(limit, default=0, minimum=0) == 0:
             return ()  # AUDIT-FIX(#7): Respect explicit zero-limit requests instead of silently widening recall.
@@ -160,8 +183,13 @@ class LongTermRetriever:
             minimum=1,
         )
         try:  # AUDIT-FIX(#1): Conflict retrieval must degrade gracefully when the store is temporarily broken.
-            conflicts = self.object_store.select_open_conflicts(
-                query_text=retrieval_text,
+            conflicts = self._merge_unique_results(
+                query_texts=query_texts,
+                load_results=lambda query_text: self.object_store.select_open_conflicts(
+                    query_text=query_text,
+                    limit=resolved_limit,
+                ),
+                result_key=self._conflict_result_key,
                 limit=resolved_limit,
             )
         except LongTermRemoteUnavailableError:
@@ -202,15 +230,15 @@ class LongTermRetriever:
 
     def _select_episodic_entries(
         self,
-        query: LongTermQueryProfile | str | None,
+        query: LongTermQueryProfile | str | tuple[str, ...] | None,
         *,
         fallback_limit: int = 2,
         require_query_match: bool = False,
     ) -> list[PersistentMemoryEntry]:
         """Load and normalize episodic memories into prompt entries."""
 
-        retrieval_text = self._normalize_query_text(query)
-        if not retrieval_text:
+        query_texts = self._query_text_variants(query)
+        if not query_texts:
             return []  # AUDIT-FIX(#2): Do not recall arbitrary episodic memory for empty queries.
         limit = self._coerce_limit(
             self.config.long_term_memory_recall_limit,
@@ -223,17 +251,37 @@ class LongTermRetriever:
             minimum=0,
         )
         try:  # AUDIT-FIX(#1): Corrupt or unavailable episodic storage must not crash the request.
-            selected = self.object_store.select_relevant_episodic_objects(
-                query_text=retrieval_text,
+            selected = self._merge_unique_results(
+                query_texts=query_texts,
+                load_results=lambda query_text: self.object_store.select_relevant_episodic_objects(
+                    query_text=query_text,
+                    limit=limit,
+                    fallback_limit=0,
+                    require_query_match=True,
+                ),
+                result_key=lambda item: self._normalize_text(getattr(item, "memory_id", None), limit=256),
                 limit=limit,
-                fallback_limit=resolved_fallback_limit,
-                require_query_match=require_query_match,
             )
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
             logger.exception("Long-term episodic retrieval failed; continuing without episodic context.")
             return []
+        if not selected and not require_query_match and resolved_fallback_limit > 0:
+            try:
+                selected = self._coerce_iterable(
+                    self.object_store.select_relevant_episodic_objects(
+                        query_text=query_texts[0],
+                        limit=limit,
+                        fallback_limit=resolved_fallback_limit,
+                        require_query_match=False,
+                    )
+                )
+            except LongTermRemoteUnavailableError:
+                raise
+            except Exception:
+                logger.exception("Long-term episodic fallback retrieval failed; continuing without episodic context.")
+                return []
 
         entries: list[PersistentMemoryEntry] = []
         for item in self._coerce_iterable(selected):
@@ -242,19 +290,25 @@ class LongTermRetriever:
                 entries.append(entry)
         return entries
 
-    def _select_midterm_packets(self, retrieval_text: str) -> tuple[object, ...]:
-        """Load bounded mid-term packets for normalized retrieval text."""
+    def _select_midterm_packets(self, query_texts: tuple[str, ...]) -> tuple[object, ...]:
+        """Load bounded mid-term packets across one or more retrieval texts."""
 
-        if not retrieval_text:
+        if not query_texts:
             return ()
+        resolved_limit = self._coerce_limit(
+            self.config.long_term_memory_midterm_limit,
+            default=1,
+            minimum=1,
+        )
         try:  # AUDIT-FIX(#1): Mid-term retrieval failures should not abort the response turn.
-            packets = self.midterm_store.select_relevant_packets(
-                retrieval_text,
-                limit=self._coerce_limit(
-                    self.config.long_term_memory_midterm_limit,
-                    default=1,
-                    minimum=1,
+            packets = self._merge_unique_results(
+                query_texts=query_texts,
+                load_results=lambda query_text: self.midterm_store.select_relevant_packets(
+                    query_text,
+                    limit=resolved_limit,
                 ),
+                result_key=lambda item: self._normalize_text(getattr(item, "packet_id", None), limit=256),
+                limit=resolved_limit,
             )
         except LongTermRemoteUnavailableError:
             raise
@@ -263,26 +317,41 @@ class LongTermRetriever:
             return ()
         return tuple(self._coerce_iterable(packets))
 
-    def _select_durable_objects(self, retrieval_text: str) -> tuple[object, ...]:
-        """Load bounded durable memory objects for normalized retrieval text."""
+    def _select_durable_objects(
+        self,
+        query_texts: tuple[str, ...],
+        *,
+        limit: int | None = None,
+    ) -> tuple[object, ...]:
+        """Load bounded durable memory objects across retrieval text variants."""
 
-        if not retrieval_text:
+        if not query_texts:
             return ()
+        resolved_limit = self._coerce_limit(
+            self.config.long_term_memory_recall_limit if limit is None else limit,
+            default=1,
+            minimum=1,
+        )
         try:  # AUDIT-FIX(#1): Durable-memory retrieval failures should not abort the response turn.
-            objects = self.object_store.select_relevant_objects(
-                query_text=retrieval_text,
-                limit=self._coerce_limit(
-                    self.config.long_term_memory_recall_limit,
-                    default=1,
-                    minimum=1,
+            objects = self._merge_unique_results(
+                query_texts=query_texts,
+                load_results=lambda query_text: self.object_store.select_relevant_objects(
+                    query_text=query_text,
+                    limit=resolved_limit,
                 ),
+                result_key=lambda item: self._normalize_text(getattr(item, "memory_id", None), limit=256),
+                limit=resolved_limit,
             )
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
             logger.exception("Long-term durable retrieval failed; continuing without durable context.")
             return ()
-        return tuple(self._coerce_iterable(objects))
+        return self.object_store.rank_selected_objects(
+            query_texts=query_texts,
+            objects=self._coerce_iterable(objects),
+            limit=resolved_limit,
+        )
 
     def _build_graph_context(self, retrieval_text: str) -> str | None:
         """Render graph-derived prompt context for normalized retrieval text."""
@@ -318,6 +387,29 @@ class LongTermRetriever:
         except Exception:
             logger.exception("Long-term subtext build failed; continuing without subtext context.")
             return None
+
+    def _build_adaptive_packets(
+        self,
+        *,
+        retrieval_text: str,
+        durable_objects: tuple[object, ...],
+    ) -> tuple[object, ...]:
+        """Compile adaptive prompt policies from relevant long-term signals."""
+
+        if self.adaptive_policy_builder is None or not retrieval_text or not durable_objects:
+            return ()
+        try:
+            return tuple(
+                self._coerce_iterable(
+                    self.adaptive_policy_builder.build_packets(
+                        query_text=retrieval_text,
+                        durable_objects=durable_objects,
+                    )
+                )
+            )
+        except Exception:
+            logger.exception("Adaptive long-term policy build failed; continuing without adaptive policies.")
+            return ()
 
     def _episodic_entry_from_object(self, item: object) -> PersistentMemoryEntry | None:
         """Convert a stored episodic object into ``PersistentMemoryEntry``."""
@@ -439,7 +531,10 @@ class LongTermRetriever:
                             limit=_MAX_DETAILS_CHARS,
                         ),
                         "status": self._serialize_json_value(getattr(item, "status", None)),
+                        "confirmed_by_user": self._serialize_json_value(getattr(item, "confirmed_by_user", None)),
                         "confidence": self._serialize_json_value(getattr(item, "confidence", None)),
+                        "slot_key": self._serialize_json_value(getattr(item, "slot_key", None)),
+                        "value_key": self._serialize_json_value(getattr(item, "value_key", None)),
                         "valid_from": self._serialize_json_value(getattr(item, "valid_from", None)),  # AUDIT-FIX(#3): JSON-safe serialization for temporal and enum-like fields.
                         "valid_to": self._serialize_json_value(getattr(item, "valid_to", None)),
                     }
@@ -705,6 +800,70 @@ class LongTermRetriever:
         if normalized:
             return normalized
         return self._normalize_text(fallback_text) or ""
+
+    def _query_text_variants(
+        self,
+        query: LongTermQueryProfile | str | tuple[str, ...] | None,
+        *,
+        fallback_text: str | None = None,
+    ) -> tuple[str, ...]:
+        """Return unique normalized query texts in user-language-first order."""
+
+        candidates: list[object | None] = []
+        if isinstance(query, LongTermQueryProfile):
+            candidates.extend(query.retrieval_variants())
+        elif isinstance(query, tuple):
+            candidates.extend(query)
+        else:
+            candidates.append(query)
+        candidates.append(fallback_text)
+        variants: list[str] = []
+        for candidate in candidates:
+            normalized = self._normalize_text(candidate)
+            if normalized and normalized not in variants:
+                variants.append(normalized)
+        return tuple(variants)
+
+    def _combine_query_texts(self, query_texts: tuple[str, ...]) -> str:
+        """Combine unique query texts for token-based relevance helpers."""
+
+        return " ".join(
+            text
+            for text in self._coerce_iterable(query_texts)
+            if isinstance(text, str) and text
+        )
+
+    def _merge_unique_results(
+        self,
+        *,
+        query_texts: tuple[str, ...],
+        load_results: Callable[[str], object],
+        result_key: Callable[[object], object],
+        limit: int,
+    ) -> tuple[object, ...]:
+        """Merge bounded retrieval results across query variants without duplicates."""
+
+        merged: list[object] = []
+        seen: set[str] = set()
+        for query_text in query_texts:
+            for item in self._coerce_iterable(load_results(query_text)):
+                key = self._normalize_text(result_key(item), limit=256)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+                if len(merged) >= max(1, limit):
+                    return tuple(merged)
+        return tuple(merged)
+
+    def _conflict_result_key(self, item: object) -> str | None:
+        """Build a stable deduplication key for one conflict-like object."""
+
+        slot_key = self._normalize_text(getattr(item, "slot_key", None), limit=256)
+        candidate_memory_id = self._normalize_text(getattr(item, "candidate_memory_id", None), limit=256)
+        if not slot_key or not candidate_memory_id:
+            return None
+        return f"{slot_key}:{candidate_memory_id}"
 
     def _normalize_text(self, value: object | None, *, limit: int | None = None) -> str | None:
         """Collapse whitespace and optionally bound free-form text."""

@@ -1,10 +1,9 @@
 """Drive the Twinr status display loop from runtime snapshots.
 
 This module polls the runtime snapshot store, samples bounded health and
-connectivity signals, translates them into short status frames for the e-paper
-adapter, and persists a small display heartbeat so supervision can distinguish
-an alive companion from a hung one. Hardware-specific rendering lives in
-``waveshare_v2.py``.
+connectivity signals, translates them into short status frames for the active
+display backend, and persists a small display heartbeat so supervision can
+distinguish an alive companion from a hung one.
 """
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import inspect
 import logging
 import math
 import os
@@ -20,23 +20,26 @@ import time
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
+from twinr.display.contracts import TwinrDisplayAdapter
 from twinr.display.debug_log import LogSections, TwinrDisplayDebugLogBuilder
+from twinr.display.face_cues import DisplayFaceCue, DisplayFaceCueStore
+from twinr.display.factory import create_display_adapter
 from twinr.display.heartbeat import DisplayHeartbeatStore, save_display_heartbeat
-from twinr.display.waveshare_v2 import WaveshareEPD4In2V2
 from twinr.ops.health import TwinrSystemHealth, collect_system_health
 
 _STATUS_ANIMATION_SPECS: dict[str, tuple[int, float]] = {
-    "waiting": (6, 5.0),
-    "listening": (4, 1.4),
-    "processing": (4, 1.6),
-    "answering": (4, 1.2),
-    "printing": (4, 1.6),
-    "error": (4, 2.0),
+    "waiting": (12, 0.75),
+    "listening": (6, 0.45),
+    "processing": (6, 0.55),
+    "answering": (6, 0.40),
+    "printing": (6, 0.55),
+    "error": (6, 0.65),
 }
 
 _HEALTH_FOOTER_REFRESH_S = 10.0
 _INTERNET_FOOTER_REFRESH_S = 60.0
 _DEGRADED_INTERNET_FOOTER_REFRESH_S = 10.0
+_DEBUG_LOG_MIN_REFRESH_S = 30.0
 _MIN_DISPLAY_POLL_INTERVAL_S = 0.05
 _SNAPSHOT_RETRY_DELAY_S = 0.05
 _STATUS_TEXT_MAX_LEN = 32
@@ -99,7 +102,7 @@ class TwinrStatusDisplayLoop:
     """
 
     config: TwinrConfig
-    display: WaveshareEPD4In2V2
+    display: TwinrDisplayAdapter
     snapshot_store: RuntimeSnapshotStore
     # AUDIT-FIX(#8): Replace invalid `callable` annotations with explicit callable signatures for Python 3.11 type safety.
     emit: Callable[[str], None] = _default_emit
@@ -109,6 +112,7 @@ class TwinrStatusDisplayLoop:
     internet_probe: Callable[[], bool] = _default_internet_probe
     debug_log_builder: TwinrDisplayDebugLogBuilder | None = None
     heartbeat_store: DisplayHeartbeatStore | None = None
+    face_cue_store: DisplayFaceCueStore | None = None
     _cached_health: TwinrSystemHealth | None = field(default=None, init=False, repr=False)
     _cached_health_error: str | None = field(default=None, init=False, repr=False)
     _cached_health_status: str | None = field(default=None, init=False, repr=False)
@@ -122,6 +126,8 @@ class TwinrStatusDisplayLoop:
     _last_heartbeat_at: float = field(default=0.0, init=False, repr=False)
     _last_render_started_at: datetime | None = field(default=None, init=False, repr=False)
     _last_render_completed_at: datetime | None = field(default=None, init=False, repr=False)
+    _last_render_status: str | None = field(default=None, init=False, repr=False)
+    _last_render_monotonic_s: float = field(default=0.0, init=False, repr=False)
 
     @classmethod
     def from_config(
@@ -144,12 +150,13 @@ class TwinrStatusDisplayLoop:
         """
         return cls(
             config=config,
-            display=WaveshareEPD4In2V2.from_config(config),
+            display=create_display_adapter(config, emit=emit or _default_emit),
             snapshot_store=RuntimeSnapshotStore(config.runtime_state_path),
             emit=emit or _default_emit,
             sleep=sleep,
             debug_log_builder=TwinrDisplayDebugLogBuilder.from_config(config),
             heartbeat_store=DisplayHeartbeatStore.from_config(config),
+            face_cue_store=DisplayFaceCueStore.from_config(config),
         )
 
     def run(self, *, duration_s: float | None = None, max_cycles: int | None = None) -> int:
@@ -163,8 +170,7 @@ class TwinrStatusDisplayLoop:
             ``0`` when the loop exits cleanly.
         """
         started_at = time.monotonic()
-        # AUDIT-FIX(#8): Track the full display signature with the correct tuple shape so static checks match runtime behavior.
-        last_signature: tuple[str, str, tuple[str, ...], tuple[tuple[str, str], ...], LogSections, int] | None = None
+        last_signature: tuple[object, ...] | None = None
         cycles = 0
         try:
             while True:
@@ -180,8 +186,17 @@ class TwinrStatusDisplayLoop:
                 log_sections = self._build_log_sections(snapshot, stale=snapshot_stale)
                 status = self._snapshot_status(snapshot)
                 frame = self._display_animation_frame(status)
-                signature = (status, headline, details, state_fields, log_sections, frame)
-                if signature != last_signature:
+                face_cue = self._active_face_cue()
+                signature = self._render_signature(
+                    status=status,
+                    headline=headline,
+                    details=details,
+                    state_fields=state_fields,
+                    log_sections=log_sections,
+                    animation_frame=frame,
+                    face_cue=face_cue,
+                )
+                if self._should_render_signature(status=status, signature=signature, last_signature=last_signature):
                     self._last_render_started_at = datetime.now(timezone.utc)
                     self._write_heartbeat(status, phase="rendering", force=True)
                     if self._show_status(
@@ -191,15 +206,19 @@ class TwinrStatusDisplayLoop:
                         state_fields=state_fields,
                         log_sections=log_sections,
                         animation_frame=frame,
+                        face_cue=face_cue,
                     ):
                         self._safe_emit(f"display_status={status}")
                         last_signature = signature
                         self._last_render_completed_at = datetime.now(timezone.utc)
+                        self._last_render_status = status
+                        self._last_render_monotonic_s = time.monotonic()
                         self._write_heartbeat(status, phase="idle", force=True)
                     else:
                         self._write_heartbeat(status, phase="error", detail="display_show_failed", force=True)
                 else:
                     self._write_heartbeat(status, phase="idle")
+                self._tick_display()
                 cycles += 1
                 self._sleep_once()
         finally:
@@ -497,6 +516,7 @@ class TwinrStatusDisplayLoop:
         state_fields: tuple[tuple[str, str], ...],
         log_sections: LogSections,
         animation_frame: int,
+        face_cue: DisplayFaceCue | None,
     ) -> bool:
         try:
             self.display.show_status(
@@ -506,6 +526,7 @@ class TwinrStatusDisplayLoop:
                 state_fields=state_fields,
                 log_sections=log_sections,
                 animation_frame=animation_frame,
+                face_cue=face_cue,
             )
             return True
         except Exception as exc:
@@ -521,6 +542,7 @@ class TwinrStatusDisplayLoop:
                     state_fields=state_fields,
                     log_sections=log_sections,
                     animation_frame=animation_frame,
+                    face_cue=face_cue,
                 )
                 return True
             except Exception as retry_exc:
@@ -560,22 +582,45 @@ class TwinrStatusDisplayLoop:
         self._last_heartbeat_at = now_monotonic
 
     def _reopen_display(self) -> bool:
+        last_rendered_status = getattr(self.display, "_last_rendered_status", None)
         self._close_display()
-        factories: list[Callable[[TwinrConfig], WaveshareEPD4In2V2]] = []
+        factories: list[Callable[[TwinrConfig], TwinrDisplayAdapter]] = []
         display_factory = getattr(type(self.display), "from_config", None)
         if callable(display_factory):
             factories.append(display_factory)
-        default_factory = getattr(WaveshareEPD4In2V2, "from_config", None)
-        if callable(default_factory) and default_factory not in factories:
-            factories.append(default_factory)
+        if create_display_adapter not in factories:
+            factories.append(create_display_adapter)
 
         for factory in factories:
             try:
-                self.display = factory(self.config)
+                reopened = self._build_display_from_factory(factory)
+                if last_rendered_status is not None and hasattr(reopened, "_last_rendered_status"):
+                    setattr(reopened, "_last_rendered_status", last_rendered_status)
+                self.display = reopened
                 return True
             except Exception as exc:
                 self._emit_error("display_reopen_failed", exc)
         return False
+
+    def _build_display_from_factory(
+        self,
+        factory: Callable[[TwinrConfig], TwinrDisplayAdapter],
+    ) -> TwinrDisplayAdapter:
+        try:
+            signature = inspect.signature(factory)
+        except (TypeError, ValueError):
+            return factory(self.config)
+        accepts_emit = False
+        for name, parameter in signature.parameters.items():
+            if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+                accepts_emit = True
+                break
+            if name == "emit":
+                accepts_emit = True
+                break
+        if accepts_emit:
+            return factory(self.config, emit=self.emit)
+        return factory(self.config)
 
     def _close_display(self) -> None:
         close = getattr(self.display, "close", None)
@@ -584,6 +629,16 @@ class TwinrStatusDisplayLoop:
                 close()
             except Exception as exc:
                 self._emit_error("display_close_failed", exc)
+
+    def _tick_display(self) -> None:
+        tick = getattr(self.display, "tick", None)
+        if not callable(tick):
+            return
+        try:
+            tick()
+        except Exception as exc:
+            self._emit_error("display_tick_failed", exc)
+            self._reopen_display()
 
     def _sleep_once(self) -> None:
         poll_interval_s = self._poll_interval_s()
@@ -620,10 +675,66 @@ class TwinrStatusDisplayLoop:
     def _display_animation_frame(self, status: str) -> int:
         if self._display_layout() != "default":
             return 0
+        if self._compact_text(status).lower() == "waiting" and not self._supports_idle_waiting_animation():
+            return 0
         return self._animation_frame(status)
+
+    def _supports_idle_waiting_animation(self) -> bool:
+        capability = getattr(self.display, "supports_idle_waiting_animation", None)
+        if not callable(capability):
+            return False
+        try:
+            return bool(capability())
+        except Exception as exc:
+            self._emit_error("display_idle_waiting_animation_capability_failed", exc)
+            return False
+
+    def _render_signature(
+        self,
+        *,
+        status: str,
+        headline: str,
+        details: tuple[str, ...],
+        state_fields: tuple[tuple[str, str], ...],
+        log_sections: LogSections,
+        animation_frame: int,
+        face_cue: DisplayFaceCue | None,
+    ) -> tuple[object, ...]:
+        layout_mode = self._display_layout()
+        if layout_mode == "debug_log":
+            return (layout_mode, status, headline, log_sections)
+        cue_signature = face_cue.signature() if face_cue is not None else None
+        return (layout_mode, status, headline, details, state_fields, log_sections, animation_frame, cue_signature)
+
+    def _should_render_signature(
+        self,
+        *,
+        status: str,
+        signature: tuple[object, ...],
+        last_signature: tuple[object, ...] | None,
+    ) -> bool:
+        if signature == last_signature:
+            return False
+        if self._display_layout() != "debug_log":
+            return True
+        if last_signature is None or status != self._last_render_status:
+            return True
+        return (time.monotonic() - self._last_render_monotonic_s) >= _DEBUG_LOG_MIN_REFRESH_S
 
     def _display_layout(self) -> str:
         return self._compact_text(getattr(self.config, "display_layout", "default")).lower() or "default"
+
+    def _active_face_cue(self) -> DisplayFaceCue | None:
+        if self._display_layout() != "default":
+            return None
+        store = self.face_cue_store
+        if store is None:
+            return None
+        try:
+            return store.load_active()
+        except Exception as exc:
+            self._emit_error("display_face_cue_load_failed", exc)
+            return None
 
     def _debug_log_builder(self) -> TwinrDisplayDebugLogBuilder:
         if self.debug_log_builder is None:

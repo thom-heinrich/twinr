@@ -115,6 +115,7 @@ class FakeToolBackend:
     def __init__(self, config: TwinrConfig) -> None:
         self.config = config
         self._client = SimpleNamespace(responses=FakeResponsesClient())
+        self.build_tools_calls: list[tuple[bool, str]] = []
 
     def _resolve_base_instructions(self) -> str:
         return "Base instructions"
@@ -167,7 +168,8 @@ class FakeToolBackend:
             request["prompt_cache_key"] = f"twinr:{prompt_cache_scope}:{model}:de"
         return request
 
-    def _build_tools(self, use_web_search: bool):
+    def _build_tools(self, use_web_search: bool, *, model: str):
+        self.build_tools_calls.append((use_web_search, model))
         return [{"type": "web_search"}] if use_web_search else []
 
     def _apply_prompt_cache(self, request: dict[str, object], *, scope: str | None, model: str) -> None:
@@ -343,6 +345,42 @@ class OpenAIToolCallingAgentProviderTests(unittest.TestCase):
             [{"type": "function_call_output", "call_id": "call_1", "output": '{"status":"printed"}'}],
         )
         self.assertEqual(request["tools"], [{"type": "function", "name": "print_receipt"}])
+        self.assertEqual(backend.build_tools_calls, [(False, "gpt-5.2")])
+
+    def test_continue_turn_streaming_passes_model_into_web_search_tool_build(self) -> None:
+        backend = FakeToolBackend(self.config)
+        backend._client.responses.stream_results.append(
+            (
+                [],
+                SimpleNamespace(
+                    id="resp_continue_search_1",
+                    _request_id="req_continue_search_1",
+                    model="gpt-5.2",
+                    output_text="Ich habe es gefunden.",
+                    output=[],
+                    usage=None,
+                ),
+            )
+        )
+        provider = OpenAIToolCallingAgentProvider(backend)
+
+        response = provider.continue_turn_streaming(
+            continuation_token="resp_start_2",
+            tool_results=(
+                AgentToolResult(
+                    call_id="call_2",
+                    name="web_lookup",
+                    output={"status": "ok"},
+                    serialized_output='{"status":"ok"}',
+                ),
+            ),
+            allow_web_search=True,
+        )
+
+        request = backend._client.responses.stream_requests[0]
+        self.assertEqual(response.text, "Ich habe es gefunden.")
+        self.assertEqual(backend.build_tools_calls, [(True, "gpt-5.2")])
+        self.assertEqual(request["tools"], [{"type": "web_search"}])
 
     def test_provider_overrides_model_and_base_instructions_for_fast_model(self) -> None:
         backend = FakeToolBackend(self.config)

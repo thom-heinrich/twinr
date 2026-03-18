@@ -1,1 +1,1 @@
-"""Runtime orchestration and background workers for long-term memory."""
+"""Runtime orchestration, flush budgeting, and background workers for long-term memory."""

@@ -1490,7 +1490,11 @@ class TwinrPersonalGraphStore:
         if self.remote_state is None or not self.remote_state.enabled:
             return None
         try:
-            payload = self.remote_state.load_snapshot(snapshot_kind="graph", local_path=self.path)
+            payload = self.remote_state.load_snapshot(
+                snapshot_kind="graph",
+                local_path=self.path,
+                prefer_cached_document_id=True,
+            )
         except LongTermRemoteUnavailableError:
             if self.remote_state.required:
                 raise

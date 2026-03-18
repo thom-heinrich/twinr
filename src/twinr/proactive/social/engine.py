@@ -112,6 +112,15 @@ class SocialBodyPose(StrEnum):
     FLOOR = "floor"
 
 
+class SocialPersonZone(StrEnum):
+    """Describe the coarse horizontal zone of the primary visible person."""
+
+    UNKNOWN = "unknown"
+    LEFT = "left"
+    CENTER = "center"
+    RIGHT = "right"
+
+
 def _coerce_body_pose(value: object) -> SocialBodyPose:
     """Coerce one value to a known body pose."""
 
@@ -124,6 +133,34 @@ def _coerce_body_pose(value: object) -> SocialBodyPose:
         except ValueError:
             return SocialBodyPose.UNKNOWN
     return SocialBodyPose.UNKNOWN
+
+
+def _coerce_person_zone(value: object) -> SocialPersonZone:
+    """Coerce one value to a known coarse person zone."""
+
+    if isinstance(value, SocialPersonZone):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        try:
+            return SocialPersonZone(normalized)
+        except ValueError:
+            return SocialPersonZone.UNKNOWN
+    return SocialPersonZone.UNKNOWN
+
+
+def _coerce_non_negative_int(value: object, *, default: int) -> int:
+    """Coerce one value to a non-negative integer with fallback."""
+
+    if isinstance(value, bool):
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    if number < 0:
+        return default
+    return number
 
 
 class SocialTriggerPriority(IntEnum):
@@ -144,6 +181,8 @@ class SocialVisionObservation:
     """Describe one normalized vision observation tick."""
 
     person_visible: bool = False
+    person_count: int = 0
+    primary_person_zone: SocialPersonZone = SocialPersonZone.UNKNOWN
     looking_toward_device: bool = False
     body_pose: SocialBodyPose = SocialBodyPose.UNKNOWN
     smiling: bool = False
@@ -1237,10 +1276,18 @@ class SocialTriggerEngine:
 
         person_visible = _coerce_bool(vision.person_visible)
         if not person_visible:
-            return SocialVisionObservation(person_visible=False)
+            return SocialVisionObservation(
+                person_visible=False,
+                person_count=0,
+                primary_person_zone=SocialPersonZone.UNKNOWN,
+            )
 
         return SocialVisionObservation(
             person_visible=True,
+            person_count=max(1, _coerce_non_negative_int(getattr(vision, "person_count", 1), default=1)),
+            primary_person_zone=_coerce_person_zone(
+                getattr(vision, "primary_person_zone", SocialPersonZone.UNKNOWN)
+            ),
             looking_toward_device=_coerce_bool(vision.looking_toward_device),
             body_pose=_coerce_body_pose(vision.body_pose),
             smiling=_coerce_bool(vision.smiling),

@@ -155,6 +155,26 @@ class LongTermQueryProfile:
             retrieval_text=retrieval_text or original,
         )
 
+    def retrieval_variants(self) -> tuple[str, ...]:
+        """Return unique normalized retrieval texts in user-language-first order.
+
+        The original query stays first so same-language memories are not lost
+        when an optional canonical English rewrite differs from persisted
+        memory text. Canonical English stays available as a secondary lookup
+        path for memories stored in normalized English.
+        """
+
+        variants: list[str] = []
+        for candidate in (
+            self.original_text,
+            self.canonical_english_text,
+            self.retrieval_text,
+        ):
+            normalized = _normalize_text(candidate)
+            if normalized and normalized not in variants:
+                variants.append(normalized)
+        return tuple(variants)
+
 
 @dataclass(slots=True)
 class LongTermQueryRewriter:

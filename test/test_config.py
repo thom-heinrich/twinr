@@ -41,6 +41,7 @@ class TwinrConfigTests(unittest.TestCase):
 
     def test_display_gpio_conflicts_reports_button_overlap(self) -> None:
         config = TwinrConfig(
+            display_driver="waveshare_4in2_v2",
             green_button_gpio=23,
             yellow_button_gpio=24,
             display_cs_gpio=8,
@@ -53,6 +54,17 @@ class TwinrConfigTests(unittest.TestCase):
             config.display_gpio_conflicts(),
             ("Display BUSY GPIO 24 collides with yellow button GPIO 24.",),
         )
+
+    def test_hdmi_display_driver_skips_gpio_conflicts(self) -> None:
+        config = TwinrConfig(
+            display_driver="hdmi_fbdev",
+            green_button_gpio=23,
+            yellow_button_gpio=24,
+            display_busy_gpio=24,
+        )
+
+        self.assertFalse(config.display_uses_gpio)
+        self.assertEqual(config.display_gpio_conflicts(), ())
 
     def test_from_env_normalizes_display_layout_alias(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -71,6 +83,55 @@ class TwinrConfigTests(unittest.TestCase):
             config = TwinrConfig.from_env(env_path)
 
         self.assertEqual(config.display_busy_timeout_s, 12.5)
+
+    def test_from_env_reads_display_runtime_trace_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("TWINR_DISPLAY_RUNTIME_TRACE_ENABLED=true\n", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertTrue(config.display_runtime_trace_enabled)
+
+    def test_from_env_reads_wayland_display_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_DISPLAY_DRIVER=hdmi_wayland",
+                        "TWINR_DISPLAY_WAYLAND_DISPLAY=wayland-1",
+                        "TWINR_DISPLAY_WAYLAND_RUNTIME_DIR=/run/user/1001",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_driver, "hdmi_wayland")
+        self.assertEqual(config.display_wayland_display, "wayland-1")
+        self.assertEqual(config.display_wayland_runtime_dir, "/run/user/1001")
+
+    def test_from_env_reads_display_face_cue_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_DISPLAY_FACE_CUE_PATH=state/custom/face.json",
+                        "TWINR_DISPLAY_FACE_CUE_TTL_S=7.5",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_face_cue_path, "state/custom/face.json")
+        self.assertEqual(config.display_face_cue_ttl_s, 7.5)
 
     def test_reads_openai_button_and_printer_settings_from_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -326,6 +387,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_LONG_TERM_MEMORY_ARCHIVE_ENABLED=true",
                         "TWINR_LONG_TERM_MEMORY_MIGRATION_ENABLED=false",
                         "TWINR_LONG_TERM_MEMORY_MIGRATION_BATCH_SIZE=32",
+                        "TWINR_LONG_TERM_MEMORY_REMOTE_BULK_REQUEST_MAX_BYTES=131072",
                         "TWINR_CHONKYDB_BASE_URL=https://memory.example.com:2149",
                         "TWINR_CHONKYDB_API_KEY=secret-key",
                         "TWINR_CHONKYDB_API_KEY_HEADER=x-api-key",
@@ -354,7 +416,8 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_BUTTON_BIAS=pull-up",
                         "TWINR_BUTTON_DEBOUNCE_MS=120",
                         "TWINR_BUTTON_PROBE_LINES=17,27,22",
-                        "TWINR_DISPLAY_DRIVER=waveshare_4in2_v2",
+                        "TWINR_DISPLAY_DRIVER=hdmi_fbdev",
+                        "TWINR_DISPLAY_FB_PATH=/dev/fb1",
                         "TWINR_DISPLAY_VENDOR_DIR=hardware/display/vendor",
                         "TWINR_DISPLAY_SPI_BUS=0",
                         "TWINR_DISPLAY_SPI_DEVICE=0",
@@ -636,6 +699,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertTrue(config.long_term_memory_archive_enabled)
         self.assertFalse(config.long_term_memory_migration_enabled)
         self.assertEqual(config.long_term_memory_migration_batch_size, 32)
+        self.assertEqual(config.long_term_memory_remote_bulk_request_max_bytes, 131072)
         self.assertEqual(config.chonkydb_base_url, "https://memory.example.com:2149")
         self.assertEqual(config.chonkydb_api_key, "secret-key")
         self.assertEqual(config.chonkydb_api_key_header, "x-api-key")
@@ -664,7 +728,8 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.button_bias, "pull-up")
         self.assertEqual(config.button_debounce_ms, 120)
         self.assertEqual(config.button_probe_lines, (17, 27, 22))
-        self.assertEqual(config.display_driver, "waveshare_4in2_v2")
+        self.assertEqual(config.display_driver, "hdmi_fbdev")
+        self.assertEqual(config.display_fb_path, "/dev/fb1")
         self.assertEqual(config.display_vendor_dir, "hardware/display/vendor")
         self.assertEqual(config.display_spi_bus, 0)
         self.assertEqual(config.display_spi_device, 0)
@@ -677,6 +742,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_rotation_degrees, 270)
         self.assertEqual(config.display_full_refresh_interval, 120)
         self.assertEqual(config.display_busy_timeout_s, 20.0)
+        self.assertFalse(config.display_runtime_trace_enabled)
         self.assertEqual(config.printer_queue, "Twinr_Test_Printer")
         self.assertEqual(
             config.printer_device_uri,
@@ -716,6 +782,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.processing_feedback_delay_ms, 0)
         self.assertTrue(config.turn_controller_enabled)
         self.assertEqual(config.turn_controller_context_turns, 4)
+        self.assertEqual(config.display_full_refresh_interval, 0)
         self.assertEqual(config.turn_controller_instructions_file, "TURN_CONTROLLER.md")
         self.assertTrue(config.turn_controller_fast_endpoint_enabled)
         self.assertEqual(config.turn_controller_fast_endpoint_min_chars, 10)
@@ -735,6 +802,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_transcript_verifier_max_words, 6)
         self.assertEqual(config.streaming_transcript_verifier_max_chars, 32)
         self.assertEqual(config.streaming_transcript_verifier_min_confidence, 0.92)
+        self.assertFalse(config.display_runtime_trace_enabled)
         self.assertEqual(config.streaming_transcript_verifier_max_capture_ms, 6500)
         self.assertEqual(config.streaming_first_word_prefetch_min_words, 2)
         self.assertTrue(config.conversation_closure_guard_enabled)
@@ -802,6 +870,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertTrue(config.long_term_memory_archive_enabled)
         self.assertTrue(config.long_term_memory_migration_enabled)
         self.assertEqual(config.long_term_memory_migration_batch_size, 64)
+        self.assertEqual(config.long_term_memory_remote_bulk_request_max_bytes, 512 * 1024)
         self.assertEqual(config.proactive_possible_fall_visibility_loss_hold_s, 15.0)
         self.assertEqual(config.proactive_possible_fall_visibility_loss_arming_s, 6.0)
         self.assertEqual(config.proactive_possible_fall_slumped_visibility_loss_arming_s, 4.0)

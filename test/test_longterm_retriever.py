@@ -18,10 +18,13 @@ from twinr.memory.longterm import (
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,
     LongTermMidtermStore,
+    LongTermProactiveCandidateV1,
+    LongTermProactiveStateStore,
     LongTermRetriever,
     LongTermSourceRefV1,
     LongTermStructuredStore,
 )
+from twinr.memory.longterm.retrieval.adaptive_policy import LongTermAdaptivePolicyBuilder
 from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder
 from twinr.memory.query_normalization import LongTermQueryProfile
 
@@ -254,6 +257,226 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertEqual(len(matching), 1)
         self.assertEqual(matching[0].slot_key, "contact:person:corinna_maier:phone")
         self.assertEqual(unrelated, ())
+
+    def test_build_context_merges_original_query_with_canonical_rewrite_for_same_language_memory(self) -> None:
+        thermos_location = LongTermMemoryObjectV1(
+            memory_id="fact:thermos_location_old",
+            kind="fact",
+            summary="Früher stand die rote Thermoskanne im Flurschrank.",
+            details="Historische Ortsangabe zur roten Thermoskanne.",
+            source=_source("turn:thermos"),
+            status="active",
+            confidence=0.98,
+            confirmed_by_user=True,
+            slot_key="object:red_thermos:location",
+            value_key="hallway_cupboard",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.write_snapshot(
+                objects=(thermos_location,),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Wo stand früher meine rote Thermoskanne?",
+                    canonical_english_text="Where did my red thermos flask used to be kept?",
+                ),
+                original_query_text="Wo stand früher meine rote Thermoskanne?",
+            )
+
+        self.assertIsNotNone(context.durable_context)
+        self.assertIn("Flurschrank", context.durable_context or "")
+        self.assertIn("Thermoskanne", context.durable_context or "")
+
+    def test_select_conflict_queue_merges_original_query_with_canonical_rewrite_for_same_language_conflicts(self) -> None:
+        existing = LongTermMemoryObjectV1(
+            memory_id="fact:thermos_location_hallway",
+            kind="fact",
+            summary="Früher stand die rote Thermoskanne im Flurschrank.",
+            details="Historische Ortsangabe zur roten Thermoskanne.",
+            source=_source("turn:thermos_old"),
+            status="active",
+            confidence=0.95,
+            slot_key="object:red_thermos:location",
+            value_key="hallway_cupboard",
+        )
+        candidate = LongTermMemoryObjectV1(
+            memory_id="fact:thermos_location_kitchen",
+            kind="fact",
+            summary="Später stand die rote Thermoskanne in der Küche.",
+            details="Abweichende Ortsangabe zur roten Thermoskanne.",
+            source=_source("turn:thermos_new"),
+            status="uncertain",
+            confidence=0.9,
+            slot_key="object:red_thermos:location",
+            value_key="kitchen",
+        )
+        conflict = LongTermMemoryConflictV1(
+            slot_key="object:red_thermos:location",
+            candidate_memory_id="fact:thermos_location_kitchen",
+            existing_memory_ids=("fact:thermos_location_hallway",),
+            question="Wo stand früher die rote Thermoskanne?",
+            reason="Widersprüchliche Ortsangaben zur roten Thermoskanne.",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:thermos_conflict",
+                    occurred_at=datetime(2026, 3, 14, 12, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                    episodic_objects=(),
+                    durable_objects=(existing,),
+                    deferred_objects=(candidate,),
+                    conflicts=(conflict,),
+                    graph_edges=(),
+                )
+            )
+
+            matching = retriever.select_conflict_queue(
+                query=LongTermQueryProfile.from_text(
+                    "Wo stand früher meine rote Thermoskanne?",
+                    canonical_english_text="Where did my red thermos flask used to be kept?",
+                )
+            )
+
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].slot_key, "object:red_thermos:location")
+        self.assertIn("rote Thermoskanne", matching[0].question)
+
+    def test_build_context_includes_adaptive_policy_packets_for_confirmed_memory_and_successful_usage(self) -> None:
+        confirmed_preference = LongTermMemoryObjectV1(
+            memory_id="fact:coffee_brand",
+            kind="fact",
+            summary="The user prefers Melitta coffee.",
+            details="Use Melitta as the default coffee suggestion.",
+            source=_source("turn:coffee"),
+            status="active",
+            confidence=0.99,
+            confirmed_by_user=True,
+            slot_key="preference:coffee:brand",
+            value_key="Melitta",
+            attributes={"fact_type": "preference", "support_count": 3},
+        )
+        routine_plan = LongTermMemoryObjectV1(
+            memory_id="plan:morning_walk",
+            kind="plan",
+            summary="Go for a morning walk in the park.",
+            details="The user often asks for simple walk-related suggestions.",
+            source=_source("turn:walk"),
+            status="active",
+            confidence=0.94,
+            slot_key="plan:morning_walk",
+            value_key="park_walk",
+            attributes={"support_count": 3},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            proactive_state_store = LongTermProactiveStateStore.from_config(_config(temp_dir))
+            object.__setattr__(
+                retriever,
+                "adaptive_policy_builder",
+                LongTermAdaptivePolicyBuilder(
+                    proactive_state_store=proactive_state_store,
+                ),
+            )
+            object_store.write_snapshot(
+                objects=(confirmed_preference, routine_plan),
+                conflicts=(),
+                archived_objects=(),
+            )
+            candidate = LongTermProactiveCandidateV1(
+                candidate_id="proactive:walk:coffee",
+                kind="routine_check_in",
+                summary="Offer one simple next step before the morning walk.",
+                rationale="This suggestion supports the established walk routine.",
+                source_memory_ids=(routine_plan.memory_id,),
+                confidence=0.9,
+            )
+            proactive_state_store.mark_delivered(
+                candidate=candidate,
+                delivered_at=datetime(2026, 3, 18, 8, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                prompt_text="Would you like one simple coffee tip before the walk?",
+            )
+            proactive_state_store.mark_delivered(
+                candidate=candidate,
+                delivered_at=datetime(2026, 3, 18, 9, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                prompt_text="Shall I give you one short idea before the walk?",
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Which coffee should I get before my walk today?",
+                    canonical_english_text="Which coffee should I get before my walk today?",
+                ),
+                original_query_text="Which coffee should I get before my walk today?",
+            )
+
+        self.assertIsNotNone(context.midterm_context)
+        self.assertIn("adaptive_confirmed_memory_policy", context.midterm_context or "")
+        self.assertIn("adaptive_delivery_policy", context.midterm_context or "")
+        self.assertIn("Melitta coffee", context.midterm_context or "")
+
+    def test_build_context_includes_adaptive_avoidance_policy_after_repeated_skips(self) -> None:
+        medication_plan = LongTermMemoryObjectV1(
+            memory_id="plan:evening_medication",
+            kind="plan",
+            summary="Take the evening medication after dinner.",
+            details="Keep medication reminders gentle and optional.",
+            source=_source("turn:medication"),
+            status="active",
+            confidence=0.9,
+            slot_key="plan:evening_medication",
+            value_key="after_dinner",
+            attributes={"support_count": 2},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            proactive_state_store = LongTermProactiveStateStore.from_config(_config(temp_dir))
+            object.__setattr__(
+                retriever,
+                "adaptive_policy_builder",
+                LongTermAdaptivePolicyBuilder(
+                    proactive_state_store=proactive_state_store,
+                ),
+            )
+            object_store.write_snapshot(
+                objects=(medication_plan,),
+                conflicts=(),
+                archived_objects=(),
+            )
+            candidate = LongTermProactiveCandidateV1(
+                candidate_id="proactive:medication:evening",
+                kind="same_day_reminder",
+                summary="Offer an evening medication reminder.",
+                rationale="Supports the existing evening medication plan.",
+                source_memory_ids=(medication_plan.memory_id,),
+                confidence=0.87,
+            )
+            proactive_state_store.mark_skipped(
+                candidate=candidate,
+                skipped_at=datetime(2026, 3, 18, 18, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                reason="The user did not want a reminder just now.",
+            )
+            proactive_state_store.mark_skipped(
+                candidate=candidate,
+                skipped_at=datetime(2026, 3, 18, 19, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                reason="The user already handled it alone.",
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Should I handle my evening medication now?",
+                    canonical_english_text="Should I handle my evening medication now?",
+                ),
+                original_query_text="Should I handle my evening medication now?",
+            )
+
+        self.assertIsNotNone(context.midterm_context)
+        self.assertIn("adaptive_avoidance_policy", context.midterm_context or "")
+        self.assertIn("evening medication", context.midterm_context or "")
 
 
 if __name__ == "__main__":

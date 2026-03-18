@@ -11,7 +11,8 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 - normalize malformed persisted values into stable operator-safe display values
 - validate managed integration form submissions before route handlers persist them
 - build self-coding operator telemetry rows from persisted compile, activation, health, live-e2e, and lifecycle-control state
-- build the tabbed `/ops/debug` operator page context from runtime, watchdog, usage, hardware, and raw artifact state
+- build the tabbed `/ops/debug` operator page context from runtime, watchdog, memory-attestation, usage, hardware, and raw artifact state
+- shape the `/ops/debug` memory-search tab, including grouped durable/midterm/episodic/conflict hits from the real long-term retrieval path
 - expose the presenter import surface through [`__init__.py`](./__init__.py)
 
 `presenters` does **not** own:
@@ -31,6 +32,7 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 | [`voice.py`](./voice.py) | Voice profile page helpers |
 | [`ops.py`](./ops.py) | Ops row formatters and redaction |
 | [`debug.py`](./debug.py) | Tabbed operator debug page context builder |
+| [`memory_search.py`](./memory_search.py) | Presenter shaping for the read-only `/ops/debug` memory-search tab |
 | [`connect.py`](./connect.py) | Provider-routing section builders |
 | [`memory.py`](./memory.py) | Memory-related section builders |
 | [`self_coding.py`](./self_coding.py) | Self-coding operator page context builder |

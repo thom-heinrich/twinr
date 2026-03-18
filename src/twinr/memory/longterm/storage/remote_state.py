@@ -8,6 +8,7 @@ failures through ``LongTermRemoteUnavailableError``.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field  # AUDIT-FIX(#10): Field support is needed for stable exception/internal state handling.
 from datetime import datetime, timezone
 import hashlib
@@ -19,7 +20,7 @@ from pathlib import Path
 import stat  # AUDIT-FIX(#2): Require regular files for local snapshot fallback reads.
 import threading  # AUDIT-FIX(#5): Protect lightweight circuit-breaker state across concurrent callers.
 import time
-from typing import Iterable, Mapping
+from typing import Iterable, Iterator, Mapping
 from urllib.parse import quote  # AUDIT-FIX(#6): Encode URI path segments safely.
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -336,6 +337,9 @@ class LongTermRemoteStateStore:
     _state_lock: threading.Lock = field(init=False, repr=False, default_factory=threading.Lock)  # AUDIT-FIX(#5): Guard circuit state across concurrent callers.
     _circuit_open_until_monotonic: float = field(init=False, repr=False, default=0.0)
     _consecutive_failures: int = field(init=False, repr=False, default=0)
+    _probe_cache_depth: int = field(init=False, repr=False, default=0)
+    _probe_cache: dict[str, LongTermRemoteSnapshotProbe] = field(init=False, repr=False, default_factory=dict)
+    _document_id_hints: dict[str, str] = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize the remote namespace once during construction."""
@@ -451,7 +455,30 @@ class LongTermRemoteStateStore:
             )
         return LongTermRemoteStatus(mode="remote_primary", ready=True)
 
-    def load_snapshot(self, *, snapshot_kind: str, local_path: Path | None = None) -> dict[str, object] | None:
+    @contextmanager
+    def cache_probe_reads(self) -> Iterator[None]:
+        """Reuse successful snapshot probes within one bounded readiness scope."""
+
+        with self._state_lock:
+            self._probe_cache_depth += 1
+            if self._probe_cache_depth == 1:
+                self._probe_cache.clear()
+        try:
+            yield
+        finally:
+            with self._state_lock:
+                if self._probe_cache_depth > 0:
+                    self._probe_cache_depth -= 1
+                if self._probe_cache_depth == 0:
+                    self._probe_cache.clear()
+
+    def load_snapshot(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path: Path | None = None,
+        prefer_cached_document_id: bool = False,
+    ) -> dict[str, object] | None:
         """Load one snapshot from remote storage or a safe local fallback.
 
         Args:
@@ -459,6 +486,10 @@ class LongTermRemoteStateStore:
                 ``midterm``.
             local_path: Optional local recovery snapshot path used in
                 non-required mode when the remote backend is missing or flaky.
+            prefer_cached_document_id: Reuse a previously successful remote
+                document id before resolving snapshot pointers again. Callers
+                should opt in only when a stale-but-readable snapshot can serve
+                as a bounded readiness proof until normal fallback runs.
 
         Returns:
             The loaded snapshot payload, or ``None`` when no usable payload is
@@ -494,7 +525,11 @@ class LongTermRemoteStateStore:
             )
             return None
 
-        probe = self.probe_snapshot_load(snapshot_kind=normalized_snapshot_kind, local_path=local_path)
+        probe = self._probe_snapshot_load_internal(
+            snapshot_kind=normalized_snapshot_kind,
+            local_path=local_path,
+            prefer_cached_document_id=prefer_cached_document_id,
+        )
         if probe.payload is not None:
             return probe.payload
 
@@ -598,6 +633,22 @@ class LongTermRemoteStateStore:
                 write_client,
                 snapshot_kind=normalized_snapshot_kind,
                 document_id=document_id,
+            )
+            self._remember_snapshot_document_id(
+                snapshot_kind=normalized_snapshot_kind,
+                document_id=document_id,
+            )
+        self._clear_cached_probe(snapshot_kind=normalized_snapshot_kind)
+        if not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
+            self._store_cached_probe(
+                LongTermRemoteSnapshotProbe(
+                    snapshot_kind=normalized_snapshot_kind,
+                    status="found",
+                    latency_ms=0.0,
+                    document_id=document_id,
+                    selected_source="saved_snapshot",
+                    payload=_mapping_dict(payload) or {},
+                )
             )
 
     def _require_client(self, client: ChonkyDBClient | None, *, operation: str) -> ChonkyDBClient:
@@ -803,6 +854,10 @@ class LongTermRemoteStateStore:
                         detail=f"payload_type={type(payload).__name__}",
                     )
                 )
+                if source != "pointer_document" and attempt + 1 < attempts:
+                    if backoff_s > 0:
+                        time.sleep(backoff_s)
+                    continue
                 return _RemoteSnapshotFetchResult(
                     status="unavailable",
                     detail=(
@@ -844,6 +899,10 @@ class LongTermRemoteStateStore:
                     detail="snapshot_candidate_missing",
                 )
             )
+            if source != "pointer_document" and attempt + 1 < attempts:
+                if backoff_s > 0:
+                    time.sleep(backoff_s)
+                continue
             return _RemoteSnapshotFetchResult(
                 status="unavailable",
                 detail=(
@@ -871,6 +930,21 @@ class LongTermRemoteStateStore:
     ) -> LongTermRemoteSnapshotProbe:
         """Probe one remote snapshot read and preserve pointer/origin evidence."""
 
+        return self._probe_snapshot_load_internal(
+            snapshot_kind=snapshot_kind,
+            local_path=local_path,
+            prefer_cached_document_id=False,
+        )
+
+    def _probe_snapshot_load_internal(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path: Path | None = None,
+        prefer_cached_document_id: bool,
+    ) -> LongTermRemoteSnapshotProbe:
+        """Probe one remote snapshot read, optionally reusing a learned document id."""
+
         normalized_snapshot_kind = self._normalize_snapshot_kind(snapshot_kind)
         if not self.enabled:
             return LongTermRemoteSnapshotProbe(
@@ -888,10 +962,88 @@ class LongTermRemoteStateStore:
                 latency_ms=0.0,
                 detail=str(exc),
             )
-        return self._load_snapshot_with_pointer_fallback(
+        cached_probe = self._cached_probe(snapshot_kind=normalized_snapshot_kind)
+        if cached_probe is not None:
+            return cached_probe
+        if prefer_cached_document_id and not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
+            probe = self._load_snapshot_with_document_id_hint(
+                client,
+                snapshot_kind=normalized_snapshot_kind,
+                local_path=local_path,
+            )
+        else:
+            probe = self._load_snapshot_with_pointer_fallback(
+                client,
+                snapshot_kind=normalized_snapshot_kind,
+                local_path=local_path,
+            )
+        if probe.payload is not None and probe.document_id and not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
+            self._remember_snapshot_document_id(
+                snapshot_kind=normalized_snapshot_kind,
+                document_id=probe.document_id,
+            )
+        self._store_cached_probe(probe)
+        return probe
+
+    def _load_snapshot_with_document_id_hint(
+        self,
+        client: ChonkyDBClient,
+        *,
+        snapshot_kind: str,
+        local_path: Path | None = None,
+    ) -> LongTermRemoteSnapshotProbe:
+        """Probe one snapshot by a remembered document id before pointer/origin resolution."""
+
+        started = time.monotonic()
+        attempt_records: list[LongTermRemoteFetchAttempt] = []
+        hinted_document_id = self._cached_snapshot_document_id(snapshot_kind=snapshot_kind)
+        if hinted_document_id:
+            hinted_result = self._load_snapshot_via_uri(
+                client,
+                snapshot_kind=snapshot_kind,
+                local_path=local_path,
+                document_id=hinted_document_id,
+                source="cached_document",
+            )
+            attempt_records.extend(hinted_result.attempts)
+            if hinted_result.payload is not None:
+                return LongTermRemoteSnapshotProbe(
+                    snapshot_kind=snapshot_kind,
+                    status=hinted_result.status,
+                    latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
+                    detail=hinted_result.detail,
+                    document_id=hinted_result.document_id or hinted_document_id,
+                    selected_source=hinted_result.selected_source,
+                    payload=hinted_result.payload,
+                    attempts=tuple(attempt_records),
+                )
+            if hinted_result.status == "unavailable":
+                return LongTermRemoteSnapshotProbe(
+                    snapshot_kind=snapshot_kind,
+                    status=hinted_result.status,
+                    latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
+                    detail=hinted_result.detail,
+                    document_id=hinted_result.document_id or hinted_document_id,
+                    selected_source=hinted_result.selected_source,
+                    attempts=tuple(attempt_records),
+                )
+            self._forget_snapshot_document_id(snapshot_kind=snapshot_kind)
+
+        fallback = self._load_snapshot_with_pointer_fallback(
             client,
-            snapshot_kind=normalized_snapshot_kind,
+            snapshot_kind=snapshot_kind,
             local_path=local_path,
+        )
+        return LongTermRemoteSnapshotProbe(
+            snapshot_kind=snapshot_kind,
+            status=fallback.status,
+            latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
+            detail=fallback.detail,
+            document_id=fallback.document_id,
+            pointer_document_id=fallback.pointer_document_id,
+            selected_source=fallback.selected_source,
+            payload=fallback.payload,
+            attempts=tuple(attempt_records) + fallback.attempts,
         )
 
     def _load_snapshot_with_pointer_fallback(
@@ -1119,7 +1271,7 @@ class LongTermRemoteStateStore:
         )
         if local_path is None:
             return configured
-        candidate_path = self._validated_local_snapshot_path(local_path)
+        candidate_path = self._validated_local_snapshot_path(local_path, warn=False)
         if candidate_path is None:
             return configured
         try:
@@ -1220,7 +1372,67 @@ class LongTermRemoteStateStore:
             max_length=_MAX_SNAPSHOT_KIND_LENGTH,
         )
 
-    def _validated_local_snapshot_path(self, local_path: Path) -> Path | None:
+    def _clear_probe_cache(self) -> None:
+        with self._state_lock:
+            self._probe_cache.clear()
+
+    def _clear_cached_probe(self, *, snapshot_kind: str) -> None:
+        with self._state_lock:
+            self._probe_cache.pop(snapshot_kind, None)
+
+    def _cached_snapshot_document_id(self, *, snapshot_kind: str) -> str | None:
+        with self._state_lock:
+            return self._document_id_hints.get(snapshot_kind)
+
+    def _remember_snapshot_document_id(self, *, snapshot_kind: str, document_id: str) -> None:
+        normalized_document_id = _normalize_snapshot_document_id(document_id)
+        if normalized_document_id is None:
+            return
+        with self._state_lock:
+            self._document_id_hints[snapshot_kind] = normalized_document_id
+
+    def _forget_snapshot_document_id(self, *, snapshot_kind: str) -> None:
+        with self._state_lock:
+            self._document_id_hints.pop(snapshot_kind, None)
+
+    def _cached_probe(self, *, snapshot_kind: str) -> LongTermRemoteSnapshotProbe | None:
+        with self._state_lock:
+            cached = self._probe_cache.get(snapshot_kind)
+        if cached is None:
+            return None
+        payload = dict(cached.payload) if isinstance(cached.payload, dict) else cached.payload
+        return LongTermRemoteSnapshotProbe(
+            snapshot_kind=cached.snapshot_kind,
+            status=cached.status,
+            latency_ms=0.0,
+            detail=cached.detail,
+            document_id=cached.document_id,
+            pointer_document_id=cached.pointer_document_id,
+            selected_source=cached.selected_source,
+            payload=payload,
+            attempts=cached.attempts,
+        )
+
+    def _store_cached_probe(self, probe: LongTermRemoteSnapshotProbe) -> None:
+        if probe.snapshot_kind.startswith(_SNAPSHOT_POINTER_PREFIX):
+            return
+        with self._state_lock:
+            if self._probe_cache_depth <= 0:
+                return
+            payload = dict(probe.payload) if isinstance(probe.payload, dict) else probe.payload
+            self._probe_cache[probe.snapshot_kind] = LongTermRemoteSnapshotProbe(
+                snapshot_kind=probe.snapshot_kind,
+                status=probe.status,
+                latency_ms=probe.latency_ms,
+                detail=probe.detail,
+                document_id=probe.document_id,
+                pointer_document_id=probe.pointer_document_id,
+                selected_source=probe.selected_source,
+                payload=payload,
+                attempts=probe.attempts,
+            )
+
+    def _validated_local_snapshot_path(self, local_path: Path, *, warn: bool = True) -> Path | None:
         project_root = _safe_resolve_path(Path(self.config.project_root))
         candidate = local_path if local_path.is_absolute() else (project_root / local_path)
         candidate_absolute = Path(os.path.abspath(os.fspath(candidate)))
@@ -1241,10 +1453,12 @@ class LongTermRemoteStateStore:
             allowed = resolved_target == resolved_configured_target
 
         if not allowed:
-            _LOGGER.warning(
-                "Rejected local snapshot path %s because it escapes the configured Twinr memory path.",
-                candidate_absolute,
-            )
+            if warn:
+                _LOGGER.warning(
+                    "Skipped local snapshot fallback %s because the caller supplied a path outside the configured Twinr memory root %s. This is a probe/operator path issue, not corrupted memory data.",
+                    candidate_absolute,
+                    configured_absolute,
+                )
             return None  # AUDIT-FIX(#2): Prevent traversal/symlink escapes outside the configured Twinr memory path.
         return candidate_absolute
 

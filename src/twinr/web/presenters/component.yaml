@@ -10,7 +10,8 @@ owned_concerns:
   - Validate and canonicalize managed email and calendar form submissions before route handlers persist them
   - Expose the curated presenter import surface consumed by `src/twinr/web/app.py` and `src/twinr/web/context.py`
   - Build self-coding operator telemetry rows from persisted self-coding state without moving policy into web routes
-  - Build the tabbed `/ops/debug` operator context from authoritative runtime, watchdog, usage, hardware, and raw artifact state
+  - Build the tabbed `/ops/debug` operator context from authoritative runtime, watchdog, memory-attestation, usage, hardware, and raw artifact state
+  - Shape the read-only `/ops/debug` memory-search tab from real long-term retrieval results without moving query execution into templates
 out_of_scope:
   - FastAPI route definitions, request parsing, redirects, and response handling in `src/twinr/web/app.py`
   - Template markup, styling, and client-side behavior under `src/twinr/web/templates` and static assets
@@ -79,10 +80,12 @@ files:
       - _format_usage_rows
       - _health_card_detail
   - path: debug.py
-    role: Tabbed operator debug page context builder
+    role: Tabbed operator debug page context builder, including the latest persisted live memory-attestation artifact
     exports:
       - build_ops_debug_page_context
       - coerce_ops_debug_tab
+  - path: memory_search.py
+    role: Presenter shaping for the read-only `/ops/debug` memory-search tab
   - path: settings.py
     role: Global settings form sections and adaptive timing card builder
     exports:

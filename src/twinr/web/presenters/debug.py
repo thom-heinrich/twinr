@@ -14,12 +14,19 @@ from typing import Any
 
 from twinr.agent.base_agent import RuntimeSnapshot, TwinrConfig
 from twinr.agent.workflows.required_remote_snapshot import RequiredRemoteWatchdogAssessment
+from twinr.memory.longterm.evaluation.live_midterm_attest import (
+    LiveMidtermAttestResult,
+    default_live_midterm_attest_path,
+    load_latest_live_midterm_attest,
+)
+from twinr.memory.longterm.retrieval.operator_search import LongTermOperatorSearchResult
 from twinr.ops.checks import ConfigCheck
 from twinr.ops.devices import DeviceOverview
 from twinr.ops.health import ServiceHealth, TwinrSystemHealth
 from twinr.ops.paths import TwinrOpsPaths
 from twinr.ops.remote_memory_watchdog import RemoteMemoryWatchdogSnapshot
 from twinr.ops.usage import UsageSummary
+from twinr.web.presenters.memory_search import build_memory_search_panel_context
 from twinr.web.presenters.ops import _format_log_rows, _format_usage_rows, _safe_pretty_json
 
 
@@ -27,6 +34,7 @@ _DEBUG_TABS: tuple[tuple[str, str, str], ...] = (
     ("overview", "Overview", "Start here for the current runtime, ChonkyDB, and artifact summary."),
     ("runtime", "Runtime", "Inspect the live snapshot, health state, and recent runtime errors."),
     ("chonkydb", "ChonkyDB", "Inspect the required-remote watchdog and recent remote-memory probes."),
+    ("memory_search", "Memory Search", "Search the real long-term retrieval stack and inspect matching memories."),
     ("llm", "LLM", "Inspect OpenAI usage summaries and the latest tracked response records."),
     ("events", "Events", "Inspect recent structured local ops events and their payloads."),
     ("hardware", "Hardware", "Inspect live host health plus the device overview used by Twinr ops."),
@@ -61,6 +69,9 @@ def build_ops_debug_page_context(
     redacted_env_values: dict[str, str] | None = None,
     config_checks: tuple[ConfigCheck, ...] = (),
     config_check_summary: dict[str, int] | None = None,
+    memory_search_query: str = "",
+    memory_search_result: LongTermOperatorSearchResult | None = None,
+    memory_search_error: str | None = None,
 ) -> dict[str, object]:
     """Return template-ready context for the web operator debug page."""
 
@@ -73,13 +84,21 @@ def build_ops_debug_page_context(
     event_rows = _format_log_rows(recent_events)
     usage_rows = _format_usage_rows(recent_usage)
     recent_error_rows = tuple(row for row in event_rows if row["level"] == "error")[-8:]
+    memory_attest = _load_memory_attest(ops_paths.project_root)
+    memory_attest_status = _memory_attest_status(memory_attest)
     artifact_rows = _artifact_rows(
         env_path=env_path,
         config=config,
         ops_paths=ops_paths,
         remote_memory_watchdog=remote_memory_watchdog,
+        memory_attest=memory_attest,
     )
     config_summary = dict(config_check_summary or {"ok": 0, "warn": 0, "fail": 0})
+    memory_search = build_memory_search_panel_context(
+        query_text=memory_search_query,
+        result=memory_search_result,
+        error_message=memory_search_error,
+    )
 
     return {
         "debug_tabs": tuple(
@@ -100,6 +119,7 @@ def build_ops_debug_page_context(
             snapshot=snapshot,
             health=health,
             watchdog_status=watchdog_status,
+            memory_attest_status=memory_attest_status,
             recent_events=event_rows,
             summary_24h=summary_24h,
             artifact_rows=artifact_rows,
@@ -113,6 +133,10 @@ def build_ops_debug_page_context(
             assessment=remote_memory_watchdog_assessment,
             error_message=remote_memory_watchdog_error,
         ),
+        "memory_attest_status": memory_attest_status,
+        "memory_attest_summary_rows": _memory_attest_summary_rows(memory_attest),
+        "memory_attest_packet_rows": _memory_attest_packet_rows(memory_attest),
+        "memory_search": memory_search,
         "watchdog_current_rows": _watchdog_current_rows(
             snapshot=remote_memory_watchdog,
             error_message=remote_memory_watchdog_error,
@@ -130,6 +154,7 @@ def build_ops_debug_page_context(
             summary_all=summary_all,
             summary_24h=summary_24h,
             device_overview=device_overview,
+            memory_attest=memory_attest,
             redacted_env_values=redacted_env_values,
             config_checks=config_checks,
             config_check_summary=config_summary,
@@ -143,6 +168,7 @@ def _overview_cards(
     snapshot: RuntimeSnapshot,
     health: TwinrSystemHealth,
     watchdog_status: dict[str, str],
+    memory_attest_status: dict[str, str],
     recent_events: tuple[dict[str, object], ...],
     summary_24h: UsageSummary,
     artifact_rows: tuple[dict[str, object], ...],
@@ -165,6 +191,12 @@ def _overview_cards(
             watchdog_status["label"],
             detail=watchdog_status["detail"],
             status=watchdog_status["status"],
+        ),
+        _detail_item(
+            "Memory attest",
+            memory_attest_status["label"],
+            detail=memory_attest_status["detail"],
+            status=memory_attest_status["status"],
         ),
         _detail_item(
             "LLM requests 24h",
@@ -268,6 +300,111 @@ def _watchdog_assessment_rows(
     )
 
 
+def _load_memory_attest(project_root: Path) -> LiveMidtermAttestResult | None:
+    try:
+        return load_latest_live_midterm_attest(project_root)
+    except Exception:
+        return None
+
+
+def _memory_attest_status(result: LiveMidtermAttestResult | None) -> dict[str, str]:
+    if result is None:
+        return {
+            "label": "Missing",
+            "detail": "No live memory attestation artifact exists yet.",
+            "status": "warn",
+        }
+    if result.ready:
+        detail = result.finished_at or "Latest live memory attestation passed."
+        if result.writer_packet_ids:
+            detail = f"{detail} · {len(result.writer_packet_ids)} packet(s)"
+        return {"label": "Ok", "detail": detail, "status": "ok"}
+    return {
+        "label": "Fail",
+        "detail": result.error_message or "Latest live memory attestation failed.",
+        "status": "fail",
+    }
+
+
+def _memory_attest_summary_rows(result: LiveMidtermAttestResult | None) -> tuple[dict[str, object], ...]:
+    if result is None:
+        return (
+            _detail_item(
+                "Memory attest",
+                "No artifact yet",
+                detail="Run the live midterm acceptance script to populate this block.",
+                status="warn",
+            ),
+        )
+    rows = [
+        _detail_item("Run status", _title_case(result.status or "unknown"), status=_status_class(result.status)),
+        _detail_item("Probe id", result.probe_id or "—", copy=True),
+        _detail_item("Finished", result.finished_at or "—", copy=True),
+        _detail_item("Namespace", result.runtime_namespace or "—", copy=True, wide=True),
+        _detail_item("Flush", "yes" if result.flush_ok else "no", status="ok" if result.flush_ok else "fail"),
+        _detail_item(
+            "Midterm context",
+            "yes" if result.midterm_context_present else "no",
+            status="ok" if result.midterm_context_present else "fail",
+        ),
+        _detail_item(
+            "Path warning class",
+            result.last_path_warning_class or "—",
+            detail=result.last_path_warning_message or None,
+            status="ok" if result.last_path_warning_class else "warn",
+            copy=True,
+            wide=bool(result.last_path_warning_message),
+        ),
+        _detail_item("Follow-up model", result.follow_up_model or "—", copy=True),
+        _detail_item("Artifact", result.artifact_path or "—", copy=True, wide=True),
+    ]
+    if result.follow_up_query:
+        rows.append(_detail_item("Follow-up query", result.follow_up_query, copy=True, wide=True))
+    if result.follow_up_answer_text:
+        rows.append(_detail_item("Follow-up answer", result.follow_up_answer_text, copy=True, wide=True))
+    if result.error_message:
+        rows.append(_detail_item("Error", result.error_message, status="fail", copy=True, wide=True))
+    return tuple(rows)
+
+
+def _memory_attest_packet_rows(result: LiveMidtermAttestResult | None) -> tuple[dict[str, object], ...]:
+    if result is None:
+        return ()
+    matched_terms = ", ".join(result.matched_answer_terms) if result.matched_answer_terms else "—"
+    expected_terms = ", ".join(result.expected_answer_terms) if result.expected_answer_terms else "—"
+    return (
+        _detail_item(
+            "Writer packet ids",
+            ", ".join(result.writer_packet_ids) if result.writer_packet_ids else "—",
+            status="ok" if result.writer_packet_ids else "warn",
+            copy=True,
+            wide=True,
+        ),
+        _detail_item(
+            "Remote packet ids",
+            ", ".join(result.remote_packet_ids) if result.remote_packet_ids else "—",
+            status="ok" if result.remote_packet_ids else "warn",
+            copy=True,
+            wide=True,
+        ),
+        _detail_item(
+            "Fresh-reader packet ids",
+            ", ".join(result.fresh_reader_packet_ids) if result.fresh_reader_packet_ids else "—",
+            status="ok" if result.fresh_reader_packet_ids else "warn",
+            copy=True,
+            wide=True,
+        ),
+        _detail_item(
+            "Answer terms",
+            matched_terms,
+            detail=f"expected {expected_terms}",
+            status="ok" if result.expected_answer_terms and result.matched_answer_terms == result.expected_answer_terms else "warn",
+            copy=True,
+            wide=True,
+        ),
+    )
+
+
 def _watchdog_current_rows(
     *,
     snapshot: RemoteMemoryWatchdogSnapshot | None,
@@ -354,6 +491,7 @@ def _raw_blocks(
     summary_all: UsageSummary,
     summary_24h: UsageSummary,
     device_overview: DeviceOverview | None,
+    memory_attest: LiveMidtermAttestResult | None,
     redacted_env_values: dict[str, str] | None,
     config_checks: tuple[ConfigCheck, ...],
     config_check_summary: dict[str, int],
@@ -376,6 +514,7 @@ def _raw_blocks(
             ),
         },
         {"title": "Hardware overview", "body": _safe_pretty_json(_debug_payload(device_overview))},
+        {"title": "Memory attestation", "body": _safe_pretty_json(_debug_payload(memory_attest))},
     )
 
 
@@ -393,6 +532,7 @@ def _artifact_rows(
     config: TwinrConfig,
     ops_paths: TwinrOpsPaths,
     remote_memory_watchdog: RemoteMemoryWatchdogSnapshot | None,
+    memory_attest: LiveMidtermAttestResult | None,
 ) -> tuple[dict[str, object], ...]:
     runtime_state_path = Path(config.runtime_state_path).expanduser()
     if not runtime_state_path.is_absolute():
@@ -402,6 +542,11 @@ def _artifact_rows(
         if remote_memory_watchdog is not None and remote_memory_watchdog.artifact_path
         else ops_paths.ops_store_root / "remote_memory_watchdog.json"
     )
+    memory_attest_path = (
+        Path(memory_attest.artifact_path).expanduser()
+        if memory_attest is not None and memory_attest.artifact_path
+        else default_live_midterm_attest_path(ops_paths.project_root)
+    )
     rows = (
         ("Env file", env_path),
         ("Project root", ops_paths.project_root),
@@ -409,6 +554,7 @@ def _artifact_rows(
         ("Ops events", ops_paths.events_path),
         ("LLM usage", ops_paths.usage_path),
         ("Watchdog artifact", remote_artifact_path),
+        ("Memory attest", memory_attest_path),
         ("Self-tests", ops_paths.self_tests_root),
         ("Support bundles", ops_paths.bundles_root),
     )

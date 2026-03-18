@@ -3,10 +3,12 @@ name: evaluation
 path: src/twinr/memory/longterm/evaluation
 kind: python-package
 visibility: internal
-summary: Run isolated long-term memory evaluations covering synthetic recall, multimodal retrieval, and live subtext-response behavior without changing production runtime paths.
+summary: Run isolated long-term memory evaluations covering synthetic recall, multimodal retrieval, live subtext-response behavior, live midterm memory attestation, and live synthetic-memory acceptance without mutating production local state paths.
 owned_concerns:
   - Seed deterministic evaluation fixtures and build fixed evaluation case sets
   - Execute recall, multimodal, and live subtext evaluations against the real Twinr services/backends
+  - Execute live midterm write/persist/read/LLM-usage attestations against real OpenAI and ChonkyDB in isolated temp roots and namespaces
+  - Execute live synthetic-memory acceptance matrices for earlier memory, conflict confirmation, restart persistence, and control-query containment against real OpenAI and ChonkyDB in isolated temp roots and namespaces
   - Snapshot evaluation artifacts and expose structured result payloads for inspection
 out_of_scope:
   - Production runtime serving or permanent memory mutations outside temporary workspaces
@@ -43,6 +45,28 @@ files:
       - default_subtext_eval_cases
       - contains_explicit_memory_announcement
       - run_subtext_response_eval
+  - path: live_midterm_attest.py
+    role: Artifact/result contract for the live midterm attestation
+    exports:
+      - LiveMidtermAttestResult
+      - LiveMidtermSeedTurn
+      - default_live_midterm_attest_path
+      - load_latest_live_midterm_attest
+      - load_live_midterm_attest
+      - write_live_midterm_attest_artifacts
+  - path: live_midterm_acceptance.py
+    role: Live midterm write/persist/read/LLM-usage attestation runner
+    exports:
+      - run_live_midterm_acceptance
+  - path: live_memory_acceptance.py
+    role: Live synthetic-memory acceptance runner
+    exports:
+      - LiveMemoryAcceptanceCaseResult
+      - LiveMemoryAcceptanceResult
+      - default_live_memory_acceptance_path
+      - default_live_memory_acceptance_report_dir
+      - run_live_memory_acceptance
+      - write_live_memory_acceptance_artifacts
 compatibility_reexports:
   - path: src/twinr/memory/longterm/__init__.py
     names:
@@ -63,7 +87,11 @@ primary_callers:
   - path: test/test_longterm_memory_eval.py
   - path: test/test_longterm_multimodal_eval.py
   - path: test/test_subtext_response_eval.py
+  - path: src/twinr/web/presenters/debug.py
 tests:
   - path: test/test_longterm_memory_eval.py
   - path: test/test_longterm_multimodal_eval.py
   - path: test/test_subtext_response_eval.py
+  - path: test/test_longterm_live_midterm_attest.py
+  - path: test/test_longterm_store.py
+  - path: test/test_longterm_memory.py

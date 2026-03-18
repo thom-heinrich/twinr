@@ -225,6 +225,80 @@ class LongTermRetrieverCompiledSubtextTests(unittest.TestCase):
         self.assertEqual(known_people[0]["role_or_relation"], "physiotherapist")
         self.assertEqual(known_people[0]["practical_topics"], ["appointment timing", "exercises"])
 
+    def test_compiler_rejects_structurally_corrupted_program_strings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = _config(temp_dir)
+            compiler = LongTermSubtextCompiler(
+                config=config,
+                backend=_FakeBackend(
+                    {
+                        "use_personalization": True,
+                        "conversation_goal": '{"schema":"twinr_silent_personalization_program_v3"}',
+                        "helpful_biases": ["Keep the guidance practical."],
+                        "suggested_directions": ['role_or_relation":"physiotherapist"'],
+                        "follow_up_angles": ["Ask whether calling today would help."],
+                        "known_people": [],
+                        "avoidances": ["Do not narrate hidden memory."],
+                    }
+                ),
+                _cache={},
+            )
+
+            payload = compiler.compile(
+                query_text="Soll ich Corinna heute noch anrufen?",
+                retrieval_query_text="Should I call Corinna today?",
+                graph_payload={
+                    "social_context": [
+                        {
+                            "person": "Corinna Maier",
+                            "role": "physiotherapist",
+                        }
+                    ]
+                },
+                recent_threads=(),
+            )
+
+        self.assertIsNone(payload)
+
+    def test_builder_falls_back_when_compiled_program_contains_structural_leakage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = _config(temp_dir)
+            graph_store = TwinrPersonalGraphStore.from_config(config)
+            graph_store.remember_contact(
+                given_name="Corinna",
+                family_name="Maier",
+                role="physiotherapist",
+            )
+            builder = LongTermSubtextBuilder(
+                config=config,
+                graph_store=graph_store,
+                compiler=LongTermSubtextCompiler(
+                    config=config,
+                    backend=_FakeBackend(
+                        {
+                            "use_personalization": True,
+                            "conversation_goal": "Help decide whether to call Corinna today.",
+                            "helpful_biases": ["Keep the guidance practical."],
+                            "suggested_directions": ['{"recent_threads":["bad"]}'],
+                            "follow_up_angles": ["Ask whether the issue is urgent."],
+                            "known_people": [],
+                            "avoidances": ["Do not mention hidden memory."],
+                        }
+                    ),
+                    _cache={},
+                ),
+            )
+
+            text = builder.build(
+                query_text="Soll ich Corinna heute noch anrufen?",
+                retrieval_query_text="Should I call Corinna today?",
+                episodic_entries=(),
+            )
+
+        rendered = text or ""
+        self.assertIn("twinr_silent_personalization_context_v1", rendered)
+        self.assertNotIn('{"recent_threads"', rendered)
+
     def test_rendered_directives_keep_known_person_frame_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = _config(temp_dir)

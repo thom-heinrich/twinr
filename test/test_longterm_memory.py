@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -23,7 +24,7 @@ from twinr.memory.longterm import (
     LongTermSourceRefV1,
     LongTermStructuredStore,
 )
-from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter
+from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter, AsyncLongTermWriterState
 from twinr.memory.query_normalization import LongTermQueryProfile
 
 
@@ -78,6 +79,39 @@ class _FailingReflectionProgram:
         del timezone_name
         del packet_limit
         raise RuntimeError("reflection compiler failed")
+
+
+class _BudgetRecordingWriter:
+    def __init__(
+        self,
+        *,
+        worker_name: str,
+        pending_count: int,
+        last_error_message: str | None = None,
+        flush_result: bool = True,
+        sleep_s: float = 0.0,
+    ) -> None:
+        self.recorded_timeouts: list[float] = []
+        self._state = AsyncLongTermWriterState(
+            worker_name=worker_name,
+            pending_count=pending_count,
+            inflight_count=0,
+            dropped_count=0,
+            last_error_message=last_error_message,
+            accepting=True,
+            worker_alive=True,
+        )
+        self._flush_result = flush_result
+        self._sleep_s = max(0.0, float(sleep_s))
+
+    def snapshot_state(self) -> AsyncLongTermWriterState:
+        return self._state
+
+    def flush(self, *, timeout_s: float) -> bool:
+        self.recorded_timeouts.append(timeout_s)
+        if self._sleep_s > 0.0:
+            time.sleep(self._sleep_s)
+        return self._flush_result
 
 
 class LongTermMemoryServiceTests(unittest.TestCase):
@@ -203,6 +237,71 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertTrue(drained)
         self.assertIsNone(error_message)
+
+    def test_service_flush_clamps_later_writers_to_the_remaining_total_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            if service.writer is not None:
+                service.writer.shutdown(timeout_s=1.0)
+            if service.multimodal_writer is not None:
+                service.multimodal_writer.shutdown(timeout_s=1.0)
+            conversation_writer = _BudgetRecordingWriter(
+                worker_name="twinr-longterm-memory",
+                pending_count=1,
+                sleep_s=0.12,
+            )
+            multimodal_writer = _BudgetRecordingWriter(
+                worker_name="twinr-longterm-multimodal",
+                pending_count=1,
+            )
+            service.writer = conversation_writer  # type: ignore[assignment]
+            service.multimodal_writer = multimodal_writer  # type: ignore[assignment]
+
+            drained = service.flush(timeout_s=0.6)
+
+        self.assertTrue(drained)
+        self.assertEqual(len(conversation_writer.recorded_timeouts), 1)
+        self.assertEqual(len(multimodal_writer.recorded_timeouts), 1)
+        self.assertAlmostEqual(conversation_writer.recorded_timeouts[0], 0.6, delta=0.01)
+        self.assertLess(multimodal_writer.recorded_timeouts[0], conversation_writer.recorded_timeouts[0])
+        self.assertAlmostEqual(multimodal_writer.recorded_timeouts[0], 0.48, delta=0.05)
+
+    def test_service_flush_skips_idle_writer_and_preserves_full_budget_for_active_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            if service.writer is not None:
+                service.writer.shutdown(timeout_s=1.0)
+            if service.multimodal_writer is not None:
+                service.multimodal_writer.shutdown(timeout_s=1.0)
+            conversation_writer = _BudgetRecordingWriter(
+                worker_name="twinr-longterm-memory",
+                pending_count=1,
+            )
+            multimodal_writer = _BudgetRecordingWriter(
+                worker_name="twinr-longterm-multimodal",
+                pending_count=0,
+            )
+            service.writer = conversation_writer  # type: ignore[assignment]
+            service.multimodal_writer = multimodal_writer  # type: ignore[assignment]
+
+            drained = service.flush(timeout_s=0.6)
+
+        self.assertTrue(drained)
+        self.assertEqual(len(conversation_writer.recorded_timeouts), 1)
+        self.assertAlmostEqual(conversation_writer.recorded_timeouts[0], 0.6, delta=0.01)
+        self.assertEqual(multimodal_writer.recorded_timeouts, [])
 
     def test_remote_primary_turn_persistence_skips_memory_markdown_after_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -382,6 +481,117 @@ class LongTermMemoryServiceTests(unittest.TestCase):
 
         self.assertIsNotNone(context.subtext_context)
         self.assertIn("Melitta", context.subtext_context or "")
+
+    def test_query_rewrite_does_not_hide_same_language_historical_fact_recall(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_recall_limit=3,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.query_rewriter = _StaticQueryRewriter(
+                {"Wo stand früher meine rote Thermoskanne?": "Where did my red thermos flask used to be kept?"}
+            )
+            service.object_store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:thermos_location_old",
+                        kind="fact",
+                        summary="Früher stand die rote Thermoskanne im Flurschrank.",
+                        details="Historische Ortsangabe zur roten Thermoskanne.",
+                        source=self._source("turn:thermos"),
+                        status="active",
+                        confidence=0.98,
+                        confirmed_by_user=True,
+                        slot_key="object:red_thermos:location",
+                        value_key="hallway_cupboard",
+                    ),
+                ),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            context = service.build_provider_context("Wo stand früher meine rote Thermoskanne?")
+            tool_context = service.build_tool_provider_context("Wo stand früher meine rote Thermoskanne?")
+            service.shutdown()
+
+        self.assertIsNotNone(context.durable_context)
+        self.assertIn("Flurschrank", context.durable_context or "")
+        self.assertIsNotNone(tool_context.durable_context)
+        self.assertIn("Flurschrank", tool_context.durable_context or "")
+
+    def test_query_rewrite_can_surface_confirmed_fact_for_meta_memory_query(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_recall_limit=3,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.query_rewriter = _StaticQueryRewriter(
+                {
+                    "Welche Marmelade ist jetzt als bestaetigt gespeichert?": "Which marmalade is currently saved as confirmed?"
+                }
+            )
+            service.object_store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_generic",
+                        kind="fact",
+                        summary="User usually likes some jam on bread at breakfast.",
+                        details='User said: "Ich mag beim Frühstück meistens etwas Marmelade auf dem Brot."',
+                        source=self._source("turn:jam_generic"),
+                        status="active",
+                        confidence=0.84,
+                        slot_key="fact:user:breakfast:jam",
+                        value_key="jam_on_bread_at_breakfast",
+                        attributes={
+                            "fact_type": "general",
+                            "memory_domain": "general",
+                            "value_text": "jam on bread at breakfast",
+                        },
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        details="Neuere Vorliebe fuer das Fruehstueck.",
+                        source=self._source("turn:jam_new"),
+                        status="active",
+                        confidence=0.99,
+                        confirmed_by_user=True,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                        attributes={
+                            "fact_type": "general",
+                            "memory_domain": "general",
+                            "resolved_by_user": True,
+                        },
+                    ),
+                ),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            context = service.build_provider_context("Welche Marmelade ist jetzt als bestaetigt gespeichert?")
+            tool_context = service.build_tool_provider_context("Welche Marmelade ist jetzt als bestaetigt gespeichert?")
+            service.shutdown()
+
+        self.assertIsNotNone(context.durable_context)
+        self.assertIn("Aprikosenmarmelade", context.durable_context or "")
+        self.assertIn('"confirmed_by_user": true', context.durable_context or "")
+        self.assertIsNotNone(tool_context.durable_context)
+        self.assertIn("Aprikosenmarmelade", tool_context.durable_context or "")
+        self.assertIn('"slot_key": "preference:breakfast:jam"', tool_context.durable_context or "")
 
     def test_explicit_memory_and_profile_updates_route_through_service(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

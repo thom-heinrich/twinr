@@ -1,0 +1,1250 @@
+"""Compose the modular default HDMI scene for Twinr's fullscreen surface.
+
+This module keeps the senior-facing HDMI layout separate from framebuffer or
+Wayland transport concerns. It exposes explicit scene, layout, and card models
+so future capability cards, panel morphs, and richer animations can grow
+without bloating the backend adapters.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Protocol
+
+from twinr.display.contracts import DisplayStateFields
+from twinr.display.face_cues import DisplayFaceCue
+
+
+_STATE_CARD_ORDER = ("Status", "Internet", "AI", "System", "Zeit", "Hinweis")
+_DETAIL_MAX_LINES = 3
+
+
+class _HdmiSceneTools(Protocol):
+    """Text and sanitization helpers supplied by the active HDMI backend."""
+
+    def _font(self, size: int, *, bold: bool) -> object: ...
+
+    def _text_width(self, draw: object, text: str, *, font: object | None = None) -> int: ...
+
+    def _text_height(self, draw: object, *, font: object | None = None) -> int: ...
+
+    def _truncate_text(self, draw: object, text: str, *, max_width: int, font: object | None = None) -> str: ...
+
+    def _wrapped_lines(
+        self,
+        draw: object,
+        lines: tuple[str, ...],
+        *,
+        max_width: int,
+        font: object,
+        max_lines: int,
+    ) -> tuple[str, ...]: ...
+
+    def _normalise_text(self, value: object, *, fallback: str) -> str: ...
+
+
+@dataclass(frozen=True, slots=True)
+class HdmiSceneCard:
+    """Describe one status card in the right-hand HDMI status panel."""
+
+    key: str
+    label: str
+    value: str
+    accent: tuple[int, int, int]
+    detail_lines: tuple[str, ...] = ()
+    emphasis: float = 1.0
+    column_span: int = 1
+    row_span: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class HdmiStatusPanelModel:
+    """Prepared content for the right-hand status panel."""
+
+    eyebrow: str
+    headline: str
+    helper_text: str
+    cards: tuple[HdmiSceneCard, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HdmiDefaultSceneLayout:
+    """Geometry contract for the default Twinr HDMI scene."""
+
+    header_box: tuple[int, int, int, int]
+    face_box: tuple[int, int, int, int]
+    panel_box: tuple[int, int, int, int]
+    compact_panel: bool
+
+
+@dataclass(frozen=True, slots=True)
+class HdmiDefaultScene:
+    """Full scene state for one rendered HDMI frame."""
+
+    status: str
+    animation_frame: int
+    layout: HdmiDefaultSceneLayout
+    time_value: str
+    panel: HdmiStatusPanelModel
+    face_cue: DisplayFaceCue | None = None
+
+
+def order_state_fields(
+    normalise_text: Callable[..., str],
+    state_fields: DisplayStateFields,
+    details: tuple[str, ...],
+) -> DisplayStateFields:
+    """Keep state fields stable for rendering or synthesize short detail rows."""
+
+    if state_fields:
+        order = {name: index for index, name in enumerate(_STATE_CARD_ORDER)}
+        return tuple(sorted(state_fields, key=lambda item: order.get(item[0], len(order))))
+
+    synthesized = []
+    for index, detail in enumerate(details[:_DETAIL_MAX_LINES]):
+        synthesized.append((f"Info {index + 1}", normalise_text(detail, fallback="")))
+    return tuple(synthesized)
+
+
+def state_field_value(
+    normalise_text: Callable[..., str],
+    state_fields: DisplayStateFields,
+    name: str | tuple[str, ...],
+    *,
+    fallback: str = "--",
+) -> str:
+    """Return one display state-field value with stable fallback behavior."""
+
+    names = (name,) if isinstance(name, str) else name
+    for field_name, value in state_fields:
+        if field_name in names:
+            return normalise_text(value, fallback=fallback)
+    return fallback
+
+
+def display_state_value(normalise_text: Callable[..., str], field_name: str, value: str) -> str:
+    """Translate mixed-language runtime values into stable HDMI copy."""
+
+    compact = normalise_text(value, fallback="--")
+    normalized = compact.lower()
+    if field_name in {"Internet", "Network"}:
+        mapping = {
+            "ok": "Online",
+            "fehlt": "Offline",
+            "?": "Unknown",
+            "wartet": "Waiting",
+        }
+        return mapping.get(normalized, compact)
+    if field_name == "AI":
+        mapping = {
+            "ok": "Ready",
+            "fehlt": "Missing",
+            "?": "Unknown",
+            "wartet": "Waiting",
+            "achtung": "Warning",
+            "fehler": "Error",
+        }
+        return mapping.get(normalized, compact)
+    if field_name == "System":
+        mapping = {
+            "ok": "OK",
+            "fehler": "Error",
+            "achtung": "Warning",
+            "warm": "Warm",
+            "?": "Unknown",
+        }
+        return mapping.get(normalized, compact)
+    if field_name in {"Zeit", "Time"}:
+        return compact
+
+    generic = {
+        "bereit": "Ready",
+        "wartet": "Waiting",
+        "fehlt": "Missing",
+        "achtung": "Warning",
+        "fehler": "Error",
+        "status wird aktualisiert": "Updating status",
+        "status nicht verfügbar": "Status unavailable",
+        "?": "Unknown",
+    }
+    return generic.get(normalized, compact)
+
+
+def status_headline(normalise_text: Callable[..., str], status: str, *, fallback: str | None) -> str:
+    """Return the senior-facing main headline for one runtime status."""
+
+    mapping = {
+        "waiting": "Ready",
+        "listening": "Listening",
+        "processing": "Thinking",
+        "answering": "Speaking",
+        "printing": "Printing",
+        "error": "Check system",
+    }
+    if status in mapping:
+        return mapping[status]
+    return normalise_text(fallback, fallback=status.replace("_", " ").title())
+
+
+def status_helper_text(status: str) -> str:
+    """Return a short, calm helper sentence for the active status."""
+
+    mapping = {
+        "waiting": "Press the green button and speak naturally.",
+        "listening": "Listening now. Speak at your own pace.",
+        "processing": "Thinking for a moment.",
+        "answering": "Speaking now.",
+        "printing": "Preparing the print.",
+        "error": "Please check the system in debug view.",
+    }
+    return mapping.get(status, "Twinr is updating the current status.")
+
+
+def status_accent_color(status: str) -> tuple[int, int, int]:
+    """Return the accent color associated with one runtime status."""
+
+    mapping = {
+        "waiting": (90, 132, 196),
+        "listening": (36, 163, 130),
+        "processing": (226, 164, 51),
+        "answering": (82, 114, 222),
+        "printing": (197, 128, 35),
+        "error": (205, 89, 74),
+    }
+    return mapping.get(status, (102, 126, 150))
+
+
+def state_value_color(normalise_text: Callable[..., str], value: str) -> tuple[int, int, int]:
+    """Return the accent color for a specific panel-card value."""
+
+    normalized = normalise_text(value, fallback="").lower()
+    if normalized in {"ok", "bereit", "ready", "online"}:
+        return (40, 167, 117)
+    if normalized in {"fehler", "fehlt", "error", "offline", "missing"}:
+        return (205, 89, 74)
+    if normalized in {"achtung", "warm", "warning"}:
+        return (228, 152, 34)
+    if normalized in {"?", "wartet", "waiting", "unknown"}:
+        return (130, 145, 166)
+    return (90, 132, 196)
+
+
+def time_value(state_fields: DisplayStateFields) -> str:
+    """Return the visible clock value for the header."""
+
+    for name, value in state_fields:
+        if name in {"Zeit", "Time"}:
+            return value
+    return "--:--"
+
+
+@dataclass(slots=True)
+class HdmiDefaultSceneRenderer:
+    """Render Twinr's modular default HDMI scene."""
+
+    tools: _HdmiSceneTools
+
+    def draw(
+        self,
+        draw: object,
+        *,
+        width: int,
+        height: int,
+        status: str,
+        headline: str,
+        helper_text: str,
+        state_fields: DisplayStateFields,
+        animation_frame: int,
+        face_cue: DisplayFaceCue | None = None,
+    ) -> None:
+        """Draw one full default HDMI scene onto the provided canvas."""
+
+        scene = self.build_scene(
+            width=width,
+            height=height,
+            status=status,
+            headline=headline,
+            helper_text=helper_text,
+            state_fields=state_fields,
+            animation_frame=animation_frame,
+            face_cue=face_cue,
+        )
+        draw.rectangle((0, 0, width, height), fill=(0, 0, 0))
+        self._draw_twinr_header(draw, box=scene.layout.header_box, time_value=scene.time_value)
+        self._draw_face(
+            draw,
+            box=scene.layout.face_box,
+            status=scene.status,
+            animation_frame=scene.animation_frame,
+            face_cue=scene.face_cue,
+        )
+        self._draw_status_panel(draw, box=scene.layout.panel_box, panel=scene.panel, compact=scene.layout.compact_panel)
+
+    def build_scene(
+        self,
+        *,
+        width: int,
+        height: int,
+        status: str,
+        headline: str,
+        helper_text: str,
+        state_fields: DisplayStateFields,
+        animation_frame: int,
+        face_cue: DisplayFaceCue | None = None,
+    ) -> HdmiDefaultScene:
+        """Build the scene model so layout and content can evolve independently."""
+
+        return HdmiDefaultScene(
+            status=status,
+            animation_frame=animation_frame,
+            layout=self._layout_for_size(width=width, height=height),
+            time_value=time_value(state_fields),
+            panel=self._build_panel_model(
+                status=status,
+                headline=headline,
+                helper_text=helper_text,
+                state_fields=state_fields,
+            ),
+            face_cue=face_cue,
+        )
+
+    def _layout_for_size(self, *, width: int, height: int) -> HdmiDefaultSceneLayout:
+        if width < 560 or height < 320:
+            header_box = (12, 10, width - 12, 56)
+            face_box_width = max(94, min(126, int(width * 0.33)))
+            face_box = (18, 70, 18 + face_box_width, height - 18)
+            panel_box = (face_box[2] + 14, 68, width - 18, height - 18)
+        else:
+            header_box = (24, 18, width - 24, 80)
+            face_box_width = max(228, min(292, int(width * 0.35)))
+            face_box = (38, 98, 38 + face_box_width, height - 28)
+            panel_box = (face_box[2] + 18, 98, width - 30, height - 28)
+        return HdmiDefaultSceneLayout(
+            header_box=header_box,
+            face_box=face_box,
+            panel_box=panel_box,
+            compact_panel=(panel_box[2] - panel_box[0] < 320 or panel_box[3] - panel_box[1] < 240),
+        )
+
+    def _build_panel_model(
+        self,
+        *,
+        status: str,
+        headline: str,
+        helper_text: str,
+        state_fields: DisplayStateFields,
+    ) -> HdmiStatusPanelModel:
+        normalise_text = self.tools._normalise_text
+        cards = (
+            HdmiSceneCard(
+                key="network",
+                label="NETWORK",
+                value=display_state_value(normalise_text, "Internet", state_field_value(normalise_text, state_fields, "Internet")),
+                accent=state_value_color(normalise_text, state_field_value(normalise_text, state_fields, "Internet")),
+            ),
+            HdmiSceneCard(
+                key="ai",
+                label="AI",
+                value=display_state_value(normalise_text, "AI", state_field_value(normalise_text, state_fields, "AI")),
+                accent=state_value_color(normalise_text, state_field_value(normalise_text, state_fields, "AI")),
+            ),
+            HdmiSceneCard(
+                key="system",
+                label="SYSTEM",
+                value=display_state_value(normalise_text, "System", state_field_value(normalise_text, state_fields, "System")),
+                accent=state_value_color(normalise_text, state_field_value(normalise_text, state_fields, "System")),
+            ),
+            HdmiSceneCard(
+                key="time",
+                label="TIME",
+                value=display_state_value(
+                    normalise_text,
+                    "Zeit",
+                    state_field_value(normalise_text, state_fields, ("Zeit", "Time")),
+                ),
+                accent=status_accent_color(status),
+            ),
+        )
+        return HdmiStatusPanelModel(
+            eyebrow="STATUS",
+            headline=headline,
+            helper_text=helper_text,
+            cards=cards,
+        )
+
+    def _draw_twinr_header(self, draw: object, *, box: tuple[int, int, int, int], time_value: str) -> None:
+        left, top, right, bottom = box
+        box_height = max(32, bottom - top)
+        header_font = self.tools._font(26 if box_height >= 56 else 20, bold=True)
+        time_font = self.tools._font(24 if box_height >= 56 else 18, bold=False)
+        label_y = top + max(6, (box_height - self.tools._text_height(draw, font=header_font)) // 2) - 2
+        time_y = top + max(6, (box_height - self.tools._text_height(draw, font=time_font)) // 2) - 2
+
+        draw.rounded_rectangle(box, radius=20, fill=(0, 0, 0), outline=(255, 255, 255), width=2)
+        draw.text((left + 20, label_y), "TWINR", fill=(255, 255, 255), font=header_font)
+        time_width = self.tools._text_width(draw, time_value, font=time_font)
+        draw.text((right - 22 - time_width, time_y), time_value, fill=(188, 188, 188), font=time_font)
+
+    def _draw_status_panel(
+        self,
+        draw: object,
+        *,
+        box: tuple[int, int, int, int],
+        panel: HdmiStatusPanelModel,
+        compact: bool,
+    ) -> None:
+        left, top, right, bottom = box
+        panel_width = right - left
+        panel_padding = 16 if compact else 24
+        panel_inner_width = panel_width - (panel_padding * 2)
+
+        eyebrow_font = self.tools._font(14 if compact else 16, bold=True)
+        headline_font = self.tools._font(28 if compact else 44, bold=True)
+        helper_font = self.tools._font(13 if compact else 19, bold=False)
+
+        draw.rounded_rectangle(box, radius=30, fill=(4, 4, 4), outline=(255, 255, 255), width=3)
+        header_label_y = top + (16 if compact else 22)
+        headline_y = top + (40 if compact else 56)
+        helper_y = top + (76 if compact else 118)
+        draw.text((left + panel_padding, header_label_y), panel.eyebrow, fill=(160, 160, 160), font=eyebrow_font)
+        headline_text = self.tools._truncate_text(draw, panel.headline, max_width=panel_inner_width, font=headline_font)
+        draw.text((left + panel_padding, headline_y), headline_text, fill=(255, 255, 255), font=headline_font)
+
+        helper_lines = self.tools._wrapped_lines(
+            draw,
+            (panel.helper_text,),
+            max_width=panel_inner_width,
+            font=helper_font,
+            max_lines=1 if compact else 2,
+        )
+        line_height = self.tools._text_height(draw, font=helper_font) + 6
+        for line in helper_lines:
+            draw.text((left + panel_padding, helper_y), line, fill=(214, 214, 214), font=helper_font)
+            helper_y += line_height
+
+        divider_y = helper_y + (8 if compact else 10)
+        draw.line((left + panel_padding, divider_y, right - panel_padding, divider_y), fill=(88, 88, 88), width=2)
+        rows_box = (
+            left + panel_padding,
+            divider_y + (12 if compact else 18),
+            right - panel_padding,
+            bottom - (16 if compact else 22),
+        )
+        if compact:
+            self._draw_compact_cards(draw, box=rows_box, cards=panel.cards)
+            return
+        self._draw_cards(draw, box=rows_box, cards=panel.cards)
+
+    def _draw_cards(
+        self,
+        draw: object,
+        *,
+        box: tuple[int, int, int, int],
+        cards: tuple[HdmiSceneCard, ...],
+    ) -> None:
+        left, top, right, bottom = box
+        label_font = self.tools._font(15, bold=True)
+        value_font = self.tools._font(20, bold=False)
+        column_gap = 14
+        row_gap = 12
+        card_width = max(72, (right - left - column_gap) // 2)
+        card_height = max(56, min(72, (bottom - top - row_gap) // 2))
+
+        for index, card in enumerate(cards[:4]):
+            column = index % 2
+            row = index // 2
+            row_left = left + column * (card_width + column_gap)
+            row_top = top + row * (card_height + row_gap)
+            row_right = row_left + card_width
+            row_bottom = row_top + card_height
+            self._draw_card(
+                draw,
+                box=(row_left, row_top, row_right, row_bottom),
+                card=card,
+                compact=False,
+                label_font=label_font,
+                value_font=value_font,
+            )
+
+    def _draw_compact_cards(
+        self,
+        draw: object,
+        *,
+        box: tuple[int, int, int, int],
+        cards: tuple[HdmiSceneCard, ...],
+    ) -> None:
+        left, top, right, bottom = box
+        available_height = max(0, bottom - top)
+        if available_height < 56:
+            label_font = self.tools._font(11, bold=True)
+            value_font = self.tools._font(13, bold=False)
+            summary = " | ".join(card.value for card in cards[:4])
+            draw.rounded_rectangle((left, top, right, bottom), radius=12, fill=(0, 0, 0), outline=(104, 104, 104), width=2)
+            draw.text((left + 10, top + 6), "LIVE", fill=(156, 156, 156), font=label_font)
+            rendered = self.tools._truncate_text(draw, summary, max_width=max(24, right - left - 20), font=value_font)
+            draw.text((left + 10, top + 18), rendered, fill=(255, 255, 255), font=value_font)
+            return
+
+        row_specs = (
+            HdmiSceneCard(
+                key="network_ai",
+                label="NETWORK / AI",
+                value=" / ".join(card.value for card in cards[:2]),
+                accent=cards[0].accent if cards else (104, 104, 104),
+            ),
+            HdmiSceneCard(
+                key="system_time",
+                label="SYSTEM / TIME",
+                value=" / ".join(card.value for card in cards[2:4]),
+                accent=cards[2].accent if len(cards) > 2 else (104, 104, 104),
+            ),
+        )
+        gap = 8
+        row_height = max(24, min(40, (available_height - gap) // 2))
+        label_font = self.tools._font(12, bold=True)
+        value_font = self.tools._font(14, bold=False)
+        for index, card in enumerate(row_specs):
+            row_top = top + index * (row_height + gap)
+            row_bottom = min(bottom, row_top + row_height)
+            self._draw_card(
+                draw,
+                box=(left, row_top, right, row_bottom),
+                card=card,
+                compact=True,
+                label_font=label_font,
+                value_font=value_font,
+            )
+
+    def _draw_card(
+        self,
+        draw: object,
+        *,
+        box: tuple[int, int, int, int],
+        card: HdmiSceneCard,
+        compact: bool,
+        label_font: object,
+        value_font: object,
+    ) -> None:
+        left, top, right, bottom = box
+        radius = 14 if compact else 16
+        draw.rounded_rectangle(box, radius=radius, fill=(0, 0, 0), outline=(104, 104, 104), width=2)
+        accent_left = left + 10
+        accent_top = top + (11 if compact else 12)
+        accent_size = 6 if compact else 8
+        draw.rounded_rectangle(
+            (accent_left, accent_top, accent_left + accent_size, accent_top + accent_size),
+            radius=3,
+            fill=card.accent,
+        )
+        label_x = left + (24 if compact else 16)
+        label_y = top + (8 if compact else 12)
+        value_y = top + (20 if compact else 34)
+        draw.text((label_x, label_y), card.label, fill=(156, 156, 156), font=label_font)
+        rendered_value = self.tools._truncate_text(
+            draw,
+            card.value,
+            max_width=max(36, right - left - 24),
+            font=value_font,
+        )
+        draw.text((left + 12, value_y), rendered_value, fill=(255, 255, 255), font=value_font)
+
+    def _draw_face(
+        self,
+        draw: object,
+        *,
+        box: tuple[int, int, int, int],
+        status: str,
+        animation_frame: int,
+        face_cue: DisplayFaceCue | None,
+    ) -> None:
+        left, top, right, bottom = box
+        scale = self._normalise_scale(min((right - left) / 220.0, (bottom - top) / 210.0))
+        center_x = (left + right) // 2
+        center_y = top + ((bottom - top) // 2) - self._scaled_offset(6, scale)
+        self._draw_face_features(
+            draw,
+            center_x=center_x,
+            center_y=center_y,
+            status=status,
+            animation_frame=animation_frame,
+            scale=max(0.56, min(scale, 1.55)),
+            face_cue=face_cue,
+        )
+
+    def _draw_face_features(
+        self,
+        draw: object,
+        *,
+        center_x: int,
+        center_y: int,
+        status: str,
+        animation_frame: int,
+        scale: float,
+        face_cue: DisplayFaceCue | None,
+    ) -> None:
+        safe_scale = self._normalise_scale(scale)
+        jitter_x, jitter_y = self._face_offset(status, animation_frame, face_cue=face_cue)
+        jitter_x = self._scaled_offset(jitter_x, safe_scale)
+        jitter_y = self._scaled_offset(jitter_y, safe_scale)
+
+        left_eye = (
+            center_x - self._scaled_offset(72, safe_scale) + jitter_x,
+            center_y - self._scaled_offset(24, safe_scale) + jitter_y,
+        )
+        right_eye = (
+            center_x + self._scaled_offset(72, safe_scale) + jitter_x,
+            center_y - self._scaled_offset(24, safe_scale) + jitter_y,
+        )
+        self._draw_face_eye(
+            draw,
+            left_eye,
+            status=status,
+            side="left",
+            animation_frame=animation_frame,
+            scale=safe_scale,
+            face_cue=face_cue,
+        )
+        self._draw_face_eye(
+            draw,
+            right_eye,
+            status=status,
+            side="right",
+            animation_frame=animation_frame,
+            scale=safe_scale,
+            face_cue=face_cue,
+        )
+        self._draw_face_mouth(
+            draw,
+            center_x=center_x + jitter_x,
+            center_y=center_y + self._scaled_offset(56, safe_scale) + jitter_y,
+            status=status,
+            animation_frame=animation_frame,
+            scale=safe_scale,
+            face_cue=face_cue,
+        )
+
+    def _draw_face_eye(
+        self,
+        draw: object,
+        origin: tuple[int, int],
+        *,
+        status: str,
+        side: str,
+        animation_frame: int,
+        scale: float,
+        face_cue: DisplayFaceCue | None,
+    ) -> None:
+        center_x, center_y = origin
+        eye = self._eye_state(status, animation_frame, side, face_cue=face_cue)
+        line_width = self._scaled_size(4, scale, minimum=2)
+        self._draw_face_brow(
+            draw,
+            center_x=center_x,
+            center_y=center_y,
+            scale=scale,
+            side=side,
+            eye=eye,
+            line_width=line_width,
+        )
+
+        if bool(eye["blink"]):
+            draw.arc(
+                (
+                    center_x - self._scaled_offset(26, scale),
+                    center_y - self._scaled_offset(8, scale),
+                    center_x + self._scaled_offset(26, scale),
+                    center_y + self._scaled_offset(10, scale),
+                ),
+                start=200,
+                end=340,
+                fill=(255, 255, 255),
+                width=self._scaled_size(5, scale, minimum=2),
+            )
+            return
+
+        width = self._scaled_size(int(eye["width"]), scale, minimum=8)
+        height = self._scaled_size(int(eye["height"]), scale, minimum=8)
+        offset_x = self._scaled_offset(int(eye["eye_shift_x"]), scale)
+        offset_y = self._scaled_offset(int(eye["eye_shift_y"]), scale)
+        box = (
+            center_x - (width // 2) + offset_x,
+            center_y - (height // 2) + offset_y,
+            center_x + (width // 2) + offset_x,
+            center_y + (height // 2) + offset_y,
+        )
+        draw.ellipse(box, fill=(255, 255, 255))
+        self._draw_face_eye_highlights(draw, box, eye, scale=scale)
+
+        if bool(eye["lid_arc"]):
+            draw.arc(
+                (
+                    box[0] + self._scaled_offset(4, scale),
+                    box[1] - self._scaled_offset(10, scale),
+                    box[2] - self._scaled_offset(4, scale),
+                    box[1] + self._scaled_offset(18, scale),
+                ),
+                start=180,
+                end=360,
+                fill=(255, 255, 255),
+                width=self._scaled_size(3, scale, minimum=2),
+            )
+
+    def _draw_face_brow(
+        self,
+        draw: object,
+        *,
+        center_x: int,
+        center_y: int,
+        scale: float,
+        side: str,
+        eye: dict[str, object],
+        line_width: int,
+    ) -> None:
+        """Draw one stable eyebrow using either the legacy or external style path."""
+
+        brow_y = center_y - self._scaled_offset(52, scale) + self._scaled_offset(int(eye["brow_raise"]), scale)
+        half_width = self._scaled_offset(24, scale)
+        left_x = center_x - half_width
+        right_x = center_x + half_width
+        style = str(eye.get("brow_style") or "")
+        if not style:
+            slant = self._scaled_offset(int(eye["brow_slant"]), scale)
+            if side == "left":
+                draw.line(
+                    (left_x, brow_y + slant, right_x, brow_y - slant),
+                    fill=(255, 255, 255),
+                    width=line_width,
+                )
+            else:
+                draw.line(
+                    (left_x, brow_y - slant, right_x, brow_y + slant),
+                    fill=(255, 255, 255),
+                    width=line_width,
+                )
+            return
+
+        if style == "soft":
+            draw.arc(
+                (
+                    left_x,
+                    brow_y - self._scaled_offset(10, scale),
+                    right_x,
+                    brow_y + self._scaled_offset(10, scale),
+                ),
+                start=190,
+                end=350,
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            return
+
+        if style == "roof":
+            peak_y = brow_y - self._scaled_offset(10, scale)
+            draw.line(
+                (
+                    left_x,
+                    brow_y + self._scaled_offset(4, scale),
+                    center_x,
+                    peak_y,
+                    right_x,
+                    brow_y + self._scaled_offset(4, scale),
+                ),
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            return
+
+        if style == "inward_tilt":
+            rise = self._scaled_offset(7, scale)
+            if side == "left":
+                draw.line((left_x, brow_y - rise, right_x, brow_y + rise), fill=(255, 255, 255), width=line_width)
+            else:
+                draw.line((left_x, brow_y + rise, right_x, brow_y - rise), fill=(255, 255, 255), width=line_width)
+            return
+
+        if style == "outward_tilt":
+            rise = self._scaled_offset(7, scale)
+            if side == "left":
+                draw.line((left_x, brow_y + rise, right_x, brow_y - rise), fill=(255, 255, 255), width=line_width)
+            else:
+                draw.line((left_x, brow_y - rise, right_x, brow_y + rise), fill=(255, 255, 255), width=line_width)
+            return
+
+        draw.line((left_x, brow_y, right_x, brow_y), fill=(255, 255, 255), width=line_width)
+
+    def _draw_face_mouth(
+        self,
+        draw: object,
+        *,
+        center_x: int,
+        center_y: int,
+        status: str,
+        animation_frame: int,
+        scale: float,
+        face_cue: DisplayFaceCue | None,
+    ) -> None:
+        if face_cue is not None and face_cue.mouth:
+            self._draw_face_cue_mouth(
+                draw,
+                center_x=center_x,
+                center_y=center_y,
+                animation_frame=animation_frame,
+                scale=scale,
+                mouth_style=face_cue.mouth,
+            )
+            return
+        line_width = self._scaled_size(4, scale, minimum=2)
+        if status == "waiting":
+            frame = animation_frame % 12
+            sway = (-2, -1, 0, 1, 2, 1, 0, -1, -2, -1, 0, 1)[frame]
+            smile_width = (26, 28, 30, 31, 30, 28, 26, 25, 26, 28, 30, 29)[frame]
+            smile_height = (14, 15, 17, 18, 17, 16, 15, 14, 15, 16, 18, 17)[frame]
+            draw.arc(
+                (
+                    center_x - self._scaled_offset(smile_width, scale),
+                    center_y - self._scaled_offset(12, scale) + self._scaled_offset(sway, scale),
+                    center_x + self._scaled_offset(smile_width, scale),
+                    center_y + self._scaled_offset(smile_height, scale) + self._scaled_offset(sway, scale),
+                ),
+                start=24,
+                end=156,
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if status == "listening":
+            frame = animation_frame % 6
+            openness = (12, 16, 20, 18, 14, 10)[frame]
+            mouth_width = (9, 10, 11, 11, 10, 9)[frame]
+            mouth_lift = (0, -1, -2, -1, 0, 1)[frame]
+            draw.ellipse(
+                (
+                    center_x - self._scaled_offset(mouth_width, scale),
+                    center_y - self._scaled_offset(8, scale) + self._scaled_offset(mouth_lift, scale),
+                    center_x + self._scaled_offset(mouth_width, scale),
+                    center_y + self._scaled_offset(openness, scale) + self._scaled_offset(mouth_lift, scale),
+                ),
+                outline=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if status == "processing":
+            frame = animation_frame % 6
+            offset_y = (-2, -1, 0, 1, 2, 1)[frame]
+            mouth_width = (24, 22, 20, 22, 24, 26)[frame]
+            draw.line(
+                (
+                    center_x - self._scaled_offset(mouth_width, scale),
+                    center_y + self._scaled_offset(4 + offset_y, scale),
+                    center_x - self._scaled_offset(4, scale),
+                    center_y + self._scaled_offset(2 + offset_y, scale),
+                ),
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            draw.line(
+                (
+                    center_x + self._scaled_offset(4, scale),
+                    center_y + self._scaled_offset(2 + offset_y, scale),
+                    center_x + self._scaled_offset(mouth_width, scale),
+                    center_y + self._scaled_offset(4 + offset_y, scale),
+                ),
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if status == "answering":
+            frame = animation_frame % 6
+            openness = (7, 10, 13, 11, 8, 12)[frame]
+            mouth_width = (18, 20, 22, 21, 19, 20)[frame]
+            draw.rounded_rectangle(
+                (
+                    center_x - self._scaled_offset(mouth_width, scale),
+                    center_y - self._scaled_offset(2, scale),
+                    center_x + self._scaled_offset(mouth_width, scale),
+                    center_y + self._scaled_offset(openness, scale),
+                ),
+                radius=self._scaled_size(8, scale, minimum=2),
+                outline=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if status == "printing":
+            frame = animation_frame % 6
+            lift = (0, -2, -1, 0, 1, 0)[frame]
+            smile_width = (26, 28, 30, 30, 28, 26)[frame]
+            draw.arc(
+                (
+                    center_x - self._scaled_offset(smile_width, scale),
+                    center_y - self._scaled_offset(6, scale) + self._scaled_offset(lift, scale),
+                    center_x + self._scaled_offset(smile_width, scale),
+                    center_y + self._scaled_offset(16, scale) + self._scaled_offset(lift, scale),
+                ),
+                start=12,
+                end=168,
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if status == "error":
+            frame = animation_frame % 6
+            wobble = (0, 1, 2, 1, 0, -1)[frame]
+            draw.arc(
+                (
+                    center_x - self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(6 + wobble, scale),
+                    center_x + self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(18 + wobble, scale),
+                ),
+                start=200,
+                end=340,
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            return
+
+        draw.arc(
+            (
+                center_x - self._scaled_offset(22, scale),
+                center_y - self._scaled_offset(4, scale),
+                center_x + self._scaled_offset(22, scale),
+                center_y + self._scaled_offset(10, scale),
+            ),
+            start=20,
+            end=160,
+            fill=(255, 255, 255),
+            width=line_width,
+        )
+
+    def _draw_face_cue_mouth(
+        self,
+        draw: object,
+        *,
+        center_x: int,
+        center_y: int,
+        animation_frame: int,
+        scale: float,
+        mouth_style: str,
+    ) -> None:
+        line_width = self._scaled_size(4, scale, minimum=2)
+        if mouth_style == "neutral":
+            draw.line(
+                (
+                    center_x - self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(4, scale),
+                    center_x + self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(4, scale),
+                ),
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if mouth_style == "smile":
+            sway = (-1, 0, 1, 0)[animation_frame % 4]
+            draw.arc(
+                (
+                    center_x - self._scaled_offset(28, scale),
+                    center_y - self._scaled_offset(10, scale) + self._scaled_offset(sway, scale),
+                    center_x + self._scaled_offset(28, scale),
+                    center_y + self._scaled_offset(16, scale) + self._scaled_offset(sway, scale),
+                ),
+                start=20,
+                end=160,
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if mouth_style == "open":
+            draw.ellipse(
+                (
+                    center_x - self._scaled_offset(10, scale),
+                    center_y - self._scaled_offset(8, scale),
+                    center_x + self._scaled_offset(10, scale),
+                    center_y + self._scaled_offset(16, scale),
+                ),
+                outline=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if mouth_style == "pursed":
+            pulse = (0, 1, 0, -1)[animation_frame % 4]
+            draw.rounded_rectangle(
+                (
+                    center_x - self._scaled_offset(12, scale),
+                    center_y - self._scaled_offset(4, scale),
+                    center_x + self._scaled_offset(12, scale),
+                    center_y + self._scaled_offset(10 + pulse, scale),
+                ),
+                radius=self._scaled_size(8, scale, minimum=2),
+                outline=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if mouth_style == "speak":
+            openness = (10, 14, 18, 12)[animation_frame % 4]
+            draw.rounded_rectangle(
+                (
+                    center_x - self._scaled_offset(18, scale),
+                    center_y - self._scaled_offset(4, scale),
+                    center_x + self._scaled_offset(18, scale),
+                    center_y + self._scaled_offset(openness, scale),
+                ),
+                radius=self._scaled_size(8, scale, minimum=2),
+                outline=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if mouth_style == "sad":
+            draw.arc(
+                (
+                    center_x - self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(8, scale),
+                    center_x + self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(20, scale),
+                ),
+                start=200,
+                end=340,
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if mouth_style == "thinking":
+            drift = (-1, 0, 1, 0)[animation_frame % 4]
+            draw.line(
+                (
+                    center_x - self._scaled_offset(22, scale),
+                    center_y + self._scaled_offset(6, scale),
+                    center_x - self._scaled_offset(4, scale),
+                    center_y + self._scaled_offset(2 + drift, scale),
+                    center_x + self._scaled_offset(12, scale),
+                    center_y + self._scaled_offset(6 - drift, scale),
+                    center_x + self._scaled_offset(24, scale),
+                    center_y + self._scaled_offset(4, scale),
+                ),
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        if mouth_style == "scrunched":
+            flutter = (-1, 0, 1, 0)[animation_frame % 4]
+            draw.line(
+                (
+                    center_x - self._scaled_offset(18, scale),
+                    center_y + self._scaled_offset(5 + flutter, scale),
+                    center_x - self._scaled_offset(8, scale),
+                    center_y + self._scaled_offset(1, scale),
+                    center_x,
+                    center_y + self._scaled_offset(7 - flutter, scale),
+                    center_x + self._scaled_offset(8, scale),
+                    center_y + self._scaled_offset(1, scale),
+                    center_x + self._scaled_offset(18, scale),
+                    center_y + self._scaled_offset(5 + flutter, scale),
+                ),
+                fill=(255, 255, 255),
+                width=line_width,
+            )
+            return
+        draw.line(
+            (
+                center_x - self._scaled_offset(22, scale),
+                center_y + self._scaled_offset(4, scale),
+                center_x + self._scaled_offset(22, scale),
+                center_y + self._scaled_offset(4, scale),
+            ),
+            fill=(255, 255, 255),
+            width=line_width,
+        )
+
+    def _draw_face_eye_highlights(
+        self,
+        draw: object,
+        box: tuple[int, int, int, int],
+        eye: dict[str, object],
+        *,
+        scale: float,
+    ) -> None:
+        center_x = (box[0] + box[2]) // 2
+        center_y = (box[1] + box[3]) // 2
+        main_x = center_x + self._scaled_offset(int(eye["highlight_dx"]), scale)
+        main_y = center_y + self._scaled_offset(int(eye["highlight_dy"]), scale)
+        main_radius = self._scaled_size(8, scale, minimum=2)
+        secondary_x_offset = self._scaled_offset(10, scale)
+        secondary_y_offset = self._scaled_offset(8, scale)
+        secondary_width = self._scaled_size(6, scale, minimum=2)
+        secondary_height = self._scaled_size(6, scale, minimum=2)
+        draw.ellipse((main_x - main_radius, main_y - main_radius, main_x + main_radius, main_y + main_radius), fill=(0, 0, 0))
+        draw.ellipse(
+            (
+                main_x + secondary_x_offset,
+                main_y + secondary_y_offset,
+                main_x + secondary_x_offset + secondary_width,
+                main_y + secondary_y_offset + secondary_height,
+            ),
+            fill=(0, 0, 0),
+        )
+
+    def _face_offset(
+        self,
+        status: str,
+        animation_frame: int,
+        *,
+        face_cue: DisplayFaceCue | None = None,
+    ) -> tuple[int, int]:
+        if status == "waiting":
+            base = (
+                (0, 0),
+                (-1, 0),
+                (-2, 0),
+                (-1, 0),
+                (0, -1),
+                (0, 0),
+                (0, 1),
+                (0, 0),
+                (1, 0),
+                (2, 0),
+                (1, 0),
+                (0, 0),
+            )[animation_frame % 12]
+        elif status == "listening":
+            base = ((0, 0), (0, -1), (0, -1), (0, 0), (0, 1), (0, 0))[animation_frame % 6]
+        elif status == "processing":
+            base = ((0, 0), (-1, 0), (-1, 0), (0, 0), (1, 0), (0, 0))[animation_frame % 6]
+        elif status == "answering":
+            base = ((0, 0), (0, -1), (0, 0), (0, 1), (0, 0), (0, 0))[animation_frame % 6]
+        elif status == "printing":
+            base = ((0, 0), (1, 0), (0, 0), (-1, 0), (0, 0), (0, 0))[animation_frame % 6]
+        elif status == "error":
+            base = ((0, 1), (0, 0), (0, 1), (0, 0), (0, 1), (0, 0))[animation_frame % 6]
+        else:
+            base = (0, 0)
+        if face_cue is None:
+            return base
+        return (base[0] + face_cue.head_dx, base[1] + face_cue.head_dy)
+
+    def _eye_state(
+        self,
+        status: str,
+        animation_frame: int,
+        side: str,
+        *,
+        face_cue: DisplayFaceCue | None = None,
+    ) -> dict[str, object]:
+        state: dict[str, object] = {
+            "width": 56,
+            "height": 74,
+            "eye_shift_x": 0,
+            "eye_shift_y": 0,
+            "highlight_dx": -10,
+            "highlight_dy": -18,
+            "brow_raise": 0,
+            "brow_slant": 4,
+            "brow_style": "",
+            "blink": False,
+            "lid_arc": False,
+        }
+
+        if status == "waiting":
+            frame = animation_frame % 12
+            # HDMI renders the face white-on-black, so calm idle motion reads
+            # best when the eye shape stays stable and only gaze/blink drift.
+            state["eye_shift_y"] = (-1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0)[frame]
+            state["highlight_dx"] = (-10, -8, -6, -3, 1, 5, 8, 5, 1, -3, -7, -9)[frame]
+            state["blink"] = frame == 9
+        elif status == "listening":
+            frame = animation_frame % 6
+            state["height"] = (78, 80, 82, 80, 78, 76)[frame]
+            state["highlight_dx"] = (-8, -7, -6, -5, -6, -7)[frame]
+            state["highlight_dy"] = (-18, -19, -20, -19, -18, -17)[frame]
+            state["brow_raise"] = -8
+            state["brow_slant"] = 2
+            state["blink"] = frame == 5
+        elif status == "processing":
+            frame = animation_frame % 6
+            scan = (-12, -8, -3, 3, 8, 12)[frame]
+            state["height"] = 68
+            state["highlight_dx"] = scan if side == "left" else scan - 2
+            state["highlight_dy"] = (-17, -16, -15, -16, -17, -18)[frame]
+            state["brow_raise"] = -1
+            state["brow_slant"] = 4
+        elif status == "answering":
+            frame = animation_frame % 6
+            state["height"] = (70, 74, 72, 74, 70, 72)[frame]
+            state["highlight_dx"] = (-8, -7, -6, -7, -8, -7)[frame]
+            state["highlight_dy"] = (-18, -17, -16, -17, -18, -17)[frame]
+            state["brow_raise"] = -2
+            state["brow_slant"] = 2
+        elif status == "printing":
+            frame = animation_frame % 6
+            state["height"] = (70, 68, 66, 64, 66, 68)[frame]
+            state["highlight_dx"] = (-9, -8, -7, -6, -7, -8)[frame]
+            state["brow_raise"] = -4
+            state["brow_slant"] = 2
+            state["blink"] = frame == 4
+        elif status == "error":
+            frame = animation_frame % 6
+            state["width"] = 54
+            state["height"] = (60, 58, 56, 58, 60, 58)[frame]
+            state["highlight_dx"] = (-12, -11, -10, -9, -10, -11)[frame]
+            state["highlight_dy"] = -14
+            state["brow_raise"] = 2
+            state["brow_slant"] = 8
+            state["eye_shift_y"] = 2
+            state["blink"] = frame == 3
+        return self._apply_face_cue_to_eye_state(state, face_cue=face_cue)
+
+    def _apply_face_cue_to_eye_state(
+        self,
+        state: dict[str, object],
+        *,
+        face_cue: DisplayFaceCue | None,
+    ) -> dict[str, object]:
+        if face_cue is None:
+            return state
+
+        merged = dict(state)
+        merged["highlight_dx"] = int(merged["highlight_dx"]) + (face_cue.gaze_x * 6)
+        merged["highlight_dy"] = int(merged["highlight_dy"]) + (face_cue.gaze_y * 5)
+        if face_cue.blink is not None:
+            merged["blink"] = face_cue.blink
+
+        if face_cue.brows == "raised":
+            merged["brow_raise"] = -11
+            merged["brow_slant"] = 0
+            merged["brow_style"] = "raised"
+        elif face_cue.brows == "soft":
+            merged["brow_raise"] = -3
+            merged["brow_slant"] = 0
+            merged["brow_style"] = "soft"
+        elif face_cue.brows == "straight":
+            merged["brow_raise"] = 0
+            merged["brow_slant"] = 0
+            merged["brow_style"] = "straight"
+        elif face_cue.brows == "inward_tilt":
+            merged["brow_raise"] = 0
+            merged["brow_slant"] = 0
+            merged["brow_style"] = "inward_tilt"
+        elif face_cue.brows == "outward_tilt":
+            merged["brow_raise"] = 0
+            merged["brow_slant"] = 0
+            merged["brow_style"] = "outward_tilt"
+        elif face_cue.brows == "roof":
+            merged["brow_raise"] = -1
+            merged["brow_slant"] = 0
+            merged["brow_style"] = "roof"
+        return merged
+
+    def _scaled_offset(self, value: int | float, scale: float) -> int:
+        return int(round(float(value) * scale))
+
+    def _scaled_size(self, value: int | float, scale: float, *, minimum: int = 1) -> int:
+        return max(minimum, int(round(float(value) * scale)))
+
+    def _normalise_scale(self, value: object) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+        if parsed > 0:
+            return parsed
+        return 1.0

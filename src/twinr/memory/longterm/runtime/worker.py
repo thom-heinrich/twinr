@@ -8,6 +8,7 @@ path without allowing unbounded queue growth.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Generic, TypeVar
 from queue import Empty, Full, Queue
 from threading import Condition, Event, Lock, Thread, current_thread
@@ -20,6 +21,19 @@ from twinr.memory.longterm.core.models import LongTermConversationTurn, LongTerm
 
 LOGGER = logging.getLogger(__name__)
 TLongTermItem = TypeVar("TLongTermItem")
+
+
+@dataclass(frozen=True, slots=True)
+class AsyncLongTermWriterState:
+    """Capture the exact externally visible state of one background writer."""
+
+    worker_name: str
+    pending_count: int
+    inflight_count: int
+    dropped_count: int
+    last_error_message: str | None
+    accepting: bool
+    worker_alive: bool
 
 
 class _AsyncLongTermWriter(Generic[TLongTermItem]):
@@ -109,6 +123,20 @@ class _AsyncLongTermWriter(Generic[TLongTermItem]):
         with self._drain_lock:
             # AUDIT-FIX(#4): Return an exact pending count instead of Queue.qsize().
             return self._pending
+
+    def snapshot_state(self) -> AsyncLongTermWriterState:
+        """Return an exact snapshot used by higher-level lifecycle orchestration."""
+
+        with self._drain_lock:
+            return AsyncLongTermWriterState(
+                worker_name=self._worker.name,
+                pending_count=self._pending,
+                inflight_count=self._inflight,
+                dropped_count=self._dropped_count,
+                last_error_message=self._last_error_message,
+                accepting=self._accepting,
+                worker_alive=self._worker.is_alive(),
+            )
 
     @property
     def last_error_message(self) -> str | None:

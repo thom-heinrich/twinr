@@ -13,6 +13,9 @@ PYTHON_BIN=""
 DEVICE_MATCH="${TWINR_AUDIO_DEVICE_MATCH:-Jabra}"
 CARD_INDEX=""
 DEVICE_INDEX=0
+CAPTURE_DEVICE_MATCH="${TWINR_AUDIO_CAPTURE_DEVICE_MATCH:-}"
+CAPTURE_CARD_INDEX=""
+CAPTURE_DEVICE_INDEX=""
 PROACTIVE_DEVICE="${TWINR_PROACTIVE_AUDIO_DEVICE:-}"
 PROACTIVE_DEVICE_MATCH="${TWINR_PROACTIVE_AUDIO_DEVICE_MATCH:-}"
 PROACTIVE_DEVICE_INDEX=0
@@ -29,9 +32,15 @@ Configure Twinr audio defaults for the Raspberry Pi.
 
 Options:
   --env-file PATH      Path to .env file for proactive audio updates (default: /twinr/.env)
-  --device-match TEXT  Match substring for the USB audio device (default: Jabra)
-  --card-index N       Explicit ALSA card index to use
-  --device-index N     ALSA device index (default: 0)
+  --device-match TEXT  Match substring for the playback device (default: Jabra)
+  --card-index N       Explicit ALSA playback card index to use
+  --device-index N     ALSA playback device index (default: 0)
+  --capture-device-match TEXT
+                      Match substring for the capture device (defaults to --device-match)
+  --capture-card-index N
+                      Explicit ALSA capture card index to use
+  --capture-device-index N
+                      ALSA capture device index (defaults to --device-index)
   --proactive-device ALSA  Explicit ALSA capture device for proactive background audio
   --proactive-device-match TEXT
                       Match substring for the proactive capture device and store it as plughw:CARD=...,DEV=...
@@ -49,6 +58,57 @@ HELP
 fail() {
   printf 'error: %s\n' "$*" >&2
   exit 1
+}
+
+detect_card_index() {
+  local command_name="$1"
+  local match="$2"
+
+  [[ -n "$match" ]] || return 0
+  "$command_name" -l | awk -v needle="$match" '
+    BEGIN { IGNORECASE=1 }
+    $0 ~ needle && $1 == "card" {
+      gsub(":", "", $2)
+      print $2
+      exit
+    }
+  '
+}
+
+detect_pactl_name() {
+  local table="$1"
+  local match="$2"
+  local skip_monitors="${3:-0}"
+
+  [[ -n "$match" ]] || return 0
+  run_pactl list short "$table" 2>/dev/null | awk -F '\t' -v needle="$match" -v skip_monitors="$skip_monitors" '
+    function normalize(value) {
+      value = tolower(value)
+      gsub(/[_-]+/, " ", value)
+      gsub(/[[:space:]]+/, " ", value)
+      return value
+    }
+
+    {
+      if (skip_monitors == "1" && $2 ~ /monitor/) {
+        next
+      }
+      if (normalize($0) ~ normalize(needle)) {
+        print $2
+        exit
+      }
+    }
+  '
+}
+
+run_pactl() {
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    local runtime_dir
+    runtime_dir="/run/user/$(id -u "$SUDO_USER")"
+    sudo -u "$SUDO_USER" env XDG_RUNTIME_DIR="$runtime_dir" pactl "$@"
+    return
+  fi
+  pactl "$@"
 }
 
 resolve_python_bin() {
@@ -87,6 +147,21 @@ while [[ $# -gt 0 ]]; do
     --device-index)
       [[ $# -ge 2 ]] || fail "Missing value for --device-index"
       DEVICE_INDEX="$2"
+      shift 2
+      ;;
+    --capture-device-match)
+      [[ $# -ge 2 ]] || fail "Missing value for --capture-device-match"
+      CAPTURE_DEVICE_MATCH="$2"
+      shift 2
+      ;;
+    --capture-card-index)
+      [[ $# -ge 2 ]] || fail "Missing value for --capture-card-index"
+      CAPTURE_CARD_INDEX="$2"
+      shift 2
+      ;;
+    --capture-device-index)
+      [[ $# -ge 2 ]] || fail "Missing value for --capture-device-index"
+      CAPTURE_DEVICE_INDEX="$2"
       shift 2
       ;;
     --proactive-device)
@@ -135,20 +210,28 @@ command -v aplay >/dev/null 2>&1 || fail "aplay not found"
 command -v arecord >/dev/null 2>&1 || fail "arecord not found"
 resolve_python_bin
 [[ "$DEVICE_INDEX" =~ ^[0-9]+$ ]] || fail "--device-index must be an integer"
+if [[ -z "$CAPTURE_DEVICE_INDEX" ]]; then
+  CAPTURE_DEVICE_INDEX="$DEVICE_INDEX"
+fi
+[[ "$CAPTURE_DEVICE_INDEX" =~ ^[0-9]+$ ]] || fail "--capture-device-index must be an integer"
 [[ "$PROACTIVE_DEVICE_INDEX" =~ ^[0-9]+$ ]] || fail "--proactive-device-index must be an integer"
 if [[ -n "$PROACTIVE_SAMPLE_MS" ]]; then
   [[ "$PROACTIVE_SAMPLE_MS" =~ ^[0-9]+$ ]] || fail "--proactive-sample-ms must be an integer"
 fi
 
 if [[ -z "$CARD_INDEX" ]]; then
-  CARD_INDEX="$(aplay -l | awk -v needle="$DEVICE_MATCH" 'BEGIN { IGNORECASE=1 } $0 ~ needle && $1 == "card" { gsub(":", "", $2); print $2; exit }')"
+  CARD_INDEX="$(detect_card_index aplay "$DEVICE_MATCH")"
 fi
 
 [[ -n "$CARD_INDEX" ]] || fail "Could not detect an ALSA playback card matching: $DEVICE_MATCH"
 [[ "$CARD_INDEX" =~ ^[0-9]+$ ]] || fail "Resolved card index is not numeric: $CARD_INDEX"
 
-CAPTURE_CARD_INDEX="$(arecord -l | awk -v needle="$DEVICE_MATCH" 'BEGIN { IGNORECASE=1 } $0 ~ needle && $1 == "card" { gsub(":", "", $2); print $2; exit }')"
+if [[ -z "$CAPTURE_CARD_INDEX" ]]; then
+  CAPTURE_MATCH="${CAPTURE_DEVICE_MATCH:-$DEVICE_MATCH}"
+  CAPTURE_CARD_INDEX="$(detect_card_index arecord "$CAPTURE_MATCH")"
+fi
 CAPTURE_CARD_INDEX="${CAPTURE_CARD_INDEX:-$CARD_INDEX}"
+[[ "$CAPTURE_CARD_INDEX" =~ ^[0-9]+$ ]] || fail "Resolved capture card index is not numeric: $CAPTURE_CARD_INDEX"
 
 detect_proactive_device() {
   local match="$1"
@@ -216,7 +299,8 @@ fi
 
 if [[ "$SKIP_ALSA" -eq 0 ]]; then
   if sudo test -f /etc/asound.conf; then
-    sudo cp /etc/asound.conf "/etc/asound.conf.bak.$(date +%Y%m%d%H%M%S)"
+    backup_path="/etc/asound.conf.bak.$(date +%Y%m%d%H%M%S).$$"
+    sudo cp /etc/asound.conf "$backup_path"
   fi
   sudo tee /etc/asound.conf >/dev/null <<ASOUND
 pcm.!default {
@@ -227,7 +311,7 @@ pcm.!default {
   }
   capture.pcm {
     type plug
-    slave.pcm "hw:${CAPTURE_CARD_INDEX},${DEVICE_INDEX}"
+    slave.pcm "hw:${CAPTURE_CARD_INDEX},${CAPTURE_DEVICE_INDEX}"
   }
 }
 
@@ -241,21 +325,23 @@ fi
 SINK_NAME=""
 SOURCE_NAME=""
 if command -v pactl >/dev/null 2>&1; then
-  SINK_NAME="$(pactl list short sinks 2>/dev/null | awk -F '\t' -v needle="$DEVICE_MATCH" 'BEGIN { IGNORECASE=1 } $0 ~ needle { print $2; exit }')"
-  SOURCE_NAME="$(pactl list short sources 2>/dev/null | awk -F '\t' -v needle="$DEVICE_MATCH" 'BEGIN { IGNORECASE=1 } $0 ~ needle && $2 !~ /monitor/ { print $2; exit }')"
+  SINK_NAME="$(detect_pactl_name sinks "$DEVICE_MATCH")"
+  SOURCE_MATCH="${CAPTURE_DEVICE_MATCH:-$DEVICE_MATCH}"
+  SOURCE_NAME="$(detect_pactl_name sources "$SOURCE_MATCH" 1)"
 fi
 
 if [[ "$SKIP_PULSE" -eq 0 ]]; then
   command -v pactl >/dev/null 2>&1 || fail "pactl not found"
   [[ -n "$SINK_NAME" ]] || fail "Could not detect a Pulse/PipeWire sink matching: $DEVICE_MATCH"
-  [[ -n "$SOURCE_NAME" ]] || fail "Could not detect a Pulse/PipeWire source matching: $DEVICE_MATCH"
-  pactl set-default-sink "$SINK_NAME"
-  pactl set-default-source "$SOURCE_NAME"
+  [[ -n "$SOURCE_NAME" ]] || fail "Could not detect a Pulse/PipeWire source matching: $SOURCE_MATCH"
+  run_pactl set-default-sink "$SINK_NAME"
+  run_pactl set-default-source "$SOURCE_NAME"
 fi
 
 printf 'playback_card=%s\n' "$CARD_INDEX"
 printf 'capture_card=%s\n' "$CAPTURE_CARD_INDEX"
-printf 'alsa_device=%s\n' "$DEVICE_INDEX"
+printf 'playback_device=%s\n' "$DEVICE_INDEX"
+printf 'capture_device=%s\n' "$CAPTURE_DEVICE_INDEX"
 if [[ -n "$SINK_NAME" ]]; then
   printf 'pulse_sink=%s\n' "$SINK_NAME"
 fi

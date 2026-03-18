@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 import json
+import socket
 import sys
 import tempfile
 import unittest
@@ -198,6 +199,7 @@ class OpsModuleTests(unittest.TestCase):
 
     def test_run_config_checks_rejects_display_button_collision(self) -> None:
         config = TwinrConfig(
+            display_driver="waveshare_4in2_v2",
             green_button_gpio=23,
             yellow_button_gpio=24,
             display_busy_gpio=24,
@@ -207,7 +209,40 @@ class OpsModuleTests(unittest.TestCase):
 
         by_key = {check.key: check for check in checks}
         self.assertEqual(by_key["display_gpio"].status, "fail")
-        self.assertIn("Display BUSY GPIO 24 collides with yellow button GPIO 24.", by_key["display_gpio"].detail)
+        self.assertIn("BUSY GPIO 24 collides with button `yellow`", by_key["display_gpio"].detail)
+
+    def test_run_config_checks_accepts_hdmi_display_character_device_path(self) -> None:
+        config = TwinrConfig(
+            display_driver="hdmi_fbdev",
+            display_fb_path="/dev/null",
+        )
+
+        checks = run_config_checks(config)
+
+        by_key = {check.key: check for check in checks}
+        self.assertEqual(by_key["display_gpio"].status, "ok")
+        self.assertIn("does not require display GPIO pins", by_key["display_gpio"].detail)
+
+    def test_run_config_checks_accepts_wayland_display_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_dir = Path(temp_dir)
+            socket_path = runtime_dir / "wayland-0"
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                server.bind(str(socket_path))
+                config = TwinrConfig(
+                    display_driver="hdmi_wayland",
+                    display_wayland_display="wayland-0",
+                    display_wayland_runtime_dir=str(runtime_dir),
+                )
+
+                checks = run_config_checks(config)
+            finally:
+                server.close()
+
+        by_key = {check.key: check for check in checks}
+        self.assertEqual(by_key["display_gpio"].status, "ok")
+        self.assertIn(str(socket_path), by_key["display_gpio"].detail)
 
     def test_run_config_checks_includes_self_coding_codex_readiness(self) -> None:
         config = TwinrConfig()

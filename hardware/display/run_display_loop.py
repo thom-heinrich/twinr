@@ -3,8 +3,8 @@
 
 Purpose
 -------
-Launch only the display loop so operators can validate e-paper status updates
-without starting the full hardware or realtime runtime paths.
+Launch only the display loop so operators can validate the configured display
+backend without starting the full hardware or realtime runtime paths.
 
 Usage
 -----
@@ -39,7 +39,7 @@ from twinr.display import TwinrStatusDisplayLoop
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser for the display loop runner."""
 
-    parser = argparse.ArgumentParser(description="Run the Twinr Waveshare status display loop")
+    parser = argparse.ArgumentParser(description="Run the Twinr status display loop for the configured display backend")
     parser.add_argument("--env-file", default=Path(__file__).resolve().parents[2] / ".env")
     parser.add_argument("--duration", type=float, help="Optional max runtime in seconds")
     return parser

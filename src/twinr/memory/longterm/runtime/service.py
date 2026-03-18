@@ -9,7 +9,8 @@ coordinates those pieces without owning their algorithms.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field  # AUDIT-FIX(#10): keep 3.11-safe dataclass field support for bounded defaults and locks.
 from datetime import datetime
 from functools import lru_cache
@@ -54,6 +55,7 @@ from twinr.memory.longterm.storage.midterm_store import LongTermMidtermStore
 from twinr.memory.longterm.proactive.planner import LongTermProactivePlanner
 from twinr.memory.longterm.proactive.state import LongTermProactivePolicy, LongTermProactiveReservationV1, LongTermProactiveStateStore
 from twinr.memory.longterm.reasoning.reflect import LongTermMemoryReflector
+from twinr.memory.longterm.retrieval.adaptive_policy import LongTermAdaptivePolicyBuilder
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
 from twinr.memory.longterm.reasoning.retention import LongTermRetentionPolicy
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, LongTermRemoteUnavailableError
@@ -61,6 +63,7 @@ from twinr.memory.longterm.ingestion.sensor_memory import LongTermSensorMemoryCo
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.longterm.retrieval.subtext import LongTermSubtextBuilder, LongTermSubtextCompiler
 from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
+from twinr.memory.longterm.runtime.flush_budget import build_flush_budget_plan
 from twinr.memory.longterm.runtime.health import LongTermRemoteHealthProbe, LongTermRemoteWarmResult
 from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter, AsyncLongTermMultimodalWriter
 
@@ -386,6 +389,9 @@ class LongTermMemoryService:
             midterm_store=midterm_store,
             conflict_resolver=conflict_resolver,
             subtext_builder=subtext_builder,
+            adaptive_policy_builder=LongTermAdaptivePolicyBuilder(
+                proactive_state_store=proactive_state_store,
+            ),
         )
         store_lock = threading.RLock()  # AUDIT-FIX(#1): share one re-entrant mutation lock with both background writers.
         # AUDIT-FIX(#10): guard startup against zero/negative queue sizes from configuration.
@@ -487,54 +493,55 @@ class LongTermMemoryService:
                 total_latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
             )
         with self._store_lock:
-            for step_name, callback in (
-                ("prompt_context_store.ensure_remote_snapshots", self.prompt_context_store.ensure_remote_snapshots),
-                ("graph_store.ensure_remote_snapshot", self.graph_store.ensure_remote_snapshot),
-                ("object_store.ensure_remote_snapshots", self.object_store.ensure_remote_snapshots),
-                ("midterm_store.ensure_remote_snapshot", self.midterm_store.ensure_remote_snapshot),
-            ):
-                step_started = time.monotonic()
-                try:
-                    callback()
-                except Exception as exc:
+            with self._cache_remote_probe_reads():
+                for step_name, callback in (
+                    ("prompt_context_store.ensure_remote_snapshots", self.prompt_context_store.ensure_remote_snapshots),
+                    ("graph_store.ensure_remote_snapshot", self.graph_store.ensure_remote_snapshot),
+                    ("object_store.ensure_remote_snapshots", self.object_store.ensure_remote_snapshots),
+                    ("midterm_store.ensure_remote_snapshot", self.midterm_store.ensure_remote_snapshot),
+                ):
+                    step_started = time.monotonic()
+                    try:
+                        callback()
+                    except Exception as exc:
+                        steps.append(
+                            LongTermRemoteReadinessStep(
+                                name=step_name,
+                                status="fail",
+                                latency_ms=round(max(0.0, (time.monotonic() - step_started) * 1000.0), 3),
+                                detail=f"{type(exc).__name__}: {exc}",
+                            )
+                        )
+                        return LongTermRemoteReadinessResult(
+                            ready=False,
+                            detail=f"{type(exc).__name__}: {exc}",
+                            remote_status=status,
+                            steps=tuple(steps),
+                            total_latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
+                        )
                     steps.append(
                         LongTermRemoteReadinessStep(
                             name=step_name,
-                            status="fail",
+                            status="ok",
                             latency_ms=round(max(0.0, (time.monotonic() - step_started) * 1000.0), 3),
-                            detail=f"{type(exc).__name__}: {exc}",
                         )
                     )
-                    return LongTermRemoteReadinessResult(
-                        ready=False,
-                        detail=f"{type(exc).__name__}: {exc}",
-                        remote_status=status,
-                        steps=tuple(steps),
-                        total_latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
-                    )
+                warm_started = time.monotonic()
+                warm_result = LongTermRemoteHealthProbe(
+                    prompt_context_store=self.prompt_context_store,
+                    object_store=self.object_store,
+                    graph_store=self.graph_store,
+                    midterm_store=self.midterm_store,
+                ).probe_operational()
                 steps.append(
                     LongTermRemoteReadinessStep(
-                        name=step_name,
-                        status="ok",
-                        latency_ms=round(max(0.0, (time.monotonic() - step_started) * 1000.0), 3),
+                        name="LongTermRemoteHealthProbe.probe_operational",
+                        status="ok" if warm_result.ready else "fail",
+                        latency_ms=round(max(0.0, (time.monotonic() - warm_started) * 1000.0), 3),
+                        detail=warm_result.detail,
+                        warm_result=warm_result,
                     )
                 )
-            warm_started = time.monotonic()
-            warm_result = LongTermRemoteHealthProbe(
-                prompt_context_store=self.prompt_context_store,
-                object_store=self.object_store,
-                graph_store=self.graph_store,
-                midterm_store=self.midterm_store,
-            ).probe_operational()
-            steps.append(
-                LongTermRemoteReadinessStep(
-                    name="LongTermRemoteHealthProbe.probe_operational",
-                    status="ok" if warm_result.ready else "fail",
-                    latency_ms=round(max(0.0, (time.monotonic() - warm_started) * 1000.0), 3),
-                    detail=warm_result.detail,
-                    warm_result=warm_result,
-                )
-            )
         return LongTermRemoteReadinessResult(
             ready=warm_result.ready,
             detail=warm_result.detail,
@@ -543,6 +550,31 @@ class LongTermMemoryService:
             warm_result=warm_result,
             total_latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
         )
+
+    @contextmanager
+    def _cache_remote_probe_reads(self) -> Iterator[None]:
+        """Reuse snapshot probes only within one bounded readiness pass."""
+
+        seen: set[int] = set()
+        with ExitStack() as stack:
+            for remote_state in (
+                getattr(self.prompt_context_store.memory_store, "remote_state", None),
+                getattr(self.prompt_context_store.user_store, "remote_state", None),
+                getattr(self.prompt_context_store.personality_store, "remote_state", None),
+                getattr(self.graph_store, "remote_state", None),
+                getattr(self.object_store, "remote_state", None),
+                getattr(self.midterm_store, "remote_state", None),
+            ):
+                if remote_state is None:
+                    continue
+                state_id = id(remote_state)
+                if state_id in seen:
+                    continue
+                seen.add(state_id)
+                cache_probe_reads = getattr(remote_state, "cache_probe_reads", None)
+                if callable(cache_probe_reads):
+                    stack.enter_context(cache_probe_reads())
+            yield
 
     def ensure_remote_ready(self) -> LongTermRemoteReadinessResult:
         """Prove required remote-primary long-term state is ready to use.
@@ -637,22 +669,26 @@ class LongTermMemoryService:
                     query=query,
                     original_query_text=query_text,
                 )
-                conflict_queue = self.select_conflict_queue(query_text=query.retrieval_text)
+                recall_limit = max(
+                    1,
+                    _coerce_positive_int(
+                        getattr(self.config, "long_term_memory_recall_limit", 1),
+                        default=1,
+                        maximum=_MAX_REVIEW_LIMIT,
+                    ),
+                )
+                conflict_queue = self.retriever.select_conflict_queue(
+                    query=query,
+                    limit=recall_limit,
+                )
                 conflicting_memory_ids = {
                     option.memory_id
                     for item in conflict_queue
                     for option in item.options
                 }
-                durable_objects = self.object_store.select_relevant_objects(
-                    query_text=query.retrieval_text,
-                    limit=max(
-                        1,
-                        _coerce_positive_int(
-                            getattr(self.config, "long_term_memory_recall_limit", 1),
-                            default=1,
-                            maximum=_MAX_REVIEW_LIMIT,
-                        ),
-                    ),
+                durable_objects = self.retriever.select_durable_objects(
+                    query=query,
+                    limit=recall_limit,
                 )
                 filtered_durable_objects = tuple(
                     item
@@ -672,7 +708,7 @@ class LongTermMemoryService:
                     durable_context=self.retriever._render_durable_context(filtered_durable_objects),
                     episodic_context=context.episodic_context,
                     graph_context=self.graph_store.build_prompt_context(
-                        query.retrieval_text,
+                        query.retrieval_text or query.original_text,
                         include_contact_methods=False,
                     ),
                     conflict_context=None,
@@ -1371,24 +1407,40 @@ class LongTermMemoryService:
             )
 
     def flush(self, *, timeout_s: float = 2.0) -> bool:
-        """Flush both background writers within a bounded timeout."""
+        """Flush active background writers within one true total deadline."""
 
         resolved_timeout_s = _coerce_timeout_s(timeout_s, default=2.0)  # AUDIT-FIX(#11): harden lifecycle calls against invalid timeout input and writer exceptions.
-        writer_ok = True
-        multimodal_ok = True
+        flush_targets: list[tuple[str, object, object]] = []
         if self.writer is not None:
-            try:
-                writer_ok = self.writer.flush(timeout_s=resolved_timeout_s)
-            except Exception:
-                logger.exception("Failed to flush long-term conversation writer.")
-                writer_ok = False
+            flush_targets.append(("conversation", self.writer, self.writer.snapshot_state()))
         if self.multimodal_writer is not None:
+            flush_targets.append(("multimodal", self.multimodal_writer, self.multimodal_writer.snapshot_state()))
+
+        plan = build_flush_budget_plan(
+            total_timeout_s=resolved_timeout_s,
+            writer_states=(state for _, _, state in flush_targets),
+        )
+        budgets_by_name = {
+            budget.worker_name: budget
+            for budget in plan.writer_budgets
+        }
+        deadline = time.monotonic() + resolved_timeout_s
+        flush_ok = True
+        for label, writer, state in flush_targets:
+            budget = budgets_by_name.get(getattr(state, "worker_name", ""))
+            if budget is None:
+                continue
+            writer_timeout_s = min(
+                budget.timeout_s,
+                max(0.0, deadline - time.monotonic()),
+            )
             try:
-                multimodal_ok = self.multimodal_writer.flush(timeout_s=resolved_timeout_s)
+                writer_ok = writer.flush(timeout_s=writer_timeout_s)
             except Exception:
-                logger.exception("Failed to flush long-term multimodal writer.")
-                multimodal_ok = False
-        return writer_ok and multimodal_ok
+                logger.exception("Failed to flush long-term %s writer.", label)
+                writer_ok = False
+            flush_ok = flush_ok and writer_ok
+        return flush_ok
 
     def shutdown(self, *, timeout_s: float = 2.0) -> None:
         """Request bounded shutdown for all configured background writers."""
@@ -1561,7 +1613,10 @@ class LongTermMemoryService:
                     result=result,
                 )
                 try:
-                    reflection = reflector.reflect(objects=current_objects)
+                    reflection = reflector.reflect(
+                        objects=current_objects,
+                        include_midterm=LongTermMemoryService._should_include_midterm_in_multimodal_reflection(result),
+                    )
                 except Exception:
                     logger.exception("Long-term reflection failed during multimodal persistence.")
                 else:
@@ -1692,6 +1747,27 @@ class LongTermMemoryService:
         """Report whether a reflection payload contains any state updates."""
 
         return bool(result.reflected_objects or result.created_summaries or result.midterm_packets)
+
+    @staticmethod
+    def _should_include_midterm_in_multimodal_reflection(result: LongTermConsolidationResultV1) -> bool:
+        """Return whether one multimodal batch needs optional midterm compilation.
+
+        Raw multimodal traces such as button, print, camera, and sensor events
+        still need deterministic reflection for promotions and summaries, but
+        they do not benefit from invoking the slower midterm compiler when the
+        batch contains only episodes, observations, and patterns. Richer
+        multimodal outputs can opt back into the full reflection path.
+        """
+
+        for item in (*result.episodic_objects, *result.durable_objects, *result.deferred_objects):
+            if kind_matches(item.kind, "episode", item.attributes):
+                continue
+            if kind_matches(item.kind, "observation", item.attributes):
+                continue
+            if kind_matches(item.kind, "pattern", item.attributes):
+                continue
+            return True
+        return False
 
     @staticmethod
     # AUDIT-FIX(#8): preserve newly consolidated state even when retention logic fails; do not discard the whole batch.

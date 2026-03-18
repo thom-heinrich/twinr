@@ -35,6 +35,7 @@ from twinr.agent.self_coding.watchdog import cleanup_stale_compile_status, clean
 from twinr.hardware.voice_profile import VoiceProfileMonitor
 from twinr.integrations import build_managed_integrations, integration_automation_family_providers
 from twinr.memory.reminders import format_due_label
+from twinr.memory.longterm.retrieval.operator_search import run_long_term_operator_search
 from twinr.ops import (
     TwinrSelfTestRunner,
     build_support_bundle,
@@ -1299,6 +1300,22 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             config_checks = await _call_sync(run_config_checks, config)
             config_check_summary = await _call_sync(check_summary, config_checks)
 
+        memory_search_query = str(request.query_params.get("memory_query", "")).strip()
+        memory_search_result = None
+        memory_search_error = None
+        if active_tab == "memory_search" and memory_search_query:
+            try:
+                memory_search_result = await _call_sync(
+                    run_long_term_operator_search,
+                    config,
+                    memory_search_query,
+                )
+            except Exception as exc:
+                memory_search_error = _public_error_message(
+                    exc,
+                    fallback="Twinr could not search long-term memory right now.",
+                )
+
         page_context = build_ops_debug_page_context(
             active_tab=active_tab,
             env_path=ctx.env_path,
@@ -1317,6 +1334,9 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             redacted_env_values=redact_env_values(env_values),
             config_checks=tuple(config_checks),
             config_check_summary=config_check_summary,
+            memory_search_query=memory_search_query,
+            memory_search_result=memory_search_result,
+            memory_search_error=memory_search_error,
         )
         return ctx.render(
             request,

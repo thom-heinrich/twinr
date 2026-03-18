@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
 from threading import Lock
@@ -12,8 +13,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.agent.workflows.realtime_runtime.background import TwinrRealtimeBackgroundMixin
 from twinr.agent.workflows.realtime_runtime.support import TwinrRealtimeSupportMixin
 from twinr.config import TwinrConfig
-from twinr.runtime import TwinrRuntime
+from twinr.memory.longterm.core.models import (
+    LongTermConsolidationResultV1,
+    LongTermMemoryObjectV1,
+    LongTermSourceRefV1,
+)
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
+from twinr.runtime import TwinrRuntime
 
 
 class _FakeCameraCapture:
@@ -47,7 +53,6 @@ class _SupportHarness(TwinrRealtimeSupportMixin):
         self.config = config
         self._camera_lock = Lock()
         self.emit = lambda _line: None
-
 
 def _config(root: str) -> TwinrConfig:
     return TwinrConfig(
@@ -194,6 +199,92 @@ class LongTermMultimodalTests(unittest.TestCase):
         print_pattern = next(item for item in objects if item.memory_id.startswith("pattern:print:button:"))
         self.assertEqual(print_pattern.status, "active")
         self.assertGreaterEqual((print_pattern.attributes or {}).get("support_count", 0), 2)
+
+    def test_low_signal_multimodal_batches_skip_optional_midterm_compilation(self) -> None:
+        source_ref = LongTermSourceRefV1(
+            source_type="device_event",
+            event_ids=("multimodal:button",),
+            modality="button",
+        )
+        episode = LongTermMemoryObjectV1(
+            memory_id="episode:multimodal_button",
+            kind="episode",
+            summary="Multimodal device event recorded: button_interaction.",
+            details="Structured multimodal evidence: button_interaction",
+            source=source_ref,
+            status="candidate",
+            confidence=0.92,
+            sensitivity="normal",
+            slot_key="episode:multimodal:button",
+            value_key="button_interaction",
+        )
+        pattern = LongTermMemoryObjectV1(
+            memory_id="pattern:button:green:start_listening:morning",
+            kind="pattern",
+            summary="The green button was used to start a conversation in the morning.",
+            details="Low-confidence button usage pattern derived from a physical interaction event.",
+            source=source_ref,
+            status="candidate",
+            confidence=0.6,
+            sensitivity="low",
+            slot_key="pattern:button:green:start_listening:morning",
+            value_key="button_used",
+            attributes={"pattern_type": "interaction", "support_count": 2, "daypart": "morning"},
+        )
+        result = LongTermConsolidationResultV1(
+            turn_id="multimodal:button",
+            occurred_at=datetime(2026, 3, 9, 8, 0, tzinfo=timezone.utc),
+            episodic_objects=(episode,),
+            durable_objects=(pattern,),
+            deferred_objects=(),
+            conflicts=(),
+            graph_edges=(),
+        )
+
+        self.assertFalse(LongTermMemoryService._should_include_midterm_in_multimodal_reflection(result))
+
+    def test_richer_multimodal_objects_keep_optional_midterm_compilation(self) -> None:
+        source_ref = LongTermSourceRefV1(
+            source_type="device_event",
+            event_ids=("multimodal:test",),
+            modality="sensor",
+        )
+        episode = LongTermMemoryObjectV1(
+            memory_id="episode:multimodal_test",
+            kind="episode",
+            summary="Multimodal device event recorded: custom_fact.",
+            details="Structured multimodal evidence: {}",
+            source=source_ref,
+            status="candidate",
+            confidence=0.92,
+            sensitivity="normal",
+            slot_key="episode:multimodal:test",
+            value_key="custom_fact",
+        )
+        fact = LongTermMemoryObjectV1(
+            memory_id="fact:hydration",
+            kind="fact",
+            summary="The user prefers a glass of water in the morning.",
+            details="Derived from a richer multimodal signal.",
+            source=source_ref,
+            status="candidate",
+            confidence=0.72,
+            sensitivity="low",
+            slot_key="fact:hydration_preference",
+            value_key="water_morning",
+            attributes={"fact_type": "preference"},
+        )
+        result = LongTermConsolidationResultV1(
+            turn_id="multimodal:test",
+            occurred_at=datetime(2026, 3, 9, 8, 0, tzinfo=timezone.utc),
+            episodic_objects=(episode,),
+            durable_objects=(fact,),
+            deferred_objects=(),
+            conflicts=(),
+            graph_edges=(),
+        )
+
+        self.assertTrue(LongTermMemoryService._should_include_midterm_in_multimodal_reflection(result))
 
 
 if __name__ == "__main__":

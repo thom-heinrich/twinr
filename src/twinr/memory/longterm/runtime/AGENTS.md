@@ -15,6 +15,7 @@ Out of scope:
 
 - `service.py` — runtime orchestration entrypoint; keep deep business logic in owned subpackages
 - `worker.py` — bounded async persistence workers with exact drain/error tracking
+- `flush_budget.py` — deterministic total-deadline planner for multi-writer flush orchestration
 - `health.py` — remote snapshot readiness probe; no production state mutation here
 - `component.yaml` — package metadata, callers, and test map
 
@@ -24,6 +25,7 @@ Out of scope:
 - All runtime mutations that touch prompt, object, graph, or midterm stores must stay serialized under the shared `_store_lock`.
 - Required remote-primary readiness failures must surface as `LongTermRemoteUnavailableError`; do not degrade them into empty context or silent fallback.
 - Background writers must stay bounded, reject new items after shutdown starts, and preserve exact pending/drop/error state.
+- Service-level flush deadlines must be real wall-clock totals; do not reapply the full timeout independently to multiple writers.
 - Multimodal evidence and episodic fallback payloads must remain bounded and sanitized before persistence.
 
 ## Verification
@@ -53,7 +55,13 @@ PYTHONPATH=src pytest test/test_longterm_memory.py test/test_longterm_multimodal
 
 `worker.py` changes -> also check:
 - `service.py`
+- `flush_budget.py`
 - `test/test_longterm_worker.py`
+- `test/test_longterm_memory.py`
+
+`flush_budget.py` changes -> also check:
+- `service.py`
+- `worker.py`
 - `test/test_longterm_memory.py`
 
 `health.py` changes -> also check:

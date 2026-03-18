@@ -9,11 +9,17 @@ bounded background writers into the APIs used by agent runtime loops.
 
 `runtime` owns:
 - Assemble `LongTermMemoryService` from config and subsystem dependencies
-- Build runtime provider context and tool-safe context
+- Build runtime provider context and tool-safe context while preserving both original-language and canonical query recall paths
+- Expose confirmed durable-memory state explicitly in provider/tool context so meta-memory questions can distinguish stored current facts from generic neighbors
 - Persist conversation turns and multimodal evidence through bounded workers
+- Split one service-level flush timeout into explicit per-writer budgets so wall-clock runtime deadlines stay real
+- Keep low-signal multimodal writes on the deterministic reflection path while skipping optional midterm compilation that would otherwise duplicate per-turn remote latency
 - Verify remote-primary snapshot readiness before runtime loops start
 - Record per-snapshot pointer/origin readiness evidence so watchdog failures can be traced to the exact remote read path
+- Reuse successful remote snapshot probes within one bounded readiness pass so watchdog startup does not refetch the same snapshot twice back-to-back
+- Treat successful required snapshot loads as the decisive health proof inside the warm probe instead of re-running per-store backend status checks after bootstrap
 - Fail closed when any required remote snapshot or shard is unreadable
+- Wire adaptive retrieval policies derived from confirmed memory, routines, and proactive outcomes into provider context
 - Expose review, retention, proactive, and operator mutation entry points
 
 `runtime` does **not** own:
@@ -28,6 +34,7 @@ bounded background writers into the APIs used by agent runtime loops.
 |---|---|
 | `service.py` | Runtime orchestration service |
 | `worker.py` | Bounded async persistence |
+| `flush_budget.py` | Total-deadline planner for multi-writer flush budgeting |
 | `health.py` | Remote readiness probe with per-snapshot pointer/origin evidence |
 | `component.yaml` | Structured package metadata |
 | `AGENTS.md` | Local editing rules |

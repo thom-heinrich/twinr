@@ -1285,21 +1285,42 @@ def _settings_sections(config: TwinrConfig, env_values: dict[str, str]) -> tuple
         ),
         SettingsSection(
             title="Display and printer",
-            description="E-paper wiring plus printer queue and receipt layout.",
+            description="Display backend output plus printer queue and receipt layout.",
             fields=(
                 _text_field(
                     "TWINR_DISPLAY_DRIVER",
                     "Display driver",
                     env_values,
                     config.display_driver,
-                    tooltip_text="Driver id for the configured e-paper display.",
+                    tooltip_text="Driver id for the active display backend, for example hdmi_wayland, hdmi_fbdev, or waveshare_4in2_v2.",
+                ),
+                _text_field(
+                    "TWINR_DISPLAY_FB_PATH",
+                    "Display framebuffer path",
+                    env_values,
+                    config.display_fb_path,
+                    tooltip_text="Framebuffer device path for the HDMI display backend.",
+                ),
+                _text_field(
+                    "TWINR_DISPLAY_WAYLAND_DISPLAY",
+                    "Display Wayland socket",
+                    env_values,
+                    config.display_wayland_display,
+                    tooltip_text="Wayland socket name used by the fullscreen HDMI backend, for example wayland-0.",
+                ),
+                _text_field(
+                    "TWINR_DISPLAY_WAYLAND_RUNTIME_DIR",
+                    "Display Wayland runtime dir",
+                    env_values,
+                    config.display_wayland_runtime_dir or "",
+                    tooltip_text="Runtime directory that contains the active Wayland socket for the fullscreen HDMI backend.",
                 ),
                 _text_field(
                     "TWINR_DISPLAY_VENDOR_DIR",
                     "Display vendor dir",
                     env_values,
                     config.display_vendor_dir,
-                    tooltip_text="Path to the vendor display driver files.",
+                    tooltip_text="Path to the Waveshare vendor display driver files when the e-paper backend is active.",
                 ),
                 _text_field(
                     "TWINR_DISPLAY_SPI_BUS",

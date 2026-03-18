@@ -191,12 +191,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--display-test",
         action="store_true",
-        help="Render a black/white test card on the configured Waveshare display",
+        help="Render a test card on the configured Twinr display backend",
     )
     parser.add_argument(
         "--run-display-loop",
         action="store_true",
-        help="Run the e-paper status display loop",
+        help="Run the status display loop for the configured Twinr display backend",
     )
     return parser
 
@@ -327,6 +327,42 @@ def _print_morning_briefing_acceptance_result(result: Any) -> None:
         print(f"self_coding_acceptance_last_summary={result.last_summary_text}")
 
 
+def _run_web_server(config: TwinrConfig, env_file: str | Path) -> int:
+    """Start the local web control plane without bootstrapping the runtime."""
+
+    _assert_pi_runtime_root(env_file, command_name="run-web")
+    from twinr.web import create_app
+
+    try:
+        import uvicorn
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "The web dashboard dependencies are not installed. Run `pip install -e .` in /twinr."
+        ) from exc
+
+    app = create_app(Path(env_file))
+    uvicorn.run(app, host=config.web_host, port=config.web_port)
+    return 0
+
+
+def _run_orchestrator_server(config: TwinrConfig, env_file: str | Path) -> int:
+    """Start the websocket orchestrator service without bootstrapping the runtime."""
+
+    _assert_pi_runtime_root(env_file, command_name="run-orchestrator-server")
+    from twinr.orchestrator import create_app
+
+    try:
+        import uvicorn
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "The web/orchestrator dependencies are not installed. Run `pip install -e .` in /twinr."
+        ) from exc
+
+    app = create_app(Path(env_file))
+    uvicorn.run(app, host=config.orchestrator_host, port=config.orchestrator_port)
+    return 0
+
+
 def main() -> int:
     """Dispatch the requested Twinr CLI command and return its exit code."""
 
@@ -378,6 +414,12 @@ def main() -> int:
         )
         _print_morning_briefing_acceptance_result(result)
         return 0 if getattr(result, "delivery_delivered", False) else 1
+
+    if args.run_web:
+        return _run_web_server(config, args.env_file)
+
+    if args.run_orchestrator_server:
+        return _run_orchestrator_server(config, args.env_file)
 
     uses_openai = any(
         [
@@ -459,42 +501,15 @@ def main() -> int:
 
             camera = V4L2StillCamera.from_config(config)
 
-        if args.run_web:
-            _assert_pi_runtime_root(args.env_file, command_name="run-web")
-            from twinr.web import create_app
-
-            try:
-                import uvicorn
-            except ImportError as exc:  # pragma: no cover
-                raise RuntimeError(
-                    "The web dashboard dependencies are not installed. Run `pip install -e .` in /twinr."
-                ) from exc
-
-            app = create_app(Path(args.env_file))
-            uvicorn.run(app, host=config.web_host, port=config.web_port)
-            return 0
-
-        if args.run_orchestrator_server:
-            _assert_pi_runtime_root(args.env_file, command_name="run-orchestrator-server")
-            from twinr.orchestrator import create_app
-
-            try:
-                import uvicorn
-            except ImportError as exc:  # pragma: no cover
-                raise RuntimeError(
-                    "The web/orchestrator dependencies are not installed. Run `pip install -e .` in /twinr."
-                ) from exc
-
-            app = create_app(Path(args.env_file))
-            uvicorn.run(app, host=config.orchestrator_host, port=config.orchestrator_port)
-            return 0
-
         if args.display_test:
-            from twinr.display import WaveshareEPD4In2V2
+            from twinr.display import create_display_adapter
 
-            display = WaveshareEPD4In2V2.from_config(config)
-            display.show_test_pattern()
-            print("display_test=ok")
+            display = create_display_adapter(config)
+            try:
+                display.show_test_pattern()
+                print("display_test=ok")
+            finally:
+                display.close()
             return 0
 
         if args.run_display_loop:

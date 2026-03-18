@@ -29,6 +29,20 @@ from twinr.agent.self_coding.contracts import (
 from twinr.agent.self_coding.status import CompileJobStatus, CompileTarget, LearnedSkillStatus
 from twinr.agent.self_coding.store import SelfCodingStore
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
+from twinr.memory.longterm.evaluation.live_midterm_attest import (
+    LiveMidtermAttestResult,
+    LiveMidtermSeedTurn,
+    write_live_midterm_attest_artifacts,
+)
+from twinr.memory.longterm.retrieval.operator_search import LongTermOperatorSearchResult
+from twinr.memory.longterm.core.models import (
+    LongTermConflictOptionV1,
+    LongTermConflictQueueItemV1,
+    LongTermMemoryObjectV1,
+    LongTermMidtermPacketV1,
+    LongTermSourceRefV1,
+)
+from twinr.memory.query_normalization import LongTermQueryProfile
 from twinr.memory.reminders import ReminderStore
 from twinr.memory import ConversationTurn, MemoryLedgerItem, MemoryState, SearchMemoryEntry
 from twinr.integrations import ManagedIntegrationConfig, TwinrIntegrationStore
@@ -1614,6 +1628,122 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("ChonkyDB", response.text)
         self.assertIn("Current state at a glance", response.text)
         self.assertIn("LLM requests 24h", response.text)
+
+    def test_ops_debug_page_renders_memory_attest_block(self) -> None:
+        client, env_path = self.make_client()
+        write_live_midterm_attest_artifacts(
+            LiveMidtermAttestResult(
+                probe_id="midterm_live_20260318T100000Z",
+                status="ok",
+                started_at="2026-03-18T10:00:00Z",
+                finished_at="2026-03-18T10:00:09Z",
+                env_path=str(env_path),
+                base_project_root=str(env_path.parent),
+                runtime_namespace="twinr_midterm_attest_midterm_live_20260318t100000z",
+                writer_root=str(env_path.parent / "writer"),
+                fresh_reader_root=str(env_path.parent / "reader"),
+                flush_ok=True,
+                midterm_context_present=True,
+                follow_up_query="Was bringt mir Lea heute Abend um 19 Uhr vorbei?",
+                follow_up_answer_text="Lea bringt dir eine Thermoskanne mit selbstgemachter Linsensuppe vorbei.",
+                follow_up_model="gpt-5.2",
+                expected_answer_terms=("thermoskanne", "linsensuppe"),
+                matched_answer_terms=("thermoskanne", "linsensuppe"),
+                writer_packet_ids=(
+                    "midterm:20260318_lea_visit_thermos_lentil_soup_1900",
+                    "midterm:user_has_daughter_lea",
+                ),
+                remote_packet_ids=(
+                    "midterm:20260318_lea_visit_thermos_lentil_soup_1900",
+                    "midterm:user_has_daughter_lea",
+                ),
+                fresh_reader_packet_ids=(
+                    "midterm:20260318_lea_visit_thermos_lentil_soup_1900",
+                    "midterm:user_has_daughter_lea",
+                ),
+                seed_turns=(
+                    LiveMidtermSeedTurn(
+                        prompt="Meine Tochter Lea bringt mir heute Abend eine Thermoskanne mit Linsensuppe vorbei.",
+                        response_text="Ich merke mir das für später.",
+                    ),
+                ),
+                last_path_warning_class="outside_root_local_fallback_skipped",
+                last_path_warning_message="Skipped local snapshot fallback because the path is outside the configured Twinr memory root.",
+            ),
+            project_root=env_path.parent,
+        )
+
+        response = client.get("/ops/debug")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Memory attestation", response.text)
+        self.assertIn("outside_root_local_fallback_skipped", response.text)
+        self.assertIn("Writer packet ids", response.text)
+        self.assertIn("Fresh-reader packet ids", response.text)
+        self.assertIn("midterm:user_has_daughter_lea", response.text)
+
+    def test_ops_debug_page_renders_memory_search_tab(self) -> None:
+        client, _env_path = self.make_client()
+        fake_search = LongTermOperatorSearchResult(
+            query_text="Lea Linsensuppe",
+            query_profile=LongTermQueryProfile.from_text(
+                "Lea Linsensuppe",
+                canonical_english_text="lea lentil soup",
+            ),
+            durable_objects=(
+                LongTermMemoryObjectV1(
+                    memory_id="fact:lea_visit",
+                    kind="fact",
+                    summary="Lea bringt heute Abend Linsensuppe vorbei.",
+                    details="Um 19 Uhr mit einer Thermoskanne.",
+                    status="active",
+                    confidence=0.93,
+                    source=LongTermSourceRefV1(source_type="conversation"),
+                ),
+            ),
+            episodic_entries=(),
+            midterm_packets=(
+                LongTermMidtermPacketV1(
+                    packet_id="midterm:lea_soup",
+                    kind="visit",
+                    summary="Lea bringt heute Abend Suppe vorbei.",
+                    details="Thermoskanne, 19 Uhr.",
+                    query_hints=("lea", "linsensuppe"),
+                ),
+            ),
+            conflict_queue=(
+                LongTermConflictQueueItemV1(
+                    slot_key="favorite_drink",
+                    question="Welches Getraenk stimmt jetzt?",
+                    reason="Zwei widerspruechliche Erinnerungen sind offen.",
+                    candidate_memory_id="fact:oolong",
+                    options=(
+                        LongTermConflictOptionV1(
+                            memory_id="fact:oolong",
+                            summary="Oolong-Tee",
+                            status="candidate",
+                        ),
+                        LongTermConflictOptionV1(
+                            memory_id="fact:coffee",
+                            summary="Kaffee",
+                            status="active",
+                        ),
+                    ),
+                ),
+            ),
+            graph_context="Graph says Lea is the daughter and the visit is tonight.",
+        )
+
+        with patch("twinr.web.app.run_long_term_operator_search", return_value=fake_search):
+            response = client.get("/ops/debug?tab=memory_search&memory_query=Lea+Linsensuppe")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Memory Search", response.text)
+        self.assertIn("Canonical English", response.text)
+        self.assertIn("lea lentil soup", response.text)
+        self.assertIn("Lea bringt heute Abend Linsensuppe vorbei.", response.text)
+        self.assertIn("midterm:lea_soup", response.text)
+        self.assertIn("Graph context preview", response.text)
 
     def test_ops_debug_page_renders_chonkydb_tab(self) -> None:
         client, env_path = self.make_client()

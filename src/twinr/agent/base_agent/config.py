@@ -57,6 +57,12 @@ DEFAULT_WAKEWORD_PHRASES = (
 # Custom openWakeWord models can legitimately need very low operating thresholds.
 # Keep the parser permissive and let deployment tuning decide the actual value.
 MIN_SAFE_OPENWAKEWORD_THRESHOLD = 0.0
+SUPPORTED_DISPLAY_DRIVERS = (
+    "hdmi_wayland",
+    "hdmi_fbdev",
+    "waveshare_4in2_v2",
+)
+GPIO_DISPLAY_DRIVERS = frozenset({"waveshare_4in2_v2"})
 SUPPORTED_DISPLAY_LAYOUTS = (
     "default",
     "debug_log",
@@ -452,6 +458,7 @@ class TwinrConfig:
     long_term_memory_archive_enabled: bool = True
     long_term_memory_migration_enabled: bool = True
     long_term_memory_migration_batch_size: int = 64
+    long_term_memory_remote_bulk_request_max_bytes: int = 512 * 1024
     chonkydb_base_url: str | None = None
     chonkydb_api_key: str | None = None
     chonkydb_api_key_header: str = "x-api-key"
@@ -482,7 +489,12 @@ class TwinrConfig:
     button_bias: str = "pull-up"
     button_debounce_ms: int = 80
     button_probe_lines: tuple[int, ...] = DEFAULT_BUTTON_PROBE_LINES
-    display_driver: str = "waveshare_4in2_v2"
+    display_driver: str = "hdmi_fbdev"
+    display_fb_path: str = "/dev/fb0"
+    display_wayland_display: str = "wayland-0"
+    display_wayland_runtime_dir: str | None = None
+    display_face_cue_path: str = "artifacts/stores/ops/display_face_cue.json"
+    display_face_cue_ttl_s: float = 4.0
     display_vendor_dir: str = "state/display/vendor"
     display_spi_bus: int = 0
     display_spi_device: int = 0
@@ -495,6 +507,7 @@ class TwinrConfig:
     display_rotation_degrees: int = 270
     display_full_refresh_interval: int = 0
     display_busy_timeout_s: float = 20.0
+    display_runtime_trace_enabled: bool = False
     display_poll_interval_s: float = 0.5
     display_layout: str = "default"
     printer_queue: str = "Thermal_GP58"
@@ -511,9 +524,15 @@ class TwinrConfig:
         """Normalize derived long-term-memory mode fields after construction."""
 
         normalized_mode = str(self.long_term_memory_mode or "local_first").strip().lower() or "local_first"
+        normalized_display_driver = str(self.display_driver or "hdmi_fbdev").strip().lower() or "hdmi_fbdev"
         normalized_display_layout = str(self.display_layout or "default").strip().lower() or "default"
         if normalized_display_layout == "debug_face":
             normalized_display_layout = "debug_log"
+        if normalized_display_driver not in SUPPORTED_DISPLAY_DRIVERS:
+            raise ValueError(
+                "display_driver must be one of: "
+                + ", ".join(SUPPORTED_DISPLAY_DRIVERS)
+            )
         if normalized_display_layout not in SUPPORTED_DISPLAY_LAYOUTS:
             raise ValueError(
                 "display_layout must be one of: "
@@ -523,13 +542,24 @@ class TwinrConfig:
         if not math.isfinite(normalized_display_busy_timeout_s):
             raise ValueError("display_busy_timeout_s must be finite")
         normalized_display_busy_timeout_s = max(0.1, normalized_display_busy_timeout_s)
+        normalized_display_face_cue_ttl_s = float(self.display_face_cue_ttl_s)
+        if not math.isfinite(normalized_display_face_cue_ttl_s):
+            raise ValueError("display_face_cue_ttl_s must be finite")
+        normalized_display_face_cue_ttl_s = max(0.1, normalized_display_face_cue_ttl_s)
+        normalized_display_face_cue_path = (
+            str(self.display_face_cue_path or "artifacts/stores/ops/display_face_cue.json").strip()
+            or "artifacts/stores/ops/display_face_cue.json"
+        )
         object.__setattr__(self, "long_term_memory_mode", normalized_mode)
         object.__setattr__(
             self,
             "long_term_memory_remote_required",
             normalized_mode == "remote_primary",
         )
+        object.__setattr__(self, "display_driver", normalized_display_driver)
         object.__setattr__(self, "display_busy_timeout_s", normalized_display_busy_timeout_s)
+        object.__setattr__(self, "display_face_cue_path", normalized_display_face_cue_path)
+        object.__setattr__(self, "display_face_cue_ttl_s", normalized_display_face_cue_ttl_s)
         object.__setattr__(self, "display_layout", normalized_display_layout)
 
     @property
@@ -547,6 +577,8 @@ class TwinrConfig:
     def display_gpios(self) -> dict[str, int]:
         """Return the configured display GPIO assignments with operator labels."""
 
+        if not self.display_uses_gpio:
+            return {}
         return {
             "Display CS": self.display_cs_gpio,
             "Display DC": self.display_dc_gpio,
@@ -554,9 +586,23 @@ class TwinrConfig:
             "Display BUSY": self.display_busy_gpio,
         }
 
+    @property
+    def display_uses_gpio(self) -> bool:
+        """Return whether the active display driver requires display GPIO pins."""
+
+        return self.display_driver in GPIO_DISPLAY_DRIVERS
+
+    @property
+    def supported_display_drivers(self) -> tuple[str, ...]:
+        """Return the supported display driver identifiers."""
+
+        return SUPPORTED_DISPLAY_DRIVERS
+
     def display_gpio_conflicts(self) -> tuple[str, ...]:
         """Report detected GPIO collisions between display and other inputs."""
 
+        if not self.display_uses_gpio:
+            return ()
         assignments: list[tuple[str, int]] = list(self.display_gpios.items())
         if self.green_button_gpio is not None:
             assignments.append(("green button", self.green_button_gpio))
@@ -1473,6 +1519,10 @@ class TwinrConfig:
             long_term_memory_migration_batch_size=int(
                 get_value("TWINR_LONG_TERM_MEMORY_MIGRATION_BATCH_SIZE", "64") or "64"
             ),
+            long_term_memory_remote_bulk_request_max_bytes=int(
+                get_value("TWINR_LONG_TERM_MEMORY_REMOTE_BULK_REQUEST_MAX_BYTES", str(512 * 1024))
+                or str(512 * 1024)
+            ),
             chonkydb_base_url=(
                 get_value("TWINR_CHONKYDB_BASE_URL")
                 or get_value("CCODEX_MEMORY_BASE_URL")
@@ -1523,7 +1573,16 @@ class TwinrConfig:
                 get_value("TWINR_BUTTON_PROBE_LINES"),
                 DEFAULT_BUTTON_PROBE_LINES,
             ),
-            display_driver=get_value("TWINR_DISPLAY_DRIVER", "waveshare_4in2_v2") or "waveshare_4in2_v2",
+            display_driver=get_value("TWINR_DISPLAY_DRIVER", "hdmi_fbdev") or "hdmi_fbdev",
+            display_fb_path=get_value("TWINR_DISPLAY_FB_PATH", "/dev/fb0") or "/dev/fb0",
+            display_wayland_display=get_value("TWINR_DISPLAY_WAYLAND_DISPLAY", "wayland-0") or "wayland-0",
+            display_wayland_runtime_dir=get_value("TWINR_DISPLAY_WAYLAND_RUNTIME_DIR"),
+            display_face_cue_path=get_value(
+                "TWINR_DISPLAY_FACE_CUE_PATH",
+                "artifacts/stores/ops/display_face_cue.json",
+            )
+            or "artifacts/stores/ops/display_face_cue.json",
+            display_face_cue_ttl_s=_parse_float(get_value("TWINR_DISPLAY_FACE_CUE_TTL_S"), 4.0, minimum=0.1),
             display_vendor_dir=get_value("TWINR_DISPLAY_VENDOR_DIR", "state/display/vendor")
             or "state/display/vendor",
             display_spi_bus=int(get_value("TWINR_DISPLAY_SPI_BUS", "0") or "0"),
@@ -1537,6 +1596,7 @@ class TwinrConfig:
             display_rotation_degrees=int(get_value("TWINR_DISPLAY_ROTATION_DEGREES", "270") or "270"),
             display_full_refresh_interval=int(get_value("TWINR_DISPLAY_FULL_REFRESH_INTERVAL", "0") or "0"),
             display_busy_timeout_s=_parse_float(get_value("TWINR_DISPLAY_BUSY_TIMEOUT_S"), 20.0, minimum=0.1),
+            display_runtime_trace_enabled=_parse_bool(get_value("TWINR_DISPLAY_RUNTIME_TRACE_ENABLED"), False),
             display_poll_interval_s=_parse_float(get_value("TWINR_DISPLAY_POLL_INTERVAL_S"), 0.5),
             display_layout=get_value("TWINR_DISPLAY_LAYOUT", "default") or "default",
             printer_queue=get_value("TWINR_PRINTER_QUEUE", "Thermal_GP58") or "Thermal_GP58",

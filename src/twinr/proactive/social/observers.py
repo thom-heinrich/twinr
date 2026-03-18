@@ -20,7 +20,7 @@ from twinr.hardware.audio import AmbientAudioLevelSample, AmbientAudioSampler
 from twinr.hardware.camera import V4L2StillCamera
 from twinr.providers.openai import OpenAIBackend, OpenAIImageInput
 
-from .engine import SocialAudioObservation, SocialBodyPose, SocialVisionObservation
+from .engine import SocialAudioObservation, SocialBodyPose, SocialPersonZone, SocialVisionObservation
 
 
 logger = logging.getLogger(__name__)  # AUDIT-FIX(#2): emit provider-level failure telemetry instead of failing silently.
@@ -46,6 +46,7 @@ _REQUIRED_VISION_KEYS = frozenset(
         "hand_or_object_near_camera",
     }
 )
+_OPTIONAL_VISION_KEYS = frozenset({"person_count", "primary_person_zone"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,7 +432,7 @@ def parse_vision_observation_text(text: str) -> SocialVisionObservation:
             continue
         key, value = line.split("=", 1)
         normalized_key = key.strip().lower()
-        if normalized_key not in _REQUIRED_VISION_KEYS:
+        if normalized_key not in _REQUIRED_VISION_KEYS and normalized_key not in _OPTIONAL_VISION_KEYS:
             continue
         if normalized_key in values:
             raise ValueError(
@@ -445,8 +446,19 @@ def parse_vision_observation_text(text: str) -> SocialVisionObservation:
             f"Missing required vision classifier keys: {', '.join(missing_keys)}"
         )  # AUDIT-FIX(#4): fail closed on malformed classifier output.
 
+    person_visible = _parse_bool(values.get("person_visible"))
+    person_count = _parse_non_negative_int(values.get("person_count"), default=0)
+    primary_person_zone = _parse_zone(values.get("primary_person_zone"))
+    if person_visible:
+        person_count = max(1, person_count)
+    else:
+        person_count = 0
+        primary_person_zone = SocialPersonZone.UNKNOWN
+
     return SocialVisionObservation(
-        person_visible=_parse_bool(values.get("person_visible")),
+        person_visible=person_visible,
+        person_count=person_count,
+        primary_person_zone=primary_person_zone,
         looking_toward_device=_parse_bool(values.get("looking_toward_device")),
         body_pose=_parse_pose(values.get("body_pose")),
         smiling=_parse_bool(values.get("smiling")),
@@ -482,6 +494,43 @@ def _parse_pose(value: str | None) -> SocialBodyPose:
     raise ValueError(
         f"Invalid body_pose token in vision classifier output: {value!r}"
     )  # AUDIT-FIX(#4): stop silently coercing malformed poses to UNKNOWN.
+
+
+def _parse_zone(value: str | None) -> SocialPersonZone:
+    """Parse one optional primary-person zone token."""
+
+    if value is None:
+        return SocialPersonZone.UNKNOWN
+    normalized_value = _normalize_token(value)
+    if not normalized_value:
+        return SocialPersonZone.UNKNOWN
+    try:
+        return SocialPersonZone(normalized_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid primary_person_zone token in vision classifier output: {value!r}"
+        ) from exc
+
+
+def _parse_non_negative_int(value: str | None, *, default: int) -> int:
+    """Parse one optional non-negative integer token."""
+
+    if value is None:
+        return default
+    normalized_value = _normalize_token(value)
+    if not normalized_value:
+        return default
+    try:
+        number = int(normalized_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid integer token in vision classifier output: {value!r}"
+        ) from exc
+    if number < 0:
+        raise ValueError(
+            f"Invalid non-negative integer token in vision classifier output: {value!r}"
+        )
+    return number
 
 
 # AUDIT-FIX(#5): shared coercion helpers keep provider thresholds predictable under bad config or driver metadata.
@@ -589,6 +638,8 @@ def _unknown_vision_observation() -> SocialVisionObservation:
 
     return SocialVisionObservation(
         person_visible=False,
+        person_count=0,
+        primary_person_zone=SocialPersonZone.UNKNOWN,
         looking_toward_device=False,
         body_pose=SocialBodyPose.UNKNOWN,
         smiling=False,
@@ -611,6 +662,8 @@ _VISION_CLASSIFIER_PROMPT = (
     "You classify a single live camera frame for Twinr's proactive trigger engine. "
     "Return only ASCII lines in this exact key=value format:\n"
     "person_visible=yes|no\n"
+    "person_count=0|1|2|...\n"
+    "primary_person_zone=left|center|right|unknown\n"
     "looking_toward_device=yes|no\n"
     "body_pose=upright|slumped|floor|unknown\n"
     "smiling=yes|no\n"
@@ -620,6 +673,8 @@ _VISION_CLASSIFIER_PROMPT = (
     "- If uncertain, use no or unknown.\n"
     "- Do not infer identity, emotions, diagnosis, age, or intent beyond the listed keys.\n"
     "- `person_visible=yes` if any meaningful part of a person is visible, even when the body is partly cropped.\n"
+    "- `person_count` is the non-negative number of plausibly visible people in the frame; use 0 when none are visible.\n"
+    "- `primary_person_zone` refers to the most prominent visible person. Use `left`, `center`, or `right` based on horizontal thirds of the image, or `unknown` if no person is visible or the zone is unclear.\n"
     "- `floor` means the visible person is low to the floor, clearly lying down, collapsed at ground level, or only partially visible near the floor after a drop.\n"
     "- Prefer `floor` over `unknown` when a person is obviously very low in the scene.\n"
     "- `slumped` means seated or standing but visibly collapsed forward or drooping.\n"

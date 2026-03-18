@@ -496,7 +496,7 @@ class OpenAIToolCallingAgentProvider:
         if merged_instructions:
             request["instructions"] = merged_instructions
         use_web_search = self.config.openai_enable_web_search if allow_web_search is None else allow_web_search
-        web_search_tools = self.backend._build_tools(use_web_search)
+        web_search_tools = self.backend._build_tools(use_web_search, model=model)
         if web_search_tools:
             request["tools"] = list(web_search_tools)
         self._merge_tool_schemas(request, tool_schemas)

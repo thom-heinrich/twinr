@@ -19,8 +19,16 @@ class _FakeRemoteState:
         self.enabled = True
         self.config = SimpleNamespace(long_term_memory_migration_enabled=False)
         self.snapshots: dict[str, dict[str, object]] = {}
+        self.load_calls: list[dict[str, object]] = []
 
-    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+    def load_snapshot(self, *, snapshot_kind: str, local_path=None, prefer_cached_document_id: bool = False):
+        self.load_calls.append(
+            {
+                "snapshot_kind": snapshot_kind,
+                "local_path": local_path,
+                "prefer_cached_document_id": prefer_cached_document_id,
+            }
+        )
         del local_path
         payload = self.snapshots.get(snapshot_kind)
         return dict(payload) if isinstance(payload, dict) else None
@@ -205,6 +213,21 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
         self.assertTrue(created)
         self.assertIn("graph", remote_state.snapshots)
         self.assertEqual(remote_state.snapshots["graph"]["metadata"]["kind"], "personal_graph")
+
+    def test_remote_graph_reads_prefer_cached_document_id_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = TwinrPersonalGraphStore(
+                path=Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+                timezone_name="Europe/Berlin",
+                remote_state=remote_state,
+            )
+
+            store.ensure_remote_snapshot()
+
+        self.assertTrue(remote_state.load_calls)
+        self.assertTrue(remote_state.load_calls[0]["prefer_cached_document_id"])
 
 
 if __name__ == "__main__":

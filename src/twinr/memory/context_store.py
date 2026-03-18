@@ -1019,11 +1019,21 @@ class PromptContextStore:
     def ensure_remote_snapshots(self) -> tuple[str, ...]:
         """Seed any missing remote snapshots used by prompt-context stores."""
 
-        ensured: list[str] = []
-        if self.memory_store.ensure_remote_snapshot():
-            ensured.append(self.memory_store.remote_snapshot_kind)
-        if self.user_store.ensure_remote_snapshot():
-            ensured.append(self.user_store.remote_snapshot_kind or "user_context")
-        if self.personality_store.ensure_remote_snapshot():
-            ensured.append(self.personality_store.remote_snapshot_kind or "personality_context")
-        return tuple(ensured)
+        snapshot_requests = (
+            ("prompt_memory", self.memory_store),
+            ("user_context", self.user_store),
+            ("personality_context", self.personality_store),
+        )
+
+        def ensure_one(request: tuple[str, object]) -> tuple[str, bool]:
+            default_kind, component = request
+            ensure_remote_snapshot = getattr(component, "ensure_remote_snapshot")
+            created = bool(ensure_remote_snapshot())
+            snapshot_kind = str(getattr(component, "remote_snapshot_kind", "") or default_kind)
+            return snapshot_kind, created
+
+        # Keep prompt/user/personality seeding serialized. Live readiness runs
+        # share one remote-state/client boundary, and fresh parallel snapshot
+        # bootstrap has proven flaky enough to abort required-remote startup.
+        results = tuple(ensure_one(request) for request in snapshot_requests)
+        return tuple(snapshot_kind for snapshot_kind, created in results if created)

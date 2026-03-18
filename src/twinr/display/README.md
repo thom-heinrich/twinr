@@ -1,13 +1,14 @@
 # display
 
-`display` owns Twinr's e-paper runtime surface. It turns runtime snapshots and
-health signals into short status cards and provides the Waveshare 4.2 V2 panel
-adapter used by Twinr's Pi runtime.
+`display` owns Twinr's runtime display surfaces. It turns runtime snapshots and
+health signals into short status screens and provides a fullscreen HDMI
+Wayland adapter for the visible Pi monitor surface, an HDMI framebuffer
+fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
 
 ## Responsibility
 
 `display` owns:
-- translate runtime snapshots into bounded e-paper status frames
+- translate runtime snapshots into bounded status frames for the active backend
 - compose panel-bounded layout variants such as the operator-facing `debug_log`
   view with grouped `System Log`, `LLM Log`, and `Hardware Log` sections
 - derive the debug-log sections from persisted ops events, usage telemetry,
@@ -26,8 +27,24 @@ adapter used by Twinr's Pi runtime.
   errors instead of wedging the companion thread forever
 - prefer stable two-plane refresh paths on the Waveshare 4.2 V2 panel so live
   status animations do not invert panel polarity
+- keep the Waveshare default face static in `waiting` so the Pi panel stays
+  visually calm instead of rerendering every few seconds while nothing changed
+- allow subtle idle waiting motion on HDMI backends so the fullscreen face does
+  not look frozen on the visible monitor surface
+- allow optional external face-expression cues on HDMI so other Twinr
+  capabilities can steer gaze, brows, mouth, or tiny head drift without
+  coupling those semantics into the generic runtime snapshot schema
+- allow optional periodic full-refresh cleanup after a bounded number of fast
+  incremental updates instead of running indefinitely on fast refresh alone
+- emit bounded display-driver telemetry lines for refresh mode, clear, retry,
+  driver-reset, and BUSY-timeout decisions so Pi validation can prove which
+  hardware paths actually executed
 - keep debug-log lines stable between real state changes so operator screens do
   not churn the e-paper panel every poll cycle
+- force `debug_log` through the panel's full-refresh path because the text-rich
+  operator layout proved unstable on the Pi's fast incremental path
+- coalesce rapid debug-log content churn so operator-facing full refreshes stay
+  bounded even when ops events arrive in short bursts
 - keep debug-log hardware and ChonkyDB summary lines semantically current but
   bucketed/stable enough for e-paper refresh budgets
 - keep debug-log host metrics on operator thresholds rather than narrow raw
@@ -36,6 +53,10 @@ adapter used by Twinr's Pi runtime.
   minor host-metric drift from retriggering debug-log rerenders every few
   seconds on the panel
 - discard cached vendor imports after hardware faults so the next render starts cleanly
+- drive the visible HDMI Wayland path with a full-screen, high-contrast,
+  large-type operator UI that stays readable on the Pi monitor
+- keep an HDMI framebuffer fallback backend for Pi setups that do not expose a
+  usable Wayland session
 - run the optional companion display loop beside hardware/runtime loops
 
 `display` does **not** own:
@@ -49,13 +70,149 @@ authoritative display heartbeat lives separately under
 `artifacts/stores/ops/display_heartbeat.json` so the unprivileged runtime can
 always refresh it even when the vendor directory is root-owned.
 
+For the Waveshare default face layout, Twinr keeps the `waiting` state static
+instead of animating it on a timer. That idle motion produced unnecessary
+e-paper refreshes on the Pi. HDMI backends expose that behavior as an explicit
+adapter capability instead: the senior-facing fullscreen scene may use subtle
+idle motion while the shared status loop still keeps static backends calm.
+`TWINR_DISPLAY_FULL_REFRESH_INTERVAL` remains opt-in and defaults to `0`; when
+operators enable it, the adapter injects bounded full-refresh cleanup into
+layouts that still use fast incremental updates.
+
+The `debug_log` layout is treated more conservatively: after the first render
+it always uses the full-refresh path. Live Pi evidence showed the panel's
+`display_Fast` path timing out and leaving the operator screen inverted, so the
+text-heavy debug layout no longer attempts incremental refresh there. The
+service also compares `debug_log` frames only on the content that the layout
+actually draws and applies a bounded holdoff before replaying another
+same-status update, so volatile footer fields or short ops bursts do not
+translate straight into panel flicker.
+
+The Waveshare adapter also emits short telemetry lines such as
+`display_refresh=full reason=interval`, `display_clear=true`,
+`display_retry=true`, and `display_busy_timeout=true`. In productive Pi runs
+these land in the loop's stdout/journal output, which gives a direct proof of
+which refresh or recovery path actually ran.
+
+For runtime-only stalls there is now a second, opt-in layer:
+`TWINR_DISPLAY_RUNTIME_TRACE_ENABLED=true`. When enabled, the adapter adds
+bounded journal lines such as `display_trace=phase_start`,
+`display_trace=epd_call_start`, `display_trace=busy_wait_timeout`,
+`display_trace_gpio=...`, and `display_trace_supply=...`. Those lines carry the
+render phase, current and previous runtime status, last vendor command, BUSY
+caller, GPIO snapshots, and throttling state so the first live stall can be
+proven directly from `journalctl` without stopping Twinr for the standalone
+probe script.
+
+For HDMI deployments on a Raspberry Pi desktop session, prefer:
+
+```dotenv
+TWINR_DISPLAY_DRIVER=hdmi_wayland
+TWINR_DISPLAY_WAYLAND_DISPLAY=wayland-0
+TWINR_DISPLAY_WAYLAND_RUNTIME_DIR=/run/user/1000
+```
+
+That path gives Twinr ownership of the visible fullscreen surface. Keep
+`hdmi_fbdev` only as a fallback for framebuffer-only environments where no
+usable Wayland session exists.
+
+The default HDMI surface is intentionally much calmer than the operator
+`debug_log` view: solid black background, a top `TWINR` bar, an animated
+white-on-black face on the left that mirrors the familiar e-paper eye/mouth
+language, and one large status box on the right with English-only headline and
+key runtime fields. That keeps the senior-facing screen glanceable from a
+distance while `debug_log` remains the explicit diagnostics layout for
+operators.
+
+For HDMI, eye animation should stay calmer than mouth or whole-face motion:
+prefer gaze shifts, subtle blinks, and tiny head drift over large eye-resize
+swings or inverse-color eyelid strokes that read like extra eyebrows on the
+black background.
+
+That senior-facing HDMI surface is now modeled as its own scene module instead
+of being inlined into the framebuffer adapter. `hdmi_default_scene.py` owns the
+default-scene layout, face animation, and status-card model so future HDMI
+capabilities such as expanded cards, morph transitions, or richer per-capability
+panels can be added without pushing presentation logic back into the transport
+backend.
+
+External HDMI face triggers flow through `face_cues.py`. The runtime display
+loop loads one optional cue artifact and merges it only into the `default`
+HDMI face. That keeps `debug_log`, Waveshare, and the generic runtime snapshot
+schema stable while still allowing other modules to steer:
+- `gaze_x` / `gaze_y`
+- `mouth`
+- `brows`
+- `blink`
+- `head_dx` / `head_dy`
+
+Producer modules should use `face_expressions.py` instead of writing raw JSON.
+That helper keeps the low-level cue artifact stable while exposing a richer
+combinable API:
+- brows: `straight`, `inward_tilt`, `outward_tilt`, `roof`, `raised`, `soft`
+- gaze: eight 45-degree directions plus `center`
+- mouth: `neutral`, `smile`, `sad`, `thinking`, `pursed`, `scrunched`
+- optional `blink`, `head_dx`, and `head_dy`
+
+Legacy raw labels such as `focus`, `flat`, `line`, or `concern` still
+normalize into the canonical vocabulary so older producer paths do not break.
+
+The default artifact path is `artifacts/stores/ops/display_face_cue.json` and
+the default cue TTL is `4.0` seconds. Configure them with:
+
+```dotenv
+TWINR_DISPLAY_FACE_CUE_PATH=artifacts/stores/ops/display_face_cue.json
+TWINR_DISPLAY_FACE_CUE_TTL_S=4.0
+```
+
+One bounded low-level payload still looks like:
+
+```json
+{
+  "source": "camera_surface",
+  "gaze_x": 2,
+  "gaze_y": -1,
+  "mouth": "smile",
+  "brows": "raised",
+  "blink": false
+}
+```
+
+The preferred producer-facing path is:
+
+```python
+from twinr.display import (
+    DisplayFaceBrowStyle,
+    DisplayFaceExpressionController,
+    DisplayFaceGazeDirection,
+    DisplayFaceMouthStyle,
+)
+
+controller = DisplayFaceExpressionController.from_config(config, default_source="camera_surface")
+controller.show(
+    gaze=DisplayFaceGazeDirection.UP_RIGHT,
+    brows=DisplayFaceBrowStyle.RAISED,
+    mouth=DisplayFaceMouthStyle.SMILE,
+    blink=False,
+    hold_seconds=5.0,
+)
+```
+
 ## Key files
 
 | File | Purpose |
 |---|---|
 | [__init__.py](./__init__.py) | Public display exports |
+| [contracts.py](./contracts.py) | Shared adapter/payload contracts |
+| [factory.py](./factory.py) | Config-driven display backend selection |
 | [debug_log.py](./debug_log.py) | Build grouped operator log sections from ops/usage stores |
+| [face_cues.py](./face_cues.py) | Optional external HDMI face-expression cue contract and store |
+| [face_expressions.py](./face_expressions.py) | Producer-facing combinable expression API for the HDMI face |
 | [heartbeat.py](./heartbeat.py) | Persist display forward-progress heartbeats and expose the shared companion-health contract for ops/supervision |
+| [hdmi_default_scene.py](./hdmi_default_scene.py) | Modular default HDMI scene model, face renderer, and status-card composition |
+| [hdmi_wayland.py](./hdmi_wayland.py) | Visible fullscreen HDMI Wayland adapter |
+| [hdmi_fbdev.py](./hdmi_fbdev.py) | HDMI framebuffer fallback adapter and scene host/transport layer |
+| [wayland_env.py](./wayland_env.py) | Resolve and export Wayland socket/runtime details |
 | [service.py](./service.py) | Snapshot-driven status loop |
 | [layouts.py](./layouts.py) | Status-card layout composition |
 | [waveshare_v2.py](./waveshare_v2.py) | Panel adapter and rendering |
@@ -65,9 +222,9 @@ always refresh it even when the vendor directory is root-owned.
 ## Usage
 
 ```python
-from twinr.display import TwinrStatusDisplayLoop, WaveshareEPD4In2V2
+from twinr.display import TwinrStatusDisplayLoop, create_display_adapter
 
-display = WaveshareEPD4In2V2.from_config(config)
+display = create_display_adapter(config)
 display.show_test_pattern()
 
 loop = TwinrStatusDisplayLoop.from_config(config)

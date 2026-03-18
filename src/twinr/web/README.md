@@ -11,7 +11,8 @@ templates and CSS that power the operator dashboard.
 - load config, runtime snapshot, and store handles through [`context.py`](./context.py)
 - enforce local or managed sign-in policy for the portal, including first-login password change for the permanent Pi web service over LAN
 - render the ops health page with the persisted remote-memory watchdog state
-- render the tabbed debug page that groups runtime, ChonkyDB, LLM, events, hardware, and raw local artifacts
+- render the tabbed debug page that groups runtime, ChonkyDB, live memory attestation, LLM, events, hardware, and raw local artifacts
+- render a read-only long-term memory search tab in `/ops/debug` that queries the real retrieval stack and groups hits by durable, midterm, episodic, and conflict memory
 - keep the `/ops/debug` operator surface high-contrast and readable on external monitors, including dense log-like sections
 - render the self-coding operator page with compile telemetry, health, live-e2e state, stale compile/run watchdog visibility, and learned-skill lifecycle controls
 - compose presenters, support helpers, templates, and static assets into operator pages

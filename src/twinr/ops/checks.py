@@ -14,6 +14,7 @@ from shutil import which
 import subprocess
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.display.wayland_env import resolve_wayland_socket
 
 
 _VALID_STATUSES = frozenset({"ok", "warn", "fail"})
@@ -330,6 +331,50 @@ def _gpio_check(config: TwinrConfig) -> ConfigCheck:
 
 
 def _display_gpio_check(config: TwinrConfig) -> ConfigCheck:
+    driver = _clean_config_text(getattr(config, "display_driver", "")).lower() or "hdmi_fbdev"
+    if not getattr(config, "display_uses_gpio", False):
+        if driver == "hdmi_wayland":
+            display_name = _clean_config_text(getattr(config, "display_wayland_display", "")) or "wayland-0"
+            runtime_dir = _clean_config_text(getattr(config, "display_wayland_runtime_dir", "")) or None
+            socket_path = resolve_wayland_socket(
+                display_name,
+                configured_runtime_dir=runtime_dir,
+            )
+            if socket_path is None:
+                return ConfigCheck(
+                    "display_gpio",
+                    "Display output",
+                    "fail",
+                    f"Wayland socket `{_display_value(display_name)}` was not found. Configure `TWINR_DISPLAY_WAYLAND_RUNTIME_DIR`.",
+                )
+            return ConfigCheck(
+                "display_gpio",
+                "Display output",
+                "ok",
+                f"Display driver `{driver}` targets `{_display_value(socket_path)}` and does not require display GPIO pins.",
+            )
+        fb_path = Path(_clean_config_text(getattr(config, "display_fb_path", "")) or "/dev/fb0")
+        if not fb_path.exists():
+            return ConfigCheck(
+                "display_gpio",
+                "Display output",
+                "fail",
+                f"HDMI framebuffer path `{_display_value(fb_path)}` does not exist.",
+            )
+        if not fb_path.is_char_device():
+            return ConfigCheck(
+                "display_gpio",
+                "Display output",
+                "fail",
+                f"HDMI framebuffer path `{_display_value(fb_path)}` is not a character device.",
+            )
+        return ConfigCheck(
+            "display_gpio",
+            "Display output",
+            "ok",
+            f"Display driver `{driver}` writes to `{_display_value(fb_path)}` and does not require display GPIO pins.",
+        )
+
     display_pins = _raw_display_gpio_map(config)
     missing = [name for name, value in display_pins.items() if value is None]
     if missing:

@@ -24,6 +24,7 @@ from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioSampler,
 from twinr.ops.paths import resolve_ops_paths_for_config
 from twinr.providers.openai import OpenAIBackend
 
+from ..social.camera_surface import ProactiveCameraSnapshot, ProactiveCameraSurface, ProactiveCameraSurfaceUpdate
 from ..social.engine import SocialAudioObservation, SocialObservation, SocialTriggerDecision, SocialTriggerEngine, SocialVisionObservation
 from ..social.observers import AmbientAudioObservationProvider, NullAudioObservationProvider, OpenAIVisionObservationProvider
 from ..social.vision_review import (
@@ -280,9 +281,8 @@ class ProactiveCoordinator:
         self._last_motion_at: float | None = None
         self._last_capture_at: float | None = None
         self._last_observation_key: tuple[object, ...] | None = None
+        self._camera_surface = ProactiveCameraSurface.from_config(config)
         self._last_sensor_flags: dict[str, bool] = {}
-        self._person_visible_since: float | None = None
-        self._hand_near_since: float | None = None
         self._speech_detected_since: float | None = None
         self._quiet_since: float | None = None
         self._last_presence_key: tuple[bool, str | None] | None = None
@@ -1508,8 +1508,13 @@ class ProactiveCoordinator:
         if self.observation_handler is None:
             return
         try:
-            facts = self._build_automation_facts(observation, inspected=inspected)
-            event_names = self._derive_sensor_events(facts)
+            camera_update = self._observe_camera_surface(observation, inspected=inspected)
+            facts = self._build_automation_facts(
+                observation,
+                inspected=inspected,
+                camera_snapshot=camera_update.snapshot,
+            )
+            event_names = self._derive_sensor_events(facts, camera_event_names=camera_update.event_names)
             self.observation_handler(facts, event_names)
         except Exception as exc:
             self._record_fault(
@@ -1518,24 +1523,32 @@ class ProactiveCoordinator:
                 error=exc,
             )
 
+    def _observe_camera_surface(
+        self,
+        observation: SocialObservation,
+        *,
+        inspected: bool,
+    ) -> ProactiveCameraSurfaceUpdate:
+        """Project one raw vision observation onto the stabilized camera surface."""
+
+        return self._camera_surface.observe(
+            inspected=inspected,
+            observed_at=observation.observed_at,
+            observation=observation.vision,
+        )
+
     def _build_automation_facts(
         self,
         observation: SocialObservation,
         *,
         inspected: bool,
+        camera_snapshot: ProactiveCameraSnapshot,
     ) -> dict[str, Any]:
         """Build the automation-facing fact payload for one observation."""
 
         now = observation.observed_at
-        vision = observation.vision
         audio = observation.audio
 
-        self._person_visible_since = self._next_since(vision.person_visible, self._person_visible_since, now)
-        self._hand_near_since = self._next_since(
-            vision.hand_or_object_near_camera,
-            self._hand_near_since,
-            now,
-        )
         speech_detected = audio.speech_detected is True
         quiet = audio.speech_detected is False
         self._speech_detected_since = self._next_since(speech_detected, self._speech_detected_since, now)
@@ -1555,15 +1568,7 @@ class ProactiveCoordinator:
                 "low_motion": observation.low_motion,
                 "no_motion_for_s": round(no_motion_for_s, 3),
             },
-            "camera": {
-                "person_visible": vision.person_visible,
-                "person_visible_for_s": round(self._duration_since(self._person_visible_since, now), 3),
-                "looking_toward_device": vision.looking_toward_device,
-                "body_pose": vision.body_pose.value,
-                "smiling": vision.smiling,
-                "hand_or_object_near_camera": vision.hand_or_object_near_camera,
-                "hand_or_object_near_camera_for_s": round(self._duration_since(self._hand_near_since, now), 3),
-            },
+            "camera": camera_snapshot.to_automation_facts(),
             "vad": {
                 "speech_detected": speech_detected,
                 "speech_detected_for_s": round(self._duration_since(self._speech_detected_since, now), 3),
@@ -1573,16 +1578,19 @@ class ProactiveCoordinator:
             },
         }
 
-    def _derive_sensor_events(self, facts: dict[str, Any]) -> tuple[str, ...]:
+    def _derive_sensor_events(
+        self,
+        facts: dict[str, Any],
+        *,
+        camera_event_names: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
         """Return rising-edge event names derived from the latest fact payload."""
 
         current_flags = {
             "pir.motion_detected": bool(facts["pir"]["motion_detected"]),
-            "camera.person_visible": bool(facts["camera"]["person_visible"]),
-            "camera.hand_or_object_near_camera": bool(facts["camera"]["hand_or_object_near_camera"]),
             "vad.speech_detected": bool(facts["vad"]["speech_detected"]),
         }
-        event_names: list[str] = []
+        event_names: list[str] = list(camera_event_names)
         for key, value in current_flags.items():
             previous = self._last_sensor_flags.get(key)
             if value and previous is not True:

@@ -97,7 +97,6 @@ class LongTermRemoteHealthProbe:
         checks: list[LongTermRemoteWarmCheck] = []
         try:
             prompt_remote_state = self._require_remote_state(self.prompt_context_store.memory_store.remote_state)
-            self._ensure_state_ready(prompt_remote_state)
             result = self._probe_snapshot(
                 store="prompt_context",
                 remote_state=prompt_remote_state,
@@ -127,7 +126,6 @@ class LongTermRemoteHealthProbe:
                 return result
 
             object_remote_state = self._require_remote_state(self.object_store.remote_state)
-            self._ensure_state_ready(object_remote_state)
             result = self._probe_snapshot(
                 store="object_store",
                 remote_state=object_remote_state,
@@ -157,7 +155,6 @@ class LongTermRemoteHealthProbe:
                 return result
 
             graph_remote_state = self._require_remote_state(self.graph_store.remote_state)
-            self._ensure_state_ready(graph_remote_state)
             result = self._probe_snapshot(
                 store="graph_store",
                 remote_state=graph_remote_state,
@@ -169,7 +166,6 @@ class LongTermRemoteHealthProbe:
                 return result
 
             midterm_remote_state = self._require_remote_state(self.midterm_store.remote_state)
-            self._ensure_state_ready(midterm_remote_state)
             result = self._probe_snapshot(
                 store="midterm_store",
                 remote_state=midterm_remote_state,
@@ -278,16 +274,6 @@ class LongTermRemoteHealthProbe:
             pointer_document_id=probe.pointer_document_id,
             attempts=probe.attempts,
             payload=probe.payload,
-        )
-
-    def _ensure_state_ready(self, remote_state: LongTermRemoteStateStore) -> None:
-        """Require the remote state backend to report itself ready."""
-
-        status = remote_state.status()
-        if status.ready:
-            return
-        raise LongTermRemoteUnavailableError(
-            str(status.detail or "Required remote long-term memory is unavailable.")
         )
 
     def _require_remote_state(self, remote_state: LongTermRemoteStateStore | None) -> LongTermRemoteStateStore:

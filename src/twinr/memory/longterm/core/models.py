@@ -11,6 +11,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
 from types import MappingProxyType
 from typing import Callable, Mapping, TypeVar, cast
 
@@ -833,6 +834,29 @@ class LongTermMemoryConflictV1:
             "question": self.question,
             "reason": self.reason,
         }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "LongTermMemoryConflictV1":
+        """Build a memory conflict from a persisted payload mapping."""
+
+        return cls(
+            slot_key=_payload_required_str(payload, "slot_key"),
+            candidate_memory_id=_payload_required_str(payload, "candidate_memory_id"),
+            existing_memory_ids=_coerce_str_tuple(payload.get("existing_memory_ids"), field_name="existing_memory_ids", allow_empty=False),
+            question=_payload_required_str(payload, "question"),
+            reason=_payload_required_str(payload, "reason"),
+            schema=_payload_required_str(payload, "schema"),
+            version=_coerce_int(payload.get("version", LONGTERM_MEMORY_CONFLICT_VERSION), field_name="version", default=LONGTERM_MEMORY_CONFLICT_VERSION),
+        )
+
+    def catalog_item_id(self) -> str:
+        """Return the canonical remote/local document identifier for this conflict."""
+
+        return json.dumps(
+            [self.slot_key, self.candidate_memory_id],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
 
 @dataclass(frozen=True, slots=True)

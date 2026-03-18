@@ -10,7 +10,7 @@ owned_concerns:
   - Stage Pi-side productive systemd units for authoritative runtime supervision and the web portal
   - Retire standalone break-glass units out of the tracked hardware tree once they are no longer part of product operation
   - Bootstrap the Pi-side self-coding Codex bridge, CLI, and auth prerequisites from the leading repo
-  - Run bounded manual probes for buttons, PIR motion, display, and printer setup
+  - Run bounded manual probes for buttons, Pi AI Camera, PIR motion, display, and printer setup
 out_of_scope:
   - Runtime device adapters in src/twinr/hardware and src/twinr/display
   - Twinr loop orchestration and product behavior policy
@@ -21,7 +21,7 @@ files:
   - path: buttons/probe_buttons.py
     role: Print live button events for configured or ad-hoc GPIO lines
   - path: display/setup_display.sh
-    role: Install the Waveshare vendor driver and persist display wiring settings
+    role: Configure the active HDMI or Waveshare display backend and persist its env wiring
   - path: display/display_test.py
     role: Render a one-shot display test card
   - path: display/run_display_loop.py
@@ -32,6 +32,8 @@ files:
     role: Reproducibly sync the pinned self-coding Codex bridge/auth to the Pi and run the remote readiness self-test
   - path: ops/twinr-runtime-supervisor.service
     role: Authoritatively supervise the productive streaming loop plus remote watchdog on the Pi
+  - path: piaicam/smoke_piaicam.py
+    role: Run bounded Pi AI Camera enumerate/still/video/IMX500 smoke phases
   - path: pir/setup_pir.sh
     role: Persist PIR GPIO settings and optionally run the motion probe
   - path: pir/probe_pir.py
@@ -43,4 +45,4 @@ related_runtime_packages:
   - path: src/twinr/display
 manual_checks:
   - command: bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
-  - command: PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/pir/probe_pir.py
+  - command: PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/piaicam/smoke_piaicam.py hardware/pir/probe_pir.py

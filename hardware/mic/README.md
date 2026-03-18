@@ -6,6 +6,7 @@ Pi-side audio setup script for Twinr playback, capture, and proactive listening 
 
 `mic` owns:
 - select ALSA and PipeWire/Pulse default devices for Twinr
+- support split playback/capture defaults when output and microphone hardware differ
 - persist proactive-audio env keys used by the runtime
 - run bounded playback and capture smoke checks
 
@@ -24,6 +25,7 @@ Pi-side audio setup script for Twinr playback, capture, and proactive listening 
 
 ```bash
 sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match Jabra --test
+sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match Jabra --capture-device-match reSpeaker --proactive-device-match reSpeaker
 sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match Jabra --proactive-device-match PlayStation
 ```
 

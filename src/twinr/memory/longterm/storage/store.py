@@ -199,19 +199,29 @@ class LongTermStructuredStore:
         with self._lock:  # AUDIT-FIX(#3): Keep snapshot bootstrap serialized with readers/writers.
             if self.remote_state is None or not self.remote_state.enabled:
                 return ()
-            ensured: list[str] = []
-            for snapshot_kind, local_path, empty_payload in (
+            snapshot_requests = (
                 ("objects", self.objects_path, self._empty_objects_payload()),
                 ("conflicts", self.conflicts_path, self._empty_conflicts_payload()),
                 ("archive", self.archive_path, self._empty_archive_payload()),
-            ):
-                if self._ensure_remote_snapshot_payload(
+            )
+
+            def ensure_one(
+                request: tuple[str, Path, dict[str, object]],
+            ) -> tuple[str, bool]:
+                snapshot_kind, local_path, empty_payload = request
+                ensured = self._ensure_remote_snapshot_payload(
                     snapshot_kind=snapshot_kind,
                     local_path=local_path,
                     empty_payload=empty_payload,
-                ):
-                    ensured.append(snapshot_kind)
-            return tuple(ensured)
+                )
+                return snapshot_kind, ensured
+
+            # Keep fresh object/conflict/archive bootstrap serialized. Required
+            # remote readiness shares one ChonkyDB boundary, and parallel
+            # startup seeding has proven flaky enough to trigger bulk-write
+            # timeouts on fresh namespaces under backend load.
+            results = tuple(ensure_one(request) for request in snapshot_requests)
+            return tuple(snapshot_kind for snapshot_kind, ensured in results if ensured)
 
     def load_objects(self) -> tuple[LongTermMemoryObjectV1, ...]:
         """Load long-term memory objects from the current object snapshot."""
@@ -353,6 +363,7 @@ class LongTermStructuredStore:
         self,
         *,
         snapshot_kind: str,
+        compatibility_only: bool = False,
     ) -> dict[str, object] | None:
         remote_state = self.remote_state
         if remote_state is None or not remote_state.enabled:
@@ -365,10 +376,17 @@ class LongTermStructuredStore:
                 and remote_catalog is not None
                 and remote_catalog.is_catalog_payload(snapshot_kind=snapshot_kind, payload=raw_payload)
             ):
-                candidate = remote_catalog.assemble_snapshot_from_catalog(
-                    snapshot_kind=snapshot_kind,
-                    payload=raw_payload,
-                )
+                if compatibility_only:
+                    assembly = remote_catalog.assemble_snapshot_from_catalog_result(
+                        snapshot_kind=snapshot_kind,
+                        payload=raw_payload,
+                    )
+                    candidate = assembly.payload
+                else:
+                    candidate = remote_catalog.assemble_snapshot_from_catalog(
+                        snapshot_kind=snapshot_kind,
+                        payload=raw_payload,
+                    )
             elif snapshot_kind in {"objects", "archive"}:
                 resolved_payload = self._resolve_sharded_snapshot_payload(
                     snapshot_kind=snapshot_kind,
@@ -484,16 +502,26 @@ class LongTermStructuredStore:
     ) -> bool:
         if self.remote_state is None:
             raise RuntimeError("Remote state store is required to ensure remote snapshots.")  # AUDIT-FIX(#6): Replace assert with a runtime guard that survives python -O.
-        payload = self._load_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
+        local_path = self._validated_local_path(local_path)
+        payload = self._load_remote_snapshot_payload(snapshot_kind=snapshot_kind, compatibility_only=True)
+        local_payload = self._read_local_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
+        if payload is None:
+            payload = self._load_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
         if payload is None:
             if self._remote_is_required():
-                local_payload = self._read_local_snapshot_payload(snapshot_kind=snapshot_kind, local_path=local_path)
-                if local_payload is not None and self._should_attempt_remote_repair():
-                    self._persist_remote_snapshot_payload(snapshot_kind=snapshot_kind, payload=local_payload)
+                if local_payload is None:
+                    self._persist_snapshot_payload(
+                        snapshot_kind=snapshot_kind,
+                        local_path=local_path,
+                        payload=empty_payload,
+                    )
                     return True
-                raise LongTermRemoteUnavailableError(
-                    f"Required remote structured snapshot {snapshot_kind!r} is unavailable."
+                self._persist_snapshot_payload(
+                    snapshot_kind=snapshot_kind,
+                    local_path=local_path,
+                    payload=local_payload,
                 )
+                return True
             self._persist_snapshot_payload(
                 snapshot_kind=snapshot_kind,
                 local_path=local_path,
@@ -555,8 +583,8 @@ class LongTermStructuredStore:
         return (conflict.slot_key, conflict.candidate_memory_id)
 
     def _conflict_doc_id(self, conflict: LongTermMemoryConflictV1) -> str:
-        # AUDIT-FIX(#5): Slot key alone is not unique; include candidate memory id for indexing/search.
-        return f"{conflict.slot_key}\x1f{conflict.candidate_memory_id}"
+        # AUDIT-FIX(#5): Slot key alone is not unique; use the model-owned compound id for indexing/search.
+        return conflict.catalog_item_id()
 
     def _manifest_schema_for_snapshot(self, snapshot_kind: str) -> str:
         if snapshot_kind == "objects":
@@ -877,7 +905,11 @@ class LongTermStructuredStore:
         selected = list(self._load_remote_objects_from_entries(entries=entries, snapshot_kind="objects"))
         filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
         if filtered:
-            return tuple(filtered[:bounded_limit])
+            return self.rank_selected_objects(
+                query_texts=(clean_query,),
+                objects=filtered,
+                limit=bounded_limit,
+            )
         if require_query_match or fallback_limit <= 0:
             return ()
         fallback_entries = remote_catalog.top_catalog_entries(
@@ -1464,7 +1496,12 @@ class LongTermStructuredStore:
             selected_ids = selector.search(clean_query, limit=bounded_limit)
             by_id = {item.memory_id: item for item in objects}
             selected = [by_id[memory_id] for memory_id in selected_ids if memory_id in by_id]
-            return tuple(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
+            filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
+            return self.rank_selected_objects(
+                query_texts=(clean_query,),
+                objects=filtered,
+                limit=bounded_limit,
+            )
 
     def select_open_conflicts(
         self,
@@ -1674,11 +1711,46 @@ class LongTermStructuredStore:
             )
         )
 
+    def rank_selected_objects(
+        self,
+        *,
+        query_texts: Iterable[str],
+        objects: Iterable[LongTermMemoryObjectV1],
+        limit: int | None = None,
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Rank selected objects by query overlap, confirmation state, and recency."""
+
+        unique_objects: list[LongTermMemoryObjectV1] = []
+        seen_memory_ids: set[str] = set()
+        for item in objects:
+            if item.memory_id in seen_memory_ids:
+                continue
+            seen_memory_ids.add(item.memory_id)
+            unique_objects.append(item)
+        if not unique_objects:
+            return ()
+        bounded_limit = max(1, limit) if isinstance(limit, int) else len(unique_objects)
+        query_terms = self._combined_query_terms(query_texts)
+        ranked = sorted(
+            enumerate(unique_objects),
+            key=lambda pair: self._object_query_sort_key(
+                item=pair[1],
+                query_terms=query_terms,
+                original_index=pair[0],
+            ),
+            reverse=True,
+        )
+        return tuple(item for _index, item in ranked[:bounded_limit])
+
     def _object_search_text(self, item: LongTermMemoryObjectV1) -> str:
         parts = [
             item.kind,
             item.summary,
             item.details or "",
+            item.slot_key or "",
+            item.value_key or "",
+            f"status {item.status}",
+            self._object_state_search_text(item),
         ]
         for key, value in (item.attributes or {}).items():
             if key in _NON_SEMANTIC_ATTRIBUTE_KEYS:
@@ -1686,9 +1758,74 @@ class LongTermStructuredStore:
             parts.append(key)
             if isinstance(value, str):
                 parts.append(value)
+            elif isinstance(value, bool):
+                parts.append("true" if value else "false")
             elif isinstance(value, (list, tuple)):
                 parts.extend(str(entry) for entry in value if isinstance(entry, str))
         return _normalize_text(" ".join(part for part in parts if part))
+
+    def _object_state_search_text(self, item: LongTermMemoryObjectV1) -> str:
+        parts = [item.status]
+        if item.status == "active":
+            parts.extend(("current", "stored", "available", "aktuell", "gespeichert"))
+        elif item.status == "superseded":
+            parts.extend(("previous", "former", "superseded", "frueher", "vorher"))
+        elif item.status in {"candidate", "uncertain"}:
+            parts.extend(("pending", "unconfirmed", "candidate", "unbestaetigt", "unklar"))
+        elif item.status == "invalid":
+            parts.extend(("invalid", "discarded"))
+        elif item.status == "expired":
+            parts.extend(("expired", "outdated"))
+        if item.confirmed_by_user:
+            parts.extend(("confirmed_by_user", "confirmed", "user_confirmed", "bestaetigt"))
+        return _normalize_text(" ".join(parts))
+
+    def _combined_query_terms(self, query_texts: Iterable[str]) -> set[str]:
+        query_terms: set[str] = set()
+        for query_text in query_texts:
+            if not isinstance(query_text, str):
+                continue
+            query_terms.update(retrieval_terms(query_text))
+        return query_terms
+
+    def _object_query_overlap_score(
+        self,
+        *,
+        item: LongTermMemoryObjectV1,
+        query_terms: set[str],
+    ) -> int:
+        if not query_terms:
+            return 0
+        object_terms = set(retrieval_terms(self._object_search_text(item)))
+        return len(query_terms.intersection(object_terms))
+
+    def _object_status_priority(self, status: str) -> int:
+        if status == "active":
+            return 4
+        if status == "candidate":
+            return 3
+        if status == "uncertain":
+            return 2
+        if status == "superseded":
+            return 1
+        return 0
+
+    def _object_query_sort_key(
+        self,
+        *,
+        item: LongTermMemoryObjectV1,
+        query_terms: set[str],
+        original_index: int,
+    ) -> tuple[object, ...]:
+        return (
+            self._object_query_overlap_score(item=item, query_terms=query_terms),
+            1 if item.confirmed_by_user else 0,
+            self._object_status_priority(item.status),
+            _coerce_aware_utc(item.updated_at),
+            _coerce_aware_utc(item.created_at),
+            item.confidence,
+            -original_index,
+        )
 
     def _filter_query_relevant_objects(
         self,

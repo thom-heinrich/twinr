@@ -12,6 +12,7 @@ scored proactive trigger candidates and optional visual second opinions.
 - Define the social-trigger domain models and score thresholds
 - Evaluate stateful trigger candidates from normalized observation ticks
 - Wrap ambient-audio and camera observations into bounded conservative snapshots
+- Stabilize automation-facing camera snapshots, person-count/zone anchors, and event surfaces
 - Route safety prompts and render bounded evidence facts for proactive prompting
 - Buffer recent camera frames and request conservative visual second opinions
 
@@ -26,6 +27,7 @@ scored proactive trigger candidates and optional visual second opinions.
 | File | Purpose |
 |---|---|
 | `__init__.py` | Package export surface |
+| `camera_surface.py` | Debounced camera snapshot, person-count/zone anchor, and rising-edge event surface |
 | `engine.py` | Stateful social-trigger scoring engine |
 | `observers.py` | Audio and vision observation providers |
 | `prompting.py` | Prompt routing and evidence rendering |

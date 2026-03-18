@@ -36,6 +36,17 @@ _DEFAULT_PROMPT_STRING_MAX_CHARS = 480
 _DEFAULT_THREAD_TEXT_MAX_CHARS = 320
 _DEFAULT_COLLECTION_MAX_ITEMS = 32
 _DEFAULT_MAX_SANITIZE_DEPTH = 8
+_COMPILED_TEXT_FORBIDDEN_CHARACTERS = frozenset("{}[]<>`")
+_COMPILED_TEXT_INTERNAL_MARKERS = (
+    _COMPILED_PROGRAM_SCHEMA.casefold(),
+    _FALLBACK_CONTEXT_SCHEMA.casefold(),
+    "additionalproperties",
+    "canonical_retrieval_query",
+    "graph_cues",
+    "recent_threads",
+    "rendered_guidance",
+    "role_or_relation",
+)
 
 
 def _get_config_int(
@@ -195,42 +206,82 @@ def _normalize_program_text(value: object, *, max_chars: int) -> str:
     return _normalize_free_text(value, max_chars=max_chars)
 
 
-def _normalize_string_list(value: object, *, max_items: int, max_chars: int) -> list[str]:
+def _compiled_text_contains_structural_artifacts(text: str) -> bool:
+    """Return whether one compiled guidance field leaks structure instead of prose."""
+
+    if not text:
+        return False
+    if any(character in _COMPILED_TEXT_FORBIDDEN_CHARACTERS for character in text):
+        return True
+    lowered = text.casefold()
+    if any(marker in lowered for marker in _COMPILED_TEXT_INTERNAL_MARKERS):
+        return True
+    if "</" in text or "/>" in text:
+        return True
+    if '":' in text:
+        return True
+    return False
+
+
+def _normalize_compiled_text_field(value: object, *, max_chars: int) -> tuple[str, bool]:
+    """Normalize one compiler field and flag structural leakage."""
+
+    text = _normalize_program_text(value, max_chars=max_chars)
+    if not text:
+        return "", False
+    return text, _compiled_text_contains_structural_artifacts(text)
+
+
+def _normalize_string_list(value: object, *, max_items: int, max_chars: int) -> tuple[list[str], bool]:
     """Normalize, deduplicate, and bound a list of short strings."""
 
     if not isinstance(value, list):
-        return []
+        return [], False
     cleaned: list[str] = []
+    invalid = False
     for item in value:
-        text = _normalize_program_text(item, max_chars=max_chars)
+        text, item_invalid = _normalize_compiled_text_field(item, max_chars=max_chars)
+        invalid = invalid or item_invalid
+        if item_invalid:
+            continue
         if text and text not in cleaned:
             cleaned.append(text)
         if len(cleaned) >= max_items:
             break
-    return cleaned
+    return cleaned, invalid
 
 
-def _normalize_known_people(value: object) -> list[dict[str, object]]:
+def _normalize_known_people(value: object) -> tuple[list[dict[str, object]], bool]:
     """Normalize compiler-produced known-person payload entries."""
 
     if not isinstance(value, list):
-        return []
+        return [], False
     normalized: list[dict[str, object]] = []
+    invalid = False
     for item in value[:3]:
         if not isinstance(item, dict):
             continue
-        person = _normalize_program_text(item.get("person"), max_chars=80)
+        person, person_invalid = _normalize_compiled_text_field(item.get("person"), max_chars=80)
+        invalid = invalid or person_invalid
+        if person_invalid:
+            continue
         if not person:
+            continue
+        role_or_relation, role_invalid = _normalize_compiled_text_field(item.get("role_or_relation"), max_chars=100)
+        latent_relevance, relevance_invalid = _normalize_compiled_text_field(item.get("latent_relevance"), max_chars=120)
+        practical_topics, topics_invalid = _normalize_string_list(item.get("practical_topics"), max_items=3, max_chars=80)
+        invalid = invalid or role_invalid or relevance_invalid or topics_invalid
+        if role_invalid or relevance_invalid or topics_invalid:
             continue
         normalized.append(
             {
                 "person": person,
-                "role_or_relation": _normalize_program_text(item.get("role_or_relation"), max_chars=100),
-                "latent_relevance": _normalize_program_text(item.get("latent_relevance"), max_chars=120),
-                "practical_topics": _normalize_string_list(item.get("practical_topics"), max_items=3, max_chars=80),
+                "role_or_relation": role_or_relation,
+                "latent_relevance": latent_relevance,
+                "practical_topics": practical_topics,
             }
         )
-    return normalized
+    return normalized, invalid
 
 
 def _normalize_compiled_program(value: object) -> dict[str, object] | None:
@@ -242,14 +293,46 @@ def _normalize_compiled_program(value: object) -> dict[str, object] | None:
     use_personalization = value.get("use_personalization")
     if not isinstance(use_personalization, bool):
         return None
+    conversation_goal, invalid = _normalize_compiled_text_field(value.get("conversation_goal"), max_chars=160)
+    helpful_biases, helpful_biases_invalid = _normalize_string_list(
+        value.get("helpful_biases"),
+        max_items=2,
+        max_chars=120,
+    )
+    suggested_directions, suggested_directions_invalid = _normalize_string_list(
+        value.get("suggested_directions"),
+        max_items=2,
+        max_chars=140,
+    )
+    follow_up_angles, follow_up_angles_invalid = _normalize_string_list(
+        value.get("follow_up_angles"),
+        max_items=2,
+        max_chars=120,
+    )
+    known_people, known_people_invalid = _normalize_known_people(value.get("known_people"))
+    avoidances, avoidances_invalid = _normalize_string_list(
+        value.get("avoidances"),
+        max_items=3,
+        max_chars=120,
+    )
+    invalid = (
+        invalid
+        or helpful_biases_invalid
+        or suggested_directions_invalid
+        or follow_up_angles_invalid
+        or known_people_invalid
+        or avoidances_invalid
+    )
+    if invalid:
+        return None
     return {
         "use_personalization": use_personalization,
-        "conversation_goal": _normalize_program_text(value.get("conversation_goal"), max_chars=160),
-        "helpful_biases": _normalize_string_list(value.get("helpful_biases"), max_items=2, max_chars=120),
-        "suggested_directions": _normalize_string_list(value.get("suggested_directions"), max_items=2, max_chars=140),
-        "follow_up_angles": _normalize_string_list(value.get("follow_up_angles"), max_items=2, max_chars=120),
-        "known_people": _normalize_known_people(value.get("known_people")),
-        "avoidances": _normalize_string_list(value.get("avoidances"), max_items=3, max_chars=120),
+        "conversation_goal": conversation_goal,
+        "helpful_biases": helpful_biases,
+        "suggested_directions": suggested_directions,
+        "follow_up_angles": follow_up_angles,
+        "known_people": known_people,
+        "avoidances": avoidances,
     }
 
 
@@ -702,6 +785,8 @@ class LongTermSubtextBuilder:
 
         text = _normalize_free_text(value, max_chars=_DEFAULT_PROMPT_STRING_MAX_CHARS)
         if not text:
+            return ""
+        if _compiled_text_contains_structural_artifacts(text):
             return ""
         return collapse_whitespace(text)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 from pathlib import Path
 import sys
 import tempfile
@@ -208,13 +209,51 @@ class LongTermMidtermTests(unittest.TestCase):
                 remote_state=remote_state,
             )
 
-            created = store.ensure_remote_snapshot()
+            with self.assertNoLogs("twinr.memory.longterm.storage.midterm_store", level=logging.WARNING):
+                created = store.ensure_remote_snapshot()
 
         self.assertTrue(created)
         self.assertEqual(
             remote_state.snapshots["midterm"],
             {"schema": "twinr_memory_midterm_store", "version": 1, "packets": []},
         )
+
+    def test_load_packets_ignores_missing_local_snapshot_without_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LongTermMidtermStore(base_path=Path(temp_dir) / "state" / "chonkydb")
+
+            with self.assertNoLogs("twinr.memory.longterm.storage.midterm_store", level=logging.WARNING):
+                packets = store.load_packets()
+
+        self.assertEqual(packets, ())
+
+    def test_load_packets_uses_remote_snapshot_without_warning_when_local_cache_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.snapshots["midterm"] = {
+                "schema": "twinr_memory_midterm_store",
+                "version": 1,
+                "packets": [
+                    {
+                        "packet_id": "midterm:tea_preference",
+                        "kind": "preference_bundle",
+                        "summary": "The user prefers Oolong tea in the afternoon.",
+                        "details": "Useful for drink recommendations and recall questions.",
+                        "source_memory_ids": ["fact:drink_preference"],
+                        "query_hints": ["oolong", "tea", "afternoon"],
+                        "sensitivity": "normal",
+                    }
+                ],
+            }
+            store = LongTermMidtermStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+
+            with self.assertNoLogs("twinr.memory.longterm.storage.midterm_store", level=logging.WARNING):
+                packets = store.load_packets()
+
+        self.assertEqual([item.packet_id for item in packets], ["midterm:tea_preference"])
 
     def test_retriever_includes_midterm_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

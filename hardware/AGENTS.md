@@ -3,7 +3,7 @@
 ## Scope
 
 This directory owns Raspberry Pi setup, probe, and smoke-test scripts for Twinr
-buttons, display, mic, PIR motion, and printer peripherals.
+buttons, display, mic, Pi AI Camera, PIR motion, and printer peripherals.
 
 Out of scope:
 - runtime device adapters in `src/twinr/hardware`
@@ -15,10 +15,11 @@ Out of scope:
 
 - `buttons/setup_buttons.sh` - persist button GPIO env settings and optional probe
 - `buttons/probe_buttons.py` - print button events for configured or ad-hoc lines
-- `display/setup_display.sh` - install Waveshare vendor driver and display env wiring
+- `display/setup_display.sh` - configure the active display backend and persist its env wiring
 - `display/display_test.py` - render a one-shot display test pattern
 - `display/run_display_loop.py` - run the standalone display loop
-- `mic/setup_audio.sh` - configure ALSA or PipeWire defaults and proactive audio env
+- `mic/setup_audio.sh` - configure ALSA or PipeWire playback/capture defaults and proactive audio env
+- `piaicam/smoke_piaicam.py` - run bounded Pi AI Camera enumeration, capture, and IMX500 smoke phases
 - `pir/setup_pir.sh` - persist PIR GPIO env settings and optional probe
 - `pir/probe_pir.py` - print PIR state and motion events
 - `printer/setup_printer.sh` - configure the raw CUPS queue and optional test print
@@ -27,6 +28,7 @@ Out of scope:
 ## Invariants
 
 - Setup scripts that mutate OS or `.env` state must stay idempotent for repeated runs against the same target config.
+- `mic/setup_audio.sh` must keep split playback/capture routing explicit when output and microphone devices differ.
 - Probe and smoke-test scripts must stay bounded; every hardware wait needs a duration or short fixed timeout.
 - Scripts here may persist only the hardware keys they own and must not silently rewrite unrelated `.env` entries.
 - `display/setup_display.sh` must keep generated vendor files outside tracked source trees under `state/display/vendor/`.
@@ -38,13 +40,14 @@ After any edit in this directory, run:
 
 ```bash
 bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
-PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/pir/probe_pir.py
+PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/piaicam/smoke_piaicam.py hardware/pir/probe_pir.py
 ```
 
-If button, PIR, or display probes changed and you are on Pi acceptance hardware, also run:
+If button, Pi AI Camera, PIR, or display probes changed and you are on Pi acceptance hardware, also run:
 
 ```bash
 python3 hardware/buttons/probe_buttons.py --env-file .env --configured --duration 5
+python3 hardware/piaicam/smoke_piaicam.py --profile quick
 python3 hardware/pir/probe_pir.py --env-file .env --duration 5
 python3 hardware/display/display_test.py --env-file .env
 ```
@@ -69,6 +72,11 @@ python3 hardware/display/display_test.py --env-file .env
 `mic/setup_audio.sh` changes -> also check:
 - `src/twinr/hardware/audio.py`
 - `hardware/mic/README.md`
+
+`piaicam/smoke_piaicam.py` changes -> also check:
+- `hardware/piaicam/README.md`
+- `hardware/component.yaml`
+- runtime Pi asset paths and installed `rpicam-*`/IMX500 tooling assumptions
 
 `printer/setup_printer.sh` changes -> also check:
 - `src/twinr/hardware/printer.py`

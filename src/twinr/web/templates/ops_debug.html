@@ -14,6 +14,101 @@
   </div>
 {%- endmacro %}
 
+{% macro memory_attest_panel(status, summary_rows, packet_rows) -%}
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Memory attestation</h2>
+        <p class="section-description">Latest live write, remote persist, fresh-reader readback, and LLM-usage proof.</p>
+      </div>
+      <span class="status-pill is-{{ status.status }}">{{ status.label }}</span>
+    </div>
+    {{ detail_grid(summary_rows) }}
+    {% if packet_rows %}
+    {{ detail_grid(packet_rows) }}
+    {% endif %}
+  </section>
+{%- endmacro %}
+
+{% macro memory_search_panel(search) -%}
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Memory Search</h2>
+        <p class="section-description">Searches the real long-term retrieval stack Twinr uses for recall.</p>
+        {% if search.status.detail %}
+        <p class="section-description">{{ search.status.detail }}</p>
+        {% endif %}
+      </div>
+      <span class="status-pill is-{{ search.status.status }}">{{ search.status.label }}</span>
+    </div>
+    <form class="ops-search-form" method="get" action="/ops/debug">
+      <input type="hidden" name="tab" value="memory_search">
+      <label class="detail-label" for="memory-query">Search query</label>
+      <div class="ops-search-form-row">
+        <input
+          id="memory-query"
+          name="memory_query"
+          type="search"
+          value="{{ search.query }}"
+          placeholder="z. B. Lea, Oolong-Tee oder Zahnarzttermin"
+          autocomplete="off"
+        >
+        <button type="submit">Search</button>
+      </div>
+    </form>
+
+    {% if search.summary_rows %}
+    {{ detail_grid(search.summary_rows) }}
+    {% endif %}
+
+    {% for section in search.sections %}
+    <section class="panel-subsection {% if not loop.first %}panel-subsection-spaced{% endif %}">
+      <div class="section-header">
+        <div>
+          <h3>{{ section["title"] }}</h3>
+          <p class="section-description">{{ section["description"] }}</p>
+        </div>
+      </div>
+      {% if section["items"] %}
+      <div class="log-list">
+        {% for item in section["items"] %}
+        <article class="log-entry memory-search-entry">
+          <div class="log-entry-header">
+            <span class="log-level is-{{ item.level }}">{{ item.badge }}</span>
+            <span class="log-event">{{ item.title }}</span>
+            {% if item.time %}
+            <span class="log-time">{{ item.time }}</span>
+            {% endif %}
+          </div>
+          {% if item.body %}
+          <div class="log-message">{{ item.body }}</div>
+          {% endif %}
+          {% for meta in item.meta_lines %}
+          <div class="log-message memory-search-meta">{{ meta }}</div>
+          {% endfor %}
+        </article>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state">{{ section["empty_message"] }}</div>
+      {% endif %}
+    </section>
+    {% endfor %}
+
+    {% for block in search.context_blocks %}
+    <section class="panel-subsection panel-subsection-spaced">
+      <div class="section-header">
+        <div>
+          <h3>{{ block.title }}</h3>
+        </div>
+      </div>
+      <pre class="log-data">{{ block.body }}</pre>
+    </section>
+    {% endfor %}
+  </section>
+{%- endmacro %}
+
 {% block content %}
 <div class="ops-debug-page">
   <section class="panel ops-debug-panel">
@@ -40,6 +135,8 @@
     </div>
     {{ detail_grid(overview_cards) }}
   </section>
+
+  {{ memory_attest_panel(memory_attest_status, memory_attest_summary_rows, memory_attest_packet_rows) }}
 
   <section class="panel ops-debug-panel two-column">
     <div>
@@ -130,6 +227,8 @@
     {{ detail_grid(watchdog_assessment_rows) }}
   </section>
 
+  {{ memory_attest_panel(memory_attest_status, memory_attest_summary_rows, memory_attest_packet_rows) }}
+
   <section class="panel ops-debug-panel">
     <div class="section-header">
       <div>
@@ -167,6 +266,10 @@
     <div class="empty-state">No historical watchdog samples exist yet.</div>
     {% endif %}
   </section>
+  {% endif %}
+
+  {% if active_debug_tab == "memory_search" %}
+  {{ memory_search_panel(memory_search) }}
   {% endif %}
 
   {% if active_debug_tab == "llm" %}

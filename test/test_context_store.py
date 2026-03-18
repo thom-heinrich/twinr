@@ -1,12 +1,14 @@
 from pathlib import Path
 import sys
 import tempfile
+from threading import Lock
+import time
 from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
+from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore, PromptContextStore
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 
 
@@ -31,6 +33,45 @@ class _FailingRemoteState(_FakeRemoteState):
         raise LongTermRemoteUnavailableError(
             f"Failed to read remote long-term snapshot {snapshot_kind!r}: status=503"
         )
+
+
+class _ConcurrentPromptSnapshotTracker:
+    def __init__(self) -> None:
+        self.max_concurrent_calls = 0
+        self._active_calls = 0
+        self._lock = Lock()
+        self.call_order: list[str] = []
+
+    def enter(self, snapshot_kind: str) -> None:
+        with self._lock:
+            self._active_calls += 1
+            self.max_concurrent_calls = max(self.max_concurrent_calls, self._active_calls)
+            self.call_order.append(snapshot_kind)
+
+    def leave(self) -> None:
+        with self._lock:
+            self._active_calls -= 1
+
+
+class _ConcurrentPromptSnapshotComponent:
+    def __init__(
+        self,
+        *,
+        tracker: _ConcurrentPromptSnapshotTracker,
+        remote_snapshot_kind: str,
+        created: bool,
+    ) -> None:
+        self.remote_snapshot_kind = remote_snapshot_kind
+        self._tracker = tracker
+        self._created = created
+
+    def ensure_remote_snapshot(self) -> bool:
+        self._tracker.enter(self.remote_snapshot_kind)
+        try:
+            time.sleep(0.01)
+            return self._created
+        finally:
+            self._tracker.leave()
 
 
 class ContextStoreTests(unittest.TestCase):
@@ -185,6 +226,32 @@ class ContextStoreTests(unittest.TestCase):
             remote_state.snapshots["prompt_memory"],
             {"schema": "twinr_prompt_memory", "version": 1, "entries": []},
         )
+
+    def test_prompt_context_store_serializes_remote_snapshot_checks(self) -> None:
+        tracker = _ConcurrentPromptSnapshotTracker()
+        store = PromptContextStore(
+            memory_store=_ConcurrentPromptSnapshotComponent(
+                tracker=tracker,
+                remote_snapshot_kind="prompt_memory",
+                created=True,
+            ),
+            user_store=_ConcurrentPromptSnapshotComponent(
+                tracker=tracker,
+                remote_snapshot_kind="user_context",
+                created=False,
+            ),
+            personality_store=_ConcurrentPromptSnapshotComponent(
+                tracker=tracker,
+                remote_snapshot_kind="personality_context",
+                created=True,
+            ),
+        )
+
+        ensured = store.ensure_remote_snapshots()
+
+        self.assertEqual(ensured, ("prompt_memory", "personality_context"))
+        self.assertEqual(tracker.call_order, ["prompt_memory", "user_context", "personality_context"])
+        self.assertEqual(tracker.max_concurrent_calls, 1)
 
     def test_managed_context_store_remote_primary_raises_when_remote_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

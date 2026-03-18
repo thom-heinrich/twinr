@@ -8,6 +8,7 @@ owned_concerns:
   - Define social-trigger domain models, priorities, and configurable thresholds
   - Score stateful trigger candidates from normalized observation ticks
   - Capture bounded audio and vision observations for proactive monitoring
+  - Stabilize automation-facing camera snapshots, person-count/zone anchors, and rising-edge events
   - Route prompt mode and render bounded evidence facts for proactive prompting
   - Buffer recent frames and request conservative visual second opinions
 out_of_scope:
@@ -30,6 +31,7 @@ files:
       - SocialAudioObservation
       - SocialBodyPose
       - SocialObservation
+      - SocialPersonZone
       - SocialTriggerDecision
       - SocialTriggerEngine
       - SocialTriggerEvaluation
@@ -54,12 +56,20 @@ files:
       - SocialAudioObservation
       - SocialBodyPose
       - SocialObservation
+      - SocialPersonZone
       - SocialTriggerDecision
       - SocialTriggerEngine
       - SocialTriggerEvaluation
       - SocialTriggerPriority
       - SocialTriggerThresholds
       - SocialVisionObservation
+  - path: camera_surface.py
+    role: Debounced camera snapshot and rising-edge event stabilization
+    exports:
+      - ProactiveCameraSnapshot
+      - ProactiveCameraSurface
+      - ProactiveCameraSurfaceConfig
+      - ProactiveCameraSurfaceUpdate
   - path: observers.py
     role: Ambient-audio and still-camera observation providers
     exports:
@@ -107,6 +117,7 @@ public_api:
     - SocialAudioObservation
     - SocialBodyPose
     - SocialObservation
+    - SocialPersonZone
     - SocialTriggerDecision
     - SocialTriggerEngine
     - SocialTriggerEvaluation
@@ -139,6 +150,7 @@ compatibility_reexports:
       - SocialAudioObservation
       - SocialBodyPose
       - SocialObservation
+      - SocialPersonZone
       - SocialTriggerDecision
       - SocialTriggerEngine
       - SocialTriggerEvaluation
@@ -164,6 +176,7 @@ primary_callers:
   - path: src/twinr/__main__.py
   - path: src/twinr/proactive/__init__.py
 tests:
+  - path: test/test_proactive_camera_surface.py
   - path: test/test_social_triggers.py
   - path: test/test_proactive_vision_review.py
   - path: test/test_proactive_monitor.py

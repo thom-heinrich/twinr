@@ -11,6 +11,7 @@ used by Twinr's long-term memory flows.
 - define typed request and response models for record, retrieve, and graph endpoints
 - define the canonical Twinr personal-graph schema and its local store
 - build prompt-context and subtext payloads from persisted graph memory
+- reuse the last successful remote graph document id during steady-state readiness reads so graph bootstrap avoids repeated pointer resolution when the remote snapshot has not moved
 
 `chonkydb` does **not** own:
 - the ChonkyDB server implementation or deployment
