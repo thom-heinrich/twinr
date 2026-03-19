@@ -26,6 +26,7 @@ Out of scope:
 - Required remote-primary readiness failures must surface as `LongTermRemoteUnavailableError`; do not degrade them into empty context or silent fallback.
 - Background writers must stay bounded, reject new items after shutdown starts, and preserve exact pending/drop/error state.
 - Service-level flush deadlines must be real wall-clock totals; do not reapply the full timeout independently to multiple writers.
+- Runtime restart-recall persistence stays orchestration-only here: `service.py` may trigger packet refreshes, but packet compilation logic belongs in retrieval and packet storage semantics belong in storage.
 - Multimodal evidence and episodic fallback payloads must remain bounded and sanitized before persistence.
 
 ## Verification
@@ -40,7 +41,7 @@ PYTHONPATH=src pytest test/test_longterm_worker.py test/test_longterm_runtime_he
 If `service.py` changed, also run:
 
 ```bash
-PYTHONPATH=src pytest test/test_longterm_memory.py test/test_longterm_multimodal.py test/test_longterm_proactive.py test/test_longterm_remote_state.py -q
+PYTHONPATH=src pytest test/test_longterm_memory.py test/test_longterm_multimodal.py test/test_longterm_proactive.py test/test_longterm_remote_state.py test/test_runtime_context.py test/test_longterm_midterm.py -q
 ```
 
 ## Coupling

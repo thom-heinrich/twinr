@@ -177,6 +177,45 @@ class WakewordTests(unittest.TestCase):
         self.assertTrue(fourth.armed)
         self.assertEqual(fourth.session_id, 2)
 
+    def test_presence_session_uses_recent_follow_up_speech_for_resume_window(self) -> None:
+        controller = PresenceSessionController(
+            presence_grace_s=600.0,
+            motion_grace_s=120.0,
+            speech_grace_s=45.0,
+        )
+
+        controller.observe(
+            now=0.0,
+            person_visible=True,
+            motion_active=False,
+            speech_detected=False,
+        )
+        resumed = controller.observe(
+            now=5.0,
+            person_visible=None,
+            motion_active=False,
+            speech_detected=False,
+            recent_speech_age_s=0.4,
+            presence_audio_active=False,
+            recent_follow_up_speech=True,
+            room_busy_or_overlapping=False,
+            quiet_window_open=False,
+            barge_in_recent=True,
+            speaker_direction_stable=True,
+            mute_blocks_voice_capture=False,
+            resume_window_open=True,
+            device_runtime_mode="audio_ready",
+            transport_reason=None,
+        )
+
+        self.assertTrue(resumed.armed)
+        self.assertEqual(resumed.reason, "follow_up_speech_while_recently_present")
+        self.assertAlmostEqual(resumed.last_speech_age_s or 0.0, 0.4, delta=0.05)
+        self.assertTrue(resumed.recent_follow_up_speech)
+        self.assertTrue(resumed.barge_in_recent)
+        self.assertTrue(resumed.resume_window_open)
+        self.assertEqual(resumed.device_runtime_mode, "audio_ready")
+
     def test_wakeword_phrase_spotter_matches_prefix_and_remaining_text(self) -> None:
         backend = FakeBackend("Hallo Twinner bist du da")
         spotter = WakewordPhraseSpotter(

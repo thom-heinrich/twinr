@@ -11,7 +11,9 @@ from twinr.proactive.social.engine import (
     SocialAudioObservation,
     SocialBodyPose,
     SocialDetectedObject,
+    SocialFineHandGesture,
     SocialGestureEvent,
+    SocialMotionState,
     SocialPersonZone,
     SocialSpatialBox,
     SocialTriggerEngine,
@@ -72,6 +74,29 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
         self.assertEqual(second.event_names, ())
         self.assertGreaterEqual(second.snapshot.person_visible_for_s, 6.0)
         self.assertGreaterEqual(second.snapshot.hand_or_object_near_camera_for_s, 6.0)
+
+    def test_surface_emits_fine_hand_gesture_event(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                gesture_event_cooldown_s=0.0,
+            )
+        )
+
+        update = surface.observe(
+            inspected=True,
+            observed_at=2.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.88,
+            ),
+        )
+
+        self.assertIn("camera.fine_hand_gesture_detected", update.event_names)
+        self.assertEqual(update.snapshot.fine_hand_gesture, SocialFineHandGesture.THUMBS_UP)
+        self.assertAlmostEqual(update.snapshot.fine_hand_gesture_confidence or 0.0, 0.88, places=3)
 
     def test_surface_holds_visible_state_through_brief_unknown_gap(self) -> None:
         surface = ProactiveCameraSurface(
@@ -291,6 +316,7 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
             config=ProactiveCameraSurfaceConfig(
                 person_visible_event_cooldown_s=0.0,
                 hand_or_object_near_camera_event_cooldown_s=0.0,
+                motion_event_cooldown_s=0.0,
                 showing_intent_event_cooldown_s=0.0,
                 gesture_event_cooldown_s=0.0,
                 object_on_samples=1,
@@ -316,9 +342,12 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
                 visual_attention_score=0.83,
                 body_pose=SocialBodyPose.SEATED,
                 pose_confidence=0.72,
+                motion_state=SocialMotionState.APPROACHING,
+                motion_confidence=0.61,
                 hand_or_object_near_camera=True,
                 showing_intent_likely=True,
-                gesture_event=SocialGestureEvent.STOP,
+                coarse_arm_gesture=SocialGestureEvent.TIMEOUT_T,
+                gesture_event=SocialGestureEvent.TIMEOUT_T,
                 gesture_confidence=0.75,
                 objects=(
                     SocialDetectedObject(
@@ -341,8 +370,11 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
         self.assertAlmostEqual(update.snapshot.visual_attention_score or 0.0, 0.83, places=3)
         self.assertEqual(update.snapshot.body_pose, SocialBodyPose.SEATED)
         self.assertAlmostEqual(update.snapshot.pose_confidence or 0.0, 0.72, places=3)
+        self.assertEqual(update.snapshot.motion_state, SocialMotionState.APPROACHING)
+        self.assertAlmostEqual(update.snapshot.motion_confidence or 0.0, 0.61, places=3)
         self.assertTrue(update.snapshot.showing_intent_likely)
-        self.assertEqual(update.snapshot.gesture_event, SocialGestureEvent.STOP)
+        self.assertEqual(update.snapshot.coarse_arm_gesture, SocialGestureEvent.TIMEOUT_T)
+        self.assertEqual(update.snapshot.gesture_event, SocialGestureEvent.TIMEOUT_T)
         self.assertEqual(len(update.snapshot.objects), 1)
         self.assertTrue(update.snapshot.objects[0].stable)
         self.assertEqual(
@@ -352,7 +384,9 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
                 "camera.hand_or_object_near_camera",
                 "camera.attention_window_opened",
                 "camera.showing_intent_started",
+                "camera.motion_changed",
                 "camera.gesture_detected",
+                "camera.coarse_arm_gesture_detected",
                 "camera.object_detected_stable",
             ),
         )

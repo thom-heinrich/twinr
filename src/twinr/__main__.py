@@ -675,11 +675,14 @@ def main() -> int:
             print(f"proactive_camera_ai_ready={str(snapshot.observation.camera_ai_ready).lower()}")
             print(f"proactive_looking_toward_device={str(snapshot.observation.looking_toward_device).lower()}")
             print(f"proactive_body_pose={snapshot.observation.body_pose.value}")
+            print(f"proactive_motion_state={snapshot.observation.motion_state.value}")
             print(f"proactive_smiling={str(snapshot.observation.smiling).lower()}")
             print(
                 "proactive_hand_or_object_near_camera="
                 f"{str(snapshot.observation.hand_or_object_near_camera).lower()}"
             )
+            print(f"proactive_coarse_arm_gesture={snapshot.observation.coarse_arm_gesture.value}")
+            print(f"proactive_fine_hand_gesture={snapshot.observation.fine_hand_gesture.value}")
             print(f"proactive_gesture_event={snapshot.observation.gesture_event.value}")
             print(f"proactive_person_count={snapshot.observation.person_count}")
             if snapshot.response_id:

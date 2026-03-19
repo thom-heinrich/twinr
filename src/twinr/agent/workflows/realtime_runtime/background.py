@@ -8,10 +8,15 @@ from queue import Empty, Full
 import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from twinr.display import DisplayPresentationController
 from twinr.agent.tools.handlers.automations import normalize_delivery
 from twinr.agent.tools.runtime.broker_policy import AutomationToolBrokerPolicy, default_automation_tool_broker_policy
 from twinr.automations import AutomationAction, AutomationDefinition
 from twinr.memory.reminders import format_due_label
+from twinr.agent.workflows.realtime_runtime.proactive_delivery import (
+    ProactiveDeliveryDecision,
+    ProactiveDeliveryPolicy,
+)
 from twinr.proactive import (
     ProactiveGovernorCandidate,
     ProactiveGovernorReservation,
@@ -20,6 +25,7 @@ from twinr.proactive import (
     proactive_observation_facts,
     proactive_prompt_mode,
 )
+from twinr.proactive.runtime.audio_policy import ReSpeakerAudioPolicySnapshot
 from twinr.providers.openai.core.instructions import REMINDER_DELIVERY_INSTRUCTIONS
 
 
@@ -93,9 +99,9 @@ class TwinrRealtimeBackgroundMixin:
             self._remember_background_fault("enqueue_multimodal_evidence", exc)
 
     # AUDIT-FIX(#3): Post-delivery follow-up logic must not bubble up and tear down the background loop.
-    def _safe_run_proactive_follow_up(self, trigger: SocialTriggerDecision) -> None:
+    def _safe_run_proactive_follow_up(self, trigger: SocialTriggerDecision) -> bool:
         try:
-            self._run_proactive_follow_up(trigger)
+            return bool(self._run_proactive_follow_up(trigger))
         except Exception as exc:
             self._remember_background_fault("run_proactive_follow_up", exc)
             self._safe_emit(f"social_follow_up_error={exc}")
@@ -106,7 +112,30 @@ class TwinrRealtimeBackgroundMixin:
                 trigger=getattr(trigger, "trigger_id", None),
                 error=str(exc),
             )
+            return False
 
+    def _proactive_delivery_policy(self) -> ProactiveDeliveryPolicy:
+        """Return the cached proactive delivery policy instance."""
+
+        policy = getattr(self, "_proactive_delivery_policy_instance", None)
+        if isinstance(policy, ProactiveDeliveryPolicy):
+            return policy
+        policy = ProactiveDeliveryPolicy.from_config(self.config)
+        setattr(self, "_proactive_delivery_policy_instance", policy)
+        return policy
+
+    def _display_presentation_controller(self) -> DisplayPresentationController:
+        """Return the cached display presentation controller."""
+
+        controller = getattr(self, "_display_presentation_controller_instance", None)
+        if isinstance(controller, DisplayPresentationController):
+            return controller
+        controller = DisplayPresentationController.from_config(
+            self.config,
+            default_source="proactive_social",
+        )
+        setattr(self, "_display_presentation_controller_instance", controller)
+        return controller
     # AUDIT-FIX(#8): Cleanup paths must survive secondary exceptions, otherwise the device can get stuck in answering state.
     def _finalize_speaking_output(self) -> None:
         self.runtime.finish_speaking()
@@ -443,6 +472,11 @@ class TwinrRealtimeBackgroundMixin:
         default_prompt = self._coerce_text(getattr(trigger, "prompt", None))
         trigger_reason = self._coerce_text(getattr(trigger, "reason", None))
         safety_trigger = is_safety_trigger(trigger_id)
+        delivery_decision = self._decide_social_trigger_delivery(
+            trigger_id=trigger_id,
+            safety_trigger=safety_trigger,
+        )
+        governor_channel = "display" if delivery_decision.channel == "display" else "speech"
 
         if not self._background_work_allowed():
             skip_reason = "busy" if getattr(getattr(self.runtime, "status", None), "value", None) != "waiting" else "conversation_active"
@@ -463,6 +497,7 @@ class TwinrRealtimeBackgroundMixin:
                 source_kind="social",
                 source_id=trigger_id,
                 summary=default_prompt,
+                channel=governor_channel,
                 priority=priority,
                 presence_session_id=self._current_presence_session_id(),
                 safety_exempt=safety_trigger,
@@ -476,6 +511,29 @@ class TwinrRealtimeBackgroundMixin:
         prompt_mode = proactive_prompt_mode(trigger)
         prompt_text = default_prompt
         try:
+            if delivery_decision.channel == "display":
+                self._show_social_trigger_display_cue(
+                    trigger_id=trigger_id,
+                    prompt_text=prompt_text,
+                    reason=delivery_decision.reason,
+                    cue_hold_seconds=delivery_decision.cue_hold_seconds,
+                )
+                self._safe_mark_governor_delivered(governor_reservation)
+                self._safe_emit(f"social_trigger={trigger_id}")
+                self._safe_emit(f"social_trigger_priority={priority}")
+                self._safe_emit("social_prompt_mode=display_first")
+                self._safe_emit(f"social_prompt={prompt_text}")
+                self._safe_record_event(
+                    "social_trigger_displayed",
+                    "Twinr kept a proactive social prompt visual-first instead of speaking it aloud.",
+                    trigger=trigger_id,
+                    reason=trigger_reason,
+                    priority=priority,
+                    prompt=prompt_text,
+                    default_prompt=default_prompt,
+                    display_reason=delivery_decision.reason,
+                )
+                return True
             if prompt_mode == "llm":
                 stop_processing_feedback = self._start_working_feedback_loop("processing")
                 try:
@@ -550,7 +608,32 @@ class TwinrRealtimeBackgroundMixin:
                 default_prompt=default_prompt,
                 prompt_mode=prompt_mode,
             )
-            self._safe_run_proactive_follow_up(trigger)
+            follow_up_engaged = self._safe_run_proactive_follow_up(trigger)
+            latest_audio_policy = self._current_audio_policy_snapshot()
+            if latest_audio_policy is not None and latest_audio_policy.barge_in_recent is True:
+                self._proactive_delivery_policy().note_interrupted(
+                    source_id=trigger_id,
+                    monotonic_now=time.monotonic(),
+                )
+                self._safe_record_event(
+                    "social_trigger_visual_first_cooldown_started",
+                    "Twinr switched future proactive prompts to visual-first after an interrupted prompt.",
+                    trigger=trigger_id,
+                    reason=trigger_reason,
+                    cooldown_reason="interrupted",
+                )
+            elif not follow_up_engaged:
+                self._proactive_delivery_policy().note_ignored(
+                    source_id=trigger_id,
+                    monotonic_now=time.monotonic(),
+                )
+                self._safe_record_event(
+                    "social_trigger_visual_first_cooldown_started",
+                    "Twinr switched future proactive prompts to visual-first after a prompt was ignored.",
+                    trigger=trigger_id,
+                    reason=trigger_reason,
+                    cooldown_reason="ignored",
+                )
             return True
         except Exception as exc:
             # AUDIT-FIX(#3): Social-trigger failures must be contained to this call path instead of crashing the background worker.
@@ -740,6 +823,21 @@ class TwinrRealtimeBackgroundMixin:
         except (TypeError, ValueError):
             return None
 
+    def _current_audio_policy_snapshot(self) -> ReSpeakerAudioPolicySnapshot | None:
+        """Return the latest proactive audio-policy snapshot when available."""
+
+        monitor = getattr(self, "proactive_monitor", None)
+        coordinator = None if monitor is None else getattr(monitor, "coordinator", None)
+        snapshot = None if coordinator is None else getattr(coordinator, "latest_audio_policy_snapshot", None)
+        if isinstance(snapshot, ReSpeakerAudioPolicySnapshot):
+            return snapshot
+        return None
+
+    def _local_now(self) -> datetime:
+        """Return the current wall clock in the configured local timezone."""
+
+        return datetime.now(self._local_timezone())
+
     def _current_longterm_live_facts(self) -> dict[str, object] | None:
         facts = getattr(self, "_latest_sensor_observation_facts", None)
         if not isinstance(facts, dict):
@@ -893,6 +991,46 @@ class TwinrRealtimeBackgroundMixin:
                 break
         prompts.reverse()
         return tuple(prompts)
+
+    def _decide_social_trigger_delivery(
+        self,
+        *,
+        trigger_id: str,
+        safety_trigger: bool,
+    ) -> ProactiveDeliveryDecision:
+        """Choose whether one social trigger should speak or stay visual."""
+
+        return self._proactive_delivery_policy().decide(
+            monotonic_now=time.monotonic(),
+            local_now=self._local_now(),
+            source_id=trigger_id,
+            safety_exempt=safety_trigger,
+            audio_policy_snapshot=self._current_audio_policy_snapshot(),
+        )
+
+    def _show_social_trigger_display_cue(
+        self,
+        *,
+        trigger_id: str,
+        prompt_text: str,
+        reason: str | None,
+        cue_hold_seconds: float | None,
+    ) -> None:
+        """Render one visual-first proactive cue on the display layer."""
+
+        controller = self._display_presentation_controller()
+        controller.show_rich_card(
+            key=f"social_{trigger_id}",
+            title=self._require_non_empty_text(prompt_text, context=f"social trigger {trigger_id} display prompt"),
+            accent="warm",
+            priority=80,
+            source="proactive_social",
+            hold_seconds=cue_hold_seconds,
+            now=datetime.now(timezone.utc),
+        )
+        self._safe_emit(f"social_trigger_display={trigger_id}")
+        if reason:
+            self._safe_emit(f"social_display_reason={reason}")
 
     def _run_matching_sensor_automations(
         self,

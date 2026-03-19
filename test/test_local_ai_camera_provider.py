@@ -7,12 +7,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.hardware.ai_camera import (
     AICameraBodyPose,
     AICameraBox,
+    AICameraFineHandGesture,
     AICameraGestureEvent,
+    AICameraMotionState,
     AICameraObjectDetection,
     AICameraObservation,
     AICameraZone,
 )
-from twinr.proactive.social.engine import SocialBodyPose, SocialGestureEvent, SocialPersonZone
+from twinr.proactive.social.engine import (
+    SocialBodyPose,
+    SocialFineHandGesture,
+    SocialGestureEvent,
+    SocialMotionState,
+    SocialPersonZone,
+)
 from twinr.proactive.social.local_camera_provider import LocalAICameraObservationProvider
 
 
@@ -47,10 +55,14 @@ class LocalAICameraProviderTests(unittest.TestCase):
                     visual_attention_score=0.81,
                     body_pose=AICameraBodyPose.SEATED,
                     pose_confidence=0.67,
+                    motion_state=AICameraMotionState.APPROACHING,
+                    motion_confidence=0.63,
                     hand_or_object_near_camera=True,
                     showing_intent_likely=True,
-                    gesture_event=AICameraGestureEvent.STOP,
+                    gesture_event=AICameraGestureEvent.TWO_HAND_DISMISS,
                     gesture_confidence=0.76,
+                    fine_hand_gesture=AICameraFineHandGesture.THUMBS_UP,
+                    fine_hand_gesture_confidence=0.83,
                     objects=(
                         AICameraObjectDetection(
                             label="cup",
@@ -76,9 +88,14 @@ class LocalAICameraProviderTests(unittest.TestCase):
         self.assertTrue(snapshot.observation.engaged_with_device)
         self.assertAlmostEqual(snapshot.observation.visual_attention_score or 0.0, 0.81, places=3)
         self.assertEqual(snapshot.observation.body_pose, SocialBodyPose.SEATED)
+        self.assertEqual(snapshot.observation.motion_state, SocialMotionState.APPROACHING)
+        self.assertAlmostEqual(snapshot.observation.motion_confidence or 0.0, 0.63, places=3)
         self.assertTrue(snapshot.observation.hand_or_object_near_camera)
         self.assertTrue(snapshot.observation.showing_intent_likely)
-        self.assertEqual(snapshot.observation.gesture_event, SocialGestureEvent.STOP)
+        self.assertEqual(snapshot.observation.coarse_arm_gesture, SocialGestureEvent.TWO_HAND_DISMISS)
+        self.assertEqual(snapshot.observation.gesture_event, SocialGestureEvent.TWO_HAND_DISMISS)
+        self.assertEqual(snapshot.observation.fine_hand_gesture, SocialFineHandGesture.THUMBS_UP)
+        self.assertAlmostEqual(snapshot.observation.fine_hand_gesture_confidence or 0.0, 0.83, places=3)
         self.assertEqual(len(snapshot.observation.objects), 1)
         self.assertEqual(snapshot.observation.objects[0].label, "cup")
         self.assertEqual(snapshot.observation.objects[0].zone, SocialPersonZone.RIGHT)

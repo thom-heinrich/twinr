@@ -17,6 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware.respeaker import capture_respeaker_primitive_snapshot, config_targets_respeaker
+from twinr.hardware.respeaker.derived_signals import derive_respeaker_signal_state
 from twinr.ops.events import TwinrOpsEventStore
 from twinr.ops.locks import loop_lock_owner
 
@@ -380,7 +381,9 @@ def _collect_respeaker_status(
         summary = "Twinr is configured for ReSpeaker XVF3800 capture, but the device is not detected."
 
     firmware_label = _respeaker_firmware_label(snapshot.firmware_version)
+    derived = derive_respeaker_signal_state(snapshot.direction, assistant_output_active=None)
     azimuth_label = _display_optional_number(snapshot.direction.doa_degrees, default="unknown")
+    direction_confidence_label = _display_optional_number(derived.direction_confidence, default="unknown")
     beam_energy_label = _display_float_tuple(snapshot.direction.beam_speech_energies)
     gpo_label = _display_int_tuple(snapshot.mute.gpo_logic_levels)
     host_control_label = "yes" if snapshot.host_control_ready else "no"
@@ -405,7 +408,10 @@ def _collect_respeaker_status(
             DeviceFact("Speech detected", _display_optional_bool(snapshot.direction.speech_detected)),
             DeviceFact("Room quiet", _display_optional_bool(snapshot.direction.room_quiet)),
             DeviceFact("DOA azimuth", azimuth_label),
+            DeviceFact("Direction confidence", direction_confidence_label),
             DeviceFact("Beam speech energy", beam_energy_label),
+            DeviceFact("Speech overlap", _display_optional_bool(derived.speech_overlap_likely)),
+            DeviceFact("Barge-in", _display_optional_bool(derived.barge_in_detected)),
             DeviceFact("Mute state", _display_optional_bool(snapshot.mute.mute_active)),
             DeviceFact("GPO levels", gpo_label),
             DeviceFact("USB device", usb_label),

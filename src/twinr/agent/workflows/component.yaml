@@ -10,6 +10,7 @@ owned_concerns:
   - Keep turn-guidance context shaping and transcript-verifier gate policy outside the active loop classes
   - Serialize beep, feedback, and spoken playback under one priority-aware speaker coordinator
   - Keep required remote-memory fail-closed checks off the GPIO polling thread
+  - Choose speech versus display-first delivery for non-safety proactive prompts based on quiet hours, media/noise suppression, and bounded repeat cooldowns
   - Produce bounded forensic run packs for live button/session/audio investigation
   - Share workflow-local support helpers for feedback tones, reference images, background delivery, and streaming capture
   - Expose compatibility workflow entry points for top-level imports and older proactive-trigger paths without eager runner imports
@@ -83,6 +84,11 @@ files:
     role: Active reminder, automation, and proactive background-delivery mixin
     exports:
       - TwinrRealtimeBackgroundMixin
+  - path: realtime_runtime/proactive_delivery.py
+    role: Display-first versus speech delivery policy for proactive background prompts
+    exports:
+      - ProactiveDeliveryDecision
+      - ProactiveDeliveryPolicy
   - path: realtime_runtime/support.py
     role: Active emit, media, config, and feedback helpers for the realtime runtime
     exports:

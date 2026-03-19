@@ -151,6 +151,16 @@ class SocialBodyPose(StrEnum):
     FLOOR = "floor"
 
 
+class SocialMotionState(StrEnum):
+    """Describe the coarse motion states exposed by the camera path."""
+
+    UNKNOWN = "unknown"
+    STILL = "still"
+    WALKING = "walking"
+    APPROACHING = "approaching"
+    LEAVING = "leaving"
+
+
 class SocialPersonZone(StrEnum):
     """Describe the coarse horizontal zone of the primary visible person."""
 
@@ -161,12 +171,29 @@ class SocialPersonZone(StrEnum):
 
 
 class SocialGestureEvent(StrEnum):
-    """Describe the tiny gesture vocabulary exposed to policy consumers."""
+    """Describe the bounded coarse-arm gesture vocabulary exposed to policy consumers."""
 
     NONE = "none"
+    WAVE = "wave"
     STOP = "stop"
     DISMISS = "dismiss"
     CONFIRM = "confirm"
+    ARMS_CROSSED = "arms_crossed"
+    TWO_HAND_DISMISS = "two_hand_dismiss"
+    TIMEOUT_T = "timeout_t"
+    UNKNOWN = "unknown"
+
+
+class SocialFineHandGesture(StrEnum):
+    """Describe the bounded fine-hand gesture vocabulary exposed to policy consumers."""
+
+    NONE = "none"
+    THUMBS_UP = "thumbs_up"
+    THUMBS_DOWN = "thumbs_down"
+    POINTING = "pointing"
+    OPEN_PALM = "open_palm"
+    OK_SIGN = "ok_sign"
+    MIDDLE_FINGER = "middle_finger"
     UNKNOWN = "unknown"
 
 
@@ -251,6 +278,20 @@ def _coerce_body_pose(value: object) -> SocialBodyPose:
     return SocialBodyPose.UNKNOWN
 
 
+def _coerce_motion_state(value: object) -> SocialMotionState:
+    """Coerce one value to a known motion state."""
+
+    if isinstance(value, SocialMotionState):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        try:
+            return SocialMotionState(normalized)
+        except ValueError:
+            return SocialMotionState.UNKNOWN
+    return SocialMotionState.UNKNOWN
+
+
 def _coerce_gesture_event(value: object) -> SocialGestureEvent:
     """Coerce one value to a known gesture event."""
 
@@ -263,6 +304,20 @@ def _coerce_gesture_event(value: object) -> SocialGestureEvent:
         except ValueError:
             return SocialGestureEvent.UNKNOWN
     return SocialGestureEvent.UNKNOWN
+
+
+def _coerce_fine_hand_gesture(value: object) -> SocialFineHandGesture:
+    """Coerce one value to a bounded fine-hand gesture enum."""
+
+    if isinstance(value, SocialFineHandGesture):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        try:
+            return SocialFineHandGesture(normalized)
+        except ValueError:
+            return SocialFineHandGesture.UNKNOWN
+    return SocialFineHandGesture.UNKNOWN
 
 
 def _coerce_person_zone(value: object) -> SocialPersonZone:
@@ -415,12 +470,18 @@ class SocialVisionObservation:
     body_pose: SocialBodyPose = SocialBodyPose.UNKNOWN
     pose_confidence: float | None = None
     body_state_changed_at: float | None = None
+    motion_state: SocialMotionState = SocialMotionState.UNKNOWN
+    motion_confidence: float | None = None
+    motion_state_changed_at: float | None = None
     smiling: bool = False
     hand_or_object_near_camera: bool = False
     showing_intent_likely: bool | None = None
     showing_intent_started_at: float | None = None
+    coarse_arm_gesture: SocialGestureEvent = SocialGestureEvent.NONE
     gesture_event: SocialGestureEvent = SocialGestureEvent.NONE
     gesture_confidence: float | None = None
+    fine_hand_gesture: SocialFineHandGesture = SocialFineHandGesture.NONE
+    fine_hand_gesture_confidence: float | None = None
     objects: tuple[SocialDetectedObject, ...] = ()
     camera_online: bool = False
     camera_ready: bool = False
@@ -438,11 +499,17 @@ class SocialAudioObservation:
     distress_detected: bool | None = None
     room_quiet: bool | None = None
     recent_speech_age_s: float | None = None
+    assistant_output_active: bool | None = None
     azimuth_deg: int | None = None
+    direction_confidence: float | None = None
     device_runtime_mode: str | None = None
     signal_source: str | None = None
     host_control_ready: bool | None = None
     transport_reason: str | None = None
+    non_speech_audio_likely: bool | None = None
+    background_media_likely: bool | None = None
+    speech_overlap_likely: bool | None = None
+    barge_in_detected: bool | None = None
     mute_active: bool | None = None
 
 
@@ -1516,11 +1583,17 @@ class SocialTriggerEngine:
             distress_detected=_coerce_optional_bool(audio.distress_detected),
             room_quiet=_coerce_optional_bool(getattr(audio, "room_quiet", None)),
             recent_speech_age_s=_coerce_recent_age(getattr(audio, "recent_speech_age_s", None)),
+            assistant_output_active=_coerce_optional_bool(getattr(audio, "assistant_output_active", None)),
             azimuth_deg=_coerce_optional_azimuth(getattr(audio, "azimuth_deg", None)),
+            direction_confidence=_coerce_optional_ratio(getattr(audio, "direction_confidence", None)),
             device_runtime_mode=_coerce_optional_text(getattr(audio, "device_runtime_mode", None), limit=64),
             signal_source=_coerce_optional_text(getattr(audio, "signal_source", None), limit=64),
             host_control_ready=_coerce_optional_bool(getattr(audio, "host_control_ready", None)),
             transport_reason=_coerce_optional_text(getattr(audio, "transport_reason", None), limit=120),
+            non_speech_audio_likely=_coerce_optional_bool(getattr(audio, "non_speech_audio_likely", None)),
+            background_media_likely=_coerce_optional_bool(getattr(audio, "background_media_likely", None)),
+            speech_overlap_likely=_coerce_optional_bool(getattr(audio, "speech_overlap_likely", None)),
+            barge_in_detected=_coerce_optional_bool(getattr(audio, "barge_in_detected", None)),
             mute_active=_coerce_optional_bool(getattr(audio, "mute_active", None)),
         )
 
@@ -1552,6 +1625,11 @@ class SocialTriggerEngine:
             if primary_person_box is not None
             else _coerce_optional_ratio(getattr(vision, "primary_person_center_y", None))
         )
+        raw_coarse_arm_gesture = getattr(
+            vision,
+            "coarse_arm_gesture",
+            getattr(vision, "gesture_event", SocialGestureEvent.NONE),
+        )
         return SocialVisionObservation(
             person_visible=person_visible,
             person_count=(
@@ -1577,12 +1655,26 @@ class SocialTriggerEngine:
             body_pose=(_coerce_body_pose(vision.body_pose) if person_visible else SocialBodyPose.UNKNOWN),
             pose_confidence=_coerce_optional_ratio(getattr(vision, "pose_confidence", None)),
             body_state_changed_at=_coerce_timestamp(getattr(vision, "body_state_changed_at", None)),
+            motion_state=(
+                _coerce_motion_state(getattr(vision, "motion_state", SocialMotionState.UNKNOWN))
+                if person_visible
+                else SocialMotionState.UNKNOWN
+            ),
+            motion_confidence=_coerce_optional_ratio(getattr(vision, "motion_confidence", None)),
+            motion_state_changed_at=_coerce_timestamp(getattr(vision, "motion_state_changed_at", None)),
             smiling=person_visible and _coerce_bool(vision.smiling),
             hand_or_object_near_camera=_coerce_bool(vision.hand_or_object_near_camera),
             showing_intent_likely=_coerce_optional_bool(getattr(vision, "showing_intent_likely", None)),
             showing_intent_started_at=_coerce_timestamp(getattr(vision, "showing_intent_started_at", None)),
-            gesture_event=_coerce_gesture_event(getattr(vision, "gesture_event", SocialGestureEvent.NONE)),
+            coarse_arm_gesture=_coerce_gesture_event(raw_coarse_arm_gesture),
+            gesture_event=_coerce_gesture_event(raw_coarse_arm_gesture),
             gesture_confidence=_coerce_optional_ratio(getattr(vision, "gesture_confidence", None)),
+            fine_hand_gesture=_coerce_fine_hand_gesture(
+                getattr(vision, "fine_hand_gesture", SocialFineHandGesture.NONE)
+            ),
+            fine_hand_gesture_confidence=_coerce_optional_ratio(
+                getattr(vision, "fine_hand_gesture_confidence", None)
+            ),
             objects=_coerce_detected_objects(getattr(vision, "objects", ())),
             camera_online=_coerce_bool(getattr(vision, "camera_online", False)),
             camera_ready=_coerce_bool(getattr(vision, "camera_ready", False)),

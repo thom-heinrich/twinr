@@ -80,11 +80,11 @@ Requirements:
 
 - [x] Detect XVF3800 runtime mode versus DFU / safe mode during startup.
 - [ ] Fail clearly when the board is visible only in DFU mode.
-- [ ] Keep a stable input-device selection path for both conversation audio and proactive audio.
-- [ ] Expose one operator-visible health view with device mode, mute state, and capture readiness.
-- [ ] Ensure hotplug / reboot recovery does not leave Twinr on a dead audio device.
+- [x] Keep a stable input-device selection path for both conversation audio and proactive audio.
+- [x] Expose one operator-visible health view with device mode, mute state, and capture readiness.
+- [x] Ensure hotplug / reboot recovery does not leave Twinr on a dead audio device.
 - [x] Bound all audio waits and lock contention so the runtime cannot wedge.
-- [ ] Keep playback and capture separation intact when Jabra remains the output sink.
+- [x] Keep playback and capture separation intact when Jabra remains the output sink.
 
 Acceptance:
 
@@ -105,12 +105,20 @@ Required outputs:
 - [x] `room_quiet`
 - [x] `recent_speech_age_s`
 - [x] `azimuth_deg` or equivalent directional bucket
-- [ ] `direction_confidence`
+- [x] `direction_confidence`
 - [x] `beam_activity` or equivalent beam-energy summary
-- [ ] `barge_in_detected`
-- [ ] `speech_overlap_likely`
-- [ ] `mute_active`
+- [x] `barge_in_detected`
+- [x] `speech_overlap_likely`
+- [x] `mute_active`
 - [x] `device_runtime_mode`
+- [x] `non_speech_audio_likely`
+- [x] `background_media_likely`
+
+Current conservative interpretation note:
+
+- `speech_detected` alone is not safe enough for barge-in during playback.
+- Single fixed-beam speech energy is also not safe enough on its own during playback.
+- V1 therefore treats busy-state `barge_in_detected` as a conservative overlap fact, not as any single speech bit.
 
 Signal-quality rules:
 
@@ -150,20 +158,20 @@ The ReSpeaker must feed the policy layer, not replace it.
 
 Required policy inputs:
 
-- [ ] `presence_audio_active`
-- [ ] `recent_follow_up_speech`
-- [ ] `room_busy_or_overlapping`
-- [ ] `quiet_window_open`
-- [ ] `barge_in_recent`
-- [ ] `speaker_direction_stable`
-- [ ] `mute_blocks_voice_capture`
+- [x] `presence_audio_active`
+- [x] `recent_follow_up_speech`
+- [x] `room_busy_or_overlapping`
+- [x] `quiet_window_open`
+- [x] `barge_in_recent`
+- [x] `speaker_direction_stable`
+- [x] `mute_blocks_voice_capture`
 
 Required suppression gates:
 
-- [ ] Never speak proactively when overlap or multi-speaker audio is likely.
-- [ ] After ignored or interrupted proactive speech, fall back to display-first.
-- [ ] Enforce global cooldown and per-source repeat cooldown on audio-triggered initiatives.
-- [ ] Keep quiet-hour behavior visual-first unless explicitly safety-related.
+- [x] Never speak proactively when overlap or multi-speaker audio is likely.
+- [x] After ignored or interrupted proactive speech, fall back to display-first.
+- [x] Enforce global cooldown and per-source repeat cooldown on audio-triggered initiatives.
+- [x] Keep quiet-hour behavior visual-first unless explicitly safety-related.
 
 ### 5. HCI And Awareness
 
@@ -246,15 +254,15 @@ These items are mandatory before any ambitious proactive behavior.
 
 - [x] Implement a dedicated XVF3800 capability probe and runtime-mode detector.
 - [x] Implement one `ReSpeakerSignalProvider` module under `src/twinr/...`.
-- [ ] Emit structured audio-direction facts with confidence and timestamps.
+- [x] Emit structured audio-direction facts with confidence and timestamps.
 - [ ] Feed those facts into presence sessions and proactive governor inputs.
 - [x] Add mute-state and device-mode visibility to operator diagnostics.
-- [ ] Add Pi acceptance proofs for runtime mode, capture, restart, and hotplug recovery.
+- [x] Add Pi acceptance proofs for runtime mode, capture, restart, and hotplug recovery.
 
 ### V2 Product Hooks
 
-- [ ] Use ReSpeaker facts for initiative scoring and resume decisions.
-- [ ] Add audio-side friction signals such as barge-in and overlap.
+- [x] Use ReSpeaker facts for initiative scoring and resume decisions.
+- [x] Add audio-side friction signals such as barge-in and overlap.
 - [ ] Add awareness-state transitions such as `noise_blocked` and `resume_window_open`.
 - [ ] Add bounded memory ingestion for audio interaction routines.
 
@@ -278,11 +286,11 @@ These are not valid reasons to extend the ReSpeaker path on its own:
 
 The ReSpeaker path is not done until these pass on `/twinr`.
 
-- [ ] Twinr starts with Jabra output and ReSpeaker input without manual fixes.
-- [ ] Device diagnostics show XVF3800 mode and capture readiness.
-- [ ] Proactive runtime reads ReSpeaker signals without blocking the main loop.
-- [ ] Wakeword / presence / proactive audio path recovers after supervisor restart.
-- [ ] Disconnect / reconnect errors are explicit and operator-readable.
+- [x] Twinr starts with Jabra output and ReSpeaker input without manual fixes.
+- [x] Device diagnostics show XVF3800 mode and capture readiness.
+- [x] Proactive runtime reads ReSpeaker signals without blocking the main loop.
+- [x] Wakeword / presence / proactive audio path recovers after supervisor restart.
+- [x] Disconnect / reconnect errors are explicit and operator-readable.
 - [ ] Long-term memory stores only structured facts, not raw audio.
 
 ## Documentation Follow-Up

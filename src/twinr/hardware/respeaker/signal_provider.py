@@ -6,6 +6,7 @@ from threading import Lock
 from typing import Callable
 import time
 
+from twinr.hardware.respeaker.derived_signals import derive_respeaker_signal_state
 from twinr.hardware.respeaker.models import ReSpeakerPrimitiveSnapshot, ReSpeakerSignalSnapshot
 from twinr.hardware.respeaker.snapshot_service import capture_respeaker_primitive_snapshot
 from twinr.hardware.respeaker.transport import ReSpeakerLibusbTransport
@@ -31,6 +32,7 @@ class ReSpeakerSignalProvider:
         transport: ReSpeakerLibusbTransport | None = None,
         snapshot_factory: Callable[..., ReSpeakerPrimitiveSnapshot] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
+        assistant_output_active_predicate: Callable[[], bool] | None = None,
     ) -> None:
         """Initialize one provider with bounded lock and snapshot settings."""
 
@@ -39,6 +41,7 @@ class ReSpeakerSignalProvider:
         self.transport = transport or ReSpeakerLibusbTransport()
         self._snapshot_factory = snapshot_factory or capture_respeaker_primitive_snapshot
         self._monotonic_clock = monotonic_clock or time.monotonic
+        self._assistant_output_active_predicate = assistant_output_active_predicate
         self._lock = Lock()
         self._last_speech_monotonic: float | None = None
 
@@ -58,8 +61,18 @@ class ReSpeakerSignalProvider:
         try:
             primitive = self._snapshot_factory(transport=self.transport)
             now_monotonic = self._monotonic_clock()
+            assistant_output_active = self._assistant_output_active()
             speech_detected = primitive.direction.speech_detected
-            if speech_detected is True:
+            derived = derive_respeaker_signal_state(
+                primitive.direction,
+                assistant_output_active=assistant_output_active,
+            )
+            recent_speech_detected = (
+                derived.speech_overlap_likely
+                if assistant_output_active is True
+                else speech_detected
+            )
+            if recent_speech_detected is True:
                 self._last_speech_monotonic = now_monotonic
                 recent_speech_age_s = 0.0
             elif primitive.host_control_ready and self._last_speech_monotonic is not None:
@@ -79,8 +92,12 @@ class ReSpeakerSignalProvider:
                 speech_detected=speech_detected,
                 room_quiet=primitive.direction.room_quiet,
                 recent_speech_age_s=recent_speech_age_s,
+                assistant_output_active=assistant_output_active,
                 azimuth_deg=primitive.direction.doa_degrees,
+                direction_confidence=derived.direction_confidence,
                 beam_activity=primitive.direction.beam_speech_energies,
+                speech_overlap_likely=derived.speech_overlap_likely,
+                barge_in_detected=derived.barge_in_detected,
                 mute_active=primitive.mute.mute_active,
                 gpo_logic_levels=primitive.mute.gpo_logic_levels,
             )
@@ -106,3 +123,13 @@ class ReSpeakerSignalProvider:
         """
 
         return None
+
+    def _assistant_output_active(self) -> bool | None:
+        """Return whether Twinr is currently speaking when a callback exists."""
+
+        if self._assistant_output_active_predicate is None:
+            return False
+        try:
+            return bool(self._assistant_output_active_predicate())
+        except Exception:
+            return None

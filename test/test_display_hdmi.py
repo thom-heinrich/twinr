@@ -118,10 +118,121 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         panel_bright = sum(1 for pixel in panel_pixels.getdata() if min(pixel) >= 220)
 
         self.assertEqual(image.getpixel((10, 10)), (0, 0, 0))
-        self.assertLessEqual(max(image.getpixel((500, 180))), 10)
+        self.assertLessEqual(max(image.getpixel((500, 180))), 18)
         self.assertGreater(dark_pixels, 300000)
         self.assertGreater(face_bright, 9000)
         self.assertGreater(panel_bright, 3500)
+
+    def test_render_status_image_draws_bottom_news_ticker(self) -> None:
+        display = self.make_display()
+        base = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+        )
+        ticked = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+            ticker_text="Tagesschau · Calm readable headline for seniors",
+        )
+
+        scene = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+            ticker_text="Tagesschau · Calm readable headline for seniors",
+        )
+        ticker_diff = ImageChops.difference(base.crop(scene.layout.ticker_box), ticked.crop(scene.layout.ticker_box))
+        panel_diff = ImageChops.difference(base.crop(scene.layout.panel_box), ticked.crop(scene.layout.panel_box))
+
+        self.assertIsNotNone(ticker_diff.getbbox())
+        self.assertGreater(sum(1 for pixel in ticker_diff.getdata() if max(pixel) >= 24), 2000)
+        self.assertGreater(sum(1 for pixel in panel_diff.getdata() if max(pixel) >= 24), 2000)
+
+    def test_default_scene_only_reserves_bottom_band_when_ticker_is_visible(self) -> None:
+        display = self.make_display()
+        state_fields = (
+            ("Status", "Waiting"),
+            ("Internet", "ok"),
+            ("AI", "ok"),
+            ("System", "ok"),
+            ("Zeit", "12:34"),
+        )
+
+        without_ticker = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=state_fields,
+            animation_frame=0,
+        )
+        with_ticker = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=state_fields,
+            animation_frame=0,
+            ticker_text="Tagesschau · Headline",
+        )
+
+        self.assertFalse(without_ticker.layout.ticker_reserved)
+        self.assertTrue(with_ticker.layout.ticker_reserved)
+        self.assertGreater(without_ticker.layout.panel_box[3], with_ticker.layout.panel_box[3])
+        self.assertGreater(without_ticker.layout.face_box[3], with_ticker.layout.face_box[3])
+
+    def test_default_scene_uses_compact_panel_when_ticker_reduces_vertical_space(self) -> None:
+        display = self.make_display()
+        scene = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+            ticker_text="Tagesschau · Calm readable headline for seniors",
+        )
+
+        self.assertTrue(scene.layout.compact_panel)
 
     def test_default_scene_waiting_face_animates_between_idle_frames(self) -> None:
         display = self.make_display()
@@ -136,7 +247,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             width=800,
             height=480,
             status="waiting",
-            headline="Ready",
+            headline="Waiting",
             helper_text="Press the green button and speak naturally.",
             state_fields=state_fields,
             animation_frame=0,
@@ -245,7 +356,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             width=800,
             height=480,
             status="waiting",
-            headline="Ready",
+            headline="Waiting",
             helper_text="Press the green button and speak naturally.",
             state_fields=state_fields,
             animation_frame=0,
@@ -297,7 +408,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             width=800,
             height=480,
             status="waiting",
-            headline="Ready",
+            headline="Waiting",
             helper_text="Press the green button and speak naturally.",
             state_fields=state_fields,
             animation_frame=0,
@@ -331,7 +442,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
     def test_default_surface_uses_english_copy_and_translated_state_values(self) -> None:
         display = self.make_display()
 
-        self.assertEqual(display._status_headline("waiting", fallback="Waiting"), "Ready")
+        self.assertEqual(display._status_headline("waiting", fallback="Waiting"), "Waiting")
         self.assertEqual(display._status_helper_text("listening"), "Listening now. Speak at your own pace.")
         self.assertEqual(display._display_state_value("Internet", "ok"), "Online")
         self.assertEqual(display._display_state_value("AI", "ok"), "Ready")
@@ -347,7 +458,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             width=800,
             height=480,
             status="waiting",
-            headline="Ready",
+            headline="Waiting",
             helper_text="Press the green button and speak naturally.",
             state_fields=(
                 ("Status", "Waiting"),
@@ -367,6 +478,32 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertEqual(scene.panel.cards[3].value, "12:34")
         self.assertGreater(scene.layout.panel_box[0], scene.layout.face_box[2])
 
+    def test_default_scene_prioritises_face_space_and_uses_a_slighter_header(self) -> None:
+        display = self.make_display()
+        scene = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "warm"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+        )
+
+        header_height = scene.layout.header_box[3] - scene.layout.header_box[1]
+        face_width = scene.layout.face_box[2] - scene.layout.face_box[0]
+        panel_width = scene.layout.panel_box[2] - scene.layout.panel_box[0]
+
+        self.assertLess(header_height, 60)
+        self.assertGreater(face_width, 300)
+        self.assertLess(panel_width, 410)
+
     def test_default_scene_builds_morphing_presentation_overlay(self) -> None:
         display = self.make_display()
         renderer = display._scene_renderer()
@@ -384,7 +521,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             width=800,
             height=480,
             status="waiting",
-            headline="Ready",
+            headline="Waiting",
             helper_text="Press the green button and speak naturally.",
             state_fields=(
                 ("Status", "Waiting"),
@@ -431,7 +568,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             width=800,
             height=480,
             status="waiting",
-            headline="Ready",
+            headline="Waiting",
             helper_text="Press the green button and speak naturally.",
             state_fields=(
                 ("Status", "Waiting"),

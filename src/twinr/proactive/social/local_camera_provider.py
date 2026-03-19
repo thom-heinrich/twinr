@@ -9,6 +9,8 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware.ai_camera import (
     AICameraBodyPose,
     AICameraGestureEvent,
+    AICameraFineHandGesture,
+    AICameraMotionState,
     AICameraObservation,
     AICameraZone,
     LocalAICameraAdapter,
@@ -17,7 +19,9 @@ from twinr.hardware.ai_camera import (
 from .engine import (
     SocialBodyPose,
     SocialDetectedObject,
+    SocialFineHandGesture,
     SocialGestureEvent,
+    SocialMotionState,
     SocialPersonZone,
     SocialSpatialBox,
     SocialVisionObservation,
@@ -121,11 +125,16 @@ class LocalAICameraObservationProvider:
             visual_attention_score=observation.visual_attention_score,
             body_pose=_map_body_pose(observation.body_pose),
             pose_confidence=observation.pose_confidence,
+            motion_state=_map_motion_state(observation.motion_state),
+            motion_confidence=observation.motion_confidence,
             smiling=False,
             hand_or_object_near_camera=observation.hand_or_object_near_camera,
             showing_intent_likely=observation.showing_intent_likely,
+            coarse_arm_gesture=_map_gesture(observation.gesture_event),
             gesture_event=_map_gesture(observation.gesture_event),
             gesture_confidence=observation.gesture_confidence,
+            fine_hand_gesture=_map_fine_hand_gesture(observation.fine_hand_gesture),
+            fine_hand_gesture_confidence=observation.fine_hand_gesture_confidence,
             objects=tuple(
                 SocialDetectedObject(
                     label=item.label,
@@ -162,7 +171,9 @@ class LocalAICameraObservationProvider:
             f"ai_ready={'yes' if observation.camera_ai_ready else 'no'} "
             f"person_count={observation.person_count} "
             f"body_pose={_map_body_pose(observation.body_pose).value} "
-            f"gesture={_map_gesture(observation.gesture_event).value} "
+            f"motion={_map_motion_state(observation.motion_state).value} "
+            f"coarse_arm_gesture={_map_gesture(observation.gesture_event).value} "
+            f"fine_hand_gesture={_map_fine_hand_gesture(observation.fine_hand_gesture).value} "
             f"error={observation.camera_error or 'none'}"
         )
 
@@ -193,17 +204,50 @@ def _map_body_pose(value: AICameraBodyPose) -> SocialBodyPose:
     return mapping.get(value, SocialBodyPose.UNKNOWN)
 
 
+def _map_motion_state(value: AICameraMotionState) -> SocialMotionState:
+    """Map one hardware motion enum to the social motion enum."""
+
+    mapping = {
+        AICameraMotionState.STILL: SocialMotionState.STILL,
+        AICameraMotionState.WALKING: SocialMotionState.WALKING,
+        AICameraMotionState.APPROACHING: SocialMotionState.APPROACHING,
+        AICameraMotionState.LEAVING: SocialMotionState.LEAVING,
+        AICameraMotionState.UNKNOWN: SocialMotionState.UNKNOWN,
+    }
+    return mapping.get(value, SocialMotionState.UNKNOWN)
+
+
 def _map_gesture(value: AICameraGestureEvent) -> SocialGestureEvent:
     """Map one hardware gesture enum to the social gesture enum."""
 
     mapping = {
         AICameraGestureEvent.NONE: SocialGestureEvent.NONE,
+        AICameraGestureEvent.WAVE: SocialGestureEvent.WAVE,
         AICameraGestureEvent.STOP: SocialGestureEvent.STOP,
         AICameraGestureEvent.DISMISS: SocialGestureEvent.DISMISS,
         AICameraGestureEvent.CONFIRM: SocialGestureEvent.CONFIRM,
+        AICameraGestureEvent.ARMS_CROSSED: SocialGestureEvent.ARMS_CROSSED,
+        AICameraGestureEvent.TWO_HAND_DISMISS: SocialGestureEvent.TWO_HAND_DISMISS,
+        AICameraGestureEvent.TIMEOUT_T: SocialGestureEvent.TIMEOUT_T,
         AICameraGestureEvent.UNKNOWN: SocialGestureEvent.UNKNOWN,
     }
     return mapping.get(value, SocialGestureEvent.UNKNOWN)
+
+
+def _map_fine_hand_gesture(value: AICameraFineHandGesture) -> SocialFineHandGesture:
+    """Map one hardware fine-hand gesture enum to the social gesture enum."""
+
+    mapping = {
+        AICameraFineHandGesture.NONE: SocialFineHandGesture.NONE,
+        AICameraFineHandGesture.THUMBS_UP: SocialFineHandGesture.THUMBS_UP,
+        AICameraFineHandGesture.THUMBS_DOWN: SocialFineHandGesture.THUMBS_DOWN,
+        AICameraFineHandGesture.POINTING: SocialFineHandGesture.POINTING,
+        AICameraFineHandGesture.OPEN_PALM: SocialFineHandGesture.OPEN_PALM,
+        AICameraFineHandGesture.OK_SIGN: SocialFineHandGesture.OK_SIGN,
+        AICameraFineHandGesture.MIDDLE_FINGER: SocialFineHandGesture.MIDDLE_FINGER,
+        AICameraFineHandGesture.UNKNOWN: SocialFineHandGesture.UNKNOWN,
+    }
+    return mapping.get(value, SocialFineHandGesture.UNKNOWN)
 
 
 __all__ = [

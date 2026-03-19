@@ -600,7 +600,7 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertEqual(second_query["document_id"], ["doc-123"])
         self.assertNotIn("origin_uri", second_query)
 
-    def test_remote_snapshot_load_reuses_cached_document_id_hint_by_default(self) -> None:
+    def test_remote_snapshot_load_reuses_explicit_document_id_hint_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir)
             read_opener = FakeOpener()
@@ -611,27 +611,6 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
                 "updated_at": "2026-03-18T13:00:01+00:00",
                 "body": {"schema": "graph", "nodes": [{"id": "user:main"}], "edges": []},
             }
-            read_opener.queue_json(
-                {
-                    "success": True,
-                    "document_id": "pointer-doc",
-                    "origin_uri": "twinr://longterm/test-namespace/__pointer__:graph",
-                    "content": json.dumps(
-                        {
-                            "schema": "twinr_remote_snapshot_v1",
-                            "namespace": "test-namespace",
-                            "snapshot_kind": "__pointer__:graph",
-                            "updated_at": "2026-03-18T13:00:00+00:00",
-                            "body": {
-                                "schema": "twinr_remote_snapshot_pointer_v1",
-                                "version": 1,
-                                "snapshot_kind": "graph",
-                                "document_id": "graph-doc-123",
-                            },
-                        }
-                    ),
-                }
-            )
             read_opener.queue_json(
                 {
                     "success": True,
@@ -657,46 +636,25 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
                     opener=FakeOpener(),
                 ),
             )
+            state._remember_snapshot_document_id(snapshot_kind="graph", document_id="graph-doc-123")
 
             first = state.load_snapshot(snapshot_kind="graph", local_path=Path(temp_dir) / "graph.json")
             second = state.load_snapshot(snapshot_kind="graph", local_path=Path(temp_dir) / "graph.json")
 
         self.assertEqual(first, {"schema": "graph", "nodes": [{"id": "user:main"}], "edges": []})
         self.assertEqual(second, first)
-        self.assertEqual(len(read_opener.calls), 3)
+        self.assertEqual(len(read_opener.calls), 2)
         first_query = parse_qs(urlparse(read_opener.calls[0]["full_url"]).query)
         second_query = parse_qs(urlparse(read_opener.calls[1]["full_url"]).query)
-        third_query = parse_qs(urlparse(read_opener.calls[2]["full_url"]).query)
-        self.assertEqual(first_query["origin_uri"], ["twinr://longterm/test-namespace/__pointer__%3Agraph"])
+        self.assertEqual(first_query["document_id"], ["graph-doc-123"])
         self.assertEqual(second_query["document_id"], ["graph-doc-123"])
-        self.assertEqual(third_query["document_id"], ["graph-doc-123"])
-        self.assertNotIn("origin_uri", third_query)
+        self.assertNotIn("origin_uri", first_query)
+        self.assertNotIn("origin_uri", second_query)
 
     def test_remote_snapshot_load_reuses_cached_document_id_hint_when_opted_in(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir)
             read_opener = FakeOpener()
-            read_opener.queue_json(
-                {
-                    "success": True,
-                    "document_id": "pointer-doc",
-                    "origin_uri": "twinr://longterm/test-namespace/__pointer__:graph",
-                    "content": json.dumps(
-                        {
-                            "schema": "twinr_remote_snapshot_v1",
-                            "namespace": "test-namespace",
-                            "snapshot_kind": "__pointer__:graph",
-                            "updated_at": "2026-03-18T13:00:00+00:00",
-                            "body": {
-                                "schema": "twinr_remote_snapshot_pointer_v1",
-                                "version": 1,
-                                "snapshot_kind": "graph",
-                                "document_id": "graph-doc-123",
-                            },
-                        }
-                    ),
-                }
-            )
             graph_payload = {
                 "schema": "twinr_remote_snapshot_v1",
                 "namespace": "test-namespace",
@@ -729,6 +687,7 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
                     opener=FakeOpener(),
                 ),
             )
+            state._remember_snapshot_document_id(snapshot_kind="graph", document_id="graph-doc-123")
 
             first = state.load_snapshot(
                 snapshot_kind="graph",
@@ -743,35 +702,34 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
 
         self.assertEqual(first, {"schema": "graph", "nodes": [{"id": "user:main"}], "edges": []})
         self.assertEqual(second, first)
-        self.assertEqual(len(read_opener.calls), 3)
+        self.assertEqual(len(read_opener.calls), 2)
         first_query = parse_qs(urlparse(read_opener.calls[0]["full_url"]).query)
         second_query = parse_qs(urlparse(read_opener.calls[1]["full_url"]).query)
-        third_query = parse_qs(urlparse(read_opener.calls[2]["full_url"]).query)
-        self.assertEqual(first_query["origin_uri"], ["twinr://longterm/test-namespace/__pointer__%3Agraph"])
+        self.assertEqual(first_query["document_id"], ["graph-doc-123"])
         self.assertEqual(second_query["document_id"], ["graph-doc-123"])
-        self.assertEqual(third_query["document_id"], ["graph-doc-123"])
-        self.assertNotIn("origin_uri", third_query)
+        self.assertNotIn("origin_uri", first_query)
+        self.assertNotIn("origin_uri", second_query)
 
-    def test_remote_snapshot_load_rebuilds_cached_document_id_hint_after_stale_hit(self) -> None:
+    def test_remote_snapshot_load_revalidates_after_external_update_instead_of_reusing_read_learned_hint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir)
             read_opener = FakeOpener()
             read_opener.queue_json(
                 {
                     "success": True,
-                    "document_id": "pointer-doc",
-                    "origin_uri": "twinr://longterm/test-namespace/__pointer__:graph",
+                    "document_id": "pointer-doc-1",
+                    "origin_uri": "twinr://longterm/test-namespace/__pointer__:objects",
                     "content": json.dumps(
                         {
                             "schema": "twinr_remote_snapshot_v1",
                             "namespace": "test-namespace",
-                            "snapshot_kind": "__pointer__:graph",
+                            "snapshot_kind": "__pointer__:objects",
                             "updated_at": "2026-03-18T13:00:00+00:00",
                             "body": {
                                 "schema": "twinr_remote_snapshot_pointer_v1",
                                 "version": 1,
-                                "snapshot_kind": "graph",
-                                "document_id": "graph-doc-123",
+                                "snapshot_kind": "objects",
+                                "document_id": "doc-123",
                             },
                         }
                     ),
@@ -780,19 +738,118 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
             read_opener.queue_json(
                 {
                     "success": True,
-                    "document_id": "graph-doc-123",
+                    "document_id": "doc-123",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "objects",
+                            "updated_at": "2026-03-18T13:00:01+00:00",
+                            "body": {"schema": "object_store", "objects": [{"memory_id": "fact:stale"}]},
+                        }
+                    ),
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "pointer-doc-2",
+                    "origin_uri": "twinr://longterm/test-namespace/__pointer__:objects",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "__pointer__:objects",
+                            "updated_at": "2026-03-18T13:05:00+00:00",
+                            "body": {
+                                "schema": "twinr_remote_snapshot_pointer_v1",
+                                "version": 1,
+                                "snapshot_kind": "objects",
+                                "document_id": "doc-456",
+                            },
+                        }
+                    ),
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "doc-456",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "objects",
+                            "updated_at": "2026-03-18T13:05:01+00:00",
+                            "body": {"schema": "object_store", "objects": [{"memory_id": "fact:fresh"}]},
+                        }
+                    ),
+                }
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+
+            first = state.load_snapshot(snapshot_kind="objects", local_path=Path(temp_dir) / "objects.json")
+            second = state.load_snapshot(snapshot_kind="objects", local_path=Path(temp_dir) / "objects.json")
+
+        self.assertEqual(first, {"schema": "object_store", "objects": [{"memory_id": "fact:stale"}]})
+        self.assertEqual(second, {"schema": "object_store", "objects": [{"memory_id": "fact:fresh"}]})
+        self.assertEqual(len(read_opener.calls), 4)
+        third_query = parse_qs(urlparse(read_opener.calls[2]["full_url"]).query)
+        fourth_query = parse_qs(urlparse(read_opener.calls[3]["full_url"]).query)
+        self.assertEqual(third_query["origin_uri"], ["twinr://longterm/test-namespace/__pointer__%3Aobjects"])
+        self.assertEqual(fourth_query["document_id"], ["doc-456"])
+
+    def test_remote_snapshot_load_clears_stale_explicit_document_id_hint_after_stale_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            read_opener = FakeOpener()
+            read_opener.queue_http_error(404, {"detail": "not found"})
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "pointer-doc-2",
+                    "origin_uri": "twinr://longterm/test-namespace/__pointer__:graph",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "__pointer__:graph",
+                            "updated_at": "2026-03-18T13:05:00+00:00",
+                            "body": {
+                                "schema": "twinr_remote_snapshot_pointer_v1",
+                                "version": 1,
+                                "snapshot_kind": "graph",
+                                "document_id": "graph-doc-456",
+                            },
+                        }
+                    ),
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "graph-doc-456",
                     "content": json.dumps(
                         {
                             "schema": "twinr_remote_snapshot_v1",
                             "namespace": "test-namespace",
                             "snapshot_kind": "graph",
-                            "updated_at": "2026-03-18T13:00:01+00:00",
-                            "body": {"schema": "graph", "nodes": [{"id": "user:main"}], "edges": []},
+                            "updated_at": "2026-03-18T13:05:01+00:00",
+                            "body": {"schema": "graph", "nodes": [{"id": "user:next"}], "edges": []},
                         }
                     ),
                 }
             )
-            read_opener.queue_http_error(404, {"detail": "not found"})
             read_opener.queue_json(
                 {
                     "success": True,
@@ -840,6 +897,7 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
                     opener=FakeOpener(),
                 ),
             )
+            state._remember_snapshot_document_id(snapshot_kind="graph", document_id="graph-doc-123")
 
             first = state.load_snapshot(
                 snapshot_kind="graph",
@@ -852,13 +910,17 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
                 prefer_cached_document_id=True,
             )
 
-        self.assertEqual(first, {"schema": "graph", "nodes": [{"id": "user:main"}], "edges": []})
+        self.assertEqual(first, {"schema": "graph", "nodes": [{"id": "user:next"}], "edges": []})
         self.assertEqual(second, {"schema": "graph", "nodes": [{"id": "user:next"}], "edges": []})
         self.assertEqual(len(read_opener.calls), 5)
+        first_query = parse_qs(urlparse(read_opener.calls[0]["full_url"]).query)
+        second_query = parse_qs(urlparse(read_opener.calls[1]["full_url"]).query)
         third_query = parse_qs(urlparse(read_opener.calls[2]["full_url"]).query)
         fourth_query = parse_qs(urlparse(read_opener.calls[3]["full_url"]).query)
         fifth_query = parse_qs(urlparse(read_opener.calls[4]["full_url"]).query)
-        self.assertEqual(third_query["document_id"], ["graph-doc-123"])
+        self.assertEqual(first_query["document_id"], ["graph-doc-123"])
+        self.assertEqual(second_query["origin_uri"], ["twinr://longterm/test-namespace/__pointer__%3Agraph"])
+        self.assertEqual(third_query["document_id"], ["graph-doc-456"])
         self.assertEqual(fourth_query["origin_uri"], ["twinr://longterm/test-namespace/__pointer__%3Agraph"])
         self.assertEqual(fifth_query["document_id"], ["graph-doc-456"])
 

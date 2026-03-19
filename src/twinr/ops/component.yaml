@@ -7,7 +7,7 @@ summary: Provide Twinr's operational support layer for config checks, health sna
 owned_concerns:
   - Resolve canonical filesystem paths for ops artifacts, stores, self-tests, and support bundles
   - Persist sanitized operational events and provider usage telemetry as bounded JSONL stores
-  - Sample config, device, and host health for Twinr's local web UI and support workflows, including ReSpeaker runtime and host-control readiness
+  - Sample config, device, and host health for Twinr's local web UI and support workflows, including ReSpeaker runtime, host-control readiness, and conservative direction/interruption facts
   - Run a dedicated rolling remote-memory watchdog that reuses Twinr's fail-closed readiness probe
   - Persist structured probe evidence and supervisor-seeded watchdog bootstrap snapshots for required-remote debugging
   - Ensure live Pi runtimes can start that watchdog as a separate companion process

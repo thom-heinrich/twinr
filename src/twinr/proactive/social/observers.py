@@ -18,6 +18,7 @@ import time
 
 from twinr.hardware.audio import AmbientAudioLevelSample, AmbientAudioSampler
 from twinr.hardware.camera import V4L2StillCamera
+from twinr.hardware.respeaker.ambient_classification import classify_respeaker_ambient_audio
 from twinr.hardware.respeaker.models import ReSpeakerSignalSnapshot
 from twinr.hardware.respeaker.signal_provider import ReSpeakerSignalProvider
 from twinr.providers.openai import OpenAIBackend, OpenAIImageInput
@@ -214,10 +215,19 @@ class ReSpeakerAudioObservationProvider:
         """Return one audio snapshot with ReSpeaker signals overlaid when available."""
 
         signal_snapshot = self.signal_provider.observe()
-        fallback_snapshot = _observe_fallback_audio(self.fallback_observer)
+        fallback_snapshot = None
+        if signal_snapshot.assistant_output_active is not True:
+            fallback_snapshot = _observe_fallback_audio(self.fallback_observer)
         fallback_observation = (
             fallback_snapshot.observation if fallback_snapshot is not None else SocialAudioObservation()
         )
+        ambient_classification = classify_respeaker_ambient_audio(
+            signal_snapshot=signal_snapshot,
+            sample=None if fallback_snapshot is None else fallback_snapshot.sample,
+        )
+        room_quiet = signal_snapshot.room_quiet
+        if ambient_classification.non_speech_audio_likely is True:
+            room_quiet = False
         observation = SocialAudioObservation(
             speech_detected=(
                 signal_snapshot.speech_detected
@@ -225,13 +235,19 @@ class ReSpeakerAudioObservationProvider:
                 else fallback_observation.speech_detected
             ),
             distress_detected=fallback_observation.distress_detected,
-            room_quiet=signal_snapshot.room_quiet,
+            room_quiet=room_quiet,
             recent_speech_age_s=signal_snapshot.recent_speech_age_s,
+            assistant_output_active=signal_snapshot.assistant_output_active,
             azimuth_deg=signal_snapshot.azimuth_deg,
+            direction_confidence=signal_snapshot.direction_confidence,
             device_runtime_mode=signal_snapshot.device_runtime_mode,
             signal_source=signal_snapshot.source,
             host_control_ready=signal_snapshot.host_control_ready,
             transport_reason=signal_snapshot.transport_reason,
+            non_speech_audio_likely=ambient_classification.non_speech_audio_likely,
+            background_media_likely=ambient_classification.background_media_likely,
+            speech_overlap_likely=signal_snapshot.speech_overlap_likely,
+            barge_in_detected=signal_snapshot.barge_in_detected,
             mute_active=signal_snapshot.mute_active,
         )
         if fallback_snapshot is None:

@@ -202,7 +202,11 @@ class ReSpeakerSignalSnapshot:
     speech_detected: bool | None = None
     room_quiet: bool | None = None
     recent_speech_age_s: float | None = None
+    assistant_output_active: bool | None = None
     azimuth_deg: int | None = None
+    direction_confidence: float | None = None
     beam_activity: tuple[float | None, ...] | None = None
+    speech_overlap_likely: bool | None = None
+    barge_in_detected: bool | None = None
     mute_active: bool | None = None
     gpo_logic_levels: tuple[int, ...] | None = None

@@ -10,6 +10,8 @@ owned_concerns:
   - Expose a producer-facing HDMI face-expression API so camera, proactive, or other runtime modules can set combinable gaze, brow, mouth, and blink cues without writing raw JSON
   - Persist and load optional HDMI presentation cues so capabilities can expand the right-hand panel into a fullscreen image or rich card without changing the generic runtime snapshot schema
   - Resolve prioritized HDMI presentation cards into a calm scene graph with eased morph stages and default face-sync reactions
+  - Schedule rare idle-only HDMI ambient moments so the waiting face can occasionally show a small cute surprise without disrupting the status panel
+  - Fetch, cache, and rotate optional RSS or Atom headlines for the HDMI bottom ticker without blocking the display loop on remote network I/O
   - Run bounded HDMI visual QC scene sets that capture screenshots, diff metrics, and report-ready artifacts for the visible monitor surface
   - Compose operator-friendly layout variants such as the grouped debug log display
   - Derive bounded debug-log sections from persisted ops events, usage telemetry, host health, and the remote-memory watchdog artifact without poll-to-poll timer churn or raw high-frequency metric jitter
@@ -66,6 +68,8 @@ files:
       - DisplayFaceExpressionController
       - DisplayFaceGazeDirection
       - DisplayFaceMouthStyle
+  - path: news_ticker.py
+    role: Fetch, cache, and rotate bounded RSS or Atom headlines for the HDMI bottom ticker
   - path: presentation_cues.py
     role: Persist and normalize optional fullscreen HDMI presentation cues and expose producer-facing single-card and scene-card controllers
     exports:
@@ -75,6 +79,8 @@ files:
       - DisplayPresentationStore
   - path: heartbeat.py
     role: Persist display forward-progress heartbeats and expose the shared companion-health contract for ops health and supervision
+  - path: hdmi_ambient_moments.py
+    role: Resolve deterministic rare idle-only HDMI ambient moments and their temporary face cues
   - path: hdmi_default_scene.py
     role: Compose the modular senior-facing HDMI default scene, including layout, face animation, and status cards
   - path: hdmi_presentation_graph.py
@@ -110,7 +116,9 @@ primary_callers:
   - path: hardware/display/run_visual_qc.py
 tests:
   - path: test/test_display.py
+  - path: test/test_display_ambient_moments.py
   - path: test/test_display_face_cues.py
+  - path: test/test_display_news_ticker.py
   - path: test/test_display_presentation_cues.py
   - path: test/test_display_service.py
   - path: test/test_display_visual_qc.py

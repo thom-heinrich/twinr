@@ -24,6 +24,7 @@ class FakeDisplay:
             tuple[
                 str,
                 str | None,
+                str | None,
                 tuple[str, ...],
                 tuple[tuple[str, str], ...],
                 tuple[tuple[str, tuple[str, ...]], ...],
@@ -38,6 +39,7 @@ class FakeDisplay:
         status: str,
         *,
         headline: str | None = None,
+        ticker_text: str | None = None,
         details: tuple[str, ...] = (),
         state_fields: tuple[tuple[str, str], ...] = (),
         log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
@@ -45,7 +47,7 @@ class FakeDisplay:
         face_cue: DisplayFaceCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
-        self.calls.append((status, headline, details, state_fields, log_sections, animation_frame, face_cue, presentation_cue))
+        self.calls.append((status, headline, ticker_text, details, state_fields, log_sections, animation_frame, face_cue, presentation_cue))
 
 
 class IdleAnimatedDisplay(FakeDisplay):
@@ -79,6 +81,7 @@ class ReopenableDisplay:
         status: str,
         *,
         headline: str | None = None,
+        ticker_text: str | None = None,
         details: tuple[str, ...] = (),
         state_fields: tuple[tuple[str, str], ...] = (),
         log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
@@ -86,7 +89,7 @@ class ReopenableDisplay:
         face_cue: DisplayFaceCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
-        del status, headline, details, state_fields, log_sections, animation_frame, face_cue, presentation_cue
+        del status, headline, ticker_text, details, state_fields, log_sections, animation_frame, face_cue, presentation_cue
         if self.fail:
             raise RuntimeError("boom")
         if self.emit is not None:
@@ -184,7 +187,7 @@ class DisplayServiceTests(unittest.TestCase):
             self.assertEqual(
                 [
                     (status, headline, details)
-                    for status, headline, details, _fields, _logs, _frame, _cue, _presentation in display.calls
+                    for status, headline, _ticker, details, _fields, _logs, _frame, _cue, _presentation in display.calls
                 ],
                 [
                     ("waiting", "Waiting", ("Internet ok", "AI ok", "System ok", "Zeit 12:34")),
@@ -322,6 +325,7 @@ class DisplayServiceTests(unittest.TestCase):
         rendered = loop._show_status(
             "waiting",
             headline="Waiting",
+            ticker_text=None,
             details=(),
             state_fields=(),
             log_sections=(),
@@ -427,7 +431,7 @@ class DisplayServiceTests(unittest.TestCase):
 
         self.assertEqual(len(display.calls), 1)
         self.assertEqual(
-            display.calls[0][4],
+            display.calls[0][5],
             (
                 ("System Log", ("12:34 now Waiting",)),
                 ("LLM Log", ("user Hallo",)),
@@ -461,6 +465,7 @@ class DisplayServiceTests(unittest.TestCase):
         first_signature = loop._render_signature(
             status="waiting",
             headline="Waiting",
+            ticker_text=None,
             details=("Internet ok", "AI ok", "System ok", "Zeit 12:34"),
             state_fields=(
                 ("Status", "Waiting"),
@@ -481,6 +486,7 @@ class DisplayServiceTests(unittest.TestCase):
         second_signature = loop._render_signature(
             status="waiting",
             headline="Waiting",
+            ticker_text="Tagesschau · Headline",
             details=("Internet ok", "AI ok", "System ok", "Zeit 12:35"),
             state_fields=(
                 ("Status", "Waiting"),
@@ -711,13 +717,49 @@ class DisplayServiceTests(unittest.TestCase):
             loop.run(max_cycles=1)
 
         self.assertEqual(len(display.calls), 1)
-        cue = display.calls[0][6]
+        cue = display.calls[0][7]
         self.assertIsNotNone(cue)
         assert cue is not None
         self.assertEqual(cue.gaze_x, 2)
         self.assertEqual(cue.gaze_y, -1)
         self.assertEqual(cue.mouth, "smile")
         self.assertEqual(cue.brows, "inward_tilt")
+
+    def test_display_loop_forwards_news_ticker_text_to_default_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot_path = Path(temp_dir) / "state" / "runtime-state.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            store = RuntimeSnapshotStore(snapshot_path)
+            store.save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Hallo Thom",
+            )
+            display = FakeDisplay()
+            ticker_runtime = mock.Mock()
+            ticker_runtime.current_text.return_value = "Tagesschau · Major headline"
+            loop = TwinrStatusDisplayLoop(
+                config=TwinrConfig(
+                    runtime_state_path=str(snapshot_path),
+                    display_poll_interval_s=0.0,
+                    openai_api_key="sk-test",
+                ),
+                display=display,
+                snapshot_store=store,
+                emit=lambda _line: None,
+                sleep=lambda _seconds: None,
+                health_collector=lambda _config, *, snapshot=None: self.make_health(),
+                internet_probe=lambda: True,
+                clock=self.make_clock(),
+                news_ticker_runtime=ticker_runtime,
+            )
+
+            loop.run(max_cycles=1)
+
+        self.assertEqual(len(display.calls), 1)
+        self.assertEqual(display.calls[0][2], "Tagesschau · Major headline")
+        ticker_runtime.current_text.assert_called_once()
 
     def test_display_loop_forwards_active_presentation_cue_to_default_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -764,7 +806,7 @@ class DisplayServiceTests(unittest.TestCase):
             loop.run(max_cycles=1)
 
         self.assertEqual(len(display.calls), 1)
-        cue = display.calls[0][7]
+        cue = display.calls[0][8]
         self.assertIsNotNone(cue)
         assert cue is not None
         self.assertEqual(cue.kind, "rich_card")

@@ -12,7 +12,8 @@ scored proactive trigger candidates and optional visual second opinions.
 - Define the social-trigger domain models and score thresholds
 - Evaluate stateful trigger candidates from normalized observation ticks
 - Wrap ambient-audio, ReSpeaker XVF3800, legacy OpenAI vision, and local-first AI-camera observations into bounded conservative snapshots
-- Stabilize automation-facing camera snapshots, person-count/zone anchors, and event surfaces
+- Preserve conservative ReSpeaker facts such as `assistant_output_active`, `direction_confidence`, `speech_overlap_likely`, and `barge_in_detected`
+- Stabilize automation-facing camera snapshots, including person-count/zone anchors, coarse motion, and coarse/fine gesture event surfaces
 - Route safety prompts and render bounded evidence facts for proactive prompting
 - Buffer recent camera frames and request conservative visual second opinions
 
@@ -27,9 +28,9 @@ scored proactive trigger candidates and optional visual second opinions.
 | File | Purpose |
 |---|---|
 | `__init__.py` | Package export surface |
-| `camera_surface.py` | Debounced camera snapshot, person-count/zone anchor, and rising-edge event surface |
-| `engine.py` | Stateful social-trigger scoring engine |
-| `local_camera_provider.py` | Maps the local IMX500 adapter onto the social vision contract |
+| `camera_surface.py` | Debounced camera snapshot, person-count/zone anchor, coarse motion, and rising-edge coarse/fine gesture event surface |
+| `engine.py` | Stateful social-trigger scoring engine and normalized vision contract |
+| `local_camera_provider.py` | Maps the local IMX500 + MediaPipe adapter onto the social vision contract, including motion plus coarse/fine gesture output |
 | `observers.py` | Audio, ReSpeaker overlay, and vision observation providers |
 | `prompting.py` | Prompt routing and evidence rendering |
 | `scoring.py` | Weighted scoring primitives |

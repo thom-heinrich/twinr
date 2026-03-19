@@ -19,7 +19,7 @@ from twinr.agent.base_agent.config import TwinrConfig
 
 
 _SOURCE_KINDS = frozenset({"social", "reminder", "automation", "longterm"})
-_CHANNELS = frozenset({"speech", "print"})
+_CHANNELS = frozenset({"speech", "print", "display"})
 _OUTCOMES = frozenset({"delivered", "skipped"})
 _BOOL_TRUE = frozenset({"1", "true", "t", "yes", "y", "on"})
 _BOOL_FALSE = frozenset({"0", "false", "f", "no", "n", "off"})

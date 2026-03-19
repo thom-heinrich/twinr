@@ -21,8 +21,11 @@ from twinr.hardware.respeaker import (
     ReSpeakerUsbDevice,
     capture_respeaker_primitive_snapshot,
     config_targets_respeaker,
+    derive_respeaker_signal_state,
     probe_respeaker_xvf3800,
 )
+from twinr.hardware.audio import AmbientAudioLevelSample
+from twinr.hardware.respeaker.ambient_classification import classify_respeaker_ambient_audio
 from twinr.hardware.respeaker.models import (
     ReSpeakerCaptureDevice,
     ReSpeakerDirectionSnapshot,
@@ -266,7 +269,51 @@ class ReSpeakerProbeTests(unittest.TestCase):
         self.assertEqual(snapshot.direction.beam_speech_energies, (0.25, 0.5, 0.0, 0.75))
         self.assertEqual(snapshot.direction.selected_azimuth_degrees, (45.0, None))
         self.assertEqual(snapshot.mute.gpo_logic_levels, (0, 0, 0, 1, 0))
-        self.assertIsNone(snapshot.mute.mute_active)
+        self.assertFalse(snapshot.mute.mute_active)
+
+    def test_derive_signal_state_uses_fixed_beam_speech_for_confidence_overlap_and_barge_in(self) -> None:
+        direction = ReSpeakerDirectionSnapshot(
+            captured_at=10.0,
+            speech_detected=True,
+            room_quiet=False,
+            doa_degrees=88,
+            beam_azimuth_degrees=(90.0, 270.0, 180.0, 90.0),
+            beam_speech_energies=(0.5, 0.25, 0.0, 0.5),
+            selected_azimuth_degrees=(92.0, 90.0),
+        )
+
+        derived = derive_respeaker_signal_state(direction, assistant_output_active=True)
+
+        self.assertEqual(derived.fixed_beam_speech_count, 2)
+        self.assertTrue(derived.near_end_speech_detected)
+        self.assertAlmostEqual(derived.direction_confidence, 0.483, places=3)
+        self.assertTrue(derived.speech_overlap_likely)
+        self.assertTrue(derived.barge_in_detected)
+
+    def test_classify_respeaker_ambient_audio_marks_background_media_without_speech(self) -> None:
+        classification = classify_respeaker_ambient_audio(
+            signal_snapshot=type(
+                "SignalSnapshot",
+                (),
+                {
+                    "assistant_output_active": False,
+                    "host_control_ready": True,
+                    "speech_detected": False,
+                },
+            )(),
+            sample=AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=10,
+                active_chunk_count=8,
+                average_rms=1800,
+                peak_rms=3200,
+                active_ratio=0.8,
+            ),
+        )
+
+        self.assertTrue(classification.audio_activity_detected)
+        self.assertTrue(classification.non_speech_audio_likely)
+        self.assertTrue(classification.background_media_likely)
 
     def test_snapshot_service_degrades_when_transport_is_unavailable(self) -> None:
         class FakeTransport:
@@ -377,6 +424,89 @@ class ReSpeakerProbeTests(unittest.TestCase):
         self.assertTrue(second.room_quiet)
         self.assertEqual(second.azimuth_deg, 15)
         self.assertTrue(second.host_control_ready)
+
+    def test_signal_provider_requires_fixed_beam_speech_for_busy_state_barge_in(self) -> None:
+        probe = ReSpeakerProbeResult(
+            usb_device=ReSpeakerUsbDevice(
+                bus="001",
+                device="005",
+                vendor_id="2886",
+                product_id="001a",
+                description="Seeed Technology Co., Ltd. reSpeaker XVF3800 4-Mic Array",
+                raw_line="Bus 001 Device 005: ID 2886:001a Seeed Technology Co., Ltd. reSpeaker XVF3800 4-Mic Array",
+            ),
+            capture_device=ReSpeakerCaptureDevice(
+                card_index=4,
+                card_name="Array",
+                card_label="reSpeaker XVF3800 4-Mic Array",
+                device_index=0,
+                raw_line="card 4: Array [reSpeaker XVF3800 4-Mic Array], device 0: USB Audio [USB Audio]",
+            ),
+            lsusb_available=True,
+            arecord_available=True,
+        )
+        snapshots = iter(
+            (
+                ReSpeakerPrimitiveSnapshot(
+                    captured_at=10.0,
+                    probe=probe,
+                    transport=ReSpeakerTransportAvailability(backend="libusb", available=True),
+                    firmware_version=(2, 0, 7),
+                    direction=ReSpeakerDirectionSnapshot(
+                        captured_at=10.0,
+                        speech_detected=True,
+                        room_quiet=False,
+                        doa_degrees=270,
+                        beam_azimuth_degrees=(90.0, 270.0, 180.0, 148.0),
+                        beam_speech_energies=(0.0, 18_710_022.0, 9_360_130.0, 18_710_022.0),
+                        selected_azimuth_degrees=(148.0, 149.0),
+                    ),
+                    mute=ReSpeakerMuteSnapshot(
+                        captured_at=10.0,
+                        mute_active=None,
+                        gpo_logic_levels=(0, 0, 0, 1, 0),
+                    ),
+                ),
+                ReSpeakerPrimitiveSnapshot(
+                    captured_at=11.0,
+                    probe=probe,
+                    transport=ReSpeakerTransportAvailability(backend="libusb", available=True),
+                    firmware_version=(2, 0, 7),
+                    direction=ReSpeakerDirectionSnapshot(
+                        captured_at=11.0,
+                        speech_detected=True,
+                        room_quiet=False,
+                        doa_degrees=92,
+                        beam_azimuth_degrees=(90.0, 270.0, 180.0, 92.0),
+                        beam_speech_energies=(0.7, 0.65, 0.0, 0.7),
+                        selected_azimuth_degrees=(91.0, 92.0),
+                    ),
+                    mute=ReSpeakerMuteSnapshot(
+                        captured_at=11.0,
+                        mute_active=None,
+                        gpo_logic_levels=(0, 0, 0, 1, 0),
+                    ),
+                ),
+            )
+        )
+        clock_values = iter((100.0, 101.5))
+        provider = ReSpeakerSignalProvider(
+            snapshot_factory=lambda **_kwargs: next(snapshots),
+            monotonic_clock=lambda: next(clock_values),
+            assistant_output_active_predicate=lambda: True,
+        )
+
+        playback_only = provider.observe()
+        interruption = provider.observe()
+
+        self.assertIsNone(playback_only.recent_speech_age_s)
+        self.assertGreater(playback_only.direction_confidence, 0.49)
+        self.assertFalse(playback_only.speech_overlap_likely)
+        self.assertFalse(playback_only.barge_in_detected)
+        self.assertEqual(interruption.recent_speech_age_s, 0.0)
+        self.assertGreater(interruption.direction_confidence, 0.45)
+        self.assertTrue(interruption.speech_overlap_likely)
+        self.assertTrue(interruption.barge_in_detected)
 
     def test_signal_provider_degrades_conservatively_on_snapshot_failure(self) -> None:
         provider = ReSpeakerSignalProvider(

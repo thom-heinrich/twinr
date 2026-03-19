@@ -23,7 +23,7 @@ Pi-side setup, probe, and smoke-test scripts for Twinr peripherals.
 | [display/](./display) | Display backend setup and smoke tests |
 | [mic/](./mic) | Audio default-device setup and XVF3800 USB-access rule |
 | [ops/](./ops) | Pi-side productive systemd units plus Pi bootstrap helpers |
-| [piaicam/](./piaicam) | Pi AI Camera smoke tests |
+| [piaicam/](./piaicam) | Pi AI Camera smoke tests and MediaPipe model staging |
 | [pir/](./pir) | PIR setup and motion probe |
 | [printer/](./printer) | Thermal-printer CUPS setup |
 | [component.yaml](./component.yaml) | Structured directory metadata |
@@ -38,6 +38,7 @@ Retired standalone break-glass units now live only under the ignored top-level `
 python3 hardware/display/display_test.py --env-file .env
 sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match Jabra --capture-device-match reSpeaker --proactive-device-match reSpeaker --test
 sudo ./hardware/mic/setup_respeaker_access.sh
+python3 hardware/piaicam/fetch_mediapipe_models.py
 python3 hardware/piaicam/smoke_piaicam.py --profile quick
 python3 hardware/ops/bootstrap_self_coding_pi.py
 ```

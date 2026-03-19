@@ -152,6 +152,76 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_presentation_path, "state/custom/presentation.json")
         self.assertEqual(config.display_presentation_ttl_s, 18.0)
 
+    def test_from_env_reads_display_news_ticker_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_DISPLAY_NEWS_TICKER_ENABLED=true",
+                        "TWINR_DISPLAY_NEWS_TICKER_FEED_URLS=https://example.com/a.rss, https://example.com/b.atom",
+                        "TWINR_DISPLAY_NEWS_TICKER_STORE_PATH=state/custom/news.json",
+                        "TWINR_DISPLAY_NEWS_TICKER_REFRESH_INTERVAL_S=1200",
+                        "TWINR_DISPLAY_NEWS_TICKER_ROTATION_INTERVAL_S=15",
+                        "TWINR_DISPLAY_NEWS_TICKER_MAX_ITEMS=8",
+                        "TWINR_DISPLAY_NEWS_TICKER_TIMEOUT_S=3.5",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertTrue(config.display_news_ticker_enabled)
+        self.assertEqual(
+            config.display_news_ticker_feed_urls,
+            ("https://example.com/a.rss", "https://example.com/b.atom"),
+        )
+        self.assertEqual(config.display_news_ticker_store_path, "state/custom/news.json")
+        self.assertEqual(config.display_news_ticker_refresh_interval_s, 1200.0)
+        self.assertEqual(config.display_news_ticker_rotation_interval_s, 15.0)
+        self.assertEqual(config.display_news_ticker_max_items, 8)
+        self.assertEqual(config.display_news_ticker_timeout_s, 3.5)
+
+    def test_from_env_reads_local_camera_mediapipe_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_POSE_BACKEND=mediapipe",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_POSE_MODEL_PATH=state/mediapipe/models/pose.task",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_GESTURE_MODEL_PATH=state/mediapipe/models/gesture.task",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_CUSTOM_GESTURE_MODEL_PATH=state/mediapipe/models/custom.task",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_NUM_HANDS=1",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_SEQUENCE_WINDOW_S=2.4",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_SEQUENCE_MIN_FRAMES=6",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.proactive_local_camera_pose_backend, "mediapipe")
+        self.assertEqual(
+            config.proactive_local_camera_mediapipe_pose_model_path,
+            "state/mediapipe/models/pose.task",
+        )
+        self.assertEqual(
+            config.proactive_local_camera_mediapipe_gesture_model_path,
+            "state/mediapipe/models/gesture.task",
+        )
+        self.assertEqual(
+            config.proactive_local_camera_mediapipe_custom_gesture_model_path,
+            "state/mediapipe/models/custom.task",
+        )
+        self.assertEqual(config.proactive_local_camera_mediapipe_num_hands, 1)
+        self.assertEqual(config.proactive_local_camera_sequence_window_s, 2.4)
+        self.assertEqual(config.proactive_local_camera_sequence_min_frames, 6)
+
     def test_reads_openai_button_and_printer_settings_from_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -350,6 +420,12 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_PROACTIVE_GOVERNOR_PRESENCE_SESSION_PROMPT_LIMIT=3",
                         "TWINR_PROACTIVE_GOVERNOR_SOURCE_REPEAT_COOLDOWN_S=420",
                         "TWINR_PROACTIVE_GOVERNOR_HISTORY_LIMIT=96",
+                        "TWINR_PROACTIVE_VISUAL_FIRST_AUDIO_GLOBAL_COOLDOWN_S=240",
+                        "TWINR_PROACTIVE_VISUAL_FIRST_AUDIO_SOURCE_REPEAT_COOLDOWN_S=840",
+                        "TWINR_PROACTIVE_VISUAL_FIRST_CUE_HOLD_S=75",
+                        "TWINR_PROACTIVE_QUIET_HOURS_VISUAL_ONLY_ENABLED=false",
+                        "TWINR_PROACTIVE_QUIET_HOURS_START_LOCAL=22:15",
+                        "TWINR_PROACTIVE_QUIET_HOURS_END_LOCAL=06:45",
                         "TWINR_WEB_HOST=0.0.0.0",
                         "TWINR_RUNTIME_STATE_PATH=/tmp/twinr-state-test.json",
                         "TWINR_MEMORY_MARKDOWN_PATH=/tmp/twinr-memory-test.md",
@@ -662,6 +738,12 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_governor_presence_session_prompt_limit, 3)
         self.assertEqual(config.proactive_governor_source_repeat_cooldown_s, 420.0)
         self.assertEqual(config.proactive_governor_history_limit, 96)
+        self.assertEqual(config.proactive_visual_first_audio_global_cooldown_s, 240.0)
+        self.assertEqual(config.proactive_visual_first_audio_source_repeat_cooldown_s, 840.0)
+        self.assertEqual(config.proactive_visual_first_cue_hold_s, 75.0)
+        self.assertFalse(config.proactive_quiet_hours_visual_only_enabled)
+        self.assertEqual(config.proactive_quiet_hours_start_local, "22:15")
+        self.assertEqual(config.proactive_quiet_hours_end_local, "06:45")
         self.assertEqual(config.web_host, "0.0.0.0")
         self.assertEqual(config.runtime_state_path, "/tmp/twinr-state-test.json")
         self.assertEqual(config.memory_markdown_path, "/tmp/twinr-memory-test.md")
@@ -902,6 +984,12 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_governor_presence_session_prompt_limit, 2)
         self.assertEqual(config.proactive_governor_source_repeat_cooldown_s, 600.0)
         self.assertEqual(config.proactive_governor_history_limit, 128)
+        self.assertEqual(config.proactive_visual_first_audio_global_cooldown_s, 300.0)
+        self.assertEqual(config.proactive_visual_first_audio_source_repeat_cooldown_s, 900.0)
+        self.assertEqual(config.proactive_visual_first_cue_hold_s, 45.0)
+        self.assertTrue(config.proactive_quiet_hours_visual_only_enabled)
+        self.assertEqual(config.proactive_quiet_hours_start_local, "21:00")
+        self.assertEqual(config.proactive_quiet_hours_end_local, "07:00")
 
     def test_wakeword_openwakeword_threshold_allows_deployment_tuned_low_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

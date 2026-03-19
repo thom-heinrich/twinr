@@ -7,6 +7,7 @@ summary: Wire long-term memory stores, reasoning helpers, remote readiness check
 owned_concerns:
   - Assemble the runtime-facing LongTermMemoryService from config and subsystem dependencies
   - Build provider and tool-facing long-term memory context for runtime prompts
+  - Rebuild and persist restart-recall continuity packets after durable-memory mutations so confirmed stable facts survive fresh-reader restarts
   - Persist conversation turns and multimodal evidence through bounded workers and synchronous fallback paths
   - Enforce true total-deadline flush budgeting across multiple background writers
   - Verify remote-primary snapshot readiness before runtime loops depend on long-term memory state

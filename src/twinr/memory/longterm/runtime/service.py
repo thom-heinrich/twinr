@@ -56,6 +56,7 @@ from twinr.memory.longterm.proactive.planner import LongTermProactivePlanner
 from twinr.memory.longterm.proactive.state import LongTermProactivePolicy, LongTermProactiveReservationV1, LongTermProactiveStateStore
 from twinr.memory.longterm.reasoning.reflect import LongTermMemoryReflector
 from twinr.memory.longterm.retrieval.adaptive_policy import LongTermAdaptivePolicyBuilder
+from twinr.memory.longterm.retrieval.restart_recall_policy import LongTermRestartRecallPolicyCompiler
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
 from twinr.memory.longterm.reasoning.retention import LongTermRetentionPolicy
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, LongTermRemoteUnavailableError
@@ -327,6 +328,7 @@ class LongTermMemoryService:
     planner: LongTermProactivePlanner
     proactive_policy: LongTermProactivePolicy
     retention_policy: LongTermRetentionPolicy
+    restart_recall_policy_compiler: LongTermRestartRecallPolicyCompiler | None = None
     writer: AsyncLongTermMemoryWriter | None = None
     multimodal_writer: AsyncLongTermMultimodalWriter | None = None
     _store_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)  # AUDIT-FIX(#1): serialize file-backed state mutations across foreground calls and background workers.
@@ -455,6 +457,7 @@ class LongTermMemoryService:
             planner=planner,
             proactive_policy=proactive_policy,
             retention_policy=retention_policy,
+            restart_recall_policy_compiler=LongTermRestartRecallPolicyCompiler(),
             writer=writer,
             multimodal_writer=multimodal_writer,
             _store_lock=store_lock,
@@ -1292,6 +1295,7 @@ class LongTermMemoryService:
                 selected_memory_id=selected_memory_id,
             )
             self.object_store.apply_conflict_resolution(result)
+            self._refresh_restart_recall_packets_locked()
             return result
 
     def review_memory(
@@ -1336,9 +1340,11 @@ class LongTermMemoryService:
                     selected_memory_id=memory_id,
                 )
                 self.object_store.apply_conflict_resolution(result)
+                self._refresh_restart_recall_packets_locked()
                 return result
             result = self.object_store.confirm_object(memory_id)
             self.object_store.apply_memory_mutation(result)
+            self._refresh_restart_recall_packets_locked()
             return result
 
     def invalidate_memory(
@@ -1352,6 +1358,7 @@ class LongTermMemoryService:
         with self._store_lock:
             result = self.object_store.invalidate_object(memory_id, reason=reason)
             self.object_store.apply_memory_mutation(result)
+            self._refresh_restart_recall_packets_locked()
             return result
 
     def delete_memory(self, *, memory_id: str) -> LongTermMemoryMutationResultV1:
@@ -1360,6 +1367,7 @@ class LongTermMemoryService:
         with self._store_lock:
             result = self.object_store.delete_object(memory_id)
             self.object_store.apply_memory_mutation(result)
+            self._refresh_restart_recall_packets_locked()
             return result
 
     def store_explicit_memory(
@@ -1441,6 +1449,20 @@ class LongTermMemoryService:
                 writer_ok = False
             flush_ok = flush_ok and writer_ok
         return flush_ok
+
+    def _refresh_restart_recall_packets_locked(self) -> None:
+        """Refresh persistent restart-recall packets from the current durable store."""
+
+        if self.restart_recall_policy_compiler is None:
+            return
+        packets = self.restart_recall_policy_compiler.build_packets(
+            objects=self.object_store.load_objects(),
+        )
+        self.midterm_store.replace_packets_with_attribute(
+            packets=packets,
+            attribute_key="persistence_scope",
+            attribute_value="restart_recall",
+        )
 
     def shutdown(self, *, timeout_s: float = 2.0) -> None:
         """Request bounded shutdown for all configured background writers."""

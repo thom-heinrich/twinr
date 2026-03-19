@@ -25,6 +25,7 @@ from twinr.display.debug_log import LogSections, TwinrDisplayDebugLogBuilder
 from twinr.display.face_cues import DisplayFaceCue, DisplayFaceCueStore
 from twinr.display.factory import create_display_adapter
 from twinr.display.heartbeat import DisplayHeartbeatStore, save_display_heartbeat
+from twinr.display.news_ticker import DisplayNewsTickerRuntime
 from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPresentationStore
 from twinr.ops.health import TwinrSystemHealth, collect_system_health
 
@@ -115,6 +116,7 @@ class TwinrStatusDisplayLoop:
     heartbeat_store: DisplayHeartbeatStore | None = None
     face_cue_store: DisplayFaceCueStore | None = None
     presentation_cue_store: DisplayPresentationStore | None = None
+    news_ticker_runtime: DisplayNewsTickerRuntime | None = None
     _cached_health: TwinrSystemHealth | None = field(default=None, init=False, repr=False)
     _cached_health_error: str | None = field(default=None, init=False, repr=False)
     _cached_health_status: str | None = field(default=None, init=False, repr=False)
@@ -161,6 +163,7 @@ class TwinrStatusDisplayLoop:
             heartbeat_store=DisplayHeartbeatStore.from_config(config),
             face_cue_store=DisplayFaceCueStore.from_config(config),
             presentation_cue_store=DisplayPresentationStore.from_config(config),
+            news_ticker_runtime=DisplayNewsTickerRuntime.from_config(config, emit=emit or _default_emit),
         )
 
     def run(self, *, duration_s: float | None = None, max_cycles: int | None = None) -> int:
@@ -192,9 +195,11 @@ class TwinrStatusDisplayLoop:
                 frame = self._display_animation_frame(status)
                 face_cue = self._active_face_cue()
                 presentation_cue = self._active_presentation_cue()
+                ticker_text = self._ticker_text()
                 signature = self._render_signature(
                     status=status,
                     headline=headline,
+                    ticker_text=ticker_text,
                     details=details,
                     state_fields=state_fields,
                     log_sections=log_sections,
@@ -208,6 +213,7 @@ class TwinrStatusDisplayLoop:
                     if self._show_status(
                         status,
                         headline=headline,
+                        ticker_text=ticker_text,
                         details=details,
                         state_fields=state_fields,
                         log_sections=log_sections,
@@ -519,6 +525,7 @@ class TwinrStatusDisplayLoop:
         status: str,
         *,
         headline: str,
+        ticker_text: str | None,
         details: tuple[str, ...],
         state_fields: tuple[tuple[str, str], ...],
         log_sections: LogSections,
@@ -530,6 +537,7 @@ class TwinrStatusDisplayLoop:
             self.display.show_status(
                 status,
                 headline=headline,
+                ticker_text=ticker_text,
                 details=details,
                 state_fields=state_fields,
                 log_sections=log_sections,
@@ -547,6 +555,7 @@ class TwinrStatusDisplayLoop:
                 self.display.show_status(
                     status,
                     headline=headline,
+                    ticker_text=ticker_text,
                     details=details,
                     state_fields=state_fields,
                     log_sections=log_sections,
@@ -690,6 +699,16 @@ class TwinrStatusDisplayLoop:
             return 0
         return self._animation_frame(status)
 
+    def _ticker_text(self) -> str | None:
+        runtime = self.news_ticker_runtime
+        if runtime is None:
+            return None
+        try:
+            return runtime.current_text(now=self.clock())
+        except Exception as exc:
+            self._emit_error("display_news_ticker_failed", exc)
+            return None
+
     def _supports_idle_waiting_animation(self) -> bool:
         capability = getattr(self.display, "supports_idle_waiting_animation", None)
         if not callable(capability):
@@ -705,6 +724,7 @@ class TwinrStatusDisplayLoop:
         *,
         status: str,
         headline: str,
+        ticker_text: str | None,
         details: tuple[str, ...],
         state_fields: tuple[tuple[str, str], ...],
         log_sections: LogSections,
@@ -722,6 +742,7 @@ class TwinrStatusDisplayLoop:
             layout_mode,
             status,
             headline,
+            ticker_text,
             details,
             state_fields,
             log_sections,

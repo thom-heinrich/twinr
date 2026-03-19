@@ -38,6 +38,8 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
   expand the default right-hand panel into a bounded fullscreen image or rich
   card without teaching the generic runtime snapshot schema about
   presentation-only payloads
+- fetch, cache, and rotate optional RSS/Atom headlines for a calm HDMI
+  bottom-bar ticker without blocking the display loop on network I/O
 - allow optional periodic full-refresh cleanup after a bounded number of fast
   incremental updates instead of running indefinitely on fast refresh alone
 - emit bounded display-driver telemetry lines for refresh mode, clear, retry,
@@ -121,12 +123,23 @@ That path gives Twinr ownership of the visible fullscreen surface. Keep
 usable Wayland session exists.
 
 The default HDMI surface is intentionally much calmer than the operator
-`debug_log` view: solid black background, a top `TWINR` bar, an animated
+`debug_log` view: solid black background, a slim top `TWINR` bar, an animated
 white-on-black face on the left that mirrors the familiar e-paper eye/mouth
 language, and one large status box on the right with English-only headline and
-key runtime fields. That keeps the senior-facing screen glanceable from a
+key runtime fields. That headline should mirror the real runtime state
+directly, for example `Waiting`, `Listening`, `Thinking`, or `Speaking`,
+instead of restating generic readiness. On 800x480 the face should stay the
+visually dominant element, so the right-hand panel must not regrow until it
+crowds the face area. That keeps the senior-facing screen glanceable from a
 distance while `debug_log` remains the explicit diagnostics layout for
 operators.
+
+That waiting surface may also show very rare ambient moments: tiny sparkles,
+hearts, crescent moons, wave marks, curious dot clusters, or even a tiny crown
+can briefly appear near the face while the status is idle. Those moments are
+deliberately HDMI-only, deterministic, and suppressed whenever an external face
+cue or presentation is active, so the screen stays calm instead of turning
+into a noisy novelty loop.
 
 For HDMI, eye animation should stay calmer than mouth or whole-face motion:
 prefer gaze shifts, subtle blinks, and tiny head drift over large eye-resize
@@ -290,6 +303,31 @@ controller.show_scene(
 )
 ```
 
+The optional HDMI news ticker flows through `news_ticker.py`. That path stays
+separate from face and presentation cues because headline fetch, cache, and
+rotation are display-surface concerns, not generic runtime-snapshot state. It
+uses a runtime-writable cache artifact and refreshes asynchronously so the
+display loop never blocks on remote feed downloads.
+
+Configure it with:
+
+```dotenv
+TWINR_DISPLAY_NEWS_TICKER_ENABLED=true
+TWINR_DISPLAY_NEWS_TICKER_FEED_URLS=https://www.tagesschau.de/infoservices/alle-meldungen-100~rss2.xml
+TWINR_DISPLAY_NEWS_TICKER_STORE_PATH=artifacts/stores/ops/display_news_ticker.json
+TWINR_DISPLAY_NEWS_TICKER_REFRESH_INTERVAL_S=900
+TWINR_DISPLAY_NEWS_TICKER_ROTATION_INTERVAL_S=12
+TWINR_DISPLAY_NEWS_TICKER_MAX_ITEMS=12
+TWINR_DISPLAY_NEWS_TICKER_TIMEOUT_S=4
+```
+
+Behavior contract:
+- when disabled, the bottom ticker bar is omitted entirely
+- when enabled but cold, the bar shows `Loading headlines...`
+- when the last refresh failed and no cached items exist, the bar shows `Headlines unavailable.`
+- fullscreen HDMI presentations suppress the ticker while the focused surface owns the whole screen
+- when the ticker reduces vertical space too far, the right-hand status panel collapses into compact summary rows instead of letting card chrome overlap
+
 `service.py` also keeps display telemetry semantic now: `display_status=...`
 is emitted only when the user-meaningful display state changes, such as a real
 runtime status transition or a presentation stage change. Idle HDMI animation
@@ -319,10 +357,12 @@ The current default scene set covers:
 | [face_cues.py](./face_cues.py) | Optional external HDMI face-expression cue contract and store |
 | [face_expressions.py](./face_expressions.py) | Producer-facing combinable expression API for the HDMI face |
 | [heartbeat.py](./heartbeat.py) | Persist display forward-progress heartbeats and expose the shared companion-health contract for ops/supervision |
+| [hdmi_ambient_moments.py](./hdmi_ambient_moments.py) | Deterministically schedule rare idle-only HDMI ambient moments such as sparkles or hearts |
 | [hdmi_default_scene.py](./hdmi_default_scene.py) | Modular default HDMI scene model, face renderer, and status-card composition |
 | [hdmi_presentation_graph.py](./hdmi_presentation_graph.py) | Resolve prioritized HDMI presentation cards into eased morph stages and face-sync reactions |
 | [hdmi_wayland.py](./hdmi_wayland.py) | Visible fullscreen HDMI Wayland adapter |
 | [hdmi_fbdev.py](./hdmi_fbdev.py) | HDMI framebuffer fallback adapter and scene host/transport layer |
+| [news_ticker.py](./news_ticker.py) | Bounded RSS/Atom fetch, cache, and headline rotation for the HDMI ticker bar |
 | [presentation_cues.py](./presentation_cues.py) | Optional fullscreen HDMI presentation-cue contract, store, and producer-facing controller |
 | [wayland_env.py](./wayland_env.py) | Resolve and export Wayland socket/runtime details |
 | [wayland_surface_host.py](./wayland_surface_host.py) | Native Wayland/Qt surface host kept separate from rendering and scene composition |

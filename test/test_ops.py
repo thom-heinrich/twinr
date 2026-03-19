@@ -73,7 +73,9 @@ def _fake_respeaker_snapshot(
             doa_degrees=277,
             speech_detected=True,
             room_quiet=False,
+            beam_azimuth_degrees=(90.0, 270.0, 180.0, 277.0),
             beam_speech_energies=(0.1, 0.2, 0.0, 0.0),
+            selected_azimuth_degrees=(277.0, 277.0),
         ),
         mute=SimpleNamespace(
             mute_active=None,

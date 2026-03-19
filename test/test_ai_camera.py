@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import unittest
 
@@ -7,13 +8,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.hardware.ai_camera import (
     AICameraBodyPose,
     AICameraBox,
+    AICameraFineHandGesture,
     AICameraGestureEvent,
+    AICameraMotionState,
+    AICameraAdapterConfig,
     LocalAICameraAdapter,
     _classify_body_pose,
     _classify_gesture,
+    _infer_motion_state,
     _rank_pose_candidates,
     _support_pose_confidence,
 )
+from twinr.hardware.mediapipe_vision import MediaPipeVisionResult
 from twinr.hardware.ai_camera_diagnostics import capture_pose_probe
 
 
@@ -38,6 +44,84 @@ class AICameraTests(unittest.TestCase):
         self.assertFalse(observation.camera_ready)
         self.assertFalse(observation.camera_ai_ready)
         self.assertEqual(observation.camera_error, "picamera2_unavailable")
+
+    def test_adapter_uses_mediapipe_pose_backend_when_configured(self) -> None:
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                pose_backend="mediapipe",
+                mediapipe_pose_model_path="state/mediapipe/models/pose_landmarker_full.task",
+                mediapipe_gesture_model_path="state/mediapipe/models/gesture_recognizer.task",
+            )
+        )
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: SimpleNamespace(
+            person_count=1,
+            primary_person_box=AICameraBox(top=0.12, left=0.24, bottom=0.92, right=0.68),
+            primary_person_zone="center",
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: object()
+        adapter._ensure_mediapipe_pipeline = lambda: SimpleNamespace(
+            analyze=lambda **_: MediaPipeVisionResult(
+                body_pose=AICameraBodyPose.UPRIGHT,
+                pose_confidence=0.74,
+                looking_toward_device=True,
+                visual_attention_score=0.82,
+                hand_near_camera=True,
+                showing_intent_likely=True,
+                gesture_event=AICameraGestureEvent.WAVE,
+                gesture_confidence=0.69,
+                fine_hand_gesture=AICameraFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.88,
+            )
+        )
+        adapter._resolve_motion = lambda **_: (AICameraMotionState.STILL, 0.57)
+
+        observation = adapter.observe()
+
+        self.assertEqual(observation.model, "local-imx500+mediapipe")
+        self.assertEqual(observation.body_pose, AICameraBodyPose.UPRIGHT)
+        self.assertEqual(observation.gesture_event, AICameraGestureEvent.WAVE)
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.THUMBS_UP)
+        self.assertAlmostEqual(observation.fine_hand_gesture_confidence or 0.0, 0.88, places=3)
+        self.assertTrue(observation.camera_ready)
+
+    def test_adapter_reports_missing_custom_mediapipe_gesture_model_explicitly(self) -> None:
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                pose_backend="mediapipe",
+                mediapipe_pose_model_path="state/mediapipe/models/pose_landmarker_full.task",
+                mediapipe_gesture_model_path="state/mediapipe/models/gesture_recognizer.task",
+                mediapipe_custom_gesture_model_path="state/mediapipe/models/custom_gesture.task",
+            )
+        )
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: SimpleNamespace(
+            person_count=1,
+            primary_person_box=AICameraBox(top=0.12, left=0.24, bottom=0.92, right=0.68),
+            primary_person_zone="center",
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: object()
+        adapter._ensure_mediapipe_pipeline = lambda: SimpleNamespace(
+            analyze=lambda **_: (_ for _ in ()).throw(
+                FileNotFoundError("mediapipe_custom_gesture_model_missing:state/mediapipe/models/custom_gesture.task")
+            )
+        )
+
+        observation = adapter.observe()
+
+        self.assertTrue(observation.camera_online)
+        self.assertTrue(observation.camera_ready)
+        self.assertFalse(observation.camera_ai_ready)
+        self.assertEqual(observation.camera_error, "mediapipe_custom_gesture_model_missing")
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.UNKNOWN)
 
     def test_support_pose_confidence_uses_keypoint_coverage_not_raw_score_alone(self) -> None:
         box = AICameraBox(top=0.10, left=0.35, bottom=0.92, right=0.62)
@@ -138,6 +222,63 @@ class AICameraTests(unittest.TestCase):
         self.assertEqual(gesture, AICameraGestureEvent.CONFIRM)
         self.assertGreater(confidence or 0.0, 0.6)
 
+    def test_gesture_detects_wave_from_raised_lateral_arm(self) -> None:
+        box = AICameraBox(top=0.14, left=0.28, bottom=0.88, right=0.74)
+        keypoints = {
+            6: (0.58, 0.45, 0.94),
+            8: (0.67, 0.34, 0.92),
+            10: (0.79, 0.23, 0.95),
+        }
+
+        gesture, confidence = _classify_gesture(keypoints, attention_score=0.41, fallback_box=box)
+
+        self.assertEqual(gesture, AICameraGestureEvent.WAVE)
+        self.assertGreater(confidence or 0.0, 0.6)
+
+    def test_gesture_detects_arms_crossed_from_crossing_wrists(self) -> None:
+        box = AICameraBox(top=0.22, left=0.28, bottom=0.90, right=0.72)
+        keypoints = {
+            5: (0.42, 0.43, 0.93),
+            6: (0.58, 0.43, 0.94),
+            9: (0.57, 0.55, 0.95),
+            10: (0.43, 0.56, 0.95),
+        }
+
+        gesture, confidence = _classify_gesture(keypoints, attention_score=0.28, fallback_box=box)
+
+        self.assertEqual(gesture, AICameraGestureEvent.ARMS_CROSSED)
+        self.assertGreater(confidence or 0.0, 0.6)
+
+    def test_gesture_detects_two_hand_dismiss_from_symmetric_outreach(self) -> None:
+        box = AICameraBox(top=0.20, left=0.24, bottom=0.90, right=0.76)
+        keypoints = {
+            5: (0.40, 0.45, 0.91),
+            6: (0.60, 0.45, 0.92),
+            9: (0.16, 0.47, 0.94),
+            10: (0.84, 0.46, 0.95),
+        }
+
+        gesture, confidence = _classify_gesture(keypoints, attention_score=0.31, fallback_box=box)
+
+        self.assertEqual(gesture, AICameraGestureEvent.TWO_HAND_DISMISS)
+        self.assertGreater(confidence or 0.0, 0.65)
+
+    def test_gesture_detects_timeout_t_from_horizontal_and_vertical_arms(self) -> None:
+        box = AICameraBox(top=0.16, left=0.30, bottom=0.88, right=0.72)
+        keypoints = {
+            5: (0.42, 0.44, 0.92),
+            6: (0.58, 0.44, 0.93),
+            7: (0.48, 0.46, 0.90),
+            8: (0.58, 0.36, 0.91),
+            9: (0.54, 0.46, 0.94),
+            10: (0.58, 0.24, 0.95),
+        }
+
+        gesture, confidence = _classify_gesture(keypoints, attention_score=0.34, fallback_box=box)
+
+        self.assertEqual(gesture, AICameraGestureEvent.TIMEOUT_T)
+        self.assertGreater(confidence or 0.0, 0.6)
+
     def test_gesture_bbox_fallback_detects_wide_dismiss_without_shoulder_joint(self) -> None:
         box = AICameraBox(top=0.20, left=0.34, bottom=0.84, right=0.66)
         keypoints = {
@@ -161,6 +302,58 @@ class AICameraTests(unittest.TestCase):
         gesture, confidence = _classify_gesture(keypoints, attention_score=0.35, fallback_box=box)
 
         self.assertEqual(gesture, AICameraGestureEvent.NONE)
+        self.assertIsNone(confidence)
+
+    def test_motion_state_detects_approaching_from_box_growth(self) -> None:
+        state, confidence = _infer_motion_state(
+            previous_box=AICameraBox(top=0.26, left=0.34, bottom=0.70, right=0.62),
+            current_box=AICameraBox(top=0.18, left=0.28, bottom=0.84, right=0.68),
+            previous_observed_at=10.0,
+            current_observed_at=11.0,
+            previous_person_count=1,
+            current_person_count=1,
+        )
+
+        self.assertEqual(state, AICameraMotionState.APPROACHING)
+        self.assertGreater(confidence or 0.0, 0.5)
+
+    def test_motion_state_detects_walking_from_lateral_shift(self) -> None:
+        state, confidence = _infer_motion_state(
+            previous_box=AICameraBox(top=0.14, left=0.18, bottom=0.86, right=0.42),
+            current_box=AICameraBox(top=0.15, left=0.43, bottom=0.87, right=0.67),
+            previous_observed_at=20.0,
+            current_observed_at=21.2,
+            previous_person_count=1,
+            current_person_count=1,
+        )
+
+        self.assertEqual(state, AICameraMotionState.WALKING)
+        self.assertGreater(confidence or 0.0, 0.5)
+
+    def test_motion_state_detects_still_from_small_box_delta(self) -> None:
+        state, confidence = _infer_motion_state(
+            previous_box=AICameraBox(top=0.16, left=0.32, bottom=0.88, right=0.61),
+            current_box=AICameraBox(top=0.17, left=0.33, bottom=0.87, right=0.60),
+            previous_observed_at=30.0,
+            current_observed_at=31.0,
+            previous_person_count=1,
+            current_person_count=1,
+        )
+
+        self.assertEqual(state, AICameraMotionState.STILL)
+        self.assertGreater(confidence or 0.0, 0.5)
+
+    def test_motion_state_stays_unknown_when_person_count_is_not_singular(self) -> None:
+        state, confidence = _infer_motion_state(
+            previous_box=AICameraBox(top=0.16, left=0.32, bottom=0.88, right=0.61),
+            current_box=AICameraBox(top=0.17, left=0.33, bottom=0.87, right=0.60),
+            previous_observed_at=30.0,
+            current_observed_at=31.0,
+            previous_person_count=2,
+            current_person_count=1,
+        )
+
+        self.assertEqual(state, AICameraMotionState.UNKNOWN)
         self.assertIsNone(confidence)
 
     def test_pose_candidate_ranking_prefers_spatial_match_over_raw_score_spike(self) -> None:

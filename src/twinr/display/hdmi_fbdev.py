@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 import fcntl
 import math
 from pathlib import Path
@@ -166,6 +167,7 @@ class HdmiFramebufferDisplay:
         status: str,
         *,
         headline: str | None = None,
+        ticker_text: str | None = None,
         details: tuple[str, ...] = (),
         state_fields: DisplayStateFields = (),
         log_sections: DisplayLogSections = (),
@@ -178,6 +180,7 @@ class HdmiFramebufferDisplay:
         image = self.render_status_image(
             status=status,
             headline=headline,
+            ticker_text=ticker_text,
             details=details,
             state_fields=state_fields,
             log_sections=log_sections,
@@ -251,8 +254,10 @@ class HdmiFramebufferDisplay:
         state_fields: DisplayStateFields,
         log_sections: DisplayLogSections,
         animation_frame: int,
+        ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
+        render_now: datetime | None = None,
     ):
         """Render one HDMI-friendly status frame."""
 
@@ -291,11 +296,13 @@ class HdmiFramebufferDisplay:
             height=height,
             status=safe_status,
             headline=safe_headline,
+            ticker_text=ticker_text,
             helper_text=helper_text,
             state_fields=ordered_fields,
             animation_frame=animation_frame,
             face_cue=face_cue,
             presentation_cue=presentation_cue,
+            render_now=render_now,
         )
         return image
 
@@ -330,8 +337,10 @@ class HdmiFramebufferDisplay:
         helper_text: str,
         state_fields: DisplayStateFields,
         animation_frame: int,
+        ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
+        render_now: datetime | None = None,
     ) -> None:
         self._scene_renderer().draw(
             image=image,
@@ -340,11 +349,13 @@ class HdmiFramebufferDisplay:
             height=height,
             status=status,
             headline=headline,
+            ticker_text=ticker_text,
             helper_text=helper_text,
             state_fields=state_fields,
             animation_frame=animation_frame,
             face_cue=face_cue,
             presentation_cue=presentation_cue,
+            ambient_now=render_now,
         )
 
     def _state_field_value(

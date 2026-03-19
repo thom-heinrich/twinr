@@ -199,7 +199,34 @@ class LongTermMidtermTests(unittest.TestCase):
             math_packets = store.select_relevant_packets("What is 27 times 14?", limit=2)
 
         self.assertEqual([item.packet_id for item in janina_packets], ["midterm:janina_today"])
-        self.assertEqual([item.packet_id for item in math_packets], ["midterm:janina_today", "midterm:tea_shopping"])
+        self.assertEqual(math_packets, ())
+
+    def test_midterm_store_matches_compound_terms_without_off_topic_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = _config(temp_dir)
+            store = LongTermMidtermStore.from_config(config)
+            store.save_packets(
+                packets=(
+                    store.packet_type(
+                        packet_id="midterm:jam_restart",
+                        kind="adaptive_restart_recall_policy",
+                        summary="Persistent restart recall for this stable durable memory: Inzwischen magst du lieber Aprikosenmarmelade.",
+                        details="Use this packet as direct grounding after fresh runtime restarts when the current turn overlaps the same topic.",
+                        source_memory_ids=("fact:jam_preference_new",),
+                        query_hints=("preference:breakfast:jam", "bestaetigt"),
+                        attributes={"persistence_scope": "restart_recall"},
+                    ),
+                )
+            )
+
+            jam_packets = store.select_relevant_packets(
+                "Welche Marmelade ist jetzt als bestaetigt gespeichert?",
+                limit=2,
+            )
+            control_packets = store.select_relevant_packets("Was ist ein Regenbogen?", limit=2)
+
+        self.assertEqual([item.packet_id for item in jam_packets], ["midterm:jam_restart"])
+        self.assertEqual(control_packets, ())
 
     def test_ensure_remote_snapshot_seeds_empty_midterm_store(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -254,6 +281,54 @@ class LongTermMidtermTests(unittest.TestCase):
                 packets = store.load_packets()
 
         self.assertEqual([item.packet_id for item in packets], ["midterm:tea_preference"])
+
+    def test_replace_packets_with_attribute_preserves_other_packet_scopes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = _config(temp_dir)
+            store = LongTermMidtermStore.from_config(config)
+            store.save_packets(
+                packets=(
+                    store.packet_type(
+                        packet_id="midterm:reflection",
+                        kind="recent_life_bundle",
+                        summary="Reflection packet",
+                        source_memory_ids=("fact:reflection",),
+                        query_hints=("reflection",),
+                        sensitivity="normal",
+                    ),
+                    store.packet_type(
+                        packet_id="adaptive:restart:old",
+                        kind="adaptive_restart_recall_policy",
+                        summary="Old restart packet",
+                        source_memory_ids=("fact:old",),
+                        query_hints=("old",),
+                        sensitivity="normal",
+                        attributes={"persistence_scope": "restart_recall"},
+                    ),
+                )
+            )
+
+            store.replace_packets_with_attribute(
+                packets=(
+                    store.packet_type(
+                        packet_id="adaptive:restart:new",
+                        kind="adaptive_restart_recall_policy",
+                        summary="New restart packet",
+                        source_memory_ids=("fact:new",),
+                        query_hints=("new",),
+                        sensitivity="normal",
+                        attributes={"persistence_scope": "restart_recall"},
+                    ),
+                ),
+                attribute_key="persistence_scope",
+                attribute_value="restart_recall",
+            )
+            loaded = store.load_packets()
+
+        self.assertEqual(
+            [item.packet_id for item in loaded],
+            ["adaptive:restart:new", "midterm:reflection"],
+        )
 
     def test_retriever_includes_midterm_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

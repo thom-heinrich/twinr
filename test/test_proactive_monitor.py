@@ -19,8 +19,11 @@ from twinr.proactive import (
     PresenceSessionSnapshot,
     SocialAudioObservation,
     SocialBodyPose,
+    SocialObservation,
     SocialPersonZone,
+    SocialTriggerDecision,
     SocialTriggerEngine,
+    SocialTriggerPriority,
     SocialVisionObservation,
     WakewordMatch,
     WakewordStreamDetection,
@@ -30,6 +33,7 @@ from twinr.proactive import (
 )
 from twinr.proactive.social.observers import ReSpeakerAudioObservationProvider
 from twinr.proactive.social.vision_review import ProactiveVisionReview
+from twinr.proactive.runtime.audio_policy import ReSpeakerAudioPolicySnapshot
 from twinr.runtime import TwinrRuntime
 
 
@@ -345,7 +349,11 @@ class ProactiveMonitorTests(unittest.TestCase):
                 speech_detected=True,
                 room_quiet=False,
                 recent_speech_age_s=0.0,
+                assistant_output_active=False,
                 azimuth_deg=277,
+                direction_confidence=0.88,
+                speech_overlap_likely=False,
+                barge_in_detected=False,
             )
         )
         fallback = FakeAudioObserver(
@@ -372,11 +380,49 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertTrue(snapshot.observation.speech_detected)
         self.assertTrue(snapshot.observation.distress_detected)
         self.assertEqual(snapshot.observation.azimuth_deg, 277)
+        self.assertEqual(snapshot.observation.direction_confidence, 0.88)
         self.assertEqual(snapshot.observation.device_runtime_mode, "audio_ready")
         self.assertEqual(snapshot.observation.signal_source, "respeaker_xvf3800")
         self.assertTrue(snapshot.observation.host_control_ready)
         self.assertIsNotNone(snapshot.sample)
         self.assertIs(snapshot.signal_snapshot, signal_provider.snapshot)
+
+    def test_respeaker_audio_observer_skips_fallback_sampling_while_assistant_output_is_active(self) -> None:
+        signal_provider = FakeReSpeakerSignalProvider(
+            ReSpeakerSignalSnapshot(
+                captured_at=10.0,
+                source="respeaker_xvf3800",
+                source_type="observed",
+                sensor_window_ms=1000,
+                device_runtime_mode="audio_ready",
+                host_control_ready=True,
+                speech_detected=True,
+                room_quiet=False,
+                recent_speech_age_s=0.0,
+                assistant_output_active=True,
+                azimuth_deg=92,
+                direction_confidence=0.97,
+                speech_overlap_likely=False,
+                barge_in_detected=True,
+            )
+        )
+        fallback = FakeAudioObserver(
+            SocialAudioObservation(
+                speech_detected=False,
+                distress_detected=True,
+            )
+        )
+        observer = ReSpeakerAudioObservationProvider(
+            signal_provider=signal_provider,
+            fallback_observer=fallback,
+        )
+
+        snapshot = observer.observe()
+
+        self.assertEqual(fallback.calls, 0)
+        self.assertTrue(snapshot.observation.assistant_output_active)
+        self.assertTrue(snapshot.observation.barge_in_detected)
+        self.assertIsNone(snapshot.sample)
 
     def test_coordinator_triggers_person_returned_after_absence(self) -> None:
         config = TwinrConfig(
@@ -577,10 +623,169 @@ class ProactiveMonitorTests(unittest.TestCase):
         result = coordinator.tick()
 
         self.assertFalse(result.inspected)
+
+    def test_coordinator_observes_audio_while_runtime_is_answering(self) -> None:
+        config = TwinrConfig(
+            proactive_enabled=True,
+            proactive_capture_interval_s=1.0,
+            proactive_motion_window_s=20.0,
+        )
+        runtime = TwinrRuntime(config=config)
+        runtime.begin_proactive_prompt("Hallo")
+        audio_observer = FakeAudioObserver(
+            SocialAudioObservation(
+                speech_detected=True,
+                assistant_output_active=True,
+                barge_in_detected=True,
+            )
+        )
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(),
+            trigger_handler=lambda _decision: True,
+            vision_observer=None,
+            audio_observer=audio_observer,
+            pir_monitor=FakePirMonitor(events=[False], level=False),
+            emit=lambda _line: None,
+            clock=MutableClock(0.0),
+        )
+
+        result = coordinator.tick()
+
+        self.assertEqual(audio_observer.calls, 1)
         self.assertIsNone(result.decision)
-        self.assertEqual(vision_observer.calls, 0)
-        self.assertEqual(audio_observer.calls, 0)
+        self.assertIsNone(result.wakeword_match)
+
+    def test_coordinator_suppresses_trigger_when_resume_window_is_open(self) -> None:
+        config = TwinrConfig(
+            proactive_enabled=True,
+            proactive_capture_interval_s=1.0,
+            proactive_motion_window_s=20.0,
+        )
+        runtime = TwinrRuntime(config=config)
+        emitted: list[str] = []
+        handled: list[str] = []
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(),
+            trigger_handler=lambda decision: handled.append(decision.trigger_id) or True,
+            vision_observer=None,
+            pir_monitor=FakePirMonitor(level=False),
+            emit=emitted.append,
+            clock=MutableClock(10.0),
+        )
+
+        result = coordinator._process_decision(
+            now=10.0,
+            decision=SocialTriggerDecision(
+                trigger_id="attention_window",
+                prompt="Kann ich dir helfen?",
+                reason="short quiet attention window",
+                observed_at=10.0,
+                priority=SocialTriggerPriority.ATTENTION_WINDOW,
+                score=0.92,
+                threshold=0.86,
+            ),
+            observation=SocialObservation(
+                observed_at=10.0,
+                inspected=False,
+                pir_motion_detected=False,
+                low_motion=False,
+                vision=SocialVisionObservation(person_visible=False),
+                audio=SocialAudioObservation(speech_detected=False),
+            ),
+            inspected=False,
+            presence_snapshot=PresenceSessionSnapshot(
+                armed=True,
+                reason="recent_person_visible",
+                person_visible=False,
+                session_id=7,
+            ),
+            audio_policy_snapshot=ReSpeakerAudioPolicySnapshot(
+                observed_at=10.0,
+                recent_follow_up_speech=True,
+                barge_in_recent=True,
+                resume_window_open=True,
+                initiative_block_reason="resume_window_open",
+            ),
+        )
+
+        self.assertIsNone(result.decision)
         self.assertEqual(handled, [])
+        self.assertIn("social_trigger_skipped=resume_window_open", emitted)
+        skip_events = [entry for entry in runtime.ops_events.tail(limit=10) if entry.get("event") == "social_trigger_skipped"]
+        self.assertEqual(skip_events[-1]["data"]["reason"], "resume_window_open")
+
+    def test_coordinator_records_explicit_respeaker_runtime_alerts(self) -> None:
+        config = TwinrConfig(
+            proactive_enabled=True,
+            proactive_capture_interval_s=1.0,
+            proactive_motion_window_s=20.0,
+        )
+        runtime = TwinrRuntime(config=config)
+        emitted: list[str] = []
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(),
+            trigger_handler=lambda _decision: True,
+            vision_observer=None,
+            pir_monitor=FakePirMonitor(level=False),
+            emit=emitted.append,
+            clock=MutableClock(5.0),
+        )
+
+        coordinator._record_observation_if_changed(
+            SocialObservation(
+                observed_at=5.0,
+                inspected=False,
+                pir_motion_detected=False,
+                low_motion=False,
+                vision=SocialVisionObservation(person_visible=False),
+                audio=SocialAudioObservation(
+                    speech_detected=False,
+                    device_runtime_mode="usb_visible_no_capture",
+                    host_control_ready=False,
+                ),
+            ),
+            inspected=True,
+            audio_policy_snapshot=ReSpeakerAudioPolicySnapshot(
+                observed_at=5.0,
+                mute_blocks_voice_capture=True,
+                runtime_alert_code="dfu_mode",
+                runtime_alert_message="ReSpeaker is visible on USB but has no ALSA capture device.",
+            ),
+            runtime_status_value="waiting",
+        )
+        coordinator._record_observation_if_changed(
+            SocialObservation(
+                observed_at=7.0,
+                inspected=False,
+                pir_motion_detected=False,
+                low_motion=False,
+                vision=SocialVisionObservation(person_visible=False),
+                audio=SocialAudioObservation(
+                    speech_detected=False,
+                    device_runtime_mode="audio_ready",
+                    host_control_ready=True,
+                ),
+            ),
+            inspected=True,
+            audio_policy_snapshot=ReSpeakerAudioPolicySnapshot(
+                observed_at=7.0,
+                mute_blocks_voice_capture=False,
+                runtime_alert_code="ready",
+                runtime_alert_message="ReSpeaker capture and host-control are ready.",
+            ),
+            runtime_status_value="waiting",
+        )
+
+        alerts = [entry for entry in runtime.ops_events.tail(limit=10) if entry.get("event") == "respeaker_runtime_alert"]
+        self.assertEqual([entry["data"]["alert_code"] for entry in alerts[-2:]], ["dfu_mode", "ready"])
+        self.assertIn("respeaker_runtime_alert=dfu_mode", emitted)
+        self.assertIn("respeaker_runtime_alert=ready", emitted)
 
     def test_coordinator_does_not_inspect_without_recent_motion(self) -> None:
         config = TwinrConfig(proactive_enabled=True)
@@ -1367,9 +1572,20 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(first_facts["camera"]["person_visible"], True)
         self.assertEqual(first_facts["vad"]["speech_detected"], True)
         self.assertEqual(first_facts["vad"]["signal_source"], "respeaker_xvf3800")
+        self.assertEqual(first_facts["vad"]["assistant_output_active"], None)
         self.assertEqual(first_facts["respeaker"]["runtime_mode"], "audio_ready")
         self.assertEqual(first_facts["respeaker"]["azimuth_deg"], 277)
+        self.assertEqual(first_facts["respeaker"]["direction_confidence"], None)
+        self.assertEqual(first_facts["respeaker"]["speech_overlap_likely"], None)
+        self.assertEqual(first_facts["respeaker"]["barge_in_detected"], None)
         self.assertEqual(first_facts["respeaker"]["host_control_ready"], True)
+        self.assertEqual(first_facts["audio_policy"]["presence_audio_active"], True)
+        self.assertEqual(first_facts["audio_policy"]["recent_follow_up_speech"], False)
+        self.assertEqual(first_facts["audio_policy"]["room_busy_or_overlapping"], None)
+        self.assertEqual(first_facts["audio_policy"]["quiet_window_open"], False)
+        self.assertEqual(first_facts["audio_policy"]["resume_window_open"], False)
+        self.assertEqual(first_facts["audio_policy"]["initiative_block_reason"], "presence_audio_active")
+        self.assertEqual(first_facts["audio_policy"]["runtime_alert_code"], "ready")
         self.assertEqual(second_events, ())
         self.assertGreaterEqual(second_facts["camera"]["person_visible_for_s"], 6.0)
 

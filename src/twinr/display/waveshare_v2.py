@@ -215,6 +215,7 @@ class WaveshareEPD4In2V2:
         status: str,
         *,
         headline: str | None = None,
+        ticker_text: str | None = None,
         details: tuple[str, ...] = (),
         state_fields: tuple[tuple[str, str], ...] = (),
         log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
@@ -233,7 +234,7 @@ class WaveshareEPD4In2V2:
             animation_frame: Precomputed animation frame index.
             face_cue: Optional HDMI-only expression cue. Ignored on Waveshare.
         """
-        del face_cue, presentation_cue
+        del ticker_text, face_cue, presentation_cue
         safe_status = self._normalise_text(status, fallback="status").lower() or "status"
         safe_headline = self._normalise_text(headline, fallback=safe_status.title())
         self._set_trace_surface_context(

@@ -522,7 +522,7 @@ class TwinrRealtimeHardwareLoop(
     def _handle_green_turn(self) -> None:
         self._run_conversation_session(initial_source="button")
 
-    def _run_proactive_follow_up(self, trigger: SocialTriggerDecision) -> None:
+    def _run_proactive_follow_up(self, trigger: SocialTriggerDecision) -> bool:
         try:  # AUDIT-FIX(#4): Keep proactive background monitoring alive when hands-free follow-up fails.
             self.emit("proactive_listen=true")
             self._record_event(
@@ -531,12 +531,13 @@ class TwinrRealtimeHardwareLoop(
                 trigger=trigger.trigger_id,
                 timeout_s=self.config.conversation_follow_up_timeout_s,
             )
-            self._run_conversation_session(
+            return self._run_conversation_session(
                 initial_source="proactive",
                 proactive_trigger=trigger.trigger_id,
             )
         except Exception as exc:
             self._handle_error(exc)
+            return False
 
     def _follow_up_allowed_for_source(self, *, initial_source: str) -> bool:
         if not self.config.conversation_follow_up_enabled:

@@ -36,6 +36,7 @@ from twinr.memory.longterm.core.models import (
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, LongTermRemoteUnavailableError
 from twinr.memory.reminders import now_in_timezone
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority, WakewordMatch
+from twinr.proactive.runtime.audio_policy import ReSpeakerAudioPolicySnapshot
 from twinr.providers.openai import OpenAITextResponse
 from twinr.providers.openai.realtime import OpenAIRealtimeTurn
 from twinr.realtime_runner import TwinrRealtimeHardwareLoop
@@ -904,6 +905,27 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 config.long_term_memory_path,
                 temp_root / "state" / "chonkydb",
                 default="state/chonkydb",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
+            ),
+            display_face_cue_path=self._sandbox_path(
+                config.display_face_cue_path,
+                temp_root / "artifacts" / "stores" / "ops" / "display_face_cue.json",
+                default="artifacts/stores/ops/display_face_cue.json",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
+            ),
+            display_presentation_path=self._sandbox_path(
+                config.display_presentation_path,
+                temp_root / "artifacts" / "stores" / "ops" / "display_presentation.json",
+                default="artifacts/stores/ops/display_presentation.json",
+                project_root=original_project_root,
+                sandbox_project_default=sandbox_project_default,
+            ),
+            display_news_ticker_store_path=self._sandbox_path(
+                config.display_news_ticker_store_path,
+                temp_root / "artifacts" / "stores" / "ops" / "display_news_ticker.json",
+                default="artifacts/stores/ops/display_news_ticker.json",
                 project_root=original_project_root,
                 sandbox_project_default=sandbox_project_default,
             ),
@@ -3761,6 +3783,50 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertTrue(social_events)
         self.assertEqual(social_events[-1]["data"]["prompt"], "Brauchst du Hilfe?")
         self.assertEqual(social_events[-1]["data"]["prompt_mode"], "direct_safety")
+
+    def test_social_trigger_uses_visual_first_delivery_when_background_media_is_active(self) -> None:
+        config = TwinrConfig(proactive_quiet_hours_visual_only_enabled=False)
+        proactive_monitor = SimpleNamespace(
+            coordinator=SimpleNamespace(
+                latest_audio_policy_snapshot=ReSpeakerAudioPolicySnapshot(
+                    observed_at=42.0,
+                    speech_delivery_defer_reason="background_media_active",
+                    background_media_likely=True,
+                ),
+            )
+        )
+        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
+            config=config,
+            proactive_monitor=proactive_monitor,
+        )
+
+        spoke = loop.handle_social_trigger(
+            SocialTriggerDecision(
+                trigger_id="attention_window",
+                prompt="Soll ich dir helfen?",
+                reason="User seems attentive and quiet.",
+                observed_at=42.0,
+                priority=SocialTriggerPriority.ATTENTION_WINDOW,
+            )
+        )
+
+        presentation_path = Path(loop.config.display_presentation_path)
+        payload = json.loads(presentation_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(spoke)
+        self.assertEqual(print_backend.proactive_calls, [])
+        self.assertEqual(player.played, [])
+        self.assertIn("social_prompt_mode=display_first", lines)
+        self.assertIn("social_display_reason=background_media_active", lines)
+        self.assertEqual(payload["title"], "Soll ich dir helfen?")
+        social_events = [
+            entry
+            for entry in loop.runtime.ops_events.tail(limit=20)
+            if entry["event"] == "social_trigger_displayed"
+            and entry.get("data", {}).get("trigger") == "attention_window"
+        ]
+        self.assertEqual(len(social_events), 1)
+        self.assertEqual(social_events[0]["data"]["display_reason"], "background_media_active")
 
     def test_social_trigger_is_skipped_when_runtime_is_busy(self) -> None:
         loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from urllib.error import URLError
 
 from twinr.memory.chonkydb.client import ChonkyDBError
+from twinr.memory.longterm.storage.remote_read_observability import record_remote_read_observation
 
 if TYPE_CHECKING:
     from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore
@@ -327,3 +328,11 @@ def _record_remote_request_diagnostic(
         )
     except Exception:
         _LOG.warning("Failed to append remote long-term %s diagnostic event.", normalized_request_kind, exc_info=True)
+    if normalized_request_kind == "read":
+        record_remote_read_observation(
+            remote_state=remote_state,
+            context=context,
+            latency_ms=elapsed_ms,
+            outcome=normalized_outcome,
+            classification=classification,
+        )

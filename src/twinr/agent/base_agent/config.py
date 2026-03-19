@@ -331,6 +331,13 @@ class TwinrConfig:
     proactive_vision_provider: str = "local_first"
     proactive_local_camera_detection_network_path: str = "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk"
     proactive_local_camera_pose_network_path: str = "/usr/share/imx500-models/imx500_network_posenet.rpk"
+    proactive_local_camera_pose_backend: str = "mediapipe"
+    proactive_local_camera_mediapipe_pose_model_path: str = "state/mediapipe/models/pose_landmarker_full.task"
+    proactive_local_camera_mediapipe_gesture_model_path: str = "state/mediapipe/models/gesture_recognizer.task"
+    proactive_local_camera_mediapipe_custom_gesture_model_path: str | None = None
+    proactive_local_camera_mediapipe_num_hands: int = 2
+    proactive_local_camera_sequence_window_s: float = 1.6
+    proactive_local_camera_sequence_min_frames: int = 4
     proactive_local_camera_source_device: str = "imx500"
     proactive_local_camera_frame_rate: int = 10
     proactive_local_camera_lock_timeout_s: float = 5.0
@@ -414,6 +421,12 @@ class TwinrConfig:
     proactive_governor_presence_session_prompt_limit: int = 2
     proactive_governor_source_repeat_cooldown_s: float = 10.0 * 60.0
     proactive_governor_history_limit: int = 128
+    proactive_visual_first_audio_global_cooldown_s: float = 5.0 * 60.0
+    proactive_visual_first_audio_source_repeat_cooldown_s: float = 15.0 * 60.0
+    proactive_visual_first_cue_hold_s: float = 45.0
+    proactive_quiet_hours_visual_only_enabled: bool = True
+    proactive_quiet_hours_start_local: str = "21:00"
+    proactive_quiet_hours_end_local: str = "07:00"
     web_host: str = "0.0.0.0"
     web_port: int = 1337
     runtime_state_path: str = "/tmp/twinr-runtime-state.json"
@@ -529,6 +542,13 @@ class TwinrConfig:
     display_runtime_trace_enabled: bool = False
     display_poll_interval_s: float = 0.5
     display_layout: str = "default"
+    display_news_ticker_enabled: bool = False
+    display_news_ticker_feed_urls: tuple[str, ...] = ()
+    display_news_ticker_store_path: str = "artifacts/stores/ops/display_news_ticker.json"
+    display_news_ticker_refresh_interval_s: float = 900.0
+    display_news_ticker_rotation_interval_s: float = 12.0
+    display_news_ticker_max_items: int = 12
+    display_news_ticker_timeout_s: float = 4.0
     printer_queue: str = "Thermal_GP58"
     printer_device_uri: str | None = None
     printer_header_text: str = "TWINR.com"
@@ -569,6 +589,19 @@ class TwinrConfig:
         if not math.isfinite(normalized_display_presentation_ttl_s):
             raise ValueError("display_presentation_ttl_s must be finite")
         normalized_display_presentation_ttl_s = max(0.1, normalized_display_presentation_ttl_s)
+        normalized_display_news_ticker_refresh_interval_s = float(self.display_news_ticker_refresh_interval_s)
+        if not math.isfinite(normalized_display_news_ticker_refresh_interval_s):
+            raise ValueError("display_news_ticker_refresh_interval_s must be finite")
+        normalized_display_news_ticker_refresh_interval_s = max(30.0, normalized_display_news_ticker_refresh_interval_s)
+        normalized_display_news_ticker_rotation_interval_s = float(self.display_news_ticker_rotation_interval_s)
+        if not math.isfinite(normalized_display_news_ticker_rotation_interval_s):
+            raise ValueError("display_news_ticker_rotation_interval_s must be finite")
+        normalized_display_news_ticker_rotation_interval_s = max(4.0, normalized_display_news_ticker_rotation_interval_s)
+        normalized_display_news_ticker_timeout_s = float(self.display_news_ticker_timeout_s)
+        if not math.isfinite(normalized_display_news_ticker_timeout_s):
+            raise ValueError("display_news_ticker_timeout_s must be finite")
+        normalized_display_news_ticker_timeout_s = max(0.5, normalized_display_news_ticker_timeout_s)
+        normalized_display_news_ticker_max_items = max(1, int(self.display_news_ticker_max_items))
         normalized_display_face_cue_path = (
             str(self.display_face_cue_path or "artifacts/stores/ops/display_face_cue.json").strip()
             or "artifacts/stores/ops/display_face_cue.json"
@@ -576,6 +609,16 @@ class TwinrConfig:
         normalized_display_presentation_path = (
             str(self.display_presentation_path or "artifacts/stores/ops/display_presentation.json").strip()
             or "artifacts/stores/ops/display_presentation.json"
+        )
+        normalized_proactive_quiet_hours_start_local = (
+            str(self.proactive_quiet_hours_start_local or "21:00").strip() or "21:00"
+        )
+        normalized_proactive_quiet_hours_end_local = (
+            str(self.proactive_quiet_hours_end_local or "07:00").strip() or "07:00"
+        )
+        normalized_display_news_ticker_store_path = (
+            str(self.display_news_ticker_store_path or "artifacts/stores/ops/display_news_ticker.json").strip()
+            or "artifacts/stores/ops/display_news_ticker.json"
         )
         object.__setattr__(self, "long_term_memory_mode", normalized_mode)
         object.__setattr__(
@@ -589,7 +632,22 @@ class TwinrConfig:
         object.__setattr__(self, "display_face_cue_ttl_s", normalized_display_face_cue_ttl_s)
         object.__setattr__(self, "display_presentation_path", normalized_display_presentation_path)
         object.__setattr__(self, "display_presentation_ttl_s", normalized_display_presentation_ttl_s)
+        object.__setattr__(self, "display_news_ticker_store_path", normalized_display_news_ticker_store_path)
+        object.__setattr__(
+            self,
+            "display_news_ticker_refresh_interval_s",
+            normalized_display_news_ticker_refresh_interval_s,
+        )
+        object.__setattr__(
+            self,
+            "display_news_ticker_rotation_interval_s",
+            normalized_display_news_ticker_rotation_interval_s,
+        )
+        object.__setattr__(self, "display_news_ticker_max_items", normalized_display_news_ticker_max_items)
+        object.__setattr__(self, "display_news_ticker_timeout_s", normalized_display_news_ticker_timeout_s)
         object.__setattr__(self, "display_layout", normalized_display_layout)
+        object.__setattr__(self, "proactive_quiet_hours_start_local", normalized_proactive_quiet_hours_start_local)
+        object.__setattr__(self, "proactive_quiet_hours_end_local", normalized_proactive_quiet_hours_end_local)
 
     @property
     def button_gpios(self) -> dict[str, int]:
@@ -1107,6 +1165,36 @@ class TwinrConfig:
                 )
                 or "/usr/share/imx500-models/imx500_network_posenet.rpk"
             ),
+            proactive_local_camera_pose_backend=(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_POSE_BACKEND", "mediapipe") or "mediapipe"
+            ).strip().lower(),
+            proactive_local_camera_mediapipe_pose_model_path=(
+                get_value(
+                    "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_POSE_MODEL_PATH",
+                    "state/mediapipe/models/pose_landmarker_full.task",
+                )
+                or "state/mediapipe/models/pose_landmarker_full.task"
+            ),
+            proactive_local_camera_mediapipe_gesture_model_path=(
+                get_value(
+                    "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_GESTURE_MODEL_PATH",
+                    "state/mediapipe/models/gesture_recognizer.task",
+                )
+                or "state/mediapipe/models/gesture_recognizer.task"
+            ),
+            proactive_local_camera_mediapipe_custom_gesture_model_path=(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_CUSTOM_GESTURE_MODEL_PATH") or None
+            ),
+            proactive_local_camera_mediapipe_num_hands=int(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_NUM_HANDS", "2") or "2"
+            ),
+            proactive_local_camera_sequence_window_s=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_SEQUENCE_WINDOW_S"),
+                1.6,
+            ),
+            proactive_local_camera_sequence_min_frames=int(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_SEQUENCE_MIN_FRAMES", "4") or "4"
+            ),
             proactive_local_camera_source_device=(
                 get_value("TWINR_PROACTIVE_LOCAL_CAMERA_SOURCE_DEVICE", "imx500") or "imx500"
             ),
@@ -1399,6 +1487,32 @@ class TwinrConfig:
             proactive_governor_history_limit=int(
                 get_value("TWINR_PROACTIVE_GOVERNOR_HISTORY_LIMIT", "128") or "128"
             ),
+            proactive_visual_first_audio_global_cooldown_s=_parse_float(
+                get_value("TWINR_PROACTIVE_VISUAL_FIRST_AUDIO_GLOBAL_COOLDOWN_S"),
+                5.0 * 60.0,
+            ),
+            proactive_visual_first_audio_source_repeat_cooldown_s=_parse_float(
+                get_value("TWINR_PROACTIVE_VISUAL_FIRST_AUDIO_SOURCE_REPEAT_COOLDOWN_S"),
+                15.0 * 60.0,
+            ),
+            proactive_visual_first_cue_hold_s=_parse_float(
+                get_value("TWINR_PROACTIVE_VISUAL_FIRST_CUE_HOLD_S"),
+                45.0,
+            ),
+            proactive_quiet_hours_visual_only_enabled=_parse_bool(
+                get_value("TWINR_PROACTIVE_QUIET_HOURS_VISUAL_ONLY_ENABLED"),
+                True,
+            ),
+            proactive_quiet_hours_start_local=get_value(
+                "TWINR_PROACTIVE_QUIET_HOURS_START_LOCAL",
+                "21:00",
+            )
+            or "21:00",
+            proactive_quiet_hours_end_local=get_value(
+                "TWINR_PROACTIVE_QUIET_HOURS_END_LOCAL",
+                "07:00",
+            )
+            or "07:00",
             web_host=get_value("TWINR_WEB_HOST", "0.0.0.0") or "0.0.0.0",
             web_port=int(get_value("TWINR_WEB_PORT", "1337") or "1337"),
             runtime_state_path=get_value(
@@ -1707,6 +1821,32 @@ class TwinrConfig:
             display_runtime_trace_enabled=_parse_bool(get_value("TWINR_DISPLAY_RUNTIME_TRACE_ENABLED"), False),
             display_poll_interval_s=_parse_float(get_value("TWINR_DISPLAY_POLL_INTERVAL_S"), 0.5),
             display_layout=get_value("TWINR_DISPLAY_LAYOUT", "default") or "default",
+            display_news_ticker_enabled=_parse_bool(get_value("TWINR_DISPLAY_NEWS_TICKER_ENABLED"), False),
+            display_news_ticker_feed_urls=_parse_csv_strings(
+                get_value("TWINR_DISPLAY_NEWS_TICKER_FEED_URLS"),
+                (),
+            ),
+            display_news_ticker_store_path=get_value(
+                "TWINR_DISPLAY_NEWS_TICKER_STORE_PATH",
+                "artifacts/stores/ops/display_news_ticker.json",
+            )
+            or "artifacts/stores/ops/display_news_ticker.json",
+            display_news_ticker_refresh_interval_s=_parse_float(
+                get_value("TWINR_DISPLAY_NEWS_TICKER_REFRESH_INTERVAL_S"),
+                900.0,
+                minimum=30.0,
+            ),
+            display_news_ticker_rotation_interval_s=_parse_float(
+                get_value("TWINR_DISPLAY_NEWS_TICKER_ROTATION_INTERVAL_S"),
+                12.0,
+                minimum=4.0,
+            ),
+            display_news_ticker_max_items=int(get_value("TWINR_DISPLAY_NEWS_TICKER_MAX_ITEMS", "12") or "12"),
+            display_news_ticker_timeout_s=_parse_float(
+                get_value("TWINR_DISPLAY_NEWS_TICKER_TIMEOUT_S"),
+                4.0,
+                minimum=0.5,
+            ),
             printer_queue=get_value("TWINR_PRINTER_QUEUE", "Thermal_GP58") or "Thermal_GP58",
             printer_device_uri=get_value("TWINR_PRINTER_DEVICE_URI"),
             printer_header_text=get_value("TWINR_PRINTER_HEADER_TEXT", "TWINR.com") or "TWINR.com",

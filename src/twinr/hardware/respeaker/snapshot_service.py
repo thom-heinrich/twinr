@@ -47,7 +47,7 @@ def capture_respeaker_primitive_snapshot(
     )
     mute = ReSpeakerMuteSnapshot(
         captured_at=direction_time,
-        mute_active=None,
+        mute_active=_mute_active(raw_reads.get("GPO_READ_VALUES")),
         gpo_logic_levels=_int_tuple(raw_reads.get("GPO_READ_VALUES"), expected_count=5),
     )
 
@@ -109,6 +109,21 @@ def _degrees_or_none(value: float | None) -> float | None:
     if not math.isfinite(normalized):
         return None
     return math.degrees(normalized) % 360.0
+
+
+def _mute_active(read: ReSpeakerParameterRead | None) -> bool | None:
+    """Return whether the XVF3800 mute control pin is currently asserted.
+
+    Seeed documents ``GPO_READ_VALUES`` in the order ``X0D11, X0D30, X0D31,
+    X0D33, X0D39`` and states that pin ``X0D30`` drives the microphone mute
+    circuit plus the red mute LED. A high level therefore means the microphones
+    are muted.
+    """
+
+    values = _int_tuple(read, expected_count=5)
+    if values is None:
+        return None
+    return bool(values[1])
 
 
 def _float_tuple(

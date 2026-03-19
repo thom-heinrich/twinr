@@ -41,6 +41,7 @@ from ..wakeword.matching import WakewordMatch, WakewordPhraseSpotter
 from ..wakeword.policy import SttWakewordVerifier, WakewordDecision, WakewordDecisionPolicy, normalize_wakeword_backend
 from ..wakeword.spotter import WakewordOpenWakeWordSpotter
 from ..wakeword.stream import OpenWakeWordStreamingMonitor, WakewordStreamDetection
+from .audio_policy import ReSpeakerAudioPolicySnapshot, ReSpeakerAudioPolicyTracker
 from .presence import PresenceSessionController, PresenceSessionSnapshot
 
 if TYPE_CHECKING:
@@ -151,6 +152,15 @@ def _format_firmware_version(version: tuple[int, int, int] | None) -> str | None
     if version is None:
         return None
     return ".".join(str(int(part)) for part in version)
+
+
+def _assistant_output_active(runtime: TwinrRuntime) -> bool:
+    """Return whether Twinr is actively speaking right now."""
+
+    try:
+        return getattr(runtime.status, "value", None) == "answering"
+    except Exception:
+        return False
 
 
 # AUDIT-FIX(#7): Refuse obviously unsafe capture directories and require the final path to stay under artifacts_root.
@@ -304,10 +314,13 @@ class ProactiveCoordinator:
         self._last_sensor_flags: dict[str, bool] = {}
         self._speech_detected_since: float | None = None
         self._quiet_since: float | None = None
-        self._last_presence_key: tuple[bool, str | None] | None = None
+        self._last_presence_key: tuple[object, ...] | None = None
+        self._last_respeaker_runtime_alert_code: str | None = None
         self._last_wakeword_attempt_at: float | None = None
         self._last_possible_fall_prompted_session_id: int | None = None
         self.latest_presence_snapshot: PresenceSessionSnapshot | None = None
+        self.latest_audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None = None
+        self.audio_policy_tracker = ReSpeakerAudioPolicyTracker.from_config(config)
 
     # AUDIT-FIX(#1): Route all module-local emits through a non-throwing wrapper.
     def _emit(self, line: str) -> None:
@@ -434,6 +447,7 @@ class ProactiveCoordinator:
         observation: SocialObservation,
         inspected: bool,
         presence_snapshot: PresenceSessionSnapshot,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None = None,
     ) -> ProactiveTickResult:
         """Apply final suppression, review, and dispatch to one trigger decision."""
 
@@ -456,12 +470,26 @@ class ProactiveCoordinator:
             decision,
             presence_snapshot=presence_snapshot,
         )
-        if blocked_reason is not None:
-            self._record_trigger_skipped_presence_session(
+        if blocked_reason is None:
+            blocked_reason = self._audio_policy_block_reason(
                 decision,
                 presence_snapshot=presence_snapshot,
-                reason=blocked_reason,
+                audio_policy_snapshot=audio_policy_snapshot,
             )
+        if blocked_reason is not None:
+            if blocked_reason == "already_prompted_this_presence_session":
+                self._record_trigger_skipped_presence_session(
+                    decision,
+                    presence_snapshot=presence_snapshot,
+                    reason=blocked_reason,
+                )
+            else:
+                self._record_trigger_skipped_audio_policy(
+                    decision,
+                    presence_snapshot=presence_snapshot,
+                    audio_policy_snapshot=audio_policy_snapshot,
+                    reason=blocked_reason,
+                )
             return ProactiveTickResult(
                 inspected=inspected,
                 person_visible=observation.vision.person_visible,
@@ -490,6 +518,7 @@ class ProactiveCoordinator:
         now: float,
         motion_active: bool,
         audio_snapshot,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot,
         proactive_enabled: bool,
     ) -> ProactiveTickResult:
         """Run one proactive cycle when no fresh camera inspection is available."""
@@ -504,14 +533,21 @@ class ProactiveCoordinator:
             now=now,
             person_visible=None,
             motion_active=motion_active,
-            speech_detected=audio_snapshot.observation.speech_detected is True,
+            audio_observation=audio_snapshot.observation,
+            audio_policy_snapshot=audio_policy_snapshot,
         )
-        self._dispatch_automation_observation(observation, inspected=False)
+        self._dispatch_automation_observation(
+            observation,
+            inspected=False,
+            audio_policy_snapshot=audio_policy_snapshot,
+        )
         self._record_observation_if_changed(
             observation,
             inspected=False,
             audio_snapshot=audio_snapshot,
+            audio_policy_snapshot=audio_policy_snapshot,
             presence_snapshot=presence_snapshot,
+            runtime_status_value="waiting",
         )
         wakeword_match = self._maybe_detect_wakeword(
             now=now,
@@ -530,6 +566,7 @@ class ProactiveCoordinator:
             observation=observation,
             inspected=False,
             presence_snapshot=presence_snapshot,
+            audio_policy_snapshot=audio_policy_snapshot,
         )
 
     def tick(self) -> ProactiveTickResult:
@@ -549,8 +586,13 @@ class ProactiveCoordinator:
                 return ProactiveTickResult()
         motion_active = self._update_motion(now)
         try:
-            if self.runtime.status.value != "waiting":
-                return ProactiveTickResult()
+            runtime_status_value = self.runtime.status.value
+            if runtime_status_value != "waiting":
+                return self._run_busy_audio_only(
+                    now=now,
+                    motion_active=motion_active,
+                    runtime_status_value=runtime_status_value,
+                )
         except Exception as exc:
             self._record_fault(
                 event="proactive_runtime_status_failed",
@@ -560,12 +602,17 @@ class ProactiveCoordinator:
             return ProactiveTickResult()
 
         audio_snapshot = self._observe_audio_safe()
+        audio_policy_snapshot = self._observe_audio_policy(
+            now=now,
+            audio_observation=audio_snapshot.observation,
+        )
         proactive_enabled = self._proactive_triggers_enabled()
         if not self._should_inspect(now, motion_active=motion_active):
             return self._run_without_inspection(
                 now=now,
                 motion_active=motion_active,
                 audio_snapshot=audio_snapshot,
+                audio_policy_snapshot=audio_policy_snapshot,
                 proactive_enabled=proactive_enabled,
             )
 
@@ -594,15 +641,22 @@ class ProactiveCoordinator:
             now=now,
             person_visible=snapshot.observation.person_visible,
             motion_active=motion_active,
-            speech_detected=audio_snapshot.observation.speech_detected is True,
+            audio_observation=audio_snapshot.observation,
+            audio_policy_snapshot=audio_policy_snapshot,
         )
-        self._dispatch_automation_observation(observation, inspected=True)
+        self._dispatch_automation_observation(
+            observation,
+            inspected=True,
+            audio_policy_snapshot=audio_policy_snapshot,
+        )
         self._record_observation_if_changed(
             observation,
             inspected=True,
             vision_snapshot=snapshot,
             audio_snapshot=audio_snapshot,
+            audio_policy_snapshot=audio_policy_snapshot,
             presence_snapshot=presence_snapshot,
+            runtime_status_value="waiting",
         )
         self._emit(f"proactive_person_visible={str(snapshot.observation.person_visible).lower()}")  # AUDIT-FIX(#1): safe emit wrapper prevents telemetry failures from aborting monitor execution.
         self._emit(
@@ -635,7 +689,39 @@ class ProactiveCoordinator:
             observation=observation,
             inspected=True,
             presence_snapshot=presence_snapshot,
+            audio_policy_snapshot=audio_policy_snapshot,
         )
+
+    def _run_busy_audio_only(
+        self,
+        *,
+        now: float,
+        motion_active: bool,
+        runtime_status_value: str,
+    ) -> ProactiveTickResult:
+        """Record bounded audio-only facts while Twinr is busy speaking."""
+
+        audio_snapshot = self._observe_audio_safe()
+        audio_policy_snapshot = self._observe_audio_policy(
+            now=now,
+            audio_observation=audio_snapshot.observation,
+        )
+        observation = SocialObservation(
+            observed_at=now,
+            inspected=False,
+            pir_motion_detected=motion_active,
+            low_motion=self._is_low_motion(now, motion_active=motion_active),
+            vision=SocialVisionObservation(person_visible=False),
+            audio=audio_snapshot.observation,
+        )
+        self._record_observation_if_changed(
+            observation,
+            inspected=False,
+            audio_snapshot=audio_snapshot,
+            audio_policy_snapshot=audio_policy_snapshot,
+            runtime_status_value=runtime_status_value,
+        )
+        return ProactiveTickResult()
 
     def _feed_absence(
         self,
@@ -663,7 +749,8 @@ class ProactiveCoordinator:
         now: float,
         person_visible: bool | None,
         motion_active: bool,
-        speech_detected: bool,
+        audio_observation: SocialAudioObservation,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
     ) -> PresenceSessionSnapshot:
         """Update and publish the current wakeword presence-session snapshot."""
 
@@ -672,6 +759,33 @@ class ProactiveCoordinator:
                 armed=False,
                 reason="disabled",
                 person_visible=bool(person_visible),
+                last_speech_age_s=_round_optional_seconds(audio_observation.recent_speech_age_s),
+                presence_audio_active=(
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.presence_audio_active
+                ),
+                recent_follow_up_speech=(
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.recent_follow_up_speech
+                ),
+                room_busy_or_overlapping=(
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.room_busy_or_overlapping
+                ),
+                quiet_window_open=(
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.quiet_window_open
+                ),
+                barge_in_recent=(
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.barge_in_recent
+                ),
+                speaker_direction_stable=(
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.speaker_direction_stable
+                ),
+                mute_blocks_voice_capture=(
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.mute_blocks_voice_capture
+                ),
+                resume_window_open=(
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.resume_window_open
+                ),
+                device_runtime_mode=audio_observation.device_runtime_mode,
+                transport_reason=audio_observation.transport_reason,
             )
             self.latest_presence_snapshot = snapshot
             return snapshot
@@ -679,7 +793,34 @@ class ProactiveCoordinator:
             now=now,
             person_visible=person_visible,
             motion_active=motion_active,
-            speech_detected=speech_detected,
+            speech_detected=audio_observation.speech_detected is True,
+            recent_speech_age_s=audio_observation.recent_speech_age_s,
+            presence_audio_active=(
+                None if audio_policy_snapshot is None else audio_policy_snapshot.presence_audio_active
+            ),
+            recent_follow_up_speech=(
+                None if audio_policy_snapshot is None else audio_policy_snapshot.recent_follow_up_speech
+            ),
+            room_busy_or_overlapping=(
+                None if audio_policy_snapshot is None else audio_policy_snapshot.room_busy_or_overlapping
+            ),
+            quiet_window_open=(
+                None if audio_policy_snapshot is None else audio_policy_snapshot.quiet_window_open
+            ),
+            barge_in_recent=(
+                None if audio_policy_snapshot is None else audio_policy_snapshot.barge_in_recent
+            ),
+            speaker_direction_stable=(
+                None if audio_policy_snapshot is None else audio_policy_snapshot.speaker_direction_stable
+            ),
+            mute_blocks_voice_capture=(
+                None if audio_policy_snapshot is None else audio_policy_snapshot.mute_blocks_voice_capture
+            ),
+            resume_window_open=(
+                None if audio_policy_snapshot is None else audio_policy_snapshot.resume_window_open
+            ),
+            device_runtime_mode=audio_observation.device_runtime_mode,
+            transport_reason=audio_observation.transport_reason,
         )
         self.latest_presence_snapshot = snapshot
         self._record_presence_if_changed(snapshot)
@@ -1152,6 +1293,18 @@ class ProactiveCoordinator:
             return False  # AUDIT-FIX(#4): do not infer "low motion" before any real motion history exists, especially when PIR hardware is missing or has not fired yet.
         return (now - self._last_motion_at) >= self.config.proactive_low_motion_after_s
 
+    def _observe_audio_policy(
+        self,
+        *,
+        now: float,
+        audio_observation: SocialAudioObservation,
+    ) -> ReSpeakerAudioPolicySnapshot:
+        """Derive one conservative ReSpeaker policy snapshot for this tick."""
+
+        snapshot = self.audio_policy_tracker.observe(now=now, audio=audio_observation)
+        self.latest_audio_policy_snapshot = snapshot
+        return snapshot
+
     def _record_observation_if_changed(
         self,
         observation: SocialObservation,
@@ -1159,13 +1312,16 @@ class ProactiveCoordinator:
         inspected: bool,
         vision_snapshot=None,
         audio_snapshot=None,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None = None,
         presence_snapshot: PresenceSessionSnapshot | None = None,
+        runtime_status_value: str | None = None,
     ) -> None:
         """Append one observation event only when the visible state changed."""
 
         presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
         observation_key = (
             inspected,
+            runtime_status_value,
             observation.pir_motion_detected,
             observation.low_motion,
             observation.vision.person_visible,
@@ -1175,11 +1331,30 @@ class ProactiveCoordinator:
             observation.vision.hand_or_object_near_camera,
             observation.audio.speech_detected,
             observation.audio.distress_detected,
+            observation.audio.assistant_output_active,
             observation.audio.device_runtime_mode,
             observation.audio.host_control_ready,
             observation.audio.transport_reason,
+            observation.audio.non_speech_audio_likely,
+            observation.audio.background_media_likely,
             observation.audio.signal_source,
+            observation.audio.direction_confidence,
+            observation.audio.speech_overlap_likely,
+            observation.audio.barge_in_detected,
             observation.audio.mute_active,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.presence_audio_active,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.recent_follow_up_speech,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.room_busy_or_overlapping,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.quiet_window_open,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.non_speech_audio_likely,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.background_media_likely,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.barge_in_recent,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.speaker_direction_stable,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.mute_blocks_voice_capture,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.resume_window_open,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.initiative_block_reason,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.speech_delivery_defer_reason,
+            None if audio_policy_snapshot is None else audio_policy_snapshot.runtime_alert_code,
             None if presence_snapshot is None else presence_snapshot.armed,
             None if presence_snapshot is None else presence_snapshot.reason,
             presence_session_id,
@@ -1190,8 +1365,14 @@ class ProactiveCoordinator:
             self._last_observation_key = observation_key
             return
         self._last_observation_key = observation_key
+        if audio_policy_snapshot is not None:
+            self._record_respeaker_runtime_alert_if_changed(
+                observation.audio,
+                audio_policy_snapshot=audio_policy_snapshot,
+            )
         data = {
             "inspected": inspected,
+            "runtime_status": runtime_status_value,
             "pir_motion_detected": observation.pir_motion_detected,
             "low_motion": observation.low_motion,
             "person_visible": observation.vision.person_visible,
@@ -1203,19 +1384,51 @@ class ProactiveCoordinator:
             "distress_detected": observation.audio.distress_detected,
             "audio_room_quiet": observation.audio.room_quiet,
             "audio_recent_speech_age_s": _round_optional_seconds(observation.audio.recent_speech_age_s),
+            "audio_assistant_output_active": observation.audio.assistant_output_active,
             "audio_azimuth_deg": observation.audio.azimuth_deg,
+            "audio_direction_confidence": observation.audio.direction_confidence,
             "audio_signal_source": observation.audio.signal_source,
             "audio_device_runtime_mode": observation.audio.device_runtime_mode,
             "audio_host_control_ready": observation.audio.host_control_ready,
             "audio_transport_reason": observation.audio.transport_reason,
+            "audio_non_speech_audio_likely": observation.audio.non_speech_audio_likely,
+            "audio_background_media_likely": observation.audio.background_media_likely,
+            "audio_speech_overlap_likely": observation.audio.speech_overlap_likely,
+            "audio_barge_in_detected": observation.audio.barge_in_detected,
             "audio_mute_active": observation.audio.mute_active,
         }
+        if audio_policy_snapshot is not None:
+            data.update(
+                {
+                    "presence_audio_active": audio_policy_snapshot.presence_audio_active,
+                    "recent_follow_up_speech": audio_policy_snapshot.recent_follow_up_speech,
+                    "room_busy_or_overlapping": audio_policy_snapshot.room_busy_or_overlapping,
+                    "quiet_window_open": audio_policy_snapshot.quiet_window_open,
+                    "non_speech_audio_likely": audio_policy_snapshot.non_speech_audio_likely,
+                    "background_media_likely": audio_policy_snapshot.background_media_likely,
+                    "barge_in_recent": audio_policy_snapshot.barge_in_recent,
+                    "speaker_direction_stable": audio_policy_snapshot.speaker_direction_stable,
+                    "mute_blocks_voice_capture": audio_policy_snapshot.mute_blocks_voice_capture,
+                    "resume_window_open": audio_policy_snapshot.resume_window_open,
+                    "audio_initiative_block_reason": audio_policy_snapshot.initiative_block_reason,
+                    "audio_speech_delivery_defer_reason": audio_policy_snapshot.speech_delivery_defer_reason,
+                    "respeaker_runtime_alert_code": audio_policy_snapshot.runtime_alert_code,
+                }
+            )
         if presence_snapshot is not None:
             data.update(
                 {
                     "wakeword_armed": presence_snapshot.armed,
                     "wakeword_presence_reason": presence_snapshot.reason,
                     "wakeword_presence_session_id": presence_session_id,
+                    "wakeword_presence_audio_active": presence_snapshot.presence_audio_active,
+                    "wakeword_recent_follow_up_speech": presence_snapshot.recent_follow_up_speech,
+                    "wakeword_room_busy_or_overlapping": presence_snapshot.room_busy_or_overlapping,
+                    "wakeword_quiet_window_open": presence_snapshot.quiet_window_open,
+                    "wakeword_barge_in_recent": presence_snapshot.barge_in_recent,
+                    "wakeword_speaker_direction_stable": presence_snapshot.speaker_direction_stable,
+                    "wakeword_mute_blocks_voice_capture": presence_snapshot.mute_blocks_voice_capture,
+                    "wakeword_resume_window_open": presence_snapshot.resume_window_open,
                 }
             )
         if vision_snapshot is not None:
@@ -1256,6 +1469,8 @@ class ProactiveCoordinator:
             )
             if top_evaluation.blocked_reason is not None:
                 data["top_blocked_reason"] = top_evaluation.blocked_reason
+            if top_evaluation.passed and audio_policy_snapshot is not None:
+                data["top_audio_policy_block_reason"] = audio_policy_snapshot.initiative_block_reason
         self._append_ops_event(
             event="proactive_observation",
             message="Proactive monitor recorded a changed observation.",
@@ -1266,7 +1481,21 @@ class ProactiveCoordinator:
         """Append one ops event when the presence-session state changes."""
 
         session_id = getattr(snapshot, "session_id", None)
-        key = (snapshot.armed, snapshot.reason, session_id)
+        key = (
+            snapshot.armed,
+            snapshot.reason,
+            session_id,
+            snapshot.presence_audio_active,
+            snapshot.recent_follow_up_speech,
+            snapshot.room_busy_or_overlapping,
+            snapshot.quiet_window_open,
+            snapshot.barge_in_recent,
+            snapshot.speaker_direction_stable,
+            snapshot.mute_blocks_voice_capture,
+            snapshot.resume_window_open,
+            snapshot.device_runtime_mode,
+            snapshot.transport_reason,
+        )
         if key == self._last_presence_key:
             return
         self._last_presence_key = key
@@ -1281,6 +1510,46 @@ class ProactiveCoordinator:
                 "last_person_seen_age_s": snapshot.last_person_seen_age_s,
                 "last_motion_age_s": snapshot.last_motion_age_s,
                 "last_speech_age_s": snapshot.last_speech_age_s,
+                "presence_audio_active": snapshot.presence_audio_active,
+                "recent_follow_up_speech": snapshot.recent_follow_up_speech,
+                "room_busy_or_overlapping": snapshot.room_busy_or_overlapping,
+                "quiet_window_open": snapshot.quiet_window_open,
+                "barge_in_recent": snapshot.barge_in_recent,
+                "speaker_direction_stable": snapshot.speaker_direction_stable,
+                "mute_blocks_voice_capture": snapshot.mute_blocks_voice_capture,
+                "resume_window_open": snapshot.resume_window_open,
+                "device_runtime_mode": snapshot.device_runtime_mode,
+                "transport_reason": snapshot.transport_reason,
+            },
+        )
+
+    def _record_respeaker_runtime_alert_if_changed(
+        self,
+        audio: SocialAudioObservation,
+        *,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot,
+    ) -> None:
+        """Append one explicit operator-readable ReSpeaker runtime alert on change."""
+
+        alert_code = audio_policy_snapshot.runtime_alert_code
+        if alert_code is None:
+            return
+        if alert_code == self._last_respeaker_runtime_alert_code:
+            return
+        self._last_respeaker_runtime_alert_code = alert_code
+        level = "warning" if alert_code != "ready" else "info"
+        message = audio_policy_snapshot.runtime_alert_message or "ReSpeaker runtime state changed."
+        self._emit(f"respeaker_runtime_alert={alert_code}")
+        self._append_ops_event(
+            event="respeaker_runtime_alert",
+            level=level,
+            message=message,
+            data={
+                "alert_code": alert_code,
+                "device_runtime_mode": audio.device_runtime_mode,
+                "host_control_ready": audio.host_control_ready,
+                "transport_reason": audio.transport_reason,
+                "mute_active": audio.mute_active,
             },
         )
 
@@ -1542,7 +1811,88 @@ class ProactiveCoordinator:
             },
         )
 
-    def _dispatch_automation_observation(self, observation: SocialObservation, *, inspected: bool) -> None:
+    def _audio_policy_block_reason(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        presence_snapshot: PresenceSessionSnapshot,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
+    ) -> str | None:
+        """Return a conservative ReSpeaker-driven suppression reason for one trigger."""
+
+        del presence_snapshot
+        if decision.trigger_id in _WAKEWORD_SUPPRESSION_EXEMPT_TRIGGERS:
+            return None
+        if audio_policy_snapshot is None:
+            return None
+        return audio_policy_snapshot.initiative_block_reason
+
+    def _record_trigger_skipped_audio_policy(
+        self,
+        decision: SocialTriggerDecision,
+        *,
+        presence_snapshot: PresenceSessionSnapshot,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
+        reason: str,
+    ) -> None:
+        """Record that a trigger was skipped by conservative ReSpeaker policy hooks."""
+
+        session_id = getattr(presence_snapshot, "session_id", None)
+        self._emit(f"social_trigger_skipped={reason}")
+        self._append_ops_event(
+            event="social_trigger_skipped",
+            message="Social trigger prompt was skipped by conservative ReSpeaker audio policy.",
+            data={
+                "trigger": decision.trigger_id,
+                "reason": reason,
+                "presence_session_id": session_id,
+                "presence_reason": presence_snapshot.reason,
+                "priority": int(decision.priority),
+                "score": decision.score,
+                "threshold": decision.threshold,
+                "presence_audio_active": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.presence_audio_active
+                ),
+                "recent_follow_up_speech": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.recent_follow_up_speech
+                ),
+                "room_busy_or_overlapping": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.room_busy_or_overlapping
+                ),
+                "quiet_window_open": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.quiet_window_open
+                ),
+                "non_speech_audio_likely": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.non_speech_audio_likely
+                ),
+                "background_media_likely": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.background_media_likely
+                ),
+                "barge_in_recent": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.barge_in_recent
+                ),
+                "resume_window_open": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.resume_window_open
+                ),
+                "mute_blocks_voice_capture": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.mute_blocks_voice_capture
+                ),
+                "speech_delivery_defer_reason": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.speech_delivery_defer_reason
+                ),
+                "runtime_alert_code": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.runtime_alert_code
+                ),
+            },
+        )
+
+    def _dispatch_automation_observation(
+        self,
+        observation: SocialObservation,
+        *,
+        inspected: bool,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
+    ) -> None:
         """Publish one normalized observation to the automation observer hook."""
 
         if self.observation_handler is None:
@@ -1553,6 +1903,7 @@ class ProactiveCoordinator:
                 observation,
                 inspected=inspected,
                 camera_snapshot=camera_update.snapshot,
+                audio_policy_snapshot=audio_policy_snapshot,
             )
             event_names = self._derive_sensor_events(facts, camera_event_names=camera_update.event_names)
             self.observation_handler(facts, event_names)
@@ -1583,6 +1934,7 @@ class ProactiveCoordinator:
         *,
         inspected: bool,
         camera_snapshot: ProactiveCameraSnapshot,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
     ) -> dict[str, Any]:
         """Build the automation-facing fact payload for one observation."""
 
@@ -1617,6 +1969,7 @@ class ProactiveCoordinator:
                 "distress_detected": audio.distress_detected is True,
                 "room_quiet": audio.room_quiet,
                 "recent_speech_age_s": _round_optional_seconds(audio.recent_speech_age_s),
+                "assistant_output_active": audio.assistant_output_active,
                 "signal_source": audio.signal_source,
             },
             "respeaker": {
@@ -1624,7 +1977,53 @@ class ProactiveCoordinator:
                 "host_control_ready": audio.host_control_ready,
                 "transport_reason": audio.transport_reason,
                 "azimuth_deg": audio.azimuth_deg,
+                "direction_confidence": audio.direction_confidence,
+                "non_speech_audio_likely": audio.non_speech_audio_likely,
+                "background_media_likely": audio.background_media_likely,
+                "speech_overlap_likely": audio.speech_overlap_likely,
+                "barge_in_detected": audio.barge_in_detected,
                 "mute_active": audio.mute_active,
+            },
+            "audio_policy": {
+                "presence_audio_active": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.presence_audio_active
+                ),
+                "recent_follow_up_speech": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.recent_follow_up_speech
+                ),
+                "room_busy_or_overlapping": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.room_busy_or_overlapping
+                ),
+                "quiet_window_open": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.quiet_window_open
+                ),
+                "non_speech_audio_likely": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.non_speech_audio_likely
+                ),
+                "background_media_likely": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.background_media_likely
+                ),
+                "barge_in_recent": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.barge_in_recent
+                ),
+                "speaker_direction_stable": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.speaker_direction_stable
+                ),
+                "mute_blocks_voice_capture": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.mute_blocks_voice_capture
+                ),
+                "resume_window_open": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.resume_window_open
+                ),
+                "initiative_block_reason": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.initiative_block_reason
+                ),
+                "speech_delivery_defer_reason": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.speech_delivery_defer_reason
+                ),
+                "runtime_alert_code": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.runtime_alert_code
+                ),
             },
         }
 
@@ -2061,7 +2460,10 @@ def build_default_proactive_monitor(
     )
     if respeaker_targeted and (config.proactive_audio_enabled or config.wakeword_enabled):
         try:
-            signal_provider = ReSpeakerSignalProvider(sensor_window_ms=config.proactive_audio_sample_ms)
+            signal_provider = ReSpeakerSignalProvider(
+                sensor_window_ms=config.proactive_audio_sample_ms,
+                assistant_output_active_predicate=lambda: _assistant_output_active(runtime),
+            )
             initial_signal = signal_provider.observe()
             if not initial_signal.host_control_ready:
                 reason = initial_signal.transport_reason or "unknown_transport_state"

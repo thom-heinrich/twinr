@@ -593,6 +593,101 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIn("Aprikosenmarmelade", tool_context.durable_context or "")
         self.assertIn('"slot_key": "preference:breakfast:jam"', tool_context.durable_context or "")
 
+    def test_confirm_memory_persists_restart_recall_packets_for_fresh_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_recall_limit=3,
+                long_term_memory_midterm_enabled=True,
+                long_term_memory_midterm_limit=3,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            service.object_store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:thermos_location_old",
+                        kind="fact",
+                        summary="Früher stand die rote Thermoskanne im Flurschrank.",
+                        details="Historische Ortsangabe zur roten Thermoskanne.",
+                        source=self._source("turn:thermos"),
+                        status="active",
+                        confidence=0.99,
+                        confirmed_by_user=True,
+                        slot_key="object:red_thermos:location",
+                        value_key="hallway_cupboard",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_generic",
+                        kind="fact",
+                        summary="User usually likes some jam on bread at breakfast.",
+                        details='User said: "Ich mag beim Frühstück meistens etwas Marmelade auf dem Brot."',
+                        source=self._source("turn:jam_generic"),
+                        status="active",
+                        confidence=0.84,
+                        slot_key="fact:user:breakfast:jam",
+                        value_key="jam_on_bread_at_breakfast",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        details="Aeltere Vorliebe fuer das Fruehstueck.",
+                        source=self._source("turn:jam_old"),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        details="Neuere Vorliebe fuer das Fruehstueck.",
+                        source=self._source("turn:jam_new"),
+                        status="uncertain",
+                        confidence=0.95,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                    ),
+                ),
+                conflicts=(
+                    LongTermMemoryConflictV1(
+                        slot_key="preference:breakfast:jam",
+                        candidate_memory_id="fact:jam_preference_new",
+                        existing_memory_ids=("fact:jam_preference_old",),
+                        question="Welche Marmelade stimmt gerade?",
+                        reason="Widerspruechliche Marmeladenpraeferenzen liegen vor.",
+                    ),
+                ),
+                archived_objects=(),
+            )
+            service.confirm_memory(memory_id="fact:jam_preference_new")
+            service.shutdown()
+
+            fresh_service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            stored_packets = fresh_service.midterm_store.load_packets()
+            jam_context = fresh_service.build_provider_context("Welche Marmelade ist jetzt als bestaetigt gespeichert?")
+            thermos_context = fresh_service.build_provider_context("Wo stand früher meine rote Thermoskanne?")
+            control_context = fresh_service.build_provider_context("Was ist ein Regenbogen?")
+            fresh_service.shutdown()
+
+        self.assertEqual(
+            [item.packet_id for item in stored_packets],
+            [
+                "adaptive:restart:fact_jam_preference_new",
+                "adaptive:restart:fact_thermos_location_old",
+            ],
+        )
+        self.assertIn("Aprikosenmarmelade", jam_context.midterm_context or "")
+        self.assertIn("restart_recall", jam_context.midterm_context or "")
+        self.assertIn("Flurschrank", thermos_context.midterm_context or "")
+        self.assertNotIn("Aprikosenmarmelade", control_context.midterm_context or "")
+
     def test_provider_context_omits_off_topic_conflict_memory_for_control_query(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(

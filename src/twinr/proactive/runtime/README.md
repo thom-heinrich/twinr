@@ -10,8 +10,12 @@ and presence-session state used to arm wakeword listening and proactive checks.
 `runtime` owns:
 - Coordinate proactive monitor ticks across PIR, camera, ambient audio, and wakeword policy paths
 - Maintain wakeword presence-session state from recent sensor activity
+- Derive conservative ReSpeaker audio-policy hooks such as quiet windows, resume windows, and overlap guards
+- Derive conservative ReSpeaker speech-delivery defer reasons such as background media or non-speech room activity
 - Export normalized observation facts and ops telemetry from proactive monitoring
 - Inject ReSpeaker XVF3800 signal facts into runtime audio observations when that device is targeted
+- Keep bounded ReSpeaker audio observation alive while Twinr is already speaking so interruption facts do not go blind in `answering`
+- Emit explicit operator-readable ReSpeaker runtime alerts for DFU, disconnect, and recovery state changes
 - Open and close the bounded proactive monitor worker and its resources
 
 `runtime` does **not** own:
@@ -25,6 +29,7 @@ and presence-session state used to arm wakeword listening and proactive checks.
 | File | Purpose |
 |---|---|
 | `__init__.py` | Package export surface |
+| `audio_policy.py` | Conservative ReSpeaker policy-hook, speech-defer, and runtime-alert derivation |
 | `presence.py` | Presence-session state machine |
 | `service.py` | Monitor orchestration and lifecycle |
 | `component.yaml` | Structured package metadata |

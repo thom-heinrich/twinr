@@ -34,6 +34,7 @@ class TwinrDisplayAdapter(Protocol):
         status: str,
         *,
         headline: str | None = None,
+        ticker_text: str | None = None,
         details: tuple[str, ...] = (),
         state_fields: DisplayStateFields = (),
         log_sections: DisplayLogSections = (),

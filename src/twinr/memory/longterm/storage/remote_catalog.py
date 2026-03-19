@@ -27,6 +27,7 @@ from twinr.memory.longterm.storage.remote_read_diagnostics import (
     record_remote_read_diagnostic,
     record_remote_write_diagnostic,
 )
+from twinr.memory.longterm.storage.remote_read_observability import record_remote_read_observation
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStateStore, LongTermRemoteUnavailableError
 
 
@@ -432,6 +433,20 @@ class LongTermRemoteCatalogStore:
                     include_metadata=True,
                     allowed_doc_ids=tuple(allowed_doc_ids),
                 )
+            )
+            record_remote_read_observation(
+                remote_state=remote_state,
+                context=LongTermRemoteReadContext(
+                    snapshot_kind=snapshot_kind,
+                    operation="retrieve_search",
+                    query_text=query_text,
+                    catalog_entry_count=len(entries),
+                    allowed_doc_count=len(allowed_doc_ids),
+                    result_limit=result_limit,
+                ),
+                latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+                outcome="ok",
+                classification="ok",
             )
         except Exception as exc:
             record_remote_read_diagnostic(
@@ -1223,6 +1238,19 @@ class LongTermRemoteCatalogStore:
                         include_metadata=True,
                         allowed_doc_ids=batch,
                     )
+                )
+                record_remote_read_observation(
+                    remote_state=remote_state,
+                    context=LongTermRemoteReadContext(
+                        snapshot_kind=snapshot_kind,
+                        operation="retrieve_batch",
+                        allowed_doc_count=len(batch),
+                        result_limit=len(batch),
+                        batch_size=len(batch),
+                    ),
+                    latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+                    outcome="ok",
+                    classification="ok",
                 )
             except Exception as exc:
                 record_remote_read_diagnostic(

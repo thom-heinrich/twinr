@@ -9,8 +9,9 @@ owned_concerns:
   - Score stateful trigger candidates from normalized observation ticks
   - Capture bounded audio and vision observations for proactive monitoring
   - Overlay direct ReSpeaker XVF3800 signal facts onto normalized audio observations
+  - Preserve conservative ReSpeaker busy-state and direction-quality facts for downstream policy consumers
   - Map the local-first IMX500 adapter onto the normalized social vision contract
-  - Stabilize automation-facing camera snapshots, person-count/zone anchors, and rising-edge events
+  - Stabilize automation-facing camera snapshots, person-count/zone anchors, coarse motion, and rising-edge coarse/fine gesture events
   - Route prompt mode and render bounded evidence facts for proactive prompting
   - Buffer recent frames and request conservative visual second opinions
 out_of_scope:
@@ -59,6 +60,8 @@ files:
       - SocialBodyPose
       - SocialDetectedObject
       - SocialGestureEvent
+      - SocialFineHandGesture
+      - SocialMotionState
       - SocialObservation
       - SocialPersonZone
       - SocialSpatialBox
@@ -69,14 +72,14 @@ files:
       - SocialTriggerThresholds
       - SocialVisionObservation
   - path: camera_surface.py
-    role: Debounced camera snapshot and rising-edge event stabilization
+    role: Debounced camera snapshot plus coarse-motion and coarse/fine gesture event stabilization
     exports:
       - ProactiveCameraSnapshot
       - ProactiveCameraSurface
       - ProactiveCameraSurfaceConfig
       - ProactiveCameraSurfaceUpdate
   - path: local_camera_provider.py
-    role: Local-first IMX500 provider mapped onto the social vision contract
+    role: Local-first IMX500 + MediaPipe provider mapped onto the social vision contract, including motion plus coarse/fine gesture output
     exports:
       - LocalAICameraObservationProvider
       - LocalAICameraProviderConfig

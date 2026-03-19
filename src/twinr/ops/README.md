@@ -60,7 +60,9 @@ support exports for the web UI and operator tools.
 The device overview and config checks now also surface ReSpeaker XVF3800
 runtime and host-control state separately from generic audio-device listings,
 so operators can see the difference between `USB-visible`, `capture-ready`,
-host-control degradation, and `not detected`.
+host-control degradation, and `not detected`. The ReSpeaker device surface also
+includes conservative direction-confidence, overlap, and barge-in facts when
+the direct XVF3800 primitives support them.
 
 ## Usage
 

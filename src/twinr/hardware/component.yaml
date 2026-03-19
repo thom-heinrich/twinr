@@ -8,9 +8,11 @@ owned_concerns:
   - Capture and play bounded audio for conversation, ambient sensing, and wakeword flows
   - Monitor GPIO buttons and PIR motion across supported Pi backends
   - Capture still photos via ffmpeg-backed V4L2 integration
-  - Run bounded local-first IMX500 health, detection, pose, and gesture inference
+  - Run bounded hybrid IMX500 + MediaPipe health, person/object gating, coarse motion, temporal coarse-arm, and fine-hand gesture inference
   - Format and submit bounded receipt print jobs
   - Probe ReSpeaker XVF3800 USB/ALSA readiness and capture typed host-control primitives
+  - Derive conservative XVF3800 runtime facts such as direction confidence, overlap, mute state, and busy-state interruption hints
+  - Derive conservative XVF3800 non-speech and background-media suppression facts from bounded ambient capture
   - Persist and assess local on-device voice profiles
 out_of_scope:
   - Hardware-loop orchestration in src/twinr/agent/workflows
@@ -47,12 +49,14 @@ files:
       - resolve_dynamic_pause_thresholds
       - resolve_pause_resume_confirmation
   - path: ai_camera.py
-    role: Local-first IMX500 health, detection, and support-aware sparse-keypoint pose/gesture adapter
+    role: Hybrid IMX500 gate plus MediaPipe-backed health, motion, coarse-arm, and fine-hand adapter
     exports:
       - AICameraAdapterConfig
       - AICameraBodyPose
       - AICameraBox
+      - AICameraFineHandGesture
       - AICameraGestureEvent
+      - AICameraMotionState
       - AICameraObjectDetection
       - AICameraObservation
       - AICameraZone
@@ -65,6 +69,15 @@ files:
       - AICameraPoseSupportDiagnostic
       - capture_pose_probe
       - capture_pose_probe_sequence
+  - path: mediapipe_vision.py
+    role: Pi-side MediaPipe pose, temporal coarse-arm sequence classification, and fine-hand gesture bridge
+    exports:
+      - DEFAULT_MEDIAPIPE_GESTURE_MODEL_URL
+      - DEFAULT_MEDIAPIPE_POSE_MODEL_URL
+      - MediaPipeVisionConfig
+      - MediaPipeVisionPipeline
+      - MediaPipeVisionResult
+      - TemporalPoseGestureClassifier
   - path: buttons.py
     role: GPIO button monitoring across libgpiod and CLI fallbacks
     exports:
@@ -110,6 +123,7 @@ files:
       - DOA_VALUE_PARAMETER
       - GPO_READ_VALUES_PARAMETER
       - VERSION_PARAMETER
+      - ReSpeakerDerivedSignalState
       - ReSpeakerCaptureDevice
       - ReSpeakerDirectionSnapshot
       - ReSpeakerLibusbTransport
@@ -125,8 +139,13 @@ files:
       - ReSpeakerUsbDevice
       - capture_respeaker_primitive_snapshot
       - config_targets_respeaker
+      - derive_respeaker_signal_state
       - probe_respeaker_xvf3800
       - read_default_respeaker_parameters
+  - path: respeaker/ambient_classification.py
+    role: Conservative non-speech and background-media classification from bounded ambient capture plus XVF3800 speech facts
+  - path: respeaker/derived_signals.py
+    role: Conservative XVF3800 signal interpretation helpers for direction, overlap, and busy-state interruption facts
   - path: respeaker/models.py
     role: Typed XVF3800 probe, host-control, and primitive snapshot models
   - path: respeaker/probe.py
@@ -186,6 +205,7 @@ tests:
   - path: test/test_button_helpers.py
   - path: test/test_camera.py
   - path: test/test_local_ai_camera_provider.py
+  - path: test/test_mediapipe_vision.py
   - path: test/test_pir.py
   - path: test/test_printer.py
   - path: test/test_respeaker.py

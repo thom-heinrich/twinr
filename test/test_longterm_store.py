@@ -781,8 +781,12 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertFalse(default_events)
         self.assertTrue(override_events)
-        self.assertEqual(override_events[-1]["event"], "longterm_remote_read_failed")
-        self.assertEqual(override_events[-1]["data"]["snapshot_kind"], "conflicts")
+        failed_event = next(
+            event
+            for event in override_events
+            if event.get("event") == "longterm_remote_read_failed"
+        )
+        self.assertEqual(failed_event["data"]["snapshot_kind"], "conflicts")
 
     def test_select_open_conflicts_logs_remote_retrieve_failure_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -887,6 +891,66 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(data["read_timeout_s"], 9.0)
         self.assertEqual(data["error_type"], "TimeoutError")
         self.assertEqual(data["root_cause_type"], "TimeoutError")
+        alert_event = next(
+            event
+            for event in events
+            if event.get("event") == "longterm_remote_read_alert"
+            and dict(event.get("data") or {}).get("operation") == "retrieve_search"
+        )
+        self.assertEqual(alert_event["level"], "warning")
+        alert_data = dict(alert_event["data"])
+        self.assertEqual(alert_data["classification"], "timeout")
+        self.assertEqual(alert_data["alert_kind"], "timeout")
+
+    def test_select_relevant_objects_records_remote_read_histograms_for_search_and_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.project_root = str(project_root)
+            store = LongTermStructuredStore(
+                base_path=project_root / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            store.write_snapshot(
+                objects=tuple(
+                    LongTermMemoryObjectV1(
+                        memory_id=f"fact:{index}",
+                        kind="fact",
+                        summary=f"Früher stand die rote Thermoskanne im Flurschrank Fach {index}.",
+                        details="Historische Ortsangabe zur roten Thermoskanne.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.99,
+                        confirmed_by_user=True,
+                        slot_key=f"object:red_thermos:location:{index}",
+                        value_key=f"hallway_cupboard_{index}",
+                    )
+                    for index in range(4)
+                ),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            relevant = store.select_relevant_objects(
+                query_text="Früher stand die rote Thermoskanne",
+                limit=3,
+            )
+            histogram_path = project_root / "artifacts" / "stores" / "ops" / "longterm_remote_read_histograms.json"
+            payload = json.loads(histogram_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(relevant), 3)
+        operations = dict(payload.get("operations") or {})
+        self.assertIn("objects:retrieve_search", operations)
+        self.assertIn("objects:retrieve_batch", operations)
+        search_entry = dict(operations["objects:retrieve_search"])
+        batch_entry = dict(operations["objects:retrieve_batch"])
+        self.assertEqual(search_entry["last_outcome"], "ok")
+        self.assertEqual(search_entry["last_classification"], "ok")
+        self.assertGreaterEqual(int(search_entry["total_count"]), 1)
+        self.assertEqual(batch_entry["last_outcome"], "ok")
+        self.assertEqual(batch_entry["last_classification"], "ok")
+        self.assertGreaterEqual(int(batch_entry["total_count"]), 1)
 
     def test_select_relevant_objects_degrades_remote_search_timeout_to_local_catalog_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

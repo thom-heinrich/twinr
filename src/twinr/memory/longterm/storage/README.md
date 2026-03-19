@@ -15,10 +15,13 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 - load compact remote catalog segment documents through bounded-parallel reads so required startup does not serialize every segment fetch
 - keep required-readiness probes read-only even for sparse legacy object catalogs, so watchdog startup never blocks on catalog rewrites
 - reuse successful remote snapshot probes within one readiness cycle so store bootstrap and health attestation do not refetch the same snapshot twice
-- prefer the last successful remote document id on ordinary snapshot reads, so steady-state loads skip repeat pointer resolution while still falling back safely when the hint goes stale
+- prefer explicitly remembered remote document ids on ordinary snapshot reads right after local writes, while avoiding sticky read-learned hints that could keep a fresh reader on stale snapshot documents after another runtime updates the same namespace
 - skip `retrieve_search` entirely when the current remote catalog candidate set already fits inside the caller's requested limit, so small conflict/object lookups do not burn an extra timeout-prone backend roundtrip
 - overlap the independent `objects` / `conflicts` / `archive` required-startup reads so object-store readiness is bounded by the slowest current snapshot instead of the sum of all three
 - emit structured ops diagnostics for remote ChonkyDB read and write failures plus recoverable retrieve-batch fallbacks so DNS issues, timeouts, backend flakes, and client-contract payload problems can be separated after live incidents
+- persist structured retrieve-search/retrieve-batch latency histograms plus explicit timeout/slow-read alert events so `/twinr` operators can see ChonkyDB read spikes without replaying raw logs
+- preserve restart-recall midterm packets while reflection refreshes the rest of the midterm snapshot, so confirmed/stable durable facts can survive fresh runtime roots as explicit policy context
+- match midterm packet queries on content-bearing terms, including compound-word containment, and fail closed when no real topic overlap exists so restart-recall packets do not leak into control questions
 - project structured memory-state semantics such as `confirmed`, `aktuell`, `gespeichert`, and `superseded` into durable-object search text so meta-memory queries can retrieve the right fact instead of a generic sibling
 - rank selected durable objects by combined query overlap, confirmation state, and recency before returning them to retrieval/runtime callers
 - gate durable-object and conflict recall on content-bearing query terms so control questions do not pull in off-topic memory just because they share auxiliary words like `ist`
@@ -42,6 +45,7 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 | `midterm_store.py` | Midterm packet store |
 | `remote_catalog.py` | Fine-grained remote object/conflict/archive catalog adapter |
 | `remote_read_diagnostics.py` | Structured ops-event diagnostics for remote long-term I/O failures and fallbacks |
+| `remote_read_observability.py` | Persisted retrieve histogram + alert helper for remote read spikes |
 | `remote_state.py` | Small remote snapshot/catalog adapter |
 | `component.yaml` | Structured ownership metadata |
 | `AGENTS.md` | Local editing rules |

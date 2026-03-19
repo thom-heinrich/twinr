@@ -10,6 +10,7 @@ personalization cues for a single user turn.
 - merge original-language and canonical-English query variants during store-backed recall so optional rewrites improve recall without suppressing same-language memories
 - rerank durable recall across merged query variants so confirmed/current facts surface ahead of generic siblings for meta-memory questions
 - compile adaptive mid-term policy hints from confirmed memory, recurring routines, and proactive success/skip history
+- compile persistent restart-recall policy packets from stable durable memories so fresh runtime roots retain a small provenance-rich continuity layer
 - compile and render silent personalization cues from graph and episodic memory
 - sanitize recalled memory payloads before prompt serialization or optional LLM use
 - reject compiled personalization payloads that leak schema/JSON/markup structure and fall back to the static subtext path instead of injecting corrupted hidden guidance
@@ -27,6 +28,7 @@ personalization cues for a single user turn.
 | `__init__.py` | Package marker |
 | `retriever.py` | Context assembly |
 | `adaptive_policy.py` | Adaptive prompt-policy compiler from stored long-term signals |
+| `restart_recall_policy.py` | Persistent restart-recall packet compiler from stable durable memory |
 | `operator_search.py` | Read-only operator search over the real long-term retrieval stack |
 | `subtext.py` | Subtext compiler and builder |
 | `component.yaml` | Structured ownership metadata |

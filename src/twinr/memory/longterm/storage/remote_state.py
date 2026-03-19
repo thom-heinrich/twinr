@@ -490,11 +490,13 @@ class LongTermRemoteStateStore:
                 ``midterm``.
             local_path: Optional local recovery snapshot path used in
                 non-required mode when the remote backend is missing or flaky.
-            prefer_cached_document_id: Reuse a previously successful remote
+            prefer_cached_document_id: Reuse a previously remembered remote
                 document id before resolving snapshot pointers again. This is
                 enabled by default for ordinary snapshot reads because exact
-                document ids are both faster and more deterministic after fresh
-                writes; stale hints still fall back to pointer/origin lookup.
+                document ids are both faster and more deterministic right after
+                local writes; ordinary reads do not retain fresh hints across
+                calls so a long-lived reader does not keep serving stale
+                snapshots after another runtime updates the same namespace.
 
         Returns:
             The loaded snapshot payload, or ``None`` when no usable payload is
@@ -981,11 +983,6 @@ class LongTermRemoteStateStore:
                 client,
                 snapshot_kind=normalized_snapshot_kind,
                 local_path=local_path,
-            )
-        if probe.payload is not None and probe.document_id and not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
-            self._remember_snapshot_document_id(
-                snapshot_kind=normalized_snapshot_kind,
-                document_id=probe.document_id,
             )
         self._store_cached_probe(probe)
         return probe

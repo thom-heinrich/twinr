@@ -160,6 +160,32 @@ class ProactiveGovernorTests(unittest.TestCase):
         self.assertFalse(second.allowed)
         self.assertEqual(second.reason, "prompt_inflight")
 
+    def test_display_channel_bypasses_speech_cooldowns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            governor = ProactiveGovernor.from_config(self._config(temp_dir))
+            first = governor.try_reserve(
+                ProactiveGovernorCandidate(
+                    source_kind="social",
+                    source_id="attention_window",
+                    summary="Gentle greeting.",
+                ),
+                now=datetime(2026, 3, 14, 10, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+            )
+            self.assertTrue(first.allowed)
+            governor.mark_delivered(first.reservation, now=datetime(2026, 3, 14, 10, 0, tzinfo=ZoneInfo("Europe/Berlin")))
+
+            second = governor.try_reserve(
+                ProactiveGovernorCandidate(
+                    source_kind="social",
+                    source_id="attention_window",
+                    summary="Gentle greeting.",
+                    channel="display",
+                ),
+                now=datetime(2026, 3, 14, 10, 1, tzinfo=ZoneInfo("Europe/Berlin")),
+            )
+
+        self.assertTrue(second.allowed)
+
 
 if __name__ == "__main__":
     unittest.main()

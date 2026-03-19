@@ -15,7 +15,9 @@ from typing import Any
 from .engine import (
     SocialBodyPose,
     SocialDetectedObject,
+    SocialFineHandGesture,
     SocialGestureEvent,
+    SocialMotionState,
     SocialPersonZone,
     SocialSpatialBox,
     SocialVisionObservation,
@@ -26,7 +28,10 @@ _HAND_NEAR_EVENT = "camera.hand_or_object_near_camera"
 _PERSON_RETURNED_EVENT = "camera.person_returned"
 _ATTENTION_WINDOW_EVENT = "camera.attention_window_opened"
 _SHOWING_INTENT_EVENT = "camera.showing_intent_started"
+_MOTION_EVENT = "camera.motion_changed"
 _GESTURE_EVENT = "camera.gesture_detected"
+_COARSE_ARM_GESTURE_EVENT = "camera.coarse_arm_gesture_detected"
+_FINE_HAND_GESTURE_EVENT = "camera.fine_hand_gesture_detected"
 _OBJECT_STABLE_EVENT = "camera.object_detected_stable"
 
 
@@ -57,6 +62,7 @@ class ProactiveCameraSurfaceConfig:
     hand_or_object_near_camera_off_samples: int = 2
     hand_or_object_near_camera_unknown_hold_s: float = 9.0
     hand_or_object_near_camera_event_cooldown_s: float = 9.0
+    motion_event_cooldown_s: float = 9.0
     gesture_event_cooldown_s: float = 9.0
     object_on_samples: int = 2
     object_off_samples: int = 2
@@ -110,6 +116,7 @@ class ProactiveCameraSurfaceConfig:
             self.hand_or_object_near_camera_event_cooldown_s,
             field_name="hand_or_object_near_camera_event_cooldown_s",
         )
+        _require_non_negative_float(self.motion_event_cooldown_s, field_name="motion_event_cooldown_s")
         _require_non_negative_float(self.gesture_event_cooldown_s, field_name="gesture_event_cooldown_s")
         _require_positive_int(self.object_on_samples, field_name="object_on_samples")
         _require_positive_int(self.object_off_samples, field_name="object_off_samples")
@@ -138,6 +145,7 @@ class ProactiveCameraSurfaceConfig:
             showing_intent_event_cooldown_s=cooldown_s,
             hand_or_object_near_camera_unknown_hold_s=unknown_hold_s,
             hand_or_object_near_camera_event_cooldown_s=cooldown_s,
+            motion_event_cooldown_s=cooldown_s,
             gesture_event_cooldown_s=cooldown_s,
             object_unknown_hold_s=unknown_hold_s,
             secondary_unknown_hold_s=unknown_hold_s,
@@ -194,6 +202,12 @@ class ProactiveCameraSnapshot:
     pose_confidence_unknown: bool
     body_state_changed_at: float | None
     body_state_changed_at_unknown: bool
+    motion_state: SocialMotionState
+    motion_state_unknown: bool
+    motion_confidence: float | None
+    motion_confidence_unknown: bool
+    motion_state_changed_at: float | None
+    motion_state_changed_at_unknown: bool
     smiling: bool
     smiling_unknown: bool
     hand_or_object_near_camera: bool
@@ -207,8 +221,36 @@ class ProactiveCameraSnapshot:
     gesture_event_unknown: bool
     gesture_confidence: float | None
     gesture_confidence_unknown: bool
+    fine_hand_gesture: SocialFineHandGesture
+    fine_hand_gesture_unknown: bool
+    fine_hand_gesture_confidence: float | None
+    fine_hand_gesture_confidence_unknown: bool
     objects: tuple[SocialDetectedObject, ...]
     objects_unknown: bool
+
+    @property
+    def coarse_arm_gesture(self) -> SocialGestureEvent:
+        """Alias the stabilized V1 contract name onto the legacy gesture field."""
+
+        return self.gesture_event
+
+    @property
+    def coarse_arm_gesture_unknown(self) -> bool:
+        """Alias the stabilized V1 contract unknown flag."""
+
+        return self.gesture_event_unknown
+
+    @property
+    def coarse_arm_gesture_confidence(self) -> float | None:
+        """Alias the stabilized V1 contract confidence field."""
+
+        return self.gesture_confidence
+
+    @property
+    def coarse_arm_gesture_confidence_unknown(self) -> bool:
+        """Alias the stabilized V1 contract confidence unknown flag."""
+
+        return self.gesture_confidence_unknown
 
     @property
     def unknown(self) -> bool:
@@ -238,12 +280,17 @@ class ProactiveCameraSnapshot:
                 self.body_pose_unknown,
                 self.pose_confidence_unknown,
                 self.body_state_changed_at_unknown,
+                self.motion_state_unknown,
+                self.motion_confidence_unknown,
+                self.motion_state_changed_at_unknown,
                 self.smiling_unknown,
                 self.hand_or_object_near_camera_unknown,
                 self.showing_intent_likely_unknown,
                 self.showing_intent_started_at_unknown,
                 self.gesture_event_unknown,
                 self.gesture_confidence_unknown,
+                self.fine_hand_gesture_unknown,
+                self.fine_hand_gesture_confidence_unknown,
                 self.objects_unknown,
             )
         )
@@ -299,6 +346,12 @@ class ProactiveCameraSnapshot:
             "pose_confidence_unknown": self.pose_confidence_unknown,
             "body_state_changed_at": self.body_state_changed_at,
             "body_state_changed_at_unknown": self.body_state_changed_at_unknown,
+            "motion_state": self.motion_state.value,
+            "motion_state_unknown": self.motion_state_unknown,
+            "motion_confidence": self.motion_confidence,
+            "motion_confidence_unknown": self.motion_confidence_unknown,
+            "motion_state_changed_at": self.motion_state_changed_at,
+            "motion_state_changed_at_unknown": self.motion_state_changed_at_unknown,
             "smiling": self.smiling,
             "smiling_unknown": self.smiling_unknown,
             "hand_or_object_near_camera": self.hand_or_object_near_camera,
@@ -308,10 +361,18 @@ class ProactiveCameraSnapshot:
             "showing_intent_likely_unknown": self.showing_intent_likely_unknown,
             "showing_intent_started_at": self.showing_intent_started_at,
             "showing_intent_started_at_unknown": self.showing_intent_started_at_unknown,
+            "coarse_arm_gesture": self.coarse_arm_gesture.value,
+            "coarse_arm_gesture_unknown": self.coarse_arm_gesture_unknown,
+            "coarse_arm_gesture_confidence": self.coarse_arm_gesture_confidence,
+            "coarse_arm_gesture_confidence_unknown": self.coarse_arm_gesture_confidence_unknown,
             "gesture_event": self.gesture_event.value,
             "gesture_event_unknown": self.gesture_event_unknown,
             "gesture_confidence": self.gesture_confidence,
             "gesture_confidence_unknown": self.gesture_confidence_unknown,
+            "fine_hand_gesture": self.fine_hand_gesture.value,
+            "fine_hand_gesture_unknown": self.fine_hand_gesture_unknown,
+            "fine_hand_gesture_confidence": self.fine_hand_gesture_confidence,
+            "fine_hand_gesture_confidence_unknown": self.fine_hand_gesture_confidence_unknown,
             "objects": _serialize_objects(self.objects),
             "objects_unknown": self.objects_unknown,
             "unknown": self.unknown,
@@ -579,6 +640,13 @@ class ProactiveCameraSurface:
         self._body_state_changed_seen_at: float | None = None
         self._last_pose_confidence: float | None = None
         self._last_pose_confidence_at: float | None = None
+        self._last_motion_state = SocialMotionState.UNKNOWN
+        self._last_motion_state_at: float | None = None
+        self._motion_state_changed_at: float | None = None
+        self._motion_state_changed_seen_at: float | None = None
+        self._last_motion_confidence: float | None = None
+        self._last_motion_confidence_at: float | None = None
+        self._last_motion_emitted_at: float | None = None
         self._last_person_count = 0
         self._last_person_count_at: float | None = None
         self._last_primary_person_zone = SocialPersonZone.UNKNOWN
@@ -598,6 +666,11 @@ class ProactiveCameraSurface:
         self._last_gesture_confidence: float | None = None
         self._last_gesture_confidence_at: float | None = None
         self._last_gesture_emitted_at: float | None = None
+        self._last_fine_hand_gesture = SocialFineHandGesture.NONE
+        self._last_fine_hand_gesture_at: float | None = None
+        self._last_fine_hand_gesture_confidence: float | None = None
+        self._last_fine_hand_gesture_confidence_at: float | None = None
+        self._last_fine_hand_gesture_emitted_at: float | None = None
         self._has_seen_person = False
         self._last_authoritative_person_visible = False
         self._last_person_seen_at: float | None = None
@@ -716,6 +789,22 @@ class ProactiveCameraSurface:
             inspected=inspected,
             observed_at=now,
         )
+        motion_state, motion_state_unknown, motion_rising = self._resolve_motion_state(
+            inspected=inspected,
+            person_visible=person_sample.value,
+            observed_at=now,
+            raw_state=getattr(observation, "motion_state", SocialMotionState.UNKNOWN),
+        )
+        motion_confidence, motion_confidence_unknown = self._resolve_motion_confidence(
+            inspected=inspected,
+            person_visible=person_sample.value,
+            observed_at=now,
+            raw_confidence=getattr(observation, "motion_confidence", None),
+        )
+        motion_state_changed_at, motion_state_changed_at_unknown = self._resolve_motion_state_changed_at(
+            inspected=inspected,
+            observed_at=now,
+        )
         smiling, smiling_unknown = self._resolve_smiling(
             inspected=inspected,
             person_visible=person_sample.value,
@@ -726,9 +815,25 @@ class ProactiveCameraSurface:
             self._resolve_gesture(
                 inspected=inspected,
                 observed_at=now,
-                gesture_event=getattr(observation, "gesture_event", SocialGestureEvent.NONE),
+                gesture_event=getattr(
+                    observation,
+                    "coarse_arm_gesture",
+                    getattr(observation, "gesture_event", SocialGestureEvent.NONE),
+                ),
                 gesture_confidence=getattr(observation, "gesture_confidence", None),
             )
+        )
+        (
+            fine_hand_gesture,
+            fine_hand_gesture_unknown,
+            fine_hand_gesture_confidence,
+            fine_hand_gesture_confidence_unknown,
+            fine_hand_gesture_rising,
+        ) = self._resolve_fine_hand_gesture(
+            inspected=inspected,
+            observed_at=now,
+            fine_hand_gesture=getattr(observation, "fine_hand_gesture", SocialFineHandGesture.NONE),
+            fine_hand_gesture_confidence=getattr(observation, "fine_hand_gesture_confidence", None),
         )
         objects_view = self._object_tracker.observe(
             _coerce_detected_objects(getattr(observation, "objects", ())) if inspected else None,
@@ -846,6 +951,12 @@ class ProactiveCameraSurface:
             pose_confidence_unknown=pose_confidence_unknown,
             body_state_changed_at=body_state_changed_at,
             body_state_changed_at_unknown=body_state_changed_at_unknown,
+            motion_state=motion_state,
+            motion_state_unknown=motion_state_unknown,
+            motion_confidence=motion_confidence,
+            motion_confidence_unknown=motion_confidence_unknown,
+            motion_state_changed_at=motion_state_changed_at,
+            motion_state_changed_at_unknown=motion_state_changed_at_unknown,
             smiling=smiling,
             smiling_unknown=smiling_unknown,
             hand_or_object_near_camera=hand_sample.value,
@@ -859,6 +970,10 @@ class ProactiveCameraSurface:
             gesture_event_unknown=gesture_event_unknown,
             gesture_confidence=gesture_confidence,
             gesture_confidence_unknown=gesture_confidence_unknown,
+            fine_hand_gesture=fine_hand_gesture,
+            fine_hand_gesture_unknown=fine_hand_gesture_unknown,
+            fine_hand_gesture_confidence=fine_hand_gesture_confidence,
+            fine_hand_gesture_confidence_unknown=fine_hand_gesture_confidence_unknown,
             objects=objects_view.objects,
             objects_unknown=objects_view.unknown,
         )
@@ -874,8 +989,13 @@ class ProactiveCameraSurface:
             event_names.append(_ATTENTION_WINDOW_EVENT)
         if showing_sample.rising_edge:
             event_names.append(_SHOWING_INTENT_EVENT)
+        if motion_rising:
+            event_names.append(_MOTION_EVENT)
         if gesture_rising:
             event_names.append(_GESTURE_EVENT)
+            event_names.append(_COARSE_ARM_GESTURE_EVENT)
+        if fine_hand_gesture_rising:
+            event_names.append(_FINE_HAND_GESTURE_EVENT)
         if objects_view.rising_objects:
             event_names.append(_OBJECT_STABLE_EVENT)
         return ProactiveCameraSurfaceUpdate(snapshot=snapshot, event_names=tuple(event_names))
@@ -1108,6 +1228,80 @@ class ProactiveCameraSurface:
             observed_at=observed_at,
         )
 
+    def _resolve_motion_state(
+        self,
+        *,
+        inspected: bool,
+        person_visible: bool,
+        observed_at: float,
+        raw_state: object,
+    ) -> tuple[SocialMotionState, bool, bool]:
+        """Resolve one held coarse-motion state and whether it changed materially."""
+
+        now = _coerce_timestamp(observed_at)
+        if inspected:
+            state = _coerce_motion_state(raw_state) if person_visible else SocialMotionState.UNKNOWN
+            rising = False
+            if state != self._last_motion_state:
+                self._motion_state_changed_at = now
+                self._motion_state_changed_seen_at = now
+                if state not in {SocialMotionState.UNKNOWN, SocialMotionState.STILL}:
+                    if (
+                        self._last_motion_emitted_at is None
+                        or (now - self._last_motion_emitted_at) >= self.config.motion_event_cooldown_s
+                    ):
+                        self._last_motion_emitted_at = now
+                        rising = True
+            self._last_motion_state = state
+            self._last_motion_state_at = now
+            return state, False, rising
+        state, unknown = self._hold_secondary(
+            value=self._last_motion_state,
+            last_seen_at=self._last_motion_state_at,
+            fallback=SocialMotionState.UNKNOWN,
+            observed_at=observed_at,
+        )
+        return state, unknown, False
+
+    def _resolve_motion_confidence(
+        self,
+        *,
+        inspected: bool,
+        person_visible: bool,
+        observed_at: float,
+        raw_confidence: object,
+    ) -> tuple[float | None, bool]:
+        """Resolve one held motion confidence score."""
+
+        if inspected:
+            value = _coerce_optional_ratio(raw_confidence) if person_visible else None
+            self._last_motion_confidence = value
+            self._last_motion_confidence_at = _coerce_timestamp(observed_at)
+            return value, False
+        return self._hold_secondary(
+            value=self._last_motion_confidence,
+            last_seen_at=self._last_motion_confidence_at,
+            fallback=None,
+            observed_at=observed_at,
+        )
+
+    def _resolve_motion_state_changed_at(
+        self,
+        *,
+        inspected: bool,
+        observed_at: float,
+    ) -> tuple[float | None, bool]:
+        """Resolve the last timestamp where the coarse motion state changed."""
+
+        if inspected:
+            return self._motion_state_changed_at, False
+        return self._hold_secondary(
+            value=self._motion_state_changed_at,
+            last_seen_at=self._motion_state_changed_seen_at,
+            fallback=None,
+            observed_at=observed_at,
+        )
+
     def _resolve_smiling(
         self,
         *,
@@ -1162,6 +1356,48 @@ class ProactiveCameraSurface:
         confidence, confidence_unknown = self._hold_secondary(
             value=self._last_gesture_confidence,
             last_seen_at=self._last_gesture_confidence_at,
+            fallback=None,
+            observed_at=observed_at,
+        )
+        return event, event_unknown, confidence, confidence_unknown, False
+
+    def _resolve_fine_hand_gesture(
+        self,
+        *,
+        inspected: bool,
+        observed_at: float,
+        fine_hand_gesture: object,
+        fine_hand_gesture_confidence: object,
+    ) -> tuple[SocialFineHandGesture, bool, float | None, bool, bool]:
+        """Stabilize fine-hand gesture output with the same bounded cadence rules."""
+
+        now = _coerce_timestamp(observed_at)
+        if inspected:
+            event = _coerce_fine_hand_gesture(fine_hand_gesture)
+            confidence = _coerce_optional_ratio(fine_hand_gesture_confidence)
+            self._last_fine_hand_gesture = event
+            self._last_fine_hand_gesture_at = now
+            self._last_fine_hand_gesture_confidence = confidence
+            self._last_fine_hand_gesture_confidence_at = now
+            rising = False
+            if event not in {SocialFineHandGesture.NONE, SocialFineHandGesture.UNKNOWN}:
+                if (
+                    self._last_fine_hand_gesture_emitted_at is None
+                    or (now - self._last_fine_hand_gesture_emitted_at) >= self.config.gesture_event_cooldown_s
+                ):
+                    self._last_fine_hand_gesture_emitted_at = now
+                    rising = True
+            return event, False, confidence, False, rising
+
+        event, event_unknown = self._hold_secondary(
+            value=self._last_fine_hand_gesture,
+            last_seen_at=self._last_fine_hand_gesture_at,
+            fallback=SocialFineHandGesture.UNKNOWN,
+            observed_at=observed_at,
+        )
+        confidence, confidence_unknown = self._hold_secondary(
+            value=self._last_fine_hand_gesture_confidence,
+            last_seen_at=self._last_fine_hand_gesture_confidence_at,
             fallback=None,
             observed_at=observed_at,
         )
@@ -1362,6 +1598,20 @@ def _coerce_body_pose(value: object) -> SocialBodyPose:
     return SocialBodyPose.UNKNOWN
 
 
+def _coerce_motion_state(value: object) -> SocialMotionState:
+    """Normalize a raw motion token into the coarse ``SocialMotionState`` enum."""
+
+    if isinstance(value, SocialMotionState):
+        return value
+    if value is None:
+        return SocialMotionState.UNKNOWN
+    token = str(value).strip().lower()
+    for state in SocialMotionState:
+        if state.value == token:
+            return state
+    return SocialMotionState.UNKNOWN
+
+
 def _coerce_person_zone(value: object) -> SocialPersonZone:
     """Normalize a raw zone token into the coarse ``SocialPersonZone`` enum."""
 
@@ -1388,6 +1638,20 @@ def _coerce_gesture_event(value: object) -> SocialGestureEvent:
         if event.value == token:
             return event
     return SocialGestureEvent.UNKNOWN
+
+
+def _coerce_fine_hand_gesture(value: object) -> SocialFineHandGesture:
+    """Normalize a raw fine-hand gesture token into the bounded enum."""
+
+    if isinstance(value, SocialFineHandGesture):
+        return value
+    if value is None:
+        return SocialFineHandGesture.UNKNOWN
+    token = str(value).strip().lower()
+    for event in SocialFineHandGesture:
+        if event.value == token:
+            return event
+    return SocialFineHandGesture.UNKNOWN
 
 
 def _coerce_optional_ratio(value: object) -> float | None:

@@ -64,6 +64,23 @@ The current scene set covers `idle_home`, `face_react`, `presentation_mid`,
 can be validated with concrete before/mid/focused/after evidence instead of
 manual screenshots.
 
+For the optional HDMI news ticker, configure the feed URLs in `.env` so the
+runtime display loop can fetch and cache headlines asynchronously:
+
+```dotenv
+TWINR_DISPLAY_NEWS_TICKER_ENABLED=true
+TWINR_DISPLAY_NEWS_TICKER_FEED_URLS=https://www.tagesschau.de/infoservices/alle-meldungen-100~rss2.xml
+TWINR_DISPLAY_NEWS_TICKER_STORE_PATH=artifacts/stores/ops/display_news_ticker.json
+TWINR_DISPLAY_NEWS_TICKER_REFRESH_INTERVAL_S=900
+TWINR_DISPLAY_NEWS_TICKER_ROTATION_INTERVAL_S=12
+TWINR_DISPLAY_NEWS_TICKER_MAX_ITEMS=12
+TWINR_DISPLAY_NEWS_TICKER_TIMEOUT_S=4
+```
+
+The ticker bar only appears on HDMI default surfaces, hides during fullscreen
+presentations, and uses cached fallback text when a fresh feed download is not
+yet available.
+
 For manual HDMI face-trigger validation, write one short-lived cue artifact
 into the configured cue path and let the running display loop pick it up on the
 next cycle. Example:

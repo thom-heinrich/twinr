@@ -6,9 +6,13 @@ visibility: internal
 summary: Coordinate proactive monitor ticks, wakeword presence sessions, and bounded monitor lifecycle for Twinr runtime workflows.
 owned_concerns:
   - Maintain wakeword presence-session state from camera, PIR, and speech activity
+  - Derive conservative ReSpeaker policy hooks such as quiet windows, resume windows, and overlap guards
+  - Derive conservative ReSpeaker speech-delivery defer reasons for display-first proactive routing
   - Coordinate proactive monitor ticks across vision, PIR, ambient audio, and wakeword policy paths
   - Export normalized observation facts and ops telemetry from runtime monitoring
   - Wrap targeted ReSpeaker XVF3800 audio paths with direct signal facts and startup degradation warnings
+  - Keep bounded ReSpeaker audio observation active during `answering` so interruption facts remain observable
+  - Emit explicit operator-readable ReSpeaker runtime alerts for DFU, disconnect, and recovery transitions
   - Open and close monitor resources and the bounded worker thread safely
 out_of_scope:
   - Social trigger scoring thresholds, evidence rules, or prompt content
@@ -24,6 +28,12 @@ files:
       - ProactiveCoordinator
       - ProactiveMonitorService
       - build_default_proactive_monitor
+  - path: audio_policy.py
+    role: Conservative ReSpeaker policy-hook, speech-defer, and runtime alert mapping
+    exports:
+      - ReSpeakerAudioPolicySnapshot
+      - ReSpeakerAudioPolicyTracker
+      - describe_respeaker_runtime_alert
   - path: presence.py
     role: Wakeword presence-session controller and snapshot model
     exports:

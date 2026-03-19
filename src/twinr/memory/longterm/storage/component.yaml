@@ -6,9 +6,9 @@ visibility: internal
 summary: Persist long-term object, conflict, archive, and midterm state locally while mirroring remote-primary object/conflict/archive data through fine-grained ChonkyDB documents plus small catalogs.
 owned_concerns:
   - Persist canonical long-term object, conflict, and archive snapshots under the configured memory path
-  - Persist midterm reflection packets and expose bounded midterm lookup helpers
+  - Persist midterm reflection and restart-recall packets and expose bounded midterm lookup helpers
   - Mirror validated object/conflict/archive state to the remote ChonkyDB namespace as individual documents plus current catalogs and load safe local fallbacks when optional remote reads fail
-  - Emit structured diagnostics for remote ChonkyDB read and write failures plus degraded retrieve fallbacks so live incidents can be classified after the fact
+  - Emit structured diagnostics, histogram artifacts, and alert events for remote ChonkyDB read/write failures and degraded retrieve fallbacks so live incidents can be classified after the fact
   - Expose store-level mutation and review helpers used by long-term runtime, retrieval, and operator flows
 out_of_scope:
   - Define canonical long-term schemas or ontology normalization
@@ -31,6 +31,8 @@ files:
       - LongTermRemoteCatalogStore
   - path: remote_read_diagnostics.py
     role: Structured ops diagnostics for remote long-term I/O failures and fallbacks
+  - path: remote_read_observability.py
+    role: Persisted retrieve latency histograms and explicit remote-read alert policy
   - path: remote_state.py
     role: Small remote snapshot/catalog adapter and status types
     exports:

@@ -18,6 +18,7 @@ bounded.
 - keep required remote-memory checks off the GPIO polling thread by gating live loops from the external remote-memory watchdog artifact while still failing closed when remote memory becomes unavailable
 - keep streamed TTS abortable even before the first chunk arrives so a stalled provider request does not pin the runtime in `answering`
 - only surface `answering` once spoken audio has actually started instead of when text is merely queued
+- route non-safety proactive prompts through a dedicated delivery policy that can choose speech or display-first based on quiet hours, media/noise suppression, and recent ignored or interrupted prompts
 - rearm spoken follow-up turns directly from `answering` back to `listening` so the display and operator cues do not briefly fall through `waiting` between a reply and the reopened microphone window
 - start the post-response closure guard while streamed speech is still draining so follow-up beeps do not sit behind a second model wait after the audible answer ends
 - keep turn-controller context selection, label-aware guidance, and transcript-verifier gate policy in dedicated runtime components instead of inlining them into the active loop classes
@@ -58,6 +59,7 @@ bounded.
 | [streaming_turn_orchestrator.py](./streaming_turn_orchestrator.py) | Low-level parallel bridge/final lane watchdog executor used by the coordinator |
 | [playback_coordinator.py](./playback_coordinator.py) | Single-owner speaker queue with priority-aware, request-bound preemption for beep, feedback, and TTS |
 | [realtime_runtime/background.py](./realtime_runtime/background.py) | Active background delivery helpers used by the realtime loop |
+| [realtime_runtime/proactive_delivery.py](./realtime_runtime/proactive_delivery.py) | Display-first versus speech delivery policy for proactive background prompts |
 | [realtime_runtime/support.py](./realtime_runtime/support.py) | Active emit/media/config helpers used by the realtime loop |
 | [realtime_runner_background.py](./realtime_runner_background.py) | Compatibility shim for background helpers |
 | [realtime_runner_support.py](./realtime_runner_support.py) | Compatibility shim for support helpers |

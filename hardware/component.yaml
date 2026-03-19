@@ -36,6 +36,8 @@ files:
     role: Reproducibly sync the pinned self-coding Codex bridge/auth to the Pi and run the remote readiness self-test
   - path: ops/twinr-runtime-supervisor.service
     role: Authoritatively supervise the productive streaming loop plus remote watchdog on the Pi
+  - path: piaicam/fetch_mediapipe_models.py
+    role: Download the official MediaPipe pose and gesture task bundles needed by the Pi runtime path
   - path: piaicam/smoke_piaicam.py
     role: Run bounded Pi AI Camera enumerate/still/video/IMX500 smoke phases
   - path: pir/setup_pir.sh
@@ -49,4 +51,4 @@ related_runtime_packages:
   - path: src/twinr/display
 manual_checks:
   - command: bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/mic/setup_respeaker_access.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
-  - command: PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/display/run_visual_qc.py hardware/piaicam/smoke_piaicam.py hardware/pir/probe_pir.py
+  - command: PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/display/run_visual_qc.py hardware/piaicam/fetch_mediapipe_models.py hardware/piaicam/smoke_piaicam.py hardware/pir/probe_pir.py

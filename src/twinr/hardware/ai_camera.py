@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_DETECTION_NETWORK = "/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk"
 _DEFAULT_POSE_NETWORK = "/usr/share/imx500-models/imx500_network_posenet.rpk"
+_DEFAULT_POSE_BACKEND = "mediapipe"
+_DEFAULT_MEDIAPIPE_POSE_MODEL = "state/mediapipe/models/pose_landmarker_full.task"
+_DEFAULT_MEDIAPIPE_GESTURE_MODEL = "state/mediapipe/models/gesture_recognizer.task"
 _DEFAULT_MAIN_SIZE = (640, 480)
 _DEFAULT_FRAME_RATE = 10
 _DEFAULT_LOCK_TIMEOUT_S = 5.0
@@ -39,10 +42,14 @@ _DEFAULT_ATTENTION_SCORE_THRESHOLD = 0.62
 _DEFAULT_ENGAGED_SCORE_THRESHOLD = 0.45
 _DEFAULT_POSE_CONFIDENCE = 0.30
 _DEFAULT_POSE_REFRESH_S = 12.0
+_DEFAULT_SEQUENCE_WINDOW_S = 1.6
+_DEFAULT_SEQUENCE_MIN_FRAMES = 4
 _DEFAULT_UNDEFINED_LABELS = frozenset({"-", "", "unknown"})
 _PERSON_LABELS = frozenset({"person"})
 _KEYPOINT_COUNT = 17
 _NO_GESTURE = "none"
+_MOTION_UNKNOWN_MAX_GAP_S = 12.0
+_MOTION_MIN_DELTA_S = 0.15
 
 
 class AICameraZone(StrEnum):
@@ -65,13 +72,40 @@ class AICameraBodyPose(StrEnum):
     FLOOR = "floor"
 
 
+class AICameraMotionState(StrEnum):
+    """Describe one coarse motion class derived from recent person-box deltas."""
+
+    UNKNOWN = "unknown"
+    STILL = "still"
+    WALKING = "walking"
+    APPROACHING = "approaching"
+    LEAVING = "leaving"
+
+
 class AICameraGestureEvent(StrEnum):
-    """Describe the tiny camera gesture vocabulary."""
+    """Describe the bounded coarse-arm gesture vocabulary."""
 
     NONE = "none"
+    WAVE = "wave"
     STOP = "stop"
     DISMISS = "dismiss"
     CONFIRM = "confirm"
+    ARMS_CROSSED = "arms_crossed"
+    TWO_HAND_DISMISS = "two_hand_dismiss"
+    TIMEOUT_T = "timeout_t"
+    UNKNOWN = "unknown"
+
+
+class AICameraFineHandGesture(StrEnum):
+    """Describe the bounded fine-hand gesture vocabulary."""
+
+    NONE = "none"
+    THUMBS_UP = "thumbs_up"
+    THUMBS_DOWN = "thumbs_down"
+    POINTING = "pointing"
+    OPEN_PALM = "open_palm"
+    OK_SIGN = "ok_sign"
+    MIDDLE_FINGER = "middle_finger"
     UNKNOWN = "unknown"
 
 
@@ -81,6 +115,11 @@ class AICameraAdapterConfig:
 
     detection_network_path: str = _DEFAULT_DETECTION_NETWORK
     pose_network_path: str = _DEFAULT_POSE_NETWORK
+    pose_backend: str = _DEFAULT_POSE_BACKEND
+    mediapipe_pose_model_path: str = _DEFAULT_MEDIAPIPE_POSE_MODEL
+    mediapipe_gesture_model_path: str = _DEFAULT_MEDIAPIPE_GESTURE_MODEL
+    mediapipe_custom_gesture_model_path: str | None = None
+    mediapipe_num_hands: int = 2
     main_size: tuple[int, int] = _DEFAULT_MAIN_SIZE
     frame_rate: int = _DEFAULT_FRAME_RATE
     lock_timeout_s: float = _DEFAULT_LOCK_TIMEOUT_S
@@ -95,6 +134,8 @@ class AICameraAdapterConfig:
     engaged_score_threshold: float = _DEFAULT_ENGAGED_SCORE_THRESHOLD
     pose_confidence_threshold: float = _DEFAULT_POSE_CONFIDENCE
     pose_refresh_s: float = _DEFAULT_POSE_REFRESH_S
+    sequence_window_s: float = _DEFAULT_SEQUENCE_WINDOW_S
+    sequence_min_frames: int = _DEFAULT_SEQUENCE_MIN_FRAMES
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "AICameraAdapterConfig":
@@ -106,6 +147,23 @@ class AICameraAdapterConfig:
                 or _DEFAULT_DETECTION_NETWORK
             ),
             pose_network_path=str(getattr(config, "proactive_local_camera_pose_network_path", _DEFAULT_POSE_NETWORK) or _DEFAULT_POSE_NETWORK),
+            pose_backend=str(getattr(config, "proactive_local_camera_pose_backend", _DEFAULT_POSE_BACKEND) or _DEFAULT_POSE_BACKEND).strip().lower(),
+            mediapipe_pose_model_path=str(
+                getattr(config, "proactive_local_camera_mediapipe_pose_model_path", _DEFAULT_MEDIAPIPE_POSE_MODEL)
+                or _DEFAULT_MEDIAPIPE_POSE_MODEL
+            ),
+            mediapipe_gesture_model_path=str(
+                getattr(config, "proactive_local_camera_mediapipe_gesture_model_path", _DEFAULT_MEDIAPIPE_GESTURE_MODEL)
+                or _DEFAULT_MEDIAPIPE_GESTURE_MODEL
+            ),
+            mediapipe_custom_gesture_model_path=(
+                str(getattr(config, "proactive_local_camera_mediapipe_custom_gesture_model_path", "") or "").strip()
+                or None
+            ),
+            mediapipe_num_hands=_coerce_positive_int(
+                getattr(config, "proactive_local_camera_mediapipe_num_hands", 2),
+                default=2,
+            ),
             main_size=(
                 _coerce_positive_int(getattr(config, "camera_width", _DEFAULT_MAIN_SIZE[0]), default=_DEFAULT_MAIN_SIZE[0]),
                 _coerce_positive_int(getattr(config, "camera_height", _DEFAULT_MAIN_SIZE[1]), default=_DEFAULT_MAIN_SIZE[1]),
@@ -161,6 +219,14 @@ class AICameraAdapterConfig:
             pose_refresh_s=_coerce_non_negative_float(
                 getattr(config, "proactive_local_camera_pose_refresh_s", _DEFAULT_POSE_REFRESH_S),
                 default=_DEFAULT_POSE_REFRESH_S,
+            ),
+            sequence_window_s=_coerce_positive_float(
+                getattr(config, "proactive_local_camera_sequence_window_s", _DEFAULT_SEQUENCE_WINDOW_S),
+                default=_DEFAULT_SEQUENCE_WINDOW_S,
+            ),
+            sequence_min_frames=_coerce_positive_int(
+                getattr(config, "proactive_local_camera_sequence_min_frames", _DEFAULT_SEQUENCE_MIN_FRAMES),
+                default=_DEFAULT_SEQUENCE_MIN_FRAMES,
             ),
         )
 
@@ -260,10 +326,14 @@ class AICameraObservation:
     visual_attention_score: float | None = None
     body_pose: AICameraBodyPose = AICameraBodyPose.UNKNOWN
     pose_confidence: float | None = None
+    motion_state: AICameraMotionState = AICameraMotionState.UNKNOWN
+    motion_confidence: float | None = None
     hand_or_object_near_camera: bool = False
     showing_intent_likely: bool | None = None
     gesture_event: AICameraGestureEvent = AICameraGestureEvent.NONE
     gesture_confidence: float | None = None
+    fine_hand_gesture: AICameraFineHandGesture = AICameraFineHandGesture.NONE
+    fine_hand_gesture_confidence: float | None = None
     objects: tuple[AICameraObjectDetection, ...] = ()
     model: str = "local-imx500"
 
@@ -319,6 +389,8 @@ class _PoseResult:
     showing_intent_likely: bool | None
     gesture_event: AICameraGestureEvent
     gesture_confidence: float | None
+    fine_hand_gesture: AICameraFineHandGesture = AICameraFineHandGesture.NONE
+    fine_hand_gesture_confidence: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +430,12 @@ class LocalAICameraAdapter:
         self._last_health_signature: tuple[bool, bool, bool, str | None] | None = None
         self._last_pose_at: float | None = None
         self._last_pose_result: _PoseResult | None = None
+        self._mediapipe_pipeline: Any | None = None
+        self._last_motion_box: AICameraBox | None = None
+        self._last_motion_person_count = 0
+        self._last_motion_at: float | None = None
+        self._last_motion_state = AICameraMotionState.UNKNOWN
+        self._last_motion_confidence: float | None = None
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LocalAICameraAdapter":
@@ -369,6 +447,12 @@ class LocalAICameraAdapter:
         """Close any active Picamera2 session."""
 
         self._close_session()
+        if self._mediapipe_pipeline is not None:
+            try:
+                self._mediapipe_pipeline.close()
+            except Exception:  # pragma: no cover - depends on MediaPipe runtime state.
+                logger.debug("Ignoring MediaPipe close failure during AI camera cleanup.", exc_info=True)
+            self._mediapipe_pipeline = None
 
     def observe(self) -> AICameraObservation:
         """Capture one local IMX500 observation or one explicit health failure."""
@@ -417,7 +501,7 @@ class LocalAICameraAdapter:
                 observation,
                 online=True,
                 ready=True,
-                ai_ready=True,
+                ai_ready=(pose_error is None),
                 error=pose_error,
                 frame_at=observed_at,
             )
@@ -444,7 +528,20 @@ class LocalAICameraAdapter:
     ) -> tuple[_PoseResult | None, str | None]:
         """Return one fresh or cached pose result for the current detection frame."""
 
-        if detection.person_count <= 0 or not self.config.pose_network_path:
+        if detection.person_count <= 0:
+            if self._mediapipe_pipeline is not None:
+                self._mediapipe_pipeline.reset_temporal_state()
+            self._last_pose_result = None
+            self._last_pose_at = None
+            return None, None
+
+        if self.config.pose_backend == "mediapipe":
+            return self._resolve_mediapipe_pose(
+                runtime,
+                observed_at=observed_at,
+                detection=detection,
+            )
+        if not self.config.pose_network_path:
             self._last_pose_result = None
             self._last_pose_at = None
             return None, None
@@ -477,6 +574,44 @@ class LocalAICameraAdapter:
         self._last_pose_at = observed_at
         return pose, None
 
+    def _resolve_mediapipe_pose(
+        self,
+        runtime: dict[str, Any],
+        *,
+        observed_at: float,
+        detection: _DetectionResult,
+    ) -> tuple[_PoseResult | None, str | None]:
+        """Run the Pi-side MediaPipe pose and gesture path on the RGB preview frame."""
+
+        if detection.primary_person_box is None:
+            return None, None
+        try:
+            frame_rgb = self._capture_rgb_frame(runtime, observed_at=observed_at)
+            pipeline = self._ensure_mediapipe_pipeline()
+            result = pipeline.analyze(
+                frame_rgb=frame_rgb,
+                observed_at=observed_at,
+                primary_person_box=detection.primary_person_box,
+            )
+        except Exception as exc:  # pragma: no cover - depends on Pi runtime and model assets.
+            logger.warning("Local AI camera MediaPipe inference failed: %s", exc)
+            return None, self._classify_error(exc)
+        pose = _PoseResult(
+            body_pose=result.body_pose,
+            pose_confidence=result.pose_confidence,
+            looking_toward_device=result.looking_toward_device,
+            visual_attention_score=result.visual_attention_score,
+            hand_near_camera=result.hand_near_camera,
+            showing_intent_likely=result.showing_intent_likely,
+            gesture_event=result.gesture_event,
+            gesture_confidence=result.gesture_confidence,
+            fine_hand_gesture=result.fine_hand_gesture,
+            fine_hand_gesture_confidence=result.fine_hand_gesture_confidence,
+        )
+        self._last_pose_result = pose
+        self._last_pose_at = observed_at
+        return pose, None
+
     def _compose_observation(
         self,
         *,
@@ -496,8 +631,12 @@ class LocalAICameraAdapter:
         engaged_with_device = None
         body_pose = AICameraBodyPose.UNKNOWN
         pose_confidence = None
+        motion_state = AICameraMotionState.UNKNOWN
+        motion_confidence = None
         gesture_event = AICameraGestureEvent.UNKNOWN if pose_error is not None else AICameraGestureEvent.NONE
         gesture_confidence = None
+        fine_hand_gesture = AICameraFineHandGesture.UNKNOWN if pose_error is not None else AICameraFineHandGesture.NONE
+        fine_hand_gesture_confidence = None
         showing_intent_likely = None
         hand_or_object_near_camera = detection.hand_or_object_near_camera
 
@@ -525,8 +664,16 @@ class LocalAICameraAdapter:
             pose_confidence = pose.pose_confidence
             gesture_event = pose.gesture_event
             gesture_confidence = pose.gesture_confidence
+            fine_hand_gesture = pose.fine_hand_gesture
+            fine_hand_gesture_confidence = pose.fine_hand_gesture_confidence
             hand_or_object_near_camera = hand_or_object_near_camera or pose.hand_near_camera
             showing_intent_likely = pose.showing_intent_likely
+
+        motion_state, motion_confidence = self._resolve_motion(
+            observed_at=observed_at,
+            person_count=detection.person_count,
+            primary_person_box=primary_person_box,
+        )
 
         return AICameraObservation(
             observed_at=observed_at,
@@ -543,11 +690,20 @@ class LocalAICameraAdapter:
             visual_attention_score=visual_attention_score,
             body_pose=body_pose,
             pose_confidence=pose_confidence,
+            motion_state=motion_state,
+            motion_confidence=motion_confidence,
             hand_or_object_near_camera=hand_or_object_near_camera,
             showing_intent_likely=showing_intent_likely,
             gesture_event=gesture_event,
             gesture_confidence=gesture_confidence,
+            fine_hand_gesture=fine_hand_gesture,
+            fine_hand_gesture_confidence=fine_hand_gesture_confidence,
             objects=detection.objects,
+            model=(
+                "local-imx500+mediapipe"
+                if self.config.pose_backend == "mediapipe"
+                else "local-imx500"
+            ),
         )
 
     def _capture_detection(self, runtime: dict[str, Any], *, observed_at: float) -> _DetectionResult:
@@ -696,6 +852,34 @@ class LocalAICameraAdapter:
             gesture_confidence=gesture_confidence,
         )
 
+    def _capture_rgb_frame(self, runtime: dict[str, Any], *, observed_at: float) -> Any:
+        """Capture one RGB preview frame from the live detection session."""
+
+        session = self._ensure_session(
+            runtime,
+            network_path=self.config.detection_network_path,
+            task_name="detection",
+        )
+        try:
+            frame = session.picam2.capture_array("main")
+        except TypeError:
+            frame = session.picam2.capture_array()
+        if frame is None:
+            raise RuntimeError("rgb_frame_missing")
+        return frame
+
+    def _ensure_mediapipe_pipeline(self) -> Any:
+        """Reuse or create the Pi-side MediaPipe inference pipeline lazily."""
+
+        if self._mediapipe_pipeline is not None:
+            return self._mediapipe_pipeline
+        from twinr.hardware.mediapipe_vision import MediaPipeVisionConfig, MediaPipeVisionPipeline
+
+        self._mediapipe_pipeline = MediaPipeVisionPipeline(
+            config=MediaPipeVisionConfig.from_ai_camera_config(self.config),
+        )
+        return self._mediapipe_pipeline
+
     def _select_primary_pose(
         self,
         *,
@@ -761,7 +945,7 @@ class LocalAICameraAdapter:
         imx500 = IMX500(network_path)
         picam2 = Picamera2(imx500.camera_num)
         configuration = picam2.create_preview_configuration(
-            main={"size": self.config.main_size},
+            main={"size": self.config.main_size, "format": "RGB888"},
             controls={"FrameRate": self.config.frame_rate},
         )
         picam2.configure(configuration)
@@ -882,13 +1066,41 @@ class LocalAICameraAdapter:
             visual_attention_score=observation.visual_attention_score,
             body_pose=observation.body_pose,
             pose_confidence=observation.pose_confidence,
+            motion_state=observation.motion_state,
+            motion_confidence=observation.motion_confidence,
             hand_or_object_near_camera=observation.hand_or_object_near_camera,
             showing_intent_likely=observation.showing_intent_likely,
             gesture_event=observation.gesture_event,
             gesture_confidence=observation.gesture_confidence,
+            fine_hand_gesture=observation.fine_hand_gesture,
+            fine_hand_gesture_confidence=observation.fine_hand_gesture_confidence,
             objects=observation.objects,
             model=observation.model,
         )
+
+    def _resolve_motion(
+        self,
+        *,
+        observed_at: float,
+        person_count: int,
+        primary_person_box: AICameraBox | None,
+    ) -> tuple[AICameraMotionState, float | None]:
+        """Derive one coarse motion state from recent primary-person box deltas."""
+
+        motion_state, motion_confidence = _infer_motion_state(
+            previous_box=self._last_motion_box,
+            current_box=primary_person_box,
+            previous_observed_at=self._last_motion_at,
+            current_observed_at=observed_at,
+            previous_person_count=self._last_motion_person_count,
+            current_person_count=person_count,
+        )
+        self._last_motion_box = primary_person_box
+        self._last_motion_person_count = max(0, int(person_count))
+        self._last_motion_at = observed_at
+        self._last_motion_state = motion_state
+        self._last_motion_confidence = motion_confidence
+        return motion_state, motion_confidence
 
     def _classify_error(self, exc: Exception) -> str:
         """Return one stable operator-facing error code for the exception."""
@@ -902,10 +1114,20 @@ class LocalAICameraAdapter:
             return "picamera2_unavailable"
         if "metadata_timeout" in message:
             return "metadata_timeout"
+        if "mediapipe_custom_gesture_model_missing" in message:
+            return "mediapipe_custom_gesture_model_missing"
+        if "mediapipe_pose_model_missing" in message:
+            return "mediapipe_pose_model_missing"
+        if "mediapipe_gesture_model_missing" in message:
+            return "mediapipe_gesture_model_missing"
+        if "mediapipe_unavailable" in message:
+            return "mediapipe_unavailable"
         if "model_missing" in message:
             return "model_missing"
         if "pose_dependency_missing" in message:
             return "pose_dependency_missing"
+        if "rgb_frame_missing" in message:
+            return "rgb_frame_missing"
         if "pose_outputs_missing" in message or "pose_people_missing" in message or "operands could not be broadcast together" in message:
             return "pose_decode_failed"
         if "pose_confidence_low" in message:
@@ -1251,6 +1473,69 @@ def _strong_keypoint_count(
     return sum(1 for _, _, score in keypoints.values() if score >= min_score)
 
 
+def _matches_wave_arm(
+    *,
+    shoulder: tuple[float, float, float] | None,
+    elbow: tuple[float, float, float] | None,
+    wrist: tuple[float, float, float] | None,
+    side: str,
+) -> bool:
+    """Return whether one arm geometry looks like a simple raised wave pose."""
+
+    if shoulder is None or elbow is None or wrist is None:
+        return False
+    lateral = wrist[0] - shoulder[0]
+    if side == "left":
+        lateral *= -1.0
+    return (
+        wrist[1] < shoulder[1] - 0.05
+        and lateral >= 0.12
+        and elbow[1] > wrist[1]
+        and elbow[1] <= shoulder[1] + 0.18
+    )
+
+
+def _matches_vertical_arm(
+    *,
+    shoulder: tuple[float, float, float] | None,
+    elbow: tuple[float, float, float] | None,
+    wrist: tuple[float, float, float] | None,
+    shoulder_span: float,
+) -> bool:
+    """Return whether one arm is held mostly vertical."""
+
+    if shoulder is None or elbow is None or wrist is None:
+        return False
+    x_tolerance = max(0.05, shoulder_span * 0.18)
+    return (
+        abs(wrist[0] - elbow[0]) <= x_tolerance
+        and abs(elbow[0] - shoulder[0]) <= x_tolerance
+        and wrist[1] < elbow[1] < (shoulder[1] + 0.20)
+    )
+
+
+def _matches_horizontal_arm_toward_center(
+    *,
+    shoulder: tuple[float, float, float] | None,
+    elbow: tuple[float, float, float] | None,
+    wrist: tuple[float, float, float] | None,
+    shoulder_center_x: float,
+    shoulder_y: float,
+    side: str,
+) -> bool:
+    """Return whether one forearm is held roughly horizontal toward the torso center."""
+
+    if shoulder is None or elbow is None or wrist is None:
+        return False
+    toward_center = wrist[0] > shoulder[0] if side == "left" else wrist[0] < shoulder[0]
+    return (
+        toward_center
+        and abs(wrist[1] - elbow[1]) <= 0.08
+        and abs(elbow[1] - shoulder_y) <= 0.16
+        and abs(wrist[0] - shoulder_center_x) <= 0.16
+    )
+
+
 def _support_pose_confidence(
     raw_score: float,
     keypoints: dict[int, tuple[float, float, float]],
@@ -1294,37 +1579,113 @@ def _classify_gesture(
     attention_score: float,
     fallback_box: AICameraBox,
 ) -> tuple[AICameraGestureEvent, float | None]:
-    """Return one conservative gesture classification."""
+    """Return one conservative coarse-arm gesture classification."""
 
-    left_shoulder = keypoints.get(5)
-    right_shoulder = keypoints.get(6)
-    left_elbow = keypoints.get(7)
-    right_elbow = keypoints.get(8)
-    left_wrist = keypoints.get(9)
-    right_wrist = keypoints.get(10)
+    left_shoulder = _visible_joint(keypoints, 5)
+    right_shoulder = _visible_joint(keypoints, 6)
+    left_elbow = _visible_joint(keypoints, 7)
+    right_elbow = _visible_joint(keypoints, 8)
+    left_wrist = _visible_joint(keypoints, 9)
+    right_wrist = _visible_joint(keypoints, 10)
 
-    if left_shoulder and left_wrist and min(left_shoulder[2], left_wrist[2]) >= 0.20:
+    if left_shoulder is not None and right_shoulder is not None:
+        shoulder_center_x = (left_shoulder[0] + right_shoulder[0]) / 2.0
+        shoulder_y = (left_shoulder[1] + right_shoulder[1]) / 2.0
+        shoulder_span = max(0.08, abs(right_shoulder[0] - left_shoulder[0]))
+        chest_bottom = shoulder_y + max(0.18, fallback_box.height * 0.24)
+        crossed_margin = max(0.03, shoulder_span * 0.08)
+        horizontal_outreach = max(0.12, shoulder_span * 0.28)
+
+        if (
+            left_wrist is not None
+            and right_wrist is not None
+            and shoulder_y - 0.04 <= left_wrist[1] <= chest_bottom
+            and shoulder_y - 0.04 <= right_wrist[1] <= chest_bottom
+            and left_wrist[0] >= shoulder_center_x + crossed_margin
+            and right_wrist[0] <= shoulder_center_x - crossed_margin
+        ):
+            return AICameraGestureEvent.ARMS_CROSSED, round(
+                _clamp_ratio(0.62 + 0.18 * attention_score, default=0.62),
+                3,
+            )
+
+        if (
+            left_wrist is not None
+            and right_wrist is not None
+            and left_wrist[0] <= left_shoulder[0] - horizontal_outreach
+            and right_wrist[0] >= right_shoulder[0] + horizontal_outreach
+            and abs(left_wrist[1] - left_shoulder[1]) <= 0.18
+            and abs(right_wrist[1] - right_shoulder[1]) <= 0.18
+        ):
+            return AICameraGestureEvent.TWO_HAND_DISMISS, round(
+                _clamp_ratio(0.66 + 0.18 * attention_score, default=0.66),
+                3,
+            )
+
+        if (
+            _matches_horizontal_arm_toward_center(
+                shoulder=left_shoulder,
+                elbow=left_elbow,
+                wrist=left_wrist,
+                shoulder_center_x=shoulder_center_x,
+                shoulder_y=shoulder_y,
+                side="left",
+            )
+            and _matches_vertical_arm(
+                shoulder=right_shoulder,
+                elbow=right_elbow,
+                wrist=right_wrist,
+                shoulder_span=shoulder_span,
+            )
+        ) or (
+            _matches_horizontal_arm_toward_center(
+                shoulder=right_shoulder,
+                elbow=right_elbow,
+                wrist=right_wrist,
+                shoulder_center_x=shoulder_center_x,
+                shoulder_y=shoulder_y,
+                side="right",
+            )
+            and _matches_vertical_arm(
+                shoulder=left_shoulder,
+                elbow=left_elbow,
+                wrist=left_wrist,
+                shoulder_span=shoulder_span,
+            )
+        ):
+            return AICameraGestureEvent.TIMEOUT_T, round(
+                _clamp_ratio(0.64 + 0.18 * attention_score, default=0.64),
+                3,
+            )
+
+    if _matches_wave_arm(shoulder=left_shoulder, elbow=left_elbow, wrist=left_wrist, side="left") or _matches_wave_arm(
+        shoulder=right_shoulder,
+        elbow=right_elbow,
+        wrist=right_wrist,
+        side="right",
+    ):
+        return AICameraGestureEvent.WAVE, round(_clamp_ratio(0.60 + 0.20 * attention_score, default=0.60), 3)
+
+    if left_shoulder and left_wrist:
         if left_wrist[1] < left_shoulder[1] - 0.08 and abs(left_wrist[0] - left_shoulder[0]) <= 0.16:
             return AICameraGestureEvent.STOP, round(_clamp_ratio(0.7 + 0.3 * attention_score, default=0.7), 3)
         if left_wrist[0] < left_shoulder[0] - 0.18 and abs(left_wrist[1] - left_shoulder[1]) <= 0.16:
             return AICameraGestureEvent.DISMISS, round(_clamp_ratio(0.6 + 0.2 * attention_score, default=0.6), 3)
         if (
             left_elbow
-            and left_elbow[2] >= 0.20
             and abs(left_wrist[0] - left_shoulder[0]) <= 0.08
             and left_wrist[1] <= left_shoulder[1]
             and left_elbow[1] > left_wrist[1]
         ):
             return AICameraGestureEvent.CONFIRM, round(_clamp_ratio(0.55 + 0.2 * attention_score, default=0.55), 3)
 
-    if right_shoulder and right_wrist and min(right_shoulder[2], right_wrist[2]) >= 0.20:
+    if right_shoulder and right_wrist:
         if right_wrist[1] < right_shoulder[1] - 0.08 and abs(right_wrist[0] - right_shoulder[0]) <= 0.16:
             return AICameraGestureEvent.STOP, round(_clamp_ratio(0.7 + 0.3 * attention_score, default=0.7), 3)
         if right_wrist[0] > right_shoulder[0] + 0.18 and abs(right_wrist[1] - right_shoulder[1]) <= 0.16:
             return AICameraGestureEvent.DISMISS, round(_clamp_ratio(0.6 + 0.2 * attention_score, default=0.6), 3)
         if (
             right_elbow
-            and right_elbow[2] >= 0.20
             and abs(right_wrist[0] - right_shoulder[0]) <= 0.08
             and right_wrist[1] <= right_shoulder[1]
             and right_elbow[1] > right_wrist[1]
@@ -1439,11 +1800,69 @@ def _classify_body_pose(
     return AICameraBodyPose.UNKNOWN
 
 
+def _infer_motion_state(
+    *,
+    previous_box: AICameraBox | None,
+    current_box: AICameraBox | None,
+    previous_observed_at: float | None,
+    current_observed_at: float,
+    previous_person_count: int,
+    current_person_count: int,
+) -> tuple[AICameraMotionState, float | None]:
+    """Infer one coarse motion state from recent primary-person box deltas."""
+
+    if (
+        previous_box is None
+        or current_box is None
+        or previous_observed_at is None
+        or previous_person_count != 1
+        or current_person_count != 1
+    ):
+        return AICameraMotionState.UNKNOWN, None
+
+    delta_t = max(0.0, float(current_observed_at) - float(previous_observed_at))
+    if delta_t < _MOTION_MIN_DELTA_S or delta_t > _MOTION_UNKNOWN_MAX_GAP_S:
+        return AICameraMotionState.UNKNOWN, None
+
+    delta_x = current_box.center_x - previous_box.center_x
+    delta_y = current_box.center_y - previous_box.center_y
+    center_distance = math.hypot(delta_x, delta_y)
+    center_speed = center_distance / max(delta_t, _MOTION_MIN_DELTA_S)
+    area_delta = current_box.area - previous_box.area
+    height_delta = current_box.height - previous_box.height
+    scale_strength = max(abs(area_delta), abs(height_delta))
+    confidence = round(
+        _clamp_ratio(max(center_speed * 5.0, scale_strength * 3.4), default=0.0),
+        3,
+    )
+
+    if abs(area_delta) >= 0.06 and abs(delta_x) <= 0.10:
+        if area_delta > 0.0 and height_delta >= -0.01:
+            return AICameraMotionState.APPROACHING, max(confidence, 0.56)
+        if area_delta < 0.0 and height_delta <= 0.01:
+            return AICameraMotionState.LEAVING, max(confidence, 0.56)
+
+    if center_speed >= 0.08 or (abs(delta_x) >= 0.08 and scale_strength <= 0.08):
+        return AICameraMotionState.WALKING, max(confidence, 0.54)
+
+    if center_distance <= 0.035 and scale_strength <= 0.04:
+        return AICameraMotionState.STILL, max(0.52, round(0.52 + (0.04 - scale_strength), 3))
+
+    if abs(area_delta) >= 0.04:
+        return (
+            (AICameraMotionState.APPROACHING if area_delta > 0.0 else AICameraMotionState.LEAVING),
+            max(confidence, 0.5),
+        )
+    return AICameraMotionState.STILL, max(confidence, 0.45)
+
+
 __all__ = [
     "AICameraAdapterConfig",
     "AICameraBodyPose",
     "AICameraBox",
     "AICameraGestureEvent",
+    "AICameraFineHandGesture",
+    "AICameraMotionState",
     "AICameraObjectDetection",
     "AICameraObservation",
     "AICameraZone",

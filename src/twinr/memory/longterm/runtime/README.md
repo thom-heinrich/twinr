@@ -11,6 +11,7 @@ bounded background writers into the APIs used by agent runtime loops.
 - Assemble `LongTermMemoryService` from config and subsystem dependencies
 - Build runtime provider context and tool-safe context while preserving both original-language and canonical query recall paths
 - Expose confirmed durable-memory state explicitly in provider/tool context so meta-memory questions can distinguish stored current facts from generic neighbors
+- Rebuild and persist provenance-rich restart-recall packets after durable-memory mutations so fresh runtime roots retain immediate continuity
 - Persist conversation turns and multimodal evidence through bounded workers
 - Split one service-level flush timeout into explicit per-writer budgets so wall-clock runtime deadlines stay real
 - Keep low-signal multimodal writes on the deterministic reflection path while skipping optional midterm compilation that would otherwise duplicate per-turn remote latency

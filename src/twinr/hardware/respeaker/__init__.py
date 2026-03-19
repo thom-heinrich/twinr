@@ -19,6 +19,7 @@ from twinr.hardware.respeaker.models import (
     ReSpeakerTransportAvailability,
     ReSpeakerUsbDevice,
 )
+from twinr.hardware.respeaker.derived_signals import ReSpeakerDerivedSignalState, derive_respeaker_signal_state
 from twinr.hardware.respeaker.probe import config_targets_respeaker, probe_respeaker_xvf3800
 from twinr.hardware.respeaker.raw_reads import (
     AEC_AZIMUTH_VALUES_PARAMETER,
@@ -42,6 +43,7 @@ __all__ = [
     "DOA_VALUE_PARAMETER",
     "GPO_READ_VALUES_PARAMETER",
     "VERSION_PARAMETER",
+    "ReSpeakerDerivedSignalState",
     "ReSpeakerCaptureDevice",
     "ReSpeakerDirectionSnapshot",
     "ReSpeakerLibusbTransport",
@@ -57,6 +59,7 @@ __all__ = [
     "ReSpeakerUsbDevice",
     "capture_respeaker_primitive_snapshot",
     "config_targets_respeaker",
+    "derive_respeaker_signal_state",
     "probe_respeaker_xvf3800",
     "read_default_respeaker_parameters",
 ]

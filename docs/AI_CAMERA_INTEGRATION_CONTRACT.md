@@ -25,6 +25,34 @@ It must **not** deliver:
 
 The camera subsystem proposes observations. Twinr policy decides what to do.
 
+## Classification Separation Rule
+
+The camera contract must not collapse all human-state signals into one generic
+`gesture_event`.
+
+Twinr should reason about four separate classes:
+- `body_pose`
+- `motion`
+- `coarse_arm_gesture`
+- `fine_hand_gesture`
+
+These classes serve different consumers, have different confidence limits, and
+must be allowed to evolve independently.
+
+Examples:
+- `standing`, `seated` -> `body_pose`
+- `walking`, `approaching`, `leaving` -> `motion`
+- `wave`, `stop`, `dismiss`, `two_hand_dismiss`, `timeout_t`, `arms_crossed`
+  -> `coarse_arm_gesture`
+- `thumbs_up`, `thumbs_down`, `ok_sign`, `pointing`, `middle_finger`
+  -> `fine_hand_gesture`
+
+On the current hardware and pipeline, Twinr V1 should treat `body_pose`,
+`motion`, and `coarse_arm_gesture` as realistic first-class requirements.
+`fine_hand_gesture` is a separate extension surface that should only become
+policy-relevant when a dedicated hand/finger provider proves it can support it
+defensibly.
+
 ## What The Camera Must Deliver
 
 ### 1. Health And Readiness
@@ -98,7 +126,7 @@ Unsafe/non-required signals:
 
 These signals are for pacing, initiative gating, and display-state transitions.
 
-### 5. Coarse Body State
+### 5. Body Pose Class
 
 The camera must provide only coarse posture states that are defensible on the
 current hardware.
@@ -112,7 +140,22 @@ Optional supporting fields:
 
 This is for calm prompts such as concern follow-up, not diagnosis.
 
-### 6. Showing-Intent And Near-Camera Intent
+### 6. Motion Class
+
+The camera must provide a temporal motion view separate from posture and
+separate from gestures.
+
+Minimum required field:
+- `motion_state: still | walking | approaching | leaving | unknown`
+
+Optional supporting fields:
+- `motion_confidence: float | null`
+- `motion_state_changed_at: timestamp | null`
+
+This signal must come from bounded multi-frame evidence. A single-frame pose
+guess is not enough to claim `walking`.
+
+### 7. Showing-Intent And Near-Camera Intent
 
 Twinr needs to know when the user is intentionally presenting something to the
 device.
@@ -125,22 +168,53 @@ Minimum required fields:
 This supports "show me this" flows, document/object assistance, and gentle
 context prompts.
 
-### 7. Small Gesture Set
+### 8. Coarse Arm Gesture Class
 
-The camera path should support a tiny, high-value gesture vocabulary.
+The camera path should expose a small, high-value set of coarse arm/upper-body
+gestures that the current pose stack can plausibly defend.
 
-Recommended initial gestures only:
+Realistic V1 target vocabulary:
+- `wave`
 - `stop`
 - `dismiss`
 - `confirm`
+- `arms_crossed`
+- `two_hand_dismiss`
+- `timeout_t`
 
 Minimum required field:
-- `gesture_event: none | stop | dismiss | confirm | unknown`
+- `coarse_arm_gesture: none | wave | stop | dismiss | confirm | arms_crossed | two_hand_dismiss | timeout_t | unknown`
 
-This should stay small. The camera contract should not grow into a full gesture
-language.
+Contract rules:
+- this surface must stay small and inspectable
+- classifications must be confidence-gated and debounced
+- policy must tolerate `unknown`
+- the camera contract should not grow into an open-ended gesture language
 
-### 8. On-Device Object Detection
+### 9. Fine Hand Gesture Class
+
+Fine hand/finger gestures are a separate class and must not be faked from a
+coarse body-pose model.
+
+Target vocabulary:
+- `thumbs_up`
+- `thumbs_down`
+- `ok_sign`
+- `pointing`
+- `middle_finger`
+
+Output field:
+- `fine_hand_gesture: none | thumbs_up | thumbs_down | ok_sign | pointing | middle_finger | unknown`
+
+Contract rules:
+- this class is not a required V1 policy dependency on the current pipeline
+- if no dedicated hand/finger provider is active, `unknown` is the honest value
+- product logic must not silently reinterpret coarse-arm output as finger-level
+  intent
+- this class should only graduate into policy use after dedicated validation on
+  the Pi
+
+### 10. On-Device Object Detection
 
 The camera path should expose bounded object detections that can support local
 automation and contextual help.
@@ -157,7 +231,7 @@ Contract rules:
 The rest of Twinr may later map these detections into routines or prompts, but
 the camera path must only deliver the observation itself.
 
-### 9. Snapshot Surface And Event Surface
+### 11. Snapshot Surface And Event Surface
 
 Twinr should not consume raw frame-by-frame jitter. The camera path must expose:
 
@@ -170,7 +244,10 @@ Minimum snapshot examples:
 - `primary_person_zone`
 - `looking_toward_device`
 - `body_pose`
+- `motion_state`
 - `hand_or_object_near_camera`
+- `coarse_arm_gesture`
+- `fine_hand_gesture`
 - `objects`
 - `camera_ready`
 
@@ -179,8 +256,33 @@ Minimum event examples:
 - `camera_person_returned`
 - `camera_attention_window_opened`
 - `camera_showing_intent_started`
-- `camera_gesture_detected`
+- `camera_motion_changed`
+- `camera_coarse_arm_gesture_detected`
+- `camera_fine_hand_gesture_detected`
 - `camera_object_detected_stable`
+
+## Realistic Scope On Current Hardware
+
+Twinr should explicitly separate what the current AI-camera stack can defend
+today from what needs a stronger provider.
+
+Realistic V1 scope on the current pipeline:
+- `body_pose`
+- `motion`
+- `showing_intent`
+- `coarse_arm_gesture`
+- stable `objects`
+
+Only promote to V2 after dedicated Pi validation:
+- `fine_hand_gesture`
+
+This means a user-level wish such as "recognize standing, sitting, going,
+waving, thumbs up, thumbs down, ok sign, pointing, middle finger, crossed arms,
+two-hand dismiss, timeout T" should be split as follows:
+- `standing`, `sitting` -> V1 `body_pose`
+- `going` -> V1 `motion`
+- `waving`, `crossed arms`, `two-hand dismiss`, `timeout T` -> V1 `coarse_arm_gesture`
+- `thumbs up`, `thumbs down`, `ok sign`, `pointing`, `middle finger` -> V2 `fine_hand_gesture`
 
 ## Quality Bar
 
@@ -196,13 +298,15 @@ Twinr should be able to trust:
 - `person visible` / `not visible`
 - coarse spatial zone
 - coarse posture
-- stable object/gesture events
+- coarse motion
+- stable coarse-arm/object events
 
 Twinr should **not** be asked to trust:
 - emotional interpretation
 - identity recognition
 - medical conclusions
 - fragile single-frame guesses
+- finger-level gesture claims without a dedicated hand provider
 
 ## Runtime Integration Targets
 
@@ -214,9 +318,9 @@ These are the main consumers the camera contract must support:
 | Resume Engine | `person_visible`, `person_returned_after_absence`, `engaged_with_device` |
 | DOA person matching | `primary_person_box`, `primary_person_zone`, `person_count` |
 | Awareness display state machine | `camera_ready`, `person_visible`, `looking_toward_device`, `showing_intent_likely` |
-| Initiative score policy | presence, attention, showing-intent, stable object/gesture events |
+| Initiative score policy | presence, attention, showing-intent, stable motion/coarse-arm/object events |
 | Object-led proactive flows | stable `objects` output only |
-| Gesture control | `gesture_event` |
+| Gesture control | `coarse_arm_gesture` first, `fine_hand_gesture` only after dedicated validation |
 | Sensor memory | summary events and counts, not raw frames |
 
 ## Memory And Privacy Requirements
@@ -248,6 +352,7 @@ The camera does **not** need to deliver:
 - whether a medical event definitely happened
 - why an object is present
 - whether Twinr should speak
+- finger-level gesture semantics from a coarse pose-only model
 
 Those are either policy decisions, consent decisions, or claims the hardware
 cannot defend.
@@ -260,13 +365,18 @@ The camera path is ready for seamless Twinr integration when it can provide:
 2. a stable person-visible / person-returned signal
 3. a coarse spatial anchor for the visible person
 4. a bounded engagement signal
-5. a coarse posture signal
-6. a showing-intent signal
-7. a tiny gesture event surface
-8. stable object detections
-9. both snapshot and event interfaces
-10. memory-safe structured outputs with no raw-frame dependence
+5. a coarse `body_pose` signal
+6. a bounded `motion` signal
+7. a showing-intent signal
+8. a small `coarse_arm_gesture` surface
+9. stable object detections
+10. both snapshot and event interfaces
+11. memory-safe structured outputs with no raw-frame dependence
 
-If those ten pieces are present, Twinr can wire the camera into presence,
+`fine_hand_gesture` is part of the broader camera target surface, but it is not
+required for V1 seamless integration unless a dedicated hand/finger provider is
+present and validated on the Pi.
+
+If those V1 pieces are present, Twinr can wire the camera into presence,
 initiative, resume, display, gesture, and proactive behavior without coupling
 the product to camera-model internals.
