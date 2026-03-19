@@ -23,6 +23,7 @@ from twinr.web.presenters.integrations import (
     _calendar_integration_sections,
     _email_integration_sections,
     _integration_overview_rows,
+    _whatsapp_integration_context,
 )
 from twinr.web.presenters.memory import _memory_sections
 from twinr.web.presenters.ops import _format_log_rows, _format_usage_rows, _health_card_detail
@@ -34,6 +35,7 @@ from twinr.web.presenters.voice import (
     _voice_profile_page_context,
     _voice_snapshot_label,
 )
+from twinr.web.presenters.whatsapp_wizard import build_whatsapp_wizard_page_context
 
 __all__ = [
     "_adaptive_timing_view",
@@ -55,8 +57,10 @@ __all__ = [
     "_reminder_rows",
     "_resolve_named_file",
     "_settings_sections",
+    "_whatsapp_integration_context",
     "build_ops_debug_page_context",
     "build_self_coding_ops_page_context",
+    "build_whatsapp_wizard_page_context",
     "coerce_ops_debug_tab",
     "_voice_action_result",
     "_voice_profile_page_context",

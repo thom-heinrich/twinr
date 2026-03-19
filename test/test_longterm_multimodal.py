@@ -16,8 +16,10 @@ from twinr.config import TwinrConfig
 from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermMemoryObjectV1,
+    LongTermMultimodalEvidence,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.ingestion.multimodal import LongTermMultimodalExtractor
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
 from twinr.runtime import TwinrRuntime
 
@@ -87,6 +89,126 @@ def _sensor_facts() -> dict[str, object]:
             "quiet": True,
             "quiet_for_s": 9.0,
             "distress_detected": False,
+        },
+    }
+
+
+def _respeaker_sensor_facts(
+    *,
+    observed_at: float = 8.0,
+    presence_session_id: int = 17,
+    speech_detected: bool = True,
+    room_quiet: bool = False,
+    recent_speech_age_s: float = 0.2,
+    direction_confidence: float = 0.81,
+    background_media_likely: bool = False,
+    room_busy_or_overlapping: bool = False,
+    quiet_window_open: bool = False,
+    presence_audio_active: bool = True,
+    recent_follow_up_speech: bool = False,
+    barge_in_recent: bool = False,
+    resume_window_open: bool = False,
+) -> dict[str, object]:
+    return {
+        "sensor": {
+            "inspected": False,
+            "observed_at": observed_at,
+            "captured_at": observed_at,
+            "presence_session_id": presence_session_id,
+        },
+        "pir": {
+            "motion_detected": False,
+            "low_motion": True,
+            "no_motion_for_s": 30.0,
+        },
+        "camera": {
+            "person_visible": False,
+            "person_visible_for_s": 0.0,
+            "looking_toward_device": False,
+            "body_pose": "unknown",
+            "smiling": False,
+            "hand_or_object_near_camera": False,
+            "hand_or_object_near_camera_for_s": 0.0,
+        },
+        "vad": {
+            "speech_detected": speech_detected,
+            "speech_detected_for_s": 0.5 if speech_detected else 0.0,
+            "quiet": not speech_detected,
+            "quiet_for_s": 0.0 if speech_detected else 12.0,
+            "distress_detected": False,
+            "room_quiet": room_quiet,
+            "recent_speech_age_s": recent_speech_age_s,
+            "assistant_output_active": False,
+            "signal_source": "respeaker_xvf3800",
+        },
+        "respeaker": {
+            "runtime_mode": "audio_ready",
+            "host_control_ready": True,
+            "transport_reason": None,
+            "azimuth_deg": 285,
+            "direction_confidence": direction_confidence,
+            "non_speech_audio_likely": False,
+            "background_media_likely": background_media_likely,
+            "speech_overlap_likely": room_busy_or_overlapping,
+            "barge_in_detected": barge_in_recent,
+            "mute_active": False,
+            "claim_contract": {
+                "speech_detected": {
+                    "captured_at": observed_at,
+                    "source": "respeaker_xvf3800",
+                    "source_type": "observed",
+                    "confidence": 0.76,
+                    "sensor_window_ms": 0,
+                    "memory_class": "ephemeral_state",
+                    "session_id": presence_session_id,
+                    "requires_confirmation": False,
+                },
+                "recent_speech_age_s": {
+                    "captured_at": observed_at,
+                    "source": "respeaker_xvf3800",
+                    "source_type": "observed",
+                    "confidence": 0.76,
+                    "sensor_window_ms": 0,
+                    "memory_class": "ephemeral_state",
+                    "session_id": presence_session_id,
+                    "requires_confirmation": False,
+                },
+                "direction_confidence": {
+                    "captured_at": observed_at,
+                    "source": "respeaker_xvf3800",
+                    "source_type": "observed",
+                    "confidence": max(0.4, direction_confidence),
+                    "sensor_window_ms": 0,
+                    "memory_class": "ephemeral_state",
+                    "session_id": presence_session_id,
+                    "requires_confirmation": False,
+                },
+                "azimuth_deg": {
+                    "captured_at": observed_at,
+                    "source": "respeaker_xvf3800",
+                    "source_type": "observed",
+                    "confidence": max(0.4, direction_confidence),
+                    "sensor_window_ms": 0,
+                    "memory_class": "ephemeral_state",
+                    "session_id": presence_session_id,
+                    "requires_confirmation": False,
+                },
+            },
+        },
+        "audio_policy": {
+            "presence_audio_active": presence_audio_active,
+            "recent_follow_up_speech": recent_follow_up_speech,
+            "room_busy_or_overlapping": room_busy_or_overlapping,
+            "quiet_window_open": quiet_window_open,
+            "non_speech_audio_likely": False,
+            "background_media_likely": background_media_likely,
+            "barge_in_recent": barge_in_recent,
+            "speaker_direction_stable": True,
+            "mute_blocks_voice_capture": False,
+            "resume_window_open": resume_window_open,
+            "initiative_block_reason": None,
+            "speech_delivery_defer_reason": None,
+            "runtime_alert_code": "ready",
         },
     }
 
@@ -199,6 +321,42 @@ class LongTermMultimodalTests(unittest.TestCase):
         print_pattern = next(item for item in objects if item.memory_id.startswith("pattern:print:button:"))
         self.assertEqual(print_pattern.status, "active")
         self.assertGreaterEqual((print_pattern.attributes or {}).get("support_count", 0), 2)
+
+    def test_multimodal_extractor_emits_respeaker_audio_routine_seed_without_raw_audio(self) -> None:
+        extractor = LongTermMultimodalExtractor()
+        evidence = LongTermMultimodalEvidence(
+            event_name="sensor_observation",
+            modality="sensor",
+            source="proactive_monitor",
+            message="Changed multimodal sensor observation recorded.",
+            data={
+                "facts": _respeaker_sensor_facts(),
+                "event_names": ["audio_policy.presence_audio_active", "vad.speech_detected"],
+            },
+            created_at=datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc),
+        )
+
+        extraction = extractor.extract_evidence(evidence)
+        pattern = next(
+            item
+            for item in extraction.candidate_objects
+            if item.memory_id == "pattern:audio_interaction:conversation_start_audio:morning"
+        )
+        attrs = dict(pattern.attributes or {})
+        episode = extraction.episode
+        self.assertEqual(attrs["memory_domain"], "respeaker_audio_routine")
+        self.assertEqual(attrs["memory_class"], "session_memory")
+        self.assertEqual(attrs["source_sensor"], "respeaker_xvf3800")
+        self.assertEqual(attrs["source_type"], "observed")
+        self.assertEqual(attrs["presence_session_id"], 17)
+        self.assertTrue(attrs["requires_confirmation"])
+        self.assertAlmostEqual(attrs["claim_confidence"], 0.785, places=3)
+        self.assertEqual(attrs["claim_source"], "respeaker_xvf3800")
+        self.assertEqual(attrs["claim_names"], ("speech_detected", "recent_speech_age_s", "direction_confidence", "azimuth_deg"))
+        self.assertEqual(attrs["claim_contract"]["speech_detected"]["session_id"], 17)
+        self.assertEqual(attrs["captured_at"], 8.0)
+        self.assertNotIn("pcm_bytes", episode.details or "")
+        self.assertNotIn("raw_audio", episode.details or "")
 
     def test_low_signal_multimodal_batches_skip_optional_midterm_compilation(self) -> None:
         source_ref = LongTermSourceRefV1(

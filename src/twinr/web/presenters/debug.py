@@ -26,6 +26,7 @@ from twinr.ops.health import ServiceHealth, TwinrSystemHealth
 from twinr.ops.paths import TwinrOpsPaths
 from twinr.ops.remote_memory_watchdog import RemoteMemoryWatchdogSnapshot
 from twinr.ops.usage import UsageSummary
+from twinr.web.presenters.conversation_lab import build_conversation_lab_panel_context
 from twinr.web.presenters.memory_search import build_memory_search_panel_context
 from twinr.web.presenters.ops import _format_log_rows, _format_usage_rows, _safe_pretty_json
 
@@ -35,6 +36,7 @@ _DEBUG_TABS: tuple[tuple[str, str, str], ...] = (
     ("runtime", "Runtime", "Inspect the live snapshot, health state, and recent runtime errors."),
     ("chonkydb", "ChonkyDB", "Inspect the required-remote watchdog and recent remote-memory probes."),
     ("memory_search", "Memory Search", "Search the real long-term retrieval stack and inspect matching memories."),
+    ("conversation_lab", "Conversation Lab", "Run one real text turn and inspect human-readable routing, tool, and memory traces."),
     ("llm", "LLM", "Inspect OpenAI usage summaries and the latest tracked response records."),
     ("events", "Events", "Inspect recent structured local ops events and their payloads."),
     ("hardware", "Hardware", "Inspect live host health plus the device overview used by Twinr ops."),
@@ -72,6 +74,7 @@ def build_ops_debug_page_context(
     memory_search_query: str = "",
     memory_search_result: LongTermOperatorSearchResult | None = None,
     memory_search_error: str | None = None,
+    conversation_lab_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Return template-ready context for the web operator debug page."""
 
@@ -99,6 +102,7 @@ def build_ops_debug_page_context(
         result=memory_search_result,
         error_message=memory_search_error,
     )
+    conversation_lab = build_conversation_lab_panel_context(state=conversation_lab_state)
 
     return {
         "debug_tabs": tuple(
@@ -137,6 +141,7 @@ def build_ops_debug_page_context(
         "memory_attest_summary_rows": _memory_attest_summary_rows(memory_attest),
         "memory_attest_packet_rows": _memory_attest_packet_rows(memory_attest),
         "memory_search": memory_search,
+        "conversation_lab": conversation_lab,
         "watchdog_current_rows": _watchdog_current_rows(
             snapshot=remote_memory_watchdog,
             error_message=remote_memory_watchdog_error,

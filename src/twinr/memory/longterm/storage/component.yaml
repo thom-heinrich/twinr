@@ -8,7 +8,8 @@ owned_concerns:
   - Persist canonical long-term object, conflict, and archive snapshots under the configured memory path
   - Persist midterm reflection and restart-recall packets and expose bounded midterm lookup helpers
   - Mirror validated object/conflict/archive state to the remote ChonkyDB namespace as individual documents plus current catalogs and load safe local fallbacks when optional remote reads fail
-  - Emit structured diagnostics, histogram artifacts, and alert events for remote ChonkyDB read/write failures and degraded retrieve fallbacks so live incidents can be classified after the fact
+  - Reuse unchanged remote item documents directly from payload fingerprints plus catalog selectors so transient item readback failures do not amplify no-op snapshot rewrites into oversized bulk writes
+  - Emit structured diagnostics, histogram artifacts, and alert events for remote ChonkyDB read/write failures and degraded retrieve fallbacks so live incidents can be classified after the fact, including correlated bulk-write ids that propagate into watchdog/runtime failure surfaces
   - Expose store-level mutation and review helpers used by long-term runtime, retrieval, and operator flows
 out_of_scope:
   - Define canonical long-term schemas or ontology normalization

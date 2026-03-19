@@ -1,11 +1,14 @@
 from pathlib import Path
+import subprocess
 import sys
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.hardware import buttons as buttons_module
 from twinr.hardware.buttons import (
     ButtonAction,
     ButtonBinding,
@@ -80,3 +83,104 @@ class ButtonHelperTests(unittest.TestCase):
         self.assertEqual(pressed.name, "yellow")
         self.assertEqual(pressed.action, ButtonAction.PRESSED)
         self.assertEqual(released.action, ButtonAction.RELEASED)
+
+    def test_cli_monitor_uses_legacy_gpioget_syntax_when_help_lacks_named_flags(self) -> None:
+        monitor = GpioButtonMonitor(
+            "gpiochip0",
+            bindings=(ButtonBinding(name="green", line_offset=23),),
+        )
+        monitor._cli_tools["gpioget"] = "/usr/bin/gpioget"
+        commands: list[list[str]] = []
+
+        def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            if command == ["/usr/bin/gpioget", "--help"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=(
+                        "Usage: gpioget [OPTIONS] <chip name/number> <offset 1>\n"
+                        "Options:\n"
+                        "  -B, --bias=[as-is|disable|pull-down|pull-up]\n"
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(command, 0, stdout="0\n", stderr="")
+
+        with patch.object(buttons_module, "_GPIOGET_CLI_SPECS", {}, create=True):
+            with patch("twinr.hardware.buttons.subprocess.run", side_effect=fake_run):
+                values = monitor._read_cli_values()
+
+        self.assertEqual(values, {23: 0})
+        self.assertEqual(
+            commands[1],
+            ["/usr/bin/gpioget", "--bias=pull-up", "gpiochip0", "23"],
+        )
+
+    def test_cli_monitor_uses_named_gpioget_flags_when_help_advertises_them(self) -> None:
+        monitor = GpioButtonMonitor(
+            "gpiochip0",
+            bindings=(
+                ButtonBinding(name="green", line_offset=17),
+                ButtonBinding(name="yellow", line_offset=27),
+            ),
+        )
+        monitor._cli_tools["gpioget"] = "/usr/bin/gpioget"
+        commands: list[list[str]] = []
+
+        def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            if command == ["/usr/bin/gpioget", "--help"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=(
+                        "Usage: gpioget [OPTIONS] <offset 1>\n"
+                        "Options:\n"
+                        "  --chip <chip>\n"
+                        "  --numeric\n"
+                        "  -B, --bias=[as-is|disable|pull-down|pull-up]\n"
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(command, 0, stdout="1 0\n", stderr="")
+
+        with patch.object(buttons_module, "_GPIOGET_CLI_SPECS", {}, create=True):
+            with patch("twinr.hardware.buttons.subprocess.run", side_effect=fake_run):
+                values = monitor._read_cli_values()
+
+        self.assertEqual(values, {17: 1, 27: 0})
+        self.assertEqual(
+            commands[1],
+            ["/usr/bin/gpioget", "--bias=pull-up", "--chip", "gpiochip0", "--numeric", "17", "27"],
+        )
+
+    def test_cli_monitor_retries_with_legacy_syntax_when_named_flags_are_rejected(self) -> None:
+        monitor = GpioButtonMonitor(
+            "gpiochip0",
+            bindings=(ButtonBinding(name="green", line_offset=23),),
+        )
+        monitor._cli_tools["gpioget"] = "/usr/bin/gpioget"
+        commands: list[list[str]] = []
+
+        def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            if command == ["/usr/bin/gpioget", "--help"]:
+                raise OSError("help unavailable")
+            if "--chip" in command or "--numeric" in command:
+                raise subprocess.CalledProcessError(
+                    1,
+                    command,
+                    stderr="/usr/bin/gpioget: unrecognized option '--chip'\n",
+                )
+            return subprocess.CompletedProcess(command, 0, stdout="1\n", stderr="")
+
+        with patch.object(buttons_module, "_GPIOGET_CLI_SPECS", {}, create=True):
+            with patch("twinr.hardware.buttons.subprocess.run", side_effect=fake_run):
+                values = monitor._read_cli_values()
+
+        self.assertEqual(values, {23: 1})
+        self.assertEqual(
+            commands[-1],
+            ["/usr/bin/gpioget", "--bias=pull-up", "gpiochip0", "23"],
+        )

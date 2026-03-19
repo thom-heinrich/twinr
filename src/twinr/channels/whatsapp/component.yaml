@@ -1,0 +1,30 @@
+schema_version: 1
+name: twinr.channels.whatsapp
+path: src/twinr/channels/whatsapp
+kind: python-package
+visibility: internal
+summary: Baileys-backed consumer WhatsApp transport for Twinr internal messaging tests.
+owned_concerns:
+  - Adapt the global Twinr config into focused WhatsApp runtime settings.
+  - Enforce allowlist, self-chat, and outbound-echo policy for the WhatsApp channel.
+  - Supervise the Node/Baileys worker and relay normalized inbound and outbound messages.
+  - Emit pairing QR updates for both terminal fallback use and portal rendering.
+out_of_scope:
+  - Generic external text-channel contracts in `src/twinr/channels`
+  - Core Twinr runtime turn execution in `src/twinr/agent/base_agent`
+  - Provider SDK request construction in `src/twinr/providers`
+files:
+  - path: __init__.py
+    role: Public export surface for the WhatsApp loop and focused config/policy types
+  - path: config.py
+    role: Focused WhatsApp config parsing and normalization
+  - path: policy.py
+    role: Allowlist, self-chat, and outbound-echo policy
+  - path: worker_bridge.py
+    role: JSONL stdio bridge to the Node/Baileys worker, including QR status payloads
+  - path: loop.py
+    role: Long-lived WhatsApp listener loop
+  - path: worker/index.mjs
+    role: Node/Baileys worker process with terminal and portal QR emission
+tests:
+  - path: test/test_channels_whatsapp.py

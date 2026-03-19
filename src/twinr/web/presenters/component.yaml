@@ -8,10 +8,13 @@ owned_concerns:
   - Shape config, runtime, ops, reminder, and integration state into template-ready rows, sections, and page context dictionaries
   - Normalize malformed persisted values into stable operator-facing defaults instead of letting dashboard pages crash
   - Validate and canonicalize managed email and calendar form submissions before route handlers persist them
+  - Build the compact WhatsApp setup summary for `/integrations` while keeping QR pairing in the dedicated wizard
+  - Build the WhatsApp self-chat wizard page context, including bounded pairing-state rows, persisted onboarding snapshots, and live portal QR rendering, without moving route orchestration or subprocess calls into templates
   - Expose the curated presenter import surface consumed by `src/twinr/web/app.py` and `src/twinr/web/context.py`
   - Build self-coding operator telemetry rows from persisted self-coding state without moving policy into web routes
   - Build the tabbed `/ops/debug` operator context from authoritative runtime, watchdog, memory-attestation, usage, hardware, and raw artifact state
   - Shape the read-only `/ops/debug` memory-search tab from real long-term retrieval results without moving query execution into templates
+  - Shape the interactive `/ops/debug` Conversation Lab tab from stored portal session traces without moving live text-turn execution into presenters
 out_of_scope:
   - FastAPI route definitions, request parsing, redirects, and response handling in `src/twinr/web/app.py`
   - Template markup, styling, and client-side behavior under `src/twinr/web/templates` and static assets
@@ -40,7 +43,9 @@ files:
       - _reminder_rows
       - _resolve_named_file
       - _settings_sections
+      - _whatsapp_integration_context
       - build_self_coding_ops_page_context
+      - build_whatsapp_wizard_page_context
       - _voice_action_result
       - _voice_profile_page_context
       - _voice_snapshot_label
@@ -57,14 +62,19 @@ files:
     role: Provider-routing and credential presenter sections for `/connect`
     exports:
       - _connect_sections
+  - path: whatsapp_wizard.py
+    role: WhatsApp self-chat wizard page context builder with bounded pairing, live QR rendering, and live status shaping
+    exports:
+      - build_whatsapp_wizard_page_context
   - path: integrations.py
-    role: Integration overview rows, form sections, and validated form-to-record builders
+    role: Integration overview rows, email/calendar form sections, and the compact WhatsApp setup summary for `/integrations`
     exports:
       - _build_calendar_integration_record
       - _build_email_integration_record
       - _calendar_integration_sections
       - _email_integration_sections
       - _integration_overview_rows
+      - _whatsapp_integration_context
   - path: memory.py
     role: Memory, reminders, and print-related settings sections
     exports:
@@ -84,6 +94,8 @@ files:
     exports:
       - build_ops_debug_page_context
       - coerce_ops_debug_tab
+  - path: conversation_lab.py
+    role: Presenter shaping for the interactive `/ops/debug` Conversation Lab tab
   - path: memory_search.py
     role: Presenter shaping for the read-only `/ops/debug` memory-search tab
   - path: settings.py
@@ -109,12 +121,12 @@ public_api:
     - _connect_sections
     - _default_reminder_due_at
     - _email_integration_sections
-      - _format_log_rows
-      - _format_usage_rows
-      - _health_card_detail
-      - build_ops_debug_page_context
-      - coerce_ops_debug_tab
-      - _integration_overview_rows
+    - _format_log_rows
+    - _format_usage_rows
+    - _health_card_detail
+    - build_ops_debug_page_context
+    - coerce_ops_debug_tab
+    - _integration_overview_rows
     - _memory_sections
     - _nav_items
     - _provider_status
@@ -122,7 +134,9 @@ public_api:
     - _reminder_rows
     - _resolve_named_file
     - _settings_sections
+    - _whatsapp_integration_context
     - build_self_coding_ops_page_context
+    - build_whatsapp_wizard_page_context
     - _voice_action_result
     - _voice_profile_page_context
     - _voice_snapshot_label

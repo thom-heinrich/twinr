@@ -10,15 +10,20 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 - bridge validated local snapshots to fine-grained remote ChonkyDB documents plus compact catalog heads and bounded segment documents
 - write each remote memory item as a real ChonkyDB document whose public metadata/content contract is sufficient for Twinr readback
 - reuse unchanged remote item documents across snapshot rewrites so stable memories are not pointlessly re-upserted and older readback-safe documents stay intact
+- reuse unchanged remote item documents directly from payload fingerprints plus the existing catalog selectors, so transient per-item readback failures do not amplify a no-op snapshot rewrite into a large `records/bulk` storm
 - validate and repair remote catalog/pointer consistency before long-term memory is exposed to runtime callers
 - direct-assemble catalog-backed remote object snapshots from rich segment entries when possible, and use bounded-parallel `retrieve` plus `allowed_doc_ids` only for sparse legacy catalogs
 - load compact remote catalog segment documents through bounded-parallel reads so required startup does not serialize every segment fetch
 - keep required-readiness probes read-only even for sparse legacy object catalogs, so watchdog startup never blocks on catalog rewrites
 - reuse successful remote snapshot probes within one readiness cycle so store bootstrap and health attestation do not refetch the same snapshot twice
 - prefer explicitly remembered remote document ids on ordinary snapshot reads right after local writes, while avoiding sticky read-learned hints that could keep a fresh reader on stale snapshot documents after another runtime updates the same namespace
+- attest every required remote snapshot write and subsequent pointer update with immediate parseable readbacks before Twinr trusts the saved snapshot or updates its fresh-reader document-id hints
+- route exact-read remote snapshot and pointer writes through ChonkyDB's fast async content path, then prove visibility via readback attestation instead of waiting on the timeout-prone synchronous `records/bulk` content-processing path
 - skip `retrieve_search` entirely when the current remote catalog candidate set already fits inside the caller's requested limit, so small conflict/object lookups do not burn an extra timeout-prone backend roundtrip
 - overlap the independent `objects` / `conflicts` / `archive` required-startup reads so object-store readiness is bounded by the slowest current snapshot instead of the sum of all three
 - emit structured ops diagnostics for remote ChonkyDB read and write failures plus recoverable retrieve-batch fallbacks so DNS issues, timeouts, backend flakes, and client-contract payload problems can be separated after live incidents
+- reject ChonkyDB bulk responses that return item-level store failures inside an HTTP-success envelope, so Twinr never treats a fast backend rejection as a durable snapshot write
+- stamp each remote `records/bulk` failure with a bounded request correlation id, batch coordinates, and request bytes, then propagate that same context into watchdog/runtime failure surfaces for Pi incident tracing
 - persist structured retrieve-search/retrieve-batch latency histograms plus explicit timeout/slow-read alert events so `/twinr` operators can see ChonkyDB read spikes without replaying raw logs
 - preserve restart-recall midterm packets while reflection refreshes the rest of the midterm snapshot, so confirmed/stable durable facts can survive fresh runtime roots as explicit policy context
 - match midterm packet queries on content-bearing terms, including compound-word containment, and fail closed when no real topic overlap exists so restart-recall packets do not leak into control questions

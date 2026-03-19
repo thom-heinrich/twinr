@@ -95,3 +95,69 @@ class AdaptiveTimingView:
     current_metrics: tuple[DetailMetric, ...]
     counter_metrics: tuple[DetailMetric, ...]
     baseline_metrics: tuple[DetailMetric, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WizardCheckRow:
+    """Represent one status row inside an operator setup wizard.
+
+    Attributes:
+        label: Short check name shown on the left side of the row.
+        summary: Operator-facing status summary such as ready or missing.
+        detail: Secondary explanation that clarifies the current state.
+        status: Template-ready status token such as ok, warn, fail, or muted.
+    """
+
+    label: str
+    summary: str
+    detail: str = ""
+    status: str = "muted"
+
+
+@dataclass(frozen=True, slots=True)
+class WizardStep:
+    """Describe one template-ready setup step for a server-rendered wizard.
+
+    Attributes:
+        key: Stable URL/query key for the step.
+        index: Human-readable step number shown in the UI.
+        title: Step heading.
+        description: Short plain-language explanation of the step goal.
+        status: Template-ready status token such as ok, warn, fail, or muted.
+        status_label: Short operator-facing label for the current status.
+        detail: Supporting copy shown under the step header.
+        fields: Optional env-backed fields rendered for this step.
+        checks: Optional checklist rows rendered under the step.
+        action: Optional POST action token used by the page form.
+        action_label: Button label for the step form.
+        action_enabled: Whether the main form action should be clickable.
+        action_hint: Optional plain-language note shown near the action.
+        media_src: Optional image or media URL rendered inside the step.
+        media_alt: Alternative text for the optional media block.
+        media_title: Optional heading shown above the media block.
+        media_detail: Optional supporting copy shown under the media block.
+        code_block: Optional command or code snippet rendered in a block.
+        code_title: Optional heading shown above the code block.
+        current: Whether this step is the currently highlighted step.
+    """
+
+    key: str
+    index: int
+    title: str
+    description: str
+    status: str
+    status_label: str
+    detail: str = ""
+    fields: tuple[FileBackedSetting, ...] = ()
+    checks: tuple[WizardCheckRow, ...] = ()
+    action: str = ""
+    action_label: str = ""
+    action_enabled: bool = True
+    action_hint: str = ""
+    media_src: str = ""
+    media_alt: str = ""
+    media_title: str = ""
+    media_detail: str = ""
+    code_block: str = ""
+    code_title: str = ""
+    current: bool = False

@@ -8,6 +8,7 @@ candidate long-term memory inputs.
 `ingestion` owns:
 - Extract an episode plus candidate objects and graph edges from one turn
 - Normalize multimodal sensor, button, printer, and camera evidence
+- Normalize structured ReSpeaker audio-policy facts and per-claim metadata into bounded audio routine seeds and observed preference hypotheses
 - Replay persisted ops history into multimodal evidence for backfill
 - Compile sensor-derived routines and deviations from pattern history
 
@@ -24,6 +25,8 @@ candidate long-term memory inputs.
 | `extract.py` | Turn extraction entrypoint |
 | `propositions.py` | Structured proposition compiler |
 | `multimodal.py` | Multimodal event extractor |
+| `respeaker_audio.py` | Structured ReSpeaker audio routine-seed extraction |
+| `respeaker_contract.py` | ReSpeaker claim-contract parsing and memory-attribute helpers |
 | `sensor_memory.py` | Sensor routine compiler |
 | `backfill.py` | Ops history replay |
 

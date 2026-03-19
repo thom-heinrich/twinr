@@ -1,19 +1,19 @@
-"""Construct and validate env-backed settings fields for the web UI.
+"""Construct and validate declared settings fields for the web UI.
 
 This module centralizes file-backed field registration and form submission
-normalization for Twinr's settings pages. It keeps accepted keys fail-closed
-and turns malformed persisted values into stable display defaults.
+normalization for Twinr's settings pages and managed integration forms. It
+keeps accepted keys fail-closed and turns malformed persisted values into
+stable display defaults.
 """
 
 from __future__ import annotations
 
-import re
 from typing import AbstractSet
 
 from twinr.web.support.store import FileBackedSetting
 
-# AUDIT-FIX(#1): Restrict setting keys to ASCII env-style identifiers to block confusable / injected keys.
-_ENV_KEY_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
+# AUDIT-FIX(#1): Restrict setting keys to short ASCII identifiers to block confusable / injected keys.
+_MAX_SETTING_KEY_LENGTH = 128
 # AUDIT-FIX(#3): Bound accepted submitted values so malformed or hostile payloads cannot grow unbounded on a small RPi.
 _MAX_SUBMITTED_VALUE_LENGTH = 16_384
 # AUDIT-FIX(#6): Clamp textarea height to a sane UI range so one bad caller value cannot break the settings layout.
@@ -29,9 +29,14 @@ _REGISTERED_SELECT_OPTIONS: dict[str, frozenset[str]] = {}
 
 
 def _is_valid_setting_key(key: str) -> bool:
-    """Return whether ``key`` is a safe env-style identifier."""
+    """Return whether ``key`` is a safe ASCII settings identifier."""
 
-    return bool(_ENV_KEY_PATTERN.fullmatch(key))
+    if not isinstance(key, str) or not key or len(key) > _MAX_SETTING_KEY_LENGTH or not key.isascii():
+        return False
+    first_char = key[0]
+    if first_char != "_" and not first_char.isalpha():
+        return False
+    return all(character == "_" or character.isalnum() for character in key)
 
 
 def _register_setting_key(
@@ -44,7 +49,9 @@ def _register_setting_key(
 
     # AUDIT-FIX(#1): Reject unsafe keys at declaration time instead of letting them flow into file-backed configuration.
     if not _is_valid_setting_key(key):
-        raise ValueError(f"Invalid setting key {key!r}; expected an ASCII uppercase env-style key.")
+        raise ValueError(
+            f"Invalid setting key {key!r}; expected an ASCII identifier starting with a letter or underscore."
+        )
     _REGISTERED_SETTING_KEYS.add(key)
     _REGISTERED_FIELD_TYPES[key] = input_type
     if input_type == "select":

@@ -46,12 +46,18 @@ def _rgb565_geometry(*, width: int = 800, height: int = 480) -> FramebufferGeome
 
 
 class HdmiFramebufferDisplayTests(unittest.TestCase):
-    def make_display(self, *, layout_mode: str = "default") -> HdmiFramebufferDisplay:
+    def make_display(
+        self,
+        *,
+        layout_mode: str = "default",
+        width: int = 800,
+        height: int = 480,
+    ) -> HdmiFramebufferDisplay:
         display = HdmiFramebufferDisplay(
             framebuffer_path=Path("/dev/null"),
             layout_mode=layout_mode,
         )
-        display._geometry = _rgb565_geometry()
+        display._geometry = _rgb565_geometry(width=width, height=height)
         return display
 
     def test_factory_selects_hdmi_backend(self) -> None:
@@ -500,9 +506,73 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         face_width = scene.layout.face_box[2] - scene.layout.face_box[0]
         panel_width = scene.layout.panel_box[2] - scene.layout.panel_box[0]
 
-        self.assertLess(header_height, 60)
-        self.assertGreater(face_width, 300)
-        self.assertLess(panel_width, 410)
+        self.assertLess(header_height, 44)
+        self.assertGreater(face_width, 380)
+        self.assertLess(panel_width, 340)
+
+    def test_default_scene_with_ticker_keeps_compact_panel_visibly_face_first(self) -> None:
+        display = self.make_display()
+        scene = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="error",
+            headline="Check system",
+            helper_text="Please check the system in debug view.",
+            state_fields=(
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "fehler"),
+                ("Zeit", "10:41"),
+            ),
+            animation_frame=0,
+            ticker_text="Europaeische Zentralbank: Wann steigen die Zinsen?",
+        )
+
+        header_height = scene.layout.header_box[3] - scene.layout.header_box[1]
+        face_width = scene.layout.face_box[2] - scene.layout.face_box[0]
+        panel_width = scene.layout.panel_box[2] - scene.layout.panel_box[0]
+
+        self.assertTrue(scene.layout.compact_panel)
+        self.assertLess(header_height, 44)
+        self.assertGreater(face_width, panel_width)
+        self.assertLess(panel_width, 330)
+
+    def test_default_scene_widescreen_caps_panel_width_and_scales_face_region(self) -> None:
+        display = self.make_display(width=1920, height=1080)
+        scene = display._scene_renderer().build_scene(
+            width=1920,
+            height=1080,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "warm"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+            ticker_text="Tagesschau · Calm readable headline for seniors",
+        )
+
+        header_height = scene.layout.header_box[3] - scene.layout.header_box[1]
+        face_width = scene.layout.face_box[2] - scene.layout.face_box[0]
+        panel_width = scene.layout.panel_box[2] - scene.layout.panel_box[0]
+
+        self.assertLess(header_height, 48)
+        self.assertGreater(face_width, panel_width)
+        self.assertLess(panel_width, 640)
+
+    def test_face_scale_grows_on_widescreen_hdmi(self) -> None:
+        display = self.make_display(width=1920, height=1080)
+        renderer = display._scene_renderer()
+
+        widescreen_scale = renderer._face_scale_for_box((248, 78, 1070, 990))
+        compact_scale = renderer._face_scale_for_box((38, 90, 350, 390))
+
+        self.assertGreater(widescreen_scale, 2.0)
+        self.assertGreater(widescreen_scale, compact_scale)
 
     def test_default_scene_builds_morphing_presentation_overlay(self) -> None:
         display = self.make_display()

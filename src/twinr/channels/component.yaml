@@ -1,0 +1,26 @@
+schema_version: 1
+name: twinr.channels
+path: src/twinr/channels
+kind: python-package
+visibility: internal
+summary: Generic external text-channel contracts and long-lived transport listeners.
+owned_concerns:
+  - Define the shared inbound and outbound message contract for external text channels.
+  - Host reusable runtime services that convert an external text message into one Twinr turn.
+  - Delegate concrete transport session/auth/reconnect behavior to documented child packages such as `whatsapp`.
+out_of_scope:
+  - Core Twinr runtime state-machine behavior in `src/twinr/agent/base_agent`
+  - Provider SDK implementations in `src/twinr/providers`
+  - Synchronous integration manifests and request/response adapters in `src/twinr/integrations`
+files:
+  - path: __init__.py
+    role: Package export surface for generic channel contracts and runtime helpers
+  - path: contracts.py
+    role: Shared external text-channel contracts
+  - path: runtime.py
+    role: Shared Twinr text-turn execution bridge
+subpackages:
+  - path: whatsapp
+    role: Baileys-backed WhatsApp listener, worker bridge, and policy
+tests:
+  - path: test/test_channels_whatsapp.py

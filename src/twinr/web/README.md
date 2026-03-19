@@ -10,11 +10,15 @@ templates and CSS that power the operator dashboard.
 - assemble the local FastAPI app, middleware, and page/form routes
 - load config, runtime snapshot, and store handles through [`context.py`](./context.py)
 - enforce local or managed sign-in policy for the portal, including first-login password change for the permanent Pi web service over LAN
+- keep state-changing form requests fail-closed while still accepting trusted same-origin browser posts behind an HTTPS reverse proxy
 - render the ops health page with the persisted remote-memory watchdog state
 - render the tabbed debug page that groups runtime, ChonkyDB, live memory attestation, LLM, events, hardware, and raw local artifacts
 - render a read-only long-term memory search tab in `/ops/debug` that queries the real retrieval stack and groups hits by durable, midterm, episodic, and conflict memory
+- run the interactive `/ops/debug` Conversation Lab tab that sends a real text turn through Twinr's provider/tool/memory path and persists human-readable routing, tool, retrieval, and memory-write traces
 - keep the `/ops/debug` operator surface high-contrast and readable on external monitors, including dense log-like sections
 - render the self-coding operator page with compile telemetry, health, live-e2e state, stale compile/run watchdog visibility, and learned-skill lifecycle controls
+- render the `/connect/whatsapp` wizard that guides one internal WhatsApp self-chat setup through allowlist, runtime, a bounded pairing window, and the final self-chat test
+- persist per-channel onboarding snapshots so web-driven channel setup can show live QR-needed, paired, reconnect, and repair-needed status without moving runtime state into templates
 - compose presenters, support helpers, templates, and static assets into operator pages
 - persist safe web-driven changes for settings, reminders, automations, integrations, personality, and user context
 
@@ -30,8 +34,11 @@ templates and CSS that power the operator dashboard.
 |---|---|
 | [`__init__.py`](./__init__.py) | Export `create_app` |
 | [`app.py`](./app.py) | FastAPI factory and route handlers |
+| [`conversation_lab.py`](./conversation_lab.py) | Portal conversation-lab session store and real text-turn execution helper |
 | [`context.py`](./context.py) | Shared loaders and template rendering |
 | [`automations.py`](./automations.py) | Automation page/form helpers |
+| [`support/channel_onboarding.py`](./support/channel_onboarding.py) | Generic file-backed onboarding snapshots and bounded in-process pairing registry |
+| [`support/whatsapp.py`](./support/whatsapp.py) | WhatsApp wizard validation, runtime probes, and bounded pairing coordination |
 | [`presenters`](./presenters/README.md) | Template-ready section builders |
 | [`support`](./support/README.md) | Shared contracts and file helpers |
 | [`templates`](./templates/) | Jinja page templates |

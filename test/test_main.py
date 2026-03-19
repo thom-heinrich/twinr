@@ -43,6 +43,18 @@ class _FakeRemoteMemoryWatchdog:
         return 0
 
 
+class _FakeWhatsAppLoop:
+    def __init__(self, *, config, runtime, backend) -> None:
+        self.config = config
+        self.runtime = runtime
+        self.backend = backend
+        self.duration_s = None
+
+    def run(self, *, duration_s: float | None = None) -> int:
+        self.duration_s = duration_s
+        return 0
+
+
 class _FakeRuntimeSupervisor:
     def __init__(self) -> None:
         self.duration_s = None
@@ -67,14 +79,27 @@ class MainCliTests(unittest.TestCase):
         finally:
             sys.modules.pop("twinr.__main__", None)
 
-    def test_should_enable_display_companion_requires_real_pi_host(self) -> None:
+    def test_should_enable_display_companion_defaults_to_real_pi_runtime_hosts(self) -> None:
         main_mod = importlib.import_module("twinr.__main__")
         try:
-            with patch.object(main_mod, "_uses_pi_runtime_root", return_value=True):
-                with patch.object(main_mod, "_is_raspberry_pi_host", return_value=True):
-                    self.assertTrue(main_mod._should_enable_display_companion("/twinr/.env"))
-                with patch.object(main_mod, "_is_raspberry_pi_host", return_value=False):
-                    self.assertFalse(main_mod._should_enable_display_companion("/twinr/.env"))
+            config = main_mod.TwinrConfig()
+            with patch.object(main_mod, "_is_raspberry_pi_host", return_value=True):
+                self.assertTrue(main_mod._should_enable_display_companion(config, "/twinr/.env"))
+            with patch.object(main_mod, "_is_raspberry_pi_host", return_value=False):
+                self.assertFalse(main_mod._should_enable_display_companion(config, "/twinr/.env"))
+            self.assertFalse(main_mod._should_enable_display_companion(config, "/home/thh/twinr/.env"))
+        finally:
+            sys.modules.pop("twinr.__main__", None)
+
+    def test_should_enable_display_companion_honors_explicit_override(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        try:
+            enabled = main_mod.TwinrConfig(display_companion_enabled=True)
+            disabled = main_mod.TwinrConfig(display_companion_enabled=False)
+            with patch.object(main_mod, "_is_raspberry_pi_host", return_value=False):
+                self.assertTrue(main_mod._should_enable_display_companion(enabled, "/twinr/.env"))
+            with patch.object(main_mod, "_is_raspberry_pi_host", return_value=True):
+                self.assertFalse(main_mod._should_enable_display_companion(disabled, "/twinr/.env"))
         finally:
             sys.modules.pop("twinr.__main__", None)
 
@@ -260,6 +285,48 @@ class MainCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(uvicorn_calls, [(fake_app, "127.0.0.1", 1447)])
+
+    def test_run_whatsapp_channel_dispatches_to_channel_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    (
+                        f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
+                        "TWINR_WHATSAPP_ALLOW_FROM=+49 171 1234567",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
+            fake_backend = object()
+            fake_whatsapp_module = ModuleType("twinr.channels.whatsapp")
+            fake_whatsapp_module.TwinrWhatsAppChannelLoop = _FakeWhatsAppLoop
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(sys.modules, {"twinr.channels.whatsapp": fake_whatsapp_module}):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_build_runtime", return_value=fake_runtime):
+                        with patch("twinr.providers.openai.OpenAIBackend", return_value=fake_backend):
+                            with patch("twinr.ops.loop_instance_lock", _fake_lock):
+                                sys.argv = [
+                                    "twinr",
+                                    "--env-file",
+                                    str(env_path),
+                                    "--run-whatsapp-channel",
+                                    "--loop-duration",
+                                    "0",
+                                ]
+                                exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
 
     def test_run_hardware_loop_enables_display_companion_for_pi_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

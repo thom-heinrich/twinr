@@ -172,6 +172,47 @@ class DisplayDebugLogTests(unittest.TestCase):
 
         self.assertTrue(any("x3" in line for line in sections[0][1]))
 
+    def test_build_sections_includes_respeaker_hci_lines_in_hardware_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            event_store = TwinrOpsEventStore.from_config(config)
+            usage_store = TwinrUsageStore.from_config(config)
+            watchdog_store = RemoteMemoryWatchdogStore.from_config(config)
+            event_store.append(
+                event="proactive_observation",
+                message="Proactive monitor recorded a changed observation.",
+                data={
+                    "speech_detected": True,
+                    "audio_device_runtime_mode": "audio_ready",
+                    "audio_direction_confidence": 0.81,
+                    "audio_azimuth_deg": 270,
+                    "audio_mute_active": True,
+                    "room_busy_or_overlapping": True,
+                    "resume_window_open": True,
+                    "audio_initiative_block_reason": "mute_blocks_voice_capture",
+                    "respeaker_runtime_alert_code": "mic_muted",
+                },
+            )
+
+            builder = TwinrDisplayDebugLogBuilder(
+                config=config,
+                event_store=event_store,
+                usage_store=usage_store,
+                watchdog_store=watchdog_store,
+            )
+            sections = builder.build_sections(
+                snapshot=RuntimeSnapshot(status="waiting"),
+                runtime_status="Waiting",
+                internet_state="ok",
+                ai_state="ok",
+                system_state="ok",
+                clock_text="09:31",
+            )
+
+        hardware_lines = sections[2][1]
+        self.assertTrue(any("mic muted" in line for line in hardware_lines))
+        self.assertTrue(any("heard speech" in line for line in hardware_lines))
+
     def test_build_sections_does_not_drift_when_only_watchdog_ages_advance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             now_text = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")

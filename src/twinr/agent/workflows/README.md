@@ -19,6 +19,7 @@ bounded.
 - keep streamed TTS abortable even before the first chunk arrives so a stalled provider request does not pin the runtime in `answering`
 - only surface `answering` once spoken audio has actually started instead of when text is merely queued
 - route non-safety proactive prompts through a dedicated delivery policy that can choose speech or display-first based on quiet hours, media/noise suppression, and recent ignored or interrupted prompts
+- package the latest ReSpeaker presence/audio policy facts into explicit governor-input context so proactive reservations carry the same channel/session/runtime view that chose display-first or speech
 - rearm spoken follow-up turns directly from `answering` back to `listening` so the display and operator cues do not briefly fall through `waiting` between a reply and the reopened microphone window
 - start the post-response closure guard while streamed speech is still draining so follow-up beeps do not sit behind a second model wait after the audible answer ends
 - keep turn-controller context selection, label-aware guidance, and transcript-verifier gate policy in dedicated runtime components instead of inlining them into the active loop classes

@@ -3,7 +3,12 @@
 Package root for Twinr's long-term memory subsystem. It exposes the canonical
 `twinr.memory.longterm` import surface and points newcomers to the subpackages
 that own models, ingestion, reasoning, retrieval, storage, runtime, proactive
-behavior, and evaluation.
+behavior, and evaluation. ReSpeaker-specific audio routine learning is ingested
+through structured multimodal facts under `ingestion/`; no raw PCM belongs in
+this subsystem. ReSpeaker-derived observed preferences remain distinct from
+explicitly confirmed preferences and must not auto-promote just because their
+confidence is high. Confirmed response-channel preferences can then flow back
+out through `retrieval/` as explicit adaptive policy packets.
 
 ## Responsibility
 

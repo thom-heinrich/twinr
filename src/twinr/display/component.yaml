@@ -6,6 +6,8 @@ visibility: internal
 summary: Render Twinr runtime state on the configured Twinr display backend and optionally keep the display loop running beside other hardware loops.
 owned_concerns:
   - Translate runtime snapshots and health signals into bounded status frames for the active display backend
+  - Derive calm operator-visible ReSpeaker HCI state from authoritative ops events instead of embedding raw proactive-event parsing in the display loop
+  - Surface calm ReSpeaker listening, heard-speech, direction-hint, and ring-semantic states without mirroring weak audio evidence
   - Persist and load optional HDMI face-expression cues so external triggers can steer gaze, brows, mouth, and subtle head drift without changing the generic runtime snapshot schema
   - Expose a producer-facing HDMI face-expression API so camera, proactive, or other runtime modules can set combinable gaze, brow, mouth, and blink cues without writing raw JSON
   - Persist and load optional HDMI presentation cues so capabilities can expand the right-hand panel into a fullscreen image or rich card without changing the generic runtime snapshot schema
@@ -57,6 +59,8 @@ files:
       - TwinrStatusDisplayLoop
   - path: debug_log.py
     role: Group recent system, llm, hardware, and ChonkyDB watchdog telemetry into display-safe log sections
+  - path: respeaker_hci.py
+    role: Parse authoritative ReSpeaker ops events into calm status-card and debug-log HCI states, including listening/heard-speech/direction and ring semantics
   - path: face_cues.py
     role: Persist and normalize optional external HDMI face-expression cues
   - path: face_expressions.py
@@ -117,9 +121,11 @@ primary_callers:
 tests:
   - path: test/test_display.py
   - path: test/test_display_ambient_moments.py
+  - path: test/test_display_debug_log.py
   - path: test/test_display_face_cues.py
   - path: test/test_display_news_ticker.py
   - path: test/test_display_presentation_cues.py
+  - path: test/test_display_respeaker_hci.py
   - path: test/test_display_service.py
   - path: test/test_display_visual_qc.py
   - path: test/test_display_companion.py

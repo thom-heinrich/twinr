@@ -254,12 +254,46 @@ class ListenTimeoutCaptureDiagnostics:
         return self.active_chunk_count / max(1, self.chunk_count)
 
 
+@dataclass(frozen=True, slots=True)
+class AudioCaptureReadinessProbe:
+    """Describe whether a bounded audio-capture probe yielded readable frames."""
+
+    device: str
+    sample_rate: int
+    channels: int
+    chunk_ms: int
+    duration_ms: int
+    target_chunk_count: int
+    captured_chunk_count: int
+    captured_bytes: int
+    failure_reason: str | None = None
+    detail: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        """Return whether the probe captured the requested readable chunks."""
+
+        return (
+            self.failure_reason is None
+            and self.captured_chunk_count >= self.target_chunk_count
+            and self.captured_bytes > 0
+        )
+
+
 class SpeechStartTimeoutError(RuntimeError):
     """Raise when speech never starts and retain bounded capture diagnostics."""
 
     def __init__(self, message: str, *, diagnostics: ListenTimeoutCaptureDiagnostics) -> None:
         super().__init__(message)
         self.diagnostics = diagnostics
+
+
+class AudioCaptureReadinessError(RuntimeError):
+    """Raise when a bounded microphone probe cannot read usable audio frames."""
+
+    def __init__(self, message: str, *, probe: AudioCaptureReadinessProbe) -> None:
+        super().__init__(message)
+        self.probe = probe
 
 
 def resolve_pause_resume_confirmation(
@@ -790,85 +824,44 @@ class AmbientAudioSampler:
 
         return self.sample_window(duration_ms=duration_ms).sample
 
-    def sample_window(self, *, duration_ms: int | None = None) -> AmbientAudioCaptureWindow:
-        """Sample ambient audio and return both metrics and captured PCM bytes."""
+    def require_readable_frames(
+        self,
+        *,
+        duration_ms: int | None = None,
+        chunk_count: int = 1,
+    ) -> AudioCaptureReadinessProbe:
+        """Assert that the configured capture path yields readable PCM frames."""
 
-        if duration_ms is None:
-            normalized_duration_ms = self.default_duration_ms
-        else:
-            requested_duration_ms = _ensure_int("duration_ms", duration_ms, minimum=0)
-            normalized_duration_ms = (
-                self.default_duration_ms if requested_duration_ms == 0 else requested_duration_ms
-            )
-        effective_duration_ms = max(self.chunk_ms, normalized_duration_ms)
-        chunk_bytes = _chunk_byte_count(
+        effective_duration_ms = self._resolve_duration_ms(duration_ms)
+        normalized_chunk_count = _ensure_int("chunk_count", chunk_count, minimum=1)
+        chunks = self._capture_chunks(
+            target_chunk_count=normalized_chunk_count,
+            effective_duration_ms=effective_duration_ms,
+        )
+        return AudioCaptureReadinessProbe(
+            device=self.device,
             sample_rate=self.sample_rate,
             channels=self.channels,
             chunk_ms=self.chunk_ms,
+            duration_ms=effective_duration_ms,
+            target_chunk_count=normalized_chunk_count,
+            captured_chunk_count=len(chunks),
+            captured_bytes=sum(len(chunk) for chunk in chunks),
+            detail=(
+                f"Captured {len(chunks)} readable chunk(s) from {self.device} "
+                f"at {self.sample_rate} Hz/{self.channels} channel(s)."
+            ),
         )
-        target_chunk_count = max(1, math.ceil(effective_duration_ms / self.chunk_ms))
-        command = [
-            "arecord",
-            "-D",
-            self.device,
-            "-q",
-            "-t",
-            "raw",
-            "-f",
-            "S16_LE",
-            "-c",
-            str(self.channels),
-            "-r",
-            str(self.sample_rate),
-        ]
-        process = _spawn_audio_process(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            purpose="Ambient audio capture",
+
+    def sample_window(self, *, duration_ms: int | None = None) -> AmbientAudioCaptureWindow:
+        """Sample ambient audio and return both metrics and captured PCM bytes."""
+
+        effective_duration_ms = self._resolve_duration_ms(duration_ms)
+        pcm_fragments = self._capture_chunks(
+            target_chunk_count=max(1, math.ceil(effective_duration_ms / self.chunk_ms)),
+            effective_duration_ms=effective_duration_ms,
         )
-        rms_values: list[int] = []
-        pcm_fragments: list[bytes] = []
-        started_at = time.monotonic()
-        last_chunk_at = started_at
-        capture_deadline_at = started_at + (effective_duration_ms / 1000.0) + _AMBIENT_CAPTURE_EXTRA_TIMEOUT_S
-        read_stall_timeout_s = _compute_read_stall_timeout(self.chunk_ms)
-
-        try:
-            while len(rms_values) < target_chunk_count:
-                now = time.monotonic()
-                # AUDIT-FIX(#3): Add absolute and stall timeouts so ambient sampling cannot hang forever on dead audio input.
-                if now >= capture_deadline_at:
-                    raise RuntimeError("Ambient audio capture timed out before collecting enough samples")
-                if process.poll() is not None:
-                    self._raise_process_error(process)
-                if process.stdout is None:
-                    raise RuntimeError("arecord did not expose stdout")
-                is_ready = _wait_for_readable(
-                    process.stdout,
-                    timeout_s=_SELECT_TIMEOUT_S,
-                    purpose="Ambient audio capture",
-                )
-                if not is_ready:
-                    if time.monotonic() - last_chunk_at >= read_stall_timeout_s:
-                        raise RuntimeError("Ambient audio capture stalled while waiting for microphone data")
-                    continue
-                chunk = os.read(process.stdout.fileno(), chunk_bytes)
-                if not chunk:
-                    if time.monotonic() - last_chunk_at >= read_stall_timeout_s:
-                        raise RuntimeError("Ambient audio capture stalled while reading microphone data")
-                    continue
-                last_chunk_at = time.monotonic()
-                chunk = _trim_incomplete_bytes(chunk, alignment=_SAMPLE_WIDTH_BYTES)
-                if not chunk:
-                    continue
-                rms_values.append(_pcm16_rms(chunk))
-                pcm_fragments.append(chunk)
-        finally:
-            self._stop_process(process)
-
-        if not rms_values:
-            raise RuntimeError("Ambient audio capture ended without usable samples")
+        rms_values = [_pcm16_rms(chunk) for chunk in pcm_fragments]
 
         active_chunk_count = sum(1 for rms in rms_values if rms >= self.speech_threshold)
         average_rms = int(sum(rms_values) / len(rms_values))
@@ -896,6 +889,142 @@ class AmbientAudioSampler:
 
     def _stop_process(self, process: subprocess.Popen[bytes]) -> None:
         _stop_process(process)
+
+    def _resolve_duration_ms(self, duration_ms: int | None) -> int:
+        """Normalize one optional sample duration to a bounded chunk-aligned window."""
+
+        if duration_ms is None:
+            normalized_duration_ms = self.default_duration_ms
+        else:
+            requested_duration_ms = _ensure_int("duration_ms", duration_ms, minimum=0)
+            normalized_duration_ms = (
+                self.default_duration_ms if requested_duration_ms == 0 else requested_duration_ms
+            )
+        return max(self.chunk_ms, normalized_duration_ms)
+
+    def _capture_chunks(
+        self,
+        *,
+        target_chunk_count: int,
+        effective_duration_ms: int,
+    ) -> list[bytes]:
+        """Collect a bounded number of readable PCM chunks from the current device."""
+
+        normalized_target_chunk_count = _ensure_int(
+            "target_chunk_count",
+            target_chunk_count,
+            minimum=1,
+        )
+        chunk_bytes = _chunk_byte_count(
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            chunk_ms=self.chunk_ms,
+        )
+        command = [
+            "arecord",
+            "-D",
+            self.device,
+            "-q",
+            "-t",
+            "raw",
+            "-f",
+            "S16_LE",
+            "-c",
+            str(self.channels),
+            "-r",
+            str(self.sample_rate),
+        ]
+        process = _spawn_audio_process(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            purpose="Ambient audio capture",
+        )
+        pcm_fragments: list[bytes] = []
+        bytes_captured = 0
+        started_at = time.monotonic()
+        last_chunk_at = started_at
+        capture_deadline_at = started_at + (effective_duration_ms / 1000.0) + _AMBIENT_CAPTURE_EXTRA_TIMEOUT_S
+        read_stall_timeout_s = _compute_read_stall_timeout(self.chunk_ms)
+
+        def _raise_capture_readiness_error(
+            *,
+            failure_reason: str,
+            detail: str,
+        ) -> None:
+            raise AudioCaptureReadinessError(
+                detail,
+                probe=AudioCaptureReadinessProbe(
+                    device=self.device,
+                    sample_rate=self.sample_rate,
+                    channels=self.channels,
+                    chunk_ms=self.chunk_ms,
+                    duration_ms=effective_duration_ms,
+                    target_chunk_count=normalized_target_chunk_count,
+                    captured_chunk_count=len(pcm_fragments),
+                    captured_bytes=bytes_captured,
+                    failure_reason=failure_reason,
+                    detail=detail,
+                ),
+            )
+
+        try:
+            while len(pcm_fragments) < normalized_target_chunk_count:
+                now = time.monotonic()
+                # AUDIT-FIX(#3): Add absolute and stall timeouts so ambient sampling cannot hang forever on dead audio input.
+                if now >= capture_deadline_at:
+                    _raise_capture_readiness_error(
+                        failure_reason="timed_out",
+                        detail="Ambient audio capture timed out before collecting enough samples",
+                    )
+                if process.poll() is not None:
+                    _raise_capture_readiness_error(
+                        failure_reason="process_exited",
+                        detail=(
+                            "Ambient audio capture failed: "
+                            f"{_process_failure_message(process, default_action='Ambient audio capture')}"
+                        ),
+                    )
+                if process.stdout is None:
+                    _raise_capture_readiness_error(
+                        failure_reason="stdout_missing",
+                        detail="arecord did not expose stdout",
+                    )
+                is_ready = _wait_for_readable(
+                    process.stdout,
+                    timeout_s=_SELECT_TIMEOUT_S,
+                    purpose="Ambient audio capture",
+                )
+                if not is_ready:
+                    if time.monotonic() - last_chunk_at >= read_stall_timeout_s:
+                        _raise_capture_readiness_error(
+                            failure_reason="stalled_waiting",
+                            detail="Ambient audio capture stalled while waiting for microphone data",
+                        )
+                    continue
+                chunk = os.read(process.stdout.fileno(), chunk_bytes)
+                if not chunk:
+                    if time.monotonic() - last_chunk_at >= read_stall_timeout_s:
+                        _raise_capture_readiness_error(
+                            failure_reason="stalled_reading",
+                            detail="Ambient audio capture stalled while reading microphone data",
+                        )
+                    continue
+                last_chunk_at = time.monotonic()
+                chunk = _trim_incomplete_bytes(chunk, alignment=_SAMPLE_WIDTH_BYTES)
+                if not chunk:
+                    continue
+                pcm_fragments.append(chunk)
+                bytes_captured += len(chunk)
+        finally:
+            self._stop_process(process)
+
+        if not pcm_fragments:
+            _raise_capture_readiness_error(
+                failure_reason="no_usable_samples",
+                detail="Ambient audio capture ended without usable samples",
+            )
+        return pcm_fragments
 
 
 class WaveAudioPlayer:

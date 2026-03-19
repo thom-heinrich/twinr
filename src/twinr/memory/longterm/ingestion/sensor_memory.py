@@ -23,6 +23,22 @@ _WEEKDAY_LABELS = {  # AUDIT-FIX(#8): Use explicit human-readable labels to avoi
     "weekday": "weekdays",
     "weekend": "weekends",
 }
+_INTERACTION_LABELS = {
+    "conversation_start": "Conversation starts",
+    "conversation_start_audio": "Voice conversation starts",
+    "print": "Printed Twinr outputs",
+    "camera_use": "Camera uses",
+    "camera_showing": "Camera-side interactions",
+    "quiet_window": "Quiet windows around the device",
+    "friction_overlap": "Audio interruptions or overlap events",
+    "resume_follow_up": "Short spoken follow-ups",
+}
+_VOICE_RESPONSE_PREFERENCE_INTERACTIONS = frozenset(
+    {
+        "conversation_start_audio",
+        "resume_follow_up",
+    }
+)
 _MAX_EVENT_IDS = 32
 _DEFAULT_TIMEZONE_NAME = "Europe/Berlin"
 _DEFAULT_BASELINE_DAYS = 21
@@ -317,6 +333,14 @@ class LongTermSensorMemoryCompiler:
                             reference_day=reference_day,
                         )
                     )
+                    preference = self._build_response_channel_preference(
+                        signals=signal_tuple,
+                        weekday_class=weekday_class,
+                        daypart=daypart,
+                        reference_day=reference_day,
+                    )
+                    if preference is not None:
+                        created.append(preference)
             created.extend(
                 self._build_presence_deviations(
                     routines=tuple(presence_routines),
@@ -412,6 +436,9 @@ class LongTermSensorMemoryCompiler:
         elif item.memory_id.startswith("pattern:camera_interaction:"):
             routine_type = "interaction"
             interaction_type = "camera_showing"
+        elif item.memory_id.startswith("pattern:audio_interaction:"):
+            routine_type = "interaction"
+            interaction_type = self._audio_interaction_type(item=item)
         if not routine_type:
             return None
 
@@ -433,6 +460,18 @@ class LongTermSensorMemoryCompiler:
             event_id_days=event_id_days,
             event_ids=tuple(event_id for event_id, _ in event_id_days),
         )
+
+    def _audio_interaction_type(self, *, item: LongTermMemoryObjectV1) -> str | None:
+        """Resolve one supported audio interaction type from a raw pattern object."""
+
+        attrs = _coerce_attributes(item.attributes)
+        candidate = _normalize_text(attrs.get("interaction_type")).lower()
+        if candidate in _INTERACTION_LABELS:
+            return candidate
+        parts = item.memory_id.split(":")
+        if len(parts) >= 4:
+            candidate = _normalize_text(parts[2]).lower()
+        return candidate if candidate in _INTERACTION_LABELS else None
 
     def _event_id_days(
         self,
@@ -555,7 +594,7 @@ class LongTermSensorMemoryCompiler:
 
         created: list[LongTermMemoryObjectV1] = []
         weekday_label = _weekday_label(weekday_class)
-        for interaction_type in ("conversation_start", "print", "camera_use", "camera_showing"):
+        for interaction_type in _INTERACTION_LABELS:
             relevant = tuple(
                 signal
                 for signal in signals
@@ -583,7 +622,7 @@ class LongTermSensorMemoryCompiler:
                 LongTermMemoryObjectV1(
                     memory_id=f"routine:interaction:{interaction_type}:{weekday_class}:{daypart}",
                     kind="pattern",
-                    summary=f"{interaction_type.replace('_', ' ').title()} is typical in the {daypart} on {weekday_label}.",  # AUDIT-FIX(#8): Use explicit labels so summaries stay grammatical.
+                    summary=f"{_INTERACTION_LABELS[interaction_type]} are typical in the {daypart} on {weekday_label}.",  # AUDIT-FIX(#8): Use explicit labels so summaries stay grammatical.
                     details="Derived from repeated multimodal interaction signals in the bounded sensor-memory window.",
                     source=LongTermSourceRefV1(
                         source_type="sensor_memory",
@@ -612,6 +651,104 @@ class LongTermSensorMemoryCompiler:
                 )
             )
         return tuple(created)
+
+    def _build_response_channel_preference(
+        self,
+        *,
+        signals: tuple[_RawPatternSignal, ...],
+        weekday_class: str,
+        daypart: str,
+        reference_day: date,
+    ) -> LongTermMemoryObjectV1 | None:
+        """Build one observed voice-channel preference hypothesis when repeated.
+
+        The ReSpeaker path may only suggest a channel preference from repeated
+        voice-side behavior. The resulting object stays a candidate and still
+        requires explicit user confirmation before it can drive durable
+        personalization.
+        """
+
+        observed_days = set(
+            _eligible_dates(
+                reference_day=reference_day,
+                baseline_days=self.baseline_days,
+                weekday_class=weekday_class,
+            )
+        )
+        if len(observed_days) < self.min_days_observed:
+            return None
+
+        relevant = tuple(
+            signal
+            for signal in signals
+            if signal.routine_type == "interaction"
+            and signal.interaction_type in _VOICE_RESPONSE_PREFERENCE_INTERACTIONS
+            and signal.daypart == daypart
+        )
+        if not relevant:
+            return None
+
+        signal_days = {
+            event_day
+            for signal in relevant
+            for event_day in signal.event_days
+            if event_day in observed_days
+        }
+        if not signal_days:
+            return None
+
+        ratio = len(signal_days) / len(observed_days)
+        if ratio < self.min_routine_ratio:
+            return None
+
+        weekday_label = _weekday_label(weekday_class)
+        evidence_types = tuple(
+            sorted(
+                {
+                    signal.interaction_type
+                    for signal in relevant
+                    if signal.interaction_type is not None
+                }
+            )
+        )
+        return LongTermMemoryObjectV1(
+            memory_id=f"preference:response_channel:voice:{weekday_class}:{daypart}",
+            kind="summary",
+            summary=f"Voice replies may be preferred in the {daypart} on {weekday_label}.",
+            details=(
+                "Observed ReSpeaker hypothesis derived from repeated voice-led interaction signals. "
+                "This object must stay confirm-first and must not be treated like an explicit user preference."
+            ),
+            source=LongTermSourceRefV1(
+                source_type="sensor_memory",
+                event_ids=self._window_event_ids(signals=relevant, observed_days=observed_days),
+                modality="sensor",
+            ),
+            status="candidate",
+            confidence=min(0.82, 0.38 + (ratio * 0.28) + (min(len(signal_days), 8) * 0.018)),
+            sensitivity="low",
+            slot_key=f"preference:response_channel:{weekday_class}:{daypart}",
+            value_key="voice",
+            valid_from=min(day.isoformat() for day in signal_days),
+            valid_to=max(day.isoformat() for day in signal_days),
+            attributes={
+                "memory_domain": "respeaker_audio_preference",
+                "memory_class": "observed_preference",
+                "preference_type": "response_channel",
+                "preferred_channel": "voice",
+                "weekday_class": weekday_class,
+                "daypart": daypart,
+                "days_observed": len(observed_days),
+                "days_with_voice_signal": len(signal_days),
+                "typical_preference_ratio": round(ratio, 4),
+                "baseline_window_days": self.baseline_days,
+                "requires_confirmation": True,
+                "source_sensor": "respeaker_xvf3800",
+                "source_type": "observed",
+                "evidence_interaction_types": evidence_types,
+                "last_observed_date": max(signal_days).isoformat(),
+            },
+        )
 
     def _build_presence_deviations(
         self,

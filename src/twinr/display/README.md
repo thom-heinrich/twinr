@@ -11,6 +11,7 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
 - translate runtime snapshots into bounded status frames for the active backend
 - compose panel-bounded layout variants such as the operator-facing `debug_log`
   view with grouped `System Log`, `LLM Log`, and `Hardware Log` sections
+- derive calm ReSpeaker HCI states such as `DFU`, `fehlt`, `stumm`, or room-audio blockers from authoritative ops events instead of parsing proactive payloads inline
 - derive the debug-log sections from persisted ops events, usage telemetry,
   host health, and the remote-memory watchdog artifact
 - persist an authoritative display heartbeat so ops health and the runtime
@@ -122,6 +123,22 @@ That path gives Twinr ownership of the visible fullscreen surface. Keep
 `hdmi_fbdev` only as a fallback for framebuffer-only environments where no
 usable Wayland session exists.
 
+The productive display companion does not start on every `/twinr` host by
+default. Automatic startup remains limited to authoritative `/twinr` launches
+on real Raspberry Pi hosts so generic servers do not suddenly lose a monitor to
+the Twinr face. When an operator intentionally wants the visible companion on a
+different authoritative host, set:
+
+```dotenv
+TWINR_DISPLAY_COMPANION_ENABLED=true
+```
+
+To suppress the fullscreen companion explicitly even on a Pi host, set:
+
+```dotenv
+TWINR_DISPLAY_COMPANION_ENABLED=false
+```
+
 The default HDMI surface is intentionally much calmer than the operator
 `debug_log` view: solid black background, a slim top `TWINR` bar, an animated
 white-on-black face on the left that mirrors the familiar e-paper eye/mouth
@@ -133,6 +150,18 @@ visually dominant element, so the right-hand panel must not regrow until it
 crowds the face area. That keeps the senior-facing screen glanceable from a
 distance while `debug_log` remains the explicit diagnostics layout for
 operators.
+
+On larger HDMI outputs such as 1920x1080, the same rule still applies: do not
+let the panel stretch just because more pixels are available. Keep the content
+centered, cap the right-hand panel width, and allow the face itself to scale
+up so the screen still reads as "face first, status second" instead of turning
+into one giant empty status card.
+
+On the real 800x480 HDMI surface, that same hierarchy must still read clearly
+even when the bottom news ticker is active and the panel collapses into its
+compact summary form: keep the top bar visibly slim and the right-hand box
+materially narrower than the face region so the live screen does not regress
+back toward the earlier cramped composition.
 
 That waiting surface may also show very rare ambient moments: tiny sparkles,
 hearts, crescent moons, wave marks, curious dot clusters, or even a tiny crown
@@ -152,6 +181,17 @@ default-scene layout, face animation, and status-card model so future HDMI
 capabilities such as expanded cards, morph transitions, or richer per-capability
 panels can be added without pushing presentation logic back into the transport
 backend.
+
+When proactive monitoring targets the XVF3800, the display service now reads
+the latest authoritative ReSpeaker ops facts and surfaces only calm status
+transitions on the operator card: degraded hardware states such as `DFU` or
+`fehlt`, microphone mute or explicit `hört`, recent `Sprache`, strong
+direction hints, and room-audio blockers such as `Medien`, loud overlap, or a
+short `Pause`/resume window. The default surface intentionally does not mirror
+every weak audio bit; direction hints require strong confidence, and the shared
+ring semantics are `listening_mute_only`, which means the XVF3800 ring may
+mirror explicit listening or mute but never flickers on weak direction/speech
+evidence. Richer ReSpeaker detail stays in the `debug_log` hardware section.
 
 The first presentation-capability slice now resolves through a dedicated HDMI
 scene graph instead of directly from one cue to one overlay. The graph builder

@@ -26,6 +26,9 @@ from twinr.proactive import (
     proactive_prompt_mode,
 )
 from twinr.proactive.runtime.audio_policy import ReSpeakerAudioPolicySnapshot
+from twinr.proactive.runtime.governor_inputs import ReSpeakerGovernorInputs, build_respeaker_governor_inputs
+from twinr.proactive.runtime.multimodal_initiative import ReSpeakerMultimodalInitiativeSnapshot
+from twinr.proactive.runtime.sensitive_behavior_gate import evaluate_respeaker_sensitive_behavior_gate
 from twinr.providers.openai.core.instructions import REMINDER_DELIVERY_INSTRUCTIONS
 
 
@@ -476,7 +479,9 @@ class TwinrRealtimeBackgroundMixin:
             trigger_id=trigger_id,
             safety_trigger=safety_trigger,
         )
-        governor_channel = "display" if delivery_decision.channel == "display" else "speech"
+        governor_inputs = self._current_governor_inputs(
+            requested_channel="display" if delivery_decision.channel == "display" else "speech"
+        )
 
         if not self._background_work_allowed():
             skip_reason = "busy" if getattr(getattr(self.runtime, "status", None), "value", None) != "waiting" else "conversation_active"
@@ -497,12 +502,13 @@ class TwinrRealtimeBackgroundMixin:
                 source_kind="social",
                 source_id=trigger_id,
                 summary=default_prompt,
-                channel=governor_channel,
+                channel=governor_inputs.channel,
                 priority=priority,
-                presence_session_id=self._current_presence_session_id(),
+                presence_session_id=governor_inputs.presence_session_id,
                 safety_exempt=safety_trigger,
                 counts_toward_presence_budget=not safety_trigger,
-            )
+            ),
+            governor_inputs=governor_inputs,
         )
         if governor_reservation is None:
             return False
@@ -706,16 +712,18 @@ class TwinrRealtimeBackgroundMixin:
             preview_entries = self.runtime.peek_due_reminders(limit=1)
             if not preview_entries:
                 return False
+            governor_inputs = self._current_governor_inputs(requested_channel="speech")
             governor_reservation = self._reserve_governed_prompt(
                 ProactiveGovernorCandidate(
                     source_kind="reminder",
                     source_id=preview_entries[0].reminder_id,
                     summary=preview_entries[0].summary,
                     priority=80,
-                    presence_session_id=self._current_presence_session_id(),
+                    presence_session_id=governor_inputs.presence_session_id,
                     safety_exempt=False,
                     counts_toward_presence_budget=False,
-                )
+                ),
+                governor_inputs=governor_inputs,
             )
             if governor_reservation is None:
                 return False
@@ -833,6 +841,29 @@ class TwinrRealtimeBackgroundMixin:
             return snapshot
         return None
 
+    def _current_multimodal_initiative_snapshot(self) -> ReSpeakerMultimodalInitiativeSnapshot | None:
+        """Return the latest multimodal initiative snapshot when available."""
+
+        facts = getattr(self, "_latest_sensor_observation_facts", None)
+        if not isinstance(facts, dict):
+            return None
+        return ReSpeakerMultimodalInitiativeSnapshot.from_fact_map(
+            facts.get("multimodal_initiative"),
+        )
+
+    def _current_governor_inputs(self, *, requested_channel: str) -> ReSpeakerGovernorInputs:
+        """Return the current ReSpeaker-aware governor input bundle."""
+
+        monitor = getattr(self, "proactive_monitor", None)
+        coordinator = None if monitor is None else getattr(monitor, "coordinator", None)
+        presence_snapshot = None if coordinator is None else getattr(coordinator, "latest_presence_snapshot", None)
+        return build_respeaker_governor_inputs(
+            requested_channel=requested_channel,
+            presence_snapshot=presence_snapshot,
+            audio_policy_snapshot=self._current_audio_policy_snapshot(),
+            multimodal_initiative_snapshot=self._current_multimodal_initiative_snapshot(),
+        )
+
     def _local_now(self) -> datetime:
         """Return the current wall clock in the configured local timezone."""
 
@@ -855,6 +886,99 @@ class TwinrRealtimeBackgroundMixin:
         copied["last_response_available"] = bool(getattr(self.runtime, "last_response", None))
         copied["recent_print_completed"] = self._recent_print_completed()
         return copied
+
+    def _block_sensitive_longterm_candidate_if_needed(
+        self,
+        *,
+        candidate,
+        live_facts: dict[str, object] | None,
+        current_time: datetime,
+    ) -> bool:
+        """Skip one sensitive long-term candidate when room context is ambiguous."""
+
+        decision = evaluate_respeaker_sensitive_behavior_gate(
+            candidate_sensitivity=getattr(candidate, "sensitivity", None),
+            live_facts=live_facts,
+        )
+        if decision.allowed:
+            return False
+
+        reservation = None
+        skip_reason = decision.reason or "sensitive_audio_context_blocked"
+        try:
+            reservation = self.runtime.reserve_specific_long_term_proactive_candidate(
+                candidate,
+                now=current_time,
+            )
+        except Exception as exc:
+            self._remember_background_fault("reserve_sensitive_longterm_candidate", exc)
+
+        if reservation is not None:
+            self._safe_mark_long_term_proactive_candidate_skipped(
+                reservation,
+                reason=skip_reason,
+            )
+
+        candidate_id = self._coerce_text(getattr(candidate, "candidate_id", None)) or "unknown"
+        self._safe_emit(f"longterm_proactive_skipped={skip_reason}")
+        self._safe_record_event(
+            "longterm_proactive_skipped",
+            "Twinr blocked a sensitive proactive memory prompt because current room context was too ambiguous.",
+            candidate_id=candidate_id,
+            candidate_kind=self._coerce_text(getattr(candidate, "kind", None)),
+            summary=self._coerce_text(getattr(candidate, "summary", None)),
+            skip_reason=skip_reason,
+            skip_recorded=reservation is not None,
+            **decision.event_data(),
+        )
+        return True
+
+    def _block_longterm_candidate_for_multimodal_initiative_if_needed(
+        self,
+        *,
+        candidate,
+        live_facts: dict[str, object] | None,
+        current_time: datetime,
+    ) -> bool:
+        """Skip one non-safety long-term candidate when initiative confidence is low."""
+
+        if not isinstance(live_facts, dict):
+            return False
+        snapshot = ReSpeakerMultimodalInitiativeSnapshot.from_fact_map(
+            live_facts.get("multimodal_initiative"),
+        )
+        if snapshot is None or snapshot.ready or snapshot.recommended_channel != "display":
+            return False
+
+        reservation = None
+        skip_reason = self._coerce_text(snapshot.block_reason) or "low_multimodal_initiative_confidence"
+        try:
+            reservation = self.runtime.reserve_specific_long_term_proactive_candidate(
+                candidate,
+                now=current_time,
+            )
+        except Exception as exc:
+            self._remember_background_fault("reserve_multimodal_longterm_candidate", exc)
+
+        if reservation is not None:
+            self._safe_mark_long_term_proactive_candidate_skipped(
+                reservation,
+                reason=skip_reason,
+            )
+
+        candidate_id = self._coerce_text(getattr(candidate, "candidate_id", None)) or "unknown"
+        self._safe_emit(f"longterm_proactive_skipped={skip_reason}")
+        self._safe_record_event(
+            "longterm_proactive_skipped",
+            "Twinr blocked a long-term proactive prompt because multimodal initiative confidence was too low.",
+            candidate_id=candidate_id,
+            candidate_kind=self._coerce_text(getattr(candidate, "kind", None)),
+            summary=self._coerce_text(getattr(candidate, "summary", None)),
+            skip_reason=skip_reason,
+            skip_recorded=reservation is not None,
+            **snapshot.event_data(),
+        )
+        return True
 
     def _recent_print_completed(self, *, within_s: float = 900.0) -> bool:
         cutoff = datetime.now(timezone.utc).timestamp() - max(0.0, within_s)
@@ -911,6 +1035,13 @@ class TwinrRealtimeBackgroundMixin:
                 if isinstance(vad, dict):
                     facts.append(f"live_quiet={bool(vad.get('quiet'))}")
                     facts.append(f"live_speech_detected={bool(vad.get('speech_detected'))}")
+                multimodal = live_facts.get("multimodal_initiative")
+                if isinstance(multimodal, dict):
+                    facts.append(f"multimodal_initiative_ready={bool(multimodal.get('ready'))}")
+                    facts.append(
+                        "multimodal_initiative_block_reason="
+                        f"{self._coerce_text(multimodal.get('block_reason')) or 'none'}"
+                    )
                 facts.append(f"last_response_available={bool(live_facts.get('last_response_available'))}")
                 facts.append(f"recent_print_completed={bool(live_facts.get('recent_print_completed'))}")
         return tuple(facts)
@@ -918,6 +1049,8 @@ class TwinrRealtimeBackgroundMixin:
     def _reserve_governed_prompt(
         self,
         candidate: ProactiveGovernorCandidate,
+        *,
+        governor_inputs: ReSpeakerGovernorInputs | None = None,
     ) -> ProactiveGovernorReservation | None:
         # AUDIT-FIX(#12): Governor errors should fail closed for this prompt, not crash the whole background worker.
         try:
@@ -938,6 +1071,7 @@ class TwinrRealtimeBackgroundMixin:
                 source_id=candidate.source_id,
                 summary=candidate.summary,
                 error=str(exc),
+                **({} if governor_inputs is None else governor_inputs.event_data()),
             )
             return None
 
@@ -961,6 +1095,7 @@ class TwinrRealtimeBackgroundMixin:
             channel=getattr(candidate, "channel", None),
             priority=int(candidate.priority),
             presence_session_id=candidate.presence_session_id,
+            **({} if governor_inputs is None else governor_inputs.event_data()),
         )
         return None
 
@@ -1000,13 +1135,29 @@ class TwinrRealtimeBackgroundMixin:
     ) -> ProactiveDeliveryDecision:
         """Choose whether one social trigger should speak or stay visual."""
 
-        return self._proactive_delivery_policy().decide(
+        decision = self._proactive_delivery_policy().decide(
             monotonic_now=time.monotonic(),
             local_now=self._local_now(),
             source_id=trigger_id,
             safety_exempt=safety_trigger,
             audio_policy_snapshot=self._current_audio_policy_snapshot(),
         )
+        if safety_trigger:
+            return decision
+        initiative_snapshot = self._current_multimodal_initiative_snapshot()
+        if (
+            initiative_snapshot is not None
+            and not initiative_snapshot.ready
+            and initiative_snapshot.recommended_channel == "display"
+            and decision.channel == "speech"
+        ):
+            return ProactiveDeliveryDecision(
+                channel="display",
+                reason=self._coerce_text(initiative_snapshot.block_reason)
+                or "low_multimodal_initiative_confidence",
+                cue_hold_seconds=self._proactive_delivery_policy().visual_first_cue_hold_s,
+            )
+        return decision
 
     def _show_social_trigger_display_cue(
         self,
@@ -1083,23 +1234,38 @@ class TwinrRealtimeBackgroundMixin:
                 return False
 
             candidate_id = self._coerce_text(getattr(preview, "candidate_id", None)) or "unknown"
+            current_time = datetime.now(self._local_timezone())
+            if self._block_sensitive_longterm_candidate_if_needed(
+                candidate=preview,
+                live_facts=live_facts,
+                current_time=current_time,
+            ):
+                return False
+            if self._block_longterm_candidate_for_multimodal_initiative_if_needed(
+                candidate=preview,
+                live_facts=live_facts,
+                current_time=current_time,
+            ):
+                return False
+            governor_inputs = self._current_governor_inputs(requested_channel="speech")
             governor_reservation = self._reserve_governed_prompt(
                 ProactiveGovernorCandidate(
                     source_kind="longterm",
                     source_id=candidate_id,
                     summary=self._coerce_text(getattr(preview, "summary", None)),
                     priority=self._confidence_to_priority(getattr(preview, "confidence", None), default=50),
-                    presence_session_id=self._current_presence_session_id(),
+                    presence_session_id=governor_inputs.presence_session_id,
                     safety_exempt=False,
                     counts_toward_presence_budget=True,
-                )
+                ),
+                governor_inputs=governor_inputs,
             )
             if governor_reservation is None:
                 return False
 
             reservation = self.runtime.reserve_specific_long_term_proactive_candidate(
                 preview,
-                now=datetime.now(self._local_timezone()),
+                now=current_time,
             )
             if reservation is None or reservation.candidate.candidate_id != getattr(preview, "candidate_id", None):
                 self._safe_cancel_governor_reservation(governor_reservation)
@@ -1375,16 +1541,18 @@ class TwinrRealtimeBackgroundMixin:
         executed = False
         try:
             if self._automation_uses_speech(entry):
+                governor_inputs = self._current_governor_inputs(requested_channel="speech")
                 governor_reservation = self._reserve_governed_prompt(
                     ProactiveGovernorCandidate(
                         source_kind="automation",
                         source_id=automation_id,
                         summary=automation_name,
                         priority=70,
-                        presence_session_id=self._current_presence_session_id(),
+                        presence_session_id=governor_inputs.presence_session_id,
                         safety_exempt=False,
                         counts_toward_presence_budget=True,
-                    )
+                    ),
+                    governor_inputs=governor_inputs,
                 )
                 if governor_reservation is None:
                     return False

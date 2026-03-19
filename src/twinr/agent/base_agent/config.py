@@ -319,6 +319,17 @@ class TwinrConfig:
     orchestrator_port: int = 8797
     orchestrator_ws_url: str = "ws://127.0.0.1:8797/ws/orchestrator"
     orchestrator_shared_secret: str | None = None
+    whatsapp_node_binary: str = "node"
+    whatsapp_allow_from: str | None = None
+    whatsapp_auth_dir: str = "state/channels/whatsapp/auth"
+    whatsapp_worker_root: str = "src/twinr/channels/whatsapp/worker"
+    whatsapp_groups_enabled: bool = False
+    whatsapp_self_chat_mode: bool = False
+    whatsapp_reconnect_base_delay_s: float = 2.0
+    whatsapp_reconnect_max_delay_s: float = 30.0
+    whatsapp_send_timeout_s: float = 20.0
+    whatsapp_sent_cache_ttl_s: float = 180.0
+    whatsapp_sent_cache_max_entries: int = 256
     camera_device: str = "/dev/video0"
     camera_width: int = 640
     camera_height: int = 480
@@ -333,6 +344,7 @@ class TwinrConfig:
     proactive_local_camera_pose_network_path: str = "/usr/share/imx500-models/imx500_network_posenet.rpk"
     proactive_local_camera_pose_backend: str = "mediapipe"
     proactive_local_camera_mediapipe_pose_model_path: str = "state/mediapipe/models/pose_landmarker_full.task"
+    proactive_local_camera_mediapipe_hand_landmarker_model_path: str = "state/mediapipe/models/hand_landmarker.task"
     proactive_local_camera_mediapipe_gesture_model_path: str = "state/mediapipe/models/gesture_recognizer.task"
     proactive_local_camera_mediapipe_custom_gesture_model_path: str | None = None
     proactive_local_camera_mediapipe_num_hands: int = 2
@@ -520,6 +532,7 @@ class TwinrConfig:
     button_debounce_ms: int = 80
     button_probe_lines: tuple[int, ...] = DEFAULT_BUTTON_PROBE_LINES
     display_driver: str = "hdmi_fbdev"
+    display_companion_enabled: bool | None = None
     display_fb_path: str = "/dev/fb0"
     display_wayland_display: str = "wayland-0"
     display_wayland_runtime_dir: str | None = None
@@ -1141,6 +1154,44 @@ class TwinrConfig:
                 or "ws://127.0.0.1:8797/ws/orchestrator"
             ),
             orchestrator_shared_secret=get_value("TWINR_ORCHESTRATOR_SHARED_SECRET") or None,
+            whatsapp_node_binary=get_value("TWINR_WHATSAPP_NODE_BINARY", "node") or "node",
+            whatsapp_allow_from=get_value("TWINR_WHATSAPP_ALLOW_FROM") or None,
+            whatsapp_auth_dir=get_value(
+                "TWINR_WHATSAPP_AUTH_DIR",
+                str(project_root / "state" / "channels" / "whatsapp" / "auth"),
+            )
+            or str(project_root / "state" / "channels" / "whatsapp" / "auth"),
+            whatsapp_worker_root=get_value(
+                "TWINR_WHATSAPP_WORKER_ROOT",
+                str(project_root / "src" / "twinr" / "channels" / "whatsapp" / "worker"),
+            )
+            or str(project_root / "src" / "twinr" / "channels" / "whatsapp" / "worker"),
+            whatsapp_groups_enabled=_parse_bool(get_value("TWINR_WHATSAPP_GROUPS_ENABLED"), False),
+            whatsapp_self_chat_mode=_parse_bool(get_value("TWINR_WHATSAPP_SELF_CHAT_MODE"), False),
+            whatsapp_reconnect_base_delay_s=_parse_float(
+                get_value("TWINR_WHATSAPP_RECONNECT_BASE_DELAY_S"),
+                2.0,
+                minimum=0.1,
+            ),
+            whatsapp_reconnect_max_delay_s=_parse_float(
+                get_value("TWINR_WHATSAPP_RECONNECT_MAX_DELAY_S"),
+                30.0,
+                minimum=0.1,
+            ),
+            whatsapp_send_timeout_s=_parse_float(
+                get_value("TWINR_WHATSAPP_SEND_TIMEOUT_S"),
+                20.0,
+                minimum=1.0,
+            ),
+            whatsapp_sent_cache_ttl_s=_parse_float(
+                get_value("TWINR_WHATSAPP_SENT_CACHE_TTL_S"),
+                180.0,
+                minimum=1.0,
+            ),
+            whatsapp_sent_cache_max_entries=max(
+                16,
+                int(get_value("TWINR_WHATSAPP_SENT_CACHE_MAX_ENTRIES", "256") or "256"),
+            ),
             camera_device=get_value("TWINR_CAMERA_DEVICE", "/dev/video0") or "/dev/video0",
             camera_width=int(get_value("TWINR_CAMERA_WIDTH", "640") or "640"),
             camera_height=int(get_value("TWINR_CAMERA_HEIGHT", "480") or "480"),
@@ -1174,6 +1225,13 @@ class TwinrConfig:
                     "state/mediapipe/models/pose_landmarker_full.task",
                 )
                 or "state/mediapipe/models/pose_landmarker_full.task"
+            ),
+            proactive_local_camera_mediapipe_hand_landmarker_model_path=(
+                get_value(
+                    "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_HAND_LANDMARKER_MODEL_PATH",
+                    "state/mediapipe/models/hand_landmarker.task",
+                )
+                or "state/mediapipe/models/hand_landmarker.task"
             ),
             proactive_local_camera_mediapipe_gesture_model_path=(
                 get_value(
@@ -1786,6 +1844,9 @@ class TwinrConfig:
                 DEFAULT_BUTTON_PROBE_LINES,
             ),
             display_driver=get_value("TWINR_DISPLAY_DRIVER", "hdmi_fbdev") or "hdmi_fbdev",
+            display_companion_enabled=_parse_optional_bool(
+                get_value("TWINR_DISPLAY_COMPANION_ENABLED")
+            ),
             display_fb_path=get_value("TWINR_DISPLAY_FB_PATH", "/dev/fb0") or "/dev/fb0",
             display_wayland_display=get_value("TWINR_DISPLAY_WAYLAND_DISPLAY", "wayland-0") or "wayland-0",
             display_wayland_runtime_dir=get_value("TWINR_DISPLAY_WAYLAND_RUNTIME_DIR"),

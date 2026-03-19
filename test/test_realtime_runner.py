@@ -3055,6 +3055,157 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0].delivery_count, 1)
 
+    def test_idle_loop_blocks_sensitive_longterm_proactive_candidate_in_multi_person_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                long_term_memory_proactive_enabled=True,
+                long_term_memory_proactive_poll_interval_s=0.0,
+                long_term_memory_proactive_min_confidence=0.7,
+                long_term_memory_proactive_allow_sensitive=True,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            loop._latest_sensor_observation_facts = {
+                "sensor": {
+                    "observed_at": time.monotonic(),
+                    "presence_session_id": 17,
+                },
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 2,
+                    "person_count_unknown": False,
+                },
+                "vad": {
+                    "speech_detected": True,
+                    "quiet": False,
+                },
+                "respeaker": {
+                    "direction_confidence": 0.92,
+                },
+                "audio_policy": {
+                    "presence_audio_active": True,
+                    "speaker_direction_stable": True,
+                    "room_busy_or_overlapping": False,
+                },
+            }
+            loop.runtime.long_term_memory.object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:thread",
+                    occurred_at=datetime(2026, 3, 14, 12, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                    episodic_objects=(),
+                    durable_objects=(
+                        LongTermMemoryObjectV1(
+                            memory_id="thread:family_doctor",
+                            kind="thread_summary",
+                            summary="Ongoing thread about Janina's doctor appointment.",
+                            details="Reflected from multiple related turns.",
+                            source=_longterm_source("turn:thread"),
+                            status="active",
+                            confidence=0.84,
+                            sensitivity="private",
+                            slot_key="thread:user:main:family_doctor",
+                            value_key="family_doctor",
+                            attributes={"support_count": 4},
+                        ),
+                    ),
+                    deferred_objects=(),
+                    conflicts=(),
+                    graph_edges=(),
+                )
+            )
+
+            delivered = loop._maybe_run_long_term_memory_proactive()
+            history = loop.runtime.long_term_memory.proactive_policy.state_store.load_entries()
+
+        self.assertFalse(delivered)
+        self.assertEqual(print_backend.proactive_calls, [])
+        self.assertEqual(player.played, [])
+        self.assertIn("longterm_proactive_skipped=sensitive_multi_person_context", lines)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].skip_count, 1)
+        self.assertEqual(history[0].last_skip_reason, "sensitive_multi_person_context")
+
+    def test_idle_loop_blocks_longterm_proactive_candidate_when_multimodal_initiative_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                long_term_memory_proactive_enabled=True,
+                long_term_memory_proactive_poll_interval_s=0.0,
+                long_term_memory_proactive_min_confidence=0.7,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
+            reference = datetime.now(ZoneInfo(config.local_timezone_name))
+            daypart = (
+                "morning"
+                if 5 <= reference.hour < 11
+                else "afternoon"
+                if 11 <= reference.hour < 17
+                else "evening"
+                if 17 <= reference.hour < 22
+                else "night"
+            )
+            weekday_class = "weekend" if reference.weekday() >= 5 else "weekday"
+            loop._latest_sensor_observation_facts = {
+                "sensor": {"observed_at": time.monotonic()},
+                "camera": {
+                    "person_visible": True,
+                    "looking_toward_device": False,
+                    "hand_or_object_near_camera": True,
+                    "body_pose": "upright",
+                },
+                "vad": {
+                    "speech_detected": False,
+                    "quiet": True,
+                },
+                "multimodal_initiative": {
+                    "ready": False,
+                    "confidence": 0.58,
+                    "block_reason": "low_confidence_speaker_association",
+                    "recommended_channel": "display",
+                },
+            }
+            loop.runtime.long_term_memory.object_store.apply_reflection(
+                LongTermReflectionResultV1(
+                    reflected_objects=(),
+                    created_summaries=(
+                        LongTermMemoryObjectV1(
+                            memory_id=f"routine:interaction:camera_showing:{weekday_class}:{daypart}",
+                            kind="pattern",
+                            summary=f"Camera showing is typical in the {daypart} on {weekday_class}s.",
+                            source=_longterm_source("turn:sensor"),
+                            status="active",
+                            confidence=0.82,
+                            sensitivity="low",
+                            valid_from="2026-03-03",
+                            valid_to="2026-03-17",
+                            attributes={
+                                "memory_domain": "sensor_routine",
+                                "routine_type": "interaction",
+                                "interaction_type": "camera_showing",
+                                "weekday_class": weekday_class,
+                                "daypart": daypart,
+                            },
+                        ),
+                    ),
+                )
+            )
+
+            delivered = loop._maybe_run_long_term_memory_proactive()
+            history = loop.runtime.long_term_memory.proactive_policy.state_store.load_entries()
+
+        self.assertFalse(delivered)
+        self.assertEqual(len(print_backend.proactive_calls), 0)
+        self.assertEqual(player.played, [])
+        self.assertIn("longterm_proactive_skipped=low_confidence_speaker_association", lines)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].last_skip_reason, "low_confidence_speaker_association")
+
     def test_idle_loop_delivers_due_reminder_with_generic_backend_fallback(self) -> None:
         class LegacyReminderBackend(FakePrintBackend):
             phrase_due_reminder_with_metadata = None
@@ -3828,6 +3979,51 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(social_events), 1)
         self.assertEqual(social_events[0]["data"]["display_reason"], "background_media_active")
 
+    def test_social_trigger_uses_visual_first_delivery_when_multimodal_initiative_is_not_ready(self) -> None:
+        config = TwinrConfig(proactive_quiet_hours_visual_only_enabled=False)
+        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
+            config=config,
+        )
+        loop._latest_sensor_observation_facts = {
+            "multimodal_initiative": {
+                "ready": False,
+                "confidence": 0.59,
+                "block_reason": "low_confidence_speaker_association",
+                "recommended_channel": "display",
+            },
+        }
+
+        spoke = loop.handle_social_trigger(
+            SocialTriggerDecision(
+                trigger_id="attention_window",
+                prompt="Soll ich dir helfen?",
+                reason="User seems attentive and quiet.",
+                observed_at=42.0,
+                priority=SocialTriggerPriority.ATTENTION_WINDOW,
+            )
+        )
+
+        presentation_path = Path(loop.config.display_presentation_path)
+        payload = json.loads(presentation_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(spoke)
+        self.assertEqual(print_backend.proactive_calls, [])
+        self.assertEqual(player.played, [])
+        self.assertIn("social_prompt_mode=display_first", lines)
+        self.assertIn("social_display_reason=low_confidence_speaker_association", lines)
+        self.assertEqual(payload["title"], "Soll ich dir helfen?")
+        social_events = [
+            entry
+            for entry in loop.runtime.ops_events.tail(limit=20)
+            if entry["event"] == "social_trigger_displayed"
+            and entry.get("data", {}).get("trigger") == "attention_window"
+        ]
+        self.assertEqual(len(social_events), 1)
+        self.assertEqual(
+            social_events[0]["data"]["display_reason"],
+            "low_confidence_speaker_association",
+        )
+
     def test_social_trigger_is_skipped_when_runtime_is_busy(self) -> None:
         loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()
         loop.runtime.press_green_button()
@@ -3921,6 +4117,43 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("status=error", lines)
         self.assertNotIn("status=listening", lines)
         self.assertEqual(button_monitor.poll_calls, 0)
+
+    def test_run_emits_required_remote_correlation_id_for_bulk_write_failures(self) -> None:
+        button_monitor = FakeIdleButtonMonitor()
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=TwinrConfig(
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_keepalive_interval_s=0.01,
+            ),
+            button_monitor=button_monitor,
+        )
+        loop.runtime.reset_error()
+        exc = LongTermRemoteUnavailableError(
+            "Failed to persist fine-grained remote long-term memory items "
+            "(request_id=ltw-test123, batch=1/1, items=51, bytes=518642)."
+        )
+        setattr(
+            exc,
+            "remote_write_context",
+            {
+                "snapshot_kind": "objects",
+                "operation": "store_records_bulk",
+                "request_correlation_id": "ltw-test123",
+                "batch_index": 1,
+                "batch_count": 1,
+                "request_item_count": 51,
+                "request_bytes": 518642,
+            },
+        )
+
+        entered = loop._enter_required_remote_error(exc)
+
+        self.assertTrue(entered)
+        self.assertEqual(loop.runtime.status.value, "error")
+        self.assertIn("status=error", lines)
+        self.assertIn("required_remote_correlation_id=ltw-test123", lines)
 
     def test_run_recovers_after_required_remote_dependency_returns(self) -> None:
         button_monitor = FakeIdleButtonMonitor()

@@ -7,6 +7,7 @@ summary: Normalize conversation turns, multimodal evidence, and replayed ops his
 owned_concerns:
   - Extract an episode plus candidate objects and graph edges from one conversation turn
   - Normalize multimodal evidence from sensor, button, printer, and camera events into candidate memories
+  - Normalize structured ReSpeaker audio-policy facts and per-claim metadata into bounded audio routine seeds and observed preference candidates
   - Replay persisted ops history into multimodal evidence for bounded backfill and recovery
   - Compile sensor-derived routines and deviations from previously consolidated pattern objects
 out_of_scope:
@@ -36,6 +37,10 @@ files:
     role: Multimodal evidence extraction into candidate memories
     exports:
       - LongTermMultimodalExtractor
+  - path: respeaker_audio.py
+    role: Structured ReSpeaker audio routine-seed extraction from automation facts
+  - path: respeaker_contract.py
+    role: ReSpeaker claim-contract parsing and memory-attribute helpers
   - path: sensor_memory.py
     role: Routine and deviation compilation from multimodal patterns
     exports:
@@ -63,4 +68,5 @@ tests:
   - path: test/test_longterm_propositions.py
   - path: test/test_longterm_multimodal.py
   - path: test/test_sensor_memory.py
+  - path: test/test_proactive_monitor.py
   - path: test/test_longterm_memory.py

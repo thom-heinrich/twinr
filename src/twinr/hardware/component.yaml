@@ -6,12 +6,15 @@ visibility: internal
 summary: Provide bounded audio, GPIO, camera, printer, and voice-profile adapters for Twinr runtime paths.
 owned_concerns:
   - Capture and play bounded audio for conversation, ambient sensing, and wakeword flows
+  - Prove bounded readable-frame microphone capture before runtime layers trust a targeted input path as voice-ready
   - Monitor GPIO buttons and PIR motion across supported Pi backends
   - Capture still photos via ffmpeg-backed V4L2 integration
-  - Run bounded hybrid IMX500 + MediaPipe health, person/object gating, coarse motion, temporal coarse-arm, and fine-hand gesture inference
+  - Run bounded hybrid IMX500 + MediaPipe health, person/object gating, pose enrichment, hand-landmark ROI work, temporal coarse-arm, and fine-hand gesture inference
   - Format and submit bounded receipt print jobs
   - Probe ReSpeaker XVF3800 USB/ALSA readiness and capture typed host-control primitives
   - Derive conservative XVF3800 runtime facts such as direction confidence, overlap, mute state, and busy-state interruption hints
+  - Keep expensive XVF3800 host-control polling on an activity-aware schedule so idle Pi loops reuse recent signal snapshots instead of re-reading USB control state every tick
+  - Resolve one calm XVF3800 listening/mute-only indicator contract for future ring or LED feedback
   - Derive conservative XVF3800 non-speech and background-media suppression facts from bounded ambient capture
   - Persist and assess local on-device voice profiles
 out_of_scope:
@@ -37,10 +40,12 @@ files:
       - configured_pir_monitor
       - voice_profile_store_path
   - path: audio.py
-    role: Bounded microphone capture, ambient sampling, and playback helpers
+    role: Bounded microphone capture, readable-frame probing, ambient sampling, and playback helpers
     exports:
       - AmbientAudioCaptureWindow
       - AmbientAudioLevelSample
+      - AudioCaptureReadinessError
+      - AudioCaptureReadinessProbe
       - SpeechCaptureResult
       - SilenceDetectedRecorder
       - AmbientAudioSampler
@@ -49,7 +54,7 @@ files:
       - resolve_dynamic_pause_thresholds
       - resolve_pause_resume_confirmation
   - path: ai_camera.py
-    role: Hybrid IMX500 gate plus MediaPipe-backed health, motion, coarse-arm, and fine-hand adapter
+    role: Stable compatibility facade for the public local AI-camera adapter surface
     exports:
       - AICameraAdapterConfig
       - AICameraBodyPose
@@ -61,6 +66,8 @@ files:
       - AICameraObservation
       - AICameraZone
       - LocalAICameraAdapter
+  - path: camera_ai/
+    role: Internal SoC package for AI-camera contracts, IMX500 runtime, MediaPipe runtime, pose, motion, and gesture modules
   - path: ai_camera_diagnostics.py
     role: Bounded diagnostics for IMX500 pose candidate selection and keypoint support on the Pi
     exports:
@@ -69,10 +76,21 @@ files:
       - AICameraPoseSupportDiagnostic
       - capture_pose_probe
       - capture_pose_probe_sequence
+  - path: hand_landmarks.py
+    role: Bounded MediaPipe hand-landmark ROI worker for the Pi-side camera path
+    exports:
+      - DEFAULT_MEDIAPIPE_HAND_LANDMARKER_MODEL_URL
+      - HandLandmarkDetection
+      - HandLandmarkPoint
+      - HandLandmarkResult
+      - HandLandmarkWorkerConfig
+      - HandRoiSource
+      - MediaPipeHandLandmarkWorker
   - path: mediapipe_vision.py
-    role: Pi-side MediaPipe pose, temporal coarse-arm sequence classification, and fine-hand gesture bridge
+    role: Stable compatibility facade for the public MediaPipe camera pipeline surface
     exports:
       - DEFAULT_MEDIAPIPE_GESTURE_MODEL_URL
+      - DEFAULT_MEDIAPIPE_HAND_LANDMARKER_MODEL_URL
       - DEFAULT_MEDIAPIPE_POSE_MODEL_URL
       - MediaPipeVisionConfig
       - MediaPipeVisionPipeline
@@ -123,8 +141,11 @@ files:
       - DOA_VALUE_PARAMETER
       - GPO_READ_VALUES_PARAMETER
       - VERSION_PARAMETER
+      - ReSpeakerClaimMetadata
       - ReSpeakerDerivedSignalState
       - ReSpeakerCaptureDevice
+      - ReSpeakerIndicatorState
+      - ReSpeakerMemoryClass
       - ReSpeakerDirectionSnapshot
       - ReSpeakerLibusbTransport
       - ReSpeakerMuteSnapshot
@@ -135,15 +156,25 @@ files:
       - ReSpeakerProbeResult
       - ReSpeakerSignalProvider
       - ReSpeakerSignalSnapshot
+      - ReSpeakerSchedulingContext
       - ReSpeakerTransportAvailability
       - ReSpeakerUsbDevice
+      - ScheduledReSpeakerSignalProvider
+      - build_respeaker_claim_payloads
+      - build_respeaker_signal_claim_contract
       - capture_respeaker_primitive_snapshot
+      - claim_contract_to_payload
       - config_targets_respeaker
       - derive_respeaker_signal_state
       - probe_respeaker_xvf3800
       - read_default_respeaker_parameters
+      - resolve_respeaker_indicator_state
+  - path: respeaker/claim_contract.py
+    role: Build and serialize per-claim XVF3800 provenance/confidence metadata
   - path: respeaker/ambient_classification.py
     role: Conservative non-speech and background-media classification from bounded ambient capture plus XVF3800 speech facts
+  - path: respeaker/indicator_policy.py
+    role: Shared calm XVF3800 ring/indicator semantics for listening, mute, and unavailable states
   - path: respeaker/derived_signals.py
     role: Conservative XVF3800 signal interpretation helpers for direction, overlap, and busy-state interruption facts
   - path: respeaker/models.py
@@ -156,6 +187,8 @@ files:
     role: Typed XVF3800 primitive snapshot capture and interpretation
   - path: respeaker/signal_provider.py
     role: Runtime-facing XVF3800 signal adapter with recent-speech tracking
+  - path: respeaker/scheduled_provider.py
+    role: Activity-aware XVF3800 polling wrapper that caches heavy host-control snapshots between active refresh windows
   - path: respeaker/transport.py
     role: Dependency-light libusb host-control transport for XVF3800 reads
     exports:
@@ -205,6 +238,7 @@ tests:
   - path: test/test_button_helpers.py
   - path: test/test_camera.py
   - path: test/test_local_ai_camera_provider.py
+  - path: test/test_hand_landmarks.py
   - path: test/test_mediapipe_vision.py
   - path: test/test_pir.py
   - path: test/test_printer.py

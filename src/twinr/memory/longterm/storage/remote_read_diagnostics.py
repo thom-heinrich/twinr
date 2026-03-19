@@ -8,6 +8,7 @@ shared ops event stream without bloating the storage orchestration path.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
@@ -58,6 +59,31 @@ class LongTermRemoteWriteContext:
     uri_hint: str | None = None
     attempt_count: int | None = None
     request_item_count: int | None = None
+    request_correlation_id: str | None = None
+    batch_index: int | None = None
+    batch_count: int | None = None
+    request_bytes: int | None = None
+
+
+def extract_remote_write_context(exc: BaseException | None) -> dict[str, object] | None:
+    """Return normalized bulk-write correlation metadata attached to one exception."""
+
+    if exc is None:
+        return None
+    raw_context = getattr(exc, "remote_write_context", None)
+    if not isinstance(raw_context, Mapping):
+        return None
+    context = {
+        "snapshot_kind": _normalize_text(raw_context.get("snapshot_kind")),
+        "operation": _normalize_text(raw_context.get("operation")),
+        "request_correlation_id": _normalize_text(raw_context.get("request_correlation_id")),
+        "batch_index": _normalize_int(raw_context.get("batch_index")),
+        "batch_count": _normalize_int(raw_context.get("batch_count")),
+        "request_item_count": _normalize_int(raw_context.get("request_item_count")),
+        "request_bytes": _normalize_int(raw_context.get("request_bytes")),
+    }
+    normalized = {key: value for key, value in context.items() if value is not None}
+    return normalized or None
 
 
 def record_remote_read_diagnostic(
@@ -281,6 +307,10 @@ def _record_remote_request_diagnostic(
         "batch_size": _normalize_int(getattr(context, "batch_size", None)),
         "attempt_count": _normalize_int(getattr(context, "attempt_count", None)),
         "request_item_count": _normalize_int(getattr(context, "request_item_count", None)),
+        "request_correlation_id": _normalize_text(getattr(context, "request_correlation_id", None)),
+        "batch_index": _normalize_int(getattr(context, "batch_index", None)),
+        "batch_count": _normalize_int(getattr(context, "batch_count", None)),
+        "request_bytes": _normalize_int(getattr(context, "request_bytes", None)),
         "query_sha256": _query_sha256(getattr(context, "query_text", None)),
         "query_term_count": _query_term_count(getattr(context, "query_text", None)),
         "query_chars": len(str(getattr(context, "query_text", None) or "")),
@@ -319,6 +349,13 @@ def _record_remote_request_diagnostic(
         f"Remote long-term {data['snapshot_kind'] or 'unknown'} {data['operation'] or normalized_request_kind} "
         f"{action} ({classification})."
     )
+    request_correlation_id = data.get("request_correlation_id")
+    batch_index = data.get("batch_index")
+    batch_count = data.get("batch_count")
+    if isinstance(request_correlation_id, str) and request_correlation_id:
+        message = f"{message[:-1]} request_id={request_correlation_id}."
+    if isinstance(batch_index, int) and isinstance(batch_count, int) and batch_count > 0:
+        message = f"{message[:-1]} batch={batch_index}/{batch_count}."
     try:
         store.append(
             event=event_name,

@@ -62,6 +62,15 @@ Today Twinr already carries these raw or fused states in the proactive path:
 - weighted trigger candidates such as `person_returned`, `attention_window`, `showing_intent`, `slumped_quiet`, `possible_fall`, and `floor_stillness`
 - optional OpenAI frame-buffer review before image-driven proactive prompts
 
+Twinr now also uses explicit runtime contract surfaces around these signals:
+
+- `ambiguous_room_guard`
+  - fail-closed gate for person-targeted inference when room context is missing, multi-person, noisy, or direction-ambiguous
+- `known_user_hint`
+  - conservative voice-profile-plus-room-context hint for calm personalization only, never identity proof
+- `affect_proxy`
+  - prompt-only coarse cue such as `positive_contact`, `low_engagement`, or `concern_cue`, never emotion fact
+
 That is a good baseline. The next step is to separate what is already good enough from what needs better local models.
 
 ## Maximal Derivable States With Current Sensors

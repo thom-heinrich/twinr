@@ -16,9 +16,12 @@ dependencies = [
     "munkres>=1.1,<2; platform_machine == 'aarch64'",
     "numpy>=1.26,<2",
     "onnxruntime>=1.22,<1.23; platform_machine == 'aarch64'",
+    "opencv-contrib-python>=4.10,<5; platform_machine == 'aarch64'",
     "openwakeword>=0.6,<0.7",
     "openai>=2.26.0,<3",
     "pillow>=10,<12",
+    "PyQt5>=5.15,<6",
+    "Send2Trash>=1.8.3,<2",
     "uvicorn>=0.32,<1",
     "websockets>=13,<16",
 ]
@@ -35,6 +38,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 twinr = [
+    "channels/whatsapp/worker/*.json",
+    "channels/whatsapp/worker/*.mjs",
     "web/static/*.css",
     "web/templates/*.html",
 ]

@@ -98,6 +98,37 @@ class _AlwaysFailRemoteService:
         self.shutdown_calls += 1
 
 
+class _CorrelatedFailRemoteService:
+    def remote_required(self) -> bool:
+        return True
+
+    def remote_status(self):
+        return SimpleNamespace(mode="remote_primary", ready=True, detail=None)
+
+    def ensure_remote_ready(self) -> None:
+        exc = LongTermRemoteUnavailableError(
+            "Failed to persist fine-grained remote long-term memory items "
+            "(request_id=ltw-test123, batch=1/1, items=51, bytes=518642)."
+        )
+        setattr(
+            exc,
+            "remote_write_context",
+            {
+                "snapshot_kind": "objects",
+                "operation": "store_records_bulk",
+                "request_correlation_id": "ltw-test123",
+                "batch_index": 1,
+                "batch_count": 1,
+                "request_item_count": 51,
+                "request_bytes": 518642,
+            },
+        )
+        raise exc
+
+    def shutdown(self, *, timeout_s: float = 2.0) -> None:
+        del timeout_s
+
+
 class _ShallowFailThenRecoverRemoteService:
     def __init__(self) -> None:
         self.status_calls = 0
@@ -457,6 +488,36 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         warm_result = snapshot.current.probe["steps"][0]["warm_result"]
         self.assertEqual(warm_result["failed_snapshot_kind"], "prompt_memory")
         self.assertEqual(warm_result["checks"][0]["attempts"][0]["status_code"], 503)
+
+    def test_probe_once_carries_remote_write_context_into_sample_and_transition_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            event_store = TwinrOpsEventStore.from_config(config)
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_CorrelatedFailRemoteService,
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=event_store,
+                emit=lambda _line: None,
+            )
+
+            snapshot = watchdog.probe_once()
+            events = event_store.tail(limit=5)
+
+        self.assertEqual(snapshot.current.status, "fail")
+        self.assertIsNotNone(snapshot.current.probe)
+        assert snapshot.current.probe is not None
+        remote_write_context = snapshot.current.probe["remote_write_context"]
+        self.assertEqual(remote_write_context["request_correlation_id"], "ltw-test123")
+        transition_event = next(event for event in events if event["event"] == "remote_memory_watchdog_status_changed")
+        transition_data = dict(transition_event["data"])
+        self.assertEqual(transition_data["remote_write_context"]["request_correlation_id"], "ltw-test123")
 
 
 if __name__ == "__main__":

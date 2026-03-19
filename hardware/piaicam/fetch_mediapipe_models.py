@@ -5,8 +5,9 @@
 """Download the official MediaPipe task models needed by Twinr's Pi camera path.
 
 This helper is intentionally separate from the runtime. It fetches the official
-pose and built-in gesture task bundles into a bounded local directory so the
-runtime does not perform hidden downloads during normal camera inference.
+pose, hand-landmarker, and built-in gesture task bundles into a bounded local
+directory so the runtime does not perform hidden downloads during normal camera
+inference.
 
 Purpose
 -------
@@ -45,6 +46,9 @@ DEFAULT_TIMEOUT_S = 60.0
 POSE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task"
 )
+HAND_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+)
 GESTURE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"
 )
@@ -64,6 +68,11 @@ MODEL_SPECS = (
         name="pose_landmarker_full",
         url=POSE_MODEL_URL,
         filename="pose_landmarker_full.task",
+    ),
+    DownloadSpec(
+        name="hand_landmarker",
+        url=HAND_LANDMARKER_MODEL_URL,
+        filename="hand_landmarker.task",
     ),
     DownloadSpec(
         name="gesture_recognizer",

@@ -22,6 +22,30 @@
   </div>
 </section>
 
+<section class="panel">
+  <div class="section-header">
+    <div>
+      <h2>{{ whatsapp_summary.title }}</h2>
+      <p class="section-description">{{ whatsapp_summary.detail }}</p>
+    </div>
+    <span class="status-pill is-{{ whatsapp_summary.status }}">{{ whatsapp_summary.status_label }}</span>
+  </div>
+  <div class="check-list">
+    {% for item in whatsapp_summary.checks %}
+    <article class="check-row">
+      <div class="check-row-main">
+        <div class="check-row-title">{{ item.label }}</div>
+        <div class="check-row-detail">{{ item.detail }}</div>
+      </div>
+      <span class="status-pill is-{{ item.status }}">{{ item.summary }}</span>
+    </article>
+    {% endfor %}
+  </div>
+  <div class="link-row">
+    <a class="link-button" href="{{ whatsapp_summary.action_href }}">{{ whatsapp_summary.action_label }}</a>
+  </div>
+</section>
+
 <section class="panel two-column">
   <div>
     <h2>Storage</h2>
@@ -33,6 +57,7 @@
   <div>
     <h2>Scope</h2>
     <ul class="plain-list">
+      <li><strong>WhatsApp</strong> One guided self-chat wizard with QR pairing, one allowed number, and groups blocked</li>
       <li><strong>Email</strong> IMAP/SMTP setup, Gmail-friendly, approval-first</li>
       <li><strong>Calendar</strong> Read-only ICS feed setup for agenda views</li>
     </ul>

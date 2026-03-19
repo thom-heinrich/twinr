@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% from "_form_fields.html" import render_setting_field %}
+
+{% block content %}
+<section class="panel wizard-hero">
+  <div class="section-header">
+    <div>
+      <div class="wizard-kicker">Connect / WhatsApp</div>
+      <h2>WhatsApp self-chat wizard</h2>
+      <p class="section-description">{{ overall_detail }}</p>
+    </div>
+    <span class="status-pill is-{{ overall_status }}">{{ overall_status_label }}</span>
+  </div>
+
+  <div class="detail-grid">
+    {% for metric in summary_metrics %}
+    <article class="detail-card">
+      <div class="detail-label">{{ metric.label }}</div>
+      <div class="detail-body">{{ metric.value }}</div>
+      <div class="field-help">{{ metric.detail }}</div>
+    </article>
+    {% endfor %}
+  </div>
+
+  <div class="wizard-step-strip">
+    {% for step in steps %}
+    <a class="wizard-step-chip {% if step.current %}current{% endif %}" href="/connect/whatsapp?step={{ step.key }}">
+      <span class="wizard-step-chip-index">Step {{ step.index }}</span>
+      <span class="wizard-step-chip-title">{{ step.title }}</span>
+      <span class="status-pill is-{{ step.status }}">{{ step.status_label }}</span>
+    </a>
+    {% endfor %}
+  </div>
+
+  <div class="link-row">
+    <a class="inline-link" href="/connect">Back to Connect</a>
+  </div>
+</section>
+
+{% for step in steps %}
+<section id="step-{{ step.key }}" class="panel wizard-step-panel{% if step.current %} wizard-step-panel-current{% endif %}">
+  <div class="section-header">
+    <div>
+      <div class="wizard-step-label">Step {{ step.index }}</div>
+      <h2>{{ step.title }}</h2>
+      <p class="section-description">{{ step.description }}</p>
+    </div>
+    <span class="status-pill is-{{ step.status }}">{{ step.status_label }}</span>
+  </div>
+
+  {% if step.detail %}
+  <p class="wizard-step-detail">{{ step.detail }}</p>
+  {% endif %}
+
+  {% if step.action %}
+  <form method="post" action="/connect/whatsapp" class="stack">
+    <input type="hidden" name="_action" value="{{ step.action }}">
+    {% if step.fields %}
+    <div class="form-grid">
+      {% for field in step.fields %}
+      {{ render_setting_field(field) }}
+      {% endfor %}
+    </div>
+    {% endif %}
+    <div class="actions actions-start wizard-actions">
+      <button type="submit"{% if not step.action_enabled %} disabled{% endif %}>{{ step.action_label }}</button>
+    </div>
+  {% if step.action_hint %}
+  <div class="field-help">{{ step.action_hint }}</div>
+  {% endif %}
+  </form>
+  {% endif %}
+
+  {% if step.media_src %}
+  <div class="panel-subsection panel-subsection-spaced">
+    <h3 class="subsection-title">{{ step.media_title or "Scan code" }}</h3>
+    <div class="wizard-qr-frame">
+      <img class="wizard-qr-image" src="{{ step.media_src }}" alt="{{ step.media_alt or 'QR code' }}">
+    </div>
+    {% if step.media_detail %}
+    <div class="field-help">{{ step.media_detail }}</div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if step.code_block %}
+  <div class="panel-subsection panel-subsection-spaced">
+    <h3 class="subsection-title">{{ step.code_title or "Run this on the Pi" }}</h3>
+    <pre class="log-data wizard-command">{{ step.code_block }}</pre>
+  </div>
+  {% endif %}
+
+  {% if step.checks %}
+  <div class="panel-subsection{% if step.fields or step.code_block %} panel-subsection-spaced{% endif %}">
+    <h3 class="subsection-title">Current status</h3>
+    <div class="check-list">
+      {% for item in step.checks %}
+      <article class="check-row">
+        <div class="check-row-main">
+          <div class="check-row-title">{{ item.label }}</div>
+          <div class="check-row-detail">{{ item.detail }}</div>
+        </div>
+        <span class="status-pill is-{{ item.status }}">{{ item.summary }}</span>
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+</section>
+{% endfor %}
+{% endblock %}

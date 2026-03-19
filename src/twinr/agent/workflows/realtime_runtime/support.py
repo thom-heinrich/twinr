@@ -17,6 +17,7 @@ from typing import Callable
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.conversation.closure import ToolCallingConversationClosureEvaluator
 from twinr.agent.base_agent.conversation.turn_controller import ToolCallingTurnDecisionEvaluator
+from twinr.memory.longterm.storage.remote_read_diagnostics import extract_remote_write_context
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.agent.workflows.forensics import WorkflowForensics
 from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
@@ -285,6 +286,7 @@ class TwinrRealtimeSupportMixin:
         message = self._safe_error_text(exc) if isinstance(exc, BaseException) else str(exc or "").strip()
         if not message:
             message = "Required remote long-term memory is unavailable."
+        remote_write_context = extract_remote_write_context(exc) if isinstance(exc, BaseException) else None
         self._trace_event(
             "required_remote_error_entered",
             kind="invariant",
@@ -292,6 +294,7 @@ class TwinrRealtimeSupportMixin:
             details={
                 "message": message,
                 "runtime_status": getattr(getattr(self.runtime, "status", None), "value", "unknown"),
+                "remote_write_context": remote_write_context,
             },
         )
         active = bool(getattr(self, "_required_remote_dependency_error_active", False))
@@ -317,6 +320,10 @@ class TwinrRealtimeSupportMixin:
         self.runtime.fail(message)
         self._emit_status(force=True)
         self._try_emit(f"error={message}")
+        if isinstance(remote_write_context, dict):
+            request_correlation_id = remote_write_context.get("request_correlation_id")
+            if isinstance(request_correlation_id, str) and request_correlation_id:
+                self._try_emit(f"required_remote_correlation_id={request_correlation_id}")
         self._try_emit("required_remote_dependency=false")
         return True
 
@@ -418,7 +425,12 @@ class TwinrRealtimeSupportMixin:
                     "required_remote_refresh_failed",
                     kind="exception",
                     level="ERROR",
-                    details={"force": force, "force_sync": force_sync, "exception": self._safe_error_text(exc)},
+                    details={
+                        "force": force,
+                        "force_sync": force_sync,
+                        "exception": self._safe_error_text(exc),
+                        "remote_write_context": extract_remote_write_context(exc),
+                    },
                     kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
                 )
                 self._enter_required_remote_error(exc)

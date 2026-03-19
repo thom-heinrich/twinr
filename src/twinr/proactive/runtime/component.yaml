@@ -8,11 +8,21 @@ owned_concerns:
   - Maintain wakeword presence-session state from camera, PIR, and speech activity
   - Derive conservative ReSpeaker policy hooks such as quiet windows, resume windows, and overlap guards
   - Derive conservative ReSpeaker speech-delivery defer reasons for display-first proactive routing
+  - Enforce a hard XVF3800 startup/runtime contract so DFU/safe mode and unreadable enumerated capture block proactive voice monitoring clearly
+  - Package current ReSpeaker presence/audio facts into explicit governor-facing input bundles
+  - Fuse the primary camera anchor with ReSpeaker direction confidence into a conservative speaker-association fact
+  - Derive a bounded multimodal initiative state that later proactive behavior can use for display-first or skip decisions
+  - Derive an explicit ambiguous-room guard before any person-targeted runtime inference proceeds
+  - Derive a conservative known-user hint from fresh voice-profile state plus clear room context
+  - Derive prompt-only affect proxies from coarse posture, attention, quiet, and motion cues without claiming emotion as fact
+  - Block sensitive proactive behavior when current ReSpeaker plus camera context is ambiguous
   - Coordinate proactive monitor ticks across vision, PIR, ambient audio, and wakeword policy paths
   - Export normalized observation facts and ops telemetry from runtime monitoring
-  - Wrap targeted ReSpeaker XVF3800 audio paths with direct signal facts and startup degradation warnings
+  - Export structured ReSpeaker audio-policy facts plus presence-session metadata for bounded automation and long-term memory ingestion
+  - Wrap targeted ReSpeaker XVF3800 audio paths with direct signal facts plus readable-frame startup/runtime blocking when capture dies
+  - Schedule heavy XVF3800 host-control polling more slowly than the cheap ambient-audio path when the room is idle
   - Keep bounded ReSpeaker audio observation active during `answering` so interruption facts remain observable
-  - Emit explicit operator-readable ReSpeaker runtime alerts for DFU, disconnect, and recovery transitions
+  - Emit explicit operator-readable ReSpeaker runtime alerts for DFU, disconnect, unreadable capture, and recovery transitions
   - Open and close monitor resources and the bounded worker thread safely
 out_of_scope:
   - Social trigger scoring thresholds, evidence rules, or prompt content
@@ -27,13 +37,65 @@ files:
       - PresenceSessionSnapshot
       - ProactiveCoordinator
       - ProactiveMonitorService
+      - ReSpeakerMultimodalInitiativeSnapshot
+      - ReSpeakerSpeakerAssociationSnapshot
+      - ReSpeakerSensitiveBehaviorGateDecision
       - build_default_proactive_monitor
+      - derive_respeaker_multimodal_initiative
+      - derive_respeaker_speaker_association
+      - evaluate_respeaker_sensitive_behavior_gate
   - path: audio_policy.py
     role: Conservative ReSpeaker policy-hook, speech-defer, and runtime alert mapping
     exports:
       - ReSpeakerAudioPolicySnapshot
       - ReSpeakerAudioPolicyTracker
       - describe_respeaker_runtime_alert
+  - path: claim_metadata.py
+    role: Shared `confidence` / `source` / `requires_confirmation` helpers for multimodal runtime claims
+    exports:
+      - RuntimeClaimMetadata
+  - path: ambiguous_room_guard.py
+    role: Fail-closed room-ambiguity guard for person-targeted runtime inferences
+    exports:
+      - AmbiguousRoomGuardSnapshot
+      - derive_ambiguous_room_guard
+  - path: known_user_hint.py
+    role: Conservative known-user hint from voice-profile state plus clear room context
+    exports:
+      - KnownUserHintSnapshot
+      - derive_known_user_hint
+  - path: affect_proxy.py
+    role: Prompt-only affect proxy surface from coarse posture, attention, and quiet cues
+    exports:
+      - AffectProxySnapshot
+      - derive_affect_proxy
+  - path: runtime_contract.py
+    role: Hard startup-blocker contract for XVF3800 DFU/safe-mode states
+    exports:
+      - ReSpeakerRuntimeContractError
+      - ReSpeakerStartupContractAssessment
+      - assess_respeaker_monitor_startup_contract
+      - is_respeaker_runtime_hard_block
+  - path: governor_inputs.py
+    role: Focused packaging of current ReSpeaker presence/audio facts for proactive governor callers
+    exports:
+      - ReSpeakerGovernorInputs
+      - build_respeaker_governor_inputs
+  - path: multimodal_initiative.py
+    role: Conservative multimodal initiative readiness and display-first recommendation from camera and ReSpeaker facts
+    exports:
+      - ReSpeakerMultimodalInitiativeSnapshot
+      - derive_respeaker_multimodal_initiative
+  - path: sensitive_behavior_gate.py
+    role: Conservative gate for blocking sensitive proactive behavior on ambiguous multi-person or low-confidence audio context
+    exports:
+      - ReSpeakerSensitiveBehaviorGateDecision
+      - evaluate_respeaker_sensitive_behavior_gate
+  - path: speaker_association.py
+    role: Conservative association of current speech to the single primary visible person anchor
+    exports:
+      - ReSpeakerSpeakerAssociationSnapshot
+      - derive_respeaker_speaker_association
   - path: presence.py
     role: Wakeword presence-session controller and snapshot model
     exports:
@@ -53,7 +115,13 @@ public_api:
     - PresenceSessionSnapshot
     - ProactiveCoordinator
     - ProactiveMonitorService
+    - ReSpeakerMultimodalInitiativeSnapshot
+    - ReSpeakerSpeakerAssociationSnapshot
+    - ReSpeakerSensitiveBehaviorGateDecision
     - build_default_proactive_monitor
+    - derive_respeaker_multimodal_initiative
+    - derive_respeaker_speaker_association
+    - evaluate_respeaker_sensitive_behavior_gate
 compatibility_reexports:
   - path: src/twinr/proactive/__init__.py
     names:
@@ -61,7 +129,13 @@ compatibility_reexports:
       - PresenceSessionSnapshot
       - ProactiveCoordinator
       - ProactiveMonitorService
+      - ReSpeakerMultimodalInitiativeSnapshot
+      - ReSpeakerSpeakerAssociationSnapshot
+      - ReSpeakerSensitiveBehaviorGateDecision
       - build_default_proactive_monitor
+      - derive_respeaker_multimodal_initiative
+      - derive_respeaker_speaker_association
+      - evaluate_respeaker_sensitive_behavior_gate
 primary_callers:
   - path: src/twinr/agent/legacy/classic_hardware_loop.py
   - path: src/twinr/agent/workflows/realtime_runner.py
@@ -69,6 +143,11 @@ primary_callers:
   - path: src/twinr/proactive/__init__.py
 tests:
   - path: test/test_proactive_monitor.py
+  - path: test/test_governor_inputs.py
+  - path: test/test_multimodal_initiative.py
+  - path: test/test_runtime_claims.py
+  - path: test/test_respeaker_sensitive_behavior_gate.py
+  - path: test/test_respeaker_scheduled_provider.py
   - path: test/test_runner.py
   - path: test/test_realtime_runner.py
   - path: test/test_config.py

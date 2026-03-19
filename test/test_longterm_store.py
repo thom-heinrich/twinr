@@ -402,6 +402,24 @@ class _CorruptingRewriteChonkyClient(_LiveShapeChonkyClient):
         return {"items": response_items}
 
 
+class _ExistingItemFetchFailingChonkyClient(_LiveShapeChonkyClient):
+    def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
+        record = None
+        if isinstance(document_id, str) and document_id:
+            record = self.records_by_document_id.get(document_id)
+        if record is None and isinstance(origin_uri, str) and origin_uri:
+            record = self.records_by_uri.get(origin_uri)
+        payload = dict(record.get("payload") or {}) if isinstance(record, dict) else {}
+        if payload.get("schema") == "twinr_memory_object_record_v2":
+            raise TimeoutError("item readback timed out")
+        return super().fetch_full_document(
+            document_id=document_id,
+            origin_uri=origin_uri,
+            include_content=include_content,
+            max_content_chars=max_content_chars,
+        )
+
+
 class _TermOverlapChonkyClient(_FakeChonkyClient):
     def retrieve(self, request):
         payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
@@ -1154,6 +1172,100 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(data["write_timeout_s"], 15.0)
         self.assertEqual(data["error_type"], "ChonkyDBError")
         self.assertEqual(data["root_cause_type"], "gaierror")
+        self.assertTrue(data["request_correlation_id"])
+        self.assertEqual(data["batch_index"], 1)
+        self.assertEqual(data["batch_count"], 1)
+        self.assertGreater(data["request_bytes"], 0)
+
+    def test_write_snapshot_bulk_failure_preserves_elapsed_latency_and_correlation_context(self) -> None:
+        class _DelayedBulkWriteFailingClient(_FakeChonkyClient):
+            def store_records_bulk(self, request):
+                del request
+                time.sleep(0.02)
+                try:
+                    raise TimeoutError("write timed out")
+                except TimeoutError as inner:
+                    raise ChonkyDBError(
+                        "ChonkyDB request failed for POST /v1/external/records/bulk: timed out"
+                    ) from inner
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.project_root = str(project_root)
+            remote_state.config.long_term_memory_remote_write_timeout_s = 15.0
+            failing_client = _DelayedBulkWriteFailingClient()
+            remote_state.client = failing_client
+            remote_state.read_client = failing_client
+            remote_state.write_client = failing_client
+            store = LongTermStructuredStore(
+                base_path=project_root / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            object_fact = LongTermMemoryObjectV1(
+                memory_id="fact:jam_preference_old",
+                kind="fact",
+                summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                source=_source(),
+                status="active",
+                confidence=0.94,
+                slot_key="preference:breakfast:jam",
+                value_key="strawberry",
+            )
+
+            with self.assertRaises(LongTermRemoteUnavailableError) as raised:
+                store.write_snapshot(objects=(object_fact,), conflicts=(), archived_objects=())
+
+            events = TwinrOpsEventStore.from_project_root(project_root).tail(limit=5)
+
+        self.assertTrue(events)
+        last_event = events[-1]
+        data = dict(last_event["data"])
+        self.assertGreaterEqual(float(data["latency_ms"]), 15.0)
+        self.assertTrue(data["request_correlation_id"])
+        self.assertEqual(data["batch_index"], 1)
+        self.assertEqual(data["batch_count"], 1)
+        self.assertGreater(data["request_bytes"], 0)
+        raised_context = getattr(raised.exception, "remote_write_context", None)
+        self.assertIsInstance(raised_context, dict)
+        assert isinstance(raised_context, dict)
+        self.assertEqual(raised_context["request_correlation_id"], data["request_correlation_id"])
+        self.assertIn(data["request_correlation_id"], str(raised.exception))
+
+    def test_remote_primary_store_reuses_unchanged_documents_without_item_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.project_root = str(project_root)
+            remote_state.client = _ExistingItemFetchFailingChonkyClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=project_root / "state" / "chonkydb", remote_state=remote_state)
+            objects = (
+                LongTermMemoryObjectV1(
+                    memory_id="fact:jam_preference",
+                    kind="fact",
+                    summary="Du magst Aprikosenmarmelade.",
+                    source=_source(),
+                    status="active",
+                    confidence=0.95,
+                    slot_key="preference:breakfast:jam",
+                    value_key="apricot",
+                ),
+            )
+
+            store.write_snapshot(objects=objects, conflicts=(), archived_objects=())
+            first_record_count = _count_remote_records_with_schema(remote_state.client, "twinr_memory_object_record_v2")
+
+            store.write_snapshot(objects=objects, conflicts=(), archived_objects=())
+            second_record_count = _count_remote_records_with_schema(remote_state.client, "twinr_memory_object_record_v2")
+            events = TwinrOpsEventStore.from_project_root(project_root).tail(limit=5)
+
+        self.assertEqual(first_record_count, 1)
+        self.assertEqual(second_record_count, 1)
+        self.assertFalse(any(event.get("event") == "longterm_remote_read_failed" for event in events))
 
     def test_ensure_remote_snapshots_seeds_empty_remote_documents(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

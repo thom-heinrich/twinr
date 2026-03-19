@@ -268,6 +268,10 @@ class ReSpeakerProbeTests(unittest.TestCase):
         self.assertEqual(snapshot.direction.beam_azimuth_degrees, (0.0, 90.0, 180.0, 270.0))
         self.assertEqual(snapshot.direction.beam_speech_energies, (0.25, 0.5, 0.0, 0.75))
         self.assertEqual(snapshot.direction.selected_azimuth_degrees, (45.0, None))
+        self.assertEqual(
+            snapshot.raw_reads["AUDIO_MGR_SELECTED_AZIMUTHS"].decoded_value,
+            (math.pi / 4.0, None),
+        )
         self.assertEqual(snapshot.mute.gpo_logic_levels, (0, 0, 0, 1, 0))
         self.assertFalse(snapshot.mute.mute_active)
 
@@ -420,6 +424,10 @@ class ReSpeakerProbeTests(unittest.TestCase):
 
         self.assertEqual(first.recent_speech_age_s, 0.0)
         self.assertEqual(first.azimuth_deg, 277)
+        self.assertIn("speech_detected", first.claim_contract)
+        self.assertEqual(first.claim_contract["speech_detected"].source, "respeaker_xvf3800")
+        self.assertGreater(first.claim_contract["speech_detected"].confidence, 0.7)
+        self.assertIn("azimuth_deg", first.claim_contract)
         self.assertEqual(second.recent_speech_age_s, 3.25)
         self.assertTrue(second.room_quiet)
         self.assertEqual(second.azimuth_deg, 15)
@@ -517,8 +525,10 @@ class ReSpeakerProbeTests(unittest.TestCase):
 
         self.assertFalse(snapshot.host_control_ready)
         self.assertEqual(snapshot.device_runtime_mode, "signal_provider_error")
-        self.assertEqual(snapshot.transport_reason, "signal_provider_error:RuntimeError")
+        self.assertEqual(snapshot.transport_reason, "signal_provider_error")
+        self.assertNotIn("RuntimeError", snapshot.transport_reason)
         self.assertIsNone(snapshot.speech_detected)
+        self.assertEqual(dict(snapshot.claim_contract), {})
 
 
 if __name__ == "__main__":

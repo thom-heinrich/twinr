@@ -8,7 +8,7 @@ owned_concerns:
   - Expose the lazy `twinr` import surface for runtime config, status, and on-device memory compatibility.
   - Bootstrap `python -m twinr` and the installed `twinr` script, then dispatch into focused subsystem packages.
   - Host small shared utility modules for text normalization, local date parsing, and structured JSON response handling.
-  - Define the package boundary around the agent, memory, providers, hardware, display, web, proactive, orchestrator, ops, automations, and integrations subsystems.
+  - Define the package boundary around the agent, channels, memory, providers, hardware, display, web, proactive, orchestrator, ops, automations, and integrations subsystems.
 out_of_scope:
   - Deep runtime, provider, memory, hardware, or web behavior that belongs in a documented child package under `src/twinr/*`
   - Raspberry Pi bootstrap and OS setup scripts in `hardware/`
@@ -46,6 +46,8 @@ files:
 subpackages:
   - path: agent
     role: Core runtime, tools, workflows, and self-coding packages
+  - path: channels
+    role: External text-channel contracts and transport listeners
   - path: automations
     role: Automation scheduling and sensor-trigger helpers
   - path: display

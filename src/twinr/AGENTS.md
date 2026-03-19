@@ -10,6 +10,7 @@ subsystems. Structural ownership and entrypoints live in
 
 Out of scope:
 - deep runtime, tool, and workflow behavior in `src/twinr/agent`
+- long-lived external messaging transport behavior in `src/twinr/channels`
 - provider implementations in `src/twinr/providers`
 - hardware adapters in `src/twinr/hardware`
 - memory internals in `src/twinr/memory`
@@ -55,6 +56,7 @@ PYTHONPATH=src pytest test/test_llm_json.py test/test_temporal.py -q
 ## Coupling
 
 `__main__.py` changes → also check:
+- `src/twinr/channels/`
 - `src/twinr/agent/workflows/`
 - `src/twinr/ops/`
 - `src/twinr/providers/`

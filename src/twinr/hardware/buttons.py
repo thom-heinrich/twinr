@@ -41,6 +41,7 @@ _CLI_READ_TIMEOUT_S = 2.0
 _SAMPLE_INTERVAL_S = 0.01
 
 _LOGGER = logging.getLogger(__name__)
+_GPIOGET_CLI_SPECS: dict[str, "_GpiogetCliSpec"] = {}
 
 
 class ButtonAction(StrEnum):
@@ -72,6 +73,14 @@ class ButtonEvent:
     action: ButtonAction
     raw_edge: str
     timestamp_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GpiogetCliSpec:
+    """Describe which named flags one installed ``gpioget`` binary supports."""
+
+    supports_chip_option: bool = True
+    supports_numeric_option: bool = True
 
 
 def _require_gpiod():
@@ -245,6 +254,77 @@ def _cli_bias_arg(bias: str) -> str | None:
     if normalized == "as-is":
         return None
     return normalized
+
+
+def _detect_gpioget_cli_spec(gpioget_path: str) -> _GpiogetCliSpec:
+    """Probe and cache the supported ``gpioget`` CLI shape for one binary path."""
+
+    cached = _GPIOGET_CLI_SPECS.get(gpioget_path)
+    if cached is not None:
+        return cached
+
+    spec = _GpiogetCliSpec()
+    try:
+        completed = subprocess.run(
+            [gpioget_path, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=_CLI_READ_TIMEOUT_S,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        # If help probing is unavailable, keep the newer CLI as the initial guess
+        # and let the execution path fall back when the binary rejects named flags.
+        pass
+    else:
+        help_text = " ".join(
+            part
+            for part in (completed.stdout, completed.stderr)
+            if isinstance(part, str) and part.strip()
+        )
+        spec = _GpiogetCliSpec(
+            supports_chip_option="--chip" in help_text,
+            supports_numeric_option="--numeric" in help_text,
+        )
+
+    _GPIOGET_CLI_SPECS[gpioget_path] = spec
+    return spec
+
+
+def _build_gpioget_command(
+    gpioget_path: str,
+    *,
+    chip_name: str,
+    bindings: tuple[ButtonBinding, ...],
+    bias: str,
+) -> list[str]:
+    """Build the correct ``gpioget`` invocation for the detected CLI generation."""
+
+    cli_spec = _detect_gpioget_cli_spec(gpioget_path)
+    command = [gpioget_path]
+    cli_bias = _cli_bias_arg(bias)
+    if cli_bias is not None:
+        command.append(f"--bias={cli_bias}")
+
+    if cli_spec.supports_chip_option:
+        command.extend(["--chip", chip_name])
+    else:
+        command.append(chip_name)
+
+    if cli_spec.supports_numeric_option:
+        command.append("--numeric")
+
+    command.extend(str(binding.line_offset) for binding in bindings)
+    return command
+
+
+def _gpioget_rejected_named_options(command: list[str], exc: subprocess.CalledProcessError) -> bool:
+    """Return whether ``gpioget`` explicitly rejected the newer named-option CLI."""
+
+    if "--chip" not in command and "--numeric" not in command:
+        return False
+    stderr = exc.stderr.strip().lower() if isinstance(exc.stderr, str) else ""
+    return "unrecognized option" in stderr and ("--chip" in stderr or "--numeric" in stderr)
 
 
 def edge_name(event_type: object) -> str:
@@ -758,19 +838,15 @@ class GpioButtonMonitor:
 
     def _read_cli_values(self) -> dict[int, int]:
         gpioget_path = self._resolve_cli_tool("gpioget")
-        command = [
+        command = _build_gpioget_command(
             gpioget_path,
-            "--chip",
-            self.chip_name,
-            "--numeric",
-            *(str(binding.line_offset) for binding in self.bindings),
-        ]
+            chip_name=self.chip_name,
+            bindings=self.bindings,
+            bias=self.bias,
+        )
 
-        cli_bias = _cli_bias_arg(self.bias)
-        if cli_bias is not None:
-            command.insert(1, f"--bias={cli_bias}")
-
-        # AUDIT-FIX(#2): Use the documented gpioget flags for chip-scoped offset reads and numeric output parsing.
+        # AUDIT-FIX(#2): Probe and cache the installed gpioget CLI shape so both
+        # legacy libgpiod v1 positional syntax and newer named-option syntax stay supported.
         # AUDIT-FIX(#7): Bound CLI reads with a timeout and capture stderr so transient GPIO/tool issues do not hang the monitor forever.
         try:
             completed = subprocess.run(
@@ -780,12 +856,38 @@ class GpioButtonMonitor:
                 timeout=_CLI_READ_TIMEOUT_S,
                 check=True,
             )
+        except subprocess.CalledProcessError as exc:
+            if _gpioget_rejected_named_options(command, exc):
+                _GPIOGET_CLI_SPECS[gpioget_path] = _GpiogetCliSpec(
+                    supports_chip_option=False,
+                    supports_numeric_option=False,
+                )
+                command = _build_gpioget_command(
+                    gpioget_path,
+                    chip_name=self.chip_name,
+                    bindings=self.bindings,
+                    bias=self.bias,
+                )
+                try:
+                    completed = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=_CLI_READ_TIMEOUT_S,
+                        check=True,
+                    )
+                except subprocess.CalledProcessError as retry_exc:
+                    stderr = retry_exc.stderr.strip() if isinstance(retry_exc.stderr, str) else ""
+                    detail = f": {stderr}" if stderr else ""
+                    raise RuntimeError(
+                        f"gpioget failed with exit code {retry_exc.returncode}{detail}"
+                    ) from retry_exc
+            else:
+                stderr = exc.stderr.strip() if isinstance(exc.stderr, str) else ""
+                detail = f": {stderr}" if stderr else ""
+                raise RuntimeError(f"gpioget failed with exit code {exc.returncode}{detail}") from exc
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("Timed out while reading GPIO values via gpioget") from exc
-        except subprocess.CalledProcessError as exc:
-            stderr = exc.stderr.strip() if isinstance(exc.stderr, str) else ""
-            detail = f": {stderr}" if stderr else ""
-            raise RuntimeError(f"gpioget failed with exit code {exc.returncode}{detail}") from exc
         except OSError as exc:
             raise RuntimeError("Unable to execute gpioget for GPIO button monitoring") from exc
         output = completed.stdout.strip()

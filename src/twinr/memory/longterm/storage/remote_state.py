@@ -197,6 +197,39 @@ def _extract_store_document_id(result: Mapping[str, object] | None) -> str | Non
     return None
 
 
+def _store_result_failure_detail(result: Mapping[str, object] | None) -> str | None:
+    """Summarize item-level ChonkyDB store failures from an otherwise 200 response."""
+
+    if not isinstance(result, Mapping):
+        return None
+    failures: list[str] = []
+    items = result.get("items")
+    if isinstance(items, list):
+        for index, item in enumerate(items):
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("success") is False:
+                error_type = _normalize_text(item.get("error_type"))
+                error_text = _normalize_text(item.get("error"))
+                if error_type and error_text:
+                    failures.append(f"item[{index}] {error_type}: {error_text}")
+                elif error_text:
+                    failures.append(f"item[{index}] {error_text}")
+                else:
+                    failures.append(f"item[{index}] rejected")
+    if failures:
+        return "; ".join(failures)
+    if result.get("success") is False:
+        error_type = _normalize_text(result.get("error_type"))
+        error_text = _normalize_text(result.get("error"))
+        if error_type and error_text:
+            return f"{error_type}: {error_text}"
+        if error_text:
+            return error_text
+        return "request rejected"
+    return None
+
+
 def _safe_resolve_path(path: Path) -> Path:
     """Resolve a path defensively without propagating odd filesystem errors."""
 
@@ -625,19 +658,62 @@ class LongTermRemoteStateStore:
         if not self.enabled:
             return
         write_client = self._require_client(self.write_client, operation="write")
+        read_client = self._require_client(self.read_client, operation="read")
         if self._circuit_is_open():  # AUDIT-FIX(#5): Fail fast while the remote circuit breaker is open.
             raise LongTermRemoteUnavailableError(
                 "Remote long-term memory is temporarily cooling down after recent failures."
             )
-
-        document_id = self._store_snapshot_record(
-            write_client,
-            snapshot_kind=normalized_snapshot_kind,
-            payload=_mapping_dict(payload) or {},
-        )
+        payload_dict = _mapping_dict(payload) or {}
+        retry_attempts = self._retry_attempts()
+        retry_backoff_s = self._retry_backoff_s()
+        document_id: str | None = None
+        attested_payload: dict[str, object] | None = None
+        attested_source = "saved_snapshot"
+        for attempt in range(retry_attempts):
+            try:
+                document_id = self._store_snapshot_record(
+                    write_client,
+                    snapshot_kind=normalized_snapshot_kind,
+                    payload=payload_dict,
+                    attempts=1,
+                    backoff_s=0.0,
+                )
+            except LongTermRemoteUnavailableError:
+                self._forget_snapshot_document_id(snapshot_kind=normalized_snapshot_kind)
+                if attempt + 1 >= retry_attempts:
+                    raise
+                if retry_backoff_s > 0:
+                    time.sleep(retry_backoff_s)
+                continue
+            if not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
+                attested_probe = self._attest_saved_snapshot_readback(
+                    read_client,
+                    snapshot_kind=normalized_snapshot_kind,
+                    payload=payload_dict,
+                    document_id=document_id,
+                )
+                if attested_probe.payload is not None:
+                    document_id = attested_probe.document_id or document_id
+                    attested_payload = dict(attested_probe.payload)
+                    attested_source = attested_probe.selected_source or "saved_snapshot_attested"
+                    break
+                self._forget_snapshot_document_id(snapshot_kind=normalized_snapshot_kind)
+                if attempt + 1 >= retry_attempts:
+                    raise LongTermRemoteUnavailableError(
+                        attested_probe.detail
+                        or (
+                            f"Remote long-term snapshot {normalized_snapshot_kind!r} could not be "
+                            "read back after write attestation."
+                        )
+                    )
+                if retry_backoff_s > 0:
+                    time.sleep(retry_backoff_s)
+                continue
+            break
         if document_id and not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
-            self._save_snapshot_pointer(
+            self._save_snapshot_pointer_with_attestation(
                 write_client,
+                read_client,
                 snapshot_kind=normalized_snapshot_kind,
                 document_id=document_id,
             )
@@ -653,8 +729,8 @@ class LongTermRemoteStateStore:
                     status="found",
                     latency_ms=0.0,
                     document_id=document_id,
-                    selected_source="saved_snapshot",
-                    payload=_mapping_dict(payload) or {},
+                    selected_source=attested_source,
+                    payload=attested_payload or dict(payload_dict),
                 )
             )
 
@@ -769,6 +845,7 @@ class LongTermRemoteStateStore:
         local_path: Path | None = None,
         document_id: str | None = None,
         source: str,
+        retry_not_found: bool = False,
     ) -> _RemoteSnapshotFetchResult:
         if self._circuit_is_open():  # AUDIT-FIX(#5): Skip repeat remote calls while the breaker is open.
             return _RemoteSnapshotFetchResult(
@@ -807,6 +884,10 @@ class LongTermRemoteStateStore:
                             error_type=type(exc).__name__,
                         )
                     )
+                    if retry_not_found and attempt + 1 < attempts:
+                        if backoff_s > 0:
+                            time.sleep(backoff_s)
+                        continue
                     return _RemoteSnapshotFetchResult(
                         status="not_found",
                         latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
@@ -1019,16 +1100,6 @@ class LongTermRemoteStateStore:
                     payload=hinted_result.payload,
                     attempts=tuple(attempt_records),
                 )
-            if hinted_result.status == "unavailable":
-                return LongTermRemoteSnapshotProbe(
-                    snapshot_kind=snapshot_kind,
-                    status=hinted_result.status,
-                    latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
-                    detail=hinted_result.detail,
-                    document_id=hinted_result.document_id or hinted_document_id,
-                    selected_source=hinted_result.selected_source,
-                    attempts=tuple(attempt_records),
-                )
             self._forget_snapshot_document_id(snapshot_kind=snapshot_kind)
 
         fallback = self._load_snapshot_with_pointer_fallback(
@@ -1036,6 +1107,22 @@ class LongTermRemoteStateStore:
             snapshot_kind=snapshot_kind,
             local_path=local_path,
         )
+        if (
+            hinted_document_id
+            and hinted_result.status == "unavailable"
+            and fallback.payload is None
+            and fallback.status == "not_found"
+        ):
+            return LongTermRemoteSnapshotProbe(
+                snapshot_kind=snapshot_kind,
+                status="unavailable",
+                latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
+                detail=hinted_result.detail,
+                document_id=hinted_result.document_id or hinted_document_id,
+                pointer_document_id=fallback.pointer_document_id,
+                selected_source=hinted_result.selected_source,
+                attempts=tuple(attempt_records) + fallback.attempts,
+            )
         return LongTermRemoteSnapshotProbe(
             snapshot_kind=snapshot_kind,
             status=fallback.status,
@@ -1176,6 +1263,8 @@ class LongTermRemoteStateStore:
         *,
         snapshot_kind: str,
         payload: Mapping[str, object],
+        attempts: int | None = None,
+        backoff_s: float | None = None,
     ) -> str | None:
         namespace = self.namespace or _REMOTE_NAMESPACE_PREFIX
         updated_at = _utcnow_iso()
@@ -1206,22 +1295,29 @@ class LongTermRemoteStateStore:
             content=snapshot_content,
             enable_chunking=False,
             include_insights_in_response=False,
+            execution_mode="async",
         )
         last_error: Exception | None = None
-        attempts = self._retry_attempts()
-        backoff_s = self._retry_backoff_s()
-        for attempt in range(attempts):
+        resolved_attempts = max(1, int(attempts or self._retry_attempts()))
+        resolved_backoff_s = max(0.0, float(backoff_s if backoff_s is not None else self._retry_backoff_s()))
+        for attempt in range(resolved_attempts):
             try:
                 result = write_client.store_record(record)
+                failure_detail = _store_result_failure_detail(result)
+                if failure_detail:
+                    raise ChonkyDBError(
+                        f"ChonkyDB rejected remote snapshot write: {failure_detail}",
+                        response_json=dict(result) if isinstance(result, Mapping) else None,
+                    )
                 self._note_remote_success()
                 return _extract_store_document_id(result)
             except Exception as exc:  # AUDIT-FIX(#5): Catch all remote client failures, not only ChonkyDBError subclasses.
                 last_error = exc
                 self._note_remote_failure()
-                if attempt + 1 >= attempts:
+                if attempt + 1 >= resolved_attempts:
                     break
-                if backoff_s > 0:
-                    time.sleep(backoff_s)
+                if resolved_backoff_s > 0:
+                    time.sleep(resolved_backoff_s)
         if last_error is not None:
             record_remote_write_diagnostic(
                 remote_state=self,
@@ -1229,7 +1325,7 @@ class LongTermRemoteStateStore:
                     snapshot_kind=snapshot_kind,
                     operation="store_snapshot_record",
                     uri_hint=record.uri,
-                    attempt_count=attempts,
+                    attempt_count=resolved_attempts,
                     request_item_count=1,
                 ),
                 exc=last_error,
@@ -1244,6 +1340,138 @@ class LongTermRemoteStateStore:
         raise LongTermRemoteUnavailableError(
             self._remote_failure_detail("write", snapshot_kind, exc=last_error)  # AUDIT-FIX(#8): Keep outward-facing errors generic and secret-safe.
         ) from last_error
+
+    def _attest_saved_snapshot_readback(
+        self,
+        read_client: ChonkyDBClient,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object],
+        document_id: str | None,
+    ) -> LongTermRemoteSnapshotProbe:
+        """Verify one just-written snapshot is immediately readable and parseable."""
+
+        expected_payload = dict(payload)
+        source = "saved_document" if document_id else "saved_origin_uri"
+        result = self._load_snapshot_via_uri(
+            read_client,
+            snapshot_kind=snapshot_kind,
+            document_id=document_id,
+            source=source,
+            retry_not_found=document_id is None,
+        )
+        if result.payload == expected_payload:
+            return LongTermRemoteSnapshotProbe(
+                snapshot_kind=snapshot_kind,
+                status="found",
+                latency_ms=result.latency_ms,
+                detail=result.detail,
+                document_id=result.document_id or document_id,
+                selected_source=result.selected_source,
+                payload=dict(result.payload or expected_payload),
+                attempts=result.attempts,
+            )
+        detail = (
+            result.detail
+            or (
+                f"Remote long-term snapshot {snapshot_kind!r} readback did not match the just-written payload."
+            )
+        )
+        return LongTermRemoteSnapshotProbe(
+            snapshot_kind=snapshot_kind,
+            status="unavailable",
+            latency_ms=result.latency_ms,
+            detail=detail,
+            document_id=result.document_id or document_id,
+            selected_source=result.selected_source,
+            attempts=result.attempts,
+        )
+
+    def _attest_saved_pointer_readback(
+        self,
+        read_client: ChonkyDBClient,
+        *,
+        snapshot_kind: str,
+        document_id: str,
+    ) -> LongTermRemoteSnapshotProbe:
+        """Verify one just-written pointer snapshot is immediately readable."""
+
+        pointer_snapshot_kind = self._pointer_snapshot_kind(snapshot_kind)
+        expected_payload = {
+            "schema": _SNAPSHOT_POINTER_SCHEMA,
+            "version": _SNAPSHOT_POINTER_VERSION,
+            "snapshot_kind": snapshot_kind,
+            "document_id": document_id,
+        }
+        result = self._load_snapshot_via_uri(
+            read_client,
+            snapshot_kind=pointer_snapshot_kind,
+            source="saved_pointer",
+            retry_not_found=True,
+        )
+        if result.payload == expected_payload:
+            return LongTermRemoteSnapshotProbe(
+                snapshot_kind=pointer_snapshot_kind,
+                status="found",
+                latency_ms=result.latency_ms,
+                detail=result.detail,
+                document_id=result.document_id,
+                selected_source=result.selected_source,
+                payload=dict(result.payload or expected_payload),
+                attempts=result.attempts,
+            )
+        detail = (
+            result.detail
+            or (
+                f"Remote long-term snapshot pointer {snapshot_kind!r} could not be "
+                "read back after write attestation."
+            )
+        )
+        return LongTermRemoteSnapshotProbe(
+            snapshot_kind=pointer_snapshot_kind,
+            status="unavailable",
+            latency_ms=result.latency_ms,
+            detail=detail,
+            document_id=result.document_id,
+            selected_source=result.selected_source,
+            attempts=result.attempts,
+        )
+
+    def _save_snapshot_pointer_with_attestation(
+        self,
+        write_client: ChonkyDBClient,
+        read_client: ChonkyDBClient,
+        *,
+        snapshot_kind: str,
+        document_id: str,
+    ) -> None:
+        """Persist one pointer snapshot and prove that fresh readers can see it."""
+
+        retry_attempts = self._retry_attempts()
+        retry_backoff_s = self._retry_backoff_s()
+        for attempt in range(retry_attempts):
+            self._save_snapshot_pointer(
+                write_client,
+                snapshot_kind=snapshot_kind,
+                document_id=document_id,
+            )
+            attested_probe = self._attest_saved_pointer_readback(
+                read_client,
+                snapshot_kind=snapshot_kind,
+                document_id=document_id,
+            )
+            if attested_probe.payload is not None:
+                return
+            if attempt + 1 >= retry_attempts:
+                raise LongTermRemoteUnavailableError(
+                    attested_probe.detail
+                    or (
+                        f"Remote long-term snapshot pointer {snapshot_kind!r} could not be "
+                        "read back after write attestation."
+                    )
+                )
+            if retry_backoff_s > 0:
+                time.sleep(retry_backoff_s)
 
     def _save_snapshot_pointer(
         self,

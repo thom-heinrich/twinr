@@ -3,12 +3,16 @@ name: web
 path: src/twinr/web
 kind: python-package
 visibility: internal
-summary: Serve Twinr's local FastAPI control surface and compose route handlers, shared web context, presenters, support primitives, templates, and static assets, including managed portal sign-in plus the self-coding and tabbed debug operator pages.
+summary: Serve Twinr's local FastAPI control surface and compose route handlers, shared web context, presenters, support primitives, templates, and static assets, including managed portal sign-in plus the self-coding, tabbed debug, Conversation Lab, and WhatsApp setup wizard pages with bounded channel-onboarding state.
 owned_concerns:
   - Build the FastAPI app factory, control-plane middleware, and route handlers for Twinr's local dashboard and settings pages
   - Enforce managed portal sign-in, including first-login password change for the permanent Pi web service
+  - Keep state-changing web requests fail-closed while honoring trusted same-origin posts behind a proxy-terminated HTTPS deployment
   - Expose the self-coding operator page and learned-skill control forms backed by `src/twinr/agent/self_coding`
-  - Expose the read-only tabbed debug page for runtime, ChonkyDB, live memory attestation, LLM, events, hardware, and raw artifacts
+  - Expose the tabbed debug page for runtime, ChonkyDB, live memory attestation, memory search, Conversation Lab, LLM, events, hardware, and raw artifacts
+  - Persist and replay portal Conversation Lab sessions with human-readable turn traces while delegating real text-turn execution to focused helpers
+  - Expose the `/connect/whatsapp` wizard for one-number WhatsApp self-chat setup, including allowlist, runtime, a bounded pairing window, live worker status, and the final self-chat test
+  - Persist and read generic per-channel onboarding snapshots so pairing, reconnect, and repair-needed state survive page reloads
   - Centralize request-time config loading, store construction, and safe template rendering through `context.py`
   - Validate and persist web-driven automation, reminder, integration, provider, personality, and user-context edits through the appropriate helpers
   - Ship the package-local Jinja templates and static CSS used by the local control surface
@@ -23,9 +27,11 @@ files:
     exports:
       - create_app
   - path: app.py
-    role: FastAPI app factory, security middleware, and route handlers
+    role: FastAPI app factory, proxy-aware security middleware, and route handlers, including the WhatsApp setup wizard routes
     exports:
       - create_app
+  - path: conversation_lab.py
+    role: Portal conversation-lab session storage and real text-turn execution helper
   - path: context.py
     role: Shared request-time context, store factories, and safe template renderer
     exports:
@@ -47,7 +53,7 @@ files:
   - path: presenters
     role: Template-ready page sections, normalized rows, and integration form builders
   - path: support
-    role: Shared contracts, form-field declarations, and file-backed persistence helpers
+    role: Shared contracts, form-field declarations, file-backed persistence helpers, and WhatsApp wizard validation/probe helpers
   - path: templates
     role: Jinja templates for the local control surface
   - path: static

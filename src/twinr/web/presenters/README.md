@@ -13,6 +13,9 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 - build self-coding operator telemetry rows from persisted compile, activation, health, live-e2e, and lifecycle-control state
 - build the tabbed `/ops/debug` operator page context from runtime, watchdog, memory-attestation, usage, hardware, and raw artifact state
 - shape the `/ops/debug` memory-search tab, including grouped durable/midterm/episodic/conflict hits from the real long-term retrieval path
+- shape the `/ops/debug` Conversation Lab tab from stored portal session traces without moving turn execution into templates
+- build the `/connect/whatsapp` wizard context, including step status, guarded runtime probes, persisted channel-onboarding snapshots, live portal QR rendering, and operator-facing pairing/repair guidance
+- build the compact WhatsApp setup summary for `/integrations`, while keeping the stateful QR pairing flow in the dedicated wizard
 - expose the presenter import surface through [`__init__.py`](./__init__.py)
 
 `presenters` does **not** own:
@@ -28,12 +31,14 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 | [`__init__.py`](./__init__.py) | Curated presenter export surface |
 | [`common.py`](./common.py) | Shared nav and reminder helpers |
 | [`settings.py`](./settings.py) | Global settings page builders |
-| [`integrations.py`](./integrations.py) | Integration sections and validators |
+| [`integrations.py`](./integrations.py) | Email/calendar sections plus the compact WhatsApp setup summary for `/integrations` |
 | [`voice.py`](./voice.py) | Voice profile page helpers |
 | [`ops.py`](./ops.py) | Ops row formatters and redaction |
 | [`debug.py`](./debug.py) | Tabbed operator debug page context builder |
+| [`conversation_lab.py`](./conversation_lab.py) | Presenter shaping for the interactive `/ops/debug` Conversation Lab tab |
 | [`memory_search.py`](./memory_search.py) | Presenter shaping for the read-only `/ops/debug` memory-search tab |
 | [`connect.py`](./connect.py) | Provider-routing section builders |
+| [`whatsapp_wizard.py`](./whatsapp_wizard.py) | WhatsApp self-chat wizard page context with bounded pairing, live QR rendering, and live status rows |
 | [`memory.py`](./memory.py) | Memory-related section builders |
 | [`self_coding.py`](./self_coding.py) | Self-coding operator page context builder |
 

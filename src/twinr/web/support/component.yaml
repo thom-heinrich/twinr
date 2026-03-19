@@ -3,12 +3,14 @@ name: support
 path: src/twinr/web/support
 kind: python-package
 visibility: internal
-summary: Provide shared web support contracts, env-backed field helpers, and hardened file-backed persistence utilities for Twinr's local control surface.
+summary: Provide shared web support contracts, declared settings-field helpers, and hardened file-backed persistence utilities for Twinr's local control surface.
 owned_concerns:
   - Define immutable contract objects shared by web presenters, routes, and templates
-  - Build declared env-backed field definitions and collect fail-closed form updates
+  - Build declared form-field definitions for env-backed and managed-store settings and collect fail-closed updates
   - Parse URL-encoded request bodies and atomically read or write `.env` and text-backed settings files
   - Persist the managed web-auth state and verify signed portal sessions without leaking raw passwords
+  - Persist generic per-channel onboarding snapshots, including temporary portal QR payloads, and coordinate one bounded pairing job per channel inside the web process
+  - Validate WhatsApp wizard inputs, collect bounded runtime probes, and coordinate the bounded WhatsApp pairing flow
   - Expose the curated support import surface consumed across the web package
 out_of_scope:
   - FastAPI route handling, redirects, and page composition in `src/twinr/web/app.py`
@@ -32,15 +34,17 @@ files:
       - write_env_updates
       - write_text_file
   - path: contracts.py
-    role: Immutable contract dataclasses shared by presenters and routes
+    role: Immutable contract dataclasses shared by presenters, routes, and templates
     exports:
       - AdaptiveTimingView
       - DashboardCard
       - DetailMetric
       - IntegrationOverviewRow
       - SettingsSection
+      - WizardCheckRow
+      - WizardStep
   - path: forms.py
-    role: Env-backed field builders and sanitized standard update collection
+    role: Declared settings-field builders and sanitized standard update collection
     exports:
       - _collect_standard_updates
       - _select_field
@@ -68,6 +72,20 @@ files:
       - web_auth_password_min_length
       - web_auth_session_cookie_name
       - web_auth_session_max_age_seconds
+  - path: channel_onboarding.py
+    role: Generic channel-onboarding snapshot persistence, including QR payload storage, and bounded in-process pairing registry
+    exports:
+      - ChannelPairingSnapshot
+      - FileBackedChannelOnboardingStore
+      - InProcessChannelPairingRegistry
+  - path: whatsapp.py
+    role: WhatsApp wizard validation, QR snapshot shaping, bounded runtime probes, and bounded pairing coordination
+    exports:
+      - WhatsAppPairingCoordinator
+      - WhatsAppRuntimeProbe
+      - canonicalize_whatsapp_allow_from
+      - normalize_project_relative_directory
+      - probe_whatsapp_runtime
 public_api:
   module: twinr.web.support
   exports:

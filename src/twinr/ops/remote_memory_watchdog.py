@@ -22,6 +22,7 @@ import time
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.longterm.runtime.service import LongTermMemoryService
+from twinr.memory.longterm.storage.remote_read_diagnostics import extract_remote_write_context
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.ops.events import TwinrOpsEventStore, compact_text
 from twinr.ops.paths import resolve_ops_paths_for_config
@@ -438,6 +439,10 @@ class RemoteMemoryWatchdog:
                 status = "fail"
                 ready = False
                 detail = self._normalize_detail(str(exc))
+                probe_payload = self._merge_remote_write_context(
+                    probe_payload,
+                    extract_remote_write_context(exc),
+                )
                 if deep_probe_attempted:
                     self._drop_service_instance()
             except Exception as exc:
@@ -585,6 +590,17 @@ class RemoteMemoryWatchdog:
         if not isinstance(value, dict):
             return None
         return dict(value)
+
+    @staticmethod
+    def _merge_remote_write_context(
+        probe: dict[str, object] | None,
+        remote_write_context: dict[str, object] | None,
+    ) -> dict[str, object] | None:
+        if not remote_write_context:
+            return probe
+        merged = dict(probe or {})
+        merged["remote_write_context"] = dict(remote_write_context)
+        return merged
 
     def _probe_worker_main(self) -> None:
         """Run one deep remote probe in the background."""
@@ -800,5 +816,8 @@ class RemoteMemoryWatchdog:
                 "detail": sample.detail,
                 "consecutive_ok": sample.consecutive_ok,
                 "consecutive_fail": sample.consecutive_fail,
+                "remote_write_context": dict(sample.probe.get("remote_write_context"))
+                if isinstance(sample.probe, dict) and isinstance(sample.probe.get("remote_write_context"), dict)
+                else None,
             },
         )

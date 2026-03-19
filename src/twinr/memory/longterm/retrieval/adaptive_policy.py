@@ -165,6 +165,10 @@ class LongTermAdaptivePolicyBuilder:
                 if packet.packet_id not in seen_packet_ids:
                     ranked_packets.append((100 + _support_count(item), packet))
                     seen_packet_ids.add(packet.packet_id)
+                channel_packet = self._confirmed_response_channel_policy_packet(item)
+                if channel_packet is not None and channel_packet.packet_id not in seen_packet_ids:
+                    ranked_packets.append((110 + _support_count(item), channel_packet))
+                    seen_packet_ids.add(channel_packet.packet_id)
 
             if item.status == "active" and item.kind in {"pattern", "plan"} and _support_count(item) >= self.min_pattern_support:
                 packet = self._routine_policy_packet(item)
@@ -249,6 +253,53 @@ class LongTermAdaptivePolicyBuilder:
             attributes={
                 "policy_scope": "routine_pattern",
                 "memory_kind": item.kind,
+                "support_count": _support_count(item),
+            },
+        )
+
+    def _confirmed_response_channel_policy_packet(
+        self,
+        item: LongTermMemoryObjectV1,
+    ) -> LongTermMidtermPacketV1 | None:
+        """Build one explicit policy packet from a confirmed response-channel preference."""
+
+        attributes = _attributes_mapping(item)
+        if attributes.get("preference_type") != "response_channel":
+            return None
+
+        preferred_channel = _normalize_text(attributes.get("preferred_channel"))
+        if not preferred_channel:
+            return None
+
+        daypart = _normalize_text(attributes.get("daypart"))
+        weekday_class = _normalize_text(attributes.get("weekday_class"))
+        summary = (
+            "Respect this user-confirmed response-channel preference when the current context still allows it: "
+            f"{item.summary}"
+        )
+        details = (
+            "Use the confirmed channel as the default delivery preference for matching situations, "
+            "but still obey current suppression, privacy, and room-ambiguity rules before speaking aloud."
+        )
+        return LongTermMidtermPacketV1(
+            packet_id=self._packet_id("response-channel", item.memory_id),
+            kind="adaptive_response_channel_policy",
+            summary=summary,
+            details=details,
+            source_memory_ids=(item.memory_id,),
+            query_hints=_query_hints(
+                item.summary,
+                item.details,
+                preferred_channel,
+                weekday_class,
+                daypart,
+            ),
+            sensitivity=item.sensitivity,
+            attributes={
+                "policy_scope": "confirmed_response_channel_preference",
+                "preferred_channel": preferred_channel,
+                "weekday_class": weekday_class or None,
+                "daypart": daypart or None,
                 "support_count": _support_count(item),
             },
         )

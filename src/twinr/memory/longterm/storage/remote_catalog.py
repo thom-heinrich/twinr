@@ -17,6 +17,7 @@ import json
 import logging
 import time
 from urllib.parse import quote
+from uuid import uuid4
 
 from twinr.memory.chonkydb.models import ChonkyDBBulkRecordRequest, ChonkyDBRecordItem, ChonkyDBRetrieveRequest
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
@@ -755,21 +756,14 @@ class LongTermRemoteCatalogStore:
         item_id: str,
         payload_sha256: str,
     ) -> bool:
+        del snapshot_kind
+        del item_id
         if entry is None:
             return False
         existing_sha256 = self._normalize_text(entry.metadata.get("payload_sha256"))
         if not existing_sha256 or existing_sha256 != payload_sha256:
             return False
-        try:
-            payload = self.load_item_payload(
-                snapshot_kind=snapshot_kind,
-                item_id=item_id,
-                document_id=entry.document_id,
-                uri=entry.uri,
-            )
-        except Exception:
-            return False
-        return payload is not None
+        return bool(self._normalize_text(entry.document_id) or self._normalize_text(entry.uri))
 
     def _payload_sha256(self, payload: Mapping[str, object]) -> str:
         serialized = json.dumps(
@@ -1074,15 +1068,30 @@ class LongTermRemoteCatalogStore:
             return ()
         batches = self._split_bulk_record_batches(record_items)
         document_ids: list[str | None] = []
+        total_batches = len(batches)
         for index, batch in enumerate(batches):
+            request_correlation_id = self._new_remote_write_correlation_id()
             request = ChonkyDBBulkRecordRequest(
                 items=tuple(batch),
+                timeout_seconds=self._remote_write_timeout_s(),
+                client_request_id=request_correlation_id,
                 finalize_vector_segments=index + 1 >= len(batches),
             )
+            request_bytes = self._bulk_request_bytes(request)
+            started_monotonic = time.monotonic()
             try:
                 result = getattr(write_client, "store_records_bulk")(request)
             except Exception as exc:
                 remote_state = self._require_remote_state()
+                remote_write_context = {
+                    "snapshot_kind": snapshot_kind,
+                    "operation": "store_records_bulk",
+                    "request_correlation_id": request_correlation_id,
+                    "batch_index": index + 1,
+                    "batch_count": total_batches,
+                    "request_item_count": len(batch),
+                    "request_bytes": request_bytes,
+                }
                 record_remote_write_diagnostic(
                     remote_state=remote_state,
                     context=LongTermRemoteWriteContext(
@@ -1090,14 +1099,40 @@ class LongTermRemoteCatalogStore:
                         operation="store_records_bulk",
                         attempt_count=1,
                         request_item_count=len(batch),
+                        request_correlation_id=request_correlation_id,
+                        batch_index=index + 1,
+                        batch_count=total_batches,
+                        request_bytes=request_bytes,
                     ),
                     exc=exc,
-                    started_monotonic=time.monotonic(),
+                    started_monotonic=started_monotonic,
                     outcome="failed",
                 )
-                raise LongTermRemoteUnavailableError("Failed to persist fine-grained remote long-term memory items.") from exc
+                unavailable = LongTermRemoteUnavailableError(
+                    "Failed to persist fine-grained remote long-term memory items "
+                    f"(request_id={request_correlation_id}, batch={index + 1}/{total_batches}, "
+                    f"items={len(batch)}, bytes={request_bytes})."
+                )
+                setattr(unavailable, "remote_write_context", remote_write_context)
+                raise unavailable from exc
             document_ids.extend(self._extract_document_ids(result, expected=len(batch)))
         return tuple(document_ids)
+
+    @staticmethod
+    def _new_remote_write_correlation_id() -> str:
+        return f"ltw-{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _bulk_request_bytes(request: ChonkyDBBulkRecordRequest) -> int:
+        return len(json.dumps(request.to_payload(), ensure_ascii=False).encode("utf-8"))
+
+    def _remote_write_timeout_s(self) -> float | None:
+        config = getattr(getattr(self, "remote_state", None), "config", None)
+        try:
+            timeout_s = float(getattr(config, "long_term_memory_remote_write_timeout_s", None))
+        except (TypeError, ValueError):
+            return None
+        return timeout_s if timeout_s > 0.0 else None
 
     def _load_item_payloads_from_entries(
         self,

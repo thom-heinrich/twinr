@@ -27,6 +27,7 @@ from twinr.ops import TwinrOpsEventStore, TwinrUsageStore
 from twinr.ops.remote_memory_watchdog import RemoteMemoryWatchdogSnapshot, RemoteMemoryWatchdogStore
 from twinr.web.presenters import _nav_items
 from twinr.web.support.auth import FileBackedWebAuthStore
+from twinr.web.support.channel_onboarding import FileBackedChannelOnboardingStore
 
 # AUDIT-FIX(#7): Use plain language in the default restart notice so user-facing pages do not expose internal jargon.
 DEFAULT_RESTART_NOTICE = "Some settings only take effect after Twinr is restarted."
@@ -210,6 +211,11 @@ class WebAppContext:
         """Build the managed web-auth store rooted under the Twinr project."""
 
         return FileBackedWebAuthStore.from_project_root(self.project_root)
+
+    def channel_onboarding_store(self, channel_id: str) -> FileBackedChannelOnboardingStore:
+        """Build one rooted channel-onboarding store."""
+
+        return FileBackedChannelOnboardingStore.from_project_root(self.project_root, channel_id=channel_id)
 
     def render(
         self,

@@ -419,6 +419,53 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertIn("adaptive_delivery_policy", context.midterm_context or "")
         self.assertIn("Melitta coffee", context.midterm_context or "")
 
+    def test_build_context_includes_confirmed_response_channel_policy_packet(self) -> None:
+        confirmed_channel = LongTermMemoryObjectV1(
+            memory_id="preference:response_channel:voice:weekday:morning",
+            kind="summary",
+            summary="The user confirmed that voice replies are preferred in the morning on weekdays.",
+            details="Use voice first when the room context still clearly supports spoken delivery.",
+            source=_source("turn:voice-pref"),
+            status="active",
+            confidence=0.96,
+            confirmed_by_user=True,
+            slot_key="preference:response_channel:weekday:morning",
+            value_key="voice",
+            attributes={
+                "memory_class": "confirmed_preference",
+                "preference_type": "response_channel",
+                "preferred_channel": "voice",
+                "weekday_class": "weekday",
+                "daypart": "morning",
+                "support_count": 3,
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            object.__setattr__(
+                retriever,
+                "adaptive_policy_builder",
+                LongTermAdaptivePolicyBuilder(
+                    proactive_state_store=LongTermProactiveStateStore.from_config(_config(temp_dir)),
+                ),
+            )
+            object_store.write_snapshot(
+                objects=(confirmed_channel,),
+                conflicts=(),
+                archived_objects=(),
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Should you answer me out loud this morning?",
+                    canonical_english_text="Should you answer me out loud this morning?",
+                ),
+                original_query_text="Should you answer me out loud this morning?",
+            )
+
+        self.assertIn("adaptive_response_channel_policy", context.midterm_context or "")
+        self.assertIn("voice replies are preferred", context.midterm_context or "")
+
     def test_build_context_includes_adaptive_avoidance_policy_after_repeated_skips(self) -> None:
         medication_plan = LongTermMemoryObjectV1(
             memory_id="plan:evening_medication",

@@ -264,6 +264,28 @@ class ReSpeakerAudioObservationProvider:
             signal_snapshot=signal_snapshot,
         )
 
+    def note_runtime_context(
+        self,
+        *,
+        observed_at: float,
+        motion_active: bool,
+        inspect_requested: bool,
+        presence_session_armed: bool,
+        assistant_output_active: bool,
+    ) -> None:
+        """Forward runtime scheduling context to the nested signal provider."""
+
+        callback = getattr(self.signal_provider, "note_runtime_context", None)
+        if not callable(callback):
+            return
+        callback(
+            observed_at=observed_at,
+            motion_active=motion_active,
+            inspect_requested=inspect_requested,
+            presence_session_armed=presence_session_armed,
+            assistant_output_active=assistant_output_active,
+        )
+
     def close(self) -> None:
         """Close nested resources when the monitor shuts down."""
 

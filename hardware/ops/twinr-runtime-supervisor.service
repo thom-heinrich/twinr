@@ -6,7 +6,6 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=thh
 WorkingDirectory=/twinr
 Environment=TWINR_PYTHON=/twinr/.venv/bin/python
 ExecStart=/usr/bin/env bash -lc 'cd /twinr && PYTHONPATH=src "${TWINR_PYTHON}" -m twinr --env-file .env --run-runtime-supervisor'

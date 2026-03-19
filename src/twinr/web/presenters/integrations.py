@@ -15,10 +15,13 @@ from pathlib import Path, PurePath
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from twinr.agent.base_agent import TwinrConfig
 from twinr.integrations import ManagedIntegrationConfig, validate_calendar_source
-from twinr.web.support.contracts import IntegrationOverviewRow, SettingsSection
+from twinr.web.support.channel_onboarding import ChannelPairingSnapshot
+from twinr.web.support.contracts import IntegrationOverviewRow, SettingsSection, WizardCheckRow
 from twinr.web.support.forms import _select_field, _text_field, _textarea_field
 from twinr.web.support.store import FileBackedSetting
+from twinr.web.support.whatsapp import canonicalize_whatsapp_allow_from, probe_whatsapp_runtime
 from twinr.web.presenters.common import (
     _BOOL_OPTIONS,
     _CALENDAR_SOURCE_OPTIONS,
@@ -388,6 +391,135 @@ def _integration_overview_rows(
         )
         for item in readiness_items
     )
+
+
+def _whatsapp_integration_context(
+    config: TwinrConfig,
+    env_values: Mapping[str, object],
+    *,
+    env_path: str | Path,
+    pairing_snapshot: ChannelPairingSnapshot | None = None,
+) -> dict[str, object]:
+    """Build the compact WhatsApp setup summary shown on ``/integrations``."""
+
+    probe = probe_whatsapp_runtime(config, env_path=Path(env_path))
+    snapshot = pairing_snapshot if isinstance(pairing_snapshot, ChannelPairingSnapshot) else ChannelPairingSnapshot.initial("whatsapp")
+    allow_from_label = _display_whatsapp_allow_from(env_values.get("TWINR_WHATSAPP_ALLOW_FROM"))
+    allow_from_ready = allow_from_label != "Not set yet"
+    guardrails_ready = bool(config.whatsapp_self_chat_mode) and not bool(config.whatsapp_groups_enabled)
+    runtime_ready = probe.node_ready and probe.worker_ready
+    linked_device_summary, linked_device_detail, linked_device_status = _whatsapp_linked_device_display(
+        probe,
+        snapshot,
+        pairing_ready=(probe.paired or snapshot.paired) and not snapshot.auth_repair_needed,
+    )
+
+    if snapshot.auth_repair_needed:
+        status = "fail"
+        status_label = "Repair needed"
+        detail = "The saved WhatsApp session needs repair. Open the wizard and start a fresh QR pairing."
+    elif snapshot.running and snapshot.qr_needed:
+        status = "warn"
+        status_label = "QR needed"
+        detail = "A pairing window is open right now. Open the wizard to scan the QR directly in the portal from WhatsApp Linked devices."
+    elif snapshot.running:
+        status = "warn"
+        status_label = "Pairing live"
+        detail = "Twinr is opening the temporary WhatsApp worker and waiting for the next pairing status update."
+    elif allow_from_ready and guardrails_ready and runtime_ready and linked_device_status == "ok":
+        status = "ok"
+        status_label = "Ready"
+        detail = "Twinr is ready for one internal self-chat with your own WhatsApp number."
+    elif allow_from_ready and guardrails_ready and runtime_ready:
+        status = "warn"
+        status_label = "Needs pairing"
+        detail = "The saved number and worker runtime are ready. Open the wizard once to finish QR pairing."
+    else:
+        status = "blocked"
+        status_label = "Needs setup"
+        detail = "Use the wizard to save one allowed chat, keep self-chat mode on, block groups, and prepare the worker runtime."
+
+    if guardrails_ready:
+        guardrail_summary = "Self-chat on, groups blocked"
+        guardrail_detail = "Twinr stays limited to your own direct chat for this internal test."
+        guardrail_status = "ok"
+    else:
+        guardrail_summary = "Needs fix"
+        guardrail_detail = "The wizard should keep self-chat mode on and group chats blocked before you pair."
+        guardrail_status = "fail" if allow_from_ready else "warn"
+
+    runtime_summary = "Ready" if runtime_ready else "Needs check"
+    runtime_detail = f"{probe.node_detail} {probe.worker_detail}".strip()
+
+    return {
+        "title": "WhatsApp self-chat",
+        "status": status,
+        "status_label": status_label,
+        "detail": detail,
+        "action_href": "/connect/whatsapp",
+        "action_label": "Open WhatsApp wizard",
+        "checks": (
+            WizardCheckRow(
+                label="Allowed chat",
+                summary=allow_from_label,
+                detail="Twinr accepts only this one direct-message sender.",
+                status="ok" if allow_from_ready else "warn",
+            ),
+            WizardCheckRow(
+                label="Guardrails",
+                summary=guardrail_summary,
+                detail=guardrail_detail,
+                status=guardrail_status,
+            ),
+            WizardCheckRow(
+                label="Worker runtime",
+                summary=runtime_summary,
+                detail=runtime_detail,
+                status="ok" if runtime_ready else "warn",
+            ),
+            WizardCheckRow(
+                label="Linked device",
+                summary=linked_device_summary,
+                detail=linked_device_detail,
+                status=linked_device_status,
+            ),
+        ),
+    }
+
+
+def _display_whatsapp_allow_from(raw_value: object) -> str:
+    """Return a safe operator-facing label for the saved WhatsApp number."""
+
+    normalized = _coerce_text(raw_value).strip()
+    if not normalized:
+        return "Not set yet"
+    try:
+        return canonicalize_whatsapp_allow_from(normalized)
+    except (TypeError, ValueError):
+        return normalized
+
+
+def _whatsapp_linked_device_display(
+    probe: Any,
+    snapshot: ChannelPairingSnapshot,
+    *,
+    pairing_ready: bool,
+) -> tuple[str, str, str]:
+    """Summarize the current linked-device state for the integrations page."""
+
+    if snapshot.auth_repair_needed:
+        return "Repair needed", snapshot.detail, "fail"
+    if snapshot.running and snapshot.qr_needed:
+        return "QR needed", snapshot.detail, "warn"
+    if snapshot.running:
+        return snapshot.summary, snapshot.detail, "warn"
+    if pairing_ready and probe.paired:
+        return "Stored", probe.pair_detail, "ok"
+    if pairing_ready:
+        return "Paired", snapshot.detail, "ok"
+    if probe.auth_dir_exists:
+        return "Missing", probe.pair_detail, "warn"
+    return "Missing", probe.pair_detail, "muted"
 
 
 def _email_integration_sections(

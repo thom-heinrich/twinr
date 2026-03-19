@@ -13,7 +13,7 @@ governance, and wakeword behavior.
 - direct new work into the correct child package instead of growing the package root
 
 `proactive` does **not** own:
-- proactive monitor orchestration details, ReSpeaker policy-hook derivation, or runtime alerts in [`runtime`](./runtime/README.md)
+- proactive monitor orchestration details, ReSpeaker policy-hook derivation, conservative speaker-association/multimodal-initiative fusion, runtime alerts, or structured observation export in [`runtime`](./runtime/README.md)
 - social-trigger scoring, sensing adapters, or review behavior in [`social`](./social/README.md)
 - delivery reservation and cooldown policy details in [`governance`](./governance/README.md)
 - wakeword matching, calibration, streaming, or evaluation details in [`wakeword`](./wakeword/README.md)

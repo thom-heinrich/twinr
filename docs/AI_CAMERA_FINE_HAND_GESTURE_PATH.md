@@ -25,11 +25,17 @@ The current Twinr camera stack already has:
 - coarse arm gestures
 - stable social-camera snapshot and event surfaces
 
-The current stack does **not** have:
-- finger landmarks
-- a hand crop/ROI path
-- a fine-hand gesture classifier
-- task models for hand landmarks or gesture recognition checked into the repo
+The current stack now has:
+- a dedicated local MediaPipe hand-landmark ROI worker under `src/twinr/hardware/hand_landmarks.py`
+- a local MediaPipe Gesture Recognizer path for built-in hand classes
+- a bounded custom-gesture workflow under `hardware/piaicam/` for dataset
+  capture plus `.task` training/export
+- runtime wiring for an optional custom gesture recognizer asset via
+  `TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_CUSTOM_GESTURE_MODEL_PATH`
+
+The current stack still does **not** have:
+- a checked-in product-grade custom `.task` for `ok_sign` and `middle_finger`
+- enough real household data yet to call those two labels production-ready
 
 Environment observations from the current workspace:
 - repo-local `.venv` on the leading checkout does **not** currently have `mediapipe`
@@ -116,8 +122,8 @@ Recommended path:
    - `person_visible`
    - `person_near_device` or `showing_intent`
    - a likely upper-body/hand gesture window
-4. Build Twinr's `fine_hand_gesture` surface from landmarks, not from coarse
-   pose heuristics.
+4. Use the worker's ROIs and landmarks to drive fine-hand inference instead of
+   pretending coarse pose heuristics can see fingers.
 
 Why this is the right cut:
 - it is local-first
@@ -140,11 +146,12 @@ Why this is the right cut:
 ## Immediate Follow-Up
 
 The next concrete experiment should be:
-- add task-model assets explicitly
-- prove one bounded Pi script that runs Hand Landmarker on still frames or ROI
-  crops
-- validate whether `thumbs_up`, `thumbs_down`, and `pointing` are already
-  separable with landmarks before committing to product wiring
+- capture a real household dataset with
+  `hardware/piaicam/capture_custom_gesture_dataset.py`
+- train/export a first custom `.task` with
+  `hardware/piaicam/train_custom_gesture_model.py`
+- validate `ok_sign` and `middle_finger` accuracy on the real Pi runtime before
+  treating them as product-grade signals
 
 Do **not** start with `middle_finger` as the engineering anchor. It is a poor
 first benchmark and not product-critical.

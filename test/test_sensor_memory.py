@@ -54,6 +54,42 @@ def _pattern(
     )
 
 
+def _audio_pattern(
+    *,
+    interaction_type: str,
+    daypart: str,
+    event_days: tuple[date, ...],
+) -> LongTermMemoryObjectV1:
+    return LongTermMemoryObjectV1(
+        memory_id=f"pattern:audio_interaction:{interaction_type}:{daypart}",
+        kind="pattern",
+        summary=f"Raw audio interaction pattern for {interaction_type} in the {daypart}.",
+        details="Synthetic ReSpeaker audio interaction pattern seed for tests.",
+        source=LongTermSourceRefV1(
+            source_type="proactive_monitor",
+            event_ids=tuple(_event_id(day, f"{interaction_type}_{daypart}") for day in event_days),
+            modality="sensor",
+        ),
+        status="active",
+        confidence=0.66,
+        sensitivity="low",
+        slot_key=f"pattern:audio_interaction:{interaction_type}:{daypart}",
+        value_key="audio_interaction",
+        valid_from=min(day.isoformat() for day in event_days),
+        valid_to=max(day.isoformat() for day in event_days),
+        attributes={
+            "pattern_type": "interaction",
+            "interaction_type": interaction_type,
+            "daypart": daypart,
+            "memory_domain": "respeaker_audio_routine",
+            "memory_class": "session_memory",
+            "source_sensor": "respeaker_xvf3800",
+            "source_type": "observed",
+            "requires_confirmation": True,
+        },
+    )
+
+
 def _config(root: str, **overrides) -> TwinrConfig:
     return TwinrConfig(
         project_root=root,
@@ -157,6 +193,105 @@ class LongTermSensorMemoryCompilerTests(unittest.TestCase):
         attrs = dict(items["deviation:presence:weekday:morning:2026-03-18"].attributes or {})
         self.assertEqual(attrs["deviation_type"], "missing_presence")
         self.assertTrue(attrs["requires_live_confirmation"])
+
+    def test_builds_voice_conversation_start_routine_from_respeaker_audio_patterns(self) -> None:
+        compiler = LongTermSensorMemoryCompiler(
+            enabled=True,
+            baseline_days=7,
+            min_days_observed=4,
+            min_routine_ratio=0.6,
+            deviation_min_delta=0.5,
+        )
+        reference = datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc)
+        raw = _audio_pattern(
+            interaction_type="conversation_start_audio",
+            daypart="morning",
+            event_days=(
+                date(2026, 3, 9),
+                date(2026, 3, 10),
+                date(2026, 3, 11),
+                date(2026, 3, 13),
+            ),
+        )
+
+        result = compiler.compile(objects=(raw,), now=reference)
+        routines = {item.memory_id: item for item in result.created_summaries}
+
+        self.assertIn("routine:interaction:conversation_start_audio:weekday:morning", routines)
+        attrs = dict(routines["routine:interaction:conversation_start_audio:weekday:morning"].attributes or {})
+        self.assertEqual(attrs["interaction_type"], "conversation_start_audio")
+        self.assertEqual(attrs["days_with_interaction"], 4)
+
+    def test_builds_observed_voice_response_channel_preference_from_repeated_audio_patterns(self) -> None:
+        compiler = LongTermSensorMemoryCompiler(
+            enabled=True,
+            baseline_days=7,
+            min_days_observed=4,
+            min_routine_ratio=0.6,
+            deviation_min_delta=0.5,
+        )
+        reference = datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc)
+        start_pattern = _audio_pattern(
+            interaction_type="conversation_start_audio",
+            daypart="morning",
+            event_days=(
+                date(2026, 3, 9),
+                date(2026, 3, 10),
+                date(2026, 3, 11),
+                date(2026, 3, 13),
+            ),
+        )
+        resume_pattern = _audio_pattern(
+            interaction_type="resume_follow_up",
+            daypart="morning",
+            event_days=(
+                date(2026, 3, 10),
+                date(2026, 3, 11),
+                date(2026, 3, 13),
+            ),
+        )
+
+        result = compiler.compile(objects=(start_pattern, resume_pattern), now=reference)
+        items = {item.memory_id: item for item in result.created_summaries}
+
+        preference = items["preference:response_channel:voice:weekday:morning"]
+        attrs = dict(preference.attributes or {})
+        self.assertEqual(preference.status, "candidate")
+        self.assertEqual(attrs["memory_class"], "observed_preference")
+        self.assertEqual(attrs["preferred_channel"], "voice")
+        self.assertTrue(attrs["requires_confirmation"])
+        self.assertEqual(attrs["days_with_voice_signal"], 4)
+
+    def test_builds_resume_follow_up_routine_from_respeaker_audio_patterns(self) -> None:
+        compiler = LongTermSensorMemoryCompiler(
+            enabled=True,
+            baseline_days=14,
+            min_days_observed=4,
+            min_routine_ratio=0.6,
+            deviation_min_delta=0.5,
+        )
+        reference = datetime(2026, 3, 16, 18, 0, tzinfo=timezone.utc)
+        raw = _audio_pattern(
+            interaction_type="resume_follow_up",
+            daypart="evening",
+            event_days=(
+                date(2026, 3, 2),
+                date(2026, 3, 3),
+                date(2026, 3, 4),
+                date(2026, 3, 5),
+                date(2026, 3, 9),
+                date(2026, 3, 10),
+                date(2026, 3, 12),
+            ),
+        )
+
+        result = compiler.compile(objects=(raw,), now=reference)
+        routines = {item.memory_id: item for item in result.created_summaries}
+
+        self.assertIn("routine:interaction:resume_follow_up:weekday:evening", routines)
+        attrs = dict(routines["routine:interaction:resume_follow_up:weekday:evening"].attributes or {})
+        self.assertEqual(attrs["interaction_type"], "resume_follow_up")
+        self.assertEqual(attrs["days_with_interaction"], 7)
 
 
 class LongTermSensorMemoryServiceTests(unittest.TestCase):

@@ -16,6 +16,7 @@ from twinr.agent.workflows.required_remote_snapshot import (
     assess_required_remote_watchdog_snapshot,
 )
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot
+from twinr.display.respeaker_hci import parse_respeaker_hci_state
 from twinr.ops.health import ServiceHealth, TwinrSystemHealth
 from twinr.ops.events import TwinrOpsEventStore, compact_text
 from twinr.ops.remote_memory_watchdog import RemoteMemoryWatchdogSnapshot, RemoteMemoryWatchdogStore
@@ -212,6 +213,13 @@ class TwinrDisplayDebugLogBuilder:
         host_line = self._hardware_host_line(health)
         if host_line:
             lines.append(host_line)
+        respeaker_state = parse_respeaker_hci_state(self.event_store.tail(limit=32))
+        if respeaker_state is not None:
+            for line in respeaker_state.hardware_log_lines():
+                if line not in lines:
+                    lines.append(line)
+                if len(lines) >= self.max_section_lines:
+                    break
         lines.extend(self._event_lines(category="hardware", limit=self.max_section_lines - len(lines)))
         return self._finalize_lines(lines, empty_label="no recent hardware events")
 

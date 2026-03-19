@@ -3,6 +3,9 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    {% if page_refresh_seconds %}
+    <meta http-equiv="refresh" content="{{ page_refresh_seconds }}">
+    {% endif %}
     <title>Twinr · {{ page_title }}</title>
     <link rel="stylesheet" href="{{ request.url_for('static', path='twinr.css') }}">
   </head>
@@ -100,6 +103,5 @@
       </main>
     </div>
     {% endif %}
-    {% block content %}{% endblock %}
   </body>
 </html>

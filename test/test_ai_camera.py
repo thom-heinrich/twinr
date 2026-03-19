@@ -13,13 +13,15 @@ from twinr.hardware.ai_camera import (
     AICameraMotionState,
     AICameraAdapterConfig,
     LocalAICameraAdapter,
-    _classify_body_pose,
-    _classify_gesture,
-    _infer_motion_state,
-    _rank_pose_candidates,
-    _support_pose_confidence,
 )
-from twinr.hardware.mediapipe_vision import MediaPipeVisionResult
+from twinr.hardware.camera_ai.mediapipe_pipeline import MediaPipeVisionResult
+from twinr.hardware.camera_ai.motion import infer_motion_state as _infer_motion_state
+from twinr.hardware.camera_ai.pose_classification import (
+    classify_body_pose as _classify_body_pose,
+    classify_gesture as _classify_gesture,
+)
+from twinr.hardware.camera_ai.pose_features import support_pose_confidence as _support_pose_confidence
+from twinr.hardware.camera_ai.pose_selection import rank_pose_candidates as _rank_pose_candidates
 from twinr.hardware.ai_camera_diagnostics import capture_pose_probe
 
 
@@ -94,6 +96,7 @@ class AICameraTests(unittest.TestCase):
             config=AICameraAdapterConfig(
                 pose_backend="mediapipe",
                 mediapipe_pose_model_path="state/mediapipe/models/pose_landmarker_full.task",
+                mediapipe_hand_landmarker_model_path="state/mediapipe/models/hand_landmarker.task",
                 mediapipe_gesture_model_path="state/mediapipe/models/gesture_recognizer.task",
                 mediapipe_custom_gesture_model_path="state/mediapipe/models/custom_gesture.task",
             )
@@ -121,6 +124,40 @@ class AICameraTests(unittest.TestCase):
         self.assertTrue(observation.camera_ready)
         self.assertFalse(observation.camera_ai_ready)
         self.assertEqual(observation.camera_error, "mediapipe_custom_gesture_model_missing")
+        self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.UNKNOWN)
+
+    def test_adapter_reports_missing_hand_landmarker_model_explicitly(self) -> None:
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                pose_backend="mediapipe",
+                mediapipe_pose_model_path="state/mediapipe/models/pose_landmarker_full.task",
+                mediapipe_hand_landmarker_model_path="state/mediapipe/models/hand_landmarker.task",
+                mediapipe_gesture_model_path="state/mediapipe/models/gesture_recognizer.task",
+            )
+        )
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: SimpleNamespace(
+            person_count=1,
+            primary_person_box=AICameraBox(top=0.12, left=0.24, bottom=0.92, right=0.68),
+            primary_person_zone="center",
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: object()
+        adapter._ensure_mediapipe_pipeline = lambda: SimpleNamespace(
+            analyze=lambda **_: (_ for _ in ()).throw(
+                FileNotFoundError("mediapipe_hand_landmarker_model_missing:state/mediapipe/models/hand_landmarker.task")
+            )
+        )
+
+        observation = adapter.observe()
+
+        self.assertTrue(observation.camera_online)
+        self.assertTrue(observation.camera_ready)
+        self.assertFalse(observation.camera_ai_ready)
+        self.assertEqual(observation.camera_error, "mediapipe_hand_landmarker_model_missing")
         self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.UNKNOWN)
 
     def test_support_pose_confidence_uses_keypoint_coverage_not_raw_score_alone(self) -> None:

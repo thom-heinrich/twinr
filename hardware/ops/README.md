@@ -21,6 +21,10 @@ Pi-side operating-system service definitions for Twinr background watchdogs.
 | [twinr-web.service](./twinr-web.service) | Productive unit: keep the Twinr web control portal running with managed sign-in |
 | [bootstrap_self_coding_pi.py](./bootstrap_self_coding_pi.py) | Reproducibly sync the pinned self-coding Codex bridge/auth and run the remote self-test |
 
+The runtime supervisor intentionally runs as the system service user so it can
+access root-owned GPIO devices on deployed hosts; the web portal continues to
+run as `thh`.
+
 Retired standalone break-glass units are no longer tracked here. If an operator wants to keep local copies around during cleanup, they belong under the ignored top-level `__legacy__/hardware/ops/` folder.
 
 ## Install

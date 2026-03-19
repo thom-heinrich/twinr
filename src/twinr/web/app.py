@@ -53,7 +53,13 @@ from twinr.web.automations import (
     save_time_automation,
     toggle_automation_enabled,
 )
+from twinr.web.conversation_lab import (
+    create_conversation_lab_session,
+    load_conversation_lab_state,
+    run_conversation_lab_turn,
+)
 from twinr.web.context import WebAppContext
+from twinr.web.support.channel_onboarding import InProcessChannelPairingRegistry
 from twinr.web.support.contracts import DashboardCard
 from twinr.web.support.forms import _collect_standard_updates
 from twinr.web.support.auth import (
@@ -67,6 +73,12 @@ from twinr.web.support.auth import (
     web_auth_session_max_age_seconds,
 )
 from twinr.web.support.store import FileBackedSetting, parse_urlencoded_form, read_text_file, write_env_updates, write_text_file
+from twinr.web.support.whatsapp import (
+    WhatsAppPairingCoordinator,
+    canonicalize_whatsapp_allow_from,
+    normalize_project_relative_directory,
+    probe_whatsapp_runtime,
+)
 from twinr.web.presenters import (
     _adaptive_timing_view,
     _build_calendar_integration_record,
@@ -88,7 +100,9 @@ from twinr.web.presenters import (
     _reminder_rows,
     _resolve_named_file,
     _settings_sections,
+    _whatsapp_integration_context,
     build_self_coding_ops_page_context,
+    build_whatsapp_wizard_page_context,
     _voice_action_result,
     _voice_profile_page_context,
     _voice_snapshot_label,
@@ -268,10 +282,28 @@ def _apply_auth_context(
 
 
 def _request_origin(request: Request) -> str:
-    """Build the request origin from scheme and host headers."""
+    """Build the request origin from direct or proxy-forwarded request headers."""
 
-    host = request.headers.get("host", "").strip()
-    return f"{request.url.scheme}://{host}".rstrip("/")
+    forwarded_proto = _forwarded_header_value(request.headers.get("x-forwarded-proto"))
+    forwarded_host = _forwarded_header_value(request.headers.get("x-forwarded-host"))
+    forwarded_port = _forwarded_header_value(request.headers.get("x-forwarded-port"))
+    scheme = forwarded_proto if forwarded_proto in {"http", "https"} else request.url.scheme
+    host = forwarded_host or request.headers.get("host", "").strip()
+    if forwarded_port and host and ":" not in host and not _is_default_origin_port(scheme, forwarded_port):
+        host = f"{host}:{forwarded_port}"
+    return f"{scheme}://{host}".rstrip("/")
+
+
+def _forwarded_header_value(raw_value: str | None) -> str:
+    """Return the first comma-separated proxy-forwarded header token."""
+
+    return str(raw_value or "").split(",", 1)[0].strip().lower()
+
+
+def _is_default_origin_port(scheme: str, port: str) -> bool:
+    """Return whether one port is the default for the given origin scheme."""
+
+    return (scheme == "http" and port == "80") or (scheme == "https" and port == "443")
 
 
 def _is_same_origin_url(candidate: str, expected_origin: str) -> bool:
@@ -346,16 +378,41 @@ def _public_error_message(exc: Exception, *, fallback: str) -> str:
     return fallback
 
 
-def _redirect_with_error(path: str, message: str) -> RedirectResponse:
+def _redirect_location(path: str, *, saved: bool = False, error_message: str | None = None, step: str | None = None) -> str:
+    """Build one redirect location with optional saved/error/step query state."""
+
+    query_parts: list[str] = []
+    if saved:
+        query_parts.append("saved=1")
+    if error_message:
+        query_parts.append(f"error={quote_plus(error_message)}")
+    if step:
+        query_parts.append(f"step={quote_plus(step)}")
+    if not query_parts:
+        return path
+    return f"{path}?{'&'.join(query_parts)}"
+
+
+def _redirect_with_error(path: str, message: str, *, step: str | None = None) -> RedirectResponse:
     """Redirect to a page with a flash-style error message."""
 
-    return RedirectResponse(f"{path}?error={quote_plus(message)}", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(_redirect_location(path, error_message=message, step=step), status_code=status.HTTP_303_SEE_OTHER)
 
 
-def _redirect_saved(path: str) -> RedirectResponse:
+def _redirect_saved(path: str, *, step: str | None = None) -> RedirectResponse:
     """Redirect to a page with the saved flag set."""
 
-    return RedirectResponse(f"{path}?saved=1", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse(_redirect_location(path, saved=True, step=step), status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _conversation_lab_href(session_id: str | None = None) -> str:
+    """Return the `/ops/debug` conversation-lab location for one optional session."""
+
+    base = "/ops/debug?tab=conversation_lab"
+    normalized = str(session_id or "").strip()
+    if not normalized:
+        return base
+    return f"{base}&lab_session={quote_plus(normalized)}"
 
 
 def _require_non_empty(value: str, *, message: str) -> str:
@@ -551,8 +608,14 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
     # AUDIT-FIX(#7): Serialize file-backed control-plane writes inside the single-process app to avoid state corruption.
     state_write_lock = asyncio.Lock()
     ops_job_lock = asyncio.Lock()
+    conversation_lab_lock = asyncio.Lock()
     voice_profile_lock = asyncio.Lock()
     managed_auth_write_lock = asyncio.Lock()
+    channel_pairing_registry = InProcessChannelPairingRegistry()
+    whatsapp_pairing = WhatsAppPairingCoordinator(
+        store=ctx.channel_onboarding_store("whatsapp"),
+        registry=channel_pairing_registry,
+    )
 
     @app.middleware("http")
     async def guard_control_plane(request: Request, call_next: Any) -> Response:
@@ -1316,6 +1379,14 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                     fallback="Twinr could not search long-term memory right now.",
                 )
 
+        conversation_lab_state = None
+        if active_tab == "conversation_lab":
+            conversation_lab_state = await _call_sync(
+                load_conversation_lab_state,
+                ctx.ops_paths,
+                session_id=str(request.query_params.get("lab_session", "")).strip() or None,
+            )
+
         page_context = build_ops_debug_page_context(
             active_tab=active_tab,
             env_path=ctx.env_path,
@@ -1337,16 +1408,70 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             memory_search_query=memory_search_query,
             memory_search_result=memory_search_result,
             memory_search_error=memory_search_error,
+            conversation_lab_state=conversation_lab_state,
         )
         return ctx.render(
             request,
             "ops_debug.html",
             page_title="Debug View",
             active_page="ops_debug",
-            intro="Read-only operator view of Twinr runtime evidence, grouped into runtime, ChonkyDB, LLM, events, hardware, and raw artifacts.",
-            restart_notice="This page is read-only and reflects the latest local Twinr artifacts.",
+            intro=(
+                "Interactive operator view of Twinr runtime evidence, grouped into runtime, ChonkyDB, memory, LLM, events, hardware, and raw artifacts."
+                if active_tab == "conversation_lab"
+                else "Read-only operator view of Twinr runtime evidence, grouped into runtime, ChonkyDB, LLM, events, hardware, and raw artifacts."
+            ),
+            restart_notice=(
+                "Conversation Lab runs real provider, tool, reminder, automation, settings, and remote-memory paths against this Twinr instance."
+                if active_tab == "conversation_lab"
+                else "This page is read-only and reflects the latest local Twinr artifacts."
+            ),
             **page_context,
         )
+
+    @app.post("/ops/debug/conversation-lab/new")
+    async def create_ops_debug_conversation_lab_session(request: Request) -> Response:
+        """Create one empty portal conversation-lab session."""
+
+        try:
+            await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            async with conversation_lab_lock:
+                session_id = await _call_sync(create_conversation_lab_session, ctx.ops_paths)
+        except Exception as exc:
+            return _redirect_with_error(
+                _conversation_lab_href(),
+                _public_error_message(exc, fallback="Twinr could not start a new portal conversation."),
+            )
+        return RedirectResponse(_conversation_lab_href(session_id), status_code=status.HTTP_303_SEE_OTHER)
+
+    @app.post("/ops/debug/conversation-lab/send")
+    async def send_ops_debug_conversation_lab_turn(request: Request) -> Response:
+        """Run one portal conversation-lab turn against the real Twinr text path."""
+
+        current_session_id = None
+        try:
+            config, _env_values = await _call_sync(ctx.load_state)
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            current_session_id = str(form.get("session_id", "")).strip() or None
+            prompt = _require_non_empty(
+                form.get("prompt", ""),
+                message="Please enter a prompt for the portal conversation.",
+            )
+            async with conversation_lab_lock:
+                async with state_write_lock:
+                    resolved_session_id = await _call_sync(
+                        run_conversation_lab_turn,
+                        config,
+                        ctx.env_path,
+                        ctx.ops_paths,
+                        session_id=current_session_id,
+                        prompt=prompt,
+                    )
+        except Exception as exc:
+            return _redirect_with_error(
+                _conversation_lab_href(current_session_id),
+                _public_error_message(exc, fallback="Twinr could not run that portal conversation turn."),
+            )
+        return RedirectResponse(_conversation_lab_href(resolved_session_id), status_code=status.HTTP_303_SEE_OTHER)
 
     @app.get("/ops/devices", response_class=HTMLResponse)
     async def ops_devices(request: Request) -> HTMLResponse:
@@ -1441,11 +1566,12 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
     async def integrations(request: Request) -> HTMLResponse:
         """Render the integrations configuration page."""
 
-        _config, env_values = await _call_sync(ctx.load_state)
+        config, env_values = await _call_sync(ctx.load_state)
         store = ctx.integration_store()
         email_record = await _call_sync(store.get, "email_mailbox")
         calendar_record = await _call_sync(store.get, "calendar_agenda")
         runtime = await _call_sync(build_managed_integrations, ctx.project_root, env_path=ctx.env_path)
+        pairing_snapshot = await _call_sync(whatsapp_pairing.load_snapshot)
         return ctx.render(
             request,
             "integrations_page.html",
@@ -1453,11 +1579,20 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             active_page="integrations",
             restart_notice=(
                 "These settings stay local to this Twinr install. "
-                "Email secrets remain only in .env, while non-secret integration config lives under artifacts/stores/integrations."
+                "Email secrets remain only in .env, while WhatsApp keeps its linked-device session in its own auth folder."
             ),
-            intro="Set up safe external connections for Twinr. Calendar and mail are prepared first because they are useful and comparatively low-risk.",
+            intro=(
+                "Set up safe external connections for Twinr. Email and calendar live here as managed integrations, "
+                "and WhatsApp uses a guided self-chat wizard so pairing stays bounded and visible."
+            ),
             integration_store_path=str(store.path),
             overview_rows=_integration_overview_rows(runtime.readiness),
+            whatsapp_summary=_whatsapp_integration_context(
+                config,
+                env_values,
+                env_path=ctx.env_path,
+                pairing_snapshot=pairing_snapshot,
+            ),
             email_sections=_email_integration_sections(email_record, env_values),
             calendar_sections=_calendar_integration_sections(calendar_record),
         )
@@ -1699,7 +1834,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
         sections = _connect_sections(env_values)
         return ctx.render(
             request,
-            "form_page.html",
+            "connect_page.html",
             page_title="Connect",
             active_page="connect",
             intro="Choose providers and manage credentials. Hover the small (?) labels for short explanations. Today only OpenAI is wired in the runtime; the other providers are stored for the next integration pass.",
@@ -1731,6 +1866,110 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 _public_error_message(exc, fallback="Twinr could not save those provider settings. Please try again."),
             )
         return _redirect_saved("/connect")
+
+    @app.get("/connect/whatsapp", response_class=HTMLResponse)
+    async def connect_whatsapp(request: Request) -> HTMLResponse:
+        """Render the WhatsApp self-chat setup wizard."""
+
+        config, env_values = await _call_sync(ctx.load_state)
+        pairing_snapshot = await _call_sync(whatsapp_pairing.load_snapshot)
+        page_context = await _call_sync(
+            build_whatsapp_wizard_page_context,
+            config,
+            env_values,
+            env_path=ctx.env_path,
+            pairing_snapshot=pairing_snapshot,
+            requested_step=request.query_params.get("step"),
+        )
+        return ctx.render(
+            request,
+            "whatsapp_wizard.html",
+            page_title="WhatsApp Setup",
+            active_page="connect",
+            restart_notice=(
+                "The dashboard pairing window is temporary and bounded. "
+                "The linked-device session itself stays in its own auth folder."
+            ),
+            intro=(
+                "This wizard keeps WhatsApp in one internal self-chat with your own number. "
+                "It forces self-chat mode on, blocks groups, and can open the pairing window directly from the UI."
+            ),
+            **page_context,
+        )
+
+    @app.post("/connect/whatsapp")
+    async def save_connect_whatsapp(request: Request) -> RedirectResponse:
+        """Persist one WhatsApp wizard step."""
+
+        current_step = "chat"
+        try:
+            form = await _parse_bounded_form(request, max_form_bytes=max_form_bytes)
+            action = _require_non_empty(
+                form.get("_action", ""),
+                message="Please choose a valid WhatsApp setup step.",
+            )
+
+            if action == "save_chat":
+                allow_from = canonicalize_whatsapp_allow_from(
+                    _require_non_empty(
+                        form.get("TWINR_WHATSAPP_ALLOW_FROM", ""),
+                        message="Please enter the WhatsApp number that Twinr should allow.",
+                    )
+                )
+                updates = {
+                    "TWINR_WHATSAPP_ALLOW_FROM": allow_from,
+                    "TWINR_WHATSAPP_SELF_CHAT_MODE": "true",
+                    "TWINR_WHATSAPP_GROUPS_ENABLED": "false",
+                }
+                next_step = "runtime"
+                async with state_write_lock:
+                    await _call_sync(write_env_updates, ctx.env_path, updates)
+                return _redirect_saved("/connect/whatsapp", step=next_step)
+
+            if action == "save_runtime":
+                current_step = "runtime"
+                node_binary = _require_non_empty(
+                    form.get("TWINR_WHATSAPP_NODE_BINARY", ""),
+                    message="Please enter the Node.js binary that should start the WhatsApp worker.",
+                )
+                auth_dir = normalize_project_relative_directory(
+                    ctx.project_root,
+                    form.get("TWINR_WHATSAPP_AUTH_DIR", ""),
+                    label="the WhatsApp auth folder",
+                )
+                updates = {
+                    "TWINR_WHATSAPP_NODE_BINARY": node_binary,
+                    "TWINR_WHATSAPP_AUTH_DIR": auth_dir,
+                }
+                next_step = "pairing"
+                async with state_write_lock:
+                    await _call_sync(write_env_updates, ctx.env_path, updates)
+                return _redirect_saved("/connect/whatsapp", step=next_step)
+
+            if action == "start_pairing":
+                current_step = "pairing"
+                config, _env_values = await _call_sync(ctx.load_state)
+                if not str(getattr(config, "whatsapp_allow_from", "") or "").strip():
+                    raise ValueError("Please save your own WhatsApp number before you start pairing.")
+                if not bool(config.whatsapp_self_chat_mode) or bool(config.whatsapp_groups_enabled):
+                    raise ValueError("Twinr must keep self-chat mode on and group chats off before pairing starts.")
+                runtime_probe = await _call_sync(probe_whatsapp_runtime, config, env_path=ctx.env_path)
+                if not runtime_probe.node_ready:
+                    raise ValueError(runtime_probe.node_detail)
+                if not runtime_probe.worker_ready:
+                    raise ValueError(runtime_probe.worker_detail)
+                await _call_sync(whatsapp_pairing.load_snapshot)
+                await _call_sync(whatsapp_pairing.start_pairing, config)
+                return RedirectResponse(url="/connect/whatsapp?step=pairing", status_code=status.HTTP_303_SEE_OTHER)
+
+            raise ValueError("Please choose a valid WhatsApp setup step.")
+        except Exception as exc:
+            logger.exception("Twinr WhatsApp setup save failed", exc_info=exc)
+            return _redirect_with_error(
+                "/connect/whatsapp",
+                _public_error_message(exc, fallback="Twinr could not save that WhatsApp setup step. Please check the fields and try again."),
+                step=current_step,
+            )
 
     @app.get("/settings", response_class=HTMLResponse)
     async def settings(request: Request) -> HTMLResponse:

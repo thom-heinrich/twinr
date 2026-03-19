@@ -8,6 +8,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.hardware.audio import (
+    AmbientAudioSampler,
+    AudioCaptureReadinessError,
     SilenceDetectedRecorder,
     SpeechStartTimeoutError,
     WaveAudioPlayer,
@@ -239,6 +241,61 @@ class SilenceDetectedRecorderTests(unittest.TestCase):
         self.assertEqual(diagnostics.average_rms, 0)
         self.assertEqual(diagnostics.peak_rms, 0)
         self.assertGreaterEqual(diagnostics.listened_ms, 150)
+
+
+class AmbientAudioSamplerTests(unittest.TestCase):
+    def test_require_readable_frames_returns_probe_after_first_chunk(self) -> None:
+        sampler = AmbientAudioSampler(
+            device="default",
+            sample_rate=16000,
+            channels=1,
+            chunk_ms=100,
+            default_duration_ms=200,
+        )
+        process = _FakeCaptureProcess()
+        pcm_chunk = b"\x01\x00" * 1600
+
+        with (
+            mock.patch("twinr.hardware.audio._spawn_audio_process", return_value=process),
+            mock.patch("twinr.hardware.audio._wait_for_readable", return_value=True),
+            mock.patch("twinr.hardware.audio.os.read", return_value=pcm_chunk),
+        ):
+            probe = sampler.require_readable_frames(duration_ms=200)
+
+        self.assertTrue(probe.ready)
+        self.assertEqual(probe.captured_chunk_count, 1)
+        self.assertEqual(probe.captured_bytes, len(pcm_chunk))
+        self.assertIsNone(probe.failure_reason)
+
+    def test_sample_window_raises_readiness_error_when_capture_stalls(self) -> None:
+        sampler = AmbientAudioSampler(
+            device="default",
+            sample_rate=16000,
+            channels=1,
+            chunk_ms=100,
+            default_duration_ms=200,
+        )
+        process = _FakeCaptureProcess()
+
+        class _AdvancingMonotonic:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def __call__(self) -> float:
+                current = self.value
+                self.value += 1.1
+                return current
+
+        with (
+            mock.patch("twinr.hardware.audio._spawn_audio_process", return_value=process),
+            mock.patch("twinr.hardware.audio._wait_for_readable", return_value=False),
+            mock.patch("twinr.hardware.audio.time.monotonic", side_effect=_AdvancingMonotonic()),
+        ):
+            with self.assertRaises(AudioCaptureReadinessError) as captured:
+                sampler.sample_window(duration_ms=200)
+
+        self.assertEqual(captured.exception.probe.failure_reason, "stalled_waiting")
+        self.assertIn("waiting for microphone data", str(captured.exception))
 
 
 if __name__ == "__main__":

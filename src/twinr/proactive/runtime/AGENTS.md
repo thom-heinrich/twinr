@@ -15,6 +15,12 @@ Out of scope:
 
 ## Key files
 
+- `ambiguous_room_guard.py` — fail-closed room-ambiguity guard for person-targeted runtime inference
+- `known_user_hint.py` — conservative known-user hint from voice-profile state plus clear room context
+- `affect_proxy.py` — prompt-only affect proxy surface from coarse posture, attention, and quiet cues
+- `claim_metadata.py` — shared `confidence` / `source` / `requires_confirmation` helpers for runtime claims
+- `speaker_association.py` — conservative speaker-to-camera-anchor association for the single-primary-person case
+- `multimodal_initiative.py` — confidence-bearing display-first/skip gate for later proactive behavior
 - `presence.py` — source of truth for wakeword presence-session arming
 - `service.py` — monitor orchestration, degraded-mode handling, and lifecycle
 - `__init__.py` — package export surface; treat changes as API-impacting
@@ -25,6 +31,10 @@ Out of scope:
 - `PresenceSessionController.observe()` must preserve a monotonic internal timeline even when callers pass regressing or malformed timestamps.
 - Wakeword arming must fail closed on malformed sensor flags or unavailable dependencies.
 - `service.py` stays orchestration-focused; trigger scoring and wakeword matching belong in sibling packages.
+- `ambiguous_room_guard`, `known_user_hint`, and `affect_proxy` must remain conservative claim surfaces, not direct product decisions.
+- `known_user_hint` must stay weaker than identity and may only clear calm personalization; sensitive behavior still needs confirmation or stronger gates.
+- `affect_proxy` must never emit emotion, wellbeing, or diagnosis claims; it may only support prompt-only follow-up cues.
+- Speaker association and multimodal initiative must fail closed on multi-person or low-confidence room context; do not let weak audio hints force spoken proactivity.
 - `ProactiveMonitorService` lifecycle must remain idempotent, bounded, and safe under partial startup or shutdown failure.
 - `build_default_proactive_monitor()` must not start an inert monitor when no operational sensor path exists.
 

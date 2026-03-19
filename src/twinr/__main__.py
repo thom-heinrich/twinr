@@ -140,6 +140,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the GPIO -> STT -> tool-calling LLM -> TTS -> speaker/printer loop",
     )
     parser.add_argument(
+        "--run-whatsapp-channel",
+        action="store_true",
+        help="Run the consumer WhatsApp text channel via the Baileys worker",
+    )
+    parser.add_argument(
         "--run-runtime-supervisor",
         action="store_true",
         help="Run the authoritative Pi runtime supervisor for the streaming loop and remote watchdog.",
@@ -224,10 +229,15 @@ def _is_raspberry_pi_host() -> bool:
         return False
 
 
-def _should_enable_display_companion(env_file: str | Path) -> bool:
-    """Enable the display companion only on the Pi runtime checkout."""
+def _should_enable_display_companion(config: TwinrConfig, env_file: str | Path) -> bool:
+    """Enable the display companion only for intended authoritative runtime hosts."""
 
-    return _uses_pi_runtime_root(env_file) and _is_raspberry_pi_host()
+    if not _uses_pi_runtime_root(env_file):
+        return False
+    explicit_setting = getattr(config, "display_companion_enabled", None)
+    if explicit_setting is not None:
+        return bool(explicit_setting)
+    return _is_raspberry_pi_host()
 
 
 def _should_ensure_remote_watchdog_companion(config: TwinrConfig, env_file: str | Path) -> bool:
@@ -390,6 +400,25 @@ def _run_orchestrator_server(config: TwinrConfig, env_file: str | Path) -> int:
     return 0
 
 
+def _run_whatsapp_channel(
+    config: TwinrConfig,
+    runtime: Any,
+    backend: Any,
+    *,
+    env_file: str | Path,
+    duration_s: float | None,
+) -> int:
+    """Start the Baileys-backed WhatsApp text channel listener."""
+
+    _assert_pi_runtime_root(env_file, command_name="run-whatsapp-channel")
+    from twinr.channels.whatsapp import TwinrWhatsAppChannelLoop
+    from twinr.ops import loop_instance_lock
+
+    loop = TwinrWhatsAppChannelLoop(config=config, runtime=runtime, backend=backend)
+    with loop_instance_lock(config, "whatsapp-channel"):
+        return loop.run(duration_s=duration_s)
+
+
 def main() -> int:
     """Dispatch the requested Twinr CLI command and return its exit code."""
 
@@ -467,6 +496,7 @@ def main() -> int:
             args.run_hardware_loop,
             args.run_realtime_loop,
             args.run_streaming_loop,
+            args.run_whatsapp_channel,
             args.run_orchestrator_server,
             args.orchestrator_probe_turn,
         ]
@@ -490,7 +520,7 @@ def main() -> int:
             with loop_instance_lock(config, "streaming-loop"):
                 with optional_display_companion(
                     config,
-                    enabled=_should_enable_display_companion(args.env_file),
+                    enabled=_should_enable_display_companion(config, args.env_file),
                 ):
                     runtime = _build_runtime(config)
                     _print_runtime_banner(runtime, config, env_path)
@@ -572,8 +602,22 @@ def main() -> int:
                 print_backend=backend,
             )
             with loop_instance_lock(config, "realtime-loop"):
-                with optional_display_companion(config, enabled=_should_enable_display_companion(args.env_file)):
+                with optional_display_companion(
+                    config,
+                    enabled=_should_enable_display_companion(config, args.env_file),
+                ):
                     return loop.run(duration_s=args.loop_duration)
+
+        if args.run_whatsapp_channel:
+            if backend is None:
+                raise RuntimeError("WhatsApp channel requires configured providers")
+            return _run_whatsapp_channel(
+                config,
+                runtime,
+                backend,
+                env_file=args.env_file,
+                duration_s=args.loop_duration,
+            )
 
         if args.orchestrator_probe_turn:
             _assert_pi_runtime_root(args.env_file, command_name="orchestrator-probe-turn")
@@ -639,7 +683,10 @@ def main() -> int:
                 backend=backend,
             )
             with loop_instance_lock(config, "hardware-loop"):
-                with optional_display_companion(config, enabled=_should_enable_display_companion(args.env_file)):
+                with optional_display_companion(
+                    config,
+                    enabled=_should_enable_display_companion(config, args.env_file),
+                ):
                     return loop.run(duration_s=args.loop_duration)
 
         if args.audio_file and backend is not None:

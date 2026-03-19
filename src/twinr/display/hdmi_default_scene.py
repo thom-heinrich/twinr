@@ -396,16 +396,29 @@ class HdmiDefaultSceneRenderer:
             face_box = (18, 70, 18 + face_box_width, content_bottom)
             panel_box = (face_box[2] + 14, 68, width - 18, content_bottom)
         else:
-            header_box = (24, 18, width - 24, 72)
+            content_left, content_right = self._content_frame_edges(width)
+            content_width = content_right - content_left
+            widescreen = width >= 1280
+            compact_hdmi = not widescreen and width >= 720
+            header_bottom = 60 if widescreen else 58 if compact_hdmi else 66
+            content_top = 78 if widescreen else 76 if compact_hdmi else 86
+            panel_gap = 34 if widescreen else 30 if compact_hdmi else 24
+            panel_width = (
+                min(620, max(420, int(content_width * 0.40)))
+                if widescreen
+                else min(336, max(316, int(content_width * 0.43)))
+                if compact_hdmi
+                else min(392, max(348, int(content_width * 0.46)))
+            )
+            header_box = (content_left, 18, content_right, header_bottom)
             if reserve_ticker:
-                ticker_box = (24, height - 74, width - 24, height - 24)
+                ticker_box = (content_left, height - 74, content_right, height - 24)
                 content_bottom = ticker_box[1] - 16
             else:
-                ticker_box = (24, height - 24, width - 24, height - 24)
+                ticker_box = (content_left, height - 24, content_right, height - 24)
                 content_bottom = height - 24
-            face_box_width = max(250, min(324, int(width * 0.39)))
-            face_box = (38, 90, 38 + face_box_width, content_bottom)
-            panel_box = (face_box[2] + 20, 90, width - 36, content_bottom)
+            panel_box = (content_right - panel_width, content_top, content_right, content_bottom)
+            face_box = (content_left + 8, content_top, panel_box[0] - panel_gap, content_bottom)
         compact_panel = self._should_use_compact_panel(panel_box=panel_box, reserve_ticker=reserve_ticker)
         return HdmiDefaultSceneLayout(
             header_box=header_box,
@@ -415,6 +428,18 @@ class HdmiDefaultSceneRenderer:
             ticker_reserved=reserve_ticker,
             compact_panel=compact_panel,
         )
+
+    def _content_frame_edges(self, width: int) -> tuple[int, int]:
+        """Return centered content bounds so widescreen HDMI does not stretch infinitely."""
+
+        if width >= 1280:
+            outer_padding = max(48, min(140, width // 20))
+            content_width = min(width - (outer_padding * 2), 1440)
+        else:
+            outer_padding = 24
+            content_width = width - (outer_padding * 2)
+        left = max(outer_padding, (width - content_width) // 2)
+        return (left, width - left)
 
     def _should_use_compact_panel(
         self,
@@ -928,7 +953,7 @@ class HdmiDefaultSceneRenderer:
         face_cue: DisplayFaceCue | None,
     ) -> None:
         left, top, right, bottom = box
-        scale = self._normalise_scale(min((right - left) / 220.0, (bottom - top) / 210.0))
+        scale = self._face_scale_for_box(box)
         center_x = (left + right) // 2
         center_y = top + ((bottom - top) // 2) - self._scaled_offset(6, scale)
         self._draw_face_features(
@@ -937,7 +962,7 @@ class HdmiDefaultSceneRenderer:
             center_y=center_y,
             status=status,
             animation_frame=animation_frame,
-            scale=max(0.56, min(scale, 1.55)),
+            scale=scale,
             face_cue=face_cue,
         )
 
@@ -952,8 +977,7 @@ class HdmiDefaultSceneRenderer:
         """Draw a tiny ornament for one active idle ambient moment."""
 
         left, top, right, bottom = box
-        scale = self._normalise_scale(min((right - left) / 220.0, (bottom - top) / 210.0))
-        scale = max(0.56, min(scale, 1.55))
+        scale = self._face_scale_for_box(box)
         center_x = (left + right) // 2
         center_y = top + ((bottom - top) // 2) - self._scaled_offset(6, scale)
         if ambient_moment.ornament == "heart":
@@ -1852,6 +1876,28 @@ class HdmiDefaultSceneRenderer:
             state["eye_shift_y"] = 2
             state["blink"] = frame == 3
         return self._apply_face_cue_to_eye_state(state, face_cue=face_cue)
+
+    def _face_scale_for_box(self, box: tuple[int, int, int, int]) -> float:
+        """Return the visible face scale for one face box, including widescreen growth."""
+
+        left, top, right, bottom = box
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+        scale = self._normalise_scale(min(width / 220.0, height / 210.0))
+        scale_cap = self._max_face_scale_for_box(box)
+        return max(0.56, min(scale, scale_cap))
+
+    def _max_face_scale_for_box(self, box: tuple[int, int, int, int]) -> float:
+        """Return the upper face-scale clamp for the current screen geometry."""
+
+        left, top, right, bottom = box
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+        if width >= 640 or height >= 720:
+            return 2.45
+        if width >= 420 or height >= 420:
+            return 1.95
+        return 1.55
 
     def _apply_face_cue_to_eye_state(
         self,

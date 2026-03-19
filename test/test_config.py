@@ -114,6 +114,18 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_wayland_display, "wayland-1")
         self.assertEqual(config.display_wayland_runtime_dir, "/run/user/1001")
 
+    def test_from_env_reads_display_companion_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "TWINR_DISPLAY_COMPANION_ENABLED=true\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertTrue(config.display_companion_enabled)
+
     def test_from_env_reads_display_face_cue_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -184,6 +196,42 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_news_ticker_max_items, 8)
         self.assertEqual(config.display_news_ticker_timeout_s, 3.5)
 
+    def test_from_env_reads_whatsapp_channel_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_WHATSAPP_ALLOW_FROM=+49 171 1234567",
+                        "TWINR_WHATSAPP_NODE_BINARY=/usr/bin/node",
+                        f"TWINR_WHATSAPP_AUTH_DIR={root / 'state' / 'channels' / 'whatsapp' / 'auth'}",
+                        f"TWINR_WHATSAPP_WORKER_ROOT={root / 'src' / 'twinr' / 'channels' / 'whatsapp' / 'worker'}",
+                        "TWINR_WHATSAPP_GROUPS_ENABLED=true",
+                        "TWINR_WHATSAPP_SELF_CHAT_MODE=true",
+                        "TWINR_WHATSAPP_RECONNECT_BASE_DELAY_S=3.5",
+                        "TWINR_WHATSAPP_RECONNECT_MAX_DELAY_S=44",
+                        "TWINR_WHATSAPP_SEND_TIMEOUT_S=25",
+                        "TWINR_WHATSAPP_SENT_CACHE_TTL_S=240",
+                        "TWINR_WHATSAPP_SENT_CACHE_MAX_ENTRIES=512",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.whatsapp_allow_from, "+49 171 1234567")
+        self.assertEqual(config.whatsapp_node_binary, "/usr/bin/node")
+        self.assertTrue(config.whatsapp_groups_enabled)
+        self.assertTrue(config.whatsapp_self_chat_mode)
+        self.assertEqual(config.whatsapp_reconnect_base_delay_s, 3.5)
+        self.assertEqual(config.whatsapp_reconnect_max_delay_s, 44.0)
+        self.assertEqual(config.whatsapp_send_timeout_s, 25.0)
+        self.assertEqual(config.whatsapp_sent_cache_ttl_s, 240.0)
+        self.assertEqual(config.whatsapp_sent_cache_max_entries, 512)
+
     def test_from_env_reads_local_camera_mediapipe_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -192,6 +240,7 @@ class TwinrConfigTests(unittest.TestCase):
                     [
                         "TWINR_PROACTIVE_LOCAL_CAMERA_POSE_BACKEND=mediapipe",
                         "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_POSE_MODEL_PATH=state/mediapipe/models/pose.task",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_HAND_LANDMARKER_MODEL_PATH=state/mediapipe/models/hand.task",
                         "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_GESTURE_MODEL_PATH=state/mediapipe/models/gesture.task",
                         "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_CUSTOM_GESTURE_MODEL_PATH=state/mediapipe/models/custom.task",
                         "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_NUM_HANDS=1",
@@ -209,6 +258,10 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(
             config.proactive_local_camera_mediapipe_pose_model_path,
             "state/mediapipe/models/pose.task",
+        )
+        self.assertEqual(
+            config.proactive_local_camera_mediapipe_hand_landmarker_model_path,
+            "state/mediapipe/models/hand.task",
         )
         self.assertEqual(
             config.proactive_local_camera_mediapipe_gesture_model_path,

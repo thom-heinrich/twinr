@@ -116,6 +116,95 @@ class LongTermMemoryConsolidatorTests(unittest.TestCase):
         self.assertEqual(result.deferred_objects[0].status, "uncertain")
         self.assertEqual(len(result.graph_edges), 0)
 
+    def test_observed_preference_requires_confirmation_even_when_confident(self) -> None:
+        consolidator = LongTermMemoryConsolidator(truth_maintainer=LongTermTruthMaintainer())
+        episode = LongTermMemoryObjectV1(
+            memory_id="episode:voice_pref",
+            kind="episode",
+            summary="Conversation turn recorded for long-term memory.",
+            details="Structured multimodal evidence.",
+            source=_source(),
+            status="candidate",
+            confidence=1.0,
+            slot_key="episode:voice-pref",
+            value_key="turn:voice-pref",
+        )
+        observed = LongTermMemoryObjectV1(
+            memory_id="preference:response_channel:voice:weekday:morning",
+            kind="summary",
+            summary="Voice replies may be preferred in the morning on weekdays.",
+            details="Observed ReSpeaker hypothesis.",
+            source=_source(),
+            status="candidate",
+            confidence=0.95,
+            slot_key="preference:response_channel:weekday:morning",
+            value_key="voice",
+            attributes={
+                "memory_class": "observed_preference",
+                "preference_type": "response_channel",
+                "preferred_channel": "voice",
+                "requires_confirmation": True,
+            },
+        )
+        extraction = LongTermTurnExtractionV1(
+            turn_id="turn:voice-pref",
+            occurred_at=datetime(2026, 3, 19, 9, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+            episode=episode,
+            candidate_objects=(observed,),
+            graph_edges=(),
+        )
+
+        result = consolidator.consolidate(extraction=extraction)
+
+        self.assertEqual(len(result.durable_objects), 0)
+        self.assertEqual(len(result.deferred_objects), 1)
+        self.assertEqual(result.deferred_objects[0].status, "candidate")
+
+    def test_confirmed_preference_can_promote_after_explicit_confirmation(self) -> None:
+        consolidator = LongTermMemoryConsolidator(truth_maintainer=LongTermTruthMaintainer())
+        episode = LongTermMemoryObjectV1(
+            memory_id="episode:voice_pref_confirmed",
+            kind="episode",
+            summary="Conversation turn recorded for long-term memory.",
+            details="Structured multimodal evidence.",
+            source=_source(),
+            status="candidate",
+            confidence=1.0,
+            slot_key="episode:voice-pref-confirmed",
+            value_key="turn:voice-pref-confirmed",
+        )
+        confirmed = LongTermMemoryObjectV1(
+            memory_id="preference:response_channel:voice:weekday:morning",
+            kind="summary",
+            summary="The user confirmed that voice replies are preferred in the morning on weekdays.",
+            details="Explicit user confirmation was captured.",
+            source=_source(),
+            status="candidate",
+            confidence=0.95,
+            confirmed_by_user=True,
+            slot_key="preference:response_channel:weekday:morning",
+            value_key="voice",
+            attributes={
+                "memory_class": "confirmed_preference",
+                "preference_type": "response_channel",
+                "preferred_channel": "voice",
+                "requires_confirmation": False,
+            },
+        )
+        extraction = LongTermTurnExtractionV1(
+            turn_id="turn:voice-pref-confirmed",
+            occurred_at=datetime(2026, 3, 19, 9, 5, tzinfo=ZoneInfo("Europe/Berlin")),
+            episode=episode,
+            candidate_objects=(confirmed,),
+            graph_edges=(),
+        )
+
+        result = consolidator.consolidate(extraction=extraction)
+
+        self.assertEqual(len(result.deferred_objects), 0)
+        self.assertEqual(len(result.durable_objects), 1)
+        self.assertEqual(result.durable_objects[0].status, "active")
+
 
 if __name__ == "__main__":
     unittest.main()

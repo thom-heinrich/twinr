@@ -53,6 +53,7 @@ from twinr.ops.remote_memory_watchdog import (
     RemoteMemoryWatchdogStore,
 )
 from twinr.web import create_app
+from twinr.web.support.channel_onboarding import ChannelPairingSnapshot
 
 
 class _WarningQuietTestClient(TestClient):
@@ -95,6 +96,14 @@ def _voice_sample_wav_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0
     return buffer.getvalue()
 
 
+def _write_whatsapp_worker_package(project_root: Path) -> Path:
+    worker_root = project_root / "src" / "twinr" / "channels" / "whatsapp" / "worker"
+    worker_root.mkdir(parents=True, exist_ok=True)
+    (worker_root / "package.json").write_text("{\"name\": \"worker\"}\n", encoding="utf-8")
+    (worker_root / "index.mjs").write_text("console.log('worker');\n", encoding="utf-8")
+    return worker_root
+
+
 class WebAppTests(unittest.TestCase):
     def make_client(
         self,
@@ -126,6 +135,12 @@ class WebAppTests(unittest.TestCase):
         (personality_dir / "PERSONALITY.md").write_text("Personality text\n", encoding="utf-8")
         (personality_dir / "USER.md").write_text("User text\n", encoding="utf-8")
         return _WarningQuietTestClient(create_app(env_path), base_url=base_url, client=(client_host, 50000)), env_path
+
+    def _mock_whatsapp_node_ready(self, version: str = "v20.20.1"):
+        return patch(
+            "twinr.web.support.whatsapp.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout=f"{version}\n", stderr=""),
+        )
 
     def test_dashboard_renders_summary(self) -> None:
         client, _env_path = self.make_client()
@@ -263,6 +278,40 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(dashboard.status_code, 200)
         self.assertIn("Dashboard", dashboard.text)
+
+    def test_whatsapp_runtime_step_accepts_https_proxy_same_origin_headers(self) -> None:
+        client, env_path = self.make_client(
+            extra_env={
+                "TWINR_WEB_ALLOWED_HOSTS": "192.168.1.95",
+            },
+            base_url="http://192.168.1.95",
+            client_host="127.0.0.1",
+        )
+
+        response = client.post(
+            "/connect/whatsapp",
+            data={
+                "_action": "save_runtime",
+                "TWINR_WHATSAPP_NODE_BINARY": "/twinr/state/tools/node-v20.20.1-linux-arm64/bin/node",
+                "TWINR_WHATSAPP_AUTH_DIR": "state/channels/whatsapp/auth",
+            },
+            headers={
+                "host": "192.168.1.95",
+                "origin": "https://192.168.1.95",
+                "referer": "https://192.168.1.95/connect/whatsapp?step=runtime",
+                "x-forwarded-proto": "https",
+                "x-forwarded-host": "192.168.1.95",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/connect/whatsapp?saved=1&step=pairing")
+        env_text = env_path.read_text(encoding="utf-8")
+        self.assertIn(
+            "TWINR_WHATSAPP_NODE_BINARY=/twinr/state/tools/node-v20.20.1-linux-arm64/bin/node",
+            env_text,
+        )
 
     def test_dashboard_renders_self_coding_status_summary(self) -> None:
         client, env_path = self.make_client()
@@ -697,10 +746,182 @@ class WebAppTests(unittest.TestCase):
         response = client.get("/connect")
 
         self.assertEqual(response.status_code, 200)
+        self.assertIn("Open WhatsApp wizard", response.text)
         self.assertIn("field-tooltip", response.text)
         self.assertIn("The main OpenAI secret used for chat, speech, vision, and realtime requests.", response.text)
         self.assertIn("Controls which backend answers normal text questions.", response.text)
         self.assertIn("(?)", response.text)
+
+    def test_whatsapp_wizard_renders_setup_flow(self) -> None:
+        client, _env_path = self.make_client()
+
+        with self._mock_whatsapp_node_ready():
+            response = client.get("/connect/whatsapp")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("WhatsApp self-chat wizard", response.text)
+        self.assertIn("Choose your own WhatsApp chat", response.text)
+        self.assertIn("Prepare the worker runtime", response.text)
+        self.assertIn("Pair WhatsApp once", response.text)
+        self.assertIn("Manual fallback on the Pi", response.text)
+        self.assertEqual(response.text.count("WhatsApp self-chat wizard"), 1)
+
+    def test_whatsapp_wizard_post_saves_chat_step_and_guardrails(self) -> None:
+        client, env_path = self.make_client()
+
+        response = client.post(
+            "/connect/whatsapp",
+            data={
+                "_action": "save_chat",
+                "TWINR_WHATSAPP_ALLOW_FROM": "+49 171 1234567",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/connect/whatsapp?saved=1&step=runtime")
+        env_text = env_path.read_text(encoding="utf-8")
+        self.assertIn("TWINR_WHATSAPP_ALLOW_FROM=+491711234567", env_text)
+        self.assertIn("TWINR_WHATSAPP_SELF_CHAT_MODE=true", env_text)
+        self.assertIn("TWINR_WHATSAPP_GROUPS_ENABLED=false", env_text)
+
+    def test_whatsapp_wizard_post_saves_runtime_step(self) -> None:
+        client, env_path = self.make_client()
+
+        response = client.post(
+            "/connect/whatsapp",
+            data={
+                "_action": "save_runtime",
+                "TWINR_WHATSAPP_NODE_BINARY": "/opt/node-v20/bin/node",
+                "TWINR_WHATSAPP_AUTH_DIR": "state/channels/whatsapp/auth",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/connect/whatsapp?saved=1&step=pairing")
+        env_text = env_path.read_text(encoding="utf-8")
+        self.assertIn("TWINR_WHATSAPP_NODE_BINARY=/opt/node-v20/bin/node", env_text)
+        self.assertIn("TWINR_WHATSAPP_AUTH_DIR=state/channels/whatsapp/auth", env_text)
+
+    def test_whatsapp_wizard_shows_paired_state_when_creds_exist(self) -> None:
+        client, env_path = self.make_client(
+            extra_env={
+                "TWINR_WHATSAPP_ALLOW_FROM": "+491711234567",
+                "TWINR_WHATSAPP_SELF_CHAT_MODE": "1",
+                "TWINR_WHATSAPP_GROUPS_ENABLED": "0",
+                "TWINR_WHATSAPP_AUTH_DIR": "state/channels/whatsapp/auth",
+            }
+        )
+        auth_dir = env_path.parent / "state" / "channels" / "whatsapp" / "auth"
+        auth_dir.mkdir(parents=True, exist_ok=True)
+        (auth_dir / "creds.json").write_text("{}", encoding="utf-8")
+        _write_whatsapp_worker_package(env_path.parent)
+
+        with self._mock_whatsapp_node_ready():
+            response = client.get("/connect/whatsapp")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Stored linked-device session found", response.text)
+        self.assertIn("Twinr is configured for one self-chat", response.text)
+        self.assertIn("Paired", response.text)
+
+    def test_whatsapp_wizard_post_starts_pairing_window_from_ui(self) -> None:
+        client, env_path = self.make_client(
+            extra_env={
+                "TWINR_WHATSAPP_ALLOW_FROM": "+491711234567",
+                "TWINR_WHATSAPP_SELF_CHAT_MODE": "1",
+                "TWINR_WHATSAPP_GROUPS_ENABLED": "0",
+            }
+        )
+        _write_whatsapp_worker_package(env_path.parent)
+
+        with self._mock_whatsapp_node_ready():
+            with patch("twinr.web.app.WhatsAppPairingCoordinator.start_pairing", return_value=True) as start_mock:
+                response = client.post(
+                    "/connect/whatsapp",
+                    data={"_action": "start_pairing"},
+                    follow_redirects=False,
+                )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/connect/whatsapp?step=pairing")
+        start_mock.assert_called_once()
+
+    def test_whatsapp_wizard_shows_live_qr_status_and_auto_refresh(self) -> None:
+        client, env_path = self.make_client(
+            extra_env={
+                "TWINR_WHATSAPP_ALLOW_FROM": "+491711234567",
+                "TWINR_WHATSAPP_SELF_CHAT_MODE": "1",
+                "TWINR_WHATSAPP_GROUPS_ENABLED": "0",
+            }
+        )
+        _write_whatsapp_worker_package(env_path.parent)
+
+        live_snapshot = ChannelPairingSnapshot(
+            channel_id="whatsapp",
+            phase="qr_needed",
+            summary="QR needed",
+            detail="A fresh QR is ready below.",
+            running=True,
+            qr_needed=True,
+            qr_svg="<svg viewBox='0 0 10 10'></svg>",
+            worker_ready=True,
+            last_worker_detail="worker_ready",
+            updated_at="2026-03-19T12:00:00+00:00",
+            started_at="2026-03-19T11:59:00+00:00",
+        )
+
+        with self._mock_whatsapp_node_ready():
+            with patch("twinr.web.app.WhatsAppPairingCoordinator.load_snapshot", return_value=live_snapshot):
+                response = client.get("/connect/whatsapp")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('http-equiv="refresh"', response.text)
+        self.assertIn('content="3"', response.text)
+        self.assertIn("QR needed", response.text)
+        self.assertIn("A fresh QR is ready below", response.text)
+        self.assertIn("Scan this QR with WhatsApp", response.text)
+        self.assertIn("data:image/svg+xml;base64,", response.text)
+        self.assertIn("A pairing window is already active", response.text)
+
+    def test_whatsapp_wizard_surfaces_auth_repair_needed(self) -> None:
+        client, env_path = self.make_client(
+            extra_env={
+                "TWINR_WHATSAPP_ALLOW_FROM": "+491711234567",
+                "TWINR_WHATSAPP_SELF_CHAT_MODE": "1",
+                "TWINR_WHATSAPP_GROUPS_ENABLED": "0",
+                "TWINR_WHATSAPP_AUTH_DIR": "state/channels/whatsapp/auth",
+            }
+        )
+        auth_dir = env_path.parent / "state" / "channels" / "whatsapp" / "auth"
+        auth_dir.mkdir(parents=True, exist_ok=True)
+        (auth_dir / "creds.json").write_text("{}", encoding="utf-8")
+        _write_whatsapp_worker_package(env_path.parent)
+
+        repair_snapshot = ChannelPairingSnapshot(
+            channel_id="whatsapp",
+            phase="failed",
+            summary="Auth repair needed",
+            detail="The stored WhatsApp session is no longer valid. Start a fresh pairing window and scan the next QR.",
+            fatal=True,
+            auth_repair_needed=True,
+            worker_ready=True,
+            last_worker_detail="badSession",
+            last_reconnect_reason="badSession",
+            updated_at="2026-03-19T12:00:00+00:00",
+            finished_at="2026-03-19T12:00:00+00:00",
+        )
+
+        with self._mock_whatsapp_node_ready():
+            with patch("twinr.web.app.WhatsAppPairingCoordinator.load_snapshot", return_value=repair_snapshot):
+                response = client.get("/connect/whatsapp")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Needs repair", response.text)
+        self.assertIn("Auth repair needed", response.text)
+        self.assertIn("badSession", response.text)
+        self.assertIn("Start fresh pairing window", response.text)
 
     def test_integrations_page_renders_mail_and_calendar_forms(self) -> None:
         client, _env_path = self.make_client()
@@ -709,6 +930,9 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Integration overview", response.text)
+        self.assertIn("WhatsApp self-chat", response.text)
+        self.assertIn("Open WhatsApp wizard", response.text)
+        self.assertIn("/connect/whatsapp", response.text)
         self.assertIn("Save email integration", response.text)
         self.assertIn("Save calendar integration", response.text)
         self.assertIn("Gmail", response.text)
@@ -741,7 +965,7 @@ class WebAppTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 303)
         env_text = env_path.read_text(encoding="utf-8")
-        self.assertIn('TWINR_INTEGRATION_EMAIL_APP_PASSWORD="abcd efgh ijkl mnop"', env_text)
+        self.assertIn("TWINR_INTEGRATION_EMAIL_APP_PASSWORD=abcdefghijklmnop", env_text)
         record = TwinrIntegrationStore.from_project_root(env_path.parent).get("email_mailbox")
         self.assertTrue(record.enabled)
         self.assertEqual(record.value("imap_host"), "imap.gmail.com")
@@ -1744,6 +1968,138 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Lea bringt heute Abend Linsensuppe vorbei.", response.text)
         self.assertIn("midterm:lea_soup", response.text)
         self.assertIn("Graph context preview", response.text)
+
+    def test_ops_debug_page_renders_conversation_lab_tab(self) -> None:
+        client, _env_path = self.make_client()
+
+        response = client.get("/ops/debug?tab=conversation_lab")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Conversation Lab", response.text)
+        self.assertIn("New Session", response.text)
+        self.assertIn("Send Turn", response.text)
+        self.assertIn("No portal conversation turns are stored yet.", response.text)
+        self.assertIn("/ops/debug/conversation-lab/send", response.text)
+
+    def test_ops_debug_page_renders_conversation_lab_session_traces(self) -> None:
+        client, _env_path = self.make_client()
+        fake_search_snapshot = {
+            "query": "Lea Linsensuppe",
+            "status": {"label": "2 hits", "detail": "durable 1 · episodic 0 · midterm 1 · conflicts 0", "status": "ok"},
+            "summary_rows": (
+                {"label": "Query", "value": "Lea Linsensuppe", "detail": None, "status": "muted", "copy": True, "wide": True},
+            ),
+            "sections": (
+                {
+                    "title": "Durable memory",
+                    "description": "Stable facts and structured long-term objects that matched the query.",
+                    "empty_message": "No durable facts matched this query.",
+                    "items": (
+                        {
+                            "badge": "fact",
+                            "level": "ok",
+                            "title": "Lea bringt morgen Suppe vorbei.",
+                            "time": "2026-03-19T11:30:00Z",
+                            "body": "Um 19 Uhr mit einer Thermoskanne.",
+                            "meta_lines": ("memory_id=fact:lea_visit",),
+                        },
+                    ),
+                },
+            ),
+            "context_blocks": (),
+        }
+        fake_state = {
+            "sessions": (
+                {
+                    "session_id": "session_20260319",
+                    "title": "Lea soup",
+                    "updated_at": "2026-03-19T11:30:00Z",
+                    "turn_count": 1,
+                    "status": "ok",
+                },
+            ),
+            "active_session": {
+                "session_id": "session_20260319",
+                "title": "Lea soup",
+                "created_at": "2026-03-19T11:29:00Z",
+                "updated_at": "2026-03-19T11:30:00Z",
+                "turns": (
+                    {
+                        "created_at": "2026-03-19T11:30:00Z",
+                        "status": "ok",
+                        "status_badge": {"label": "Completed", "status": "ok"},
+                        "prompt": "Lea kommt morgen um 19 Uhr vorbei.",
+                        "response": "Ich merke mir das und erinnere dich gern daran.",
+                        "result_rows": (
+                            {"label": "Model", "value": "gpt-5.2", "detail": None, "status": "muted", "copy": False, "wide": False},
+                        ),
+                        "route_items": (
+                            {
+                                "badge": "decision",
+                                "level": "ok",
+                                "title": "Dual Lane Final Path Selected",
+                                "time": None,
+                                "body": "Run resolved direct supervisor path",
+                                "meta_lines": ("action: direct",),
+                            },
+                        ),
+                        "tool_items": (
+                            {
+                                "badge": "remember_memory",
+                                "level": "ok",
+                                "title": "Remember Memory",
+                                "time": None,
+                                "body": "Stored a new durable memory entry.",
+                                "meta_lines": ("status: stored",),
+                            },
+                        ),
+                        "telemetry_items": (),
+                        "memory_rows": (
+                            {"label": "Flush result", "value": "ok", "detail": None, "status": "ok", "copy": False, "wide": False},
+                        ),
+                        "retrieval_before": fake_search_snapshot,
+                        "retrieval_after": fake_search_snapshot,
+                    },
+                ),
+            },
+            "missing_session": False,
+        }
+
+        with patch("twinr.web.app.load_conversation_lab_state", return_value=fake_state):
+            response = client.get("/ops/debug?tab=conversation_lab&lab_session=session_20260319")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Routing And Model Path", response.text)
+        self.assertIn("Tool Activity", response.text)
+        self.assertIn("Memory Write", response.text)
+        self.assertIn("Retrieval Before Turn", response.text)
+        self.assertIn("Retrieval After Turn", response.text)
+        self.assertIn("Lea kommt morgen um 19 Uhr vorbei.", response.text)
+        self.assertIn("Ich merke mir das und erinnere dich gern daran.", response.text)
+        self.assertIn("Lea soup", response.text)
+
+    def test_ops_debug_conversation_lab_routes_redirect_to_session(self) -> None:
+        client, _env_path = self.make_client()
+
+        with patch("twinr.web.app.create_conversation_lab_session", return_value="session_new"):
+            new_response = client.post(
+                "/ops/debug/conversation-lab/new",
+                data={},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(new_response.status_code, 303)
+        self.assertEqual(new_response.headers["location"], "/ops/debug?tab=conversation_lab&lab_session=session_new")
+
+        with patch("twinr.web.app.run_conversation_lab_turn", return_value="session_updated"):
+            send_response = client.post(
+                "/ops/debug/conversation-lab/send",
+                data={"session_id": "session_old", "prompt": "Bitte teste die neue Portal-Konversation."},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(send_response.status_code, 303)
+        self.assertEqual(send_response.headers["location"], "/ops/debug?tab=conversation_lab&lab_session=session_updated")
 
     def test_ops_debug_page_renders_chonkydb_tab(self) -> None:
         client, env_path = self.make_client()

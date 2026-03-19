@@ -20,8 +20,19 @@ import time
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware import GpioPirMonitor, V4L2StillCamera, configured_pir_monitor
-from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioSampler, pcm16_to_wav_bytes
-from twinr.hardware.respeaker import config_targets_respeaker
+from twinr.hardware.audio import (
+    AmbientAudioCaptureWindow,
+    AmbientAudioSampler,
+    AudioCaptureReadinessError,
+    AudioCaptureReadinessProbe,
+    pcm16_to_wav_bytes,
+)
+from twinr.hardware.respeaker import (
+    build_respeaker_claim_payloads,
+    config_targets_respeaker,
+    resolve_respeaker_indicator_state,
+    ScheduledReSpeakerSignalProvider,
+)
 from twinr.hardware.respeaker.signal_provider import ReSpeakerSignalProvider
 from twinr.ops.paths import resolve_ops_paths_for_config
 from twinr.providers.openai import OpenAIBackend
@@ -41,8 +52,27 @@ from ..wakeword.matching import WakewordMatch, WakewordPhraseSpotter
 from ..wakeword.policy import SttWakewordVerifier, WakewordDecision, WakewordDecisionPolicy, normalize_wakeword_backend
 from ..wakeword.spotter import WakewordOpenWakeWordSpotter
 from ..wakeword.stream import OpenWakeWordStreamingMonitor, WakewordStreamDetection
+from .affect_proxy import AffectProxySnapshot, derive_affect_proxy
+from .ambiguous_room_guard import (
+    AmbiguousRoomGuardSnapshot,
+    derive_ambiguous_room_guard,
+)
 from .audio_policy import ReSpeakerAudioPolicySnapshot, ReSpeakerAudioPolicyTracker
+from .known_user_hint import KnownUserHintSnapshot, derive_known_user_hint
+from .multimodal_initiative import (
+    ReSpeakerMultimodalInitiativeSnapshot,
+    derive_respeaker_multimodal_initiative,
+)
 from .presence import PresenceSessionController, PresenceSessionSnapshot
+from .runtime_contract import (
+    ReSpeakerRuntimeContractError,
+    assess_respeaker_monitor_startup_contract,
+    is_respeaker_runtime_hard_block,
+)
+from .speaker_association import (
+    ReSpeakerSpeakerAssociationSnapshot,
+    derive_respeaker_speaker_association,
+)
 
 if TYPE_CHECKING:
     from twinr.agent.base_agent.runtime import TwinrRuntime
@@ -152,6 +182,113 @@ def _format_firmware_version(version: tuple[int, int, int] | None) -> str | None
     if version is None:
         return None
     return ".".join(str(int(part)) for part in version)
+
+
+def _respeaker_capture_probe_duration_ms(config: TwinrConfig) -> int:
+    """Return a short bounded capture probe window for ReSpeaker startup checks."""
+
+    chunk_ms = max(20, int(getattr(config, "audio_chunk_ms", 100) or 100))
+    requested_ms = max(chunk_ms, int(getattr(config, "proactive_audio_sample_ms", chunk_ms) or chunk_ms))
+    return min(requested_ms, max(250, chunk_ms * 3))
+
+
+def _respeaker_dead_capture_payload(
+    *,
+    probe: AudioCaptureReadinessProbe,
+    stage: str,
+    signal: object | None = None,
+) -> dict[str, Any]:
+    """Build one ops-safe payload for unreadable ReSpeaker capture failures."""
+
+    payload: dict[str, Any] = {
+        "stage": stage,
+        "capture_device": probe.device,
+        "capture_sample_rate": probe.sample_rate,
+        "capture_channels": probe.channels,
+        "capture_chunk_ms": probe.chunk_ms,
+        "capture_probe_duration_ms": probe.duration_ms,
+        "capture_probe_target_chunk_count": probe.target_chunk_count,
+        "capture_probe_chunk_count": probe.captured_chunk_count,
+        "capture_probe_bytes": probe.captured_bytes,
+        "capture_probe_ready": probe.ready,
+        "capture_probe_failure_reason": probe.failure_reason,
+        "capture_probe_detail": probe.detail,
+        "transport_reason": "capture_unreadable",
+    }
+    if signal is not None:
+        payload.update(
+            {
+                "device_runtime_mode": getattr(signal, "device_runtime_mode", None),
+                "host_control_ready": getattr(signal, "host_control_ready", None),
+                "transport_reason": getattr(signal, "transport_reason", None) or "capture_unreadable",
+                "firmware_version": _format_firmware_version(getattr(signal, "firmware_version", None)),
+            }
+        )
+    return payload
+
+
+def _record_respeaker_dead_capture_blocker(
+    *,
+    runtime: TwinrRuntime,
+    emit: Callable[[str], None] | None,
+    probe: AudioCaptureReadinessProbe,
+    stage: str,
+    signal: object | None = None,
+) -> str:
+    """Emit explicit alert/blocker events when ReSpeaker capture yields no frames."""
+
+    payload = _respeaker_dead_capture_payload(
+        probe=probe,
+        stage=stage,
+        signal=signal,
+    )
+    detail = (
+        "ReSpeaker XVF3800 is enumerated, but the configured capture path yielded no readable "
+        f"audio frames. {probe.detail or 'Twinr refuses to treat this path as ready.'}"
+    )
+    _safe_emit(emit, "respeaker_runtime_alert=capture_unknown")
+    _append_ops_event(
+        runtime,
+        event="respeaker_runtime_alert",
+        level="error",
+        message=detail,
+        data={
+            **payload,
+            "alert_code": "capture_unknown",
+        },
+        emit=emit,
+    )
+    _safe_emit(emit, "respeaker_runtime_blocker=dead_capture")
+    _append_ops_event(
+        runtime,
+        event="respeaker_runtime_blocker",
+        level="error",
+        message="ReSpeaker capture is unreadable even though the device still enumerates.",
+        data={
+            **payload,
+            "alert_code": "dead_capture",
+            "blocker_code": "dead_capture",
+        },
+        emit=emit,
+    )
+    _append_ops_event(
+        runtime,
+        event="proactive_component_blocked",
+        level="error",
+        message="ReSpeaker unreadable capture blocked the proactive audio path.",
+        data={
+            **payload,
+            "reason": (
+                "respeaker_dead_capture_blocked"
+                if stage == "startup"
+                else "respeaker_dead_capture_runtime_blocked"
+            ),
+            "detail": detail,
+            "blocker_code": "dead_capture",
+        },
+        emit=emit,
+    )
+    return detail
 
 
 def _assistant_output_active(runtime: TwinrRuntime) -> bool:
@@ -316,10 +453,20 @@ class ProactiveCoordinator:
         self._quiet_since: float | None = None
         self._last_presence_key: tuple[object, ...] | None = None
         self._last_respeaker_runtime_alert_code: str | None = None
+        self._last_respeaker_runtime_blocker_code: str | None = None
+        self._respeaker_targeted = config_targets_respeaker(
+            getattr(config, "audio_input_device", None),
+            getattr(config, "proactive_audio_input_device", None),
+        )
         self._last_wakeword_attempt_at: float | None = None
         self._last_possible_fall_prompted_session_id: int | None = None
         self.latest_presence_snapshot: PresenceSessionSnapshot | None = None
         self.latest_audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None = None
+        self.latest_speaker_association_snapshot: ReSpeakerSpeakerAssociationSnapshot | None = None
+        self.latest_multimodal_initiative_snapshot: ReSpeakerMultimodalInitiativeSnapshot | None = None
+        self.latest_ambiguous_room_guard_snapshot: AmbiguousRoomGuardSnapshot | None = None
+        self.latest_known_user_hint_snapshot: KnownUserHintSnapshot | None = None
+        self.latest_affect_proxy_snapshot: AffectProxySnapshot | None = None
         self.audio_policy_tracker = ReSpeakerAudioPolicyTracker.from_config(config)
 
     # AUDIT-FIX(#1): Route all module-local emits through a non-throwing wrapper.
@@ -383,6 +530,8 @@ class ProactiveCoordinator:
                 message="Ambient audio observation failed; using a null audio snapshot for this tick.",
                 error=exc,
             )
+            if self._respeaker_targeted and isinstance(exc, AudioCaptureReadinessError):
+                self._block_respeaker_dead_capture(exc)
             try:
                 return self._null_audio_observer.observe()
             except Exception as fallback_exc:
@@ -539,7 +688,9 @@ class ProactiveCoordinator:
         self._dispatch_automation_observation(
             observation,
             inspected=False,
+            audio_snapshot=audio_snapshot,
             audio_policy_snapshot=audio_policy_snapshot,
+            presence_snapshot=presence_snapshot,
         )
         self._record_observation_if_changed(
             observation,
@@ -601,13 +752,20 @@ class ProactiveCoordinator:
             )
             return ProactiveTickResult()
 
+        proactive_enabled = self._proactive_triggers_enabled()
+        inspect_requested = self._should_inspect(now, motion_active=motion_active)
+        self._note_audio_observer_runtime_context(
+            now=now,
+            motion_active=motion_active,
+            inspect_requested=inspect_requested,
+            runtime_status_value="waiting",
+        )
         audio_snapshot = self._observe_audio_safe()
         audio_policy_snapshot = self._observe_audio_policy(
             now=now,
             audio_observation=audio_snapshot.observation,
         )
-        proactive_enabled = self._proactive_triggers_enabled()
-        if not self._should_inspect(now, motion_active=motion_active):
+        if not inspect_requested:
             return self._run_without_inspection(
                 now=now,
                 motion_active=motion_active,
@@ -622,6 +780,7 @@ class ProactiveCoordinator:
                 now=now,
                 motion_active=motion_active,
                 audio_snapshot=audio_snapshot,
+                audio_policy_snapshot=audio_policy_snapshot,
                 proactive_enabled=proactive_enabled,
             )
 
@@ -647,7 +806,9 @@ class ProactiveCoordinator:
         self._dispatch_automation_observation(
             observation,
             inspected=True,
+            audio_snapshot=audio_snapshot,
             audio_policy_snapshot=audio_policy_snapshot,
+            presence_snapshot=presence_snapshot,
         )
         self._record_observation_if_changed(
             observation,
@@ -701,6 +862,12 @@ class ProactiveCoordinator:
     ) -> ProactiveTickResult:
         """Record bounded audio-only facts while Twinr is busy speaking."""
 
+        self._note_audio_observer_runtime_context(
+            now=now,
+            motion_active=motion_active,
+            inspect_requested=False,
+            runtime_status_value=runtime_status_value,
+        )
         audio_snapshot = self._observe_audio_safe()
         audio_policy_snapshot = self._observe_audio_policy(
             now=now,
@@ -1293,6 +1460,30 @@ class ProactiveCoordinator:
             return False  # AUDIT-FIX(#4): do not infer "low motion" before any real motion history exists, especially when PIR hardware is missing or has not fired yet.
         return (now - self._last_motion_at) >= self.config.proactive_low_motion_after_s
 
+    def _note_audio_observer_runtime_context(
+        self,
+        *,
+        now: float,
+        motion_active: bool,
+        inspect_requested: bool,
+        runtime_status_value: str,
+    ) -> None:
+        """Forward current runtime context to schedulable audio observers."""
+
+        callback = getattr(self.audio_observer, "note_runtime_context", None)
+        if not callable(callback):
+            return
+        presence_snapshot = self.latest_presence_snapshot
+        callback(
+            observed_at=now,
+            motion_active=motion_active,
+            inspect_requested=inspect_requested,
+            presence_session_armed=bool(
+                presence_snapshot is not None and getattr(presence_snapshot, "armed", False)
+            ),
+            assistant_output_active=runtime_status_value == "answering",
+        )
+
     def _observe_audio_policy(
         self,
         *,
@@ -1358,6 +1549,19 @@ class ProactiveCoordinator:
             None if presence_snapshot is None else presence_snapshot.armed,
             None if presence_snapshot is None else presence_snapshot.reason,
             presence_session_id,
+            None if self.latest_speaker_association_snapshot is None else self.latest_speaker_association_snapshot.state,
+            None if self.latest_speaker_association_snapshot is None else self.latest_speaker_association_snapshot.associated,
+            None if self.latest_speaker_association_snapshot is None else self.latest_speaker_association_snapshot.confidence,
+            None if self.latest_multimodal_initiative_snapshot is None else self.latest_multimodal_initiative_snapshot.ready,
+            None if self.latest_multimodal_initiative_snapshot is None else self.latest_multimodal_initiative_snapshot.confidence,
+            None if self.latest_multimodal_initiative_snapshot is None else self.latest_multimodal_initiative_snapshot.block_reason,
+            None if self.latest_ambiguous_room_guard_snapshot is None else self.latest_ambiguous_room_guard_snapshot.guard_active,
+            None if self.latest_ambiguous_room_guard_snapshot is None else self.latest_ambiguous_room_guard_snapshot.reason,
+            None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.state,
+            None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.matches_main_user,
+            None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.claim.confidence,
+            None if self.latest_affect_proxy_snapshot is None else self.latest_affect_proxy_snapshot.state,
+            None if self.latest_affect_proxy_snapshot is None else self.latest_affect_proxy_snapshot.claim.confidence,
         )
         if observation_key == self._last_observation_key:
             return
@@ -1370,6 +1574,13 @@ class ProactiveCoordinator:
                 observation.audio,
                 audio_policy_snapshot=audio_policy_snapshot,
             )
+        indicator_state = resolve_respeaker_indicator_state(
+            runtime_status=runtime_status_value,
+            runtime_alert_code=(
+                None if audio_policy_snapshot is None else audio_policy_snapshot.runtime_alert_code
+            ),
+            mute_active=observation.audio.mute_active,
+        )
         data = {
             "inspected": inspected,
             "runtime_status": runtime_status_value,
@@ -1396,7 +1607,19 @@ class ProactiveCoordinator:
             "audio_speech_overlap_likely": observation.audio.speech_overlap_likely,
             "audio_barge_in_detected": observation.audio.barge_in_detected,
             "audio_mute_active": observation.audio.mute_active,
+            "audio_indicator_mode": indicator_state.mode,
+            "audio_indicator_semantics": indicator_state.semantics,
         }
+        if self.latest_speaker_association_snapshot is not None:
+            data.update(self.latest_speaker_association_snapshot.event_data())
+        if self.latest_multimodal_initiative_snapshot is not None:
+            data.update(self.latest_multimodal_initiative_snapshot.event_data())
+        if self.latest_ambiguous_room_guard_snapshot is not None:
+            data.update(self.latest_ambiguous_room_guard_snapshot.event_data())
+        if self.latest_known_user_hint_snapshot is not None:
+            data.update(self.latest_known_user_hint_snapshot.event_data())
+        if self.latest_affect_proxy_snapshot is not None:
+            data.update(self.latest_affect_proxy_snapshot.event_data())
         if audio_policy_snapshot is not None:
             data.update(
                 {
@@ -1552,6 +1775,73 @@ class ProactiveCoordinator:
                 "mute_active": audio.mute_active,
             },
         )
+        self._record_respeaker_runtime_blocker_if_changed(
+            alert_code=alert_code,
+            message=message,
+            audio=audio,
+        )
+
+    def _record_respeaker_runtime_blocker_if_changed(
+        self,
+        *,
+        alert_code: str,
+        message: str,
+        audio: SocialAudioObservation,
+    ) -> None:
+        """Emit explicit hard-block lifecycle events for DFU runtime states."""
+
+        if is_respeaker_runtime_hard_block(alert_code):
+            if alert_code == self._last_respeaker_runtime_blocker_code:
+                return
+            self._last_respeaker_runtime_blocker_code = alert_code
+            self._emit(f"respeaker_runtime_blocker={alert_code}")
+            self._append_ops_event(
+                event="respeaker_runtime_blocker",
+                level="error",
+                message=message,
+                data={
+                    "alert_code": alert_code,
+                    "device_runtime_mode": audio.device_runtime_mode,
+                    "host_control_ready": audio.host_control_ready,
+                    "transport_reason": audio.transport_reason,
+                    "mute_active": audio.mute_active,
+                },
+            )
+            return
+
+        if self._last_respeaker_runtime_blocker_code is None:
+            return
+        cleared_code = self._last_respeaker_runtime_blocker_code
+        self._last_respeaker_runtime_blocker_code = None
+        self._emit(f"respeaker_runtime_blocker_cleared={cleared_code}")
+        self._append_ops_event(
+            event="respeaker_runtime_blocker_cleared",
+            message="ReSpeaker hard runtime blocker cleared and capture is usable again.",
+            data={
+                "cleared_alert_code": cleared_code,
+                "current_alert_code": alert_code,
+                "device_runtime_mode": audio.device_runtime_mode,
+                "host_control_ready": audio.host_control_ready,
+            },
+        )
+
+    def _block_respeaker_dead_capture(self, error: AudioCaptureReadinessError) -> None:
+        """Fail closed on unreadable ReSpeaker capture during live monitoring."""
+
+        self.audio_observer = self._null_audio_observer
+        self._audio_observer_fallback_factory = None
+        if self._last_respeaker_runtime_blocker_code == "dead_capture":
+            self._last_respeaker_runtime_alert_code = "capture_unknown"
+            return
+        _record_respeaker_dead_capture_blocker(
+            runtime=self.runtime,
+            emit=self.emit,
+            probe=error.probe,
+            stage="runtime",
+            signal=None,
+        )
+        self._last_respeaker_runtime_alert_code = "capture_unknown"
+        self._last_respeaker_runtime_blocker_code = "dead_capture"
 
     def _record_wakeword_attempt(
         self,
@@ -1891,7 +2181,9 @@ class ProactiveCoordinator:
         observation: SocialObservation,
         *,
         inspected: bool,
+        audio_snapshot=None,
         audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
+        presence_snapshot: PresenceSessionSnapshot | None,
     ) -> None:
         """Publish one normalized observation to the automation observer hook."""
 
@@ -1902,8 +2194,10 @@ class ProactiveCoordinator:
             facts = self._build_automation_facts(
                 observation,
                 inspected=inspected,
+                audio_snapshot=audio_snapshot,
                 camera_snapshot=camera_update.snapshot,
                 audio_policy_snapshot=audio_policy_snapshot,
+                presence_snapshot=presence_snapshot,
             )
             event_names = self._derive_sensor_events(facts, camera_event_names=camera_update.event_names)
             self.observation_handler(facts, event_names)
@@ -1933,8 +2227,10 @@ class ProactiveCoordinator:
         observation: SocialObservation,
         *,
         inspected: bool,
+        audio_snapshot=None,
         camera_snapshot: ProactiveCameraSnapshot,
         audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
+        presence_snapshot: PresenceSessionSnapshot | None,
     ) -> dict[str, Any]:
         """Build the automation-facing fact payload for one observation."""
 
@@ -1950,10 +2246,21 @@ class ProactiveCoordinator:
         if not observation.pir_motion_detected and self._last_motion_at is not None:
             no_motion_for_s = max(0.0, now - self._last_motion_at)
 
-        return {
+        presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
+        signal_snapshot = None if audio_snapshot is None else getattr(audio_snapshot, "signal_snapshot", None)
+        respeaker_claim_contract = build_respeaker_claim_payloads(
+            signal_snapshot=signal_snapshot,
+            session_id=presence_session_id,
+            non_speech_audio_likely=audio.non_speech_audio_likely,
+            background_media_likely=audio.background_media_likely,
+        )
+
+        facts = {
             "sensor": {
                 "inspected": inspected,
                 "observed_at": now,
+                "captured_at": now,
+                "presence_session_id": presence_session_id,
             },
             "pir": {
                 "motion_detected": observation.pir_motion_detected,
@@ -1983,6 +2290,14 @@ class ProactiveCoordinator:
                 "speech_overlap_likely": audio.speech_overlap_likely,
                 "barge_in_detected": audio.barge_in_detected,
                 "mute_active": audio.mute_active,
+                **resolve_respeaker_indicator_state(
+                    runtime_status=getattr(getattr(self.runtime, "status", None), "value", None),
+                    runtime_alert_code=(
+                        None if audio_policy_snapshot is None else audio_policy_snapshot.runtime_alert_code
+                    ),
+                    mute_active=audio.mute_active,
+                ).event_data(),
+                "claim_contract": respeaker_claim_contract,
             },
             "audio_policy": {
                 "presence_audio_active": (
@@ -2026,6 +2341,45 @@ class ProactiveCoordinator:
                 ),
             },
         }
+        speaker_association = derive_respeaker_speaker_association(
+            observed_at=now,
+            live_facts=facts,
+        )
+        multimodal_initiative = derive_respeaker_multimodal_initiative(
+            observed_at=now,
+            live_facts=facts,
+            speaker_association=speaker_association,
+        )
+        self.latest_speaker_association_snapshot = speaker_association
+        self.latest_multimodal_initiative_snapshot = multimodal_initiative
+        ambiguous_room_guard = derive_ambiguous_room_guard(
+            observed_at=now,
+            live_facts=facts,
+        )
+        known_user_hint = derive_known_user_hint(
+            observed_at=now,
+            live_facts=facts,
+            voice_status=getattr(self.runtime, "user_voice_status", None),
+            voice_confidence=getattr(self.runtime, "user_voice_confidence", None),
+            voice_checked_at=getattr(self.runtime, "user_voice_checked_at", None),
+            max_voice_age_s=int(getattr(self.config, "voice_assessment_max_age_s", 120) or 120),
+            ambiguous_room_guard=ambiguous_room_guard,
+            speaker_association=speaker_association,
+        )
+        affect_proxy = derive_affect_proxy(
+            observed_at=now,
+            live_facts=facts,
+            ambiguous_room_guard=ambiguous_room_guard,
+        )
+        self.latest_ambiguous_room_guard_snapshot = ambiguous_room_guard
+        self.latest_known_user_hint_snapshot = known_user_hint
+        self.latest_affect_proxy_snapshot = affect_proxy
+        facts["speaker_association"] = speaker_association.to_automation_facts()
+        facts["multimodal_initiative"] = multimodal_initiative.to_automation_facts()
+        facts["ambiguous_room_guard"] = ambiguous_room_guard.to_automation_facts()
+        facts["known_user_hint"] = known_user_hint.to_automation_facts()
+        facts["affect_proxy"] = affect_proxy.to_automation_facts()
+        return facts
 
     def _derive_sensor_events(
         self,
@@ -2038,6 +2392,16 @@ class ProactiveCoordinator:
         current_flags = {
             "pir.motion_detected": bool(facts["pir"]["motion_detected"]),
             "vad.speech_detected": bool(facts["vad"]["speech_detected"]),
+            "audio_policy.presence_audio_active": bool(facts["audio_policy"]["presence_audio_active"]),
+            "audio_policy.quiet_window_open": bool(facts["audio_policy"]["quiet_window_open"]),
+            "audio_policy.resume_window_open": bool(facts["audio_policy"]["resume_window_open"]),
+            "audio_policy.room_busy_or_overlapping": bool(facts["audio_policy"]["room_busy_or_overlapping"]),
+            "audio_policy.barge_in_recent": bool(facts["audio_policy"]["barge_in_recent"]),
+            "speaker_association.associated": bool(facts["speaker_association"]["associated"]),
+            "multimodal_initiative.ready": bool(facts["multimodal_initiative"]["ready"]),
+            "ambiguous_room_guard.guard_active": bool(facts["ambiguous_room_guard"]["guard_active"]),
+            "known_user_hint.matches_main_user": bool(facts["known_user_hint"]["matches_main_user"]),
+            "affect_proxy.concern_cue": facts["affect_proxy"]["state"] == "concern_cue",
         }
         event_names: list[str] = list(camera_event_names)
         for key, value in current_flags.items():
@@ -2460,11 +2824,36 @@ def build_default_proactive_monitor(
     )
     if respeaker_targeted and (config.proactive_audio_enabled or config.wakeword_enabled):
         try:
-            signal_provider = ReSpeakerSignalProvider(
+            base_signal_provider = ReSpeakerSignalProvider(
                 sensor_window_ms=config.proactive_audio_sample_ms,
                 assistant_output_active_predicate=lambda: _assistant_output_active(runtime),
             )
+            signal_provider = ScheduledReSpeakerSignalProvider.from_config(
+                config,
+                provider=base_signal_provider,
+            )
             initial_signal = signal_provider.observe()
+            startup_contract = assess_respeaker_monitor_startup_contract(initial_signal)
+            if startup_contract.blocking:
+                blocker_code = startup_contract.blocker_code or "blocked"
+                detail = startup_contract.detail or "ReSpeaker startup contract blocked monitor initialization."
+                _safe_emit(emit, f"respeaker_runtime_blocker={blocker_code}")
+                _append_ops_event(
+                    runtime,
+                    event="proactive_component_blocked",
+                    level="error",
+                    message="Proactive monitor startup was blocked by the ReSpeaker runtime contract.",
+                    data={
+                        "reason": startup_contract.ops_reason or "respeaker_startup_blocked",
+                        "detail": detail,
+                        "blocker_code": blocker_code,
+                        "device_runtime_mode": initial_signal.device_runtime_mode,
+                        "host_control_ready": initial_signal.host_control_ready,
+                        "transport_reason": initial_signal.transport_reason,
+                    },
+                    emit=emit,
+                )
+                raise ReSpeakerRuntimeContractError(detail)
             if not initial_signal.host_control_ready:
                 reason = initial_signal.transport_reason or "unknown_transport_state"
                 detail = (
@@ -2479,6 +2868,19 @@ def build_default_proactive_monitor(
                     reason="respeaker_signal_provider_degraded",
                     detail=detail,
                 )
+            try:
+                AmbientAudioSampler.from_config(config).require_readable_frames(
+                    duration_ms=_respeaker_capture_probe_duration_ms(config),
+                )
+            except AudioCaptureReadinessError as exc:
+                detail = _record_respeaker_dead_capture_blocker(
+                    runtime=runtime,
+                    emit=emit,
+                    probe=exc.probe,
+                    stage="startup",
+                    signal=initial_signal,
+                )
+                raise ReSpeakerRuntimeContractError(detail) from exc
             base_audio_observer = audio_observer
             audio_observer = ReSpeakerAudioObservationProvider(
                 signal_provider=signal_provider,
@@ -2495,6 +2897,8 @@ def build_default_proactive_monitor(
 
                 audio_observer_fallback_factory = _fallback_respeaker_audio_observer_factory
         except Exception as exc:
+            if isinstance(exc, ReSpeakerRuntimeContractError):
+                raise
             _record_component_warning(
                 runtime=runtime,
                 emit=emit,

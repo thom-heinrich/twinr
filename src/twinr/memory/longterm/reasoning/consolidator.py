@@ -234,9 +234,26 @@ class LongTermMemoryConsolidator:
         return origin_memory_id in accepted_memory_ids
 
     def _requires_confirmation(self, candidate: LongTermMemoryObjectV1) -> bool:
+        memory_class = self._memory_class(candidate)
         confidence = self._safe_confidence(candidate)
         confirmed_by_user = getattr(candidate, "confirmed_by_user", False) is True
+        if memory_class == "observed_preference":
+            return True
+        if memory_class == "confirmed_preference" and not confirmed_by_user:
+            return True
         return confidence < self.promotion_confidence_threshold and not confirmed_by_user
+
+    def _memory_class(self, candidate: LongTermMemoryObjectV1) -> str | None:
+        """Return one normalized memory-class tag from candidate attributes."""
+
+        attributes = getattr(candidate, "attributes", None)
+        if not isinstance(attributes, Mapping):
+            return None
+        raw_value = attributes.get("memory_class")
+        if not isinstance(raw_value, str):
+            return None
+        normalized = raw_value.strip().lower()
+        return normalized or None
 
     def _safe_confidence(self, candidate: LongTermMemoryObjectV1) -> float:
         raw_confidence = getattr(candidate, "confidence", 0.0)

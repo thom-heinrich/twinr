@@ -14,6 +14,32 @@
   </div>
 {%- endmacro %}
 
+{% macro log_item_list(items, empty_message) -%}
+  {% if items %}
+  <div class="log-list">
+    {% for item in items %}
+    <article class="log-entry memory-search-entry">
+      <div class="log-entry-header">
+        <span class="log-level is-{{ item.level }}">{{ item.badge }}</span>
+        <span class="log-event">{{ item.title }}</span>
+        {% if item.time %}
+        <span class="log-time">{{ item.time }}</span>
+        {% endif %}
+      </div>
+      {% if item.body %}
+      <div class="log-message">{{ item.body }}</div>
+      {% endif %}
+      {% for meta in item.meta_lines %}
+      <div class="log-message memory-search-meta">{{ meta }}</div>
+      {% endfor %}
+    </article>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state">{{ empty_message }}</div>
+  {% endif %}
+{%- endmacro %}
+
 {% macro memory_attest_panel(status, summary_rows, packet_rows) -%}
   <section class="panel ops-debug-panel">
     <div class="section-header">
@@ -27,6 +53,60 @@
     {% if packet_rows %}
     {{ detail_grid(packet_rows) }}
     {% endif %}
+  </section>
+{%- endmacro %}
+
+{% macro memory_search_snapshot(search, title, description) -%}
+  <section class="panel-subsection">
+    <div class="section-header">
+      <div>
+        <h3>{{ title }}</h3>
+        <p class="section-description">{{ description }}</p>
+        {% if search.status.detail %}
+        <p class="section-description">{{ search.status.detail }}</p>
+        {% endif %}
+      </div>
+      <span class="status-pill is-{{ search.status.status }}">{{ search.status.label }}</span>
+    </div>
+
+    {% if search.summary_rows %}
+    {{ detail_grid(search.summary_rows) }}
+    {% endif %}
+
+    {% for section in search.sections %}
+    <section class="panel-subsection {% if not loop.first or search.summary_rows %}panel-subsection-spaced{% endif %}">
+      <div class="section-header">
+        <div>
+          <h3>{{ section["title"] }}</h3>
+          <p class="section-description">{{ section["description"] }}</p>
+        </div>
+      </div>
+      {{ log_item_list(section["items"], section["empty_message"]) }}
+    </section>
+    {% endfor %}
+
+    {% for block in search.context_blocks %}
+    <section class="panel-subsection panel-subsection-spaced">
+      <div class="section-header">
+        <div>
+          <h3>{{ block.title }}</h3>
+        </div>
+      </div>
+      <pre class="log-data">{{ block.body }}</pre>
+    </section>
+    {% endfor %}
+  </section>
+{%- endmacro %}
+
+{% macro trace_item_panel(title, description, items, empty_message) -%}
+  <section class="panel-subsection">
+    <div class="section-header">
+      <div>
+        <h3>{{ title }}</h3>
+        <p class="section-description">{{ description }}</p>
+      </div>
+    </div>
+    {{ log_item_list(items, empty_message) }}
   </section>
 {%- endmacro %}
 
@@ -57,55 +137,174 @@
         <button type="submit">Search</button>
       </div>
     </form>
+    {{ memory_search_snapshot(search, "Matches", "What the real retrieval stack currently returns for this query.") }}
+  </section>
+{%- endmacro %}
 
-    {% if search.summary_rows %}
-    {{ detail_grid(search.summary_rows) }}
-    {% endif %}
+{% macro conversation_lab_panel(lab) -%}
+  <section class="panel ops-debug-panel">
+    <div class="section-header">
+      <div>
+        <h2>Conversation Lab</h2>
+        <p class="section-description">Run a text turn through the real Twinr tool path and open human-readable routing, retrieval, tool, and memory traces per turn.</p>
+        {% if lab.status.detail %}
+        <p class="section-description">{{ lab.status.detail }}</p>
+        {% endif %}
+      </div>
+      <span class="status-pill is-{{ lab.status.status }}">{{ lab.status.label }}</span>
+    </div>
 
-    {% for section in search.sections %}
-    <section class="panel-subsection {% if not loop.first %}panel-subsection-spaced{% endif %}">
+    {% if lab.sessions %}
+    <section class="panel-subsection">
       <div class="section-header">
         <div>
-          <h3>{{ section["title"] }}</h3>
-          <p class="section-description">{{ section["description"] }}</p>
+          <h3>Recent Sessions</h3>
+          <p class="section-description">Each session keeps its own text history and stored trace snapshots.</p>
         </div>
       </div>
-      {% if section["items"] %}
-      <div class="log-list">
-        {% for item in section["items"] %}
-        <article class="log-entry memory-search-entry">
-          <div class="log-entry-header">
-            <span class="log-level is-{{ item.level }}">{{ item.badge }}</span>
-            <span class="log-event">{{ item.title }}</span>
-            {% if item.time %}
-            <span class="log-time">{{ item.time }}</span>
-            {% endif %}
-          </div>
-          {% if item.body %}
-          <div class="log-message">{{ item.body }}</div>
-          {% endif %}
-          {% for meta in item.meta_lines %}
-          <div class="log-message memory-search-meta">{{ meta }}</div>
-          {% endfor %}
-        </article>
+      <div class="conversation-lab-session-strip">
+        {% for session in lab.sessions %}
+        <a class="conversation-lab-session-chip {% if session.active %}active{% endif %}" href="{{ session.href }}">
+          <span class="conversation-lab-session-title">{{ session.title }}</span>
+          <span class="conversation-lab-session-meta">{{ session.turn_count }} turns · {{ session.updated_at }}</span>
+        </a>
         {% endfor %}
       </div>
-      {% else %}
-      <div class="empty-state">{{ section["empty_message"] }}</div>
-      {% endif %}
     </section>
-    {% endfor %}
+    {% endif %}
 
-    {% for block in search.context_blocks %}
     <section class="panel-subsection panel-subsection-spaced">
       <div class="section-header">
         <div>
-          <h3>{{ block.title }}</h3>
+          <h3>Run A Turn</h3>
+          <p class="section-description">This is an operator text surface, not the voice UX. The turn runs against the live provider, memory, and tool stack of this Twinr instance.</p>
         </div>
       </div>
-      <pre class="log-data">{{ block.body }}</pre>
+      <div class="conversation-lab-actions">
+        <form method="post" action="{{ lab.new_action }}">
+          <button type="submit">New Session</button>
+        </form>
+      </div>
+      <form class="ops-search-form conversation-lab-form" method="post" action="{{ lab.send_action }}">
+        <input type="hidden" name="session_id" value="{{ lab.active_session_id }}">
+        <label class="detail-label" for="conversation-lab-prompt">Prompt</label>
+        <textarea
+          id="conversation-lab-prompt"
+          name="prompt"
+          rows="4"
+          placeholder="z. B. Erinnere dir, dass Lea morgen um 19 Uhr Linsensuppe vorbeibringt, oder teste eine Suche, Erinnerung, Automation oder Einstellungsfrage."
+        ></textarea>
+        <div class="conversation-lab-actions">
+          <button type="submit">Send Turn</button>
+        </div>
+      </form>
     </section>
-    {% endfor %}
+
+    {% if lab.active_session_rows %}
+    <section class="panel-subsection panel-subsection-spaced">
+      <div class="section-header">
+        <div>
+          <h3>Active Session</h3>
+        </div>
+      </div>
+      {{ detail_grid(lab.active_session_rows) }}
+    </section>
+    {% endif %}
+
+    {% if lab.turns %}
+    <section class="panel-subsection panel-subsection-spaced">
+      <div class="section-header">
+        <div>
+          <h3>Stored Turns</h3>
+          <p class="section-description">Newest turn stays at the bottom so the chat history reads naturally.</p>
+        </div>
+      </div>
+      <div class="conversation-lab-turn-list">
+        {% for turn in lab.turns %}
+        <article class="conversation-lab-turn-card">
+          <div class="conversation-lab-turn-header">
+            <div>
+              <h3>Turn {{ loop.index }}</h3>
+              <p class="section-description">{{ turn.created_at }}</p>
+            </div>
+            <span class="status-pill is-{{ turn.status_badge.status }}">{{ turn.status_badge.label }}</span>
+          </div>
+
+          <div class="conversation-lab-bubble is-user">
+            <div class="detail-label">Prompt</div>
+            <div class="detail-body-copy">{{ turn.prompt }}</div>
+          </div>
+
+          <div class="conversation-lab-bubble is-assistant">
+            <div class="detail-label">Answer</div>
+            <div class="detail-body-copy">
+              {% if turn.response %}
+              {{ turn.response }}
+              {% elif turn.error_message %}
+              {{ turn.error_message }}
+              {% else %}
+              No response text was stored for this turn.
+              {% endif %}
+            </div>
+            {% if turn.error_message %}
+            <div class="card-detail">{{ turn.error_message }}</div>
+            {% endif %}
+          </div>
+
+          {% if turn.result_rows %}
+          {{ detail_grid(turn.result_rows) }}
+          {% endif %}
+
+          <details class="conversation-lab-trace" {% if loop.last %}open{% endif %}>
+            <summary>Routing And Model Path</summary>
+            {{ trace_item_panel("Routing", "How Twinr routed this turn through the supervisor and specialist text path.", turn.route_items, "No routing trace items were stored for this turn.") }}
+          </details>
+
+          <details class="conversation-lab-trace">
+            <summary>Tool Activity</summary>
+            {{ trace_item_panel("Tools", "Requested tools plus the operator-facing results that came back from each tool call.", turn.tool_items, "This turn finished without any tool calls.") }}
+          </details>
+
+          <details class="conversation-lab-trace">
+            <summary>Memory Write</summary>
+            <section class="panel-subsection">
+              <div class="section-header">
+                <div>
+                  <h3>Persistence</h3>
+                  <p class="section-description">Queue and flush state around the long-term conversation write.</p>
+                </div>
+              </div>
+              {% if turn.memory_rows %}
+              {{ detail_grid(turn.memory_rows) }}
+              {% else %}
+              <div class="empty-state">No long-term memory writer details were stored for this turn.</div>
+              {% endif %}
+            </section>
+          </details>
+
+          <details class="conversation-lab-trace">
+            <summary>Retrieval Before Turn</summary>
+            {{ memory_search_snapshot(turn.retrieval_before, "Retrieval Before", "What Twinr's long-term retrieval stack returned before answering this prompt.") }}
+          </details>
+
+          {% if turn.retrieval_after %}
+          <details class="conversation-lab-trace">
+            <summary>Retrieval After Turn</summary>
+            {{ memory_search_snapshot(turn.retrieval_after, "Retrieval After", "What the same retrieval stack returned again after the turn was stored and flushed.") }}
+          </details>
+          {% endif %}
+
+          <details class="conversation-lab-trace">
+            <summary>Signals And Usage</summary>
+            {{ trace_item_panel("Signals", "Sanitized emit signals, tool-side audit events, and tracked usage rows collected during the turn.", turn.telemetry_items, "No extra telemetry items were stored for this turn.") }}
+          </details>
+        </article>
+        {% endfor %}
+      </div>
+    </section>
+    {% else %}
+    <div class="empty-state">No portal conversation turns are stored yet. Start a session and send one text prompt.</div>
+    {% endif %}
   </section>
 {%- endmacro %}
 
@@ -270,6 +469,10 @@
 
   {% if active_debug_tab == "memory_search" %}
   {{ memory_search_panel(memory_search) }}
+  {% endif %}
+
+  {% if active_debug_tab == "conversation_lab" %}
+  {{ conversation_lab_panel(conversation_lab) }}
   {% endif %}
 
   {% if active_debug_tab == "llm" %}

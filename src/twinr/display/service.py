@@ -27,6 +27,7 @@ from twinr.display.factory import create_display_adapter
 from twinr.display.heartbeat import DisplayHeartbeatStore, save_display_heartbeat
 from twinr.display.news_ticker import DisplayNewsTickerRuntime
 from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPresentationStore
+from twinr.display.respeaker_hci import DisplayReSpeakerHciStore
 from twinr.ops.health import TwinrSystemHealth, collect_system_health
 
 _STATUS_ANIMATION_SPECS: dict[str, tuple[int, float]] = {
@@ -117,6 +118,7 @@ class TwinrStatusDisplayLoop:
     face_cue_store: DisplayFaceCueStore | None = None
     presentation_cue_store: DisplayPresentationStore | None = None
     news_ticker_runtime: DisplayNewsTickerRuntime | None = None
+    respeaker_hci_store: DisplayReSpeakerHciStore | None = None
     _cached_health: TwinrSystemHealth | None = field(default=None, init=False, repr=False)
     _cached_health_error: str | None = field(default=None, init=False, repr=False)
     _cached_health_status: str | None = field(default=None, init=False, repr=False)
@@ -164,6 +166,7 @@ class TwinrStatusDisplayLoop:
             face_cue_store=DisplayFaceCueStore.from_config(config),
             presentation_cue_store=DisplayPresentationStore.from_config(config),
             news_ticker_runtime=DisplayNewsTickerRuntime.from_config(config, emit=emit or _default_emit),
+            respeaker_hci_store=DisplayReSpeakerHciStore.from_config(config),
         )
 
     def run(self, *, duration_s: float | None = None, max_cycles: int | None = None) -> int:
@@ -323,11 +326,27 @@ class TwinrStatusDisplayLoop:
             ("Internet", self._internet_state_value(internet_ok)),
             ("AI", self._ai_state_value(snapshot, health, internet_ok)),
             ("System", self._system_state_value(snapshot, health)),
-            ("Zeit", self._clock_text()),
         ]
+        state_fields.extend(self._respeaker_state_fields())
+        state_fields.append(("Zeit", self._clock_text()))
         if note:
             state_fields.append(("Hinweis", note))
         return tuple(state_fields)
+
+    def _respeaker_state_fields(self) -> list[tuple[str, str]]:
+        """Return calm operator-visible ReSpeaker HCI fields when relevant."""
+
+        store = self.respeaker_hci_store
+        if store is None:
+            return []
+        try:
+            state = store.load()
+        except Exception as exc:
+            self._emit_error("display_respeaker_hci_load_failed", exc)
+            return []
+        if state is None:
+            return []
+        return list(state.state_fields())
 
     def _build_log_sections(
         self,

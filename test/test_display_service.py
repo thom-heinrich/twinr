@@ -108,6 +108,14 @@ class TickingDisplay(FakeDisplay):
         self.tick_calls += 1
 
 
+class FakeReSpeakerHciStore:
+    def __init__(self, state) -> None:
+        self.state = state
+
+    def load(self):
+        return self.state
+
+
 class DisplayServiceTests(unittest.TestCase):
     def make_clock(self, hour: int = 12, minute: int = 34):
         return lambda: datetime(2026, 3, 13, hour, minute)
@@ -399,6 +407,41 @@ class DisplayServiceTests(unittest.TestCase):
                 ("Internet", "ok"),
                 ("AI", "ok"),
                 ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+        )
+
+    def test_build_state_fields_appends_respeaker_hci_status_when_available(self) -> None:
+        state = type(
+            "FakeState",
+            (),
+            {
+                "state_fields": lambda self: (("ReSpeaker", "DFU"), ("Mikrofon", "stumm")),
+            },
+        )()
+        loop = TwinrStatusDisplayLoop(
+            config=TwinrConfig(display_poll_interval_s=0.0, openai_api_key="sk-test"),
+            display=FakeDisplay(),
+            snapshot_store=RuntimeSnapshotStore("/tmp/nonexistent"),
+            emit=lambda _line: None,
+            sleep=lambda _seconds: None,
+            health_collector=lambda _config, *, snapshot=None: self.make_health(),
+            internet_probe=lambda: True,
+            clock=self.make_clock(),
+            respeaker_hci_store=FakeReSpeakerHciStore(state),
+        )
+
+        state_fields = loop._build_state_fields(RuntimeSnapshot(status="waiting"))
+
+        self.assertEqual(
+            state_fields,
+            (
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("ReSpeaker", "DFU"),
+                ("Mikrofon", "stumm"),
                 ("Zeit", "12:34"),
             ),
         )

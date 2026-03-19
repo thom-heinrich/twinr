@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% from "_form_fields.html" import render_setting_field %}
+
+{% block content %}
+<section class="panel two-column">
+  <div>
+    <h2>WhatsApp self-chat wizard</h2>
+    <p class="section-description">
+      Use this for one internal WhatsApp test with your own number. The wizard keeps the setup to one allowed chat, forces self-chat mode on, blocks groups, and walks you through QR pairing.
+    </p>
+    <div class="link-row">
+      <a class="link-button" href="/connect/whatsapp">Open WhatsApp wizard</a>
+    </div>
+  </div>
+  <div class="detail-grid">
+    <article class="detail-card">
+      <div class="detail-label">One chat only</div>
+      <div class="detail-body">Allowlisted</div>
+      <div class="field-help">Twinr listens only to the one number that you save in the wizard.</div>
+    </article>
+    <article class="detail-card">
+      <div class="detail-label">Chat mode</div>
+      <div class="detail-body">Self-chat</div>
+      <div class="field-help">The flow is built for your own "message yourself" chat first.</div>
+    </article>
+    <article class="detail-card">
+      <div class="detail-label">Groups</div>
+      <div class="detail-body">Blocked</div>
+      <div class="field-help">Group chats stay off for this internal test setup.</div>
+    </article>
+    <article class="detail-card">
+      <div class="detail-label">Session</div>
+      <div class="detail-body">Persistent</div>
+      <div class="field-help">WhatsApp auth stays in its own folder so pairing survives restarts.</div>
+    </article>
+  </div>
+</section>
+
+<form method="post" action="{{ form_action }}" class="stack">
+  {% for section in sections %}
+  <section class="panel">
+    <div class="section-header">
+      <div>
+        <h2>{{ section.title }}</h2>
+        <p class="section-description">{{ section.description }}</p>
+      </div>
+    </div>
+    <div class="form-grid">
+      {% for field in section.fields %}
+      {{ render_setting_field(field) }}
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+  <div class="actions">
+    <button type="submit">Save changes</button>
+  </div>
+</form>
+{% endblock %}

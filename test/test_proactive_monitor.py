@@ -9,7 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
 from twinr.hardware.respeaker.models import ReSpeakerSignalSnapshot
-from twinr.hardware.audio import AmbientAudioLevelSample
+from twinr.hardware.audio import (
+    AmbientAudioLevelSample,
+    AudioCaptureReadinessError,
+    AudioCaptureReadinessProbe,
+)
 from twinr.proactive import (
     AmbientAudioObservationProvider,
     OpenAIVisionObservationProvider,
@@ -121,11 +125,26 @@ class FakeAudioSampler:
         self.sample = sample
         self.calls = 0
         self.durations: list[int] = []
+        self.probe_calls = 0
 
     def sample_levels(self, *, duration_ms=None):
         self.calls += 1
         self.durations.append(duration_ms)
         return self.sample
+
+    def require_readable_frames(self, *, duration_ms=None, chunk_count=1):
+        self.probe_calls += 1
+        return AudioCaptureReadinessProbe(
+            device="plughw:CARD=Array,DEV=0",
+            sample_rate=16000,
+            channels=1,
+            chunk_ms=100,
+            duration_ms=duration_ms or 100,
+            target_chunk_count=chunk_count,
+            captured_chunk_count=chunk_count,
+            captured_bytes=3200,
+            detail="Captured readable frames.",
+        )
 
 
 class FakeAudioObserver:
@@ -136,6 +155,16 @@ class FakeAudioObserver:
     def observe(self):
         self.calls += 1
         return self.snapshot
+
+
+class FailingAudioObserver:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.calls = 0
+
+    def observe(self):
+        self.calls += 1
+        raise self.error
 
 
 class FakeReSpeakerSignalProvider:
@@ -784,8 +813,214 @@ class ProactiveMonitorTests(unittest.TestCase):
 
         alerts = [entry for entry in runtime.ops_events.tail(limit=10) if entry.get("event") == "respeaker_runtime_alert"]
         self.assertEqual([entry["data"]["alert_code"] for entry in alerts[-2:]], ["dfu_mode", "ready"])
+        blocker_events = [
+            entry
+            for entry in runtime.ops_events.tail(limit=12)
+            if entry.get("event") in {"respeaker_runtime_blocker", "respeaker_runtime_blocker_cleared"}
+        ]
+        self.assertEqual(
+            [entry["event"] for entry in blocker_events[-2:]],
+            ["respeaker_runtime_blocker", "respeaker_runtime_blocker_cleared"],
+        )
         self.assertIn("respeaker_runtime_alert=dfu_mode", emitted)
         self.assertIn("respeaker_runtime_alert=ready", emitted)
+        self.assertIn("respeaker_runtime_blocker=dfu_mode", emitted)
+        self.assertIn("respeaker_runtime_blocker_cleared=dfu_mode", emitted)
+
+    def test_build_default_monitor_fails_closed_when_respeaker_starts_in_dfu_mode(self) -> None:
+        config = TwinrConfig(
+            wakeword_enabled=True,
+            wakeword_backend="stt",
+            pir_motion_gpio=26,
+            audio_input_device="plughw:CARD=Array,DEV=0",
+            proactive_audio_enabled=True,
+            proactive_audio_input_device="plughw:CARD=Array,DEV=0",
+        )
+        runtime = TwinrRuntime(config=config)
+        fake_signal_provider = FakeReSpeakerSignalProvider(
+            ReSpeakerSignalSnapshot(
+                captured_at=10.0,
+                source="respeaker_xvf3800",
+                source_type="observed",
+                sensor_window_ms=config.proactive_audio_sample_ms,
+                device_runtime_mode="usb_visible_no_capture",
+                host_control_ready=False,
+                transport_reason="dfu_mode",
+            )
+        )
+        fake_sampler = FakeAudioSampler(
+            AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=5,
+                active_chunk_count=1,
+                average_rms=200,
+                peak_rms=500,
+                active_ratio=0.2,
+            )
+        )
+
+        with (
+            patch("twinr.proactive.runtime.service.configured_pir_monitor", return_value=FakePirMonitor()),
+            patch("twinr.proactive.runtime.service.AmbientAudioSampler.from_config", return_value=fake_sampler),
+            patch("twinr.proactive.runtime.service.ReSpeakerSignalProvider", return_value=fake_signal_provider),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                build_default_proactive_monitor(
+                    config=config,
+                    runtime=runtime,
+                    backend=FakeBackend("person_visible=no"),
+                    camera=FakeCamera(),
+                    camera_lock=None,
+                    audio_lock=None,
+                    trigger_handler=lambda _decision: True,
+                    emit=lambda _line: None,
+                )
+
+        self.assertIn("DFU/safe mode", str(ctx.exception))
+        events = runtime.ops_events.tail(limit=10)
+        blocker = next(
+            entry
+            for entry in events
+            if entry.get("event") == "proactive_component_blocked"
+            and entry.get("data", {}).get("reason") == "respeaker_dfu_mode_blocked"
+        )
+        self.assertEqual(blocker["data"]["blocker_code"], "dfu_mode")
+        self.assertEqual(blocker["data"]["device_runtime_mode"], "usb_visible_no_capture")
+
+    def test_build_default_monitor_fails_closed_when_respeaker_capture_has_no_readable_frames(self) -> None:
+        config = TwinrConfig(
+            wakeword_enabled=True,
+            wakeword_backend="stt",
+            pir_motion_gpio=26,
+            audio_input_device="plughw:CARD=Array,DEV=0",
+            proactive_audio_enabled=True,
+            proactive_audio_input_device="plughw:CARD=Array,DEV=0",
+        )
+        runtime = TwinrRuntime(config=config)
+        fake_signal_provider = FakeReSpeakerSignalProvider(
+            ReSpeakerSignalSnapshot(
+                captured_at=10.0,
+                source="respeaker_xvf3800",
+                source_type="observed",
+                sensor_window_ms=config.proactive_audio_sample_ms,
+                device_runtime_mode="audio_ready",
+                host_control_ready=True,
+                transport_reason=None,
+                firmware_version=(2, 0, 7),
+            )
+        )
+        fake_sampler = FakeAudioSampler(
+            AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=5,
+                active_chunk_count=1,
+                average_rms=200,
+                peak_rms=500,
+                active_ratio=0.2,
+            )
+        )
+        probe = AudioCaptureReadinessProbe(
+            device="plughw:CARD=Array,DEV=0",
+            sample_rate=16000,
+            channels=1,
+            chunk_ms=100,
+            duration_ms=300,
+            target_chunk_count=1,
+            captured_chunk_count=0,
+            captured_bytes=0,
+            failure_reason="stalled_waiting",
+            detail="Ambient audio capture stalled while waiting for microphone data",
+        )
+
+        with (
+            patch("twinr.proactive.runtime.service.configured_pir_monitor", return_value=FakePirMonitor()),
+            patch("twinr.proactive.runtime.service.AmbientAudioSampler.from_config", return_value=fake_sampler),
+            patch("twinr.proactive.runtime.service.ReSpeakerSignalProvider", return_value=fake_signal_provider),
+            patch.object(fake_sampler, "require_readable_frames", side_effect=AudioCaptureReadinessError(str(probe.detail), probe=probe)),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                build_default_proactive_monitor(
+                    config=config,
+                    runtime=runtime,
+                    backend=FakeBackend("person_visible=no"),
+                    camera=FakeCamera(),
+                    camera_lock=None,
+                    audio_lock=None,
+                    trigger_handler=lambda _decision: True,
+                    emit=lambda _line: None,
+                )
+
+        self.assertIn("yielded no readable audio frames", str(ctx.exception))
+        events = runtime.ops_events.tail(limit=12)
+        alert = next(
+            entry
+            for entry in events
+            if entry.get("event") == "respeaker_runtime_alert"
+            and entry.get("data", {}).get("alert_code") == "capture_unknown"
+        )
+        blocker = next(
+            entry
+            for entry in events
+            if entry.get("event") == "proactive_component_blocked"
+            and entry.get("data", {}).get("reason") == "respeaker_dead_capture_blocked"
+        )
+        self.assertEqual(alert["data"]["capture_probe_failure_reason"], "stalled_waiting")
+        self.assertEqual(blocker["data"]["blocker_code"], "dead_capture")
+        self.assertEqual(blocker["data"]["device_runtime_mode"], "audio_ready")
+        self.assertEqual(blocker["data"]["host_control_ready"], True)
+
+    def test_coordinator_blocks_respeaker_runtime_when_capture_dies_midstream(self) -> None:
+        config = TwinrConfig(
+            wakeword_enabled=True,
+            wakeword_backend="stt",
+            audio_input_device="plughw:CARD=Array,DEV=0",
+            proactive_audio_enabled=True,
+            proactive_audio_input_device="plughw:CARD=Array,DEV=0",
+        )
+        runtime = TwinrRuntime(config=config)
+        probe = AudioCaptureReadinessProbe(
+            device="plughw:CARD=Array,DEV=0",
+            sample_rate=16000,
+            channels=1,
+            chunk_ms=100,
+            duration_ms=300,
+            target_chunk_count=1,
+            captured_chunk_count=0,
+            captured_bytes=0,
+            failure_reason="stalled_waiting",
+            detail="Ambient audio capture stalled while waiting for microphone data",
+        )
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(),
+            trigger_handler=lambda _decision: True,
+            vision_observer=None,
+            audio_observer=FailingAudioObserver(
+                AudioCaptureReadinessError(str(probe.detail), probe=probe)
+            ),
+            emit=lambda _line: None,
+        )
+
+        snapshot = coordinator._observe_audio_safe()
+
+        self.assertIs(coordinator.audio_observer, coordinator._null_audio_observer)
+        self.assertIsNotNone(snapshot)
+        events = runtime.ops_events.tail(limit=12)
+        alert = next(
+            entry
+            for entry in events
+            if entry.get("event") == "respeaker_runtime_alert"
+            and entry.get("data", {}).get("alert_code") == "capture_unknown"
+        )
+        blocker = next(
+            entry
+            for entry in events
+            if entry.get("event") == "respeaker_runtime_blocker"
+            and entry.get("data", {}).get("blocker_code") == "dead_capture"
+        )
+        self.assertEqual(alert["data"]["stage"], "runtime")
+        self.assertEqual(blocker["data"]["capture_probe_failure_reason"], "stalled_waiting")
 
     def test_coordinator_does_not_inspect_without_recent_motion(self) -> None:
         config = TwinrConfig(proactive_enabled=True)
@@ -1500,7 +1735,9 @@ class ProactiveMonitorTests(unittest.TestCase):
 
         self.assertIsNotNone(monitor)
         self.assertIsInstance(monitor.coordinator.audio_observer, ReSpeakerAudioObservationProvider)
-        self.assertIs(monitor.coordinator.audio_observer.signal_provider, fake_signal_provider)
+        scheduled_provider = monitor.coordinator.audio_observer.signal_provider
+        self.assertIsNotNone(scheduled_provider)
+        self.assertIs(getattr(scheduled_provider, "provider", None), fake_signal_provider)
         events = runtime.ops_events.tail(limit=10)
         warning = next(
             entry
@@ -1569,7 +1806,10 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertIn("camera.person_visible", first_events)
         self.assertIn("camera.hand_or_object_near_camera", first_events)
         self.assertIn("vad.speech_detected", first_events)
+        self.assertIn("audio_policy.presence_audio_active", first_events)
         self.assertEqual(first_facts["camera"]["person_visible"], True)
+        self.assertEqual(first_facts["sensor"]["captured_at"], 2.0)
+        self.assertIsNone(first_facts["sensor"]["presence_session_id"])
         self.assertEqual(first_facts["vad"]["speech_detected"], True)
         self.assertEqual(first_facts["vad"]["signal_source"], "respeaker_xvf3800")
         self.assertEqual(first_facts["vad"]["assistant_output_active"], None)
@@ -1579,6 +1819,27 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(first_facts["respeaker"]["speech_overlap_likely"], None)
         self.assertEqual(first_facts["respeaker"]["barge_in_detected"], None)
         self.assertEqual(first_facts["respeaker"]["host_control_ready"], True)
+        self.assertEqual(
+            first_facts["speaker_association"]["state"],
+            "audio_direction_unavailable",
+        )
+        self.assertEqual(first_facts["speaker_association"]["associated"], False)
+        self.assertEqual(
+            first_facts["multimodal_initiative"]["block_reason"],
+            "low_confidence_speaker_association",
+        )
+        self.assertEqual(first_facts["multimodal_initiative"]["recommended_channel"], "display")
+        self.assertTrue(first_facts["ambiguous_room_guard"]["guard_active"])
+        self.assertEqual(
+            first_facts["ambiguous_room_guard"]["reason"],
+            "low_confidence_audio_direction",
+        )
+        self.assertEqual(
+            first_facts["known_user_hint"]["state"],
+            "blocked_ambiguous_room",
+        )
+        self.assertEqual(first_facts["known_user_hint"]["policy_recommendation"], "blocked")
+        self.assertEqual(first_facts["affect_proxy"]["state"], "unknown")
         self.assertEqual(first_facts["audio_policy"]["presence_audio_active"], True)
         self.assertEqual(first_facts["audio_policy"]["recent_follow_up_speech"], False)
         self.assertEqual(first_facts["audio_policy"]["room_busy_or_overlapping"], None)

@@ -20,7 +20,9 @@ Out of scope:
 - `display/run_display_loop.py` - run the standalone display loop
 - `mic/setup_audio.sh` - configure ALSA or PipeWire playback/capture defaults and proactive audio env
 - `mic/setup_respeaker_access.sh` - install the XVF3800 udev rule so the runtime user can read host-control without sudo
-- `piaicam/fetch_mediapipe_models.py` - stage the official MediaPipe pose and gesture task bundles for Pi runtime use
+- `piaicam/fetch_mediapipe_models.py` - stage the official MediaPipe pose, hand-landmarker, and gesture task bundles for Pi runtime use
+- `piaicam/capture_custom_gesture_dataset.py` - capture bounded labeled stills for custom gesture datasets
+- `piaicam/train_custom_gesture_model.py` - train and export a custom MediaPipe gesture task bundle on the leading repo
 - `piaicam/smoke_piaicam.py` - run bounded Pi AI Camera enumeration, capture, and IMX500 smoke phases
 - `pir/setup_pir.sh` - persist PIR GPIO env settings and optional probe
 - `pir/probe_pir.py` - print PIR state and motion events
@@ -42,7 +44,7 @@ After any edit in this directory, run:
 
 ```bash
 bash -n hardware/buttons/setup_buttons.sh hardware/display/setup_display.sh hardware/mic/setup_audio.sh hardware/mic/setup_respeaker_access.sh hardware/pir/setup_pir.sh hardware/printer/setup_printer.sh
-PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/piaicam/fetch_mediapipe_models.py hardware/piaicam/smoke_piaicam.py hardware/pir/probe_pir.py
+PYTHONPATH=src python3 -m py_compile hardware/buttons/probe_buttons.py hardware/display/display_test.py hardware/display/run_display_loop.py hardware/piaicam/custom_gesture_workflow.py hardware/piaicam/capture_custom_gesture_dataset.py hardware/piaicam/fetch_mediapipe_models.py hardware/piaicam/smoke_piaicam.py hardware/piaicam/train_custom_gesture_model.py hardware/pir/probe_pir.py
 ```
 
 If button, Pi AI Camera, PIR, or display probes changed and you are on Pi acceptance hardware, also run:
@@ -76,7 +78,7 @@ python3 hardware/display/display_test.py --env-file .env
 - `src/twinr/hardware/respeaker/`
 - `hardware/mic/README.md`
 
-`piaicam/fetch_mediapipe_models.py` or `piaicam/smoke_piaicam.py` changes -> also check:
+`piaicam/capture_custom_gesture_dataset.py`, `piaicam/custom_gesture_workflow.py`, `piaicam/fetch_mediapipe_models.py`, `piaicam/smoke_piaicam.py`, or `piaicam/train_custom_gesture_model.py` changes -> also check:
 - `hardware/piaicam/README.md`
 - `hardware/component.yaml`
 - runtime Pi asset paths and installed `rpicam-*`/IMX500 tooling assumptions

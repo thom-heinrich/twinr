@@ -23,6 +23,7 @@ from twinr.memory.longterm.core.models import (
     LongTermSourceRefV1,
     LongTermTurnExtractionV1,
 )
+from twinr.memory.longterm.ingestion.respeaker_audio import extract_respeaker_audio_patterns
 from twinr.text_utils import collapse_whitespace, slugify_identifier
 
 
@@ -611,6 +612,15 @@ class LongTermMultimodalExtractor:
                     attributes={"daypart": daypart, "event_names": event_names, "pattern_type": "interaction"},
                 )
             )
+        objects.extend(
+            extract_respeaker_audio_patterns(
+                fact_map=fact_map,
+                source_ref=source_ref,
+                date_key=date_key,
+                daypart=daypart,
+                event_names=event_names,
+            )
+        )
         return objects
 
     def _extract_button_interaction(

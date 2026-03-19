@@ -8,6 +8,7 @@ owned_concerns:
   - Assemble `LongTermMemoryContext` sections from long-term memory stores
   - Render bounded durable, episodic, mid-term, graph, and conflict prompt payloads
   - Compile adaptive mid-term policy hints from confirmed memory, recurring routines, and proactive outcome history
+  - Compile explicit confirmed response-channel policy packets from confirmed preferences so ReSpeaker-derived voice-channel learning stays confirm-first
   - Compile persistent restart-recall packets from stable durable memory so fresh runtime roots keep a small provenance-rich continuity layer
   - Compile and render silent personalization subtext from graph and episodic cues
   - Sanitize retrieved memory payloads before JSON serialization or optional LLM compilation
@@ -24,7 +25,7 @@ files:
     exports:
       - LongTermRetriever
   - path: adaptive_policy.py
-    role: Adaptive prompt-policy compiler from stored memory and proactive history
+    role: Adaptive prompt-policy compiler from stored memory, confirmed response-channel preferences, and proactive history
   - path: restart_recall_policy.py
     role: Persistent restart-recall packet compiler from stable durable memory
   - path: operator_search.py
