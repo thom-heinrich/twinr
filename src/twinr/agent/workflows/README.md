@@ -18,6 +18,7 @@ bounded.
 - forward the completed tool-call history of a turn into runtime-side personality learning once the authoritative answer has been finalized
 - keep GPIO polling responsive while long turns are active by dispatching button presses off the poll thread and interrupting active turns on a second green press
 - keep required remote-memory checks off the GPIO polling thread by gating live loops from the external remote-memory watchdog artifact while still failing closed when remote memory becomes unavailable
+- treat fresh external-watchdog heartbeats plus the observed recent watchdog sample cadence as a bounded bridge between healthy steady-state deep probes so the runtime does not false-fail `required_remote` while the watchdog is intentionally idling or persisting heartbeats on a slower Pi-safe cadence
 - keep streamed TTS abortable even before the first chunk arrives so a stalled provider request does not pin the runtime in `answering`
 - only surface `answering` once spoken audio has actually started instead of when text is merely queued
 - route non-safety proactive prompts through a dedicated delivery policy that can choose speech or display-first based on quiet hours, media/noise suppression, and recent ignored or interrupted prompts
@@ -70,7 +71,7 @@ bounded.
 | [realtime_runner_tools.py](./realtime_runner_tools.py) | Tool delegate mixin, including RSS/world-intelligence configuration wiring |
 | [button_dispatch.py](./button_dispatch.py) | Non-blocking button dispatch and busy-turn interruption |
 | [required_remote_watch.py](./required_remote_watch.py) | Background required-remote readiness watch for fail-closed runtimes |
-| [required_remote_snapshot.py](./required_remote_snapshot.py) | Cheap external-watchdog snapshot evaluation for live runtime gating |
+| [required_remote_snapshot.py](./required_remote_snapshot.py) | Cheap external-watchdog snapshot evaluation for live runtime gating, including bounded heartbeat bridging keyed to healthy recent steady-state probe cadence and Pi-safe heartbeat quiet windows |
 | [speech_output.py](./speech_output.py) | Interruptible streamed TTS |
 | [forensics.py](./forensics.py) | Queue-based forensic runpack tracing for live workflow bugs |
 | [listen_timeout_diagnostics.py](./listen_timeout_diagnostics.py) | Shared bounded no-speech timeout diagnostics emission |

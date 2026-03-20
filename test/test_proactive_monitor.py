@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.display.emoji_cues import DisplayEmojiCueStore
 from twinr.display.face_cues import DisplayFaceCueStore
 from twinr.hardware.portrait_match import PortraitMatchObservation
 from twinr.hardware.respeaker.models import ReSpeakerSignalSnapshot
@@ -26,6 +27,8 @@ from twinr.proactive import (
     PresenceSessionSnapshot,
     SocialAudioObservation,
     SocialBodyPose,
+    SocialFineHandGesture,
+    SocialGestureEvent,
     SocialObservation,
     SocialPersonZone,
     SocialTriggerDecision,
@@ -1123,13 +1126,47 @@ class ProactiveMonitorTests(unittest.TestCase):
                     [
                         SocialVisionObservation(
                             person_visible=True,
+                            person_count=1,
+                            primary_person_zone=SocialPersonZone.CENTER,
+                            primary_person_center_x=0.52,
+                            primary_person_center_y=0.47,
                             looking_toward_device=True,
+                            person_near_device=True,
+                            engaged_with_device=True,
+                            visual_attention_score=0.8123,
                             body_pose=SocialBodyPose.UPRIGHT,
+                            pose_confidence=0.9132,
+                            motion_confidence=0.6421,
+                            hand_or_object_near_camera=True,
+                            gesture_event=SocialGestureEvent.WAVE,
+                            gesture_confidence=0.7321,
+                            fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                            fine_hand_gesture_confidence=0.6543,
+                            camera_online=True,
+                            camera_ready=True,
+                            camera_ai_ready=True,
                         ),
                         SocialVisionObservation(
                             person_visible=True,
+                            person_count=1,
+                            primary_person_zone=SocialPersonZone.CENTER,
+                            primary_person_center_x=0.52,
+                            primary_person_center_y=0.47,
                             looking_toward_device=True,
+                            person_near_device=True,
+                            engaged_with_device=True,
+                            visual_attention_score=0.8123,
                             body_pose=SocialBodyPose.UPRIGHT,
+                            pose_confidence=0.9132,
+                            motion_confidence=0.6421,
+                            hand_or_object_near_camera=True,
+                            gesture_event=SocialGestureEvent.WAVE,
+                            gesture_confidence=0.7321,
+                            fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                            fine_hand_gesture_confidence=0.6543,
+                            camera_online=True,
+                            camera_ready=True,
+                            camera_ai_ready=True,
                         ),
                     ]
                 ),
@@ -1151,7 +1188,25 @@ class ProactiveMonitorTests(unittest.TestCase):
         observation_events = [entry for entry in events if entry.get("event") == "proactive_observation"]
         self.assertEqual(len(observation_events), 1)
         self.assertEqual(observation_events[0]["data"]["person_visible"], True)
+        self.assertEqual(observation_events[0]["data"]["camera_person_count"], 1)
+        self.assertEqual(observation_events[0]["data"]["camera_primary_person_zone"], "center")
+        self.assertEqual(observation_events[0]["data"]["camera_primary_person_center_x"], 0.52)
+        self.assertEqual(observation_events[0]["data"]["camera_primary_person_center_y"], 0.47)
         self.assertEqual(observation_events[0]["data"]["body_pose"], "upright")
+        self.assertEqual(observation_events[0]["data"]["camera_person_near_device"], True)
+        self.assertEqual(observation_events[0]["data"]["camera_engaged_with_device"], True)
+        self.assertEqual(observation_events[0]["data"]["camera_visual_attention_score"], 0.8123)
+        self.assertEqual(observation_events[0]["data"]["camera_pose_confidence"], 0.9132)
+        self.assertEqual(observation_events[0]["data"]["camera_motion_state"], "unknown")
+        self.assertEqual(observation_events[0]["data"]["camera_motion_confidence"], 0.6421)
+        self.assertEqual(observation_events[0]["data"]["camera_gesture_event"], "wave")
+        self.assertEqual(observation_events[0]["data"]["camera_gesture_confidence"], 0.7321)
+        self.assertEqual(observation_events[0]["data"]["camera_fine_hand_gesture"], "thumbs_up")
+        self.assertEqual(observation_events[0]["data"]["camera_fine_hand_gesture_confidence"], 0.6543)
+        self.assertEqual(observation_events[0]["data"]["camera_online"], True)
+        self.assertEqual(observation_events[0]["data"]["camera_ready"], True)
+        self.assertEqual(observation_events[0]["data"]["camera_ai_ready"], True)
+        self.assertIsNone(observation_events[0]["data"]["camera_error"])
         self.assertEqual(observation_events[0]["data"]["speech_detected"], False)
         self.assertIn("top_trigger", observation_events[0]["data"])
         self.assertIn("top_score", observation_events[0]["data"])
@@ -1194,7 +1249,7 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertIsNotNone(cue)
         assert cue is not None
         self.assertEqual(cue.source, "proactive_attention_follow")
-        self.assertEqual(cue.gaze_x, -2)
+        self.assertEqual(cue.gaze_x, 2)
         self.assertEqual(cue.gaze_y, 0)
 
     def test_display_attention_refresh_updates_cue_without_pir_motion(self) -> None:
@@ -1236,8 +1291,91 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertIsNotNone(cue)
         assert cue is not None
         self.assertEqual(cue.source, "proactive_attention_follow")
-        self.assertEqual(cue.gaze_x, 2)
+        self.assertEqual(cue.gaze_x, -2)
         self.assertEqual(cue.gaze_y, 0)
+
+    def test_display_attention_refresh_acknowledges_fine_hand_gesture_with_emoji(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                display_driver="hdmi_wayland",
+                display_attention_refresh_interval_s=1.0,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(10.0)
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            hand_or_object_near_camera=True,
+                            showing_intent_likely=True,
+                            fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                            fine_hand_gesture_confidence=0.91,
+                        )
+                    ],
+                    supports_attention_refresh=True,
+                ),
+                pir_monitor=FakePirMonitor(),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            refreshed = coordinator.refresh_display_attention()
+            cue = DisplayEmojiCueStore.from_config(config).load_active()
+
+        self.assertTrue(refreshed)
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertEqual(cue.source, "proactive_gesture_ack")
+        self.assertEqual(cue.symbol, "thumbs_up")
+        self.assertEqual(cue.accent, "success")
+
+    def test_tick_acknowledges_wave_gesture_with_emoji(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=1.0,
+                proactive_motion_window_s=5.0,
+                display_driver="hdmi_wayland",
+            )
+            runtime = TwinrRuntime(config=config)
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            gesture_event=SocialGestureEvent.WAVE,
+                            gesture_confidence=0.84,
+                        )
+                    ]
+                ),
+                pir_monitor=FakePirMonitor(events=[True], level=True),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                emit=lambda _line: None,
+                clock=MutableClock(1.0),
+            )
+
+            result = coordinator.tick()
+            cue = DisplayEmojiCueStore.from_config(config).load_active()
+
+        self.assertTrue(result.inspected)
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertEqual(cue.source, "proactive_gesture_ack")
+        self.assertEqual(cue.symbol, "waving_hand")
+        self.assertEqual(cue.accent, "warm")
 
     def test_display_attention_refresh_updates_cue_during_error_runtime_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1280,7 +1418,7 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertIsNotNone(cue)
         assert cue is not None
         self.assertEqual(cue.source, "proactive_attention_follow")
-        self.assertEqual(cue.gaze_x, -2)
+        self.assertEqual(cue.gaze_x, 2)
         self.assertEqual(cue.gaze_y, 0)
 
     def test_display_attention_refresh_keeps_recent_session_focus_in_multi_person_context(self) -> None:
@@ -1347,7 +1485,7 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertTrue(second_refresh)
         assert cue is not None
         self.assertEqual(cue.source, "proactive_attention_follow")
-        self.assertEqual(cue.gaze_x, -2)
+        self.assertEqual(cue.gaze_x, 2)
         self.assertEqual(cue.gaze_y, 0)
 
     def test_coordinator_logs_trigger_detection_and_absence_transition(self) -> None:
@@ -1870,15 +2008,23 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertFalse(result.inspected)
         self.assertEqual(local_provider.calls, 0)
 
-    def test_build_default_monitor_falls_back_to_stt_when_openwakeword_models_are_missing(self) -> None:
+    def test_build_default_monitor_bootstraps_inspection_from_speech_when_wakeword_enabled(self) -> None:
         config = TwinrConfig(
+            proactive_enabled=True,
             wakeword_enabled=True,
-            wakeword_backend="openwakeword",
-            pir_motion_gpio=26,
+            wakeword_backend="stt",
+            wakeword_primary_backend="stt",
+            display_driver="waveshare_4in2_v2",
+            display_attention_refresh_interval_s=0.0,
+            proactive_capture_interval_s=1.0,
         )
         runtime = TwinrRuntime(config=config)
+        local_provider = FakeVisionObserver([SocialVisionObservation(person_visible=True)])
 
-        with patch("twinr.proactive.runtime.service.configured_pir_monitor", return_value=FakePirMonitor()):
+        with patch(
+            "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
+            return_value=local_provider,
+        ):
             monitor = build_default_proactive_monitor(
                 config=config,
                 runtime=runtime,
@@ -1891,11 +2037,78 @@ class ProactiveMonitorTests(unittest.TestCase):
             )
 
         self.assertIsNotNone(monitor)
-        self.assertIsInstance(monitor.coordinator.wakeword_spotter, WakewordPhraseSpotter)
-        events = runtime.ops_events.tail(limit=10)
-        warning = next(entry for entry in events if entry.get("event") == "wakeword_backend_warning")
-        self.assertEqual(warning["data"]["reason"], "openwakeword_models_missing")
-        self.assertEqual(warning["data"]["fallback_backend"], "stt")
+        monitor.coordinator.audio_observer = FakeAudioObserver(
+            SocialAudioObservation(speech_detected=True)
+        )
+        result = monitor.coordinator.tick()
+        events = runtime.ops_events.tail(limit=20)
+        presence_event = next(
+            entry for entry in reversed(events) if entry.get("event") == "wakeword_presence_changed"
+        )
+
+        self.assertTrue(result.inspected)
+        self.assertEqual(local_provider.calls, 1)
+        self.assertTrue(presence_event["data"]["armed"])
+        self.assertEqual(presence_event["data"]["reason"], "person_visible")
+
+    def test_build_default_monitor_falls_back_to_stt_when_openwakeword_models_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                wakeword_enabled=True,
+                wakeword_backend="openwakeword",
+                pir_motion_gpio=26,
+            )
+            runtime = TwinrRuntime(config=config)
+
+            with patch("twinr.proactive.runtime.service.configured_pir_monitor", return_value=FakePirMonitor()):
+                monitor = build_default_proactive_monitor(
+                    config=config,
+                    runtime=runtime,
+                    backend=FakeBackend("person_visible=no"),
+                    camera=FakeCamera(),
+                    camera_lock=None,
+                    audio_lock=None,
+                    trigger_handler=lambda _decision: True,
+                    emit=lambda _line: None,
+                )
+
+            self.assertIsNotNone(monitor)
+            self.assertIsInstance(monitor.coordinator.wakeword_spotter, WakewordPhraseSpotter)
+            events = runtime.ops_events.tail(limit=10)
+            warning = next(entry for entry in events if entry.get("event") == "wakeword_backend_warning")
+            self.assertEqual(warning["data"]["reason"], "openwakeword_models_missing")
+            self.assertEqual(warning["data"]["fallback_backend"], "stt")
+
+    def test_build_default_monitor_falls_back_to_stt_when_kws_assets_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                wakeword_enabled=True,
+                wakeword_backend="kws",
+                wakeword_primary_backend="kws",
+                pir_motion_gpio=26,
+            )
+            runtime = TwinrRuntime(config=config)
+
+            with patch("twinr.proactive.runtime.service.configured_pir_monitor", return_value=FakePirMonitor()):
+                monitor = build_default_proactive_monitor(
+                    config=config,
+                    runtime=runtime,
+                    backend=FakeBackend("person_visible=no"),
+                    camera=FakeCamera(),
+                    camera_lock=None,
+                    audio_lock=None,
+                    trigger_handler=lambda _decision: True,
+                    emit=lambda _line: None,
+                )
+
+            self.assertIsNotNone(monitor)
+            self.assertIsInstance(monitor.coordinator.wakeword_spotter, WakewordPhraseSpotter)
+            events = runtime.ops_events.tail(limit=10)
+            warning = next(entry for entry in events if entry.get("event") == "wakeword_backend_warning")
+            self.assertEqual(warning["data"]["reason"], "kws_assets_missing")
+            self.assertEqual(warning["data"]["fallback_backend"], "stt")
 
     def test_build_default_monitor_prefers_local_camera_provider_by_default(self) -> None:
         config = TwinrConfig(

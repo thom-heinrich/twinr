@@ -21,7 +21,8 @@ from twinr.ops import TwinrOpsEventStore, resolve_ops_paths_for_config
 
 from .calibration import WakewordCalibrationProfile, WakewordCalibrationStore, apply_wakeword_calibration
 from .cascade import WakewordSequenceCaptureVerifier
-from .policy import SttWakewordVerifier, WakewordDecisionPolicy
+from .kws import WakewordSherpaOnnxSpotter
+from .policy import SttWakewordVerifier, WakewordDecisionPolicy, normalize_wakeword_backend
 from .spotter import WakewordOpenWakeWordSpotter
 
 _POSITIVE_LABELS = {"correct", "false_negative", "positive"}
@@ -203,6 +204,78 @@ def _unique_reference_clip_paths(paths: list[Path]) -> list[str]:
 
     unique_paths = dict.fromkeys(path.expanduser().resolve(strict=False) for path in paths)
     return [str(path) for path in unique_paths]
+
+
+def _primary_backend_for_config(config: TwinrConfig) -> str:
+    return normalize_wakeword_backend(
+        getattr(config, "wakeword_primary_backend", config.wakeword_backend),
+        default="openwakeword",
+    )
+
+
+def _primary_threshold_for_config(config: TwinrConfig) -> float | None:
+    primary_backend = _primary_backend_for_config(config)
+    if primary_backend == "kws":
+        return float(config.wakeword_kws_keywords_threshold)
+    if primary_backend == "openwakeword":
+        return float(config.wakeword_openwakeword_threshold)
+    return None
+
+
+def _build_local_verifier(config: TwinrConfig):
+    if _primary_backend_for_config(config) != "openwakeword":
+        return None
+    if not config.wakeword_openwakeword_sequence_verifier_models:
+        return None
+    return WakewordSequenceCaptureVerifier(
+        verifier_models=dict(config.wakeword_openwakeword_sequence_verifier_models),
+        threshold=config.wakeword_openwakeword_sequence_verifier_threshold,
+    )
+
+
+def _build_eval_spotter(
+    *,
+    config: TwinrConfig,
+    model_factory=None,
+):
+    primary_backend = _primary_backend_for_config(config)
+    if primary_backend not in {"openwakeword", "kws"}:
+        raise ValueError(
+            "Wakeword eval currently supports only local detector backends: openwakeword or kws."
+        )
+    if primary_backend == "kws":
+        return WakewordSherpaOnnxSpotter(
+            tokens_path=config.wakeword_kws_tokens_path or "",
+            encoder_path=config.wakeword_kws_encoder_path or "",
+            decoder_path=config.wakeword_kws_decoder_path or "",
+            joiner_path=config.wakeword_kws_joiner_path or "",
+            keywords_file_path=config.wakeword_kws_keywords_file_path or "",
+            phrases=config.wakeword_phrases,
+            project_root=config.project_root,
+            sample_rate=config.wakeword_kws_sample_rate,
+            feature_dim=config.wakeword_kws_feature_dim,
+            max_active_paths=config.wakeword_kws_max_active_paths,
+            keywords_score=config.wakeword_kws_keywords_score,
+            keywords_threshold=config.wakeword_kws_keywords_threshold,
+            num_trailing_blanks=config.wakeword_kws_num_trailing_blanks,
+            num_threads=config.wakeword_kws_num_threads,
+            provider=config.wakeword_kws_provider,
+            keyword_spotter_factory=model_factory,
+        )
+    return WakewordOpenWakeWordSpotter(
+        wakeword_models=config.wakeword_openwakeword_models,
+        phrases=config.wakeword_phrases,
+        threshold=config.wakeword_openwakeword_threshold,
+        vad_threshold=config.wakeword_openwakeword_vad_threshold,
+        patience_frames=config.wakeword_openwakeword_patience_frames,
+        activation_samples=config.wakeword_openwakeword_activation_samples,
+        deactivation_threshold=config.wakeword_openwakeword_deactivation_threshold,
+        enable_speex_noise_suppression=config.wakeword_openwakeword_enable_speex,
+        inference_framework=config.wakeword_openwakeword_inference_framework,
+        backend=None,
+        transcribe_on_detect=False,
+        model_factory=model_factory,
+    )
 
 
 def load_eval_manifest(manifest_path: str | Path) -> list[WakewordEvalEntry]:
@@ -404,35 +477,18 @@ def evaluate_wakeword_entries(
             language=config.openai_realtime_language,
         )
     )
-    local_verifier = (
-        None
-        if not config.wakeword_openwakeword_sequence_verifier_models
-        else WakewordSequenceCaptureVerifier(
-            verifier_models=dict(config.wakeword_openwakeword_sequence_verifier_models),
-            threshold=config.wakeword_openwakeword_sequence_verifier_threshold,
-        )
-    )
+    local_verifier = _build_local_verifier(config)
     policy = WakewordDecisionPolicy(
         primary_backend=config.wakeword_primary_backend,
         fallback_backend=config.wakeword_fallback_backend,
         verifier_mode=config.wakeword_verifier_mode,
         verifier_margin=config.wakeword_verifier_margin,
-        primary_threshold=config.wakeword_openwakeword_threshold,
+        primary_threshold=_primary_threshold_for_config(config),
         verifier=verifier,
         local_verifier=local_verifier,
     )
-    spotter = WakewordOpenWakeWordSpotter(
-        wakeword_models=config.wakeword_openwakeword_models,
-        phrases=config.wakeword_phrases,
-        threshold=config.wakeword_openwakeword_threshold,
-        vad_threshold=config.wakeword_openwakeword_vad_threshold,
-        patience_frames=config.wakeword_openwakeword_patience_frames,
-        activation_samples=config.wakeword_openwakeword_activation_samples,
-        deactivation_threshold=config.wakeword_openwakeword_deactivation_threshold,
-        enable_speex_noise_suppression=config.wakeword_openwakeword_enable_speex,
-        inference_framework=config.wakeword_openwakeword_inference_framework,
-        backend=None,
-        transcribe_on_detect=False,
+    spotter = _build_eval_spotter(
+        config=config,
         model_factory=model_factory,
     )
     counts = {"tp": 0, "fp": 0, "tn": 0, "fn": 0}

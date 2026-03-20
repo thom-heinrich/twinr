@@ -8,9 +8,10 @@ owned_concerns:
   - Translate runtime snapshots and health signals into bounded status frames for the active display backend
   - Derive calm operator-visible ReSpeaker HCI state from authoritative ops events instead of embedding raw proactive-event parsing in the display loop
   - Surface calm ReSpeaker listening, heard-speech, direction-hint, and ring-semantic states without mirroring weak audio evidence
-  - Persist and load optional HDMI face-expression cues so external triggers can steer gaze, brows, mouth, and subtle head drift without changing the generic runtime snapshot schema
+  - Persist and load optional HDMI face-expression cues so external triggers can steer gaze, brows, mouth, and subtle head drift without changing the generic runtime snapshot schema, and let directional cues calm the normal waiting-face idle churn instead of fighting it
   - Expose a producer-facing HDMI face-expression API so camera, proactive, or other runtime modules can set combinable gaze, brow, mouth, and blink cues without writing raw JSON
-  - Persist and load optional HDMI presentation cues so capabilities can expand the right-hand panel into a fullscreen image or rich card without changing the generic runtime snapshot schema
+  - Persist and load optional HDMI emoji cues so capabilities can claim the free right-hand reserve area with one real Unicode symbol and soft accent halo instead of status-card chrome
+  - Persist and load optional HDMI presentation cues so capabilities can claim the otherwise free right-hand HDMI reserve area or expand into a fullscreen image or rich card without changing the generic runtime snapshot schema
   - Resolve prioritized HDMI presentation cards into a calm scene graph with eased morph stages and default face-sync reactions
   - Schedule rare idle-only HDMI ambient moments so the waiting face can occasionally show a small cute surprise without disrupting the status panel
   - Fetch, cache, and rotate optional RSS or Atom headlines for the HDMI bottom ticker without blocking the display loop on remote network I/O
@@ -33,6 +34,10 @@ files:
       - DisplayFaceBrowStyle
       - DisplayFaceCue
       - DisplayFaceCueStore
+      - DisplayEmojiController
+      - DisplayEmojiCue
+      - DisplayEmojiCueStore
+      - DisplayEmojiSymbol
       - DisplayFaceEmotion
       - DisplayFaceExpression
       - DisplayFaceExpressionController
@@ -59,6 +64,13 @@ files:
       - TwinrStatusDisplayLoop
   - path: debug_log.py
     role: Group recent system, llm, hardware, and ChonkyDB watchdog telemetry into display-safe log sections
+  - path: emoji_cues.py
+    role: Persist and normalize optional external HDMI emoji cues and expose a producer-facing controller for the right-hand reserve area
+    exports:
+      - DisplayEmojiController
+      - DisplayEmojiCue
+      - DisplayEmojiCueStore
+      - DisplayEmojiSymbol
   - path: respeaker_hci.py
     role: Parse authoritative ReSpeaker ops events into calm status-card and debug-log HCI states, including listening/heard-speech/direction and ring semantics
   - path: face_cues.py
@@ -86,7 +98,7 @@ files:
   - path: hdmi_ambient_moments.py
     role: Resolve deterministic rare idle-only HDMI ambient moments and their temporary face cues
   - path: hdmi_default_scene.py
-    role: Compose the modular senior-facing HDMI default scene, including layout, face animation, and status cards
+    role: Compose the modular senior-facing HDMI default scene, including layout, face animation, header state, and the reserved right-hand capability area
   - path: hdmi_presentation_graph.py
     role: Resolve prioritized HDMI presentation cards into eased graph nodes and face-sync defaults
   - path: visual_qc.py
@@ -123,6 +135,7 @@ tests:
   - path: test/test_display_ambient_moments.py
   - path: test/test_display_debug_log.py
   - path: test/test_display_face_cues.py
+  - path: test/test_display_emojis.py
   - path: test/test_display_news_ticker.py
   - path: test/test_display_presentation_cues.py
   - path: test/test_display_respeaker_hci.py

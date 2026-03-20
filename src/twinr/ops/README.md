@@ -15,11 +15,15 @@ tools.
 - collect config, device, and system-health snapshots
 - run a dedicated rolling ChonkyDB remote-memory watchdog
 - persist structured remote-readiness probe evidence and supervisor-seeded watchdog bootstrap snapshots so restart phases do not look like dead/stale watchdog failures
+- run strict bootstrap/recovery remote probes once, then reuse a cheaper steady-state keepalive that proves current remote readability without reseeding every snapshot on every tick
+- keep fresh watchdog heartbeats authoritative during bounded steady-state idle gaps so the supervisor does not false-fail a healthy remote watchdog between deep probes
+- keep the heavy `archive` snapshot out of the steady-state watchdog hot path while retaining archive-inclusive bootstrap and recovery proofs
 - persist structured long-term remote-read diagnostics when ChonkyDB retrieve/fetch paths fail or degrade to bounded fallback, so operators can separate backend HTTP flakes, timeouts, and client-contract issues
 - ensure the dedicated remote-memory watchdog process is running for live Pi runtimes
 - allow the productive runtime supervisor to consume that external watchdog as the long-lived owner, so restarting the supervisor does not cold-reset the watchdog's warm remote state
 - seed detached Pi runtime processes with the user-session audio env they need for Pulse/ALSA default playback
 - supervise the productive Pi streaming loop and, when configured, consume the external remote watchdog artifact instead of always recycling a fresh watchdog child
+- adopt an already-running streaming-loop owner after supervisor restarts instead of thrashing new children into singleton-lock failures
 - consume the shared display heartbeat contract so ops health and the runtime supervisor read the same companion-progress semantics the display loop writes
 - keep display-companion degradation visible in ops health without letting a display fault tear down the speech path
 - recycle failed watchdog service instances so transient remote-state poison does not stick forever

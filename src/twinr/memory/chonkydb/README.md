@@ -13,6 +13,9 @@ used by Twinr's long-term memory flows.
 - expose a one-shot `topk_records` retrieval contract that returns structured payloads from ChonkyDB in a single roundtrip
 - carry Twinr's `namespace + scope_ref` contract for current-snapshot retrieval so server-side scope resolution can replace oversized client allowlists
 - define the canonical Twinr personal-graph schema and its local store
+- keep the personal-graph inter-process lock on a runtime-shared lock path so
+  watchdog and supervisor processes can coordinate even when the ChonkyDB data
+  directory itself is root-owned
 - build prompt-context and subtext payloads from persisted graph memory
 - reuse the last successful remote graph document id during steady-state readiness reads so graph bootstrap avoids repeated pointer resolution when the remote snapshot has not moved
 

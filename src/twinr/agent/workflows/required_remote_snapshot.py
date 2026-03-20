@@ -121,6 +121,60 @@ def _max_allowed_sample_age_s(
     return max(keepalive_floor_s, watchdog_interval_s * 2.0, observed_latency_s * 2.0 + 5.0)
 
 
+def _recent_sample_cycle_s(snapshot: RemoteMemoryWatchdogSnapshot) -> float | None:
+    """Return the largest recent completed-sample cadence in seconds."""
+
+    recent_samples = tuple(getattr(snapshot, "recent_samples", ()) or ())
+    if len(recent_samples) < 2:
+        return None
+    parsed_samples = []
+    for sample in recent_samples[-4:]:
+        captured_at = _parse_utc_timestamp(getattr(sample, "captured_at", None))
+        if captured_at is not None:
+            parsed_samples.append(captured_at)
+    if len(parsed_samples) < 2:
+        return None
+    intervals_s: list[float] = []
+    for previous_at, current_at in zip(parsed_samples, parsed_samples[1:]):
+        interval_s = max(0.0, (current_at - previous_at).total_seconds())
+        if interval_s > 0.0 and math.isfinite(interval_s):
+            intervals_s.append(interval_s)
+    if not intervals_s:
+        return None
+    return max(intervals_s)
+
+
+def _max_allowed_steady_state_sample_age_s(
+    *,
+    config: TwinrConfig,
+    snapshot: RemoteMemoryWatchdogSnapshot,
+    max_sample_age_s: float,
+) -> float:
+    """Bound how long one last-known-good sample may bridge fresh heartbeats.
+
+    In steady state the external watchdog deliberately idles between deep
+    probes. During that quiet window the persisted heartbeat keeps proving that
+    the watchdog loop is alive, but ``current.captured_at`` continues to age
+    until the next deep probe completes. Allow one bounded steady-state cycle
+    so the runtime does not flap false-stale between healthy samples, while
+    still failing closed if the watchdog stops producing fresh probe results.
+    """
+
+    watchdog_interval_s = _watchdog_interval_s(config, snapshot)
+    keepalive_floor_s = _keepalive_floor_s(config)
+    observed_latency_s = max(
+        0.0,
+        float(getattr(snapshot.current, "latency_ms", 0.0) or 0.0) / 1000.0,
+    )
+    idle_gap_s = max(watchdog_interval_s, keepalive_floor_s, observed_latency_s)
+    recent_cycle_s = _recent_sample_cycle_s(snapshot) or 0.0
+    heartbeat_slack_s = max(1.0, watchdog_interval_s * 2.0)
+    return max(
+        max_sample_age_s + idle_gap_s,
+        max(recent_cycle_s, idle_gap_s + observed_latency_s) + heartbeat_slack_s,
+    )
+
+
 def _max_allowed_heartbeat_age_s(
     *,
     config: TwinrConfig,
@@ -142,6 +196,29 @@ def _max_allowed_heartbeat_age_s(
     )
     timing_slack_s = max(1.0, _watchdog_interval_s(config, snapshot) * 2.0)
     return base_budget_s + timing_slack_s
+
+
+def _max_allowed_steady_state_heartbeat_age_s(
+    *,
+    config: TwinrConfig,
+    snapshot: RemoteMemoryWatchdogSnapshot,
+    max_sample_age_s: float,
+    max_steady_state_sample_age_s: float,
+) -> float:
+    """Return the bounded heartbeat budget while one good sample bridges idle time.
+
+    On the Pi, healthy watchdog heartbeats are persisted on a slower bounded
+    cadence than the live runtime polls. While the last completed sample still
+    fits inside the allowed steady-state bridge window, the heartbeat may
+    legitimately age past the generic keepalive budget without indicating a
+    dead watchdog loop.
+    """
+
+    keepalive_floor_s = _keepalive_floor_s(config)
+    return max(
+        _max_allowed_heartbeat_age_s(config=config, snapshot=snapshot),
+        min(max_steady_state_sample_age_s, max_sample_age_s + keepalive_floor_s),
+    )
 
 
 def _max_allowed_inflight_probe_age_s(
@@ -243,13 +320,27 @@ def assess_required_remote_watchdog_snapshot(
     if heartbeat_at is not None:
         heartbeat_age_s = max(0.0, (resolved_now - heartbeat_at).total_seconds())
     max_sample_age_s = _max_allowed_sample_age_s(config=config, snapshot=snapshot)
+    max_steady_state_sample_age_s = _max_allowed_steady_state_sample_age_s(
+        config=config,
+        snapshot=snapshot,
+        max_sample_age_s=max_sample_age_s,
+    )
     max_heartbeat_age_s = _max_allowed_heartbeat_age_s(config=config, snapshot=snapshot)
+    max_steady_state_heartbeat_age_s = _max_allowed_steady_state_heartbeat_age_s(
+        config=config,
+        snapshot=snapshot,
+        max_sample_age_s=max_sample_age_s,
+        max_steady_state_sample_age_s=max_steady_state_sample_age_s,
+    )
     inflight_probe_age_s = getattr(snapshot, "probe_age_s", None)
-    inflight_heartbeat_fresh = (
-        bool(getattr(snapshot, "probe_inflight", False))
-        and heartbeat_age_s is not None
+    heartbeat_fresh = (
+        heartbeat_age_s is not None
         and math.isfinite(heartbeat_age_s)
         and heartbeat_age_s <= max_heartbeat_age_s
+    )
+    inflight_heartbeat_fresh = (
+        bool(getattr(snapshot, "probe_inflight", False))
+        and heartbeat_fresh
         and inflight_probe_age_s is not None
         and math.isfinite(float(inflight_probe_age_s))
         and float(inflight_probe_age_s)
@@ -259,9 +350,20 @@ def assess_required_remote_watchdog_snapshot(
             max_sample_age_s=max_sample_age_s,
         )
     )
+    steady_state_heartbeat_fresh = (
+        not bool(getattr(snapshot, "probe_inflight", False))
+        and str(current.status or "").strip().lower() == "ok"
+        and bool(current.ready)
+        and heartbeat_age_s is not None
+        and math.isfinite(heartbeat_age_s)
+        and heartbeat_age_s <= max_steady_state_heartbeat_age_s
+        and sample_age_s is not None
+        and math.isfinite(sample_age_s)
+        and sample_age_s <= max_steady_state_sample_age_s
+    )
     snapshot_stale = (
         sample_age_s is None or not math.isfinite(sample_age_s) or sample_age_s > max_sample_age_s
-    ) and not inflight_heartbeat_fresh
+    ) and not inflight_heartbeat_fresh and not steady_state_heartbeat_fresh
     if snapshot_stale:
         detail = (
             f"Remote memory watchdog snapshot is stale (age={sample_age_s!r}s, max={max_sample_age_s:.1f}s)."

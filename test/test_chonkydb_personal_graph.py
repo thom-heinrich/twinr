@@ -76,6 +76,22 @@ class TwinrPersonalGraphStoreTests(unittest.TestCase):
         self.assertEqual(resolved.match.label, "Corinna Maier")
         self.assertEqual(resolved.match.phones, ("01761234",))
 
+    def test_from_config_places_graph_lock_in_runtime_state_lock_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "state" / "runtime-state.json"),
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                user_display_name="Erika",
+            )
+
+            store = TwinrPersonalGraphStore.from_config(config)
+
+        self.assertEqual(
+            store._lock_path,
+            Path(temp_dir) / "state" / "locks" / "twinr_graph_v1.json.lock",
+        )
+
     def test_contact_save_asks_before_merging_new_number_into_existing_named_person(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(

@@ -515,8 +515,19 @@ class LongTermMemoryService:
             _store_lock=store_lock,
         )
 
-    def probe_remote_ready(self) -> LongTermRemoteReadinessResult:
-        """Return structured required-remote readiness evidence for runtime use."""
+    def probe_remote_ready(
+        self,
+        *,
+        bootstrap: bool = True,
+        include_archive: bool = True,
+    ) -> LongTermRemoteReadinessResult:
+        """Return structured required-remote readiness evidence for runtime use.
+
+        Bootstrap mode performs the full remote snapshot warmup and deep
+        archive-inclusive validation. Steady-state watchdog probes can disable
+        that expensive bootstrap path while still proving the required current
+        remote state is readable.
+        """
 
         remote_state = getattr(self.prompt_context_store.memory_store, "remote_state", None)
         if remote_state is None or not remote_state.enabled:
@@ -549,48 +560,53 @@ class LongTermMemoryService:
             )
         with self._store_lock:
             with self._cache_remote_probe_reads():
-                for step_name, callback in (
-                    ("prompt_context_store.ensure_remote_snapshots", self.prompt_context_store.ensure_remote_snapshots),
-                    ("graph_store.ensure_remote_snapshot", self.graph_store.ensure_remote_snapshot),
-                    ("object_store.ensure_remote_snapshots", self.object_store.ensure_remote_snapshots),
-                    ("midterm_store.ensure_remote_snapshot", self.midterm_store.ensure_remote_snapshot),
-                ):
-                    step_started = time.monotonic()
-                    try:
-                        callback()
-                    except Exception as exc:
+                if bootstrap:
+                    for step_name, callback in (
+                        ("prompt_context_store.ensure_remote_snapshots", self.prompt_context_store.ensure_remote_snapshots),
+                        ("graph_store.ensure_remote_snapshot", self.graph_store.ensure_remote_snapshot),
+                        ("object_store.ensure_remote_snapshots", self.object_store.ensure_remote_snapshots),
+                        ("midterm_store.ensure_remote_snapshot", self.midterm_store.ensure_remote_snapshot),
+                    ):
+                        step_started = time.monotonic()
+                        try:
+                            callback()
+                        except Exception as exc:
+                            steps.append(
+                                LongTermRemoteReadinessStep(
+                                    name=step_name,
+                                    status="fail",
+                                    latency_ms=round(max(0.0, (time.monotonic() - step_started) * 1000.0), 3),
+                                    detail=f"{type(exc).__name__}: {exc}",
+                                )
+                            )
+                            return LongTermRemoteReadinessResult(
+                                ready=False,
+                                detail=f"{type(exc).__name__}: {exc}",
+                                remote_status=status,
+                                steps=tuple(steps),
+                                total_latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
+                            )
                         steps.append(
                             LongTermRemoteReadinessStep(
                                 name=step_name,
-                                status="fail",
+                                status="ok",
                                 latency_ms=round(max(0.0, (time.monotonic() - step_started) * 1000.0), 3),
-                                detail=f"{type(exc).__name__}: {exc}",
                             )
                         )
-                        return LongTermRemoteReadinessResult(
-                            ready=False,
-                            detail=f"{type(exc).__name__}: {exc}",
-                            remote_status=status,
-                            steps=tuple(steps),
-                            total_latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
-                        )
-                    steps.append(
-                        LongTermRemoteReadinessStep(
-                            name=step_name,
-                            status="ok",
-                            latency_ms=round(max(0.0, (time.monotonic() - step_started) * 1000.0), 3),
-                        )
-                    )
                 warm_started = time.monotonic()
                 warm_result = LongTermRemoteHealthProbe(
                     prompt_context_store=self.prompt_context_store,
                     object_store=self.object_store,
                     graph_store=self.graph_store,
                     midterm_store=self.midterm_store,
-                ).probe_operational()
+                ).probe_operational(include_archive=include_archive)
                 steps.append(
                     LongTermRemoteReadinessStep(
-                        name="LongTermRemoteHealthProbe.probe_operational",
+                        name=(
+                            "LongTermRemoteHealthProbe.probe_operational"
+                            if bootstrap and include_archive
+                            else "LongTermRemoteHealthProbe.probe_operational_steady_state"
+                        ),
                         status="ok" if warm_result.ready else "fail",
                         latency_ms=round(max(0.0, (time.monotonic() - warm_started) * 1000.0), 3),
                         detail=warm_result.detail,

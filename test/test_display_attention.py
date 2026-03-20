@@ -16,9 +16,9 @@ from twinr.proactive.runtime.display_attention import (
 
 
 class DisplayAttentionCueTests(unittest.TestCase):
-    def test_derives_leftward_gaze_from_primary_person_anchor(self) -> None:
+    def test_derives_user_facing_rightward_gaze_from_left_camera_anchor(self) -> None:
         decision = derive_display_attention_cue(
-            config=TwinrConfig(proactive_capture_interval_s=6.0, display_attention_refresh_interval_s=1.25),
+            config=TwinrConfig(proactive_capture_interval_s=6.0, display_attention_refresh_interval_s=0.6),
             live_facts={
                 "camera": {
                     "person_visible": True,
@@ -34,8 +34,28 @@ class DisplayAttentionCueTests(unittest.TestCase):
 
         self.assertTrue(decision.active)
         self.assertEqual(decision.reason, "visible_person")
-        self.assertEqual(decision.gaze, DisplayFaceGazeDirection.LEFT)
+        self.assertEqual(decision.gaze, DisplayFaceGazeDirection.RIGHT)
         self.assertLess(decision.hold_seconds, 6.0)
+        self.assertEqual(decision.head_dx, 2)
+
+    def test_derives_subtle_head_turn_before_full_side_gaze(self) -> None:
+        decision = derive_display_attention_cue(
+            config=TwinrConfig(proactive_capture_interval_s=6.0, display_attention_refresh_interval_s=0.6),
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "primary_person_center_x": 0.45,
+                    "primary_person_center_y": 0.5,
+                },
+                "vad": {
+                    "speech_detected": False,
+                },
+            },
+        )
+
+        self.assertTrue(decision.active)
+        self.assertEqual(decision.gaze, DisplayFaceGazeDirection.CENTER)
+        self.assertEqual(decision.head_dx, 1)
 
     def test_derives_speaking_mouth_when_visible_person_is_current_speaker(self) -> None:
         decision = derive_display_attention_cue(
@@ -82,7 +102,7 @@ class DisplayAttentionCueTests(unittest.TestCase):
 
         self.assertTrue(decision.active)
         self.assertEqual(decision.reason, "holding_session_focus")
-        self.assertEqual(decision.gaze, DisplayFaceGazeDirection.LEFT)
+        self.assertEqual(decision.gaze, DisplayFaceGazeDirection.RIGHT)
         self.assertEqual(decision.expression().brows, "soft")
 
     def test_publisher_does_not_overwrite_active_foreign_cue(self) -> None:
@@ -116,7 +136,7 @@ class DisplayAttentionCueTests(unittest.TestCase):
         self.assertEqual(loaded.source, "operator")
         self.assertEqual(loaded.gaze_x, 2)
 
-    def test_publisher_clears_its_own_cue_when_no_person_is_visible(self) -> None:
+    def test_publisher_clears_its_own_cue_when_no_person_is_visible_after_hold_window(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(project_root=temp_dir, proactive_capture_interval_s=1.0)
             publisher = DisplayAttentionCuePublisher.from_config(config)
@@ -144,10 +164,10 @@ class DisplayAttentionCueTests(unittest.TestCase):
                         "speech_detected": False,
                     },
                 },
-                now=datetime(2026, 3, 20, 8, 2, 1, tzinfo=timezone.utc),
+                now=datetime(2026, 3, 20, 8, 2, 3, tzinfo=timezone.utc),
             )
 
-            loaded = publisher.store.load_active(now=datetime(2026, 3, 20, 8, 2, 1, tzinfo=timezone.utc))
+            loaded = publisher.store.load_active(now=datetime(2026, 3, 20, 8, 2, 3, tzinfo=timezone.utc))
 
         self.assertEqual(result.action, "cleared")
         self.assertIsNone(loaded)
@@ -157,7 +177,7 @@ class DisplayAttentionCueTests(unittest.TestCase):
             config = TwinrConfig(
                 project_root=temp_dir,
                 proactive_capture_interval_s=6.0,
-                display_attention_refresh_interval_s=1.25,
+                display_attention_refresh_interval_s=0.6,
                 display_face_cue_ttl_s=4.0,
             )
             publisher = DisplayAttentionCuePublisher.from_config(config)
@@ -196,8 +216,174 @@ class DisplayAttentionCueTests(unittest.TestCase):
         self.assertEqual(refresh_result.action, "refreshed")
         self.assertIsNotNone(refreshed)
         assert refreshed is not None
-        self.assertEqual(refreshed.gaze_x, -2)
+        self.assertEqual(refreshed.gaze_x, 2)
         self.assertGreater(str(refreshed.expires_at), str(initial.expires_at))
+
+    def test_publisher_holds_recent_directional_cue_across_brief_center_jitter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_capture_interval_s=6.0,
+                display_attention_refresh_interval_s=0.6,
+                display_face_cue_ttl_s=4.0,
+            )
+            publisher = DisplayAttentionCuePublisher.from_config(config)
+            publisher.publish_from_facts(
+                config=config,
+                live_facts={
+                    "camera": {
+                        "person_visible": True,
+                        "primary_person_center_x": 0.12,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                    },
+                },
+                now=datetime(2026, 3, 20, 8, 4, tzinfo=timezone.utc),
+            )
+
+            jitter_result = publisher.publish_from_facts(
+                config=config,
+                live_facts={
+                    "camera": {
+                        "person_visible": True,
+                        "primary_person_center_x": 0.50,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                    },
+                },
+                now=datetime(2026, 3, 20, 8, 4, 1, tzinfo=timezone.utc),
+            )
+            held = publisher.store.load_active(now=datetime(2026, 3, 20, 8, 4, 1, 1000, tzinfo=timezone.utc))
+
+            settled_result = publisher.publish_from_facts(
+                config=config,
+                live_facts={
+                    "camera": {
+                        "person_visible": True,
+                        "primary_person_center_x": 0.50,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                    },
+                },
+                now=datetime(2026, 3, 20, 8, 4, 3, tzinfo=timezone.utc),
+            )
+            settled = publisher.store.load_active(now=datetime(2026, 3, 20, 8, 4, 3, 1000, tzinfo=timezone.utc))
+
+        self.assertTrue(jitter_result.decision.reason.endswith("held_direction"))
+        self.assertEqual(jitter_result.decision.gaze, DisplayFaceGazeDirection.RIGHT)
+        self.assertIsNotNone(held)
+        assert held is not None
+        self.assertEqual(held.gaze_x, 2)
+        self.assertEqual(settled_result.decision.gaze, DisplayFaceGazeDirection.CENTER)
+        self.assertIsNotNone(settled)
+        assert settled is not None
+        self.assertEqual(settled.gaze_x, 0)
+
+    def test_publisher_holds_recent_direction_when_person_is_still_on_same_side(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_capture_interval_s=6.0,
+                display_attention_refresh_interval_s=0.6,
+                display_face_cue_ttl_s=4.0,
+            )
+            publisher = DisplayAttentionCuePublisher.from_config(config)
+            publisher.publish_from_facts(
+                config=config,
+                live_facts={
+                    "camera": {
+                        "person_visible": True,
+                        "primary_person_center_x": 0.12,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                    },
+                },
+                now=datetime(2026, 3, 20, 8, 4, tzinfo=timezone.utc),
+            )
+
+            held_result = publisher.publish_from_facts(
+                config=config,
+                live_facts={
+                    "camera": {
+                        "person_visible": True,
+                        "primary_person_center_x": 0.46,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                    },
+                },
+                now=datetime(2026, 3, 20, 8, 4, 3, tzinfo=timezone.utc),
+            )
+            held = publisher.store.load_active(now=datetime(2026, 3, 20, 8, 4, 3, 1000, tzinfo=timezone.utc))
+
+        self.assertTrue(held_result.decision.reason.endswith("held_direction"))
+        self.assertEqual(held_result.decision.gaze, DisplayFaceGazeDirection.RIGHT)
+        self.assertIsNotNone(held)
+        assert held is not None
+        self.assertEqual(held.gaze_x, 2)
+
+    def test_publisher_holds_recent_cue_across_brief_visual_dropout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_capture_interval_s=6.0,
+                display_attention_refresh_interval_s=0.6,
+                display_face_cue_ttl_s=4.0,
+            )
+            publisher = DisplayAttentionCuePublisher.from_config(config)
+            publisher.publish_from_facts(
+                config=config,
+                live_facts={
+                    "camera": {
+                        "person_visible": True,
+                        "primary_person_center_x": 0.12,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                    },
+                },
+                now=datetime(2026, 3, 20, 8, 5, tzinfo=timezone.utc),
+            )
+
+            dropout_result = publisher.publish_from_facts(
+                config=config,
+                live_facts={
+                    "camera": {
+                        "person_visible": False,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                    },
+                },
+                now=datetime(2026, 3, 20, 8, 5, 1, tzinfo=timezone.utc),
+            )
+            held = publisher.store.load_active(now=datetime(2026, 3, 20, 8, 5, 1, 1000, tzinfo=timezone.utc))
+
+            cleared_result = publisher.publish_from_facts(
+                config=config,
+                live_facts={
+                    "camera": {
+                        "person_visible": False,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                    },
+                },
+                now=datetime(2026, 3, 20, 8, 5, 3, tzinfo=timezone.utc),
+            )
+            cleared = publisher.store.load_active(now=datetime(2026, 3, 20, 8, 5, 3, 1000, tzinfo=timezone.utc))
+
+        self.assertTrue(dropout_result.decision.reason.endswith("held_cue"))
+        self.assertTrue(dropout_result.decision.active)
+        self.assertIsNotNone(held)
+        assert held is not None
+        self.assertEqual(held.gaze_x, 2)
+        self.assertEqual(cleared_result.action, "cleared")
+        self.assertIsNone(cleared)
 
 
 if __name__ == "__main__":

@@ -70,7 +70,7 @@ def _normalize_backend(value: object | None, *, allow_disabled: bool) -> str | N
     normalized = (_normalize_optional_text(value) or "").lower()
     if not normalized:
         return None
-    allowed = {"openwakeword", "stt"}
+    allowed = {"openwakeword", "kws", "stt"}
     if allow_disabled:
         allowed.add("disabled")
     if normalized not in allowed:
@@ -251,7 +251,10 @@ def apply_wakeword_calibration(
 
     if profile is None:
         return config
-    primary_backend = profile.primary_backend or config.wakeword_primary_backend or config.wakeword_backend
+    # Keep deployment backend selection anchored in the base runtime config.
+    # Calibration profiles tune detector behavior, but they must not silently
+    # switch a Pi that was explicitly provisioned for another backend family.
+    primary_backend = config.wakeword_primary_backend or config.wakeword_backend
     fallback_backend = profile.fallback_backend or config.wakeword_fallback_backend
     verifier_mode = profile.verifier_mode or config.wakeword_verifier_mode
     return replace(

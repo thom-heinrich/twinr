@@ -24,6 +24,7 @@ import sys
 import time
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.display.face_cues import DisplayFaceCue
 from twinr.display.presentation_cues import DisplayPresentationCue
 from twinr.display.layouts import draw_status_card
@@ -221,6 +222,7 @@ class WaveshareEPD4In2V2:
         log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
         animation_frame: int = 0,
         face_cue: DisplayFaceCue | None = None,
+        emoji_cue: DisplayEmojiCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
         """Render and display one runtime status frame.
@@ -233,8 +235,9 @@ class WaveshareEPD4In2V2:
             log_sections: Structured log sections for debug/operator layouts.
             animation_frame: Precomputed animation frame index.
             face_cue: Optional HDMI-only expression cue. Ignored on Waveshare.
+            emoji_cue: Optional HDMI-only emoji reserve cue. Ignored on Waveshare.
         """
-        del ticker_text, face_cue, presentation_cue
+        del ticker_text, face_cue, emoji_cue, presentation_cue
         safe_status = self._normalise_text(status, fallback="status").lower() or "status"
         safe_headline = self._normalise_text(headline, fallback=safe_status.title())
         self._set_trace_surface_context(

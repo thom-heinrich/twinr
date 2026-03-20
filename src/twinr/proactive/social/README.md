@@ -41,7 +41,11 @@ scored proactive trigger candidates and optional visual second opinions.
 ## Usage
 
 ```python
-from twinr.proactive.social import SocialObservation, SocialTriggerEngine
+from twinr.proactive.social import (
+    SocialFineHandGesture,
+    SocialObservation,
+    SocialTriggerEngine,
+)
 
 engine = SocialTriggerEngine.from_config(config)
 decision = engine.observe(

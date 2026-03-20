@@ -113,6 +113,15 @@ def _infer_day_key(when_text: str | None, *, timezone_name: str) -> str | None:
     return resolved.isoformat() if resolved is not None else None
 
 
+def _resolve_config_path(configured: str | Path, *, project_root: str | Path) -> Path:
+    """Resolve one config-backed path against the Twinr project root."""
+
+    path = Path(configured).expanduser()
+    if path.is_absolute():
+        return path.resolve(strict=False)
+    return (Path(project_root).expanduser().resolve(strict=False) / path).resolve(strict=False)
+
+
 @dataclass(frozen=True, slots=True)
 class TwinrGraphContactOption:
     """Describe one contact option shown during lookup clarification."""
@@ -172,6 +181,7 @@ class TwinrPersonalGraphStore:
         user_label: str = "Main user",
         timezone_name: str = "Europe/Berlin",
         remote_state: LongTermRemoteStateStore | None = None,
+        lock_path: str | Path | None = None,
     ) -> None:
         self.path = Path(path).expanduser()
         self.user_node_id = user_node_id
@@ -179,7 +189,11 @@ class TwinrPersonalGraphStore:
         self.timezone_name = timezone_name
         self.remote_state = remote_state
         self._backup_path = self.path.with_name(f"{self.path.name}.bak")
-        self._lock_path = self.path.with_name(f"{self.path.name}.lock")
+        self._lock_path = (
+            Path(lock_path).expanduser()
+            if lock_path is not None
+            else self.path.with_name(f"{self.path.name}.lock")
+        )
         # AUDIT-FIX(#1): Protect the full read-modify-write cycle against concurrent callers in-process.
         self._document_lock_handle = threading.RLock()
 
@@ -189,11 +203,19 @@ class TwinrPersonalGraphStore:
 
         base = chonkydb_data_path(config)
         path = base / "twinr_graph_v1.json"
+        runtime_state_path = _resolve_config_path(
+            config.runtime_state_path,
+            project_root=config.project_root,
+        )
         return cls(
             path=path,
             user_label=config.user_display_name or "Main user",
             timezone_name=config.local_timezone_name,
             remote_state=LongTermRemoteStateStore.from_config(config),
+            # Keep the inter-process graph lock outside the root-owned
+            # ChonkyDB data directory so watchdog and runtime processes can
+            # coordinate even when they do not share the same effective UID.
+            lock_path=runtime_state_path.parent / "locks" / f"{path.name}.lock",
         )
 
     def load_document(self) -> TwinrGraphDocumentV1:
@@ -1468,13 +1490,26 @@ class TwinrPersonalGraphStore:
                 yield
                 return
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._lock_path, "a+b") as lock_handle:
-                # AUDIT-FIX(#1): Add an advisory file lock so multiple worker threads/processes cannot interleave writes.
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._lock_path.parent != self.path.parent:
+                with contextlib.suppress(OSError):
+                    os.chmod(self._lock_path.parent, 0o1777)
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+            lock_fd = os.open(self._lock_path, flags, 0o666)
+            try:
+                with contextlib.suppress(OSError):
+                    os.fchmod(lock_fd, 0o666)
+                with os.fdopen(lock_fd, "a+b") as lock_handle:
+                    lock_fd = -1
+                    # AUDIT-FIX(#1): Add an advisory file lock so multiple worker threads/processes cannot interleave writes.
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        yield
+                    finally:
+                        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                if lock_fd >= 0:
+                    os.close(lock_fd)
 
     def _load_local_document_locked(self) -> TwinrGraphDocumentV1 | None:
         for candidate_path in (self.path, self._backup_path):

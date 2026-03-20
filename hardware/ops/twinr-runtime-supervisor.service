@@ -3,12 +3,14 @@ Description=Twinr Authoritative Runtime Supervisor
 Wants=network-online.target twinr-remote-memory-watchdog.service
 After=network-online.target twinr-remote-memory-watchdog.service
 StartLimitIntervalSec=0
+ConditionPathExists=/proc/device-tree/model
 
 [Service]
 Type=simple
 WorkingDirectory=/twinr
 Environment=TWINR_PYTHON=/twinr/.venv/bin/python
 Environment=TWINR_REMOTE_MEMORY_WATCHDOG_MANAGED_EXTERNALLY=1
+ExecCondition=/usr/bin/env bash -lc 'grep -qa "Raspberry Pi" /proc/device-tree/model'
 ExecStart=/usr/bin/env bash -lc 'cd /twinr && PYTHONPATH=src "${TWINR_PYTHON}" -m twinr --env-file .env --run-runtime-supervisor'
 Restart=always
 RestartSec=2

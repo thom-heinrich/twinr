@@ -11,6 +11,7 @@ and snapshot commits through remote-primary state.
 `personality` owns:
 - define typed models for stable character, learned conversation style, humor, relationship context, continuity, place/world awareness, and reflection deltas
 - build ordered prompt layers that preserve Twinr's legacy `SYSTEM` / `PERSONALITY` / `USER` contract
+- render a bounded conversational self-expression and `MINDSHARE` layer so Twinr can naturally speak from ongoing themes without pretending to have a human inner life
 - provide storage seams for remote snapshot loading and saving without pushing persistence into base-agent prompting
 - extract structured interaction, continuity, place, and world signals from long-term consolidation output and tool history
 - gate background learning so repeated interaction, place, and world signals can evolve the durable personality snapshot without allowing one-off drift
@@ -30,6 +31,7 @@ and snapshot commits through remote-primary state.
 |---|---|
 | [models.py](./models.py) | Typed evolving-personality state and prompt-layer models |
 | [context_builder.py](./context_builder.py) | Ordered prompt-layer assembly |
+| [self_expression.py](./self_expression.py) | Conversational self-expression policy plus prompt-facing current-mindshare rendering |
 | [store.py](./store.py) | Remote snapshot persistence seam for prompt state, signals, and deltas |
 | [evolution.py](./evolution.py) | Policy-gated background learning loop, contradiction/sensitivity gates, and decay maintenance |
 | [signals.py](./signals.py) | Structured signal taxonomy plus extraction for style, humor, topic, continuity, place, and world evidence |
@@ -74,6 +76,8 @@ The current signal taxonomy is intentionally structured and conservative:
 - `thread` summaries refresh continuity directly and expire over time
 - `world` signals are freshness-bound and decay out of the prompt once stale
 - RSS-backed world intelligence is separate from ad-hoc live search: discovery is occasional and explicit, calibration learns slowly from structured conversation/tool evidence, refresh is cadence-bound, and feed items become contextual `WORLD`/`CONTINUITY` updates plus slower situational-awareness threads
+- Twinr's conversational self-expression stays bounded: it may speak from `MINDSHARE` when the user invites open conversation or asks what Twinr has been following, but it must not invent secret emotions, private off-screen experiences, or human-like inner life
+- `MINDSHARE` surfacing stays generic and data-driven: selection may vary slightly via bounded stochasticity, but it must be based on source type and salience rather than hardcoded entity names or place-first special cases
 
 ## See also
 

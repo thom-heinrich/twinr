@@ -51,6 +51,27 @@ class WakewordTrainingTests(unittest.TestCase):
         self.assertEqual(weights.tolist(), [1.0, 2.0, 1.0, 2.0])
         self.assertEqual(negative_weights.tolist(), [1.5, 3.0, 6.0])
 
+    def test_expanded_sample_weights_apply_difficulty_scaling(self) -> None:
+        weights = wakeword_training._expanded_sample_weights(
+            audio_paths=[
+                Path("synthetic.wav"),
+                Path("extra_neg_room.wav"),
+                Path("mined_neg_confusion.wav"),
+            ],
+            rounds=1,
+            positive=False,
+            difficulty_scores={
+                Path("extra_neg_room.wav").resolve(strict=False): 0.2,
+                Path("mined_neg_confusion.wav").resolve(strict=False): 0.9,
+            },
+            difficulty_scale=2.0,
+            difficulty_power=2.0,
+        )
+
+        self.assertAlmostEqual(weights.tolist()[0], 1.5)
+        self.assertAlmostEqual(weights.tolist()[1], 3.24, places=5)
+        self.assertAlmostEqual(weights.tolist()[2], 15.72, places=5)
+
     def test_export_openwakeword_model_to_onnx_forces_single_file_export(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -210,6 +231,9 @@ class WakewordTrainingTests(unittest.TestCase):
         self.assertEqual(metadata["selected_threshold"], 0.12)
         self.assertEqual(metadata["model_type"], "mlp")
         self.assertEqual(metadata["acceptance_eval_mode"], "runtime_stream_replay")
+        self.assertEqual(metadata["difficulty_reference_model_path"], None)
+        self.assertEqual(metadata["difficulty_positive_scale"], 0.0)
+        self.assertEqual(metadata["difficulty_negative_scale"], 0.0)
         self.assertEqual(metadata["train_positive_clips"], 2)
         self.assertEqual(metadata["train_negative_clips"], 2)
         self.assertEqual(positive_train_features.shape[0], 6)

@@ -8,7 +8,7 @@ workflow, and conversation callers use when they need ordered instruction string
 
 `prompting` owns:
 - load `SYSTEM`, `PERSONALITY`, and `USER` sections from the configured personality directory
-- merge those legacy sections with structured layers from [`../../personality`](../../personality/README.md) when a typed personality snapshot is available
+- merge those legacy sections with structured layers from [`../../personality`](../../personality/README.md) when a typed personality snapshot is available, including contextual `MINDSHARE` when Twinr has ongoing themes it may naturally speak from
 - merge memory, reminder, and automation context into loop-specific section sets
 - turn ordered sections into model-facing instruction strings
 - provide small instruction-composition helpers shared across callers

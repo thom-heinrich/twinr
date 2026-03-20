@@ -39,6 +39,8 @@ files:
       - PresenceSessionSnapshot
       - SocialAudioObservation
       - SocialBodyPose
+      - SocialFineHandGesture
+      - SocialGestureEvent
       - SocialObservation
       - SocialTriggerDecision
       - SocialTriggerEngine
@@ -126,6 +128,8 @@ public_api:
     - PresenceSessionSnapshot
     - SocialAudioObservation
     - SocialBodyPose
+    - SocialFineHandGesture
+    - SocialGestureEvent
     - SocialObservation
     - SocialTriggerDecision
     - SocialTriggerEngine

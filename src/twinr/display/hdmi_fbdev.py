@@ -12,12 +12,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import fcntl
 import math
+import os
 from pathlib import Path
+import subprocess
 from threading import RLock
 from typing import Any
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.contracts import DisplayLogSections, DisplayStateFields
+from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.display.face_cues import DisplayFaceCue
 from twinr.display.hdmi_default_scene import (
     HdmiDefaultSceneRenderer,
@@ -84,6 +87,10 @@ class HdmiFramebufferDisplay:
     _geometry: FramebufferGeometry | None = field(default=None, init=False, repr=False)
     _framebuffer: Any | None = field(default=None, init=False, repr=False)
     _font_cache: dict[str, object] = field(default_factory=dict, init=False, repr=False)
+    _emoji_cache: dict[str, object] = field(default_factory=dict, init=False, repr=False)
+    _emoji_font_path_cache: Path | None = field(default=None, init=False, repr=False)
+    _emoji_font_path_resolved: bool = field(default=False, init=False, repr=False)
+    _emoji_font_missing_reported: bool = field(default=False, init=False, repr=False)
     _lock: object = field(default_factory=RLock, init=False, repr=False)
     _last_rendered_status: str | None = field(default=None, init=False, repr=False)
     _default_scene_renderer: HdmiDefaultSceneRenderer | None = field(default=None, init=False, repr=False)
@@ -173,6 +180,7 @@ class HdmiFramebufferDisplay:
         log_sections: DisplayLogSections = (),
         animation_frame: int = 0,
         face_cue: DisplayFaceCue | None = None,
+        emoji_cue: DisplayEmojiCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
         """Render and display one runtime status frame."""
@@ -186,6 +194,7 @@ class HdmiFramebufferDisplay:
             log_sections=log_sections,
             animation_frame=animation_frame,
             face_cue=face_cue,
+            emoji_cue=emoji_cue,
             presentation_cue=presentation_cue,
         )
         self.show_image(image)
@@ -256,6 +265,7 @@ class HdmiFramebufferDisplay:
         animation_frame: int,
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
+        emoji_cue: DisplayEmojiCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         render_now: datetime | None = None,
     ):
@@ -301,6 +311,7 @@ class HdmiFramebufferDisplay:
             state_fields=ordered_fields,
             animation_frame=animation_frame,
             face_cue=face_cue,
+            emoji_cue=emoji_cue,
             presentation_cue=presentation_cue,
             render_now=render_now,
         )
@@ -339,6 +350,7 @@ class HdmiFramebufferDisplay:
         animation_frame: int,
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
+        emoji_cue: DisplayEmojiCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         render_now: datetime | None = None,
     ) -> None:
@@ -354,6 +366,7 @@ class HdmiFramebufferDisplay:
             state_fields=state_fields,
             animation_frame=animation_frame,
             face_cue=face_cue,
+            emoji_cue=emoji_cue,
             presentation_cue=presentation_cue,
             ambient_now=render_now,
         )
@@ -588,6 +601,111 @@ class HdmiFramebufferDisplay:
         while compact and self._text_width(draw, compact + ellipsis, font=font) > max_width:
             compact = compact[:-1].rstrip()
         return (compact + ellipsis).strip() if compact else ellipsis
+
+    def _render_emoji_glyph(self, emoji: str, *, target_size: int) -> object | None:
+        """Render one real Unicode emoji into a bounded transparent RGBA image."""
+
+        compact = self._normalise_text(emoji, fallback="")
+        if not compact or target_size <= 0:
+            return None
+        cache_key = f"{compact}:{int(target_size)}"
+        cached = self._emoji_cache.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            return None
+        font_path = self._resolve_emoji_font_path()
+        if font_path is None:
+            return None
+        try:
+            font = ImageFont.truetype(str(font_path), 109)
+        except OSError:
+            self._emit_missing_emoji_font_once(f"display_emoji_font=unreadable path={font_path}")
+            return None
+        canvas = Image.new("RGBA", (160, 160), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((8, 8), compact, font=font, embedded_color=True)
+        bbox = canvas.getbbox()
+        if bbox is None:
+            return None
+        glyph = canvas.crop(bbox)
+        fitted = glyph.resize((target_size, target_size), resample=Image.Resampling.LANCZOS)
+        self._emoji_cache[cache_key] = fitted
+        return fitted.copy()
+
+    def _resolve_emoji_font_path(self) -> Path | None:
+        """Return one usable emoji font path, caching the first successful probe."""
+
+        if self._emoji_font_path_resolved:
+            return self._emoji_font_path_cache
+        for candidate in self._emoji_font_candidates():
+            if candidate.is_file():
+                self._emoji_font_path_cache = candidate
+                self._emoji_font_path_resolved = True
+                return candidate
+        self._emoji_font_path_resolved = True
+        self._emit_missing_emoji_font_once(
+            "display_emoji_font=missing expected=/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"
+        )
+        return None
+
+    def _emoji_font_candidates(self) -> tuple[Path, ...]:
+        """Return prioritized emoji-font candidates for Linux HDMI deployments."""
+
+        candidates: list[Path] = []
+        override = str(os.environ.get("TWINR_DISPLAY_EMOJI_FONT_PATH", "")).strip()
+        if override:
+            candidates.append(Path(override).expanduser())
+        candidates.extend(
+            (
+                Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
+                Path("/usr/local/share/fonts/NotoColorEmoji.ttf"),
+                Path("/usr/local/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
+            )
+        )
+        fontconfig_match = self._emoji_font_path_from_fontconfig()
+        if fontconfig_match is not None:
+            candidates.append(fontconfig_match)
+        deduped: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+        return tuple(deduped)
+
+    def _emoji_font_path_from_fontconfig(self) -> Path | None:
+        """Ask fontconfig for a likely emoji font path when common paths are absent."""
+
+        try:
+            result = subprocess.run(
+                ("fc-match", "--format=%{file}\n", "Noto Color Emoji"),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        lines = (result.stdout or "").strip().splitlines()
+        if not lines:
+            return None
+        path = Path(lines[0]).expanduser()
+        if "emoji" not in str(path).lower():
+            return None
+        return path
+
+    def _emit_missing_emoji_font_once(self, line: str) -> None:
+        """Emit one bounded HDMI telemetry line for missing or unreadable emoji fonts."""
+
+        if self._emoji_font_missing_reported:
+            return
+        self._emoji_font_missing_reported = True
+        self._safe_emit(line)
 
     def _wrapped_lines(
         self,

@@ -50,6 +50,19 @@ Run the channel loop once, scan the QR shown in the dashboard wizard or the
 terminal fallback with WhatsApp's "Linked Devices" flow, and keep the
 persisted auth directory stable between restarts.
 
+## Worker Dependencies
+
+The Baileys worker is pinned by `worker/package-lock.json`. Twinr now treats
+that lockfile as authoritative at runtime:
+
+- if the required packages are already installed and match the lockfile marker,
+  startup continues immediately
+- if the packages are missing or the marker is stale, Twinr runs `npm ci` in
+  the worker folder before launching the Node process, using the same effective
+  Node runtime that the Baileys worker itself will use
+- if that install cannot complete, the WhatsApp channel fails closed with a
+  clear startup error instead of repeatedly half-starting
+
 ## Local Node runtime
 
 Stage the pinned local Node.js runtime with:

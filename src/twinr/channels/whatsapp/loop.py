@@ -48,7 +48,8 @@ class TwinrWhatsAppChannelLoop:
 
         deadline = self._deadline(duration_s)
         restart_delay_s = self.whatsapp_config.reconnect_base_delay_s
-        self.transport.start()
+        if not self._start_transport():
+            return 1
         try:
             while True:
                 remaining = self._remaining_seconds(deadline)
@@ -65,7 +66,8 @@ class TwinrWhatsAppChannelLoop:
                         restart_delay_s * 2.0,
                         self.whatsapp_config.reconnect_max_delay_s,
                     )
-                    self.transport.start()
+                    if not self._start_transport():
+                        return 1
                     continue
 
                 if event is None:
@@ -101,6 +103,17 @@ class TwinrWhatsAppChannelLoop:
                     self.runtime.fail(f"WhatsApp delivery failed: {exc}")
         finally:
             self.transport.stop()
+
+    def _start_transport(self) -> bool:
+        """Start the worker once and fail the runtime state clearly on hard startup errors."""
+
+        try:
+            self.transport.start()
+        except Exception as exc:
+            LOGGER.exception("WhatsApp worker startup failed.")
+            self.runtime.fail(f"WhatsApp startup failed: {exc}")
+            return False
+        return True
 
     def _handle_status_event(self, event: WhatsAppWorkerStatusEvent) -> None:
         if event.account_jid:

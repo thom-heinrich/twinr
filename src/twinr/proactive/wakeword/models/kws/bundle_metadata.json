@@ -1,0 +1,24 @@
+{
+  "archive_root": "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
+  "bundle_id": "gigaspeech_3_3m_bpe_int8",
+  "keyword_names": [
+    "twinr",
+    "twinna",
+    "twina",
+    "twinner"
+  ],
+  "source_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2",
+  "spec": {
+    "archive_root": "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
+    "bundle_id": "gigaspeech_3_3m_bpe_int8",
+    "decoder_filename": "decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+    "encoder_filename": "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+    "joiner_filename": "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+    "readme_filename": "README.md",
+    "source_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2",
+    "tokenizer_filename": "bpe.model",
+    "tokens_filename": "tokens.txt",
+    "tokens_type": "bpe"
+  },
+  "tokens_type": "bpe"
+}

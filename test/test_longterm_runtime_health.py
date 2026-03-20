@@ -178,6 +178,38 @@ class LongTermRemoteHealthProbeTests(unittest.TestCase):
         for state in (prompt_state, object_state, graph_state, midterm_state):
             self.assertTrue(all(call["prefer_cached_document_id"] for call in state.probe_calls))
 
+    def test_probe_operational_can_skip_archive_for_steady_state(self) -> None:
+        prompt_state = _ProbeAwareFakeRemoteState(
+            {
+                "prompt_memory": {"schema": "prompt_memory", "entries": []},
+                "user_context": {"schema": "managed_context", "entries": []},
+                "personality_context": {"schema": "managed_context", "entries": []},
+            }
+        )
+        object_state = _ProbeAwareFakeRemoteState(
+            {
+                "objects": {"schema": "twinr_memory_object_catalog_v2", "version": 2, "items": []},
+                "conflicts": {"schema": "conflicts", "conflicts": []},
+                "archive": {"schema": "twinr_memory_archive_catalog_v2", "version": 2, "items": []},
+            }
+        )
+        graph_state = _ProbeAwareFakeRemoteState({"graph": {"schema": "graph", "nodes": [], "edges": []}})
+        midterm_state = _ProbeAwareFakeRemoteState({"midterm": {"schema": "midterm", "packets": []}})
+
+        result = self._probe(
+            prompt_state=prompt_state,
+            object_state=object_state,
+            graph_state=graph_state,
+            midterm_state=midterm_state,
+        ).probe_operational(include_archive=False)
+
+        self.assertTrue(result.ready)
+        self.assertNotIn("archive", result.checked_snapshots)
+        self.assertEqual(
+            [call["snapshot_kind"] for call in object_state.probe_calls],
+            ["objects", "conflicts"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

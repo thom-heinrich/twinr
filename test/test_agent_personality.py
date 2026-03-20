@@ -33,6 +33,7 @@ from twinr.agent.personality import (
     RemoteStatePersonalitySnapshotStore,
     WorldSignal,
 )
+from twinr.agent.personality.self_expression import build_mindshare_items
 from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermConversationTurn,
@@ -188,14 +189,18 @@ class AgentPersonalityTests(unittest.TestCase):
 
         self.assertEqual(
             [title for title, _content in sections],
-            ["SYSTEM", "PERSONALITY", "USER", "CONTINUITY", "PLACE", "WORLD", "REFLECTION"],
+            ["SYSTEM", "PERSONALITY", "USER", "MINDSHARE", "CONTINUITY", "PLACE", "WORLD", "REFLECTION"],
         )
         self.assertIn("Structured core character", dict(sections)["PERSONALITY"])
         self.assertIn("Evolving conversation style", dict(sections)["PERSONALITY"])
         self.assertIn("verbosity: concise", dict(sections)["PERSONALITY"])
         self.assertIn("initiative: gently proactive", dict(sections)["PERSONALITY"])
         self.assertIn("light dry humor", dict(sections)["PERSONALITY"])
+        self.assertIn("Conversational self-expression", dict(sections)["PERSONALITY"])
         self.assertIn("local politics", dict(sections)["USER"])
+        self.assertIn("Current companion mindshare", dict(sections)["MINDSHARE"])
+        self.assertIn("Hamburg region", dict(sections)["MINDSHARE"])
+        self.assertIn("garden renovation", dict(sections)["MINDSHARE"])
         self.assertIn("garden renovation", dict(sections)["CONTINUITY"])
         self.assertIn("Hamburg region", dict(sections)["PLACE"])
         self.assertIn("energy prices", dict(sections)["WORLD"])
@@ -219,6 +224,57 @@ class AgentPersonalityTests(unittest.TestCase):
 
         self.assertEqual(sections[0][0], "PERSONALITY")
         self.assertIn("situational awareness", sections[0][1])
+
+    def test_build_mindshare_items_uses_generic_scored_selection_not_place_first(self) -> None:
+        snapshot = PersonalitySnapshot(
+            generated_at="2026-03-20T20:35:00+00:00",
+            relationship_signals=(
+                RelationshipSignal(
+                    topic="AI companions",
+                    summary="Twinr should keep noticing long-term movement in companion design.",
+                    salience=0.86,
+                    source="conversation",
+                ),
+            ),
+            continuity_threads=(
+                ContinuityThread(
+                    title="local democracy",
+                    summary="Twinr has been following civic decisions that affect daily life.",
+                    salience=0.91,
+                    updated_at="2026-03-20T19:00:00+00:00",
+                ),
+            ),
+            place_focuses=(
+                PlaceFocus(
+                    name="Schwarzenbek",
+                    summary="Keep the immediate home context in view.",
+                    geography="city",
+                    salience=0.33,
+                ),
+                PlaceFocus(
+                    name="Hamburg",
+                    summary="Keep the nearby urban context in view.",
+                    geography="city",
+                    salience=0.31,
+                ),
+            ),
+            world_signals=(
+                WorldSignal(
+                    topic="peace talks",
+                    summary="De-escalation efforts matter for Twinr's broader situational awareness.",
+                    source="situational_awareness",
+                    salience=0.82,
+                    fresh_until="2026-03-21T00:00:00+00:00",
+                ),
+            ),
+        )
+
+        items = build_mindshare_items(snapshot, max_items=2)
+        titles = [item.title for item in items]
+
+        self.assertEqual(len(items), 2)
+        self.assertEqual(titles, ["local democracy", "AI companions"])
+        self.assertNotIn("Schwarzenbek / Hamburg", titles)
 
     def test_remote_state_store_parses_snapshot_payload(self) -> None:
         payload = {

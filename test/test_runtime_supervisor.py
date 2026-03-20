@@ -347,6 +347,97 @@ class RuntimeSupervisorTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual([call["key"] for call in factory.calls], ["streaming"])
 
+    def test_run_adopts_existing_streaming_lock_owner_after_supervisor_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(root)
+            clock = _FakeClock()
+            factory = _RecordingProcessFactory(clock)
+            external_pid = 4242
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file=root / ".env",
+                process_factory=factory,
+                snapshot_store=_FreshSnapshotStore(clock),
+                health_collector=lambda *_args, **_kwargs: _build_health(display_running=True),
+                watchdog_assessor=lambda _config: _build_assessment(ready=True, watchdog_pid=4321),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                loop_owner=lambda _config, name: external_pid if name == "streaming-loop" else None,
+                pid_alive=lambda pid: pid == external_pid,
+                pid_signal=lambda _pid, _sig: None,
+                pid_cmdline=lambda pid: ("python", "-m", "twinr", "--run-streaming-loop") if pid == external_pid else (),
+                streaming_health_grace_s=999.0,
+                restart_backoff_s=0.0,
+                manage_watchdog=False,
+            )
+
+            exit_code = supervisor.run(duration_s=0.0)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(factory.calls, [])
+
+    def test_run_starts_streaming_when_existing_lock_owner_is_not_alive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(root)
+            clock = _FakeClock()
+            factory = _RecordingProcessFactory(clock)
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file=root / ".env",
+                process_factory=factory,
+                snapshot_store=_FreshSnapshotStore(clock),
+                health_collector=lambda *_args, **_kwargs: _build_health(display_running=True),
+                watchdog_assessor=lambda _config: _build_assessment(ready=True, watchdog_pid=4321),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                loop_owner=lambda _config, name: 4242 if name == "streaming-loop" else None,
+                pid_alive=lambda _pid: False,
+                pid_signal=lambda _pid, _sig: None,
+                pid_cmdline=lambda _pid: (),
+                streaming_health_grace_s=999.0,
+                restart_backoff_s=0.0,
+                manage_watchdog=False,
+            )
+
+            exit_code = supervisor.run(duration_s=0.0)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual([call["key"] for call in factory.calls], ["streaming"])
+
+    def test_run_does_not_adopt_live_non_streaming_lock_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._build_config(root)
+            clock = _FakeClock()
+            factory = _RecordingProcessFactory(clock)
+            supervisor = TwinrRuntimeSupervisor(
+                config=config,
+                env_file=root / ".env",
+                process_factory=factory,
+                snapshot_store=_FreshSnapshotStore(clock),
+                health_collector=lambda *_args, **_kwargs: _build_health(display_running=True),
+                watchdog_assessor=lambda _config: _build_assessment(ready=True, watchdog_pid=4321),
+                monotonic=clock.monotonic,
+                sleep=clock.sleep,
+                utcnow=clock.utcnow,
+                loop_owner=lambda _config, name: 4242 if name == "streaming-loop" else None,
+                pid_alive=lambda pid: pid == 4242,
+                pid_signal=lambda _pid, _sig: None,
+                pid_cmdline=lambda _pid: ("python", "holder.py"),
+                streaming_health_grace_s=999.0,
+                restart_backoff_s=0.0,
+                manage_watchdog=False,
+            )
+
+            exit_code = supervisor.run(duration_s=0.0)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual([call["key"] for call in factory.calls], ["streaming"])
+
     def test_run_delays_streaming_until_external_watchdog_startup_grace_expires(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -18,7 +18,8 @@ owned_concerns:
   - Derive a conservative known-user hint from fresh voice-profile state plus optional temporal identity-fusion evidence and clear room context
   - Derive prompt-only affect proxies from coarse posture, attention, quiet, and motion cues without claiming emotion as fact
   - Derive a bounded multimodal attention-target surface from camera anchor, speaker association, showing-intent cues, and short-lived session focus memory
-  - Drive calm HDMI face attention-follow cues from the current relevant-person anchor without teaching the generic runtime snapshot schema about gaze-follow behavior, while reserving stronger up/down body-language poses for explicit semantic cues and renewing matching cues before they expire
+  - Drive calm HDMI face attention-follow cues from the current relevant-person anchor without teaching the generic runtime snapshot schema about gaze-follow behavior, while mirroring camera-space anchors into user-facing gaze, adding small near-center head turns before full side gaze commits, reserving stronger up/down body-language poses for explicit semantic cues, and renewing or briefly holding matching cues before they expire or disappear on short camera dropouts
+  - Mirror clear stabilized user camera gestures into short-lived HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues
   - Run a bounded local HDMI attention-refresh cadence so gaze-follow stays responsive even when full proactive inspection remains motion-gated
   - Block sensitive proactive behavior when current ReSpeaker plus camera context is ambiguous
   - Coordinate proactive monitor ticks across vision, PIR, ambient audio, and wakeword policy paths
@@ -92,7 +93,7 @@ files:
       - MultimodalAttentionTargetSnapshot
       - MultimodalAttentionTargetTracker
   - path: display_attention.py
-    role: Conservative proactive producer and local refresh policy for HDMI gaze-follow face cues that keep semantic up/down poses out of normal person-following and renew matching cues before they expire
+    role: Conservative proactive producer and local refresh policy for HDMI gaze-follow face cues that mirror camera-space anchors into user-facing gaze, keep semantic up/down poses out of normal person-following, and renew or briefly hold matching cues before they expire or disappear on short camera dropouts
     exports:
       - DisplayAttentionCueDecision
       - DisplayAttentionCuePublishResult
@@ -100,6 +101,13 @@ files:
       - display_attention_refresh_supported
       - derive_display_attention_cue
       - resolve_display_attention_refresh_interval
+  - path: display_gesture_emoji.py
+    role: Conservative runtime producer that mirrors stabilized rising-edge user gestures into short-lived HDMI emoji acknowledgements without overwriting foreign emoji cues
+    exports:
+      - DisplayGestureEmojiDecision
+      - DisplayGestureEmojiPublishResult
+      - DisplayGestureEmojiPublisher
+      - derive_display_gesture_emoji
   - path: runtime_contract.py
     role: Hard startup-blocker contract for XVF3800 DFU/safe-mode states
     exports:
@@ -176,6 +184,7 @@ tests:
   - path: test/test_display_attention.py
   - path: test/test_attention_targeting.py
   - path: test/test_proactive_monitor.py
+  - path: test/test_display_gesture_emoji.py
   - path: test/test_governor_inputs.py
   - path: test/test_multimodal_initiative.py
   - path: test/test_runtime_claims.py

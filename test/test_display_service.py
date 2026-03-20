@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
 from twinr.display import service as display_service_mod
+from twinr.display.emoji_cues import DisplayEmojiCue, DisplayEmojiCueStore
 from twinr.display.face_cues import DisplayFaceCue, DisplayFaceCueStore
 from twinr.display.heartbeat import DisplayHeartbeatStore
 from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPresentationStore
@@ -30,6 +31,7 @@ class FakeDisplay:
                 tuple[tuple[str, tuple[str, ...]], ...],
                 int,
                 DisplayFaceCue | None,
+                DisplayEmojiCue | None,
                 DisplayPresentationCue | None,
             ]
         ] = []
@@ -45,9 +47,23 @@ class FakeDisplay:
         log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
         animation_frame: int = 0,
         face_cue: DisplayFaceCue | None = None,
+        emoji_cue: DisplayEmojiCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
-        self.calls.append((status, headline, ticker_text, details, state_fields, log_sections, animation_frame, face_cue, presentation_cue))
+        self.calls.append(
+            (
+                status,
+                headline,
+                ticker_text,
+                details,
+                state_fields,
+                log_sections,
+                animation_frame,
+                face_cue,
+                emoji_cue,
+                presentation_cue,
+            )
+        )
 
 
 class IdleAnimatedDisplay(FakeDisplay):
@@ -87,9 +103,10 @@ class ReopenableDisplay:
         log_sections: tuple[tuple[str, tuple[str, ...]], ...] = (),
         animation_frame: int = 0,
         face_cue: DisplayFaceCue | None = None,
+        emoji_cue: DisplayEmojiCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
-        del status, headline, ticker_text, details, state_fields, log_sections, animation_frame, face_cue, presentation_cue
+        del status, headline, ticker_text, details, state_fields, log_sections, animation_frame, face_cue, emoji_cue, presentation_cue
         if self.fail:
             raise RuntimeError("boom")
         if self.emit is not None:
@@ -195,7 +212,7 @@ class DisplayServiceTests(unittest.TestCase):
             self.assertEqual(
                 [
                     (status, headline, details)
-                    for status, headline, _ticker, details, _fields, _logs, _frame, _cue, _presentation in display.calls
+                    for status, headline, _ticker, details, _fields, _logs, _frame, _cue, _emoji, _presentation in display.calls
                 ],
                 [
                     ("waiting", "Waiting", ("Internet ok", "AI ok", "System ok", "Zeit 12:34")),
@@ -339,6 +356,7 @@ class DisplayServiceTests(unittest.TestCase):
             log_sections=(),
             animation_frame=0,
             face_cue=None,
+            emoji_cue=None,
             presentation_cue=None,
         )
 
@@ -524,6 +542,7 @@ class DisplayServiceTests(unittest.TestCase):
             ),
             animation_frame=0,
             face_cue=None,
+            emoji_cue=None,
             presentation_cue=None,
         )
         second_signature = loop._render_signature(
@@ -545,6 +564,7 @@ class DisplayServiceTests(unittest.TestCase):
             ),
             animation_frame=0,
             face_cue=DisplayFaceCue(mouth="smile"),
+            emoji_cue=DisplayEmojiCue(symbol="sparkles"),
             presentation_cue=None,
         )
 
@@ -612,6 +632,25 @@ class DisplayServiceTests(unittest.TestCase):
         _headline, details = loop._build_status_content(RuntimeSnapshot(status="waiting"))
 
         self.assertEqual(details, ("Internet ok", "AI fehlt", "System ok", "Zeit 12:34"))
+
+    def test_system_state_ignores_temperature_only_warn_for_primary_status_card(self) -> None:
+        loop = TwinrStatusDisplayLoop(
+            config=TwinrConfig(display_poll_interval_s=0.0),
+            display=FakeDisplay(),
+            snapshot_store=RuntimeSnapshotStore("/tmp/nonexistent"),
+            emit=lambda _line: None,
+            sleep=lambda _seconds: None,
+            health_collector=lambda _config, *, snapshot=None: self.make_health(
+                status="warn",
+                cpu_temperature_c=73.5,
+            ),
+            internet_probe=lambda: True,
+            clock=self.make_clock(),
+        )
+
+        system_value = loop._system_state_value(RuntimeSnapshot(status="waiting"), self.make_health(status="warn", cpu_temperature_c=73.5))
+
+        self.assertEqual(system_value, "ok")
 
     def test_waiting_animation_frame_changes_over_time(self) -> None:
         loop = TwinrStatusDisplayLoop(
@@ -768,6 +807,51 @@ class DisplayServiceTests(unittest.TestCase):
         self.assertEqual(cue.mouth, "smile")
         self.assertEqual(cue.brows, "inward_tilt")
 
+    def test_display_loop_forwards_active_emoji_cue_to_default_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            snapshot_path = root / "state" / "runtime-state.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            store = RuntimeSnapshotStore(snapshot_path)
+            store.save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Hallo Thom",
+            )
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(snapshot_path),
+                display_poll_interval_s=0.0,
+                openai_api_key="sk-test",
+            )
+            emoji_cue_store = DisplayEmojiCueStore.from_config(config)
+            emoji_cue_store.save(
+                DisplayEmojiCue(symbol="thumbs_up", accent="success"),
+                hold_seconds=15.0,
+            )
+            display = FakeDisplay()
+            loop = TwinrStatusDisplayLoop(
+                config=config,
+                display=display,
+                snapshot_store=store,
+                emit=lambda _line: None,
+                sleep=lambda _seconds: None,
+                health_collector=lambda _config, *, snapshot=None: self.make_health(),
+                internet_probe=lambda: True,
+                clock=self.make_clock(),
+                emoji_cue_store=emoji_cue_store,
+            )
+
+            loop.run(max_cycles=1)
+
+        self.assertEqual(len(display.calls), 1)
+        cue = display.calls[0][8]
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertEqual(cue.symbol, "thumbs_up")
+        self.assertEqual(cue.accent, "success")
+
     def test_display_loop_forwards_news_ticker_text_to_default_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             snapshot_path = Path(temp_dir) / "state" / "runtime-state.json"
@@ -849,7 +933,7 @@ class DisplayServiceTests(unittest.TestCase):
             loop.run(max_cycles=1)
 
         self.assertEqual(len(display.calls), 1)
-        cue = display.calls[0][8]
+        cue = display.calls[0][9]
         self.assertIsNotNone(cue)
         assert cue is not None
         self.assertEqual(cue.kind, "rich_card")

@@ -115,6 +115,15 @@ def _parse_optional_int(value: str | None) -> int | None:
     return int(value)
 
 
+def _parse_optional_text(value: str | None) -> str | None:
+    """Parse an optional text env value or return ``None``."""
+
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 def _parse_float(
     value: str | float | int | None,
     default: float,
@@ -507,6 +516,19 @@ class TwinrConfig:
     wakeword_openwakeword_enable_speex: bool = False
     wakeword_openwakeword_transcribe_on_detect: bool = False
     wakeword_openwakeword_inference_framework: str = "tflite"
+    wakeword_kws_tokens_path: str | None = None
+    wakeword_kws_encoder_path: str | None = None
+    wakeword_kws_decoder_path: str | None = None
+    wakeword_kws_joiner_path: str | None = None
+    wakeword_kws_keywords_file_path: str | None = None
+    wakeword_kws_provider: str = "cpu"
+    wakeword_kws_num_threads: int = 2
+    wakeword_kws_sample_rate: int = 16000
+    wakeword_kws_feature_dim: int = 80
+    wakeword_kws_max_active_paths: int = 4
+    wakeword_kws_keywords_score: float = 1.0
+    wakeword_kws_keywords_threshold: float = 0.25
+    wakeword_kws_num_trailing_blanks: int = 1
     wakeword_calibration_profile_path: str = "state/wakeword_calibration.json"
     wakeword_calibration_recommended_path: str = "state/wakeword_calibration.recommended.json"
     proactive_person_returned_absence_s: float = 20.0 * 60.0
@@ -646,7 +668,9 @@ class TwinrConfig:
     display_wayland_runtime_dir: str | None = None
     display_face_cue_path: str = "artifacts/stores/ops/display_face_cue.json"
     display_face_cue_ttl_s: float = 4.0
-    display_attention_refresh_interval_s: float = 1.25
+    display_emoji_cue_path: str = "artifacts/stores/ops/display_emoji.json"
+    display_emoji_cue_ttl_s: float = 6.0
+    display_attention_refresh_interval_s: float = 0.6
     display_attention_session_focus_hold_s: float = 4.5
     display_presentation_path: str = "artifacts/stores/ops/display_presentation.json"
     display_presentation_ttl_s: float = 20.0
@@ -708,6 +732,10 @@ class TwinrConfig:
         if not math.isfinite(normalized_display_face_cue_ttl_s):
             raise ValueError("display_face_cue_ttl_s must be finite")
         normalized_display_face_cue_ttl_s = max(0.1, normalized_display_face_cue_ttl_s)
+        normalized_display_emoji_cue_ttl_s = float(self.display_emoji_cue_ttl_s)
+        if not math.isfinite(normalized_display_emoji_cue_ttl_s):
+            raise ValueError("display_emoji_cue_ttl_s must be finite")
+        normalized_display_emoji_cue_ttl_s = max(0.1, normalized_display_emoji_cue_ttl_s)
         normalized_display_attention_refresh_interval_s = float(self.display_attention_refresh_interval_s)
         if not math.isfinite(normalized_display_attention_refresh_interval_s):
             raise ValueError("display_attention_refresh_interval_s must be finite")
@@ -737,6 +765,10 @@ class TwinrConfig:
             str(self.display_face_cue_path or "artifacts/stores/ops/display_face_cue.json").strip()
             or "artifacts/stores/ops/display_face_cue.json"
         )
+        normalized_display_emoji_cue_path = (
+            str(self.display_emoji_cue_path or "artifacts/stores/ops/display_emoji.json").strip()
+            or "artifacts/stores/ops/display_emoji.json"
+        )
         normalized_display_presentation_path = (
             str(self.display_presentation_path or "artifacts/stores/ops/display_presentation.json").strip()
             or "artifacts/stores/ops/display_presentation.json"
@@ -761,6 +793,8 @@ class TwinrConfig:
         object.__setattr__(self, "display_busy_timeout_s", normalized_display_busy_timeout_s)
         object.__setattr__(self, "display_face_cue_path", normalized_display_face_cue_path)
         object.__setattr__(self, "display_face_cue_ttl_s", normalized_display_face_cue_ttl_s)
+        object.__setattr__(self, "display_emoji_cue_path", normalized_display_emoji_cue_path)
+        object.__setattr__(self, "display_emoji_cue_ttl_s", normalized_display_emoji_cue_ttl_s)
         object.__setattr__(
             self,
             "display_attention_refresh_interval_s",
@@ -946,6 +980,13 @@ class TwinrConfig:
             get_value("TWINR_WAKEWORD_OPENWAKEWORD_INFERENCE_FRAMEWORK")
             or _default_openwakeword_inference_framework(wakeword_openwakeword_models)
         ).strip().lower()
+        wakeword_kws_tokens_path = _parse_optional_text(get_value("TWINR_WAKEWORD_KWS_TOKENS_PATH"))
+        wakeword_kws_encoder_path = _parse_optional_text(get_value("TWINR_WAKEWORD_KWS_ENCODER_PATH"))
+        wakeword_kws_decoder_path = _parse_optional_text(get_value("TWINR_WAKEWORD_KWS_DECODER_PATH"))
+        wakeword_kws_joiner_path = _parse_optional_text(get_value("TWINR_WAKEWORD_KWS_JOINER_PATH"))
+        wakeword_kws_keywords_file_path = _parse_optional_text(
+            get_value("TWINR_WAKEWORD_KWS_KEYWORDS_FILE_PATH")
+        )
 
         return cls(
             openai_api_key=get_value("OPENAI_API_KEY"),
@@ -1658,6 +1699,39 @@ class TwinrConfig:
                 False,
             ),
             wakeword_openwakeword_inference_framework=wakeword_openwakeword_inference_framework,
+            wakeword_kws_tokens_path=wakeword_kws_tokens_path,
+            wakeword_kws_encoder_path=wakeword_kws_encoder_path,
+            wakeword_kws_decoder_path=wakeword_kws_decoder_path,
+            wakeword_kws_joiner_path=wakeword_kws_joiner_path,
+            wakeword_kws_keywords_file_path=wakeword_kws_keywords_file_path,
+            wakeword_kws_provider=(
+                get_value("TWINR_WAKEWORD_KWS_PROVIDER", "cpu") or "cpu"
+            ).strip().lower(),
+            wakeword_kws_num_threads=int(
+                get_value("TWINR_WAKEWORD_KWS_NUM_THREADS", "2") or "2"
+            ),
+            wakeword_kws_sample_rate=int(
+                get_value("TWINR_WAKEWORD_KWS_SAMPLE_RATE", "16000") or "16000"
+            ),
+            wakeword_kws_feature_dim=int(
+                get_value("TWINR_WAKEWORD_KWS_FEATURE_DIM", "80") or "80"
+            ),
+            wakeword_kws_max_active_paths=int(
+                get_value("TWINR_WAKEWORD_KWS_MAX_ACTIVE_PATHS", "4") or "4"
+            ),
+            wakeword_kws_keywords_score=_parse_float(
+                get_value("TWINR_WAKEWORD_KWS_KEYWORDS_SCORE"),
+                1.0,
+                minimum=0.0,
+            ),
+            wakeword_kws_keywords_threshold=_parse_float(
+                get_value("TWINR_WAKEWORD_KWS_KEYWORDS_THRESHOLD"),
+                0.25,
+                minimum=0.0,
+            ),
+            wakeword_kws_num_trailing_blanks=int(
+                get_value("TWINR_WAKEWORD_KWS_NUM_TRAILING_BLANKS", "1") or "1"
+            ),
             wakeword_calibration_profile_path=get_value(
                 "TWINR_WAKEWORD_CALIBRATION_PROFILE_PATH",
                 str(project_root / "state" / "wakeword_calibration.json"),
@@ -2107,9 +2181,15 @@ class TwinrConfig:
             )
             or "artifacts/stores/ops/display_face_cue.json",
             display_face_cue_ttl_s=_parse_float(get_value("TWINR_DISPLAY_FACE_CUE_TTL_S"), 4.0, minimum=0.1),
+            display_emoji_cue_path=get_value(
+                "TWINR_DISPLAY_EMOJI_CUE_PATH",
+                "artifacts/stores/ops/display_emoji.json",
+            )
+            or "artifacts/stores/ops/display_emoji.json",
+            display_emoji_cue_ttl_s=_parse_float(get_value("TWINR_DISPLAY_EMOJI_CUE_TTL_S"), 6.0, minimum=0.1),
             display_attention_refresh_interval_s=_parse_float(
                 get_value("TWINR_DISPLAY_ATTENTION_REFRESH_INTERVAL_S"),
-                1.25,
+                0.6,
                 minimum=0.0,
             ),
             display_attention_session_focus_hold_s=_parse_float(

@@ -14,6 +14,7 @@ from PIL import Image, ImageChops
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.display.face_cues import DisplayFaceCue
 from twinr.display.face_expressions import (
     DisplayFaceBrowStyle,
@@ -127,7 +128,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertLessEqual(max(image.getpixel((500, 180))), 18)
         self.assertGreater(dark_pixels, 300000)
         self.assertGreater(face_bright, 9000)
-        self.assertGreater(panel_bright, 3500)
+        self.assertLess(panel_bright, 2000)
 
     def test_render_status_image_draws_bottom_news_ticker(self) -> None:
         display = self.make_display()
@@ -182,7 +183,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
 
         self.assertIsNotNone(ticker_diff.getbbox())
         self.assertGreater(sum(1 for pixel in ticker_diff.getdata() if max(pixel) >= 24), 2000)
-        self.assertGreater(sum(1 for pixel in panel_diff.getdata() if max(pixel) >= 24), 2000)
+        self.assertEqual(sum(1 for pixel in panel_diff.getdata() if max(pixel) >= 24), 0)
 
     def test_default_scene_only_reserves_bottom_band_when_ticker_is_visible(self) -> None:
         display = self.make_display()
@@ -321,7 +322,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertEqual(int(base["width"]), int(cued["width"]))
         self.assertEqual(int(base["height"]), int(cued["height"]))
         self.assertEqual(int(cued["eye_shift_x"]), int(base["eye_shift_x"]) + 8)
-        self.assertEqual(int(cued["eye_shift_y"]), int(base["eye_shift_y"]) - 6)
+        self.assertEqual(int(cued["eye_shift_y"]), -6)
         self.assertEqual(int(cued["highlight_dx"]), int(base["highlight_dx"]) + 12)
         self.assertEqual(int(cued["highlight_dy"]), int(base["highlight_dy"]) - 10)
         self.assertEqual(int(cued["brow_raise"]), 0)
@@ -388,6 +389,73 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
 
         self.assertEqual(first, (16, 0))
         self.assertEqual(second, (16, 0))
+
+    def test_waiting_scene_freezes_idle_eye_churn_when_directional_cue_is_active(self) -> None:
+        display = self.make_display()
+        renderer = display._scene_renderer()
+        cue = DisplayFaceCue(gaze_x=2, head_dx=1)
+
+        first = renderer._eye_state("waiting", 0, "left", face_cue=cue)
+        second = renderer._eye_state("waiting", 8, "left", face_cue=cue)
+
+        self.assertEqual(int(first["highlight_dx"]), int(second["highlight_dx"]))
+        self.assertEqual(int(first["eye_shift_y"]), int(second["eye_shift_y"]))
+        self.assertEqual(bool(first["blink"]), bool(second["blink"]))
+
+    def test_waiting_face_offset_freezes_idle_bob_when_directional_cue_is_active(self) -> None:
+        display = self.make_display()
+        renderer = display._scene_renderer()
+        cue = DisplayFaceCue(gaze_x=2, head_dx=1)
+
+        first = renderer._face_offset("waiting", 0, face_cue=cue)
+        second = renderer._face_offset("waiting", 8, face_cue=cue)
+
+        self.assertEqual(first, (5, 0))
+        self.assertEqual(second, (5, 0))
+
+    def test_waiting_face_region_changes_less_between_frames_when_directional_cue_is_active(self) -> None:
+        display = self.make_display()
+        state_fields = (
+            ("Status", "Waiting"),
+            ("Internet", "ok"),
+            ("AI", "ok"),
+            ("System", "ok"),
+            ("Zeit", "12:34"),
+        )
+        cue = DisplayFaceCue(gaze_x=2, head_dx=1)
+        scene = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=state_fields,
+            animation_frame=0,
+            face_cue=cue,
+        )
+        first = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=state_fields,
+            log_sections=(),
+            animation_frame=0,
+            face_cue=cue,
+        )
+        second = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=state_fields,
+            log_sections=(),
+            animation_frame=8,
+            face_cue=cue,
+        )
+
+        diff = ImageChops.difference(first.crop(scene.layout.face_box), second.crop(scene.layout.face_box))
+        changed_pixels = sum(1 for pixel in diff.getdata() if max(pixel) >= 24)
+
+        self.assertLess(changed_pixels, 350)
 
     def test_external_face_cue_supports_six_brow_styles(self) -> None:
         display = self.make_display()
@@ -518,7 +586,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertEqual(display._display_state_value("System", "Achtung"), "Warning")
         self.assertEqual(display._display_state_value("System", "warm"), "Warm")
 
-    def test_default_scene_renderer_builds_modular_panel_cards(self) -> None:
+    def test_default_scene_renderer_moves_runtime_state_into_header_and_leaves_panel_reserved(self) -> None:
         display = self.make_display()
         renderer = display._default_scene_renderer
 
@@ -539,13 +607,152 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             animation_frame=0,
         )
 
-        self.assertEqual(scene.panel.eyebrow, "STATUS")
-        self.assertEqual(len(scene.panel.cards), 4)
-        self.assertEqual(scene.panel.cards[0].key, "network")
-        self.assertEqual(scene.panel.cards[0].value, "Online")
-        self.assertEqual(scene.panel.cards[2].accent, (228, 152, 34))
-        self.assertEqual(scene.panel.cards[3].value, "12:34")
+        self.assertEqual(scene.header.brand, "TWINR")
+        self.assertEqual(scene.header.state, "WAITING")
+        self.assertEqual(scene.header.time_value, "12:34")
+        self.assertEqual(scene.header.system_value, "ERROR")
+        self.assertEqual(scene.panel.cards, ())
         self.assertGreater(scene.layout.panel_box[0], scene.layout.face_box[2])
+
+    def test_default_scene_header_only_surface_hides_network_and_ai_status(self) -> None:
+        display = self.make_display()
+
+        first = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+        )
+        second = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "fehlt"),
+                ("AI", "fehler"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+        )
+
+        self.assertIsNone(ImageChops.difference(first, second).getbbox())
+
+    def test_default_scene_leaves_right_hand_area_visibly_free(self) -> None:
+        display = self.make_display()
+        scene = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+        )
+        image = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+        )
+
+        panel_crop = image.crop(scene.layout.panel_box)
+        self.assertIsNone(panel_crop.getbbox())
+
+    def test_default_scene_renders_real_emoji_into_reserved_right_hand_area(self) -> None:
+        display = self.make_display()
+        scene = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+            emoji_cue=DisplayEmojiCue(symbol="thumbs_up", accent="success"),
+        )
+        base = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+        )
+        with_emoji = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+            emoji_cue=DisplayEmojiCue(symbol="thumbs_up", accent="success"),
+        )
+
+        panel_diff = ImageChops.difference(base.crop(scene.layout.panel_box), with_emoji.crop(scene.layout.panel_box))
+
+        self.assertIsNotNone(panel_diff.getbbox())
+        self.assertGreater(sum(1 for pixel in panel_diff.getdata() if max(pixel) >= 24), 1200)
+
+    def test_render_emoji_glyph_emits_once_when_font_is_missing(self) -> None:
+        emitted: list[str] = []
+        display = HdmiFramebufferDisplay(
+            framebuffer_path=Path("/dev/null"),
+            layout_mode="default",
+            emit=emitted.append,
+        )
+
+        with mock.patch.object(
+            HdmiFramebufferDisplay,
+            "_emoji_font_candidates",
+            return_value=(Path("/missing/NotoColorEmoji.ttf"),),
+        ):
+            self.assertIsNone(display._render_emoji_glyph("👍", target_size=96))
+            self.assertIsNone(display._render_emoji_glyph("👍", target_size=96))
+
+        self.assertEqual(sum("display_emoji_font=missing" in line for line in emitted), 1)
 
     def test_default_scene_prioritises_face_space_and_uses_a_slighter_header(self) -> None:
         display = self.make_display()

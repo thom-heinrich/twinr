@@ -33,6 +33,8 @@ files:
       - ProactiveVisionSnapshot
       - SocialAudioObservation
       - SocialBodyPose
+      - SocialFineHandGesture
+      - SocialGestureEvent
       - SocialObservation
       - SocialPersonZone
       - SocialTriggerDecision
@@ -130,6 +132,8 @@ public_api:
     - ProactiveVisionSnapshot
     - SocialAudioObservation
     - SocialBodyPose
+    - SocialFineHandGesture
+    - SocialGestureEvent
     - SocialObservation
     - SocialPersonZone
     - SocialTriggerDecision
@@ -163,6 +167,8 @@ compatibility_reexports:
       - ProactiveVisionSnapshot
       - SocialAudioObservation
       - SocialBodyPose
+      - SocialFineHandGesture
+      - SocialGestureEvent
       - SocialObservation
       - SocialPersonZone
       - SocialTriggerDecision

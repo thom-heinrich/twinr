@@ -49,6 +49,7 @@ from ..social.vision_review import (
     is_reviewable_image_trigger,
 )
 from ..wakeword.calibration import WakewordCalibrationStore, apply_wakeword_calibration
+from ..wakeword.kws import WakewordSherpaOnnxFrameSpotter, WakewordSherpaOnnxSpotter
 from ..wakeword.matching import WakewordMatch, WakewordPhraseSpotter
 from ..wakeword.policy import SttWakewordVerifier, WakewordDecision, WakewordDecisionPolicy, normalize_wakeword_backend
 from ..wakeword.spotter import WakewordOpenWakeWordSpotter
@@ -67,6 +68,7 @@ from .display_attention import (
     display_attention_refresh_supported,
     resolve_display_attention_refresh_interval,
 )
+from .display_gesture_emoji import DisplayGestureEmojiPublisher
 from .identity_fusion import (
     MultimodalIdentityFusionSnapshot,
     TemporalIdentityFusionTracker,
@@ -203,6 +205,14 @@ def _round_optional_seconds(value: float | None) -> float | None:
     if value is None:
         return None
     return round(max(0.0, float(value)), 3)
+
+
+def _round_optional_ratio(value: float | None) -> float | None:
+    """Round one optional bounded ratio or score for ops-safe payloads."""
+
+    if value is None:
+        return None
+    return round(float(value), 4)
 
 
 def _format_firmware_version(version: tuple[int, int, int] | None) -> str | None:
@@ -458,6 +468,7 @@ class ProactiveCoordinator:
         idle_predicate: Callable[[], bool] | None = None,
         observation_handler: Callable[[dict[str, Any], tuple[str, ...]], None] | None = None,
         display_attention_publisher: DisplayAttentionCuePublisher | None = None,
+        display_gesture_emoji_publisher: DisplayGestureEmojiPublisher | None = None,
         emit: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         audio_observer_fallback_factory: Callable[[], Any] | None = None,
@@ -483,6 +494,9 @@ class ProactiveCoordinator:
         self.idle_predicate = idle_predicate
         self.observation_handler = observation_handler
         self.display_attention_publisher = display_attention_publisher or DisplayAttentionCuePublisher.from_config(
+            config
+        )
+        self.display_gesture_emoji_publisher = display_gesture_emoji_publisher or DisplayGestureEmojiPublisher.from_config(
             config
         )
         self.emit = emit or (lambda _line: None)
@@ -818,6 +832,12 @@ class ProactiveCoordinator:
             now=now,
             audio_observation=audio_snapshot.observation,
         )
+        if not inspect_requested and self._should_bootstrap_inspect_from_speech(
+            now=now,
+            audio_observation=audio_snapshot.observation,
+        ):
+            inspect_requested = True
+            self._emit("proactive_inspection_bootstrap=speech_detected")
         if not inspect_requested:
             return self._run_without_inspection(
                 now=now,
@@ -1334,7 +1354,7 @@ class ProactiveCoordinator:
             return False
         if getattr(audio_snapshot, "channels", None) is None:
             return False
-        if self._normalized_wakeword_backend == "openwakeword":  # AUDIT-FIX(#9): normalized comparison avoids config case/whitespace mismatches.
+        if self._normalized_wakeword_backend in {"openwakeword", "kws"}:  # AUDIT-FIX(#9): normalized comparison avoids config case/whitespace mismatches.
             if sample.active_chunk_count >= max(1, self.config.wakeword_min_active_chunks):
                 return True
             if audio_snapshot.observation.speech_detected is True:
@@ -1504,6 +1524,38 @@ class ProactiveCoordinator:
             return False
         return True
 
+    def _should_bootstrap_inspect_from_speech(
+        self,
+        now: float,
+        *,
+        audio_observation: SocialAudioObservation,
+    ) -> bool:
+        """Return whether speech should trigger one bounded local vision inspection.
+
+        Wakeword listening is presence-gated. If PIR is quiet or absent, but
+        the local microphone hears active speech while wakeword mode is enabled,
+        a bounded camera inspection lets the device establish real presence
+        instead of staying permanently idle behind the PIR gate.
+        """
+
+        if not bool(getattr(self.config, "wakeword_enabled", False)):
+            return False
+        if self.vision_observer is None:
+            return False
+        if self.presence_session is None:
+            return False
+        if audio_observation.speech_detected is not True:
+            return False
+        latest_presence = self.latest_presence_snapshot
+        if latest_presence is not None and latest_presence.armed:
+            return False
+        if (
+            self._last_capture_at is not None
+            and (now - self._last_capture_at) < self.config.proactive_capture_interval_s
+        ):
+            return False
+        return True
+
     def refresh_display_attention(self) -> bool:
         """Refresh HDMI attention-follow from the local camera outside PIR-gated ticks."""
 
@@ -1551,6 +1603,7 @@ class ProactiveCoordinator:
             audio=audio_snapshot.observation,
         )
         camera_update = self._observe_camera_surface(observation, inspected=True)
+        self._update_display_gesture_emoji_ack(camera_update)
         self._update_display_attention_follow(
             observed_at=now,
             camera_snapshot=camera_update.snapshot,
@@ -1704,10 +1757,30 @@ class ProactiveCoordinator:
             "pir_motion_detected": observation.pir_motion_detected,
             "low_motion": observation.low_motion,
             "person_visible": observation.vision.person_visible,
+            "camera_person_count": observation.vision.person_count,
+            "camera_primary_person_zone": observation.vision.primary_person_zone.value,
+            "camera_primary_person_center_x": _round_optional_ratio(observation.vision.primary_person_center_x),
+            "camera_primary_person_center_y": _round_optional_ratio(observation.vision.primary_person_center_y),
             "looking_toward_device": observation.vision.looking_toward_device,
+            "camera_person_near_device": observation.vision.person_near_device,
+            "camera_engaged_with_device": observation.vision.engaged_with_device,
+            "camera_visual_attention_score": _round_optional_ratio(observation.vision.visual_attention_score),
             "body_pose": observation.vision.body_pose.value,
+            "camera_pose_confidence": _round_optional_ratio(observation.vision.pose_confidence),
+            "camera_motion_state": observation.vision.motion_state.value,
+            "camera_motion_confidence": _round_optional_ratio(observation.vision.motion_confidence),
             "smiling": observation.vision.smiling,
             "hand_or_object_near_camera": observation.vision.hand_or_object_near_camera,
+            "camera_gesture_event": observation.vision.gesture_event.value,
+            "camera_gesture_confidence": _round_optional_ratio(observation.vision.gesture_confidence),
+            "camera_fine_hand_gesture": observation.vision.fine_hand_gesture.value,
+            "camera_fine_hand_gesture_confidence": _round_optional_ratio(
+                observation.vision.fine_hand_gesture_confidence
+            ),
+            "camera_online": observation.vision.camera_online,
+            "camera_ready": observation.vision.camera_ready,
+            "camera_ai_ready": observation.vision.camera_ai_ready,
+            "camera_error": observation.vision.camera_error,
             "speech_detected": observation.audio.speech_detected,
             "distress_detected": observation.audio.distress_detected,
             "audio_room_quiet": observation.audio.room_quiet,
@@ -2319,6 +2392,7 @@ class ProactiveCoordinator:
 
         try:
             camera_update = self._observe_camera_surface(observation, inspected=inspected)
+            self._update_display_gesture_emoji_ack(camera_update)
             self._update_display_attention_follow(
                 observed_at=observation.observed_at,
                 camera_snapshot=camera_update.snapshot,
@@ -2401,6 +2475,25 @@ class ProactiveCoordinator:
                 message="Failed to update the HDMI face attention-follow cue.",
                 error=exc,
                 data={"observed_at": observed_at},
+            )
+
+    def _update_display_gesture_emoji_ack(
+        self,
+        camera_update: ProactiveCameraSurfaceUpdate,
+    ) -> None:
+        """Mirror clear stabilized user gestures into the HDMI emoji reserve area."""
+
+        publisher = self.display_gesture_emoji_publisher
+        if publisher is None:
+            return
+        try:
+            publisher.publish_update(camera_update)
+        except Exception as exc:
+            self._record_fault(
+                event="proactive_display_gesture_emoji_failed",
+                message="Failed to update the HDMI gesture-emoji acknowledgement cue.",
+                error=exc,
+                data={"event_names": list(camera_update.event_names)},
             )
 
     def _observe_camera_surface(
@@ -2974,7 +3067,7 @@ def build_default_proactive_monitor(
         getattr(config, "wakeword_fallback_backend", "stt"),
         default="stt",
     )
-    use_openwakeword_stream = config.wakeword_enabled and primary_backend == "openwakeword"
+    use_streaming_wakeword = config.wakeword_enabled and primary_backend in {"openwakeword", "kws"}
 
     pir_monitor = None
     if config.pir_enabled:
@@ -3012,12 +3105,19 @@ def build_default_proactive_monitor(
             config=config,
             backend=backend,
         )
-        if use_openwakeword_stream:
-            wakeword_stream = _build_openwakeword_stream(
-                config=config,
-                runtime=runtime,
-                emit=emit,
-            )
+        if use_streaming_wakeword:
+            if primary_backend == "kws":
+                wakeword_stream = _build_kws_stream(
+                    config=config,
+                    runtime=runtime,
+                    emit=emit,
+                )
+            else:
+                wakeword_stream = _build_openwakeword_stream(
+                    config=config,
+                    runtime=runtime,
+                    emit=emit,
+                )
         wakeword_spotter = _build_wakeword_spotter(
             config=config,
             runtime=runtime,
@@ -3300,8 +3400,12 @@ def _build_wakeword_policy(
 ) -> WakewordDecisionPolicy:
     """Build the runtime wakeword policy and optional STT verifier."""
 
+    primary_backend = normalize_wakeword_backend(
+        getattr(config, "wakeword_primary_backend", config.wakeword_backend),
+        default="openwakeword",
+    )
     local_verifier = None
-    if config.wakeword_openwakeword_sequence_verifier_models:
+    if primary_backend == "openwakeword" and config.wakeword_openwakeword_sequence_verifier_models:
         from twinr.proactive.wakeword.cascade import WakewordSequenceCaptureVerifier
 
         local_verifier = WakewordSequenceCaptureVerifier(
@@ -3321,10 +3425,32 @@ def _build_wakeword_policy(
         fallback_backend=config.wakeword_fallback_backend,
         verifier_mode=config.wakeword_verifier_mode,
         verifier_margin=config.wakeword_verifier_margin,
-        primary_threshold=config.wakeword_openwakeword_threshold,
+        primary_threshold=(
+            config.wakeword_kws_keywords_threshold
+            if primary_backend == "kws"
+            else config.wakeword_openwakeword_threshold
+        ),
         verifier=verifier,
         local_verifier=local_verifier,
     )
+
+
+def _missing_kws_asset_fields(config: TwinrConfig) -> tuple[str, ...]:
+    """Return the missing required sherpa-onnx KWS asset fields."""
+
+    required_assets = {
+        "TWINR_WAKEWORD_KWS_TOKENS_PATH": config.wakeword_kws_tokens_path,
+        "TWINR_WAKEWORD_KWS_ENCODER_PATH": config.wakeword_kws_encoder_path,
+        "TWINR_WAKEWORD_KWS_DECODER_PATH": config.wakeword_kws_decoder_path,
+        "TWINR_WAKEWORD_KWS_JOINER_PATH": config.wakeword_kws_joiner_path,
+        "TWINR_WAKEWORD_KWS_KEYWORDS_FILE_PATH": config.wakeword_kws_keywords_file_path,
+    }
+    missing: list[str] = []
+    for env_name, value in required_assets.items():
+        if str(value or "").strip():
+            continue
+        missing.append(env_name)
+    return tuple(missing)
 
 
 def _build_openwakeword_stream(
@@ -3402,6 +3528,88 @@ def _build_openwakeword_stream(
         return None
 
 
+def _build_kws_stream(
+    *,
+    config: TwinrConfig,
+    runtime: TwinrRuntime,
+    emit: Callable[[str], None] | None,
+) -> OpenWakeWordStreamingMonitor | None:
+    """Build the sherpa-onnx KWS streaming monitor when configured."""
+
+    if config.audio_channels != 1:
+        _record_wakeword_backend_warning(
+            runtime=runtime,
+            emit=emit,
+            reason="kws_requires_mono_audio",
+            detail="KWS currently requires TWINR_AUDIO_CHANNELS=1.",
+            fallback_backend=config.wakeword_fallback_backend,
+        )
+        return None
+    if int(config.audio_sample_rate) != int(config.wakeword_kws_sample_rate):
+        _record_wakeword_backend_warning(
+            runtime=runtime,
+            emit=emit,
+            reason="kws_sample_rate_mismatch",
+            detail=(
+                "KWS requires TWINR_AUDIO_SAMPLE_RATE to match "
+                "TWINR_WAKEWORD_KWS_SAMPLE_RATE."
+            ),
+            fallback_backend=config.wakeword_fallback_backend,
+        )
+        return None
+    missing_assets = _missing_kws_asset_fields(config)
+    if missing_assets:
+        _record_wakeword_backend_warning(
+            runtime=runtime,
+            emit=emit,
+            reason="kws_assets_missing",
+            detail=(
+                "KWS backend selected, but required sherpa-onnx assets are missing: "
+                + ", ".join(missing_assets)
+            ),
+            fallback_backend=config.wakeword_fallback_backend,
+        )
+        return None
+    try:
+        return OpenWakeWordStreamingMonitor(
+            device=_normalize_optional_text(
+                config.proactive_audio_input_device,
+                config.audio_input_device,
+            ),
+            sample_rate=config.audio_sample_rate,
+            channels=config.audio_channels,
+            spotter=WakewordSherpaOnnxFrameSpotter(
+                tokens_path=config.wakeword_kws_tokens_path or "",
+                encoder_path=config.wakeword_kws_encoder_path or "",
+                decoder_path=config.wakeword_kws_decoder_path or "",
+                joiner_path=config.wakeword_kws_joiner_path or "",
+                keywords_file_path=config.wakeword_kws_keywords_file_path or "",
+                phrases=config.wakeword_phrases,
+                project_root=config.project_root,
+                sample_rate=config.wakeword_kws_sample_rate,
+                feature_dim=config.wakeword_kws_feature_dim,
+                max_active_paths=config.wakeword_kws_max_active_paths,
+                keywords_score=config.wakeword_kws_keywords_score,
+                keywords_threshold=config.wakeword_kws_keywords_threshold,
+                num_trailing_blanks=config.wakeword_kws_num_trailing_blanks,
+                num_threads=config.wakeword_kws_num_threads,
+                provider=config.wakeword_kws_provider,
+            ),
+            attempt_cooldown_s=config.wakeword_attempt_cooldown_s,
+            speech_threshold=config.audio_speech_threshold,
+            emit=emit,
+        )
+    except Exception as exc:
+        _record_wakeword_backend_warning(
+            runtime=runtime,
+            emit=emit,
+            reason="kws_init_failed",
+            detail=f"KWS streaming initialization failed: {_exception_text(exc)}",
+            fallback_backend=config.wakeword_fallback_backend,
+        )
+        return None
+
+
 def _build_wakeword_spotter(
     *,
     config: TwinrConfig,
@@ -3462,6 +3670,48 @@ def _build_wakeword_spotter(
                     emit=emit,
                     reason="openwakeword_init_failed",
                     detail=f"openWakeWord initialization failed: {_exception_text(exc)}",
+                    fallback_backend=fallback_backend,
+                )
+        if fallback_backend != "stt":
+            return None
+    if selected_backend == "kws":
+        missing_assets = _missing_kws_asset_fields(config)
+        if missing_assets:
+            _record_wakeword_backend_warning(
+                runtime=runtime,
+                emit=emit,
+                reason="kws_assets_missing",
+                detail=(
+                    "KWS backend selected, but required sherpa-onnx assets are missing: "
+                    + ", ".join(missing_assets)
+                ),
+                fallback_backend=fallback_backend,
+            )
+        else:
+            try:
+                return WakewordSherpaOnnxSpotter(
+                    tokens_path=config.wakeword_kws_tokens_path or "",
+                    encoder_path=config.wakeword_kws_encoder_path or "",
+                    decoder_path=config.wakeword_kws_decoder_path or "",
+                    joiner_path=config.wakeword_kws_joiner_path or "",
+                    keywords_file_path=config.wakeword_kws_keywords_file_path or "",
+                    phrases=config.wakeword_phrases,
+                    project_root=config.project_root,
+                    sample_rate=config.wakeword_kws_sample_rate,
+                    feature_dim=config.wakeword_kws_feature_dim,
+                    max_active_paths=config.wakeword_kws_max_active_paths,
+                    keywords_score=config.wakeword_kws_keywords_score,
+                    keywords_threshold=config.wakeword_kws_keywords_threshold,
+                    num_trailing_blanks=config.wakeword_kws_num_trailing_blanks,
+                    num_threads=config.wakeword_kws_num_threads,
+                    provider=config.wakeword_kws_provider,
+                )
+            except Exception as exc:
+                _record_wakeword_backend_warning(
+                    runtime=runtime,
+                    emit=emit,
+                    reason="kws_init_failed",
+                    detail=f"KWS initialization failed: {_exception_text(exc)}",
                     fallback_backend=fallback_backend,
                 )
         if fallback_backend != "stt":

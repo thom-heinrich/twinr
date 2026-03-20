@@ -1,4 +1,11 @@
-"""Build ordered prompt layers from legacy sections and typed personality state."""
+"""Build ordered prompt layers from legacy sections and typed personality state.
+
+The builder keeps authoritative behavior guidance inside ``SYSTEM`` and
+``PERSONALITY`` while rendering evolving user/place/world context as explicit
+context-data sections. A separate ``MINDSHARE`` section lets Twinr speak more
+naturally about what it has been following without promoting those topics to
+instruction authority.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +18,10 @@ from twinr.agent.personality.models import (
     PersonalityPromptPlan,
     PersonalitySnapshot,
     PersonalityTrait,
+)
+from twinr.agent.personality.self_expression import (
+    render_mindshare_block,
+    render_self_expression_policy,
 )
 
 _LEGACY_PRIORITY_ORDER = ("SYSTEM", "PERSONALITY", "USER")
@@ -218,6 +229,7 @@ class PersonalityContextBuilder:
             _render_trait_lines(snapshot.core_traits) if snapshot else None,
             _render_style_block(snapshot.style_profile) if snapshot else None,
             _render_humor_block(snapshot.humor_profile) if snapshot else None,
+            render_self_expression_policy(snapshot),
         )
         if personality_content:
             layers.append(
@@ -241,6 +253,17 @@ class PersonalityContextBuilder:
                     title="USER",
                     content=user_content,
                     source="legacy_plus_structured",
+                )
+            )
+
+        mindshare_content = render_mindshare_block(snapshot)
+        if mindshare_content:
+            layers.append(
+                PersonalityPromptLayer(
+                    layer_id="mindshare",
+                    title="MINDSHARE",
+                    content=mindshare_content,
+                    source="structured_snapshot",
                 )
             )
 

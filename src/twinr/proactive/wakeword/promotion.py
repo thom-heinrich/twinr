@@ -32,7 +32,9 @@ from .evaluation import (
     _metrics_from_counts,
     load_eval_manifest,
 )
-from .policy import SttWakewordVerifier, WakewordDecisionPolicy
+from .kws import WakewordSherpaOnnxFrameSpotter
+from .policy import SttWakewordVerifier, WakewordDecisionPolicy, normalize_wakeword_backend
+from .stream import WakewordFrameSpotter
 from .spotter import WakewordOpenWakeWordFrameSpotter
 
 _STREAM_CAPTURE_WINDOW_MS = 2500
@@ -230,20 +232,29 @@ def _build_stream_policy(
             language=config.openai_realtime_language,
         )
     )
+    primary_backend = normalize_wakeword_backend(
+        getattr(config, "wakeword_primary_backend", config.wakeword_backend),
+        default="openwakeword",
+    )
     local_verifier = (
         None
-        if not config.wakeword_openwakeword_sequence_verifier_models
+        if primary_backend != "openwakeword" or not config.wakeword_openwakeword_sequence_verifier_models
         else WakewordSequenceCaptureVerifier(
             verifier_models=dict(config.wakeword_openwakeword_sequence_verifier_models),
             threshold=config.wakeword_openwakeword_sequence_verifier_threshold,
         )
+    )
+    primary_threshold = (
+        float(config.wakeword_kws_keywords_threshold)
+        if primary_backend == "kws"
+        else float(config.wakeword_openwakeword_threshold)
     )
     return WakewordDecisionPolicy(
         primary_backend=config.wakeword_primary_backend,
         fallback_backend=config.wakeword_fallback_backend,
         verifier_mode=config.wakeword_verifier_mode,
         verifier_margin=config.wakeword_verifier_margin,
-        primary_threshold=config.wakeword_openwakeword_threshold,
+        primary_threshold=primary_threshold,
         verifier=verifier,
         local_verifier=local_verifier,
     )
@@ -253,12 +264,47 @@ def _build_stream_spotter(
     *,
     config: TwinrConfig,
     model_factory,
-) -> WakewordOpenWakeWordFrameSpotter:
+) -> WakewordFrameSpotter:
     """Build the runtime-faithful frame spotter for manifest replay."""
 
-    if int(config.audio_sample_rate) != 16000 or int(config.audio_channels) != 1:
+    primary_backend = normalize_wakeword_backend(
+        getattr(config, "wakeword_primary_backend", config.wakeword_backend),
+        default="openwakeword",
+    )
+    if primary_backend not in {"openwakeword", "kws"}:
         raise ValueError(
-            "Runtime-faithful wakeword stream replay requires TWINR_AUDIO_SAMPLE_RATE=16000 and TWINR_AUDIO_CHANNELS=1."
+            "Wakeword stream replay currently supports only local detector backends: openwakeword or kws."
+        )
+    if int(config.audio_channels) != 1:
+        raise ValueError(
+            "Runtime-faithful wakeword stream replay requires TWINR_AUDIO_CHANNELS=1."
+        )
+    if primary_backend == "kws":
+        if int(config.audio_sample_rate) != int(config.wakeword_kws_sample_rate):
+            raise ValueError(
+                "Runtime-faithful KWS stream replay requires TWINR_AUDIO_SAMPLE_RATE to match TWINR_WAKEWORD_KWS_SAMPLE_RATE."
+            )
+        return WakewordSherpaOnnxFrameSpotter(
+            tokens_path=config.wakeword_kws_tokens_path or "",
+            encoder_path=config.wakeword_kws_encoder_path or "",
+            decoder_path=config.wakeword_kws_decoder_path or "",
+            joiner_path=config.wakeword_kws_joiner_path or "",
+            keywords_file_path=config.wakeword_kws_keywords_file_path or "",
+            phrases=config.wakeword_phrases,
+            project_root=config.project_root,
+            sample_rate=config.wakeword_kws_sample_rate,
+            feature_dim=config.wakeword_kws_feature_dim,
+            max_active_paths=config.wakeword_kws_max_active_paths,
+            keywords_score=config.wakeword_kws_keywords_score,
+            keywords_threshold=config.wakeword_kws_keywords_threshold,
+            num_trailing_blanks=config.wakeword_kws_num_trailing_blanks,
+            num_threads=config.wakeword_kws_num_threads,
+            provider=config.wakeword_kws_provider,
+            keyword_spotter_factory=model_factory,
+        )
+    if int(config.audio_sample_rate) != 16000:
+        raise ValueError(
+            "Runtime-faithful openWakeWord stream replay requires TWINR_AUDIO_SAMPLE_RATE=16000."
         )
     if not config.wakeword_openwakeword_models:
         raise ValueError("Wakeword stream replay requires at least one configured openWakeWord model.")
@@ -283,7 +329,7 @@ def _replay_stream_entry(
     config: TwinrConfig,
     entry: WakewordEvalEntry,
     policy: WakewordDecisionPolicy,
-    spotter: WakewordOpenWakeWordFrameSpotter,
+    spotter: WakewordFrameSpotter,
 ) -> tuple[bool, int, float]:
     """Replay one labeled entry through the stream detector and policy."""
 

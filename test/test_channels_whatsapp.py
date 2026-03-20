@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -12,9 +13,13 @@ from twinr.agent.base_agent.state.machine import TwinrStatus
 from twinr.channels import ChannelInboundMessage, ChannelTransportError, TwinrTextChannelTurnService
 from twinr.channels.whatsapp import WhatsAppChannelConfig, WhatsAppMessagePolicy
 from twinr.channels.whatsapp.node_runtime import detect_whatsapp_node_runtime_spec, resolve_whatsapp_node_binary
+from twinr.channels.whatsapp.worker_dependencies import (
+    ensure_whatsapp_worker_dependencies,
+    probe_whatsapp_worker_dependencies,
+)
 from twinr.channels.whatsapp.worker_bridge import WhatsAppWorkerBridge, WhatsAppWorkerStatusEvent
 from twinr.web.support.channel_onboarding import FileBackedChannelOnboardingStore, InProcessChannelPairingRegistry
-from twinr.web.support.whatsapp import WhatsAppPairingCoordinator
+from twinr.web.support.whatsapp import WhatsAppPairingCoordinator, probe_whatsapp_runtime
 
 
 class _FakeRuntime:
@@ -224,6 +229,100 @@ class WhatsAppChannelTests(unittest.TestCase):
             with self.assertRaises(ChannelTransportError):
                 bridge._assert_supported_node_runtime()
 
+    def test_probe_worker_dependencies_requires_npm_install_when_node_modules_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker_root = Path(temp_dir)
+            (worker_root / "package.json").write_text(
+                '{"name":"worker","dependencies":{"@whiskeysockets/baileys":"7.0.0-rc.9"}}\n',
+                encoding="utf-8",
+            )
+            (worker_root / "package-lock.json").write_text('{"name":"worker","lockfileVersion":3}\n', encoding="utf-8")
+
+            probe = probe_whatsapp_worker_dependencies(worker_root)
+
+        self.assertFalse(probe.ready)
+        self.assertIn("npm ci", probe.detail)
+        self.assertIn("@whiskeysockets/baileys", probe.detail)
+
+    def test_ensure_worker_dependencies_runs_npm_ci_and_writes_lock_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker_root = Path(temp_dir)
+            package_json = worker_root / "package.json"
+            package_lock = worker_root / "package-lock.json"
+            package_json.write_text(
+                '{"name":"worker","dependencies":{"@whiskeysockets/baileys":"7.0.0-rc.9","pino":"^9.7.0"}}\n',
+                encoding="utf-8",
+            )
+            package_lock.write_text('{"name":"worker","lockfileVersion":3}\n', encoding="utf-8")
+            npm_binary = worker_root / "npm"
+            npm_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+            def _fake_run(command, **kwargs):
+                self.assertEqual(command[:2], [str(npm_binary), "ci"])
+                self.assertEqual(
+                    kwargs["env"]["PATH"].split(os.pathsep)[0],
+                    str((worker_root / "node").parent),
+                )
+                node_modules = worker_root / "node_modules"
+                (node_modules / "@whiskeysockets" / "baileys").mkdir(parents=True, exist_ok=True)
+                (node_modules / "pino").mkdir(parents=True, exist_ok=True)
+                ((node_modules / "@whiskeysockets" / "baileys") / "package.json").write_text("{}", encoding="utf-8")
+                ((node_modules / "pino") / "package.json").write_text("{}", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            probe = ensure_whatsapp_worker_dependencies(
+                worker_root=worker_root,
+                node_binary=str(worker_root / "node"),
+                subprocess_runner=_fake_run,
+            )
+
+            marker_path = worker_root / "node_modules" / ".twinr-package-lock.sha256"
+            self.assertTrue(probe.ready)
+            self.assertTrue(marker_path.is_file())
+
+    def test_worker_bridge_start_ensures_dependencies_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            worker_root = Path(temp_dir)
+            auth_dir = worker_root / "auth"
+            auth_dir.mkdir(parents=True, exist_ok=True)
+            (worker_root / "index.mjs").write_text("console.log('ok')\n", encoding="utf-8")
+            config = WhatsAppChannelConfig(
+                allow_from="+49 171 1234567",
+                allow_from_jid="491711234567@s.whatsapp.net",
+                auth_dir=auth_dir,
+                worker_root=worker_root,
+                node_binary="node",
+                groups_enabled=False,
+                self_chat_mode=False,
+                reconnect_base_delay_s=2.0,
+                reconnect_max_delay_s=30.0,
+                send_timeout_s=20.0,
+                sent_cache_ttl_s=180.0,
+                sent_cache_max_entries=256,
+            )
+            bridge = WhatsAppWorkerBridge(config)
+            fake_process = SimpleNamespace(
+                poll=lambda: None,
+                stdout=[],
+                stderr=[],
+                stdin=SimpleNamespace(write=lambda _value: None, flush=lambda: None),
+            )
+
+            with patch.object(bridge, "_assert_supported_node_runtime") as assert_runtime_mock, patch(
+                "twinr.channels.whatsapp.worker_bridge.ensure_whatsapp_worker_dependencies"
+            ) as ensure_mock, patch(
+                "twinr.channels.whatsapp.worker_bridge.subprocess.Popen",
+                return_value=fake_process,
+            ) as popen_mock, patch(
+                "twinr.channels.whatsapp.worker_bridge.threading.Thread"
+            ) as thread_mock:
+                thread_mock.return_value = SimpleNamespace(start=lambda: None)
+                bridge.start()
+
+        assert_runtime_mock.assert_called_once_with()
+        ensure_mock.assert_called_once()
+        popen_mock.assert_called_once()
+
     def test_from_twinr_config_resolves_relative_paths_against_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_root = Path(temp_dir)
@@ -413,3 +512,30 @@ class WhatsAppChannelTests(unittest.TestCase):
         self.assertTrue(snapshot.auth_repair_needed)
         self.assertEqual(snapshot.summary, "Auth repair needed")
         self.assertEqual(snapshot.last_worker_detail, "badSession")
+
+    def test_probe_whatsapp_runtime_reports_missing_worker_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            auth_dir = project_root / "state" / "channels" / "whatsapp" / "auth"
+            worker_root = project_root / "src" / "twinr" / "channels" / "whatsapp" / "worker"
+            worker_root.mkdir(parents=True, exist_ok=True)
+            auth_dir.mkdir(parents=True, exist_ok=True)
+            (worker_root / "index.mjs").write_text("console.log('worker')\n", encoding="utf-8")
+            (worker_root / "package.json").write_text(
+                '{"name":"worker","dependencies":{"@whiskeysockets/baileys":"7.0.0-rc.9"}}\n',
+                encoding="utf-8",
+            )
+            (worker_root / "package-lock.json").write_text('{"name":"worker","lockfileVersion":3}\n', encoding="utf-8")
+
+            probe = probe_whatsapp_runtime(
+                SimpleNamespace(
+                    project_root=str(project_root),
+                    whatsapp_worker_root=str(worker_root),
+                    whatsapp_node_binary="node",
+                    whatsapp_auth_dir=str(auth_dir),
+                ),
+                env_path=project_root / ".env",
+            )
+
+        self.assertFalse(probe.worker_ready)
+        self.assertIn("npm ci", probe.worker_detail)

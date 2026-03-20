@@ -12,6 +12,10 @@ __all__ = [
     "DisplayFaceBrowStyle",
     "DisplayFaceCue",
     "DisplayFaceCueStore",
+    "DisplayEmojiController",
+    "DisplayEmojiCue",
+    "DisplayEmojiCueStore",
+    "DisplayEmojiSymbol",
     "DisplayFaceEmotion",
     "DisplayFaceExpression",
     "DisplayFaceExpressionController",
@@ -40,6 +44,22 @@ def __getattr__(name: str) -> Any:
         from twinr.display.face_cues import DisplayFaceCueStore
 
         return DisplayFaceCueStore
+    if name == "DisplayEmojiCue":
+        from twinr.display.emoji_cues import DisplayEmojiCue
+
+        return DisplayEmojiCue
+    if name == "DisplayEmojiCueStore":
+        from twinr.display.emoji_cues import DisplayEmojiCueStore
+
+        return DisplayEmojiCueStore
+    if name == "DisplayEmojiSymbol":
+        from twinr.display.emoji_cues import DisplayEmojiSymbol
+
+        return DisplayEmojiSymbol
+    if name == "DisplayEmojiController":
+        from twinr.display.emoji_cues import DisplayEmojiController
+
+        return DisplayEmojiController
     if name == "DisplayFaceBrowStyle":
         from twinr.display.face_expressions import DisplayFaceBrowStyle
 

@@ -18,13 +18,33 @@ import select
 import shutil
 import subprocess
 import time
-from typing import Callable
+from typing import Callable, Protocol
 
 from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample
 
 from ..runtime.presence import PresenceSessionSnapshot
 from .matching import WakewordMatch
-from .spotter import WakewordOpenWakeWordFrameSpotter
+
+
+class WakewordFrameSpotter(Protocol):
+    """Describe the streaming detector surface used by the monitor."""
+
+    @property
+    def frame_bytes(self) -> int:
+        """Return the default frame size in bytes."""
+        ...
+
+    def frame_bytes_for_channels(self, channels: int) -> int:
+        """Return the exact frame size for the supplied channel count."""
+        ...
+
+    def process_pcm_bytes(self, pcm_bytes: bytes, *, channels: int = 1) -> WakewordMatch | None:
+        """Feed PCM bytes and optionally return a wakeword match."""
+        ...
+
+    def reset(self) -> None:
+        """Reset detector state after disarm or runtime restart."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +77,7 @@ class OpenWakeWordStreamingMonitor:
         device: str,
         sample_rate: int,
         channels: int,
-        spotter: WakewordOpenWakeWordFrameSpotter,
+        spotter: WakewordFrameSpotter,
         attempt_cooldown_s: float,
         speech_threshold: int = 700,
         history_ms: int = 30_000,
@@ -123,7 +143,7 @@ class OpenWakeWordStreamingMonitor:
             with self._spotter_lock:
                 self.spotter.reset()
 
-            thread = Thread(target=self._run, daemon=True, name="twinr-openwakeword")
+            thread = Thread(target=self._run, daemon=True, name="twinr-wakeword")
             self._thread = thread
             thread.start()
         return self
@@ -238,9 +258,9 @@ class OpenWakeWordStreamingMonitor:
                 bufsize=0,
             )
             if process.stdout is None:
-                raise RuntimeError("openWakeWord stream did not expose stdout")
+                raise RuntimeError("Wakeword stream did not expose stdout")
             if process.stderr is None:
-                raise RuntimeError("openWakeWord stream did not expose stderr")
+                raise RuntimeError("Wakeword stream did not expose stderr")
 
             # AUDIT-FIX(#6): Make both pipes non-blocking so stdout/stderr can be drained incrementally without deadlocking the worker.
             os.set_blocking(process.stdout.fileno(), False)
@@ -502,5 +522,6 @@ def _pcm16_rms(samples: bytes) -> int:
 
 __all__ = [
     "OpenWakeWordStreamingMonitor",
+    "WakewordFrameSpotter",
     "WakewordStreamDetection",
 ]

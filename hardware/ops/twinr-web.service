@@ -3,12 +3,14 @@ Description=Twinr Web Control Portal
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=0
+ConditionPathExists=/proc/device-tree/model
 
 [Service]
 Type=simple
 User=thh
 WorkingDirectory=/twinr
 Environment=TWINR_PYTHON=/twinr/.venv/bin/python
+ExecCondition=/usr/bin/env bash -lc 'grep -qa "Raspberry Pi" /proc/device-tree/model'
 ExecStart=/usr/bin/env bash -lc 'cd /twinr && PYTHONPATH=src "${TWINR_PYTHON}" -m twinr --env-file .env --run-web'
 Restart=always
 RestartSec=2

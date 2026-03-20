@@ -41,7 +41,9 @@ python3 hardware/display/probe_busy_path.py --env-file .env --steady-renders 6
 active mode, auto-detects the active Wayland socket when possible, writes the
 Wayland/runtime env needed for the visible fullscreen Twinr surface, and for
 HDMI also sets the senior-facing `default` layout with runtime tracing
-disabled. Pass `--layout debug_log --runtime-trace true` when operators
+disabled. For HDMI it also installs `fonts-noto-color-emoji`, because the
+right-hand Unicode emoji reserve depends on the system
+`NotoColorEmoji.ttf` font. Pass `--layout debug_log --runtime-trace true` when operators
 explicitly want the richer live-diagnostics surface on the panel. HDMI setup
 also removes the old Waveshare GPIO/SPI env keys so the runtime stops touching
 the retired e-paper path.

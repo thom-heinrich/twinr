@@ -22,6 +22,8 @@ bounded background writers into the APIs used by agent runtime loops.
 - Record per-snapshot pointer/origin readiness evidence so watchdog failures can be traced to the exact remote read path
 - Reuse successful remote snapshot probes within one bounded readiness pass so watchdog startup does not refetch the same snapshot twice back-to-back
 - Treat successful required snapshot loads as the decisive health proof inside the warm probe instead of re-running per-store backend status checks after bootstrap
+- Split remote readiness into a strict bootstrap pass and a cheaper steady-state watchdog pass so live keepalives can prove current remote readability without reseeding every snapshot on every tick
+- Skip the heavier `archive` snapshot during steady-state watchdog probes while keeping startup and recovery fully archive-inclusive and fail closed
 - Fail closed when any required remote snapshot or shard is unreadable
 - Prewarm generic foreground-read paths plus current object/conflict payload caches before live text-channel traffic so the first real remote-only recall turn can hit a warmed remote cache instead of rebuilding selectors and fetching first-hit payloads on demand
 - Reuse remote snapshot/catalog/item reads through TTL-bounded in-process caches so warmed foreground recall stays sub-second on the Pi without changing remote-only truth semantics
@@ -53,6 +55,7 @@ from twinr.memory.longterm import LongTermMemoryService
 
 service = LongTermMemoryService.from_config(config)
 service.ensure_remote_ready()
+steady_state = service.probe_remote_ready(bootstrap=False, include_archive=False)
 context = service.build_provider_context(query_text)
 service.enqueue_conversation_turn(
     transcript=user_text,

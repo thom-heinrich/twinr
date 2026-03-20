@@ -1,8 +1,8 @@
 # wakeword
 
-Wakeword matching, openWakeWord spotting, optional local verifier assets,
-sequence-aware cascade verification, policy, calibration, streaming, and
-offline plus runtime-faithful evaluation helpers for Twinr.
+Wakeword matching, local KWS/openWakeWord spotting, optional local verifier
+assets, sequence-aware cascade verification, policy, calibration, streaming,
+and offline plus runtime-faithful evaluation helpers for Twinr.
 
 This package is the wakeword-specific boundary below proactive runtime
 orchestration and above raw audio/hardware adapters.
@@ -12,12 +12,14 @@ orchestration and above raw audio/hardware adapters.
 `wakeword` owns:
 - Normalize wakeword phrases, transcripts, and detector labels
 - Separate canonical wakeword phrases from STT-specific recognition phrases
-- Run openWakeWord clip and frame spotting plus optional local verifier and STT confirmation
+- Run local clip/frame wakeword spotting via openWakeWord or sherpa-onnx KWS plus optional verifier and STT confirmation
 - Run a Twinr-specific sequence-aware verifier as a second local stage on localized wakeword captures
 - Resolve bundled local openWakeWord model assets when the repo ships them
 - Auto-load sibling `.verifier.pkl` assets for bundled local models when available
 - Auto-load sibling `.sequence_verifier.pkl` assets for bundled local models when available
+- Fail closed when the configured sherpa-onnx KWS asset bundle is incomplete
 - Persist and apply per-device wakeword calibration overrides
+- Keep backend-family selection anchored in deployment config; calibration may tune thresholds and phrases, but it must not silently switch a Pi from `kws` back to `openwakeword`
 - Replay labeled captures for evaluation, labeling, verifier training, and autotune workflows
 - Replay labeled captures through the streaming runtime path for promotion suites and ambient false-accepts/hour guards
 - Train reproducible Twinr base models from generated multivoice datasets and select deployment thresholds against labeled acceptance captures
@@ -42,6 +44,8 @@ orchestration and above raw audio/hardware adapters.
 | `__init__.py` | Package export surface |
 | `cascade.py` | Twinr-specific second-stage DTW-aligned sequence verifier assets and runtime gate |
 | `matching.py` | Transcript and label matching |
+| `kws.py` | sherpa-onnx KWS clip and frame spotting |
+| `kws_assets.py` | Official sherpa-onnx bundle provisioning and Twinr keyword-file generation |
 | `spotter.py` | openWakeWord clip and frame spotting plus optional local verifier loading |
 | `policy.py` | Acceptance, fallback, local cascade gating, and STT verification |
 | `promotion.py` | Runtime-faithful stream replay, promotion specs, suite guards, and ambient false-accepts/hour reports |
@@ -73,6 +77,24 @@ PYTHONPATH=src python3 -m twinr \
   --env-file .env \
   --wakeword-stream-eval \
   --wakeword-manifest /tmp/twinr_critical16_v2.json
+```
+
+```bash
+TWINR_WAKEWORD_PRIMARY_BACKEND=kws
+TWINR_WAKEWORD_KWS_TOKENS_PATH=src/twinr/proactive/wakeword/models/kws/tokens.txt
+TWINR_WAKEWORD_KWS_ENCODER_PATH=src/twinr/proactive/wakeword/models/kws/encoder.onnx
+TWINR_WAKEWORD_KWS_DECODER_PATH=src/twinr/proactive/wakeword/models/kws/decoder.onnx
+TWINR_WAKEWORD_KWS_JOINER_PATH=src/twinr/proactive/wakeword/models/kws/joiner.onnx
+TWINR_WAKEWORD_KWS_KEYWORDS_FILE_PATH=src/twinr/proactive/wakeword/models/kws/keywords.txt
+```
+
+Provision the bundle reproducibly from the leading repo before switching runtime:
+
+```bash
+PYTHONPATH=src python3 -m twinr \
+  --env-file .env \
+  --wakeword-kws-provision \
+  --wakeword-kws-force
 ```
 
 ```bash
@@ -113,6 +135,8 @@ PYTHONPATH=src python3 -m twinr \
   --wakeword-model-output src/twinr/proactive/wakeword/models/twinr_v2.onnx \
   --wakeword-training-model-type mlp \
   --wakeword-training-layer-dim 256 \
+  --wakeword-training-difficulty-model src/twinr/proactive/wakeword/models/twinr_v1.onnx \
+  --wakeword-training-difficulty-negative-scale 3.0 \
   --wakeword-manifest /tmp/twinr_oww_capture_room_20260319a/captured_manifest.json
 ```
 
@@ -133,8 +157,11 @@ PYTHONPATH=src python3 scripts/generate_multivoice_dataset.py \
 - The repo now exposes one canonical research-backed training plan via `training_plan.py` and `twinr --wakeword-training-plan`.
 - Stage 1 is explicitly the broad phonetic family detector for `Twinr`, `Twinna`, `Twina`, and `Twinner`.
 - The default base-model trainer now matches the shipped `twinr_v1` family more closely: `StandardScaler + MLP` exported to ONNX, not only the upstream openWakeWord DNN loop.
+- The MLP trainer can optionally reuse one reference detector to upweight deployment-proximate hard examples, so room captures and mined confusions that still activate get more gradient pressure than easy synthetic negatives.
 - Hard-negative mining is mandatory before another promotion attempt, with priority on real Pi false activations and the confusion family `Twin`, `Winner`, `Winter`, `Tina`, `Timer`, and `Twitter`.
 - Promotion is blocked unless the candidate passes the held-out suites plus the long-form Pi ambient false-accepts/hour guard on the real Twinr runtime evaluation path, driven by `promotion.py` and `twinr --wakeword-promotion-eval`.
+- The new `kws` backend is a professional runtime path built around `sherpa-onnx` streaming keyword spotting. It requires an explicit asset bundle (`tokens.txt`, `encoder.onnx`, `decoder.onnx`, `joiner.onnx`, `keywords.txt`) and stays fail-closed when the bundle is missing or incomplete.
+- `kws_assets.py` provisions the official upstream bundle plus Twinr-specific `keywords_raw.txt`, `keywords.txt`, `bpe.model`, and `bundle_metadata.json` so `/twinr` can be switched without ad-hoc shell work or guessed token sequences.
 
 ## See also
 

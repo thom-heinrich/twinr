@@ -5,6 +5,7 @@ summary: Typed evolving-personality models, background learning, and prompt-laye
 responsibilities:
   - Define structured personality, conversation-style, humor, relationship, continuity, place/world, and reflection models.
   - Translate structured personality state into ordered prompt layers that preserve the legacy section contract.
+  - Render a bounded conversational self-expression and current-mindshare layer so Twinr can speak naturally from ongoing themes.
   - Provide clean persistence seams for remote snapshot state that can later be backed directly by ChonkyDB-derived personality objects.
   - Extract structured interaction, continuity, place, and world signals from long-term consolidation output and tool history.
   - Gate background learning so repeated signals can evolve the durable personality snapshot without one-off drift.
@@ -21,6 +22,8 @@ files:
     role: Typed evolving-personality state including conversation style, relationship stance, and prompt-layer contracts.
   - path: context_builder.py
     role: Ordered prompt-layer assembly.
+  - path: self_expression.py
+    role: Conversational self-expression policy and prompt-facing current-mindshare rendering.
   - path: store.py
     role: Remote snapshot persistence seam for snapshots, signals, and deltas.
   - path: evolution.py

@@ -99,6 +99,29 @@ class WakewordEvalTests(unittest.TestCase):
             ("hallo twinr", "hallo twin", "twinr", "twin"),
         )
 
+    def test_apply_wakeword_calibration_preserves_runtime_backend_selection(self) -> None:
+        base_config = TwinrConfig(
+            wakeword_enabled=True,
+            wakeword_backend="kws",
+            wakeword_primary_backend="kws",
+            wakeword_fallback_backend="disabled",
+        )
+
+        calibrated = apply_wakeword_calibration(
+            base_config,
+            WakewordCalibrationProfile(
+                primary_backend="openwakeword",
+                fallback_backend="stt",
+                verifier_mode="disabled",
+                threshold=0.93,
+            ),
+        )
+
+        self.assertEqual(calibrated.wakeword_backend, "kws")
+        self.assertEqual(calibrated.wakeword_primary_backend, "kws")
+        self.assertEqual(calibrated.wakeword_fallback_backend, "stt")
+        self.assertEqual(calibrated.wakeword_openwakeword_threshold, 0.93)
+
     def test_append_wakeword_capture_label_roundtrips_through_ops_log(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(project_root=temp_dir)

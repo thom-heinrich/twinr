@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Protocol
+import inspect
 import json
 import os
 import socket
@@ -31,6 +32,7 @@ from twinr.ops.paths import resolve_ops_paths_for_config
 _DEFAULT_WATCHDOG_INTERVAL_S = 1.0
 _DEFAULT_HISTORY_LIMIT = 3600
 _SNAPSHOT_SCHEMA_VERSION = 1
+_DEFAULT_DEEP_PROBE_IDLE_FLOOR_S = 5.0
 
 
 def _utc_now_iso() -> str:
@@ -392,7 +394,6 @@ class RemoteMemoryWatchdog:
             required = False
             detail: str | None = None
             probe_payload: dict[str, object] | None = None
-            deep_probe_attempted = False
 
             try:
                 service = self._service_instance()
@@ -412,10 +413,14 @@ class RemoteMemoryWatchdog:
                     ready = False
                     detail = status_detail or "Required remote long-term memory is unavailable."
                 else:
-                    deep_probe_attempted = True
                     probe_remote_ready = getattr(service, "probe_remote_ready", None)
                     if callable(probe_remote_ready):
-                        probe_result = probe_remote_ready()
+                        bootstrap_probe = self._should_run_bootstrap_probe()
+                        probe_result = self._call_probe_remote_ready(
+                            probe_remote_ready=probe_remote_ready,
+                            bootstrap=bootstrap_probe,
+                            include_archive=bootstrap_probe,
+                        )
                         probe_payload = self._normalize_probe_payload(
                             getattr(probe_result, "to_dict", lambda: None)()
                             if probe_result is not None
@@ -445,8 +450,6 @@ class RemoteMemoryWatchdog:
                     probe_payload,
                     extract_remote_write_context(exc),
                 )
-                if deep_probe_attempted:
-                    self._drop_service_instance()
             except Exception as exc:
                 status = "fail"
                 ready = False
@@ -519,27 +522,40 @@ class RemoteMemoryWatchdog:
         probe_thread: Thread | None = None
         probe_started_at: str | None = None
         probe_started_monotonic: float | None = None
+        probe_was_inflight = False
+        next_probe_not_before_monotonic = self._monotonic()
         try:
             while True:
-                if probe_thread is None or not probe_thread.is_alive():
+                now_monotonic = self._monotonic()
+                probe_inflight = bool(probe_thread is not None and probe_thread.is_alive())
+                if probe_was_inflight and not probe_inflight:
+                    last_sample = self._recent_samples[-1] if self._recent_samples else None
+                    next_probe_not_before_monotonic = max(
+                        next_probe_not_before_monotonic,
+                        now_monotonic + self._deep_probe_idle_gap_s(last_sample=last_sample),
+                    )
+                probe_was_inflight = probe_inflight
+                if not probe_inflight and now_monotonic >= next_probe_not_before_monotonic:
                     probe_started_at = _utc_now_iso()
-                    probe_started_monotonic = self._monotonic()
+                    probe_started_monotonic = now_monotonic
                     probe_thread = Thread(
                         target=self._probe_worker_main,
                         name="twinr-remote-memory-watchdog-probe",
                         daemon=True,
                     )
                     probe_thread.start()
+                    probe_inflight = True
+                    probe_was_inflight = True
                 self._emit_heartbeat(
                     probe_started_at=probe_started_at,
                     probe_started_monotonic=probe_started_monotonic,
-                    probe_inflight=probe_thread.is_alive(),
+                    probe_inflight=probe_inflight,
                 )
-                if deadline is not None and self._monotonic() >= deadline:
+                if deadline is not None and now_monotonic >= deadline:
                     return 0
                 sleep_s = self.interval_s
                 if deadline is not None:
-                    sleep_s = min(sleep_s, max(0.0, deadline - self._monotonic()))
+                    sleep_s = min(sleep_s, max(0.0, deadline - now_monotonic))
                 if sleep_s > 0.0:
                     self._sleep(sleep_s)
         except KeyboardInterrupt:
@@ -562,6 +578,25 @@ class RemoteMemoryWatchdog:
 
         print(line, flush=True)
 
+    def _deep_probe_idle_gap_s(self, *, last_sample: RemoteMemoryWatchdogSample | None) -> float:
+        """Return the minimum quiet window between completed deep probes."""
+
+        raw_keepalive = getattr(
+            self.config,
+            "long_term_memory_remote_keepalive_interval_s",
+            _DEFAULT_DEEP_PROBE_IDLE_FLOOR_S,
+        )
+        try:
+            keepalive_s = float(raw_keepalive)
+        except (TypeError, ValueError):
+            keepalive_s = _DEFAULT_DEEP_PROBE_IDLE_FLOOR_S
+        if keepalive_s <= 0.0:
+            keepalive_s = _DEFAULT_DEEP_PROBE_IDLE_FLOOR_S
+        latency_s = 0.0
+        if last_sample is not None:
+            latency_s = max(0.0, float(last_sample.latency_ms or 0.0) / 1000.0)
+        return max(self.interval_s, keepalive_s, latency_s)
+
     def _service_instance(self) -> _RemoteMemoryService:
         service = self._service
         if service is None:
@@ -580,6 +615,29 @@ class RemoteMemoryWatchdog:
             service.shutdown(timeout_s=2.0)
         except Exception:
             return
+
+    def _should_run_bootstrap_probe(self) -> bool:
+        """Return whether the next readiness probe must perform full bootstrap."""
+
+        last_sample = self._recent_samples[-1] if self._recent_samples else None
+        return last_sample is None or last_sample.status != "ok"
+
+    @staticmethod
+    def _call_probe_remote_ready(*, probe_remote_ready, bootstrap: bool, include_archive: bool):
+        """Call probe helpers compatibly across older and newer service surfaces."""
+
+        try:
+            signature = inspect.signature(probe_remote_ready)
+        except (TypeError, ValueError):
+            return probe_remote_ready()
+        parameters = signature.parameters.values()
+        supports_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        kwargs: dict[str, object] = {}
+        if supports_kwargs or "bootstrap" in signature.parameters:
+            kwargs["bootstrap"] = bootstrap
+        if supports_kwargs or "include_archive" in signature.parameters:
+            kwargs["include_archive"] = include_archive
+        return probe_remote_ready(**kwargs)
 
     @staticmethod
     def _normalize_detail(value: object) -> str | None:

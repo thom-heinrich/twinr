@@ -51,6 +51,9 @@ _THRESHOLD_CANDIDATES = (
     0.93,
 )
 
+_POSITIVE_DIFFICULTY_PREFIXES = ("extra_pos_",)
+_NEGATIVE_DIFFICULTY_PREFIXES = ("extra_neg_", "mined_neg_")
+
 
 @dataclass(frozen=True, slots=True)
 class WakewordBaseModelTrainingReport:
@@ -198,18 +201,95 @@ def _dataset_sample_weight(path: Path, *, positive: bool) -> float:
     return 1.5
 
 
+def _uses_difficulty_scoring(path: Path, *, positive: bool) -> bool:
+    """Return whether one dataset clip should receive dynamic difficulty scoring."""
+
+    name = path.name.lower()
+    prefixes = _POSITIVE_DIFFICULTY_PREFIXES if positive else _NEGATIVE_DIFFICULTY_PREFIXES
+    return any(name.startswith(prefix) for prefix in prefixes)
+
+
+def _load_reference_peak_scores(
+    *,
+    audio_paths: list[Path],
+    model_path: Path | None,
+) -> dict[Path, float]:
+    """Score the deployment-proximate dataset clips with one reference detector.
+
+    Dynamic weighting should focus on the small subset of real room captures and
+    mined confusions that most closely match the Pi deployment, not on thousands
+    of synthetic clips that already act as broad regularization.
+    """
+
+    if model_path is None:
+        return {}
+    resolved_model_path = model_path.expanduser().resolve(strict=True)
+    if not audio_paths:
+        return {}
+
+    from openwakeword.model import Model
+
+    detector_key = resolved_model_path.stem
+    model = Model(
+        wakeword_models=[str(resolved_model_path)],
+        inference_framework="onnx",
+    )
+    scores: dict[Path, float] = {}
+    for audio_path in audio_paths:
+        resolved_audio_path = audio_path.expanduser().resolve(strict=True)
+        model.reset()
+        predictions = model.predict_clip(str(resolved_audio_path), padding=1, chunk_size=1280)
+        peak_score = max((float(frame.get(detector_key, 0.0)) for frame in predictions), default=0.0)
+        scores[resolved_audio_path] = peak_score
+    return scores
+
+
+def _difficulty_weight_multiplier(
+    *,
+    score: float,
+    positive: bool,
+    difficulty_scale: float,
+    difficulty_power: float,
+) -> float:
+    """Translate one reference detector score into a bounded sample multiplier."""
+
+    normalized_score = min(1.0, max(0.0, float(score)))
+    normalized_scale = max(0.0, float(difficulty_scale))
+    normalized_power = max(1.0, float(difficulty_power))
+    if normalized_scale <= 0.0:
+        return 1.0
+    if positive:
+        difficulty = max(0.0, 1.0 - normalized_score)
+    else:
+        difficulty = normalized_score
+    return 1.0 + normalized_scale * (difficulty ** normalized_power)
+
+
 def _expanded_sample_weights(
     *,
     audio_paths: list[Path],
     rounds: int,
     positive: bool,
+    difficulty_scores: dict[Path, float] | None = None,
+    difficulty_scale: float = 0.0,
+    difficulty_power: float = 2.0,
 ) -> np.ndarray:
     """Repeat one per-clip provenance weight to match feature-array order."""
 
     weights: list[float] = []
     for _round_index in range(max(1, int(rounds))):
         for audio_path in audio_paths:
-            weights.append(_dataset_sample_weight(audio_path, positive=positive))
+            base_weight = _dataset_sample_weight(audio_path, positive=positive)
+            resolved_audio_path = audio_path.expanduser().resolve(strict=False)
+            difficulty_multiplier = 1.0
+            if difficulty_scores is not None and resolved_audio_path in difficulty_scores:
+                difficulty_multiplier = _difficulty_weight_multiplier(
+                    score=float(difficulty_scores[resolved_audio_path]),
+                    positive=positive,
+                    difficulty_scale=float(difficulty_scale),
+                    difficulty_power=float(difficulty_power),
+                )
+            weights.append(base_weight * difficulty_multiplier)
     return np.asarray(weights, dtype=np.float32)
 
 
@@ -623,6 +703,10 @@ def train_wakeword_base_model_from_dataset_root(
     feature_device: str = "cpu",
     feature_batch_size: int = 64,
     seed: int = 20260319,
+    difficulty_reference_model_path: str | Path | None = None,
+    difficulty_positive_scale: float = 0.0,
+    difficulty_negative_scale: float = 0.0,
+    difficulty_power: float = 2.0,
     evaluation_config: TwinrConfig | None = None,
     train_backend: Callable[..., None] | None = None,
     acceptance_evaluator: Callable[..., tuple[float, WakewordEvalMetrics]] | None = None,
@@ -714,6 +798,19 @@ def train_wakeword_base_model_from_dataset_root(
     )
 
     resolved_model_type = str(model_type or "mlp").strip().lower() or "mlp"
+    difficulty_reference_model = (
+        Path(difficulty_reference_model_path).expanduser().resolve(strict=True)
+        if difficulty_reference_model_path is not None
+        else None
+    )
+    positive_difficulty_scores = _load_reference_peak_scores(
+        audio_paths=[path for path in positive_train_paths if _uses_difficulty_scoring(path, positive=True)],
+        model_path=difficulty_reference_model,
+    )
+    negative_difficulty_scores = _load_reference_peak_scores(
+        audio_paths=[path for path in negative_train_paths if _uses_difficulty_scoring(path, positive=False)],
+        model_path=difficulty_reference_model,
+    )
     if train_backend is not None:
         train_backend(
             positive_train_features_path=positive_train_features_path,
@@ -746,11 +843,17 @@ def train_wakeword_base_model_from_dataset_root(
                 audio_paths=positive_train_paths,
                 rounds=max(1, int(training_rounds)),
                 positive=True,
+                difficulty_scores=positive_difficulty_scores,
+                difficulty_scale=float(difficulty_positive_scale),
+                difficulty_power=float(difficulty_power),
             ),
             negative_train_weights=_expanded_sample_weights(
                 audio_paths=negative_train_paths,
                 rounds=max(1, int(training_rounds)),
                 positive=False,
+                difficulty_scores=negative_difficulty_scores,
+                difficulty_scale=float(difficulty_negative_scale),
+                difficulty_power=float(difficulty_power),
             ),
         )
     else:
@@ -799,6 +902,14 @@ def train_wakeword_base_model_from_dataset_root(
         "feature_device": feature_device,
         "feature_batch_size": int(feature_batch_size),
         "seed": int(seed),
+        "difficulty_reference_model_path": (
+            str(difficulty_reference_model)
+            if difficulty_reference_model is not None
+            else None
+        ),
+        "difficulty_positive_scale": float(difficulty_positive_scale),
+        "difficulty_negative_scale": float(difficulty_negative_scale),
+        "difficulty_power": float(difficulty_power),
         "total_length_samples": int(total_length_samples),
         "train_positive_clips": len(positive_train_paths),
         "train_negative_clips": len(negative_train_paths),

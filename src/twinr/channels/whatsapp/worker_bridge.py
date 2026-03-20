@@ -17,6 +17,7 @@ import uuid
 from twinr.channels.contracts import ChannelInboundMessage, ChannelTransportError
 
 from .config import WhatsAppChannelConfig
+from .worker_dependencies import ensure_whatsapp_worker_dependencies
 
 
 LOGGER = logging.getLogger(__name__)
@@ -81,6 +82,10 @@ class WhatsAppWorkerBridge:
             if self._process is not None and self._process.poll() is None:
                 return
             self._assert_supported_node_runtime()
+            ensure_whatsapp_worker_dependencies(
+                worker_root=self.config.worker_root,
+                node_binary=self.config.node_binary,
+            )
             self._stop_requested = False
             self.config.auth_dir.mkdir(parents=True, exist_ok=True)
             self._event_queue = queue.Queue()

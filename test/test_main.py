@@ -109,20 +109,34 @@ class MainCliTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             fake_cwd = Path(temp_dir)
-            with patch("pathlib.Path.cwd", return_value=fake_cwd):
-                with patch.object(twinr_package, "__file__", "/twinr/src/twinr/__init__.py"):
-                    with self.assertRaisesRegex(RuntimeError, "must be launched from /twinr"):
-                        main_mod._assert_pi_runtime_root("/twinr/.env", command_name="run-streaming-loop")
+            with patch.object(main_mod, "_is_raspberry_pi_host", return_value=True):
+                with patch("pathlib.Path.cwd", return_value=fake_cwd):
+                    with patch.object(twinr_package, "__file__", "/twinr/src/twinr/__init__.py"):
+                        with self.assertRaisesRegex(RuntimeError, "must be launched from /twinr"):
+                            main_mod._assert_pi_runtime_root("/twinr/.env", command_name="run-streaming-loop")
 
         sys.modules.pop("twinr.__main__", None)
+
+    def test_assert_pi_runtime_root_rejects_non_pi_host_for_pi_env(self) -> None:
+        main_mod = importlib.import_module("twinr.__main__")
+        twinr_package = importlib.import_module("twinr")
+        try:
+            with patch.object(main_mod, "_is_raspberry_pi_host", return_value=False):
+                with patch("pathlib.Path.cwd", return_value=Path("/twinr")):
+                    with patch.object(twinr_package, "__file__", "/twinr/src/twinr/__init__.py"):
+                        with self.assertRaisesRegex(RuntimeError, "only allowed on a Raspberry Pi host"):
+                            main_mod._assert_pi_runtime_root("/twinr/.env", command_name="run-streaming-loop")
+        finally:
+            sys.modules.pop("twinr.__main__", None)
 
     def test_assert_pi_runtime_root_accepts_twinr_cwd_and_source_root(self) -> None:
         main_mod = importlib.import_module("twinr.__main__")
         twinr_package = importlib.import_module("twinr")
         try:
-            with patch("pathlib.Path.cwd", return_value=Path("/twinr")):
-                with patch.object(twinr_package, "__file__", "/twinr/src/twinr/__init__.py"):
-                    main_mod._assert_pi_runtime_root("/twinr/.env", command_name="run-streaming-loop")
+            with patch.object(main_mod, "_is_raspberry_pi_host", return_value=True):
+                with patch("pathlib.Path.cwd", return_value=Path("/twinr")):
+                    with patch.object(twinr_package, "__file__", "/twinr/src/twinr/__init__.py"):
+                        main_mod._assert_pi_runtime_root("/twinr/.env", command_name="run-streaming-loop")
         finally:
             sys.modules.pop("twinr.__main__", None)
 
@@ -1377,7 +1391,7 @@ class MainCliTests(unittest.TestCase):
             manifest_path.write_text("[]\n", encoding="utf-8")
             model_path = root / "twinr_v2.onnx"
             metadata_path = root / "twinr_v2.metadata.json"
-            calls: list[tuple[Path, Path, Path, Path, object, int, str, int, int, str]] = []
+            calls: list[tuple[Path, Path, Path, Path, object, int, str, int, int, str, object, float, float, float]] = []
             fake_proactive_module = ModuleType("twinr.proactive")
             fake_wakeword_module = ModuleType("twinr.proactive.wakeword")
 
@@ -1393,6 +1407,10 @@ class MainCliTests(unittest.TestCase):
                 layer_dim,
                 steps,
                 feature_device,
+                difficulty_reference_model_path,
+                difficulty_positive_scale,
+                difficulty_negative_scale,
+                difficulty_power,
                 evaluation_config,
             ):
                 del evaluation_config
@@ -1408,6 +1426,10 @@ class MainCliTests(unittest.TestCase):
                         layer_dim,
                         steps,
                         feature_device,
+                        difficulty_reference_model_path,
+                        difficulty_positive_scale,
+                        difficulty_negative_scale,
+                        difficulty_power,
                     )
                 )
                 return SimpleNamespace(
@@ -1469,7 +1491,22 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             calls,
-            [(dataset_root, model_path, metadata_path, manifest_path, None, 3, "mlp", 256, 1234, "gpu")],
+            [(
+                dataset_root,
+                model_path,
+                metadata_path,
+                manifest_path,
+                None,
+                3,
+                "mlp",
+                256,
+                1234,
+                "gpu",
+                None,
+                0.0,
+                0.0,
+                2.0,
+            )],
         )
 
     def test_wakeword_training_plan_writes_markdown(self) -> None:
@@ -1526,6 +1563,70 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(calls, [root])
         self.assertEqual(rendered, "# fake wakeword training plan\n")
+
+    def test_wakeword_kws_provision_dispatches_to_wakeword_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
+            output_dir = root / "kws"
+            calls: list[tuple[Path, str, tuple[str, ...], bool]] = []
+            fake_proactive_module = ModuleType("twinr.proactive")
+            fake_wakeword_module = ModuleType("twinr.proactive.wakeword")
+
+            def _provision_bundle(*, output_dir, bundle_id, phrases, explicit_keywords, force):
+                del phrases
+                calls.append((Path(output_dir), bundle_id, tuple(explicit_keywords), force))
+                return SimpleNamespace(
+                    bundle_id=bundle_id,
+                    output_dir=Path(output_dir),
+                    keyword_names=tuple(explicit_keywords),
+                    tokens_path=Path(output_dir) / "tokens.txt",
+                    encoder_path=Path(output_dir) / "encoder.onnx",
+                    decoder_path=Path(output_dir) / "decoder.onnx",
+                    joiner_path=Path(output_dir) / "joiner.onnx",
+                    keywords_path=Path(output_dir) / "keywords.txt",
+                )
+
+            fake_proactive_module.wakeword = fake_wakeword_module
+            fake_wakeword_module.provision_builtin_kws_bundle = _provision_bundle
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.proactive": fake_proactive_module,
+                        "twinr.proactive.wakeword": fake_wakeword_module,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    sys.argv = [
+                        "twinr",
+                        "--env-file",
+                        str(env_path),
+                        "--wakeword-kws-provision",
+                        "--wakeword-kws-output-dir",
+                        str(output_dir),
+                        "--wakeword-kws-bundle",
+                        "gigaspeech_3_3m_bpe_int8",
+                        "--wakeword-kws-keyword",
+                        "Twinna",
+                        "--wakeword-kws-keyword",
+                        "Twinr",
+                        "--wakeword-kws-force",
+                    ]
+                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [(output_dir, "gigaspeech_3_3m_bpe_int8", ("Twinna", "Twinr"), True)],
+        )
 
     def test_wakeword_autotune_dispatches_to_proactive_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

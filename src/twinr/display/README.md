@@ -35,6 +35,10 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
 - allow optional external face-expression cues on HDMI so other Twinr
   capabilities can steer gaze, brows, mouth, or tiny head drift without
   coupling those semantics into the generic runtime snapshot schema
+- allow optional external HDMI emoji cues so other capabilities can claim the
+  otherwise free right-hand reserve area with one real Unicode symbol such as
+  `👍` or `👋` without pushing emoji-only semantics into the generic runtime
+  snapshot schema
 - allow optional external HDMI presentation cues so other capabilities can
   expand the default right-hand panel into a bounded fullscreen image or rich
   card without teaching the generic runtime snapshot schema about
@@ -56,6 +60,9 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
   bucketed/stable enough for e-paper refresh budgets
 - keep debug-log host metrics on operator thresholds rather than narrow raw
   buckets so ordinary Pi temperature drift does not cause visual churn
+- keep the senior-facing `System` card operational: routine warm CPU drift may
+  still appear in ops/debug metrics, but it must not flap the main status card
+  between `OK` and `Warm`
 - keep watchdog probe transitions, even during repeated ChonkyDB failures, and
   minor host-metric drift from retriggering debug-log rerenders every few
   seconds on the panel
@@ -111,6 +118,12 @@ caller, GPIO snapshots, and throttling state so the first live stall can be
 proven directly from `journalctl` without stopping Twinr for the standalone
 probe script.
 
+For HDMI emoji cues, the runtime expects a real system emoji font. On Ubuntu
+Pi images that means `fonts-noto-color-emoji`, which provides
+`/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf`. When the font is missing
+or unreadable, the framebuffer adapter now emits one bounded telemetry line
+such as `display_emoji_font=missing ...` instead of silently drawing nothing.
+
 For HDMI deployments on a Raspberry Pi desktop session, prefer:
 
 ```dotenv
@@ -140,28 +153,31 @@ TWINR_DISPLAY_COMPANION_ENABLED=false
 ```
 
 The default HDMI surface is intentionally much calmer than the operator
-`debug_log` view: solid black background, a slim top `TWINR` bar, an animated
-white-on-black face on the left that mirrors the familiar e-paper eye/mouth
-language, and one large status box on the right with English-only headline and
-key runtime fields. That headline should mirror the real runtime state
-directly, for example `Waiting`, `Listening`, `Thinking`, or `Speaking`,
-instead of restating generic readiness. On 800x480 the face should stay the
-visually dominant element, so the right-hand panel must not regrow until it
-crowds the face area. That keeps the senior-facing screen glanceable from a
+`debug_log` view: solid black background, a slim top bar with `TWINR` on the
+left, the live runtime state in the middle, and `TIME + SYSTEM` on the right,
+plus an animated white-on-black face on the left that mirrors the familiar
+e-paper eye/mouth language. The header state should mirror the real runtime
+state directly in uppercase, for example `WAITING`, `LISTENING`, `THINKING`,
+or `SPEAKING`, instead of restating generic readiness. The visible `SYSTEM`
+indicator in that header is intentionally binary and prominent: `OK` or
+`ERROR`. On 800x480 the face should stay the visually dominant element, and
+the area to its right should remain visibly free until a later capability
+deliberately claims it. That keeps the senior-facing screen glanceable from a
 distance while `debug_log` remains the explicit diagnostics layout for
 operators.
 
 On larger HDMI outputs such as 1920x1080, the same rule still applies: do not
-let the panel stretch just because more pixels are available. Keep the content
-centered, cap the right-hand panel width, and allow the face itself to scale
-up so the screen still reads as "face first, status second" instead of turning
-into one giant empty status card.
+let that free right-hand reserve turn into random chrome. Keep the content
+centered, preserve the slim header, and allow the face itself to scale up so
+the screen still reads as "face first, calm state header second" instead of
+turning into one giant empty status card.
 
 On the real 800x480 HDMI surface, that same hierarchy must still read clearly
-even when the bottom news ticker is active and the panel collapses into its
-compact summary form: keep the top bar visibly slim and the right-hand box
-materially narrower than the face region so the live screen does not regress
-back toward the earlier cramped composition.
+even when the bottom news ticker is active: keep the top bar visibly slim and
+leave the right-hand reserve area free of status-card chrome so the live
+screen does not regress back toward the earlier cramped composition. When a
+capability does claim that reserve area, prefer one real emoji cue with a soft
+halo over dense text or extra chrome so the surface stays readable at a glance.
 
 That waiting surface may also show very rare ambient moments: tiny sparkles,
 hearts, crescent moons, wave marks, curious dot clusters, or even a tiny crown
@@ -173,14 +189,16 @@ into a noisy novelty loop.
 For HDMI, eye animation should stay calmer than mouth or whole-face motion:
 prefer gaze shifts, subtle blinks, and tiny head drift over large eye-resize
 swings or inverse-color eyelid strokes that read like extra eyebrows on the
-black background.
+black background. When a directional external face cue is active, that cue
+should dominate the `waiting` face instead of being overpainted by the normal
+idle side-to-side churn.
 
 That senior-facing HDMI surface is now modeled as its own scene module instead
 of being inlined into the framebuffer adapter. `hdmi_default_scene.py` owns the
-default-scene layout, face animation, and status-card model so future HDMI
-capabilities such as expanded cards, morph transitions, or richer per-capability
-panels can be added without pushing presentation logic back into the transport
-backend.
+default-scene layout, face animation, header model, and reserved right-hand
+capability area so future HDMI capabilities such as expanded cards, morph
+transitions, or richer per-capability panels can be added without pushing
+presentation logic back into the transport backend.
 
 When proactive monitoring targets the XVF3800, the display service now reads
 the latest authoritative ReSpeaker ops facts and surfaces only calm status
@@ -397,6 +415,7 @@ The current default scene set covers:
 | [contracts.py](./contracts.py) | Shared adapter/payload contracts |
 | [factory.py](./factory.py) | Config-driven display backend selection |
 | [debug_log.py](./debug_log.py) | Build grouped operator log sections from ops/usage stores |
+| [emoji_cues.py](./emoji_cues.py) | Optional external HDMI emoji cue contract, store, and producer-facing controller |
 | [face_cues.py](./face_cues.py) | Optional external HDMI face-expression cue contract and store |
 | [face_expressions.py](./face_expressions.py) | Producer-facing combinable expression API for the HDMI face |
 | [heartbeat.py](./heartbeat.py) | Persist display forward-progress heartbeats and expose the shared companion-health contract for ops/supervision |

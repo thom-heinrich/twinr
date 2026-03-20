@@ -149,6 +149,25 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_attention_refresh_interval_s, 1.4)
         self.assertEqual(config.display_attention_session_focus_hold_s, 5.25)
 
+    def test_from_env_reads_display_emoji_cue_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_DISPLAY_EMOJI_CUE_PATH=state/custom/emoji.json",
+                        "TWINR_DISPLAY_EMOJI_CUE_TTL_S=9.5",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_emoji_cue_path, "state/custom/emoji.json")
+        self.assertEqual(config.display_emoji_cue_ttl_s, 9.5)
+
     def test_from_env_reads_display_presentation_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -1151,6 +1170,59 @@ class TwinrConfigTests(unittest.TestCase):
 
         self.assertEqual(config.wakeword_phrases, ("hallo twinr", "twinr"))
         self.assertEqual(config.wakeword_stt_phrases, ("hallo twinr", "hallo twin", "twinr", "twin"))
+
+    def test_from_env_reads_kws_wakeword_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            tokens = root / "tokens.txt"
+            encoder = root / "encoder.onnx"
+            decoder = root / "decoder.onnx"
+            joiner = root / "joiner.onnx"
+            keywords = root / "keywords.txt"
+            for path in (tokens, encoder, decoder, joiner, keywords):
+                path.write_text("x\n", encoding="utf-8")
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_WAKEWORD_BACKEND=kws",
+                        "TWINR_WAKEWORD_PRIMARY_BACKEND=kws",
+                        f"TWINR_WAKEWORD_KWS_TOKENS_PATH={tokens}",
+                        f"TWINR_WAKEWORD_KWS_ENCODER_PATH={encoder}",
+                        f"TWINR_WAKEWORD_KWS_DECODER_PATH={decoder}",
+                        f"TWINR_WAKEWORD_KWS_JOINER_PATH={joiner}",
+                        f"TWINR_WAKEWORD_KWS_KEYWORDS_FILE_PATH={keywords}",
+                        "TWINR_WAKEWORD_KWS_PROVIDER=cpu",
+                        "TWINR_WAKEWORD_KWS_NUM_THREADS=3",
+                        "TWINR_WAKEWORD_KWS_SAMPLE_RATE=16000",
+                        "TWINR_WAKEWORD_KWS_FEATURE_DIM=80",
+                        "TWINR_WAKEWORD_KWS_MAX_ACTIVE_PATHS=6",
+                        "TWINR_WAKEWORD_KWS_KEYWORDS_SCORE=1.4",
+                        "TWINR_WAKEWORD_KWS_KEYWORDS_THRESHOLD=0.31",
+                        "TWINR_WAKEWORD_KWS_NUM_TRAILING_BLANKS=2",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.wakeword_backend, "kws")
+        self.assertEqual(config.wakeword_primary_backend, "kws")
+        self.assertEqual(config.wakeword_kws_tokens_path, str(tokens))
+        self.assertEqual(config.wakeword_kws_encoder_path, str(encoder))
+        self.assertEqual(config.wakeword_kws_decoder_path, str(decoder))
+        self.assertEqual(config.wakeword_kws_joiner_path, str(joiner))
+        self.assertEqual(config.wakeword_kws_keywords_file_path, str(keywords))
+        self.assertEqual(config.wakeword_kws_provider, "cpu")
+        self.assertEqual(config.wakeword_kws_num_threads, 3)
+        self.assertEqual(config.wakeword_kws_sample_rate, 16000)
+        self.assertEqual(config.wakeword_kws_feature_dim, 80)
+        self.assertEqual(config.wakeword_kws_max_active_paths, 6)
+        self.assertEqual(config.wakeword_kws_keywords_score, 1.4)
+        self.assertEqual(config.wakeword_kws_keywords_threshold, 0.31)
+        self.assertEqual(config.wakeword_kws_num_trailing_blanks, 2)
 
     def test_from_env_defaults_to_bundled_openwakeword_model_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

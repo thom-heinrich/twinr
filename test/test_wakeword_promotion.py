@@ -46,6 +46,55 @@ def _model_factory(**kwargs):
     return FakeAdaptiveModel(wakeword_models=kwargs.get("wakeword_models", ("twinr",)))
 
 
+def _touch_kws_bundle(root: Path) -> dict[str, Path]:
+    bundle = {
+        "tokens": root / "tokens.txt",
+        "encoder": root / "encoder.onnx",
+        "decoder": root / "decoder.onnx",
+        "joiner": root / "joiner.onnx",
+        "keywords": root / "keywords.txt",
+    }
+    for path in bundle.values():
+        path.write_text("x\n", encoding="utf-8")
+    return bundle
+
+
+class FakeKeywordStream:
+    def __init__(self) -> None:
+        self.pending_results: list[str] = []
+
+    def accept_waveform(self, sample_rate, samples) -> None:
+        del sample_rate
+        peak = max((abs(float(sample)) for sample in samples), default=0.0)
+        if peak >= 0.2:
+            self.pending_results.append("twinna")
+
+    def input_finished(self) -> None:
+        return None
+
+
+class FakeKeywordSpotter:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = dict(kwargs)
+
+    def create_stream(self):
+        return FakeKeywordStream()
+
+    def is_ready(self, stream) -> bool:
+        return bool(stream.pending_results)
+
+    def decode_stream(self, stream) -> None:
+        return None
+
+    def get_result(self, stream) -> str:
+        if not stream.pending_results:
+            return ""
+        return stream.pending_results.pop(0)
+
+    def reset_stream(self, stream) -> None:
+        stream.pending_results.clear()
+
+
 class WakewordPromotionTests(unittest.TestCase):
     def test_run_wakeword_stream_eval_replays_runtime_stream_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -99,6 +148,59 @@ class WakewordPromotionTests(unittest.TestCase):
         self.assertGreater(report.total_audio_seconds, 1.9)
         self.assertIsNotNone(report.report_path)
         self.assertTrue(report_path_exists)
+
+    def test_run_wakeword_stream_eval_supports_kws_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            positive = root / "wakeword_positive.wav"
+            negative = root / "wakeword_negative.wav"
+            manifest = root / "manifest.json"
+            bundle = _touch_kws_bundle(root)
+            _write_wav(positive, amplitude=16000)
+            _write_wav(negative, amplitude=100)
+            manifest.write_text(
+                json.dumps(
+                    [
+                        {"captured_audio_path": str(positive), "label": "correct"},
+                        {"captured_audio_path": str(negative), "label": "false_positive"},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = TwinrConfig(
+                project_root=temp_dir,
+                wakeword_enabled=True,
+                wakeword_primary_backend="kws",
+                wakeword_fallback_backend="stt",
+                wakeword_verifier_mode="disabled",
+                wakeword_phrases=("twinna",),
+                wakeword_kws_tokens_path=str(bundle["tokens"]),
+                wakeword_kws_encoder_path=str(bundle["encoder"]),
+                wakeword_kws_decoder_path=str(bundle["decoder"]),
+                wakeword_kws_joiner_path=str(bundle["joiner"]),
+                wakeword_kws_keywords_file_path=str(bundle["keywords"]),
+                wakeword_kws_sample_rate=16000,
+                wakeword_kws_keywords_threshold=0.25,
+                audio_sample_rate=16000,
+                audio_channels=1,
+                audio_speech_threshold=400,
+                wakeword_attempt_cooldown_s=10.0,
+            )
+
+            report = run_wakeword_stream_eval(
+                config=config,
+                manifest_path=manifest,
+                backend=None,
+                model_factory=lambda **_kwargs: FakeKeywordSpotter(),
+            )
+
+        self.assertEqual(report.evaluated_entries, 2)
+        self.assertEqual(report.metrics.true_positive, 1)
+        self.assertEqual(report.metrics.true_negative, 1)
+        self.assertEqual(report.metrics.false_positive, 0)
+        self.assertEqual(report.metrics.false_negative, 0)
+        self.assertEqual(report.accepted_detection_count, 1)
 
     def test_load_wakeword_promotion_spec_resolves_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

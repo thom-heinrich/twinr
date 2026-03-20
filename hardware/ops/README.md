@@ -28,10 +28,9 @@ Pi-side operating-system service definitions plus leading-repo mirror helpers.
 
 The runtime supervisor intentionally runs as `root` so the productive
 streaming loop keeps access to GPIO devices on deployed hosts. The dedicated
-remote-memory watchdog runs as `thh`, and the local runtime/memory snapshot
-writers therefore keep their on-disk JSON or text snapshots world-readable
-(`0644`) so the watchdog can verify them without taking ownership away from
-the runtime.
+remote-memory watchdog also runs as `root` now, so both units share one
+runtime-state ownership model and do not flap on root-vs-user lock files
+inside `/twinr/state/` or `/twinr/state/chonkydb/`.
 
 Retired standalone break-glass units are no longer tracked here. The dedicated
 remote-memory watchdog service is not break-glass; it is the productive owner
@@ -40,6 +39,9 @@ an operator wants to keep local copies of older units around during cleanup,
 they belong under the ignored top-level `__legacy__/hardware/ops/` folder.
 
 ## Install
+
+These units are Pi-only. Do not install them on development laptops or other
+non-Pi hosts, even if those machines also have a `/twinr` checkout.
 
 ```bash
 sudo systemctl disable --now twinr-streaming-loop.service twinr-display-loop.service || true

@@ -51,6 +51,11 @@ _DEFAULT_LOCAL_SNAPSHOT_MAX_BYTES = 8_388_608
 _DEFAULT_CIRCUIT_BREAKER_COOLDOWN_S = 15.0
 _DEFAULT_ORIGIN_RESOLUTION_BOOTSTRAP_TIMEOUT_S = 20.0
 _DEFAULT_ORIGIN_RESOLUTION_BOOTSTRAP_TIMEOUT_CAP_S = 30.0
+_DEFAULT_STATUS_PROBE_TIMEOUT_S = 20.0
+_DEFAULT_STATUS_PROBE_TIMEOUT_CAP_S = 45.0
+_DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_S = 20.0
+_DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S = 45.0
+_DEFAULT_ASYNC_ATTESTATION_POLL_S = 0.05
 _MAX_NAMESPACE_LENGTH = 255
 _MAX_SNAPSHOT_KIND_LENGTH = 255
 _MAX_DOCUMENT_HINTS_BYTES = 262_144
@@ -490,7 +495,7 @@ class LongTermRemoteStateStore:
         if self.read_client is None or self.write_client is None:
             return LongTermRemoteStatus(mode="remote_primary", ready=False, detail="ChonkyDB is not configured.")
         try:
-            instance = self.read_client.instance()
+            instance = self._status_probe_client(self.read_client).instance()
         except Exception as exc:  # AUDIT-FIX(#5): Normalize all client-boundary failures instead of leaking unexpected exceptions.
             self._note_remote_failure()
             _LOGGER.warning("ChonkyDB health check failed: %s", self._safe_exception_text(exc))
@@ -709,20 +714,21 @@ class LongTermRemoteStateStore:
                 if retry_backoff_s > 0:
                     time.sleep(retry_backoff_s)
                 continue
-            if not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
-                attested_probe = self._attest_saved_snapshot_readback(
-                    read_client,
-                    snapshot_kind=normalized_snapshot_kind,
-                    payload=payload_dict,
-                    document_id=document_id,
-                )
-                if attested_probe.payload is not None:
-                    document_id = attested_probe.document_id or document_id
-                    attested_payload = dict(attested_probe.payload)
-                    attested_source = attested_probe.selected_source or "saved_snapshot_attested"
-                    break
+            break
+        if not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
+            attested_probe = self._attest_saved_snapshot_readback(
+                read_client,
+                snapshot_kind=normalized_snapshot_kind,
+                payload=payload_dict,
+                document_id=document_id,
+            )
+            if attested_probe.payload is not None:
+                document_id = attested_probe.document_id or document_id
+                attested_payload = dict(attested_probe.payload)
+                attested_source = attested_probe.selected_source or "saved_snapshot_attested"
+            else:
                 self._forget_snapshot_document_id(snapshot_kind=normalized_snapshot_kind)
-                if attempt + 1 >= retry_attempts:
+                if document_id is None:
                     raise LongTermRemoteUnavailableError(
                         attested_probe.detail
                         or (
@@ -730,10 +736,44 @@ class LongTermRemoteStateStore:
                             "read back after write attestation."
                         )
                     )
-                if retry_backoff_s > 0:
-                    time.sleep(retry_backoff_s)
-                continue
-            break
+                if retry_attempts <= 1:
+                    raise LongTermRemoteUnavailableError(
+                        attested_probe.detail
+                        or (
+                            f"Remote long-term snapshot {normalized_snapshot_kind!r} could not be "
+                            "read back after write attestation."
+                        )
+                    )
+                for retry_attempt in range(1, retry_attempts):
+                    if retry_backoff_s > 0:
+                        time.sleep(retry_backoff_s)
+                    document_id = self._store_snapshot_record(
+                        write_client,
+                        snapshot_kind=normalized_snapshot_kind,
+                        payload=payload_dict,
+                        attempts=1,
+                        backoff_s=0.0,
+                    )
+                    attested_probe = self._attest_saved_snapshot_readback(
+                        read_client,
+                        snapshot_kind=normalized_snapshot_kind,
+                        payload=payload_dict,
+                        document_id=document_id,
+                    )
+                    if attested_probe.payload is not None:
+                        document_id = attested_probe.document_id or document_id
+                        attested_payload = dict(attested_probe.payload)
+                        attested_source = attested_probe.selected_source or "saved_snapshot_attested"
+                        break
+                    self._forget_snapshot_document_id(snapshot_kind=normalized_snapshot_kind)
+                    if retry_attempt + 1 >= retry_attempts:
+                        raise LongTermRemoteUnavailableError(
+                            attested_probe.detail
+                            or (
+                                f"Remote long-term snapshot {normalized_snapshot_kind!r} could not be "
+                                "read back after write attestation."
+                            )
+                        )
         if document_id and not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
             self._save_snapshot_pointer_with_attestation(
                 write_client,
@@ -1394,42 +1434,26 @@ class LongTermRemoteStateStore:
         payload: Mapping[str, object],
         document_id: str | None,
     ) -> LongTermRemoteSnapshotProbe:
-        """Verify one just-written snapshot is immediately readable and parseable."""
+        """Verify one accepted snapshot write resolves to the expected payload.
+
+        Async ChonkyDB writes may acknowledge before the corresponding
+        ``origin_uri`` read exposes the new head. When the write response did not
+        return a stable ``document_id``, poll readback instead of resubmitting the
+        same snapshot under the same URI, because duplicate writes only amplify the
+        append-only same-URI history that produced the stale read in the first
+        place.
+        """
 
         expected_payload = dict(payload)
-        source = "saved_document" if document_id else "saved_origin_uri"
-        result = self._load_snapshot_via_uri(
+        return self._attest_expected_snapshot_readback(
             read_client,
             snapshot_kind=snapshot_kind,
+            expected_payload=expected_payload,
             document_id=document_id,
-            source=source,
-            retry_not_found=document_id is None,
-        )
-        if result.payload == expected_payload:
-            return LongTermRemoteSnapshotProbe(
-                snapshot_kind=snapshot_kind,
-                status="found",
-                latency_ms=result.latency_ms,
-                detail=result.detail,
-                document_id=result.document_id or document_id,
-                selected_source=result.selected_source,
-                payload=dict(result.payload or expected_payload),
-                attempts=result.attempts,
-            )
-        detail = (
-            result.detail
-            or (
+            source="saved_document" if document_id else "saved_origin_uri",
+            mismatch_detail=(
                 f"Remote long-term snapshot {snapshot_kind!r} readback did not match the just-written payload."
-            )
-        )
-        return LongTermRemoteSnapshotProbe(
-            snapshot_kind=snapshot_kind,
-            status="unavailable",
-            latency_ms=result.latency_ms,
-            detail=detail,
-            document_id=result.document_id or document_id,
-            selected_source=result.selected_source,
-            attempts=result.attempts,
+            ),
         )
 
     def _attest_saved_pointer_readback(
@@ -1438,8 +1462,9 @@ class LongTermRemoteStateStore:
         *,
         snapshot_kind: str,
         document_id: str,
+        pointer_document_id: str | None = None,
     ) -> LongTermRemoteSnapshotProbe:
-        """Verify one just-written pointer snapshot is immediately readable."""
+        """Verify one accepted pointer write resolves to the expected payload."""
 
         pointer_snapshot_kind = self._pointer_snapshot_kind(snapshot_kind)
         expected_payload = {
@@ -1448,38 +1473,86 @@ class LongTermRemoteStateStore:
             "snapshot_kind": snapshot_kind,
             "document_id": document_id,
         }
-        result = self._load_snapshot_via_uri(
+        return self._attest_expected_snapshot_readback(
             read_client,
             snapshot_kind=pointer_snapshot_kind,
-            source="saved_pointer",
-            retry_not_found=True,
-        )
-        if result.payload == expected_payload:
-            return LongTermRemoteSnapshotProbe(
-                snapshot_kind=pointer_snapshot_kind,
-                status="found",
-                latency_ms=result.latency_ms,
-                detail=result.detail,
-                document_id=result.document_id,
-                selected_source=result.selected_source,
-                payload=dict(result.payload or expected_payload),
-                attempts=result.attempts,
-            )
-        detail = (
-            result.detail
-            or (
+            expected_payload=expected_payload,
+            document_id=pointer_document_id,
+            source="saved_pointer_document" if pointer_document_id else "saved_pointer",
+            mismatch_detail=(
                 f"Remote long-term snapshot pointer {snapshot_kind!r} could not be "
                 "read back after write attestation."
-            )
+            ),
         )
+
+    def _attest_expected_snapshot_readback(
+        self,
+        read_client: ChonkyDBClient,
+        *,
+        snapshot_kind: str,
+        expected_payload: Mapping[str, object],
+        document_id: str | None,
+        source: str,
+        mismatch_detail: str,
+    ) -> LongTermRemoteSnapshotProbe:
+        """Poll one just-written snapshot until the expected payload is visible.
+
+        Exact-document reads are deterministic and therefore checked once. When the
+        write acknowledgement did not return a ``document_id``, Twinr must resolve
+        by ``origin_uri`` and tolerate bounded propagation lag or a temporarily
+        stale same-URI head before concluding the write is unreadable.
+        """
+
+        started = time.monotonic()
+        attempt_records: list[LongTermRemoteFetchAttempt] = []
+        resolved_attempts = 1 if document_id else self._retry_attempts()
+        backoff_s = 0.0 if document_id else self._retry_backoff_s()
+        last_result = _RemoteSnapshotFetchResult(status="not_found", selected_source=source)
+        expected_payload_dict = dict(expected_payload)
+        poll_interval_s = 0.0
+        if document_id is None:
+            poll_interval_s = max(self._retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
+            visibility_timeout_s = self._async_attestation_visibility_timeout_s()
+            resolved_attempts = max(
+                resolved_attempts,
+                int(math.ceil(visibility_timeout_s / poll_interval_s)),
+            )
+        for attempt in range(resolved_attempts):
+            result = self._load_snapshot_via_uri(
+                read_client,
+                snapshot_kind=snapshot_kind,
+                document_id=document_id,
+                source=source,
+                retry_not_found=False,
+            )
+            attempt_records.extend(result.attempts)
+            last_result = result
+            if result.payload == expected_payload_dict:
+                return LongTermRemoteSnapshotProbe(
+                    snapshot_kind=snapshot_kind,
+                    status="found",
+                    latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
+                    detail=result.detail,
+                    document_id=result.document_id or document_id,
+                    selected_source=result.selected_source,
+                    payload=dict(result.payload or expected_payload_dict),
+                    attempts=tuple(attempt_records),
+                )
+            if document_id is not None or result.status == "unavailable":
+                break
+            if attempt + 1 >= resolved_attempts:
+                break
+            if poll_interval_s > 0:
+                time.sleep(poll_interval_s)
+        detail = last_result.detail or mismatch_detail
         return LongTermRemoteSnapshotProbe(
-            snapshot_kind=pointer_snapshot_kind,
+            snapshot_kind=snapshot_kind,
             status="unavailable",
-            latency_ms=result.latency_ms,
+            latency_ms=round(max(0.0, (time.monotonic() - started) * 1000.0), 3),
             detail=detail,
-            document_id=result.document_id,
-            selected_source=result.selected_source,
-            attempts=result.attempts,
+            document_id=last_result.document_id or document_id,
+            selected_source=last_result.selected_source,
+            attempts=tuple(attempt_records),
         )
 
     def _save_snapshot_pointer_with_attestation(
@@ -1495,7 +1568,7 @@ class LongTermRemoteStateStore:
         retry_attempts = self._retry_attempts()
         retry_backoff_s = self._retry_backoff_s()
         for attempt in range(retry_attempts):
-            self._save_snapshot_pointer(
+            pointer_document_id = self._save_snapshot_pointer(
                 write_client,
                 snapshot_kind=snapshot_kind,
                 document_id=document_id,
@@ -1504,10 +1577,11 @@ class LongTermRemoteStateStore:
                 read_client,
                 snapshot_kind=snapshot_kind,
                 document_id=document_id,
+                pointer_document_id=pointer_document_id,
             )
             if attested_probe.payload is not None:
                 return
-            if attempt + 1 >= retry_attempts:
+            if pointer_document_id is None or attempt + 1 >= retry_attempts:
                 raise LongTermRemoteUnavailableError(
                     attested_probe.detail
                     or (
@@ -1524,14 +1598,16 @@ class LongTermRemoteStateStore:
         *,
         snapshot_kind: str,
         document_id: str,
-    ) -> None:
+    ) -> str | None:
+        """Persist one pointer snapshot and return the exact document id when known."""
+
         pointer_payload = {
             "schema": _SNAPSHOT_POINTER_SCHEMA,
             "version": _SNAPSHOT_POINTER_VERSION,
             "snapshot_kind": snapshot_kind,
             "document_id": document_id,
         }
-        self._store_snapshot_record(
+        return self._store_snapshot_record(
             write_client,
             snapshot_kind=self._pointer_snapshot_kind(snapshot_kind),
             payload=pointer_payload,
@@ -1781,6 +1857,74 @@ class LongTermRemoteStateStore:
         if float(client.config.timeout_s) >= target_timeout_s:
             return client
         return client.clone_with_timeout(target_timeout_s)
+
+    def _async_attestation_visibility_timeout_s(self) -> float:
+        """Return the bounded visibility window for async same-URI readback.
+
+        Accepted async writes may need a few extra polling rounds before the new
+        `origin_uri` head becomes visible under shared server load. Twinr should
+        wait within one bounded visibility budget instead of re-submitting the
+        same write and growing same-URI history.
+        """
+
+        read_timeout_s = _coerce_timeout_s(
+            getattr(self.config, "long_term_memory_remote_read_timeout_s", _DEFAULT_REMOTE_READ_TIMEOUT_S),
+            default=_DEFAULT_REMOTE_READ_TIMEOUT_S,
+        )
+        write_timeout_s = _coerce_timeout_s(
+            getattr(self.config, "long_term_memory_remote_write_timeout_s", _DEFAULT_REMOTE_WRITE_TIMEOUT_S),
+            default=_DEFAULT_REMOTE_WRITE_TIMEOUT_S,
+        )
+        candidate = max(
+            _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_S,
+            self._status_probe_timeout_s(),
+            read_timeout_s,
+            min(write_timeout_s * 2.0, _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S),
+        )
+        return _coerce_float(
+            candidate,
+            default=_DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_S,
+            minimum=_DEFAULT_ASYNC_ATTESTATION_POLL_S,
+            maximum=_DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S,
+        )
+
+    def _status_probe_client(self, client: ChonkyDBClient) -> ChonkyDBClient:
+        """Return one client tuned for fail-closed remote health probes.
+
+        Health and readiness probes guard Twinr startup and fresh-reader
+        attestation. They are not on the hot retrieval path and can therefore
+        tolerate a bounded longer timeout than ordinary snapshot reads, which
+        avoids classifying a loaded-but-live backend as down under shared
+        server load.
+        """
+
+        target_timeout_s = self._status_probe_timeout_s()
+        if float(client.config.timeout_s) >= target_timeout_s:
+            return client
+        return client.clone_with_timeout(target_timeout_s)
+
+    def _status_probe_timeout_s(self) -> float:
+        """Return the bounded timeout used for remote health and readiness probes."""
+
+        read_timeout_s = _coerce_timeout_s(
+            getattr(self.config, "long_term_memory_remote_read_timeout_s", _DEFAULT_REMOTE_READ_TIMEOUT_S),
+            default=_DEFAULT_REMOTE_READ_TIMEOUT_S,
+        )
+        chonky_timeout_s = _coerce_timeout_s(
+            getattr(self.config, "chonkydb_timeout_s", _DEFAULT_STATUS_PROBE_TIMEOUT_S),
+            default=_DEFAULT_STATUS_PROBE_TIMEOUT_S,
+        )
+        candidate = max(
+            _DEFAULT_STATUS_PROBE_TIMEOUT_S,
+            read_timeout_s * 2.0,
+            chonky_timeout_s,
+        )
+        return _coerce_float(
+            candidate,
+            default=_DEFAULT_STATUS_PROBE_TIMEOUT_S,
+            minimum=read_timeout_s,
+            maximum=_DEFAULT_STATUS_PROBE_TIMEOUT_CAP_S,
+        )
 
     def _origin_resolution_bootstrap_timeout_s(self) -> float:
         """Return the bounded timeout used for cold current-head resolution."""

@@ -3,10 +3,11 @@ name: wakeword
 path: src/twinr/proactive/wakeword
 kind: python-package
 visibility: internal
-summary: Provide wakeword matching, openWakeWord spotting, optional local verifier support, sequence-aware cascade verification, verification policy, calibration profiles, streaming detection, runtime-faithful promotion replay, and offline evaluation/training helpers for proactive runtime.
+summary: Provide wakeword matching, local KWS/openWakeWord spotting, optional local verifier support, sequence-aware cascade verification, verification policy, calibration profiles, streaming detection, runtime-faithful promotion replay, and offline evaluation/training helpers for proactive runtime.
 owned_concerns:
   - Normalize wakeword transcripts, configured phrases, and detector labels
-  - Run local openWakeWord clip and frame spotting plus optional local verifier, sequence-aware cascade verification, and STT verification
+  - Run local openWakeWord or sherpa-onnx KWS clip and frame spotting plus optional local verifier, sequence-aware cascade verification, and STT verification
+  - Provision official sherpa-onnx KWS bundle assets and generate Twinr keyword files reproducibly from the leading repo
   - Persist and apply per-device wakeword calibration overrides
   - Replay labeled captures for evaluation, operator labeling, verifier training, autotune recommendations, post-training acceptance checks, and runtime-faithful promotion guards
   - Train reproducible Twinr base models from generated wakeword datasets and export local ONNX assets
@@ -34,11 +35,14 @@ files:
       - WakewordEvalEntry
       - WakewordEvalMetrics
       - WakewordEvalReport
+      - WakewordKwsAssetBundle
       - WakewordVerifierTrainingReport
       - WakewordMatch
       - WakewordOpenWakeWordFrameSpotter
       - WakewordOpenWakeWordSpotter
       - WakewordPhraseSpotter
+      - WakewordSherpaOnnxFrameSpotter
+      - WakewordSherpaOnnxSpotter
       - WakewordSequenceCaptureVerifier
       - WakewordSequenceVerifier
       - WakewordSequenceVerifierTrainingReport
@@ -76,6 +80,20 @@ files:
       - normalize_detector_label
       - phrase_from_detector_label
       - wakeword_primary_prompt
+  - path: kws.py
+    role: sherpa-onnx KWS asset validation plus clip and frame spotters
+    exports:
+      - WakewordKwsAssetBundle
+      - WakewordSherpaOnnxFrameSpotter
+      - WakewordSherpaOnnxSpotter
+  - path: kws_assets.py
+    role: Official sherpa-onnx bundle provisioning and Twinr keyword generation
+    exports:
+      - ProvisionedWakewordKwsBundle
+      - WakewordKwsProvisionSpec
+      - available_builtin_kws_bundle_specs
+      - derive_kws_keyword_names
+      - provision_builtin_kws_bundle
   - path: spotter.py
     role: openWakeWord clip and frame spotters
     exports:
@@ -161,6 +179,9 @@ public_api:
     - WakewordEvalEntry
     - WakewordEvalMetrics
     - WakewordEvalReport
+    - WakewordKwsAssetBundle
+    - ProvisionedWakewordKwsBundle
+    - WakewordKwsProvisionSpec
     - WakewordVerifierTrainingReport
     - WakewordMatch
     - WakewordOpenWakeWordFrameSpotter
@@ -173,6 +194,8 @@ public_api:
     - WakewordSequenceCaptureVerifier
     - WakewordSequenceVerifier
     - WakewordSequenceVerifierTrainingReport
+    - WakewordSherpaOnnxFrameSpotter
+    - WakewordSherpaOnnxSpotter
     - WakewordStreamEvalReport
     - WakewordStreamDetection
     - WakewordTrainingCommand
@@ -182,7 +205,9 @@ public_api:
     - append_wakeword_capture_label
     - apply_wakeword_calibration
     - autotune_wakeword_profile
+    - available_builtin_kws_bundle_specs
     - build_default_wakeword_training_plan
+    - derive_kws_keyword_names
     - evaluate_wakeword_stream_entries
     - load_eval_manifest
     - load_wakeword_promotion_spec
@@ -196,6 +221,7 @@ public_api:
     - run_wakeword_promotion_eval
     - run_wakeword_eval
     - run_wakeword_stream_eval
+    - provision_builtin_kws_bundle
     - train_wakeword_base_model_from_dataset_root
     - train_wakeword_custom_verifier_from_manifest
     - train_wakeword_sequence_verifier_from_manifest
@@ -218,6 +244,7 @@ compatibility_reexports:
       - WakewordEvalEntry
       - WakewordEvalMetrics
       - WakewordEvalReport
+      - WakewordKwsAssetBundle
       - WakewordVerifierTrainingReport
       - WakewordMatch
       - WakewordOpenWakeWordFrameSpotter
@@ -230,6 +257,8 @@ compatibility_reexports:
       - WakewordSequenceCaptureVerifier
       - WakewordSequenceVerifier
       - WakewordSequenceVerifierTrainingReport
+      - WakewordSherpaOnnxFrameSpotter
+      - WakewordSherpaOnnxSpotter
       - WakewordStreamEvalReport
       - WakewordStreamDetection
       - WakewordTrainingCommand
@@ -263,6 +292,7 @@ primary_callers:
   - path: src/twinr/proactive/__init__.py
 tests:
   - path: test/test_wakeword.py
+  - path: test/test_wakeword_kws.py
   - path: test/test_wakeword_policy.py
   - path: test/test_wakeword_eval.py
   - path: test/test_wakeword_training.py

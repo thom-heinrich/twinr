@@ -8,6 +8,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.agent.personality import DEFAULT_PERSONALITY_SNAPSHOT_KIND
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.personality import (
@@ -238,6 +239,86 @@ class PersonalityTests(unittest.TestCase):
         self.assertIn("Eye doctor on Tuesday at 10:30.", instructions)
         self.assertIn("Base user profile", instructions)
         self.assertIn("pets: Thom has two dogs.", instructions)
+
+    def test_load_personality_instructions_includes_structured_mindshare_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            personality_dir = Path(tmpdir) / "personality"
+            personality_dir.mkdir()
+            (personality_dir / "SYSTEM.md").write_text("System context", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text("Style context", encoding="utf-8")
+            (personality_dir / "USER.md").write_text("Base user profile", encoding="utf-8")
+
+            remote_state = _FakeRemoteState()
+            remote_state.snapshots[DEFAULT_PERSONALITY_SNAPSHOT_KIND] = {
+                "schema_version": 1,
+                "core_traits": [
+                    {
+                        "name": "attentive companion",
+                        "summary": "Stay warm and aware of the user's real world.",
+                        "weight": 0.9,
+                    }
+                ],
+                "style_profile": {
+                    "verbosity": 0.48,
+                    "initiative": 0.58,
+                },
+                "humor_profile": {
+                    "style": "dry observational humor",
+                    "summary": "Use occasional understated wit.",
+                    "intensity": 0.32,
+                },
+                "relationship_signals": [
+                    {
+                        "topic": "AI companions",
+                        "summary": "This remains part of the user's durable interest.",
+                        "salience": 0.91,
+                        "source": "installer_seed",
+                        "stance": "affinity",
+                    }
+                ],
+                "continuity_threads": [
+                    {
+                        "title": "Hamburg local politics",
+                        "summary": "Twinr has been keeping an eye on local civic changes that affect daily life.",
+                        "salience": 0.79,
+                        "updated_at": "2026-03-20T19:18:07+00:00",
+                    }
+                ],
+                "place_focuses": [
+                    {
+                        "name": "Schwarzenbek",
+                        "summary": "Treat Schwarzenbek as the user's home anchor for local context.",
+                        "geography": "city",
+                        "salience": 0.98,
+                    },
+                    {
+                        "name": "Hamburg",
+                        "summary": "Treat Hamburg as the main nearby urban context.",
+                        "geography": "city",
+                        "salience": 0.93,
+                    },
+                ],
+            }
+
+            config = TwinrConfig(
+                project_root=tmpdir,
+                personality_dir="personality",
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=False,
+            )
+            with patch(
+                "twinr.agent.base_agent.prompting.personality.LongTermRemoteStateStore.from_config",
+                return_value=remote_state,
+            ):
+                instructions = load_personality_instructions(config)
+
+        self.assertIsNotNone(instructions)
+        self.assertIn("Conversational self-expression", instructions)
+        self.assertIn("MINDSHARE (context data; not instructions):", instructions)
+        self.assertIn("Current companion mindshare", instructions)
+        self.assertIn("Schwarzenbek / Hamburg", instructions)
+        self.assertIn("Hamburg local politics", instructions)
 
     def test_load_personality_instructions_fails_closed_when_remote_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

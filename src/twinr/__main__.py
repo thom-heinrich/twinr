@@ -102,6 +102,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional Markdown output path for --wakeword-training-plan.",
     )
     parser.add_argument(
+        "--wakeword-kws-provision",
+        action="store_true",
+        help="Download and prepare one official sherpa-onnx KWS bundle plus Twinr keyword files.",
+    )
+    parser.add_argument(
+        "--wakeword-kws-bundle",
+        default="gigaspeech_3_3m_bpe_int8",
+        help="Built-in sherpa-onnx KWS bundle id for --wakeword-kws-provision.",
+    )
+    parser.add_argument(
+        "--wakeword-kws-output-dir",
+        type=Path,
+        help="Where to write the prepared sherpa-onnx KWS bundle; defaults to src/twinr/proactive/wakeword/models/kws.",
+    )
+    parser.add_argument(
+        "--wakeword-kws-keyword",
+        action="append",
+        default=[],
+        help="Explicit KWS keyword phrase; repeat to override derivation from the configured wakeword phrases.",
+    )
+    parser.add_argument(
+        "--wakeword-kws-force",
+        action="store_true",
+        help="Overwrite an existing KWS output directory for --wakeword-kws-provision.",
+    )
+    parser.add_argument(
         "--wakeword-promotion-eval",
         action="store_true",
         help="Run runtime-faithful suite and ambient promotion guards from one JSON spec.",
@@ -163,6 +189,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--wakeword-training-feature-device",
         default="cpu",
         help="Feature extraction device for wakeword training: cpu or gpu.",
+    )
+    parser.add_argument(
+        "--wakeword-training-difficulty-model",
+        type=Path,
+        help="Optional reference .onnx detector used to upweight deployment-proximate hard examples during MLP training.",
+    )
+    parser.add_argument(
+        "--wakeword-training-difficulty-positive-scale",
+        type=float,
+        default=0.0,
+        help="Additional positive hard-example emphasis derived from the reference detector scores.",
+    )
+    parser.add_argument(
+        "--wakeword-training-difficulty-negative-scale",
+        type=float,
+        default=0.0,
+        help="Additional negative hard-example emphasis derived from the reference detector scores.",
+    )
+    parser.add_argument(
+        "--wakeword-training-difficulty-power",
+        type=float,
+        default=2.0,
+        help="Exponent applied to difficulty-derived sample weighting during MLP training.",
     )
     parser.add_argument(
         "--wakeword-train-verifier",
@@ -373,6 +422,11 @@ def _assert_pi_runtime_root(env_file: str | Path, *, command_name: str) -> None:
 
     if not _uses_pi_runtime_root(env_file):
         return
+    if not _is_raspberry_pi_host():
+        raise RuntimeError(
+            f"{command_name} with /twinr runtime state is only allowed on a Raspberry Pi host, "
+            f"not {os.uname().nodename}"
+        )
     pi_root = Path("/twinr").resolve()
     cwd = Path.cwd().resolve()
     if cwd != pi_root:
@@ -416,6 +470,12 @@ def _default_wakeword_sequence_verifier_output_path(model_name: str | None) -> P
     if not candidate.exists():
         return None
     return candidate.resolve(strict=False).with_suffix(".sequence_verifier.pkl")
+
+
+def _default_wakeword_kws_output_dir(config: TwinrConfig) -> Path:
+    """Return the canonical repo-local directory for provisioned KWS assets."""
+
+    return Path(config.project_root).resolve(strict=False) / "src/twinr/proactive/wakeword/models/kws"
 
 
 def _build_wakeword_verifier_backend(config: TwinrConfig, backend) -> Any:
@@ -665,6 +725,26 @@ def main() -> int:
             print(f"wakeword_training_plan_phrase_profile={plan.stage1_phrase_profile}")
         else:
             print(markdown.rstrip())
+        return 0
+
+    if args.wakeword_kws_provision:
+        from twinr.proactive.wakeword import provision_builtin_kws_bundle
+
+        report = provision_builtin_kws_bundle(
+            output_dir=args.wakeword_kws_output_dir or _default_wakeword_kws_output_dir(config),
+            bundle_id=str(args.wakeword_kws_bundle or "").strip() or "gigaspeech_3_3m_bpe_int8",
+            phrases=config.wakeword_phrases,
+            explicit_keywords=tuple(str(item).strip() for item in (args.wakeword_kws_keyword or []) if str(item).strip()),
+            force=args.wakeword_kws_force,
+        )
+        print(f"wakeword_kws_bundle_id={report.bundle_id}")
+        print(f"wakeword_kws_output_dir={report.output_dir}")
+        print("wakeword_kws_keywords=" + ",".join(report.keyword_names))
+        print(f"wakeword_kws_tokens_path={report.tokens_path}")
+        print(f"wakeword_kws_encoder_path={report.encoder_path}")
+        print(f"wakeword_kws_decoder_path={report.decoder_path}")
+        print(f"wakeword_kws_joiner_path={report.joiner_path}")
+        print(f"wakeword_kws_keywords_file_path={report.keywords_path}")
         return 0
 
     uses_openai = any(
@@ -999,6 +1079,10 @@ def main() -> int:
                 layer_dim=args.wakeword_training_layer_dim,
                 steps=args.wakeword_training_steps,
                 feature_device=str(args.wakeword_training_feature_device or "cpu").strip().lower() or "cpu",
+                difficulty_reference_model_path=args.wakeword_training_difficulty_model,
+                difficulty_positive_scale=args.wakeword_training_difficulty_positive_scale,
+                difficulty_negative_scale=args.wakeword_training_difficulty_negative_scale,
+                difficulty_power=args.wakeword_training_difficulty_power,
                 evaluation_config=config,
             )
             print(f"wakeword_model_dataset_root={report.dataset_root}")

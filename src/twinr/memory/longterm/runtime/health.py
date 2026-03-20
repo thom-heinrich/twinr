@@ -90,8 +90,15 @@ class LongTermRemoteHealthProbe:
     graph_store: TwinrPersonalGraphStore
     midterm_store: LongTermMidtermStore
 
-    def probe_operational(self) -> LongTermRemoteWarmResult:
-        """Return structured per-snapshot readiness evidence without raising."""
+    def probe_operational(self, *, include_archive: bool = True) -> LongTermRemoteWarmResult:
+        """Return structured per-snapshot readiness evidence without raising.
+
+        Args:
+            include_archive: When false, skip the archival object snapshot
+                during steady-state watchdog probes so the hot keepalive path
+                proves live current-state readability without revalidating the
+                heavier archive lane every cycle.
+        """
 
         checked: list[str] = []
         checks: list[LongTermRemoteWarmCheck] = []
@@ -144,15 +151,16 @@ class LongTermRemoteHealthProbe:
             )
             if not result.ready:
                 return result
-            result = self._probe_snapshot(
-                store="object_store",
-                remote_state=object_remote_state,
-                snapshot_kind="archive",
-                checked=checked,
-                checks=checks,
-            )
-            if not result.ready:
-                return result
+            if include_archive:
+                result = self._probe_snapshot(
+                    store="object_store",
+                    remote_state=object_remote_state,
+                    snapshot_kind="archive",
+                    checked=checked,
+                    checks=checks,
+                )
+                if not result.ready:
+                    return result
 
             graph_remote_state = self._require_remote_state(self.graph_store.remote_state)
             result = self._probe_snapshot(
@@ -189,7 +197,7 @@ class LongTermRemoteHealthProbe:
             checks=tuple(checks),
         )
 
-    def ensure_operational(self) -> LongTermRemoteWarmResult:
+    def ensure_operational(self, *, include_archive: bool = True) -> LongTermRemoteWarmResult:
         """Load every required remote snapshot and shard once.
 
         Returns:
@@ -200,7 +208,7 @@ class LongTermRemoteHealthProbe:
                 snapshot, or shard is missing or unreadable.
         """
 
-        result = self.probe_operational()
+        result = self.probe_operational(include_archive=include_archive)
         if result.ready:
             return result
         raise LongTermRemoteUnavailableError(

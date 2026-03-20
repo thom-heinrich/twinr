@@ -12,6 +12,7 @@ from twinr.agent.base_agent import TwinrConfig
 from twinr.channels import ChannelTransportError
 from twinr.channels.whatsapp.config import WhatsAppChannelConfig, normalize_whatsapp_digits
 from twinr.channels.whatsapp.node_runtime import resolve_whatsapp_node_binary
+from twinr.channels.whatsapp.worker_dependencies import probe_whatsapp_worker_dependencies
 from twinr.channels.whatsapp.worker_bridge import (
     WhatsAppWorkerBridge,
     WhatsAppWorkerExitedError,
@@ -193,13 +194,17 @@ def probe_whatsapp_runtime(config: TwinrConfig, *, env_path: Path) -> WhatsAppRu
 
     package_json = worker_root / "package.json"
     worker_entry = worker_root / "index.mjs"
-    worker_ready = worker_root.is_dir() and package_json.is_file() and worker_entry.is_file()
+    dependency_probe = probe_whatsapp_worker_dependencies(worker_root)
+    worker_ready = worker_root.is_dir() and package_json.is_file() and worker_entry.is_file() and dependency_probe.ready
     if worker_ready:
-        worker_detail = f"Worker package found at {worker_root}."
+        worker_detail = dependency_probe.detail
     elif worker_root.is_dir() and not package_json.is_file():
         worker_detail = f"Worker package.json is missing under {worker_root}."
     elif worker_root.is_dir():
-        worker_detail = f"Worker entrypoint is missing under {worker_root}."
+        if not worker_entry.is_file():
+            worker_detail = f"Worker entrypoint is missing under {worker_root}."
+        else:
+            worker_detail = dependency_probe.detail
     else:
         worker_detail = f"Worker folder is missing: {worker_root}."
 

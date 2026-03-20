@@ -4,7 +4,7 @@ kind: python-package
 summary: Assemble hidden base-agent context and loop-specific instruction strings.
 responsibilities:
   - Load ordered static sections from personality files.
-  - Merge the legacy static sections with structured layers from src/twinr/agent/personality when an evolving personality snapshot exists.
+  - Merge the legacy static sections with structured layers from src/twinr/agent/personality when an evolving personality snapshot exists, including contextual mindshare when available.
   - Merge runtime memory, reminder, and automation context for the appropriate loop.
   - Provide shared instruction loaders and instruction-merging helpers.
 out_of_scope:

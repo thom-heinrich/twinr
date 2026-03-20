@@ -575,6 +575,69 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertEqual(graph_state.status_calls, 0)
         self.assertEqual(midterm_state.status_calls, 0)
 
+    def test_probe_remote_ready_steady_state_skips_bootstrap_and_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            prompt_state = _CacheAwareFakeRemoteState(
+                {
+                    "prompt_memory": {"schema": "prompt_memory", "entries": []},
+                    "user_context": {"schema": "managed_context", "entries": []},
+                    "personality_context": {"schema": "managed_context", "entries": []},
+                }
+            )
+            object_state = _CacheAwareFakeRemoteState(
+                {
+                    "objects": {"schema": "twinr_memory_object_catalog_v2", "version": 2, "items": []},
+                    "conflicts": {"schema": "conflicts", "conflicts": []},
+                    "archive": {"schema": "twinr_memory_archive_catalog_v2", "version": 2, "items": []},
+                }
+            )
+            graph_state = _CacheAwareFakeRemoteState({"graph": {"schema": "graph", "nodes": [], "edges": []}})
+            midterm_state = _CacheAwareFakeRemoteState({"midterm": {"schema": "midterm", "packets": []}})
+            service = LongTermMemoryService(
+                config=config,
+                prompt_context_store=_PromptContextStoreDouble(prompt_state),
+                graph_store=_GraphStoreDouble(graph_state),
+                object_store=_ObjectStoreDouble(object_state),
+                midterm_store=_MidtermStoreDouble(midterm_state),
+                query_rewriter=SimpleNamespace(),
+                retriever=SimpleNamespace(),
+                extractor=SimpleNamespace(),
+                multimodal_extractor=SimpleNamespace(),
+                truth_maintainer=SimpleNamespace(),
+                consolidator=SimpleNamespace(),
+                conflict_resolver=SimpleNamespace(),
+                reflector=SimpleNamespace(),
+                sensor_memory=SimpleNamespace(),
+                ops_backfiller=SimpleNamespace(),
+                planner=SimpleNamespace(),
+                proactive_policy=SimpleNamespace(),
+                retention_policy=SimpleNamespace(),
+            )
+
+            result = service.probe_remote_ready(bootstrap=False, include_archive=False)
+
+        self.assertTrue(result.ready)
+        self.assertEqual(prompt_state.load_calls, [])
+        self.assertEqual(prompt_state.probe_calls, [
+            {"snapshot_kind": "prompt_memory", "prefer_cached_document_id": True},
+            {"snapshot_kind": "user_context", "prefer_cached_document_id": True},
+            {"snapshot_kind": "personality_context", "prefer_cached_document_id": True},
+        ])
+        self.assertEqual(object_state.load_calls, [])
+        self.assertEqual(object_state.probe_calls, [
+            {"snapshot_kind": "objects", "prefer_cached_document_id": True},
+            {"snapshot_kind": "conflicts", "prefer_cached_document_id": True},
+        ])
+        self.assertEqual(graph_state.load_calls, [])
+        self.assertEqual(graph_state.probe_calls, [
+            {"snapshot_kind": "graph", "prefer_cached_document_id": True},
+        ])
+        self.assertEqual(midterm_state.load_calls, [])
+        self.assertEqual(midterm_state.probe_calls, [
+            {"snapshot_kind": "midterm", "prefer_cached_document_id": True},
+        ])
+
     def test_remote_snapshot_save_and_load_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir)
@@ -1941,10 +2004,10 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
                 ),
             )
 
-            with self.assertRaises(LongTermRemoteUnavailableError):
-                state.save_snapshot(snapshot_kind="objects", payload={"schema": "object_store", "objects": []})
+        with self.assertRaises(LongTermRemoteUnavailableError):
+            state.save_snapshot(snapshot_kind="objects", payload={"schema": "object_store", "objects": []})
 
-        self.assertEqual(len(write_opener.calls), 3)
+        self.assertEqual(len(write_opener.calls), 2)
 
     def test_remote_snapshot_save_retries_after_transient_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2270,6 +2333,412 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
         self.assertEqual(second_body["execution_mode"], "async")
         self.assertEqual(first_body["items"][0]["payload"]["snapshot_kind"], "objects")
         self.assertEqual(second_body["items"][0]["payload"]["snapshot_kind"], "__pointer__:objects")
+
+    def test_remote_snapshot_save_retries_stale_async_origin_attestation_without_rewriting_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=2,
+                long_term_memory_remote_retry_backoff_s=0.0,
+            )
+            payload = {"schema": "object_store", "objects": [{"memory_id": "fact:new"}]}
+            stale_payload = {"schema": "object_store", "objects": [{"memory_id": "fact:old"}]}
+            read_opener = FakeOpener()
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "old-doc",
+                    "origin_uri": "twinr://longterm/test-namespace/objects",
+                    "chunk_count": 1,
+                    "chunks": [
+                        {
+                            "payload_id": "old-doc",
+                            "content": json.dumps(
+                                {
+                                    "schema": "twinr_remote_snapshot_v1",
+                                    "namespace": "test-namespace",
+                                    "snapshot_kind": "objects",
+                                    "updated_at": "2026-03-20T18:00:00+00:00",
+                                    "body": stale_payload,
+                                }
+                            ),
+                        }
+                    ],
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "old-doc",
+                    "origin_uri": "twinr://longterm/test-namespace/objects",
+                    "chunk_count": 2,
+                    "chunks": [
+                        {
+                            "payload_id": "old-doc",
+                            "content": json.dumps(
+                                {
+                                    "schema": "twinr_remote_snapshot_v1",
+                                    "namespace": "test-namespace",
+                                    "snapshot_kind": "objects",
+                                    "updated_at": "2026-03-20T18:00:00+00:00",
+                                    "body": stale_payload,
+                                }
+                            ),
+                        },
+                        {
+                            "payload_id": "new-doc",
+                            "content": json.dumps(
+                                {
+                                    "schema": "twinr_remote_snapshot_v1",
+                                    "namespace": "test-namespace",
+                                    "snapshot_kind": "objects",
+                                    "updated_at": "2026-03-20T18:00:01+00:00",
+                                    "body": payload,
+                                }
+                            ),
+                        },
+                    ],
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "ptr-new",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "__pointer__:objects",
+                            "updated_at": "2026-03-20T18:00:02+00:00",
+                            "body": {
+                                "schema": "twinr_remote_snapshot_pointer_v1",
+                                "version": 1,
+                                "snapshot_kind": "objects",
+                                "document_id": "new-doc",
+                            },
+                        }
+                    ),
+                }
+            )
+            write_opener = FakeOpener()
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "job_id": "job-snapshot",
+                    "status": "pending",
+                    "items": 1,
+                    "operation": "store_payload",
+                    "execution_mode": "async",
+                }
+            )
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "items": [
+                        {
+                            "success": True,
+                            "document_id": "ptr-new",
+                            "payload_id": "ptr-new",
+                        }
+                    ],
+                    "operation": "store_payload",
+                    "execution_mode": "async",
+                }
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=write_opener,
+                ),
+            )
+
+            state.save_snapshot(snapshot_kind="objects", payload=payload)
+
+        self.assertEqual(state._document_id_hints["objects"], "new-doc")
+        self.assertEqual(len(write_opener.calls), 2)
+        self.assertEqual(len(read_opener.calls), 3)
+        first_body = json.loads(write_opener.calls[0]["body"])
+        second_body = json.loads(write_opener.calls[1]["body"])
+        self.assertEqual(first_body["items"][0]["payload"]["snapshot_kind"], "objects")
+        self.assertEqual(second_body["items"][0]["payload"]["snapshot_kind"], "__pointer__:objects")
+        self.assertEqual(second_body["items"][0]["payload"]["body"]["document_id"], "new-doc")
+
+    def test_remote_snapshot_save_waits_through_multiple_stale_async_origin_reads_without_rewriting_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=2,
+                long_term_memory_remote_retry_backoff_s=0.0,
+            )
+            payload = {"schema": "object_store", "objects": [{"memory_id": "fact:new"}]}
+            stale_payload = {"schema": "object_store", "objects": [{"memory_id": "fact:old"}]}
+            read_opener = FakeOpener()
+            for _ in range(3):
+                read_opener.queue_json(
+                    {
+                        "success": True,
+                        "document_id": "old-doc",
+                        "origin_uri": "twinr://longterm/test-namespace/objects",
+                        "chunk_count": 1,
+                        "chunks": [
+                            {
+                                "payload_id": "old-doc",
+                                "content": json.dumps(
+                                    {
+                                        "schema": "twinr_remote_snapshot_v1",
+                                        "namespace": "test-namespace",
+                                        "snapshot_kind": "objects",
+                                        "updated_at": "2026-03-20T18:00:00+00:00",
+                                        "body": stale_payload,
+                                    }
+                                ),
+                            }
+                        ],
+                    }
+                )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "old-doc",
+                    "origin_uri": "twinr://longterm/test-namespace/objects",
+                    "chunk_count": 2,
+                    "chunks": [
+                        {
+                            "payload_id": "old-doc",
+                            "content": json.dumps(
+                                {
+                                    "schema": "twinr_remote_snapshot_v1",
+                                    "namespace": "test-namespace",
+                                    "snapshot_kind": "objects",
+                                    "updated_at": "2026-03-20T18:00:00+00:00",
+                                    "body": stale_payload,
+                                }
+                            ),
+                        },
+                        {
+                            "payload_id": "new-doc",
+                            "content": json.dumps(
+                                {
+                                    "schema": "twinr_remote_snapshot_v1",
+                                    "namespace": "test-namespace",
+                                    "snapshot_kind": "objects",
+                                    "updated_at": "2026-03-20T18:00:01+00:00",
+                                    "body": payload,
+                                }
+                            ),
+                        },
+                    ],
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "ptr-new",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "__pointer__:objects",
+                            "updated_at": "2026-03-20T18:00:02+00:00",
+                            "body": {
+                                "schema": "twinr_remote_snapshot_pointer_v1",
+                                "version": 1,
+                                "snapshot_kind": "objects",
+                                "document_id": "new-doc",
+                            },
+                        }
+                    ),
+                }
+            )
+            write_opener = FakeOpener()
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "job_id": "job-snapshot",
+                    "status": "pending",
+                    "items": 1,
+                    "operation": "store_payload",
+                    "execution_mode": "async",
+                }
+            )
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "items": [
+                        {
+                            "success": True,
+                            "document_id": "ptr-new",
+                            "payload_id": "ptr-new",
+                        }
+                    ],
+                    "operation": "store_payload",
+                    "execution_mode": "async",
+                }
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=write_opener,
+                ),
+            )
+
+            state.save_snapshot(snapshot_kind="objects", payload=payload)
+
+        self.assertEqual(state._document_id_hints["objects"], "new-doc")
+        self.assertEqual(len(write_opener.calls), 2)
+        self.assertEqual(len(read_opener.calls), 5)
+
+    def test_remote_snapshot_save_retries_stale_async_pointer_attestation_without_rewriting_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                self._config(temp_dir),
+                long_term_memory_remote_retry_attempts=2,
+                long_term_memory_remote_retry_backoff_s=0.0,
+            )
+            payload = {"schema": "object_store", "objects": [{"memory_id": "fact:new"}]}
+            read_opener = FakeOpener()
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "new-doc",
+                    "content": json.dumps(
+                        {
+                            "schema": "twinr_remote_snapshot_v1",
+                            "namespace": "test-namespace",
+                            "snapshot_kind": "objects",
+                            "updated_at": "2026-03-20T18:10:00+00:00",
+                            "body": payload,
+                        }
+                    ),
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "ptr-old",
+                    "origin_uri": "twinr://longterm/test-namespace/__pointer__:objects",
+                    "chunk_count": 1,
+                    "chunks": [
+                        {
+                            "payload_id": "ptr-old",
+                            "content": json.dumps(
+                                {
+                                    "schema": "twinr_remote_snapshot_v1",
+                                    "namespace": "test-namespace",
+                                    "snapshot_kind": "__pointer__:objects",
+                                    "updated_at": "2026-03-20T18:09:59+00:00",
+                                    "body": {
+                                        "schema": "twinr_remote_snapshot_pointer_v1",
+                                        "version": 1,
+                                        "snapshot_kind": "objects",
+                                        "document_id": "old-doc",
+                                    },
+                                }
+                            ),
+                        }
+                    ],
+                }
+            )
+            read_opener.queue_json(
+                {
+                    "success": True,
+                    "document_id": "ptr-old",
+                    "origin_uri": "twinr://longterm/test-namespace/__pointer__:objects",
+                    "chunk_count": 2,
+                    "chunks": [
+                        {
+                            "payload_id": "ptr-old",
+                            "content": json.dumps(
+                                {
+                                    "schema": "twinr_remote_snapshot_v1",
+                                    "namespace": "test-namespace",
+                                    "snapshot_kind": "__pointer__:objects",
+                                    "updated_at": "2026-03-20T18:09:59+00:00",
+                                    "body": {
+                                        "schema": "twinr_remote_snapshot_pointer_v1",
+                                        "version": 1,
+                                        "snapshot_kind": "objects",
+                                        "document_id": "old-doc",
+                                    },
+                                }
+                            ),
+                        },
+                        {
+                            "payload_id": "ptr-new",
+                            "content": json.dumps(
+                                {
+                                    "schema": "twinr_remote_snapshot_v1",
+                                    "namespace": "test-namespace",
+                                    "snapshot_kind": "__pointer__:objects",
+                                    "updated_at": "2026-03-20T18:10:01+00:00",
+                                    "body": {
+                                        "schema": "twinr_remote_snapshot_pointer_v1",
+                                        "version": 1,
+                                        "snapshot_kind": "objects",
+                                        "document_id": "new-doc",
+                                    },
+                                }
+                            ),
+                        },
+                    ],
+                }
+            )
+            write_opener = FakeOpener()
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "items": [
+                        {
+                            "success": True,
+                            "document_id": "new-doc",
+                            "payload_id": "new-doc",
+                        }
+                    ],
+                    "operation": "store_payload",
+                    "execution_mode": "sync",
+                }
+            )
+            write_opener.queue_json(
+                {
+                    "success": True,
+                    "job_id": "job-pointer",
+                    "status": "pending",
+                    "items": 1,
+                    "operation": "store_payload",
+                    "execution_mode": "async",
+                }
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=read_opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=write_opener,
+                ),
+            )
+
+            state.save_snapshot(snapshot_kind="objects", payload=payload)
+
+        self.assertEqual(state._document_id_hints["objects"], "new-doc")
+        self.assertEqual(len(write_opener.calls), 2)
+        self.assertEqual(len(read_opener.calls), 3)
+        pointer_body = json.loads(write_opener.calls[1]["body"])
+        self.assertEqual(pointer_body["execution_mode"], "async")
+        self.assertEqual(pointer_body["items"][0]["payload"]["snapshot_kind"], "__pointer__:objects")
+        self.assertEqual(pointer_body["items"][0]["payload"]["body"]["document_id"], "new-doc")
 
     def test_remote_snapshot_save_rejects_item_level_store_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2764,6 +3233,41 @@ class LongTermRemoteStateStoreTests(unittest.TestCase):
 
         self.assertIsNotNone(state.namespace)
         self.assertTrue(str(state.namespace).startswith("twinr_longterm_v1:"))
+
+    def test_status_uses_extended_probe_timeout_for_health_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            opener = FakeOpener()
+            opener.queue_json({"success": True, "service": "ccodex_memory", "ready": True, "auth_enabled": True})
+            config = TwinrConfig(
+                project_root=temp_dir,
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_read_timeout_s=8.0,
+                chonkydb_timeout_s=20.0,
+                chonkydb_base_url="https://memory.test",
+                chonkydb_api_key="secret-key",
+            )
+            state = LongTermRemoteStateStore(
+                config=config,
+                read_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(
+                        base_url="https://memory.test",
+                        api_key="secret-key",
+                        timeout_s=8.0,
+                    ),
+                    opener=opener,
+                ),
+                write_client=ChonkyDBClient(
+                    ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+                    opener=FakeOpener(),
+                ),
+            )
+
+            status = state.status()
+
+        self.assertTrue(status.ready)
+        self.assertEqual(opener.calls[0]["timeout"], 20.0)
 
     def test_service_fails_closed_when_remote_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

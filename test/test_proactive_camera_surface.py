@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import unittest
 
@@ -97,6 +98,141 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
         self.assertIn("camera.fine_hand_gesture_detected", update.event_names)
         self.assertEqual(update.snapshot.fine_hand_gesture, SocialFineHandGesture.THUMBS_UP)
         self.assertAlmostEqual(update.snapshot.fine_hand_gesture_confidence or 0.0, 0.88, places=3)
+
+    def test_surface_emits_changed_fine_hand_gesture_inside_cooldown(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                gesture_event_cooldown_s=6.0,
+            )
+        )
+
+        first = surface.observe(
+            inspected=True,
+            observed_at=1.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.OPEN_PALM,
+                fine_hand_gesture_confidence=0.82,
+            ),
+        )
+        changed = surface.observe(
+            inspected=True,
+            observed_at=1.6,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.79,
+            ),
+        )
+
+        self.assertIn("camera.fine_hand_gesture_detected", first.event_names)
+        self.assertIn("camera.fine_hand_gesture_detected", changed.event_names)
+        self.assertEqual(changed.snapshot.fine_hand_gesture, SocialFineHandGesture.THUMBS_UP)
+
+    def test_surface_suppresses_same_fine_hand_gesture_inside_cooldown(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                gesture_event_cooldown_s=6.0,
+            )
+        )
+
+        first = surface.observe(
+            inspected=True,
+            observed_at=1.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.84,
+            ),
+        )
+        repeated = surface.observe(
+            inspected=True,
+            observed_at=1.5,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.81,
+            ),
+        )
+
+        self.assertIn("camera.fine_hand_gesture_detected", first.event_names)
+        self.assertNotIn("camera.fine_hand_gesture_detected", repeated.event_names)
+
+    def test_surface_accepts_legacy_gesture_event_alias_without_coarse_arm_field(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                gesture_event_cooldown_s=0.0,
+            )
+        )
+
+        update = surface.observe(
+            inspected=True,
+            observed_at=2.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                gesture_event=SocialGestureEvent.WAVE,
+                gesture_confidence=0.84,
+            ),
+        )
+
+        self.assertIn("camera.gesture_detected", update.event_names)
+        self.assertIn("camera.coarse_arm_gesture_detected", update.event_names)
+        self.assertEqual(update.snapshot.coarse_arm_gesture, SocialGestureEvent.WAVE)
+        self.assertEqual(update.snapshot.gesture_event, SocialGestureEvent.WAVE)
+
+    def test_surface_emits_changed_coarse_gesture_inside_cooldown(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                gesture_event_cooldown_s=5.0,
+            )
+        )
+
+        first = surface.observe(
+            inspected=True,
+            observed_at=2.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                gesture_event=SocialGestureEvent.WAVE,
+                gesture_confidence=0.77,
+            ),
+        )
+        changed = surface.observe(
+            inspected=True,
+            observed_at=2.4,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                gesture_event=SocialGestureEvent.STOP,
+                gesture_confidence=0.73,
+            ),
+        )
+
+        self.assertIn("camera.gesture_detected", first.event_names)
+        self.assertIn("camera.gesture_detected", changed.event_names)
+        self.assertEqual(changed.snapshot.gesture_event, SocialGestureEvent.STOP)
+
+    def test_from_config_uses_fast_attention_refresh_for_gesture_cooldown(self) -> None:
+        config = ProactiveCameraSurfaceConfig.from_config(
+            SimpleNamespace(
+                proactive_capture_interval_s=6.0,
+                display_attention_refresh_interval_s=0.6,
+            )
+        )
+
+        self.assertAlmostEqual(config.gesture_event_cooldown_s, 1.2, places=3)
 
     def test_surface_holds_visible_state_through_brief_unknown_gap(self) -> None:
         surface = ProactiveCameraSurface(

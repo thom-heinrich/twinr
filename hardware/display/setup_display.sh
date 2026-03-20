@@ -128,6 +128,11 @@ install_waveshare_driver() {
     --busy-gpio "${BUSY_GPIO}"
 }
 
+install_hdmi_runtime_dependencies() {
+  apt-get update
+  apt-get install -y fonts-noto-color-emoji
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --env-file)
@@ -256,6 +261,7 @@ if [[ -n "${DISPLAY_RUNTIME_TRACE_ENABLED}" ]]; then
 fi
 
 if [[ "${DRIVER}" == hdmi_* ]]; then
+  install_hdmi_runtime_dependencies
   probe_framebuffer_geometry
   DISPLAY_LAYOUT="${DISPLAY_LAYOUT:-default}"
   DISPLAY_RUNTIME_TRACE_ENABLED="${DISPLAY_RUNTIME_TRACE_ENABLED:-false}"

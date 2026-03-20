@@ -8,6 +8,8 @@ review into Twinr runtime workflows.
 from twinr.proactive.social.engine import (
     SocialAudioObservation,
     SocialBodyPose,
+    SocialFineHandGesture,
+    SocialGestureEvent,
     SocialObservation,
     SocialPersonZone,
     SocialTriggerDecision,
@@ -53,6 +55,8 @@ __all__ = [
     "ProactiveVisionSnapshot",
     "SocialAudioObservation",
     "SocialBodyPose",
+    "SocialFineHandGesture",
+    "SocialGestureEvent",
     "SocialObservation",
     "SocialPersonZone",
     "SocialTriggerDecision",

@@ -128,8 +128,13 @@ class ProactiveCameraSurfaceConfig:
         """Build one cadence-aware camera surface config from Twinr config."""
 
         interval_s = _coerce_positive_float(getattr(config, "proactive_capture_interval_s", 6.0), default=6.0)
+        attention_refresh_s = _coerce_positive_float(
+            getattr(config, "display_attention_refresh_interval_s", interval_s),
+            default=interval_s,
+        )
         unknown_hold_s = max(interval_s + 1.0, interval_s * 1.5)
         cooldown_s = max(interval_s, interval_s * 1.5)
+        gesture_cooldown_s = max(0.8, min(2.0, attention_refresh_s * 2.0))
         return cls(
             person_visible_unknown_hold_s=unknown_hold_s,
             person_visible_event_cooldown_s=cooldown_s,
@@ -146,7 +151,7 @@ class ProactiveCameraSurfaceConfig:
             hand_or_object_near_camera_unknown_hold_s=unknown_hold_s,
             hand_or_object_near_camera_event_cooldown_s=cooldown_s,
             motion_event_cooldown_s=cooldown_s,
-            gesture_event_cooldown_s=cooldown_s,
+            gesture_event_cooldown_s=gesture_cooldown_s,
             object_unknown_hold_s=unknown_hold_s,
             secondary_unknown_hold_s=unknown_hold_s,
         )
@@ -666,11 +671,13 @@ class ProactiveCameraSurface:
         self._last_gesture_confidence: float | None = None
         self._last_gesture_confidence_at: float | None = None
         self._last_gesture_emitted_at: float | None = None
+        self._last_gesture_emitted_event = SocialGestureEvent.NONE
         self._last_fine_hand_gesture = SocialFineHandGesture.NONE
         self._last_fine_hand_gesture_at: float | None = None
         self._last_fine_hand_gesture_confidence: float | None = None
         self._last_fine_hand_gesture_confidence_at: float | None = None
         self._last_fine_hand_gesture_emitted_at: float | None = None
+        self._last_fine_hand_gesture_emitted_event = SocialFineHandGesture.NONE
         self._has_seen_person = False
         self._last_authoritative_person_visible = False
         self._last_person_seen_at: float | None = None
@@ -815,11 +822,7 @@ class ProactiveCameraSurface:
             self._resolve_gesture(
                 inspected=inspected,
                 observed_at=now,
-                gesture_event=getattr(
-                    observation,
-                    "coarse_arm_gesture",
-                    getattr(observation, "gesture_event", SocialGestureEvent.NONE),
-                ),
+                gesture_event=_coalesce_coarse_gesture_aliases(observation),
                 gesture_confidence=getattr(observation, "gesture_confidence", None),
             )
         )
@@ -1339,11 +1342,14 @@ class ProactiveCameraSurface:
             self._last_gesture_confidence_at = now
             rising = False
             if event not in {SocialGestureEvent.NONE, SocialGestureEvent.UNKNOWN}:
-                if (
-                    self._last_gesture_emitted_at is None
-                    or (now - self._last_gesture_emitted_at) >= self.config.gesture_event_cooldown_s
+                if self._gesture_ready_to_emit(
+                    event=event,
+                    last_emitted=self._last_gesture_emitted_event,
+                    last_emitted_at=self._last_gesture_emitted_at,
+                    now=now,
                 ):
                     self._last_gesture_emitted_at = now
+                    self._last_gesture_emitted_event = event
                     rising = True
             return event, False, confidence, False, rising
 
@@ -1381,11 +1387,14 @@ class ProactiveCameraSurface:
             self._last_fine_hand_gesture_confidence_at = now
             rising = False
             if event not in {SocialFineHandGesture.NONE, SocialFineHandGesture.UNKNOWN}:
-                if (
-                    self._last_fine_hand_gesture_emitted_at is None
-                    or (now - self._last_fine_hand_gesture_emitted_at) >= self.config.gesture_event_cooldown_s
+                if self._gesture_ready_to_emit(
+                    event=event,
+                    last_emitted=self._last_fine_hand_gesture_emitted_event,
+                    last_emitted_at=self._last_fine_hand_gesture_emitted_at,
+                    now=now,
                 ):
                     self._last_fine_hand_gesture_emitted_at = now
+                    self._last_fine_hand_gesture_emitted_event = event
                     rising = True
             return event, False, confidence, False, rising
 
@@ -1402,6 +1411,30 @@ class ProactiveCameraSurface:
             observed_at=observed_at,
         )
         return event, event_unknown, confidence, confidence_unknown, False
+
+    def _gesture_ready_to_emit(
+        self,
+        *,
+        event: SocialGestureEvent | SocialFineHandGesture,
+        last_emitted: SocialGestureEvent | SocialFineHandGesture,
+        last_emitted_at: float | None,
+        now: float,
+    ) -> bool:
+        """Allow changed gestures immediately while damping repeated identical ones.
+
+        The local HDMI acknowledgement path refreshes much faster than the slow
+        proactive full-inspect cadence. Gesture acknowledgements therefore must
+        not inherit multi-second cooldowns between *different* user symbols like
+        ``✋`` followed by ``👍``. We still keep a short repeat gate for the same
+        gesture so jittery recognizer output does not flash the same emoji on
+        every frame.
+        """
+
+        if last_emitted_at is None:
+            return True
+        if event != last_emitted:
+            return True
+        return (now - last_emitted_at) >= self.config.gesture_event_cooldown_s
 
     def _resolve_showing_started_at(
         self,
@@ -1638,6 +1671,28 @@ def _coerce_gesture_event(value: object) -> SocialGestureEvent:
         if event.value == token:
             return event
     return SocialGestureEvent.UNKNOWN
+
+
+def _coalesce_coarse_gesture_aliases(observation: object) -> SocialGestureEvent:
+    """Resolve coarse-arm gesture aliases without letting default `none` mask real data.
+
+    `SocialVisionObservation` exposes both `coarse_arm_gesture` and the older
+    compatibility field `gesture_event`. The dataclass always has both
+    attributes, so a direct `getattr(..., "coarse_arm_gesture", fallback)`
+    incorrectly prefers the default `none` value and hides a real gesture
+    carried only on `gesture_event`. Prefer the first meaningful non-empty
+    value while keeping `coarse_arm_gesture` authoritative when both are set.
+    """
+
+    primary = _coerce_gesture_event(getattr(observation, "coarse_arm_gesture", SocialGestureEvent.UNKNOWN))
+    if primary not in {SocialGestureEvent.NONE, SocialGestureEvent.UNKNOWN}:
+        return primary
+    secondary = _coerce_gesture_event(getattr(observation, "gesture_event", SocialGestureEvent.UNKNOWN))
+    if secondary not in {SocialGestureEvent.NONE, SocialGestureEvent.UNKNOWN}:
+        return secondary
+    if primary is not SocialGestureEvent.UNKNOWN:
+        return primary
+    return secondary
 
 
 def _coerce_fine_hand_gesture(value: object) -> SocialFineHandGesture:

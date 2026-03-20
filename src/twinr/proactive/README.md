@@ -36,6 +36,7 @@ short-window event fusion, delivery governance, and wakeword behavior.
 ```python
 from twinr.proactive import (
     ProactiveGovernor,
+    SocialFineHandGesture,
     SocialTriggerEngine,
     WakewordDecisionPolicy,
     build_default_proactive_monitor,

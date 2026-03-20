@@ -20,6 +20,7 @@ from typing import Protocol
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -81,6 +82,9 @@ HealthCollectorFn = Callable[..., TwinrSystemHealth]
 WatchdogAssessmentFn = Callable[[TwinrConfig], RequiredRemoteWatchdogAssessment]
 UtcNowFn = Callable[[], datetime]
 LoopOwnerFn = Callable[[TwinrConfig, str], int | None]
+PidAliveFn = Callable[[int], bool]
+PidSignalFn = Callable[[int, int], None]
+PidCmdlineFn = Callable[[int], tuple[str, ...]]
 
 
 @dataclass(slots=True)
@@ -155,6 +159,67 @@ def _env_flag(name: str) -> bool:
 
     value = str(os.environ.get(name, "") or "").strip().lower()
     return value in {"1", "true", "yes", "on"}
+
+
+def _default_pid_alive(pid: int) -> bool:
+    """Return whether one local PID currently appears alive."""
+
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _default_pid_cmdline(pid: int) -> tuple[str, ...]:
+    """Return one best-effort command line tuple for a local PID."""
+
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+    except OSError:
+        return ()
+    parts = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+    return tuple(parts)
+
+
+class _PidProcessHandle:
+    """Wrap an already-running PID in the minimal child-process protocol."""
+
+    def __init__(
+        self,
+        pid: int,
+        *,
+        pid_alive: PidAliveFn,
+        pid_signal: PidSignalFn,
+        monotonic: MonotonicFn,
+        sleep: SleepFn,
+    ) -> None:
+        self.pid = int(pid)
+        self._pid_alive = pid_alive
+        self._pid_signal = pid_signal
+        self._monotonic = monotonic
+        self._sleep = sleep
+
+    def poll(self) -> int | None:
+        return None if self._pid_alive(self.pid) else 0
+
+    def terminate(self) -> None:
+        self._pid_signal(self.pid, signal.SIGTERM)
+
+    def kill(self) -> None:
+        self._pid_signal(self.pid, signal.SIGKILL)
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else self._monotonic() + max(0.0, float(timeout))
+        while self._pid_alive(self.pid):
+            if deadline is not None and self._monotonic() >= deadline:
+                raise TimeoutError(f"PID {self.pid} did not exit before timeout.")
+            self._sleep(0.05)
+        return 0
 
 
 def _default_process_factory(
@@ -271,6 +336,9 @@ class TwinrRuntimeSupervisor:
         sleep: SleepFn = _default_sleep,
         utcnow: UtcNowFn = _default_utcnow,
         loop_owner: LoopOwnerFn = loop_lock_owner,
+        pid_alive: PidAliveFn = _default_pid_alive,
+        pid_signal: PidSignalFn = os.kill,
+        pid_cmdline: PidCmdlineFn = _default_pid_cmdline,
         poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
         watchdog_startup_grace_s: float = _DEFAULT_WATCHDOG_STARTUP_GRACE_S,
         watchdog_startup_timeout_s: float = _DEFAULT_WATCHDOG_STARTUP_TIMEOUT_S,
@@ -293,6 +361,9 @@ class TwinrRuntimeSupervisor:
         self._sleep = sleep
         self._utcnow = utcnow
         self.loop_owner = loop_owner
+        self.pid_alive = pid_alive
+        self.pid_signal = pid_signal
+        self.pid_cmdline = pid_cmdline
         self.poll_interval_s = max(0.1, float(poll_interval_s))
         self.watchdog_startup_grace_s = max(0.0, float(watchdog_startup_grace_s))
         self.watchdog_startup_timeout_s = max(1.0, float(watchdog_startup_timeout_s))
@@ -395,6 +466,9 @@ class TwinrRuntimeSupervisor:
         if self._streaming.is_running():
             self._last_streaming_gate_reason = None
             return
+        if self._maybe_adopt_existing_streaming_owner(now_monotonic=now_monotonic):
+            self._last_streaming_gate_reason = None
+            return
 
         gate_reason = self._streaming_gate_reason(now_monotonic=now_monotonic, assessment=assessment)
         if gate_reason is not None:
@@ -409,6 +483,49 @@ class TwinrRuntimeSupervisor:
         self._last_streaming_gate_reason = None
         start_reason = "watchdog_ready" if assessment.ready else "watchdog_startup_grace_elapsed"
         self._ensure_child_running(self._streaming, now_monotonic, reason=start_reason)
+
+    def _maybe_adopt_existing_streaming_owner(self, *, now_monotonic: float) -> bool:
+        """Adopt one already-running streaming owner after supervisor restarts."""
+
+        if self._streaming.process is not None:
+            return False
+        owner_pid = self.loop_owner(self.config, "streaming-loop")
+        if owner_pid is None or owner_pid <= 0:
+            return False
+        if not self.pid_alive(owner_pid):
+            return False
+        owner_cmdline = self.pid_cmdline(owner_pid)
+        if "--run-streaming-loop" not in owner_cmdline:
+            return False
+        self._streaming.process = _PidProcessHandle(
+            owner_pid,
+            pid_alive=self.pid_alive,
+            pid_signal=self.pid_signal,
+            monotonic=self._monotonic,
+            sleep=self._sleep,
+        )
+        self._streaming.started_at_monotonic = now_monotonic
+        self._streaming.started_at_utc = self._utcnow()
+        self._streaming.last_restart_at_monotonic = now_monotonic
+        self._streaming.clear_health_issue()
+        self._emit_payload(
+            "runtime_supervisor_child_adopted",
+            child=self._streaming.key,
+            pid=owner_pid,
+            owner_cmdline=" ".join(owner_cmdline[:6]),
+            reason="existing_lock_owner",
+        )
+        self._append_event(
+            event="runtime_supervisor_child_adopted",
+            message=f"Supervisor adopted existing {self._streaming.label}.",
+            data={
+                "child": self._streaming.key,
+                "pid": owner_pid,
+                "owner_cmdline": " ".join(owner_cmdline[:6]),
+                "reason": "existing_lock_owner",
+            },
+        )
+        return True
 
     def _streaming_gate_reason(
         self,

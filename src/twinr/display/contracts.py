@@ -11,6 +11,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from twinr.display.emoji_cues import DisplayEmojiCue
     from twinr.display.face_cues import DisplayFaceCue
     from twinr.display.presentation_cues import DisplayPresentationCue
 
@@ -40,6 +41,7 @@ class TwinrDisplayAdapter(Protocol):
         log_sections: DisplayLogSections = (),
         animation_frame: int = 0,
         face_cue: DisplayFaceCue | None = None,
+        emoji_cue: DisplayEmojiCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None: ...
 

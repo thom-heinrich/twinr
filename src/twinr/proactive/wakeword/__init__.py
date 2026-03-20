@@ -1,9 +1,9 @@
 """Expose the wakeword package surface for proactive runtime integrations.
 
 Import from ``twinr.proactive.wakeword`` when callers need transcript
-matching, openWakeWord spotters, decision policy helpers, calibration stores,
-evaluation/promotion tools, or the streaming monitor as one coherent package
-boundary.
+matching, local wakeword spotters, decision policy helpers, calibration
+stores, evaluation/promotion tools, or the streaming monitor as one coherent
+package boundary.
 """
 
 from twinr.proactive.wakeword.calibration import (
@@ -29,6 +29,18 @@ from twinr.proactive.wakeword.evaluation import (
     load_labeled_ops_captures,
     run_wakeword_eval,
     train_wakeword_custom_verifier_from_manifest,
+)
+from twinr.proactive.wakeword.kws import (
+    WakewordKwsAssetBundle,
+    WakewordSherpaOnnxFrameSpotter,
+    WakewordSherpaOnnxSpotter,
+)
+from twinr.proactive.wakeword.kws_assets import (
+    ProvisionedWakewordKwsBundle,
+    WakewordKwsProvisionSpec,
+    available_builtin_kws_bundle_specs,
+    derive_kws_keyword_names,
+    provision_builtin_kws_bundle,
 )
 from twinr.proactive.wakeword.matching import (
     DEFAULT_WAKEWORD_PHRASES,
@@ -94,6 +106,9 @@ __all__ = [
     "WakewordEvalEntry",
     "WakewordEvalMetrics",
     "WakewordEvalReport",
+    "WakewordKwsAssetBundle",
+    "ProvisionedWakewordKwsBundle",
+    "WakewordKwsProvisionSpec",
     "WakewordVerifierTrainingReport",
     "WakewordMatch",
     "WakewordOpenWakeWordFrameSpotter",
@@ -106,6 +121,8 @@ __all__ = [
     "WakewordSequenceCaptureVerifier",
     "WakewordSequenceVerifier",
     "WakewordSequenceVerifierTrainingReport",
+    "WakewordSherpaOnnxFrameSpotter",
+    "WakewordSherpaOnnxSpotter",
     "WakewordStreamEvalReport",
     "WakewordStreamDetection",
     "WakewordTrainingCommand",
@@ -115,7 +132,9 @@ __all__ = [
     "append_wakeword_capture_label",
     "apply_wakeword_calibration",
     "autotune_wakeword_profile",
+    "available_builtin_kws_bundle_specs",
     "build_default_wakeword_training_plan",
+    "derive_kws_keyword_names",
     "evaluate_wakeword_stream_entries",
     "load_wakeword_promotion_spec",
     "load_eval_manifest",
@@ -129,6 +148,7 @@ __all__ = [
     "run_wakeword_promotion_eval",
     "run_wakeword_eval",
     "run_wakeword_stream_eval",
+    "provision_builtin_kws_bundle",
     "train_wakeword_custom_verifier_from_manifest",
     "train_wakeword_sequence_verifier_from_manifest",
     "train_wakeword_base_model_from_dataset_root",

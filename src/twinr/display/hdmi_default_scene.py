@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Protocol
 
 from twinr.display.contracts import DisplayStateFields
+from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.display.face_cues import DisplayFaceCue
 from twinr.display.hdmi_ambient_moments import HdmiAmbientMoment, HdmiAmbientMomentDirector
 from twinr.display.hdmi_presentation_graph import (
@@ -51,6 +52,8 @@ class _HdmiSceneTools(Protocol):
 
     def _normalise_text(self, value: object, *, fallback: str) -> str: ...
 
+    def _render_emoji_glyph(self, emoji: str, *, target_size: int) -> object | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class HdmiSceneCard:
@@ -67,8 +70,19 @@ class HdmiSceneCard:
 
 
 @dataclass(frozen=True, slots=True)
+class HdmiHeaderModel:
+    """Prepared content for the slim top HDMI status header."""
+
+    brand: str
+    state: str
+    time_value: str
+    system_value: str
+    system_accent: tuple[int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
 class HdmiStatusPanelModel:
-    """Prepared content for the right-hand status panel."""
+    """Prepared future content for the right-hand HDMI reserve area."""
 
     eyebrow: str
     headline: str
@@ -103,10 +117,11 @@ class HdmiDefaultScene:
     status: str
     animation_frame: int
     layout: HdmiDefaultSceneLayout
-    time_value: str
+    header: HdmiHeaderModel
     panel: HdmiStatusPanelModel
     ticker: HdmiNewsTickerModel | None = None
     face_cue: DisplayFaceCue | None = None
+    emoji_cue: DisplayEmojiCue | None = None
     ambient_moment: HdmiAmbientMoment | None = None
     presentation_graph: HdmiPresentationSceneGraph | None = None
 
@@ -281,6 +296,7 @@ class HdmiDefaultSceneRenderer:
         animation_frame: int,
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
+        emoji_cue: DisplayEmojiCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         presentation_now: datetime | None = None,
         ambient_now: datetime | None = None,
@@ -297,12 +313,13 @@ class HdmiDefaultSceneRenderer:
             state_fields=state_fields,
             animation_frame=animation_frame,
             face_cue=face_cue,
+            emoji_cue=emoji_cue,
             presentation_cue=presentation_cue,
             presentation_now=presentation_now,
             ambient_now=ambient_now,
         )
         draw.rectangle((0, 0, width, height), fill=(0, 0, 0))
-        self._draw_twinr_header(draw, box=scene.layout.header_box, time_value=scene.time_value)
+        self._draw_twinr_header(draw, box=scene.layout.header_box, header=scene.header)
         self._draw_face(
             draw,
             box=scene.layout.face_box,
@@ -327,6 +344,8 @@ class HdmiDefaultSceneRenderer:
             )
             return
         self._draw_status_panel(draw, box=scene.layout.panel_box, panel=scene.panel, compact=scene.layout.compact_panel)
+        if scene.emoji_cue is not None:
+            self._draw_emoji_reserve(image, draw, box=scene.layout.panel_box, emoji_cue=scene.emoji_cue)
         if scene.ticker is not None:
             self._draw_news_ticker(draw, box=scene.layout.ticker_box, ticker=scene.ticker)
 
@@ -342,6 +361,7 @@ class HdmiDefaultSceneRenderer:
         animation_frame: int,
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
+        emoji_cue: DisplayEmojiCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         presentation_now: datetime | None = None,
         ambient_now: datetime | None = None,
@@ -371,15 +391,15 @@ class HdmiDefaultSceneRenderer:
             status=status,
             animation_frame=animation_frame,
             layout=layout,
-            time_value=time_value(state_fields),
-            panel=self._build_panel_model(
+            header=self._build_header_model(
                 status=status,
                 headline=headline,
-                helper_text=helper_text,
                 state_fields=state_fields,
             ),
+            panel=self._build_panel_model(),
             ticker=None if presentation_graph is not None else ticker,
             face_cue=resolved_face_cue,
+            emoji_cue=emoji_cue if presentation_graph is None else None,
             ambient_moment=ambient_moment,
             presentation_graph=presentation_graph,
         )
@@ -481,50 +501,33 @@ class HdmiDefaultSceneRenderer:
             return True
         return False
 
-    def _build_panel_model(
+    def _build_header_model(
         self,
         *,
         status: str,
         headline: str,
-        helper_text: str,
         state_fields: DisplayStateFields,
-    ) -> HdmiStatusPanelModel:
+    ) -> HdmiHeaderModel:
         normalise_text = self.tools._normalise_text
-        cards = (
-            HdmiSceneCard(
-                key="network",
-                label="NETWORK",
-                value=display_state_value(normalise_text, "Internet", state_field_value(normalise_text, state_fields, "Internet")),
-                accent=state_value_color(normalise_text, state_field_value(normalise_text, state_fields, "Internet")),
-            ),
-            HdmiSceneCard(
-                key="ai",
-                label="AI",
-                value=display_state_value(normalise_text, "AI", state_field_value(normalise_text, state_fields, "AI")),
-                accent=state_value_color(normalise_text, state_field_value(normalise_text, state_fields, "AI")),
-            ),
-            HdmiSceneCard(
-                key="system",
-                label="SYSTEM",
-                value=display_state_value(normalise_text, "System", state_field_value(normalise_text, state_fields, "System")),
-                accent=state_value_color(normalise_text, state_field_value(normalise_text, state_fields, "System")),
-            ),
-            HdmiSceneCard(
-                key="time",
-                label="TIME",
-                value=display_state_value(
-                    normalise_text,
-                    "Zeit",
-                    state_field_value(normalise_text, state_fields, ("Zeit", "Time")),
-                ),
-                accent=status_accent_color(status),
-            ),
+        system_raw = state_field_value(normalise_text, state_fields, "System")
+        system_normalized = normalise_text(system_raw, fallback="").lower()
+        system_value = "OK" if system_normalized == "ok" else "ERROR"
+        return HdmiHeaderModel(
+            brand="TWINR",
+            state=normalise_text(headline, fallback=status_headline(normalise_text, status, fallback=headline)).upper(),
+            time_value=time_value(state_fields),
+            system_value=system_value,
+            system_accent=(116, 242, 170) if system_value == "OK" else (255, 134, 110),
         )
+
+    def _build_panel_model(self) -> HdmiStatusPanelModel:
+        """Keep the right-hand HDMI reserve area empty until a capability uses it."""
+
         return HdmiStatusPanelModel(
-            eyebrow="STATUS",
-            headline=headline,
-            helper_text=helper_text,
-            cards=cards,
+            eyebrow="",
+            headline="",
+            helper_text="",
+            cards=(),
         )
 
     def _build_ticker_model(self, ticker_text: str | None) -> HdmiNewsTickerModel | None:
@@ -569,18 +572,93 @@ class HdmiDefaultSceneRenderer:
             presentation_active=presentation_graph is not None,
         )
 
-    def _draw_twinr_header(self, draw: object, *, box: tuple[int, int, int, int], time_value: str) -> None:
+    def _draw_twinr_header(self, draw: object, *, box: tuple[int, int, int, int], header: HdmiHeaderModel) -> None:
         left, top, right, bottom = box
         box_height = max(32, bottom - top)
         header_font = self.tools._font(24 if box_height >= 50 else 18, bold=True)
+        state_font = self.tools._font(22 if box_height >= 50 else 17, bold=True)
         time_font = self.tools._font(22 if box_height >= 50 else 16, bold=False)
+        system_label_font = self.tools._font(12 if box_height >= 50 else 10, bold=True)
+        system_value_font = self.tools._font(22 if box_height >= 50 else 18, bold=True)
         label_y = top + max(4, (box_height - self.tools._text_height(draw, font=header_font)) // 2) - 1
+        state_y = top + max(4, (box_height - self.tools._text_height(draw, font=state_font)) // 2) - 1
         time_y = top + max(4, (box_height - self.tools._text_height(draw, font=time_font)) // 2) - 1
+        system_label_y = top + max(4, (box_height - self.tools._text_height(draw, font=system_label_font)) // 2) - 2
+        system_value_y = top + max(4, (box_height - self.tools._text_height(draw, font=system_value_font)) // 2) - 1
 
         draw.rounded_rectangle(box, radius=20, fill=(0, 0, 0), outline=(255, 255, 255), width=2)
-        draw.text((left + 20, label_y), "TWINR", fill=(255, 255, 255), font=header_font)
-        time_width = self.tools._text_width(draw, time_value, font=time_font)
-        draw.text((right - 22 - time_width, time_y), time_value, fill=(188, 188, 188), font=time_font)
+        draw.text((left + 20, label_y), header.brand, fill=(255, 255, 255), font=header_font)
+        brand_width = self.tools._text_width(draw, header.brand, font=header_font)
+        time_width = self.tools._text_width(draw, header.time_value, font=time_font)
+        system_label_width = self.tools._text_width(draw, "SYSTEM", font=system_label_font)
+        system_value_width = self.tools._text_width(draw, header.system_value, font=system_value_font)
+        system_gap = 8 if box_height >= 50 else 6
+        system_width = system_label_width + system_gap + system_value_width
+        right_group_gap = 14 if box_height >= 50 else 10
+        right_group_width = system_width + right_group_gap + time_width
+        system_x = right - 22 - right_group_width
+        draw.text((system_x, system_label_y), "SYSTEM", fill=(204, 204, 204), font=system_label_font)
+        draw.text((system_x + system_label_width + system_gap, system_value_y), header.system_value, fill=header.system_accent, font=system_value_font)
+        draw.text((right - 22 - time_width, time_y), header.time_value, fill=(188, 188, 188), font=time_font)
+
+        state_left = left + 20 + brand_width + 26
+        state_right = system_x - 24
+        if state_right <= state_left:
+            return
+        state_text = self.tools._truncate_text(
+            draw,
+            header.state,
+            max_width=state_right - state_left,
+            font=state_font,
+        )
+        state_width = self.tools._text_width(draw, state_text, font=state_font)
+        state_x = state_left + max(0, ((state_right - state_left) - state_width) // 2)
+        draw.text((state_x, state_y), state_text, fill=(255, 255, 255), font=state_font)
+
+    def _draw_emoji_reserve(
+        self,
+        image: object,
+        draw: object,
+        *,
+        box: tuple[int, int, int, int],
+        emoji_cue: DisplayEmojiCue,
+    ) -> None:
+        """Draw one real Unicode emoji in the reserved right-hand HDMI area."""
+
+        del draw
+        left, top, right, bottom = box
+        width = max(0, right - left)
+        height = max(0, bottom - top)
+        if width <= 0 or height <= 0:
+            return
+        target_size = max(72, min(width - 28, height - 28, 148))
+        emoji_image = self.tools._render_emoji_glyph(emoji_cue.glyph(), target_size=target_size)
+        if emoji_image is None:
+            return
+        from PIL import ImageDraw
+
+        overlay = ImageDraw.Draw(image, "RGBA")
+        halo_size = target_size + 26
+        halo_left = left + max(0, (width - halo_size) // 2)
+        halo_top = top + max(0, (height - halo_size) // 2)
+        halo_box = (halo_left, halo_top, halo_left + halo_size, halo_top + halo_size)
+        halo_color = self._emoji_accent_fill(emoji_cue.accent)
+        overlay.ellipse(halo_box, fill=halo_color)
+        paste_left = left + max(0, (width - emoji_image.width) // 2)
+        paste_top = top + max(0, (height - emoji_image.height) // 2)
+        image.paste(emoji_image, (paste_left, paste_top), emoji_image)
+
+    def _emoji_accent_fill(self, accent: str) -> tuple[int, int, int, int]:
+        """Return a soft reserve-halo color for one emoji accent token."""
+
+        mapping = {
+            "neutral": (255, 255, 255, 18),
+            "info": (90, 132, 196, 38),
+            "success": (92, 232, 148, 40),
+            "warm": (255, 179, 87, 42),
+            "alert": (244, 114, 90, 42),
+        }
+        return mapping.get(accent, (255, 255, 255, 18))
 
     def _draw_news_ticker(
         self,
@@ -616,51 +694,10 @@ class HdmiDefaultSceneRenderer:
         panel: HdmiStatusPanelModel,
         compact: bool,
     ) -> None:
-        left, top, right, bottom = box
-        panel_width = right - left
-        panel_padding = 16 if compact else 24
-        panel_inner_width = panel_width - (panel_padding * 2)
+        """Leave the right-hand area intentionally free for future HDMI capabilities."""
 
-        eyebrow_font = self.tools._font(14 if compact else 16, bold=True)
-        headline_font = self.tools._font(28 if compact else 44, bold=True)
-        helper_font = self.tools._font(13 if compact else 19, bold=False)
-
-        draw.rounded_rectangle(box, radius=30, fill=(4, 4, 4), outline=(255, 255, 255), width=3)
-        header_label_y = top + (16 if compact else 22)
-        headline_y = top + (40 if compact else 56)
-        helper_y = top + (76 if compact else 118)
-        draw.text((left + panel_padding, header_label_y), panel.eyebrow, fill=(160, 160, 160), font=eyebrow_font)
-        headline_text = self.tools._truncate_text(draw, panel.headline, max_width=panel_inner_width, font=headline_font)
-        draw.text((left + panel_padding, headline_y), headline_text, fill=(255, 255, 255), font=headline_font)
-
-        helper_lines = self.tools._wrapped_lines(
-            draw,
-            (panel.helper_text,),
-            max_width=panel_inner_width,
-            font=helper_font,
-            max_lines=1 if compact else 2,
-        )
-        line_height = self.tools._text_height(draw, font=helper_font) + 6
-        for line in helper_lines:
-            draw.text((left + panel_padding, helper_y), line, fill=(214, 214, 214), font=helper_font)
-            helper_y += line_height
-
-        divider_y = helper_y + (8 if compact else 10)
-        draw.line((left + panel_padding, divider_y, right - panel_padding, divider_y), fill=(88, 88, 88), width=2)
-        rows_top = divider_y + (12 if compact else 18)
-        rows_bottom = bottom - (16 if compact else 22)
-        if rows_bottom <= rows_top:
-            return
-        rows_box = (
-            left + panel_padding,
-            rows_top,
-            right - panel_padding,
-            rows_bottom,
-        )
-        if compact or self._rows_need_compact(rows_box):
-            self._draw_compact_cards(draw, box=rows_box, cards=panel.cards)
-            return
-        self._draw_cards(draw, box=rows_box, cards=panel.cards)
+        _ = (draw, box, panel, compact)
+        return
 
     def _rows_need_compact(self, box: tuple[int, int, int, int]) -> bool:
         """Return whether the remaining status-card area is too small for a two-by-two grid."""
@@ -1504,10 +1541,15 @@ class HdmiDefaultSceneRenderer:
             return
         line_width = self._scaled_size(4, scale, minimum=2)
         if status == "waiting":
-            frame = animation_frame % 12
-            sway = (-2, -1, 0, 1, 2, 1, 0, -1, -2, -1, 0, 1)[frame]
-            smile_width = (26, 28, 30, 31, 30, 28, 26, 25, 26, 28, 30, 29)[frame]
-            smile_height = (14, 15, 17, 18, 17, 16, 15, 14, 15, 16, 18, 17)[frame]
+            if self._directional_face_cue_active(face_cue):
+                sway = 0
+                smile_width = 28
+                smile_height = 16
+            else:
+                frame = animation_frame % 12
+                sway = (-2, -1, 0, 1, 2, 1, 0, -1, -2, -1, 0, 1)[frame]
+                smile_width = (26, 28, 30, 31, 30, 28, 26, 25, 26, 28, 30, 29)[frame]
+                smile_height = (14, 15, 17, 18, 17, 16, 15, 14, 15, 16, 18, 17)[frame]
             draw.arc(
                 (
                     center_x - self._scaled_offset(smile_width, scale),
@@ -1799,24 +1841,27 @@ class HdmiDefaultSceneRenderer:
         *,
         face_cue: DisplayFaceCue | None = None,
     ) -> tuple[int, int]:
-        cue_driven_error = status == "error" and face_cue is not None and (
-            face_cue.gaze_x != 0 or face_cue.gaze_y != 0 or face_cue.head_dx != 0 or face_cue.head_dy != 0
-        )
+        directional_cue_active = self._directional_face_cue_active(face_cue)
+        cue_driven_error = status == "error" and directional_cue_active
         if status == "waiting":
             base = (
-                (0, 0),
-                (-1, 0),
-                (-2, 0),
-                (-1, 0),
-                (0, -1),
-                (0, 0),
-                (0, 1),
-                (0, 0),
-                (1, 0),
-                (2, 0),
-                (1, 0),
-                (0, 0),
-            )[animation_frame % 12]
+                (0, 0)
+                if directional_cue_active
+                else (
+                    (0, 0),
+                    (-1, 0),
+                    (-2, 0),
+                    (-1, 0),
+                    (0, -1),
+                    (0, 0),
+                    (0, 1),
+                    (0, 0),
+                    (1, 0),
+                    (2, 0),
+                    (1, 0),
+                    (0, 0),
+                )[animation_frame % 12]
+            )
         elif status == "listening":
             base = ((0, 0), (0, -1), (0, -1), (0, 0), (0, 1), (0, 0))[animation_frame % 6]
         elif status == "processing":
@@ -1847,9 +1892,8 @@ class HdmiDefaultSceneRenderer:
         face_cue: DisplayFaceCue | None = None,
     ) -> dict[str, object]:
         face_cue = self._effective_face_cue(status=status, face_cue=face_cue)
-        cue_driven_error = status == "error" and face_cue is not None and (
-            face_cue.gaze_x != 0 or face_cue.gaze_y != 0 or face_cue.head_dx != 0 or face_cue.head_dy != 0
-        )
+        directional_cue_active = self._directional_face_cue_active(face_cue)
+        cue_driven_error = status == "error" and directional_cue_active
         state: dict[str, object] = {
             "width": 56,
             "height": 74,
@@ -1865,12 +1909,17 @@ class HdmiDefaultSceneRenderer:
         }
 
         if status == "waiting":
-            frame = animation_frame % 12
-            # HDMI renders the face white-on-black, so calm idle motion reads
-            # best when the eye shape stays stable and only gaze/blink drift.
-            state["eye_shift_y"] = (-1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0)[frame]
-            state["highlight_dx"] = (-10, -8, -6, -3, 1, 5, 8, 5, 1, -3, -7, -9)[frame]
-            state["blink"] = frame == 9
+            if directional_cue_active:
+                state["eye_shift_y"] = 0
+                state["highlight_dx"] = -10
+                state["blink"] = False
+            else:
+                frame = animation_frame % 12
+                # HDMI renders the face white-on-black, so calm idle motion reads
+                # best when the eye shape stays stable and only gaze/blink drift.
+                state["eye_shift_y"] = (-1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0)[frame]
+                state["highlight_dx"] = (-10, -8, -6, -3, 1, 5, 8, 5, 1, -3, -7, -9)[frame]
+                state["blink"] = frame == 9
         elif status == "listening":
             frame = animation_frame % 6
             state["height"] = (78, 80, 82, 80, 78, 76)[frame]
@@ -1983,6 +2032,18 @@ class HdmiDefaultSceneRenderer:
             merged["brow_slant"] = 0
             merged["brow_style"] = "roof"
         return merged
+
+    def _directional_face_cue_active(self, face_cue: DisplayFaceCue | None) -> bool:
+        """Return whether the current face cue should dominate waiting idle motion."""
+
+        if face_cue is None:
+            return False
+        return (
+            face_cue.gaze_x != 0
+            or face_cue.gaze_y != 0
+            or face_cue.head_dx != 0
+            or face_cue.head_dy != 0
+        )
 
     def _scaled_offset(self, value: int | float, scale: float) -> int:
         return int(round(float(value) * scale))
