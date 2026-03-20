@@ -18,6 +18,7 @@ from twinr.memory.chonkydb import (
     ChonkyDBRecordItem,
     ChonkyDBRecordRequest,
     ChonkyDBRetrieveRequest,
+    ChonkyDBTopKRecordsRequest,
     chonkydb_data_path,
 )
 
@@ -169,6 +170,56 @@ class ChonkyDBClientTests(unittest.TestCase):
         self.assertEqual(request_body["query_text"], "medication reminder")
         self.assertEqual(request_body["allowed_indexes"], ["ccodex_memory_fulltext"])
         self.assertEqual(request_body["allowed_doc_ids"], ["doc-1", "doc-2"])
+
+    def test_topk_records_parses_structured_payloads_and_query_plan(self) -> None:
+        opener = FakeOpener()
+        opener.queue_json(
+            {
+                "success": True,
+                "mode": "advanced",
+                "results": [
+                    {
+                        "payload_id": "payload-1",
+                        "document_id": "doc-1",
+                        "relevance_score": 0.91,
+                        "source_index": "vector",
+                        "candidate_origin": "vector",
+                        "payload_source": "metadata.twinr_payload",
+                        "payload": {"memory_id": "fact:janina", "summary": "Janina is the user's wife."},
+                        "metadata": {"room": "kitchen"},
+                        "score_breakdown": {"vector": 0.91},
+                    }
+                ],
+                "indexes_used": ["ccodex_memory_vector_768"],
+                "scope_ref": "longterm:objects:current",
+                "query_plan": {"latency_ms": {"search": 12.4, "materialize": 1.3}},
+            }
+        )
+        client = ChonkyDBClient(
+            ChonkyDBConnectionConfig(base_url="https://memory.test"),
+            opener=opener,
+        )
+
+        response = client.topk_records(
+            ChonkyDBTopKRecordsRequest(
+                query_text="Janina",
+                result_limit=1,
+                namespace="test-namespace",
+                scope_ref="longterm:objects:current",
+            )
+        )
+
+        self.assertTrue(response.success)
+        self.assertEqual(response.results[0].document_id, "doc-1")
+        self.assertEqual(response.results[0].payload, {"memory_id": "fact:janina", "summary": "Janina is the user's wife."})
+        self.assertEqual(response.results[0].score_breakdown, {"vector": 0.91})
+        self.assertEqual(response.scope_ref, "longterm:objects:current")
+        self.assertEqual(response.query_plan, {"latency_ms": {"search": 12.4, "materialize": 1.3}})
+        request_body = json.loads(opener.calls[0]["body"])
+        self.assertEqual(opener.calls[0]["full_url"], "https://memory.test/v1/external/retrieve/topk_records")
+        self.assertEqual(request_body["namespace"], "test-namespace")
+        self.assertNotIn("allowed_doc_ids", request_body)
+        self.assertEqual(request_body["scope_ref"], "longterm:objects:current")
 
     def test_store_request_and_bulk_request_encode_cleanly(self) -> None:
         opener = FakeOpener()

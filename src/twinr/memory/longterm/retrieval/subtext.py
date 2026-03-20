@@ -8,13 +8,15 @@ Import ``LongTermSubtextBuilder`` from this module or via
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import json
 from json import JSONDecoder
 import logging
 import math
+from threading import RLock
 from typing import Any, Sequence
 
 from twinr.agent.base_agent.config import TwinrConfig
@@ -32,6 +34,7 @@ _FALLBACK_CONTEXT_SCHEMA = "twinr_silent_personalization_context_v1"
 
 # AUDIT-FIX(#8): Apply conservative caps to prompt-bound memory payloads so corrupted or oversized memories cannot explode latency/cost on the Pi.
 _DEFAULT_COMPILER_CACHE_MAX_ITEMS = 128
+_DEFAULT_COMPILER_IMMEDIATE_WAIT_S = 0.05
 _DEFAULT_PROMPT_STRING_MAX_CHARS = 480
 _DEFAULT_THREAD_TEXT_MAX_CHARS = 320
 _DEFAULT_COLLECTION_MAX_ITEMS = 32
@@ -353,12 +356,22 @@ class LongTermSubtextCompiler:
     config: TwinrConfig
     backend: Any | None = None
     _cache: OrderedDict[str, dict[str, object]] | None = None
+    _state_lock: RLock = field(default_factory=RLock, init=False, repr=False)
+    _compiler_executor: ThreadPoolExecutor | None = field(default=None, init=False, repr=False)
+    _pending_compiles: dict[str, Future[dict[str, object] | None]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Normalize externally supplied cache mappings into ``OrderedDict``."""
 
         if self._cache is not None and not isinstance(self._cache, OrderedDict):
             self._cache = OrderedDict(self._cache)
+        if self.backend is not None:
+            # AUDIT-FIX(#11): Compile subtext on one bounded worker so silent
+            # personalization never blocks the live reply path.
+            self._compiler_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="twinr-ltm-subtext",
+            )
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermSubtextCompiler":
@@ -459,6 +472,102 @@ class LongTermSubtextCompiler:
         if cached is not None:
             return cached
 
+        pending = self._ensure_pending_compile(
+            cache_key=cache_key,
+            query_text=safe_query_text,
+            retrieval_query_text=safe_retrieval_query_text,
+            payload=payload,
+            prompt_string_max_chars=prompt_string_max_chars,
+            collection_max_items=collection_max_items,
+        )
+        if pending is None:
+            return None
+        self._await_pending_compile(
+            cache_key=cache_key,
+            future=pending,
+            timeout_s=_DEFAULT_COMPILER_IMMEDIATE_WAIT_S,
+        )
+        return self._cache_get(cache_key)
+
+    def _ensure_pending_compile(
+        self,
+        *,
+        cache_key: str,
+        query_text: str,
+        retrieval_query_text: str,
+        payload: dict[str, object],
+        prompt_string_max_chars: int,
+        collection_max_items: int,
+    ) -> Future[dict[str, object] | None] | None:
+        self._drain_completed_compile(cache_key)
+        with self._state_lock:
+            pending = self._pending_compiles.get(cache_key)
+            if pending is not None:
+                return pending
+            if self._compiler_executor is None:
+                return None
+            future = self._compiler_executor.submit(
+                self._compile_payload,
+                query_text,
+                retrieval_query_text,
+                dict(payload),
+                prompt_string_max_chars,
+                collection_max_items,
+            )
+            self._pending_compiles[cache_key] = future
+            return future
+
+    def _await_pending_compile(
+        self,
+        *,
+        cache_key: str,
+        future: Future[dict[str, object] | None],
+        timeout_s: float,
+    ) -> None:
+        try:
+            compiled = future.result(timeout=max(0.0, float(timeout_s)))
+        except FutureTimeoutError:
+            return
+        except Exception:
+            self._drain_completed_compile(cache_key)
+            return
+        with self._state_lock:
+            self._pending_compiles.pop(cache_key, None)
+        self._finalize_compiled_program(cache_key=cache_key, compiled=compiled)
+
+    def _drain_completed_compile(self, cache_key: str) -> None:
+        with self._state_lock:
+            pending = self._pending_compiles.get(cache_key)
+            if pending is None or not pending.done():
+                return
+            self._pending_compiles.pop(cache_key, None)
+        try:
+            compiled = pending.result()
+        except Exception:
+            # AUDIT-FIX(#11): Keep compiler failures observable without blocking
+            # or crashing the live reply path.
+            _LOGGER.exception("Long-term subtext compilation failed; falling back to non-compiled subtext.")
+            compiled = None
+        self._finalize_compiled_program(cache_key=cache_key, compiled=compiled)
+
+    def _finalize_compiled_program(
+        self,
+        *,
+        cache_key: str,
+        compiled: dict[str, object] | None,
+    ) -> None:
+        if compiled is None:
+            return
+        self._cache_set(cache_key, compiled)
+
+    def _compile_payload(
+        self,
+        query_text: str,
+        retrieval_query_text: str,
+        payload: dict[str, object],
+        prompt_string_max_chars: int,
+        collection_max_items: int,
+    ) -> dict[str, object] | None:
         try:
             # AUDIT-FIX(#4): Mark persisted memory cues as untrusted data so stored text cannot override the compiler's task via prompt injection.
             compiled = request_structured_json_object(
@@ -478,8 +587,8 @@ class LongTermSubtextCompiler:
                     "Prefer role-grounded practical framing over generic social advice.\n"
                     "It is acceptable for the final answer to mention the practical domain implied by the role or relation, as long as it does not frame this as remembered hidden memory or biography.\n"
                     "Do not answer the user. Do not invent facts. Do not add contact details unless the current query requires exact lookup.\n"
-                    f"Original user query: {safe_query_text}\n"
-                    f"Canonical retrieval query: {safe_retrieval_query_text}\n"
+                    f"Original user query: {query_text}\n"
+                    f"Canonical retrieval query: {retrieval_query_text}\n"
                     "Relevant long-term memory cues JSON:\n"
                     f"{_safe_json_dumps(payload, indent=2, sort_keys=True, string_max_chars=prompt_string_max_chars, collection_max_items=collection_max_items)}"
                 ),
@@ -561,41 +670,44 @@ class LongTermSubtextCompiler:
         if normalized_compiled is None:
             _LOGGER.warning("Long-term subtext compiler returned an invalid payload; falling back to non-compiled subtext.")
             return None
-
-        self._cache_set(cache_key, normalized_compiled)
-        return _deepcopy_program(normalized_compiled)
+        return normalized_compiled
 
     def _cache_get(self, cache_key: str) -> dict[str, object] | None:
         """Return a detached cached program and refresh its LRU position."""
 
-        if self._cache is None:
-            return None
-        cached = self._cache.get(cache_key)
-        if cached is None:
-            return None
-        # AUDIT-FIX(#1): Move-to-end and deep-copy cached programs so cache remains bounded and requests cannot mutate shared state.
-        self._cache.move_to_end(cache_key)
-        return _deepcopy_program(cached)
+        with self._state_lock:
+            if self._cache is None:
+                return None
+            cached = self._cache.get(cache_key)
+            if cached is None:
+                return None
+            # AUDIT-FIX(#1): Move-to-end and deep-copy cached programs so cache remains bounded and requests cannot mutate shared state.
+            self._cache.move_to_end(cache_key)
+            return _deepcopy_program(cached)
 
     def _cache_set(self, cache_key: str, value: dict[str, object]) -> None:
         """Store a detached compiled program in the bounded LRU cache."""
 
-        if self._cache is None:
-            return
-        max_items = _get_config_int(
-            self.config,
-            "long_term_memory_subtext_compiler_cache_max_items",
-            _DEFAULT_COMPILER_CACHE_MAX_ITEMS,
-            minimum=0,
-            maximum=4096,
-        )
-        if max_items <= 0:
-            self._cache.clear()
-            return
-        self._cache[cache_key] = _deepcopy_program(value)
-        self._cache.move_to_end(cache_key)
-        while len(self._cache) > max_items:
-            self._cache.popitem(last=False)
+        with self._state_lock:
+            if self._cache is None:
+                return
+            max_items = _get_config_int(
+                self.config,
+                "long_term_memory_subtext_compiler_cache_max_items",
+                _DEFAULT_COMPILER_CACHE_MAX_ITEMS,
+                minimum=0,
+                maximum=4096,
+            )
+            if max_items <= 0:
+                self._cache.clear()
+                return
+            self._cache[cache_key] = _deepcopy_program(value)
+            self._cache.move_to_end(cache_key)
+            while len(self._cache) > max_items:
+                evicted_key, _ = self._cache.popitem(last=False)
+                pending = self._pending_compiles.pop(evicted_key, None)
+                if pending is not None and not pending.done():
+                    pending.cancel()
 
 
 @dataclass(frozen=True, slots=True)

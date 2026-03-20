@@ -33,6 +33,7 @@ from twinr.hardware.respeaker import (
     resolve_respeaker_indicator_state,
     ScheduledReSpeakerSignalProvider,
 )
+from twinr.hardware.portrait_match import PortraitMatchProvider
 from twinr.hardware.respeaker.signal_provider import ReSpeakerSignalProvider
 from twinr.ops.paths import resolve_ops_paths_for_config
 from twinr.providers.openai import OpenAIBackend
@@ -57,6 +58,15 @@ from .ambiguous_room_guard import (
     AmbiguousRoomGuardSnapshot,
     derive_ambiguous_room_guard,
 )
+from .display_attention import DisplayAttentionCuePublisher
+from .display_attention import (
+    display_attention_refresh_supported,
+    resolve_display_attention_refresh_interval,
+)
+from .identity_fusion import (
+    MultimodalIdentityFusionSnapshot,
+    TemporalIdentityFusionTracker,
+)
 from .audio_policy import ReSpeakerAudioPolicySnapshot, ReSpeakerAudioPolicyTracker
 from .known_user_hint import KnownUserHintSnapshot, derive_known_user_hint
 from .multimodal_initiative import (
@@ -64,6 +74,7 @@ from .multimodal_initiative import (
     derive_respeaker_multimodal_initiative,
 )
 from .presence import PresenceSessionController, PresenceSessionSnapshot
+from .portrait_match import PortraitMatchSnapshot, derive_portrait_match
 from .runtime_contract import (
     ReSpeakerRuntimeContractError,
     assess_respeaker_monitor_startup_contract,
@@ -84,6 +95,7 @@ _VISION_REVIEW_FAIL_OPEN_TRIGGERS = _WAKEWORD_SUPPRESSION_EXEMPT_TRIGGERS
 _MAX_WAKEWORD_STREAM_EVENTS_PER_CYCLE = 8
 _DEFAULT_CLOSE_JOIN_TIMEOUT_S = 5.0
 _MAX_CAPTURE_PHRASE_TOKEN_LEN = 64
+_DISPLAY_ATTENTION_ACTIVE_RUNTIME_STATES = frozenset({"waiting", "listening", "processing", "answering"})
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -166,6 +178,18 @@ def _normalize_text_tuple(values: Any) -> tuple[str, ...]:
         if text:
             normalized.append(text)
     return tuple(normalized)
+
+
+def _resolve_openwakeword_inference_framework(*, models: tuple[str, ...], configured: str) -> str:
+    """Pick the framework that matches the configured local openWakeWord models."""
+
+    normalized_models = tuple(model.strip().lower() for model in models if model.strip())
+    normalized_framework = (configured or "tflite").strip().lower() or "tflite"
+    if normalized_models and all(model.endswith(".onnx") for model in normalized_models):
+        return "onnx"
+    if normalized_models and all(model.endswith(".tflite") for model in normalized_models):
+        return "tflite"
+    return normalized_framework
 
 
 def _round_optional_seconds(value: float | None) -> float | None:
@@ -412,9 +436,11 @@ class ProactiveCoordinator:
         wakeword_stream: OpenWakeWordStreamingMonitor | None = None,
         wakeword_policy: WakewordDecisionPolicy | None = None,
         vision_reviewer: OpenAIProactiveVisionReviewer | None = None,
+        portrait_match_provider: PortraitMatchProvider | None = None,
         wakeword_handler: Callable[[WakewordMatch], bool] | None = None,
         idle_predicate: Callable[[], bool] | None = None,
         observation_handler: Callable[[dict[str, Any], tuple[str, ...]], None] | None = None,
+        display_attention_publisher: DisplayAttentionCuePublisher | None = None,
         emit: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         audio_observer_fallback_factory: Callable[[], Any] | None = None,
@@ -435,9 +461,13 @@ class ProactiveCoordinator:
         self.wakeword_stream = wakeword_stream
         self.wakeword_policy = wakeword_policy
         self.vision_reviewer = vision_reviewer
+        self.portrait_match_provider = portrait_match_provider
         self.wakeword_handler = wakeword_handler
         self.idle_predicate = idle_predicate
         self.observation_handler = observation_handler
+        self.display_attention_publisher = display_attention_publisher or DisplayAttentionCuePublisher.from_config(
+            config
+        )
         self.emit = emit or (lambda _line: None)
         self.clock = clock
         self._normalized_wakeword_backend = normalize_wakeword_backend(
@@ -446,6 +476,7 @@ class ProactiveCoordinator:
         )
         self._last_motion_at: float | None = None
         self._last_capture_at: float | None = None
+        self._last_display_attention_refresh_at: float | None = None
         self._last_observation_key: tuple[object, ...] | None = None
         self._camera_surface = ProactiveCameraSurface.from_config(config)
         self._last_sensor_flags: dict[str, bool] = {}
@@ -465,9 +496,12 @@ class ProactiveCoordinator:
         self.latest_speaker_association_snapshot: ReSpeakerSpeakerAssociationSnapshot | None = None
         self.latest_multimodal_initiative_snapshot: ReSpeakerMultimodalInitiativeSnapshot | None = None
         self.latest_ambiguous_room_guard_snapshot: AmbiguousRoomGuardSnapshot | None = None
+        self.latest_identity_fusion_snapshot: MultimodalIdentityFusionSnapshot | None = None
+        self.latest_portrait_match_snapshot: PortraitMatchSnapshot | None = None
         self.latest_known_user_hint_snapshot: KnownUserHintSnapshot | None = None
         self.latest_affect_proxy_snapshot: AffectProxySnapshot | None = None
         self.audio_policy_tracker = ReSpeakerAudioPolicyTracker.from_config(config)
+        self.identity_fusion_tracker = TemporalIdentityFusionTracker.from_config(config)
 
     # AUDIT-FIX(#1): Route all module-local emits through a non-throwing wrapper.
     def _emit(self, line: str) -> None:
@@ -1451,6 +1485,61 @@ class ProactiveCoordinator:
             return False
         return True
 
+    def refresh_display_attention(self) -> bool:
+        """Refresh HDMI attention-follow from the local camera outside PIR-gated ticks."""
+
+        if not display_attention_refresh_supported(
+            config=self.config,
+            vision_observer=self.vision_observer,
+        ):
+            return False
+        now = self.clock()
+        interval_s = resolve_display_attention_refresh_interval(self.config)
+        if interval_s is None:
+            return False
+        if (
+            self._last_display_attention_refresh_at is not None
+            and (now - self._last_display_attention_refresh_at) < interval_s
+        ):
+            return False
+        try:
+            runtime_status_value = self.runtime.status.value
+        except Exception as exc:
+            self._record_fault(
+                event="proactive_display_attention_runtime_status_failed",
+                message="Failed to read runtime status for HDMI attention refresh.",
+                error=exc,
+            )
+            return False
+        if runtime_status_value not in _DISPLAY_ATTENTION_ACTIVE_RUNTIME_STATES:
+            return False
+        audio_snapshot = self._observe_audio_safe()
+        audio_policy_snapshot = self._observe_audio_policy(
+            now=now,
+            audio_observation=audio_snapshot.observation,
+        )
+        snapshot = self._observe_vision_safe()
+        if snapshot is None:
+            return False
+        self._last_display_attention_refresh_at = now
+        self._record_vision_snapshot_safe(snapshot)
+        observation = SocialObservation(
+            observed_at=now,
+            inspected=True,
+            pir_motion_detected=False,
+            low_motion=False,
+            vision=snapshot.observation,
+            audio=audio_snapshot.observation,
+        )
+        camera_update = self._observe_camera_surface(observation, inspected=True)
+        self._update_display_attention_follow(
+            observed_at=now,
+            camera_snapshot=camera_update.snapshot,
+            audio_observation=audio_snapshot.observation,
+            audio_policy_snapshot=audio_policy_snapshot,
+        )
+        return True
+
     def _is_low_motion(self, now: float, *, motion_active: bool) -> bool:
         """Return whether recent PIR history qualifies as low motion."""
 
@@ -1557,6 +1646,12 @@ class ProactiveCoordinator:
             None if self.latest_multimodal_initiative_snapshot is None else self.latest_multimodal_initiative_snapshot.block_reason,
             None if self.latest_ambiguous_room_guard_snapshot is None else self.latest_ambiguous_room_guard_snapshot.guard_active,
             None if self.latest_ambiguous_room_guard_snapshot is None else self.latest_ambiguous_room_guard_snapshot.reason,
+            None if self.latest_identity_fusion_snapshot is None else self.latest_identity_fusion_snapshot.state,
+            None if self.latest_identity_fusion_snapshot is None else self.latest_identity_fusion_snapshot.matches_main_user,
+            None if self.latest_identity_fusion_snapshot is None else self.latest_identity_fusion_snapshot.claim.confidence,
+            None if self.latest_portrait_match_snapshot is None else self.latest_portrait_match_snapshot.state,
+            None if self.latest_portrait_match_snapshot is None else self.latest_portrait_match_snapshot.matches_reference_user,
+            None if self.latest_portrait_match_snapshot is None else self.latest_portrait_match_snapshot.claim.confidence,
             None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.state,
             None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.matches_main_user,
             None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.claim.confidence,
@@ -1616,6 +1711,10 @@ class ProactiveCoordinator:
             data.update(self.latest_multimodal_initiative_snapshot.event_data())
         if self.latest_ambiguous_room_guard_snapshot is not None:
             data.update(self.latest_ambiguous_room_guard_snapshot.event_data())
+        if self.latest_identity_fusion_snapshot is not None:
+            data.update(self.latest_identity_fusion_snapshot.event_data())
+        if self.latest_portrait_match_snapshot is not None:
+            data.update(self.latest_portrait_match_snapshot.event_data())
         if self.latest_known_user_hint_snapshot is not None:
             data.update(self.latest_known_user_hint_snapshot.event_data())
         if self.latest_affect_proxy_snapshot is not None:
@@ -2187,10 +2286,16 @@ class ProactiveCoordinator:
     ) -> None:
         """Publish one normalized observation to the automation observer hook."""
 
-        if self.observation_handler is None:
-            return
         try:
             camera_update = self._observe_camera_surface(observation, inspected=inspected)
+            self._update_display_attention_follow(
+                observed_at=observation.observed_at,
+                camera_snapshot=camera_update.snapshot,
+                audio_observation=observation.audio,
+                audio_policy_snapshot=audio_policy_snapshot,
+            )
+            if self.observation_handler is None:
+                return
             facts = self._build_automation_facts(
                 observation,
                 inspected=inspected,
@@ -2206,6 +2311,47 @@ class ProactiveCoordinator:
                 event="proactive_observation_handler_failed",
                 message="Automation observation dispatch failed.",
                 error=exc,
+            )
+
+    def _update_display_attention_follow(
+        self,
+        *,
+        observed_at: float,
+        camera_snapshot: ProactiveCameraSnapshot,
+        audio_observation,
+        audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
+    ) -> None:
+        """Update the HDMI face so it calmly follows the visible primary person."""
+
+        publisher = self.display_attention_publisher
+        if publisher is None:
+            return
+        live_facts = {
+            "camera": camera_snapshot.to_automation_facts(),
+            "vad": {
+                "speech_detected": getattr(audio_observation, "speech_detected", None),
+            },
+            "respeaker": {
+                "azimuth_deg": getattr(audio_observation, "azimuth_deg", None),
+                "direction_confidence": getattr(audio_observation, "direction_confidence", None),
+            },
+            "audio_policy": {
+                "speaker_direction_stable": (
+                    None if audio_policy_snapshot is None else audio_policy_snapshot.speaker_direction_stable
+                ),
+            },
+        }
+        try:
+            publisher.publish_from_facts(
+                config=self.config,
+                live_facts=live_facts,
+            )
+        except Exception as exc:
+            self._record_fault(
+                event="proactive_display_attention_follow_failed",
+                message="Failed to update the HDMI face attention-follow cue.",
+                error=exc,
+                data={"observed_at": observed_at},
             )
 
     def _observe_camera_surface(
@@ -2356,6 +2502,29 @@ class ProactiveCoordinator:
             observed_at=now,
             live_facts=facts,
         )
+        portrait_match = derive_portrait_match(
+            observed_at=now,
+            live_facts=facts,
+            provider=self.portrait_match_provider,
+            ambiguous_room_guard=ambiguous_room_guard,
+            now_monotonic=now,
+        )
+        presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
+        identity_fusion = self.identity_fusion_tracker.observe(
+            observed_at=now,
+            live_facts=facts,
+            voice_status=getattr(self.runtime, "user_voice_status", None),
+            voice_confidence=getattr(self.runtime, "user_voice_confidence", None),
+            voice_checked_at=getattr(self.runtime, "user_voice_checked_at", None),
+            voice_matched_user_id=getattr(self.runtime, "user_voice_user_id", None),
+            voice_matched_user_display_name=getattr(self.runtime, "user_voice_user_display_name", None),
+            voice_match_source=getattr(self.runtime, "user_voice_match_source", None),
+            max_voice_age_s=int(getattr(self.config, "voice_assessment_max_age_s", 120) or 120),
+            presence_session_id=presence_session_id,
+            ambiguous_room_guard=ambiguous_room_guard,
+            speaker_association=speaker_association,
+            portrait_match=portrait_match,
+        )
         known_user_hint = derive_known_user_hint(
             observed_at=now,
             live_facts=facts,
@@ -2365,6 +2534,8 @@ class ProactiveCoordinator:
             max_voice_age_s=int(getattr(self.config, "voice_assessment_max_age_s", 120) or 120),
             ambiguous_room_guard=ambiguous_room_guard,
             speaker_association=speaker_association,
+            portrait_match=portrait_match,
+            identity_fusion=identity_fusion,
         )
         affect_proxy = derive_affect_proxy(
             observed_at=now,
@@ -2372,11 +2543,15 @@ class ProactiveCoordinator:
             ambiguous_room_guard=ambiguous_room_guard,
         )
         self.latest_ambiguous_room_guard_snapshot = ambiguous_room_guard
+        self.latest_identity_fusion_snapshot = identity_fusion
+        self.latest_portrait_match_snapshot = portrait_match
         self.latest_known_user_hint_snapshot = known_user_hint
         self.latest_affect_proxy_snapshot = affect_proxy
         facts["speaker_association"] = speaker_association.to_automation_facts()
         facts["multimodal_initiative"] = multimodal_initiative.to_automation_facts()
         facts["ambiguous_room_guard"] = ambiguous_room_guard.to_automation_facts()
+        facts["identity_fusion"] = identity_fusion.to_automation_facts()
+        facts["portrait_match"] = portrait_match.to_automation_facts()
         facts["known_user_hint"] = known_user_hint.to_automation_facts()
         facts["affect_proxy"] = affect_proxy.to_automation_facts()
         return facts
@@ -2400,6 +2575,8 @@ class ProactiveCoordinator:
             "speaker_association.associated": bool(facts["speaker_association"]["associated"]),
             "multimodal_initiative.ready": bool(facts["multimodal_initiative"]["ready"]),
             "ambiguous_room_guard.guard_active": bool(facts["ambiguous_room_guard"]["guard_active"]),
+            "identity_fusion.matches_main_user": bool(facts["identity_fusion"]["matches_main_user"]),
+            "portrait_match.matches_reference_user": bool(facts["portrait_match"]["matches_reference_user"]),
             "known_user_hint.matches_main_user": bool(facts["known_user_hint"]["matches_main_user"]),
             "affect_proxy.concern_cue": facts["affect_proxy"]["state"] == "concern_cue",
         }
@@ -2617,6 +2794,7 @@ class ProactiveMonitorService:
         """Run the wakeword drain and proactive tick loop until stopped."""
 
         next_tick_at = 0.0
+        next_attention_refresh_at = 0.0
         try:
             while not self._stop_event.is_set():
                 did_work = False
@@ -2635,6 +2813,25 @@ class ProactiveMonitorService:
                         data={"error": error_text},
                     )
                 now = time.monotonic()
+                if now >= next_attention_refresh_at:
+                    try:
+                        if self.coordinator.refresh_display_attention():
+                            did_work = True
+                    except Exception as exc:
+                        error_text = _exception_text(exc)
+                        self._emit(f"proactive_error={error_text}")
+                        self._append_ops_event(
+                            event="proactive_error",
+                            level="error",
+                            message="Display attention refresh failed.",
+                            data={"error": error_text},
+                        )
+                    interval_s = resolve_display_attention_refresh_interval(self.coordinator.config)
+                    next_attention_refresh_at = (
+                        time.monotonic() + interval_s
+                        if interval_s is not None
+                        else time.monotonic() + self.poll_interval_s
+                    )
                 if now >= next_tick_at:
                     try:
                         self.coordinator.tick()
@@ -2946,6 +3143,22 @@ def build_default_proactive_monitor(
                 detail=f"Buffered vision reviewer initialization failed: {_exception_text(exc)}",
             )
 
+    portrait_match_provider = None
+    if config.proactive_enabled and getattr(config, "portrait_match_enabled", True):
+        try:
+            portrait_match_provider = PortraitMatchProvider.from_config(
+                config,
+                camera=camera,
+                camera_lock=camera_lock,
+            )
+        except Exception as exc:
+            _record_component_warning(
+                runtime=runtime,
+                emit=emit,
+                reason="portrait_match_provider_init_failed",
+                detail=f"Local portrait-match provider initialization failed: {_exception_text(exc)}",
+            )
+
     if (
         pir_monitor is None
         and wakeword_stream is None
@@ -2975,6 +3188,7 @@ def build_default_proactive_monitor(
         wakeword_stream=wakeword_stream,
         wakeword_policy=wakeword_policy,
         vision_reviewer=vision_reviewer,
+        portrait_match_provider=portrait_match_provider,
         wakeword_handler=wakeword_handler,
         pir_monitor=pir_monitor,
         idle_predicate=idle_predicate,
@@ -3025,7 +3239,7 @@ def _build_wakeword_policy(
     if config.wakeword_verifier_mode != "disabled":
         verifier = SttWakewordVerifier(
             backend=backend,
-            phrases=config.wakeword_phrases,
+            phrases=config.wakeword_stt_phrases,
             language=config.openai_realtime_language,
         )
     return WakewordDecisionPolicy(
@@ -3047,6 +3261,10 @@ def _build_openwakeword_stream(
     """Build the streaming openWakeWord monitor when runtime constraints match."""
 
     models = _normalize_text_tuple(config.wakeword_openwakeword_models)
+    inference_framework = _resolve_openwakeword_inference_framework(
+        models=models,
+        configured=config.wakeword_openwakeword_inference_framework,
+    )
     if config.audio_sample_rate != 16000 or config.audio_channels != 1:
         _record_wakeword_backend_warning(
             runtime=runtime,
@@ -3084,13 +3302,15 @@ def _build_openwakeword_stream(
             spotter=WakewordOpenWakeWordFrameSpotter(
                 wakeword_models=models,
                 phrases=config.wakeword_phrases,
+                custom_verifier_models=dict(config.wakeword_openwakeword_custom_verifier_models),
+                custom_verifier_threshold=config.wakeword_openwakeword_custom_verifier_threshold,
                 threshold=config.wakeword_openwakeword_threshold,
                 vad_threshold=config.wakeword_openwakeword_vad_threshold,
                 patience_frames=config.wakeword_openwakeword_patience_frames,
                 activation_samples=config.wakeword_openwakeword_activation_samples,
                 deactivation_threshold=config.wakeword_openwakeword_deactivation_threshold,
                 enable_speex_noise_suppression=config.wakeword_openwakeword_enable_speex,
-                inference_framework=config.wakeword_openwakeword_inference_framework,
+                inference_framework=inference_framework,
             ),
             attempt_cooldown_s=config.wakeword_attempt_cooldown_s,
             speech_threshold=config.audio_speech_threshold,
@@ -3128,6 +3348,10 @@ def _build_wakeword_spotter(
     )
     if selected_backend == "openwakeword":
         models = _normalize_text_tuple(config.wakeword_openwakeword_models)
+        inference_framework = _resolve_openwakeword_inference_framework(
+            models=models,
+            configured=config.wakeword_openwakeword_inference_framework,
+        )
         if not models:
             _record_wakeword_backend_warning(
                 runtime=runtime,
@@ -3144,13 +3368,15 @@ def _build_wakeword_spotter(
                 return WakewordOpenWakeWordSpotter(
                     wakeword_models=models,
                     phrases=config.wakeword_phrases,
+                    custom_verifier_models=dict(config.wakeword_openwakeword_custom_verifier_models),
+                    custom_verifier_threshold=config.wakeword_openwakeword_custom_verifier_threshold,
                     threshold=config.wakeword_openwakeword_threshold,
                     vad_threshold=config.wakeword_openwakeword_vad_threshold,
                     patience_frames=config.wakeword_openwakeword_patience_frames,
                     activation_samples=config.wakeword_openwakeword_activation_samples,
                     deactivation_threshold=config.wakeword_openwakeword_deactivation_threshold,
                     enable_speex_noise_suppression=config.wakeword_openwakeword_enable_speex,
-                    inference_framework=config.wakeword_openwakeword_inference_framework,
+                    inference_framework=inference_framework,
                     backend=None,
                     language=config.openai_realtime_language,
                     transcribe_on_detect=False,
@@ -3169,7 +3395,7 @@ def _build_wakeword_spotter(
         return None
     return WakewordPhraseSpotter(
         backend=backend,
-        phrases=config.wakeword_phrases,
+        phrases=config.wakeword_stt_phrases,
         language=config.openai_realtime_language,
     )
 

@@ -66,8 +66,14 @@ Twinr now also uses explicit runtime contract surfaces around these signals:
 
 - `ambiguous_room_guard`
   - fail-closed gate for person-targeted inference when room context is missing, multi-person, noisy, or direction-ambiguous
+- `portrait_match`
+  - conservative local face-match hint against the enrolled local portrait store, valid only for calm personalization and always confirm-first
+- `identity_fusion`
+  - bounded temporal/session fusion over portrait, enrolled household voice candidates, visual-anchor history, and presence-session memory, still confirm-first and never identity proof
 - `known_user_hint`
-  - conservative voice-profile-plus-room-context hint for calm personalization only, never identity proof
+  - conservative voice-plus-portrait-plus-room-context hint with optional temporal identity fusion over visual-anchor history and presence-session memory for calm personalization only, never identity proof
+- `household identity manager`
+  - shared local tool/runtime layer for face enrollment, voice enrollment, explicit confirm or deny feedback, quality scoring, and bounded local household identity status
 - `affect_proxy`
   - prompt-only coarse cue such as `positive_contact`, `low_engagement`, or `concern_cue`, never emotion fact
 
@@ -105,7 +111,7 @@ This table is the target field for the existing hardware only.
 | `document_or_object_presented_for_reading` | Camera | Medium | Prompt | Good when the user intentionally holds something up. |
 | `routine_deviation_over_time` | PIR + audio + camera + memory | Medium | Prompt | Needs longitudinal memory, not single-frame analysis. |
 | `sad` / `lonely` / `confused` / `in pain` | Camera + audio | No | Never | Not defensible from the current sensor stack. |
-| `same person as reference photo` | Camera | Low | Review only | Current model path is too weak and policy-sensitive for identity assertions. |
+| `same enrolled user as local portrait store` | Camera + history | Low to Medium | Review only | Better with multiple local references and temporal fusion, still not safe as identity proof. |
 | `medical event` | Camera + audio + PIR | No | Never | Twinr may detect concern, not diagnose. |
 
 ## What Is Realistically Worth Building Next

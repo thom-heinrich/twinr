@@ -1,4 +1,4 @@
-"""Capture bounded still photos from V4L2 cameras.
+"""Capture bounded still photos from local camera devices.
 
 This module wraps ``ffmpeg`` for Twinr's camera use cases, normalizes failures
 into user-safe exceptions, and optionally confines persisted photos to an
@@ -24,6 +24,11 @@ _DEFAULT_CAPTURE_TIMEOUT_SECONDS = 10.0
 _DEFAULT_CAPTURE_FILENAME = "camera-capture.png"
 _MAX_ERROR_TEXT_LENGTH = 512
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_RPICAM_STILL_BINARY = "rpicam-still"
+_RPICAM_STILL_INPUT_FORMAT = "rpicam-still"
+_RPICAM_STILL_MIN_TIMEOUT_MS = 1000
+_RPICAM_STILL_MAX_TIMEOUT_MS = 5000
+_UNICAM_IMAGE_MARKER = "unicam-image"
 
 
 class CameraError(RuntimeError):  # AUDIT-FIX(#6): Use structured camera exceptions so callers can recover differently from config, timeout, and capture failures.
@@ -64,7 +69,13 @@ class CapturedPhoto:
 
 
 class V4L2StillCamera:
-    """Capture one still frame from a V4L2 device via ``ffmpeg``."""
+    """Capture one still frame from a local camera device.
+
+    The primary path uses bounded ``ffmpeg`` reads from one configured V4L2
+    device. On Raspberry Pi CSI camera nodes backed by ``unicam-image``, this
+    adapter can fall back to ``rpicam-still`` when the V4L2 node is busy or
+    stalls even though the libcamera stack is healthy.
+    """
 
     _device_locks: ClassVar[dict[str, threading.Lock]] = {}  # AUDIT-FIX(#2): Serialize access per device across all instances in this process to avoid V4L2 EBUSY races.
     _device_locks_guard: ClassVar[threading.Lock] = threading.Lock()  # AUDIT-FIX(#2): Protect lock creation so concurrent constructors do not race and create duplicate locks.
@@ -154,6 +165,7 @@ class V4L2StillCamera:
 
         attempted_formats = tuple(self._candidate_input_formats())
         errors: list[str] = []
+        timeout_error: CameraCaptureTimeoutError | None = None
         with self._capture_lock:
             for candidate in attempted_formats:
                 label = candidate or "default"
@@ -166,13 +178,15 @@ class V4L2StillCamera:
                         timeout=self.capture_timeout_seconds,
                     )
                 except subprocess.TimeoutExpired as exc:
-                    raise CameraCaptureTimeoutError(
+                    timeout_error = CameraCaptureTimeoutError(
                         (
                             f"Camera capture timed out for {self.device} using format {label} "
                             f"after {self.capture_timeout_seconds:.1f}s"
                         ),
                         user_safe_message="The camera took too long to respond. Please try again.",
-                    ) from exc
+                    )
+                    errors.append(f"{label}: timeout after {self.capture_timeout_seconds:.1f}s")
+                    break
                 except OSError as exc:
                     raise CameraCaptureFailedError(
                         f"Unable to execute ffmpeg for camera capture: {exc}",
@@ -196,11 +210,138 @@ class V4L2StillCamera:
                     stderr = "ffmpeg returned non-PNG bytes"
                 errors.append(f"{label}: {stderr}")
 
+            should_try_rpicam = self._should_try_rpicam_still(errors)
+            fallback_capture = self._maybe_capture_with_rpicam_still(
+                safe_filename=safe_filename,
+                output_path=output_path,
+                errors=errors,
+            )
+            if fallback_capture is not None:
+                return fallback_capture
+            if timeout_error is not None and (not should_try_rpicam or shutil.which(_RPICAM_STILL_BINARY) is None):
+                raise timeout_error
+
         candidates = ", ".join(fmt or "default" for fmt in attempted_formats)
         raise CameraCaptureFailedError(
             f"Camera capture failed for {self.device} with formats [{candidates}]: {' | '.join(errors)}",
             user_safe_message="The camera could not take a photo right now. Please try again.",
         )
+
+    def _maybe_capture_with_rpicam_still(
+        self,
+        *,
+        safe_filename: str,
+        output_path: str | Path | None,
+        errors: Sequence[str],
+    ) -> CapturedPhoto | None:
+        """Try the Pi libcamera still path after a failed V4L2 attempt."""
+
+        if not self._should_try_rpicam_still(errors):
+            return None
+
+        binary = shutil.which(_RPICAM_STILL_BINARY)
+        if binary is None:
+            return None
+
+        temp_path: str | None = None
+        try:
+            fd, temp_path = tempfile.mkstemp(prefix=".camera-rpicam-", suffix=".png")
+            os.close(fd)
+            timeout_ms = self._rpicam_still_timeout_ms()
+            result = subprocess.run(
+                [
+                    binary,
+                    "-v",
+                    "0",
+                    "--nopreview",
+                    "--immediate",
+                    "--timeout",
+                    f"{timeout_ms}ms",
+                    "--width",
+                    str(self.width),
+                    "--height",
+                    str(self.height),
+                    "--encoding",
+                    "png",
+                    "--output",
+                    temp_path,
+                ],
+                check=False,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=max(self.capture_timeout_seconds, 3.0),
+            )
+            if result.returncode != 0:
+                stderr = self._summarize_process_error(result.stderr)
+                errors_text = " | ".join(errors)
+                raise CameraCaptureFailedError(
+                    f"Pi camera fallback failed for {self.device}: {stderr}; prior_v4l2_errors={errors_text}",
+                    user_safe_message="The camera could not take a photo right now. Please try again.",
+                )
+            data = Path(temp_path).read_bytes()
+            if not self._is_png_bytes(data):
+                raise CameraCaptureFailedError(
+                    f"Pi camera fallback returned non-PNG bytes for {self.device}",
+                    user_safe_message="The camera could not take a photo right now. Please try again.",
+                )
+            capture = CapturedPhoto(
+                data=data,
+                content_type="image/png",
+                filename=safe_filename,
+                source_device=self.device,
+                input_format=_RPICAM_STILL_INPUT_FORMAT,
+            )
+            if output_path is not None:
+                self._write_output_file(output_path, safe_filename, capture.data)
+            return capture
+        except subprocess.TimeoutExpired as exc:
+            raise CameraCaptureTimeoutError(
+                f"Pi camera fallback timed out for {self.device} after {self.capture_timeout_seconds:.1f}s",
+                user_safe_message="The camera took too long to respond. Please try again.",
+            ) from exc
+        except OSError as exc:
+            raise CameraCaptureFailedError(
+                f"Pi camera fallback could not read captured output for {self.device}: {exc}",
+                user_safe_message="The camera could not take a photo right now. Please try again.",
+            ) from exc
+        finally:
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+
+    def _should_try_rpicam_still(self, errors: Sequence[str]) -> bool:
+        """Return whether the Pi libcamera fallback is appropriate here."""
+
+        if not errors:
+            return False
+        if not any("resource busy" in error.casefold() or "timeout" in error.casefold() for error in errors):
+            return False
+        if Path(self.device).name != "video0":
+            return False
+        return self._device_sysfs_name().casefold() == _UNICAM_IMAGE_MARKER
+
+    def _device_sysfs_name(self) -> str:
+        """Return the current V4L2 sysfs node name, if available."""
+
+        node_name = Path(self.device).name
+        try:
+            return (
+                Path("/sys/class/video4linux") / node_name / "name"
+            ).read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def _rpicam_still_timeout_ms(self) -> int:
+        """Return one bounded preview timeout for immediate Pi still capture."""
+
+        timeout_ms = int(self.capture_timeout_seconds * 1000.0)
+        if timeout_ms < _RPICAM_STILL_MIN_TIMEOUT_MS:
+            return _RPICAM_STILL_MIN_TIMEOUT_MS
+        if timeout_ms > _RPICAM_STILL_MAX_TIMEOUT_MS:
+            return _RPICAM_STILL_MAX_TIMEOUT_MS
+        return timeout_ms
 
     def _candidate_input_formats(self) -> Sequence[str | None]:
         if self.input_format:

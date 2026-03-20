@@ -622,6 +622,29 @@ class LongTermMemoryService:
             return LongTermRemoteStatus(mode="disabled", ready=False)
         return remote_state.status()
 
+    @contextmanager
+    def _temporary_remote_probe_cache(self) -> Iterator[None]:
+        """Reuse identical remote snapshot probes within one foreground turn."""
+
+        with self._cache_remote_probe_reads():
+            yield
+
+    def prewarm_foreground_read_cache(self) -> None:
+        """Warm remote-backed read caches for the first foreground text turn.
+
+        This keeps startup strictly query-agnostic and bounded. Remote object
+        and conflict retrieval now uses one-shot scope queries on demand, so
+        channel startup must not block on hydrating current remote catalogs.
+        """
+        with self._store_lock:
+            with self._temporary_remote_probe_cache():
+                load_packets = getattr(self.midterm_store, "load_packets", None)
+                if callable(load_packets):
+                    load_packets()
+                load_document = getattr(self.graph_store, "load_document", None)
+                if callable(load_document):
+                    load_document()
+
     def build_provider_context(self, query_text: str | None) -> LongTermMemoryContext:
         """Build the normal long-term context injected into provider prompts.
 
@@ -640,10 +663,11 @@ class LongTermMemoryService:
         try:
             query = self.query_rewriter.profile(query_text)
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
-                return self.retriever.build_context(
-                    query=query,
-                    original_query_text=query_text,
-                )
+                with self._temporary_remote_probe_cache():
+                    return self.retriever.build_context(
+                        query=query,
+                        original_query_text=query_text,
+                    )
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
@@ -668,54 +692,55 @@ class LongTermMemoryService:
         try:
             query = self.query_rewriter.profile(query_text)
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
-                context = self.retriever.build_context(
-                    query=query,
-                    original_query_text=query_text,
-                )
-                recall_limit = max(
-                    1,
-                    _coerce_positive_int(
-                        getattr(self.config, "long_term_memory_recall_limit", 1),
-                        default=1,
-                        maximum=_MAX_REVIEW_LIMIT,
-                    ),
-                )
-                conflict_queue = self.retriever.select_conflict_queue(
-                    query=query,
-                    limit=recall_limit,
-                )
-                conflicting_memory_ids = {
-                    option.memory_id
-                    for item in conflict_queue
-                    for option in item.options
-                }
-                durable_objects = self.retriever.select_durable_objects(
-                    query=query,
-                    limit=recall_limit,
-                )
-                filtered_durable_objects = tuple(
-                    item
-                    for item in durable_objects
-                    if not kind_matches(
-                        item.kind,
-                        "fact",
-                        item.attributes,
-                        attr_key="fact_type",
-                        attr_value="contact_method",
+                with self._temporary_remote_probe_cache():
+                    context = self.retriever.build_context(
+                        query=query,
+                        original_query_text=query_text,
                     )
-                    and item.memory_id not in conflicting_memory_ids
-                )
-                return LongTermMemoryContext(
-                    subtext_context=context.subtext_context,
-                    midterm_context=context.midterm_context,
-                    durable_context=self.retriever._render_durable_context(filtered_durable_objects),
-                    episodic_context=context.episodic_context,
-                    graph_context=self.graph_store.build_prompt_context(
-                        query.retrieval_text or query.original_text,
-                        include_contact_methods=False,
-                    ),
-                    conflict_context=None,
-                )
+                    recall_limit = max(
+                        1,
+                        _coerce_positive_int(
+                            getattr(self.config, "long_term_memory_recall_limit", 1),
+                            default=1,
+                            maximum=_MAX_REVIEW_LIMIT,
+                        ),
+                    )
+                    conflict_queue = self.retriever.select_conflict_queue(
+                        query=query,
+                        limit=recall_limit,
+                    )
+                    conflicting_memory_ids = {
+                        option.memory_id
+                        for item in conflict_queue
+                        for option in item.options
+                    }
+                    durable_objects = self.retriever.select_durable_objects(
+                        query=query,
+                        limit=recall_limit,
+                    )
+                    filtered_durable_objects = tuple(
+                        item
+                        for item in durable_objects
+                        if not kind_matches(
+                            item.kind,
+                            "fact",
+                            item.attributes,
+                            attr_key="fact_type",
+                            attr_value="contact_method",
+                        )
+                        and item.memory_id not in conflicting_memory_ids
+                    )
+                    return LongTermMemoryContext(
+                        subtext_context=context.subtext_context,
+                        midterm_context=context.midterm_context,
+                        durable_context=self.retriever._render_durable_context(filtered_durable_objects),
+                        episodic_context=context.episodic_context,
+                        graph_context=self.graph_store.build_prompt_context(
+                            query.retrieval_text or query.original_text,
+                            include_contact_methods=False,
+                        ),
+                        conflict_context=None,
+                    )
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
@@ -1265,10 +1290,11 @@ class LongTermMemoryService:
             query = self.query_rewriter.profile(query_text)
             normalized_limit = None if limit is None else _coerce_positive_int(limit, default=1, maximum=_MAX_REVIEW_LIMIT)
             with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
-                return self.retriever.select_conflict_queue(
-                    query=query,
-                    limit=normalized_limit,
-                )
+                with self._temporary_remote_probe_cache():
+                    return self.retriever.select_conflict_queue(
+                        query=query,
+                        limit=normalized_limit,
+                    )
         except LongTermRemoteUnavailableError:
             raise
         except Exception:

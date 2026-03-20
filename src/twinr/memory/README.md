@@ -12,6 +12,7 @@ subpackages.
 - persist durable prompt memory, managed user/personality context, and reminders
 - overlap independent prompt/user/personality remote snapshot bootstrap reads so required-remote readiness is bounded by the slowest prompt-context snapshot instead of the sum of all three
 - provide shared full-text and query-normalization helpers reused by memory stores
+- keep live long-term recall from blocking on cold query-rewrite misses by returning an immediate fallback profile and filling the rewrite cache asynchronously in the background
 - host the `on_device`, `chonkydb`, and `longterm` subpackages
 
 `memory` does **not** own:

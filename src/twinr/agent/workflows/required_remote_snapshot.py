@@ -316,6 +316,43 @@ def assess_required_remote_watchdog_snapshot(
     )
 
 
+def _watchdog_startup_wait_s(config: TwinrConfig) -> float:
+    """Return how long runtime bootstrap may wait for a starting watchdog."""
+
+    return max(
+        0.0,
+        float(getattr(config, "long_term_memory_remote_watchdog_startup_wait_s", 30.0) or 30.0),
+    )
+
+
+def _watchdog_startup_poll_s(config: TwinrConfig) -> float:
+    """Return the bounded poll cadence while the watchdog is still starting."""
+
+    return min(
+        1.0,
+        max(
+            0.1,
+            float(getattr(config, "long_term_memory_remote_watchdog_interval_s", 1.0) or 1.0),
+        ),
+    )
+
+
+def _assessment_allows_startup_wait(assessment: RequiredRemoteWatchdogAssessment) -> bool:
+    """Return whether a non-ready watchdog state still looks like startup."""
+
+    if assessment.ready or assessment.snapshot_stale:
+        return False
+    status = str(assessment.sample_status or "").strip().lower()
+    detail = str(assessment.detail or "").strip().lower()
+    if status == "starting":
+        return True
+    if "watchdog is starting" in detail:
+        return True
+    if "snapshot is missing" in detail:
+        return True
+    return False
+
+
 def ensure_required_remote_watchdog_snapshot_ready(
     config: TwinrConfig,
     *,
@@ -323,7 +360,20 @@ def ensure_required_remote_watchdog_snapshot_ready(
 ) -> RequiredRemoteWatchdogAssessment:
     """Raise when the external remote watchdog does not prove readiness."""
 
-    assessment = assess_required_remote_watchdog_snapshot(config, store=store)
-    if not assessment.ready:
-        raise LongTermRemoteUnavailableError(assessment.detail)
-    return assessment
+    watchdog_store = store or RemoteMemoryWatchdogStore.from_config(config)
+    assessment = assess_required_remote_watchdog_snapshot(config, store=watchdog_store)
+    if assessment.ready:
+        return assessment
+    startup_wait_s = _watchdog_startup_wait_s(config)
+    if startup_wait_s > 0.0 and _assessment_allows_startup_wait(assessment):
+        deadline = time.monotonic() + startup_wait_s
+        poll_s = _watchdog_startup_poll_s(config)
+        while time.monotonic() < deadline:
+            remaining_s = max(0.0, deadline - time.monotonic())
+            time.sleep(min(poll_s, remaining_s))
+            assessment = assess_required_remote_watchdog_snapshot(config, store=watchdog_store)
+            if assessment.ready:
+                return assessment
+            if not _assessment_allows_startup_wait(assessment):
+                break
+    raise LongTermRemoteUnavailableError(assessment.detail)

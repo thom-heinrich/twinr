@@ -33,6 +33,9 @@ class TwinrRuntimeSnapshotMixin:
                 user_voice_status=self.user_voice_status,
                 user_voice_confidence=self.user_voice_confidence,
                 user_voice_checked_at=self._parse_optional_snapshot_timestamp(self.user_voice_checked_at),  # AUDIT-FIX(#3): Persist normalized voice-check timestamps.
+                user_voice_user_id=self.user_voice_user_id,
+                user_voice_user_display_name=self.user_voice_user_display_name,
+                user_voice_match_source=self.user_voice_match_source,
             )
         except Exception:
             LOGGER.exception("Failed to persist runtime snapshot")  # AUDIT-FIX(#2): Persistence must never take down the runtime.
@@ -67,6 +70,11 @@ class TwinrRuntimeSnapshotMixin:
                 if restored_voice_checked_at is not None
                 else None
             )  # AUDIT-FIX(#3): Runtime context expects canonical UTC strings, not datetime objects.
+            self.user_voice_user_id = self._coerce_optional_text(self._snapshot_get(snapshot, "user_voice_user_id"))
+            self.user_voice_user_display_name = self._coerce_optional_text(
+                self._snapshot_get(snapshot, "user_voice_user_display_name")
+            )
+            self.user_voice_match_source = self._coerce_optional_text(self._snapshot_get(snapshot, "user_voice_match_source"))
 
             legacy_turns = self._restore_legacy_turns(self._snapshot_get(snapshot, "memory_turns", ()))
             raw_tail = self._restore_raw_tail(self._snapshot_get(snapshot, "memory_raw_tail", ()))
@@ -104,6 +112,9 @@ class TwinrRuntimeSnapshotMixin:
         self.user_voice_status = None
         self.user_voice_confidence = None
         self.user_voice_checked_at = None
+        self.user_voice_user_id = None
+        self.user_voice_user_display_name = None
+        self.user_voice_match_source = None
         self._reset_memory_context()
 
     def _reset_memory_context(self) -> None:

@@ -3,12 +3,14 @@ name: handlers
 path: src/twinr/agent/tools/handlers
 kind: python-package
 visibility: internal
-summary: Concrete realtime tool handlers and shared guard helpers for automation, memory, reminder, output, self-coding, settings, and voice-profile tool calls.
+summary: Concrete realtime tool handlers and shared guard helpers for automation, memory, reminder, output, self-coding, settings, voice-profile, portrait-identity, and shared household-identity tool calls.
 owned_concerns:
   - Validate and normalize tool-call payloads at the handler boundary
   - Translate tool requests into bounded runtime reads and mutations
   - Keep handler-local telemetry, audit events, and follow-up side effects best-effort
   - Share live-audio, sensitive-action confirmation, and primitive coercion helpers across handler families
+  - Return structured portrait-enrollment guidance so the model can drive camera retries naturally
+  - Return structured shared household-identity guidance for local face, voice, status, and explicit confirm or deny feedback flows
   - Bridge the self-coding front-stage learning flow into deterministic ASE modules
 out_of_scope:
   - Tool registry, binding, schemas, or prompt instruction assembly
@@ -47,6 +49,16 @@ files:
       - handle_search_live_info
       - handle_inspect_camera
       - handle_end_conversation
+  - path: household_identity.py
+    role: Shared local household-identity handler for face, voice, status, and explicit feedback
+    exports:
+      - handle_manage_household_identity
+  - path: portrait_identity.py
+    role: Local portrait-identity enrollment, status, and reset handlers
+    exports:
+      - handle_enroll_portrait_identity
+      - handle_get_portrait_identity_status
+      - handle_reset_portrait_identity
   - path: reminders.py
     role: Reminder scheduling handler
     exports:
@@ -92,6 +104,7 @@ tests:
   - path: test/test_reminders.py
   - path: test/test_simple_settings.py
   - path: test/test_voice_profile.py
+  - path: test/test_household_identity.py
   - path: test/test_runner.py
   - path: test/test_streaming_tool_loop.py
   - path: test/run_pi_tool_matrix.py

@@ -17,6 +17,7 @@ from typing import Callable
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.conversation.closure import ToolCallingConversationClosureEvaluator
 from twinr.agent.base_agent.conversation.turn_controller import ToolCallingTurnDecisionEvaluator
+from twinr.hardware.household_identity import HouseholdIdentityManager
 from twinr.memory.longterm.storage.remote_read_diagnostics import extract_remote_write_context
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.agent.workflows.forensics import WorkflowForensics
@@ -718,6 +719,51 @@ class TwinrRealtimeSupportMixin:
 
     def _update_voice_assessment_from_pcm(self, audio_pcm: bytes) -> None:
         config = self.config  # AUDIT-FIX(#3): Snapshot config during assessment to avoid mixed live-reload reads.
+        household_manager = getattr(self, "household_identity_manager", None)
+        if household_manager is None:
+            try:
+                household_manager = HouseholdIdentityManager.from_config(
+                    config,
+                    camera=self.camera,
+                    camera_lock=getattr(self, "_camera_lock", None),
+                )
+            except Exception:
+                household_manager = None
+            else:
+                setattr(self, "household_identity_manager", household_manager)
+
+        if household_manager is not None:
+            try:
+                household_assessment = household_manager.assess_voice(
+                    audio_pcm,
+                    sample_rate=config.openai_realtime_input_sample_rate,
+                    channels=config.audio_channels,
+                )
+            except Exception as exc:
+                self._try_emit(f"household_voice_profile_error={self._safe_error_text(exc)}")
+            else:
+                if household_assessment.status != "not_enrolled":
+                    if not household_assessment.should_persist:
+                        return
+                    try:
+                        self.runtime.update_user_voice_assessment(
+                            status=household_assessment.status,
+                            confidence=household_assessment.confidence,
+                            checked_at=household_assessment.checked_at,
+                            user_id=household_assessment.matched_user_id,
+                            user_display_name=household_assessment.matched_user_display_name,
+                            match_source="household_voice_identity",
+                        )
+                    except Exception as exc:
+                        self._try_emit(f"voice_profile_persist_error={self._safe_error_text(exc)}")
+                        return
+                    self._try_emit(f"voice_profile_status={household_assessment.status}")
+                    if household_assessment.confidence is not None:
+                        self._try_emit(f"voice_profile_confidence={household_assessment.confidence:.2f}")
+                    if household_assessment.matched_user_id:
+                        self._try_emit(f"voice_profile_user_id={household_assessment.matched_user_id}")
+                    return
+
         try:
             assessment = self.voice_profile_monitor.assess_pcm16(
                 audio_pcm,
@@ -734,6 +780,9 @@ class TwinrRealtimeSupportMixin:
                 status=assessment.status,
                 confidence=assessment.confidence,
                 checked_at=assessment.checked_at,
+                user_id=None,
+                user_display_name=None,
+                match_source="legacy_voice_profile",
             )
         except Exception as exc:  # AUDIT-FIX(#8): State persistence is best-effort here.
             self._try_emit(f"voice_profile_persist_error={self._safe_error_text(exc)}")

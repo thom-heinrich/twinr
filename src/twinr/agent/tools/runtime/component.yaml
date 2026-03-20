@@ -7,6 +7,7 @@ summary: Bind realtime tool handlers and run the bounded single-lane and dual-la
 owned_concerns:
   - Adapt workflow owners into the handler method surface used for realtime tool execution
   - Validate the canonical realtime tool-name to handler binding map before live turns start
+  - Route the shared household-identity tool through the same executor and binding path as legacy portrait and voice tools
   - Run the generic streaming tool loop that alternates provider turns and tool execution
   - Run the dual-lane supervisor and specialist handoff loop with speech-lane events
   - Generate LLM-only recovery replies when streaming lanes fail after the user has already started a turn

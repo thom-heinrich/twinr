@@ -7,6 +7,7 @@ summary: Provide Twinr's ChonkyDB HTTP client, validated API models, and persona
 owned_concerns:
   - Validate and issue ChonkyDB external API requests for remote memory state
   - Define typed request and response models for ChonkyDB record, retrieve, and graph endpoints
+  - Expose one-shot top-k retrieval contracts that return structured remote payloads in a single call
   - Define the canonical Twinr personal-graph schema and the on-device graph store
   - Build prompt-context and subtext payloads from persisted graph memory
 out_of_scope:
@@ -47,6 +48,9 @@ files:
       - ChonkyDBRetrieveHit
       - ChonkyDBRetrieveRequest
       - ChonkyDBRetrieveResponse
+      - ChonkyDBTopKRecordHit
+      - ChonkyDBTopKRecordsRequest
+      - ChonkyDBTopKRecordsResponse
   - path: schema.py
     role: Twinr personal-graph schema taxonomy and typed document models
     exports:
@@ -76,6 +80,7 @@ public_api:
     - ChonkyDBRecordRequest
     - ChonkyDBBulkRecordRequest
     - ChonkyDBRetrieveRequest
+    - ChonkyDBTopKRecordsRequest
     - TwinrPersonalGraphStore
     - TwinrGraphDocumentV1
     - TwinrGraphEdgeV1

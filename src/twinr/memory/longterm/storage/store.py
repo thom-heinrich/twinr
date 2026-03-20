@@ -852,6 +852,21 @@ class LongTermStructuredStore:
         by_id = {item.memory_id: item for item in loaded}
         return tuple(by_id[item_id] for item_id in item_ids if item_id in by_id)
 
+    def _load_remote_objects_from_payloads(
+        self,
+        *,
+        payloads: Iterable[Mapping[str, object]],
+    ) -> tuple[LongTermMemoryObjectV1, ...]:
+        """Parse already-materialized remote object payloads."""
+
+        loaded: list[LongTermMemoryObjectV1] = []
+        for payload in payloads:
+            try:
+                loaded.append(LongTermMemoryObjectV1.from_payload(dict(payload)))
+            except Exception:
+                _LOG.warning("Skipping invalid remote long-term object payload during direct scope search.", exc_info=True)
+        return tuple(loaded)
+
     def _remote_select_objects(
         self,
         *,
@@ -866,13 +881,6 @@ class LongTermStructuredStore:
             return None
         bounded_limit = max(1, limit)
         clean_query = _normalize_text(query_text)
-        try:
-            if not remote_catalog.catalog_available(snapshot_kind="objects"):
-                return None
-        except Exception:
-            if self._remote_is_required():
-                raise
-            return None
 
         def eligible(entry: object) -> bool:
             metadata = getattr(entry, "metadata", None)
@@ -895,6 +903,39 @@ class LongTermStructuredStore:
                 eligible=eligible,
             )
             return self._load_remote_objects_from_entries(entries=entries, snapshot_kind="objects")
+
+        try:
+            direct_payloads = remote_catalog.search_current_item_payloads(
+                snapshot_kind="objects",
+                query_text=clean_query,
+                limit=bounded_limit,
+                eligible=eligible,
+            )
+        except Exception:
+            if self._remote_is_required():
+                raise
+            direct_payloads = None
+        if direct_payloads is not None:
+            selected = list(self._load_remote_objects_from_payloads(payloads=direct_payloads))
+            filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
+            if filtered:
+                return self.rank_selected_objects(
+                    query_texts=(clean_query,),
+                    objects=filtered,
+                    limit=bounded_limit,
+                )
+            # Query-driven remote scope searches stay bounded to ranked hits.
+            # Falling back to "recent" items here would rehydrate the full
+            # remote catalog and reintroduce the 10s+ Pi startup regression.
+            return ()
+
+        try:
+            if not remote_catalog.catalog_available(snapshot_kind="objects"):
+                return None
+        except Exception:
+            if self._remote_is_required():
+                raise
+            return None
 
         entries = remote_catalog.search_catalog_entries(
             snapshot_kind="objects",
@@ -930,29 +971,53 @@ class LongTermStructuredStore:
             return None
         bounded_limit = max(1, limit)
         clean_query = _normalize_text(query_text)
-        try:
-            if not remote_catalog.catalog_available(snapshot_kind="conflicts"):
-                return None
-        except Exception:
-            if self._remote_is_required():
-                raise
-            return None
         if not clean_query:
+            try:
+                if not remote_catalog.catalog_available(snapshot_kind="conflicts"):
+                    return None
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                return None
             entries = remote_catalog.top_catalog_entries(
                 snapshot_kind="conflicts",
                 limit=bounded_limit,
                 preserve_order=True,
             )
-        else:
-            entries = remote_catalog.search_catalog_entries(
+            payloads = remote_catalog.load_item_payloads(
                 snapshot_kind="conflicts",
-                query_text=clean_query,
-                limit=bounded_limit,
+                item_ids=(entry.item_id for entry in entries),
             )
-        payloads = remote_catalog.load_item_payloads(
-            snapshot_kind="conflicts",
-            item_ids=(entry.item_id for entry in entries),
-        )
+        else:
+            try:
+                direct_payloads = remote_catalog.search_current_item_payloads(
+                    snapshot_kind="conflicts",
+                    query_text=clean_query,
+                    limit=bounded_limit,
+                )
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                direct_payloads = None
+            if direct_payloads is not None:
+                payloads = direct_payloads
+            else:
+                try:
+                    if not remote_catalog.catalog_available(snapshot_kind="conflicts"):
+                        return None
+                except Exception:
+                    if self._remote_is_required():
+                        raise
+                    return None
+                entries = remote_catalog.search_catalog_entries(
+                    snapshot_kind="conflicts",
+                    query_text=clean_query,
+                    limit=bounded_limit,
+                )
+                payloads = remote_catalog.load_item_payloads(
+                    snapshot_kind="conflicts",
+                    item_ids=(entry.item_id for entry in entries),
+                )
         conflicts: list[LongTermMemoryConflictV1] = []
         for payload in payloads:
             try:
@@ -990,16 +1055,16 @@ class LongTermStructuredStore:
             A tuple of episodic objects ordered by selector rank or recency.
         """
 
-        with self._lock:  # AUDIT-FIX(#3): Keep retrieval consistent with concurrent writes.
-            remote_selected = self._remote_select_objects(
-                query_text=query_text,
-                limit=limit,
-                include_episodes=True,
-                fallback_limit=fallback_limit,
-                require_query_match=require_query_match,
-            )
-            if remote_selected is not None:
-                return remote_selected
+        remote_selected = self._remote_select_objects(
+            query_text=query_text,
+            limit=limit,
+            include_episodes=True,
+            fallback_limit=fallback_limit,
+            require_query_match=require_query_match,
+        )
+        if remote_selected is not None:
+            return remote_selected
+        with self._lock:  # AUDIT-FIX(#3): Keep local fallback retrieval consistent with concurrent writes.
             objects = tuple(
                 sorted(
                     (
@@ -1467,16 +1532,16 @@ class LongTermStructuredStore:
             A tuple of active, candidate, or uncertain non-episodic objects.
         """
 
-        with self._lock:  # AUDIT-FIX(#3): Keep retrieval consistent with concurrent writes.
-            remote_selected = self._remote_select_objects(
-                query_text=query_text,
-                limit=limit,
-                include_episodes=False,
-                fallback_limit=0,
-                require_query_match=False,
-            )
-            if remote_selected is not None:
-                return remote_selected
+        remote_selected = self._remote_select_objects(
+            query_text=query_text,
+            limit=limit,
+            include_episodes=False,
+            fallback_limit=0,
+            require_query_match=False,
+        )
+        if remote_selected is not None:
+            return remote_selected
+        with self._lock:  # AUDIT-FIX(#3): Keep local fallback retrieval consistent with concurrent writes.
             bounded_limit = max(1, limit)  # AUDIT-FIX(#9): Prevent negative/zero slicing quirks.
             objects = tuple(
                 sorted(
@@ -1526,13 +1591,13 @@ class LongTermStructuredStore:
             A tuple of unresolved conflict records.
         """
 
-        with self._lock:  # AUDIT-FIX(#3): Keep retrieval consistent with concurrent writes.
-            remote_selected = self._remote_select_conflicts(
-                query_text=query_text,
-                limit=limit,
-            )
-            if remote_selected is not None:
-                return remote_selected
+        remote_selected = self._remote_select_conflicts(
+            query_text=query_text,
+            limit=limit,
+        )
+        if remote_selected is not None:
+            return remote_selected
+        with self._lock:  # AUDIT-FIX(#3): Keep local fallback retrieval consistent with concurrent writes.
             conflicts = self.load_conflicts()
             if not conflicts:
                 return ()

@@ -13,8 +13,12 @@ owned_concerns:
   - Fuse the primary camera anchor with ReSpeaker direction confidence into a conservative speaker-association fact
   - Derive a bounded multimodal initiative state that later proactive behavior can use for display-first or skip decisions
   - Derive an explicit ambiguous-room guard before any person-targeted runtime inference proceeds
-  - Derive a conservative known-user hint from fresh voice-profile state plus clear room context
+  - Derive a bounded temporal identity-fusion surface from voice, portrait, household-voice candidates, visual-anchor history, and presence-session memory without promoting it to identity proof
+  - Derive a conservative portrait-match claim from local face embedding plus temporal local identity evidence and clear room context
+  - Derive a conservative known-user hint from fresh voice-profile state plus optional temporal identity-fusion evidence and clear room context
   - Derive prompt-only affect proxies from coarse posture, attention, quiet, and motion cues without claiming emotion as fact
+  - Drive calm HDMI face attention-follow cues from the visible primary-person anchor without teaching the generic runtime snapshot schema about gaze-follow behavior
+  - Run a bounded local HDMI attention-refresh cadence so gaze-follow stays responsive even when full proactive inspection remains motion-gated
   - Block sensitive proactive behavior when current ReSpeaker plus camera context is ambiguous
   - Coordinate proactive monitor ticks across vision, PIR, ambient audio, and wakeword policy paths
   - Export normalized observation facts and ops telemetry from runtime monitoring
@@ -59,8 +63,19 @@ files:
     exports:
       - AmbiguousRoomGuardSnapshot
       - derive_ambiguous_room_guard
+  - path: identity_fusion.py
+    role: Bounded temporal/session identity fusion over voice, portrait, household-voice candidates, and visual-anchor history
+    exports:
+      - MultimodalIdentityFusionConfig
+      - MultimodalIdentityFusionSnapshot
+      - TemporalIdentityFusionTracker
+  - path: portrait_match.py
+    role: Conservative runtime claim surface for local portrait-match observations and temporal identity evidence
+    exports:
+      - PortraitMatchSnapshot
+      - derive_portrait_match
   - path: known_user_hint.py
-    role: Conservative known-user hint from voice-profile state plus clear room context
+    role: Conservative known-user hint from voice-profile state plus optional temporal identity-fusion evidence and clear room context
     exports:
       - KnownUserHintSnapshot
       - derive_known_user_hint
@@ -69,6 +84,15 @@ files:
     exports:
       - AffectProxySnapshot
       - derive_affect_proxy
+  - path: display_attention.py
+    role: Conservative proactive producer and local refresh policy for HDMI gaze-follow face cues
+    exports:
+      - DisplayAttentionCueDecision
+      - DisplayAttentionCuePublishResult
+      - DisplayAttentionCuePublisher
+      - display_attention_refresh_supported
+      - derive_display_attention_cue
+      - resolve_display_attention_refresh_interval
   - path: runtime_contract.py
     role: Hard startup-blocker contract for XVF3800 DFU/safe-mode states
     exports:
@@ -142,10 +166,12 @@ primary_callers:
   - path: src/twinr/proactive/wakeword/stream.py
   - path: src/twinr/proactive/__init__.py
 tests:
+  - path: test/test_display_attention.py
   - path: test/test_proactive_monitor.py
   - path: test/test_governor_inputs.py
   - path: test/test_multimodal_initiative.py
   - path: test/test_runtime_claims.py
+  - path: test/test_portrait_match.py
   - path: test/test_respeaker_sensitive_behavior_gate.py
   - path: test/test_respeaker_scheduled_provider.py
   - path: test/test_runner.py

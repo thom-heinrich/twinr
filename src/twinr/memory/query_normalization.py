@@ -7,6 +7,7 @@ LLM-backed cache.
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import logging
 from collections import OrderedDict
@@ -198,6 +199,8 @@ class LongTermQueryRewriter:
     # do not hammer the remote backend while still allowing automatic recovery later.
     _rewrite_failure_backoff_seconds: float = field(init=False, repr=False)
     _rewrite_backoff_until: float = field(default=0.0, init=False, repr=False)
+    _rewrite_executor: ThreadPoolExecutor | None = field(default=None, init=False, repr=False)
+    _pending_rewrites: dict[str, Future[str | None]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # AUDIT-FIX(#1): Resolve a bounded cache size from config with a safe default so
@@ -220,6 +223,13 @@ class LongTermQueryRewriter:
             ),
             default=_DEFAULT_REWRITE_FAILURE_BACKOFF_SECONDS,
         )
+        if self.backend is not None:
+            # AUDIT-FIX(#9): Run canonicalization in one bounded background worker so
+            # live memory retrieval never blocks on an optional rewrite call.
+            self._rewrite_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="twinr-ltm-query",
+            )
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermQueryRewriter":
@@ -283,39 +293,70 @@ class LongTermQueryRewriter:
             return LongTermQueryProfile.from_text("")
 
         with self._cache_lock:
+            self._drain_completed_rewrite_locked(clean_query)
             cached = self._cache.get(clean_query)
             if cached is not None:
                 self._cache.move_to_end(clean_query)
                 return cached
-
-        canonical_query = self._canonicalize_query(clean_query)
-        profile = LongTermQueryProfile.from_text(
-            clean_query,
-            canonical_english_text=canonical_query,
-        )
-
-        # AUDIT-FIX(#3): Do not permanently cache fallback-only profiles created during transient
-        # backend failures; otherwise a short outage becomes a sticky degradation until restart.
-        should_cache = self.backend is None or canonical_query is not None
-        if not should_cache:
-            return profile
 
         with self._cache_lock:
+            self._drain_completed_rewrite_locked(clean_query)
             cached = self._cache.get(clean_query)
             if cached is not None:
                 self._cache.move_to_end(clean_query)
                 return cached
 
+            profile = LongTermQueryProfile.from_text(clean_query)
             self._cache[clean_query] = profile
             self._cache.move_to_end(clean_query)
             self._evict_cache_if_needed_locked()
+            self._ensure_background_rewrite_locked(clean_query)
             return profile
 
     def _evict_cache_if_needed_locked(self) -> None:
         # AUDIT-FIX(#1): Evict least-recently-used entries first to cap memory while preserving
         # hot queries for repeated retrievals.
         while len(self._cache) > self._cache_limit:
-            self._cache.popitem(last=False)
+            evicted_query, _ = self._cache.popitem(last=False)
+            pending = self._pending_rewrites.pop(evicted_query, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
+
+    def _ensure_background_rewrite_locked(self, clean_query: str) -> None:
+        if self.backend is None or self._rewrite_executor is None:
+            return
+        pending = self._pending_rewrites.get(clean_query)
+        if pending is not None:
+            if pending.done():
+                self._drain_completed_rewrite_locked(clean_query)
+            return
+        self._pending_rewrites[clean_query] = self._rewrite_executor.submit(
+            self._canonicalize_query,
+            clean_query,
+        )
+
+    def _drain_completed_rewrite_locked(self, clean_query: str) -> None:
+        pending = self._pending_rewrites.get(clean_query)
+        if pending is None or not pending.done():
+            return
+        self._pending_rewrites.pop(clean_query, None)
+        canonical_query: str | None = None
+        try:
+            canonical_query = pending.result()
+        except Exception as exc:
+            # AUDIT-FIX(#9): Background rewrite failures stay observable without
+            # breaking the live retrieval path or poisoning cache entries.
+            _LOGGER.warning(
+                "Long-term query canonicalization background task failed; keeping original query. error_type=%s",
+                type(exc).__name__,
+            )
+        profile = LongTermQueryProfile.from_text(
+            clean_query,
+            canonical_english_text=canonical_query,
+        )
+        self._cache[clean_query] = profile
+        self._cache.move_to_end(clean_query)
+        self._evict_cache_if_needed_locked()
 
     def _canonicalize_query(self, query_text: str) -> str | None:
         if self.backend is None:

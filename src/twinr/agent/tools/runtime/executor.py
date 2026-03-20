@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..handlers import automations, memory, output, reminders, self_coding, settings, voice_profile
+from ..handlers import automations, household_identity, memory, output, portrait_identity, reminders, self_coding, settings, voice_profile
 
 
 class RealtimeToolExecutor:
@@ -119,6 +119,18 @@ class RealtimeToolExecutor:
 
     def handle_reset_voice_profile(self, arguments: dict[str, object]) -> dict[str, object]:
         return voice_profile.handle_reset_voice_profile(self.owner, arguments)
+
+    def handle_enroll_portrait_identity(self, arguments: dict[str, object]) -> dict[str, object]:
+        return portrait_identity.handle_enroll_portrait_identity(self.owner, arguments)
+
+    def handle_get_portrait_identity_status(self, arguments: dict[str, object]) -> dict[str, object]:
+        return portrait_identity.handle_get_portrait_identity_status(self.owner, arguments)
+
+    def handle_reset_portrait_identity(self, arguments: dict[str, object]) -> dict[str, object]:
+        return portrait_identity.handle_reset_portrait_identity(self.owner, arguments)
+
+    def handle_manage_household_identity(self, arguments: dict[str, object]) -> dict[str, object]:
+        return household_identity.handle_manage_household_identity(self.owner, arguments)
 
     def handle_inspect_camera(self, arguments: dict[str, object]) -> dict[str, object]:
         return output.handle_inspect_camera(self.owner, arguments)

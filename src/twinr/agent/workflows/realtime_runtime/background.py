@@ -26,6 +26,10 @@ from twinr.proactive import (
     proactive_prompt_mode,
 )
 from twinr.proactive.runtime.audio_policy import ReSpeakerAudioPolicySnapshot
+from twinr.proactive.runtime.ambiguous_room_guard import (
+    AmbiguousRoomGuardSnapshot,
+    derive_ambiguous_room_guard,
+)
 from twinr.proactive.runtime.governor_inputs import ReSpeakerGovernorInputs, build_respeaker_governor_inputs
 from twinr.proactive.runtime.multimodal_initiative import ReSpeakerMultimodalInitiativeSnapshot
 from twinr.proactive.runtime.sensitive_behavior_gate import evaluate_respeaker_sensitive_behavior_gate
@@ -933,6 +937,60 @@ class TwinrRealtimeBackgroundMixin:
         )
         return True
 
+    def _block_longterm_candidate_for_ambiguous_room_guard_if_needed(
+        self,
+        *,
+        candidate,
+        live_facts: dict[str, object] | None,
+        current_time: datetime,
+    ) -> bool:
+        """Skip one long-term candidate when the room context is not target-safe."""
+
+        if not isinstance(live_facts, dict):
+            return False
+        sensor = live_facts.get("sensor")
+        observed_at = None
+        if isinstance(sensor, dict):
+            observed_at = sensor.get("observed_at")
+        snapshot = AmbiguousRoomGuardSnapshot.from_fact_map(
+            live_facts.get("ambiguous_room_guard"),
+        ) or derive_ambiguous_room_guard(
+            observed_at=None if observed_at is None else observed_at,
+            live_facts=live_facts,
+        )
+        if not snapshot.guard_active:
+            return False
+
+        reservation = None
+        skip_reason = self._coerce_text(snapshot.reason) or "ambiguous_room_guard_blocked"
+        try:
+            reservation = self.runtime.reserve_specific_long_term_proactive_candidate(
+                candidate,
+                now=current_time,
+            )
+        except Exception as exc:
+            self._remember_background_fault("reserve_ambiguous_room_longterm_candidate", exc)
+
+        if reservation is not None:
+            self._safe_mark_long_term_proactive_candidate_skipped(
+                reservation,
+                reason=skip_reason,
+            )
+
+        candidate_id = self._coerce_text(getattr(candidate, "candidate_id", None)) or "unknown"
+        self._safe_emit(f"longterm_proactive_skipped={skip_reason}")
+        self._safe_record_event(
+            "longterm_proactive_skipped",
+            "Twinr blocked a long-term proactive prompt because the room context was not safe for targeted inference.",
+            candidate_id=candidate_id,
+            candidate_kind=self._coerce_text(getattr(candidate, "kind", None)),
+            summary=self._coerce_text(getattr(candidate, "summary", None)),
+            skip_reason=skip_reason,
+            skip_recorded=reservation is not None,
+            **snapshot.event_data(),
+        )
+        return True
+
     def _block_longterm_candidate_for_multimodal_initiative_if_needed(
         self,
         *,
@@ -1235,6 +1293,12 @@ class TwinrRealtimeBackgroundMixin:
 
             candidate_id = self._coerce_text(getattr(preview, "candidate_id", None)) or "unknown"
             current_time = datetime.now(self._local_timezone())
+            if self._block_longterm_candidate_for_ambiguous_room_guard_if_needed(
+                candidate=preview,
+                live_facts=live_facts,
+                current_time=current_time,
+            ):
+                return False
             if self._block_sensitive_longterm_candidate_if_needed(
                 candidate=preview,
                 live_facts=live_facts,

@@ -317,6 +317,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "enroll_voice_profile": lambda _arguments: {"status": "enrolled"},
                 "get_voice_profile_status": lambda _arguments: {"status": "ok"},
                 "reset_voice_profile": lambda _arguments: {"status": "reset"},
+                "enroll_portrait_identity": lambda _arguments: {"status": "enrolled"},
+                "get_portrait_identity_status": lambda _arguments: {"status": "ok"},
+                "reset_portrait_identity": lambda _arguments: {"status": "cleared"},
+                "manage_household_identity": lambda _arguments: {"status": "ok"},
                 "inspect_camera": lambda _arguments: {"status": "ok", "answer": "Kamerabild"},
                 "end_conversation": lambda _arguments: {"status": "ending"},
             },
@@ -351,6 +355,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "enroll_voice_profile",
                 "get_voice_profile_status",
                 "reset_voice_profile",
+                "enroll_portrait_identity",
+                "get_portrait_identity_status",
+                "reset_portrait_identity",
+                "manage_household_identity",
                 "end_conversation",
                 "inspect_camera",
             ],
@@ -407,10 +415,19 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("confirmed", tools_by_name["enroll_voice_profile"]["parameters"]["properties"])
         self.assertEqual(tools_by_name["get_voice_profile_status"]["parameters"]["properties"], {})
         self.assertIn("confirmed", tools_by_name["reset_voice_profile"]["parameters"]["properties"])
+        self.assertIn("display_name", tools_by_name["enroll_portrait_identity"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["enroll_portrait_identity"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["get_portrait_identity_status"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["reset_portrait_identity"]["parameters"]["properties"])
+        self.assertIn("action", tools_by_name["manage_household_identity"]["parameters"]["properties"])
+        self.assertIn("confirmed", tools_by_name["manage_household_identity"]["parameters"]["properties"])
         self.assertIn("reason", tools_by_name["end_conversation"]["parameters"]["properties"])
         self.assertIn("spoken_reply", tools_by_name["end_conversation"]["parameters"]["properties"])
         self.assertIn("question", tools_by_name["inspect_camera"]["parameters"]["properties"])
         self.assertEqual(connection.session.calls[0]["audio"]["output"]["speed"], 0.85)
+        self.assertIn("enroll_portrait_identity tool", connection.session.calls[0]["instructions"])
+        self.assertIn("guidance_hints", connection.session.calls[0]["instructions"])
+        self.assertIn("manage_household_identity", connection.session.calls[0]["instructions"])
 
     def test_open_uses_realtime_safe_top_level_tool_schemas(self) -> None:
         session, connection, _manager = self.make_session()

@@ -2,8 +2,9 @@
 
 `handlers` owns the concrete realtime tool handlers used during live turns. It
 translates tool payloads into bounded runtime reads or mutations for automations,
-memory, reminders, output, self-coding, settings, and voice-profile flows, and
-keeps shared voice/argument guards close to that boundary.
+memory, reminders, output, self-coding, settings, voice-profile, portrait-
+identity, and shared household-identity flows, and keeps shared voice/argument
+guards close to that boundary.
 
 ## Responsibility
 
@@ -12,6 +13,8 @@ keeps shared voice/argument guards close to that boundary.
 - validate and normalize tool arguments before they reach runtime methods
 - keep handler-local telemetry and audit side effects best-effort
 - share sensitive-action confirmation and live-audio guard helpers
+- translate local camera-driven portrait-enrollment results into structured guidance for the model
+- expose one shared local household-identity tool surface for face, voice, status, and explicit confirm or deny feedback
 - bridge the self-coding front-stage flow plus learned-skill control/runtime hooks into deterministic ASE modules
 
 `handlers` does **not** own:
@@ -27,6 +30,8 @@ keeps shared voice/argument guards close to that boundary.
 | [automations.py](./automations.py) | Automation CRUD handlers |
 | [memory.py](./memory.py) | Durable-memory tool handlers |
 | [output.py](./output.py) | Print, search, and camera handlers |
+| [household_identity.py](./household_identity.py) | Shared local household identity manager tool handler |
+| [portrait_identity.py](./portrait_identity.py) | Local portrait-identity enrollment, status, and reset handlers |
 | [reminders.py](./reminders.py) | Reminder scheduling handler |
 | [self_coding.py](./self_coding.py) | Self-coding learning, activation, pause/reactivate, and hidden runtime handlers |
 | [settings.py](./settings.py) | Simple setting mutation handler |

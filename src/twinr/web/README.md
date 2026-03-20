@@ -15,6 +15,7 @@ templates and CSS that power the operator dashboard.
 - render the tabbed debug page that groups runtime, ChonkyDB, live memory attestation, LLM, events, hardware, and raw local artifacts
 - render a read-only long-term memory search tab in `/ops/debug` that queries the real retrieval stack and groups hits by durable, midterm, episodic, and conflict memory
 - run the interactive `/ops/debug` Conversation Lab tab that sends a real text turn through Twinr's provider/tool/memory path and persists human-readable routing, tool, retrieval, and memory-write traces
+- support camera-backed Conversation Lab tool turns for portrait enrollment and `inspect_camera` without pushing camera orchestration into the route layer
 - keep the `/ops/debug` operator surface high-contrast and readable on external monitors, including dense log-like sections
 - render the self-coding operator page with compile telemetry, health, live-e2e state, stale compile/run watchdog visibility, and learned-skill lifecycle controls
 - render the `/connect/whatsapp` wizard that guides one internal WhatsApp self-chat setup through allowlist, runtime, a bounded pairing window, and the final self-chat test
@@ -35,6 +36,7 @@ templates and CSS that power the operator dashboard.
 | [`__init__.py`](./__init__.py) | Export `create_app` |
 | [`app.py`](./app.py) | FastAPI factory and route handlers |
 | [`conversation_lab.py`](./conversation_lab.py) | Portal conversation-lab session store and real text-turn execution helper |
+| [`conversation_lab_vision.py`](./conversation_lab_vision.py) | Camera and vision helpers used by Conversation Lab tool owners |
 | [`context.py`](./context.py) | Shared loaders and template rendering |
 | [`automations.py`](./automations.py) | Automation page/form helpers |
 | [`support/channel_onboarding.py`](./support/channel_onboarding.py) | Generic file-backed onboarding snapshots and bounded in-process pairing registry |

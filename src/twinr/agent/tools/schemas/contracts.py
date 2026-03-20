@@ -1341,6 +1341,104 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 },
             }
         )
+    if "enroll_portrait_identity" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "enroll_portrait_identity",
+                "description": (
+                    "Capture the current live camera view and add it to Twinr's local on-device face profile. "
+                    "Use only when the user explicitly asks Twinr to remember, learn, refresh, or update their face."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "display_name": _string_property(
+                            "Optional friendly display name for the saved local face profile when the user explicitly wants it.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this local face-profile save when extra confirmation is needed."
+                        ),
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "get_portrait_identity_status" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "get_portrait_identity_status",
+                "description": (
+                    "Read Twinr's local on-device face-profile status, including how many portrait references are saved "
+                    "and whether the current live camera view matches it."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this local face-profile status lookup when extra confirmation is needed."
+                        )
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "reset_portrait_identity" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "reset_portrait_identity",
+                "description": "Delete Twinr's local on-device face profile when the user explicitly asks to remove it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed the local face-profile reset when extra confirmation is needed."
+                        )
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "manage_household_identity" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "manage_household_identity",
+                "description": (
+                    "Manage Twinr's shared local household identity state across face, voice, live matching, "
+                    "and explicit confirm or deny feedback. Use this tool for local household identity enrollment, "
+                    "identity status, or when the user confirms that Twinr recognized the right or wrong person."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": _string_property(
+                            "Choose one supported local household identity action.",
+                            enum=("status", "enroll_face", "enroll_voice", "confirm_identity", "deny_identity"),
+                        ),
+                        "user_id": _string_property(
+                            "Optional stable local member identifier when the user explicitly names which enrolled household member should be updated or confirmed.",
+                            min_length=1,
+                        ),
+                        "display_name": _string_property(
+                            "Optional friendly household member name when the user explicitly provides it.",
+                            min_length=1,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed a persistent local identity enrollment when extra confirmation is needed."
+                        ),
+                    },
+                    "required": ["action"],
+                    "additionalProperties": False,
+                },
+            }
+        )
     if "end_conversation" in available:
         tools.append(
             {

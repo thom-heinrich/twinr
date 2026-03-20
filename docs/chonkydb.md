@@ -217,3 +217,11 @@ neighbors = client.graph_neighbors(
 - Both `x-api-key` and `Authorization: Bearer ...` are supported by the live service.
 - The current shared service still identifies itself as `ccodex_memory` in some response fields. Twinr treats that as remote service metadata, not as the local product name.
 - The public `https://tessairact.com:2149` endpoint is currently reachable from the Twinr server and the Pi.
+
+## Retrieval target
+
+Twinr's current remote-primary path is operationally fast now, but it still
+uses a hybrid of remote authority plus locally warmed projection caches for
+sub-second Pi recall. The target ChonkyDB contract for getting back to a true
+one-shot remote retrieval engine is documented in
+[CHONKYDB_ONE_SHOT_RETRIEVAL.md](./CHONKYDB_ONE_SHOT_RETRIEVAL.md).

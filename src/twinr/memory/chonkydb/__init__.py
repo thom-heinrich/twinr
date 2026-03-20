@@ -22,6 +22,9 @@ from twinr.memory.chonkydb.models import (
     ChonkyDBRetrieveHit,
     ChonkyDBRetrieveRequest,
     ChonkyDBRetrieveResponse,
+    ChonkyDBTopKRecordHit,
+    ChonkyDBTopKRecordsRequest,
+    ChonkyDBTopKRecordsResponse,
 )
 from twinr.memory.chonkydb.personal_graph import (
     TwinrGraphContactOption,
@@ -60,6 +63,9 @@ __all__ = [
     "ChonkyDBRetrieveHit",
     "ChonkyDBRetrieveRequest",
     "ChonkyDBRetrieveResponse",
+    "ChonkyDBTopKRecordHit",
+    "ChonkyDBTopKRecordsRequest",
+    "ChonkyDBTopKRecordsResponse",
     "TwinrGraphContactOption",
     "TWINR_GRAPH_ALLOWED_EDGE_TYPES",
     "TWINR_GRAPH_EDGE_TYPES_BY_NAMESPACE",

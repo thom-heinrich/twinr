@@ -32,6 +32,8 @@ from twinr.memory.chonkydb.models import (
     ChonkyDBRecordRequest,
     ChonkyDBRetrieveRequest,
     ChonkyDBRetrieveResponse,
+    ChonkyDBTopKRecordsRequest,
+    ChonkyDBTopKRecordsResponse,
     JsonDict,
 )
 
@@ -262,6 +264,17 @@ class ChonkyDBClient:
         payload = self._request_json("POST", "/v1/external/retrieve", body=body)
         # AUDIT-FIX(#4): Wrap schema/shape mismatches from from_payload() so callers always receive a ChonkyDBError.
         return self._parse_model("retrieve()", ChonkyDBRetrieveResponse.from_payload, payload)
+
+    def topk_records(
+        self,
+        request: ChonkyDBTopKRecordsRequest | Mapping[str, object],
+    ) -> ChonkyDBTopKRecordsResponse:
+        """Run one-shot top-k retrieval and return structured record payloads."""
+
+        body = request.to_payload() if isinstance(request, ChonkyDBTopKRecordsRequest) else dict(request)
+        payload = self._request_json("POST", "/v1/external/retrieve/topk_records", body=body)
+        # AUDIT-FIX(#4): Wrap schema/shape mismatches from from_payload() so callers always receive a ChonkyDBError.
+        return self._parse_model("topk_records()", ChonkyDBTopKRecordsResponse.from_payload, payload)
 
     def add_graph_edge(self, request: ChonkyDBGraphAddEdgeRequest | Mapping[str, object]) -> JsonDict:
         """Create a graph edge using numeric ChonkyDB node identifiers."""

@@ -13,7 +13,16 @@ from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailable
 from twinr.proactive import ProactiveGovernor
 
 
-_ALLOWED_VOICE_STATUSES = frozenset({"likely_user", "uncertain", "unknown_voice"})
+_ALLOWED_VOICE_STATUSES = frozenset(
+    {
+        "likely_user",
+        "uncertain",
+        "unknown_voice",
+        "known_other_user",
+        "uncertain_match",
+        "ambiguous_match",
+    }
+)
 _DEFAULT_VOICE_ASSESSMENT_MAX_AGE_S = 120
 _MAX_FUTURE_SKEW_S = 5
 _LOCK_INIT_GUARD = threading.Lock()
@@ -436,6 +445,9 @@ class TwinrRuntimeContextMixin:
         status: str | None,
         confidence: float | None,
         checked_at: str | None,
+        user_id: str | None = None,
+        user_display_name: str | None = None,
+        match_source: str | None = None,
     ) -> None:
         """Store a normalized voice-verification assessment for this runtime."""
 
@@ -443,12 +455,18 @@ class TwinrRuntimeContextMixin:
             normalized_status = self._normalize_voice_status(status)
             normalized_confidence = self._normalize_confidence(confidence)
             normalized_checked_at = self._normalize_checked_at(checked_at)
+            normalized_user_id = self._coerce_optional_text(user_id)
+            normalized_user_display_name = self._coerce_optional_text(user_display_name)
+            normalized_match_source = self._coerce_optional_text(match_source)
             # AUDIT-FIX(#1): Persist only validated voice-state enums so provider prompts cannot be text-injected.
             self.user_voice_status = normalized_status
             # AUDIT-FIX(#7): Persist bounded confidence only.
             self.user_voice_confidence = normalized_confidence
             # AUDIT-FIX(#2): Persist only timezone-aware UTC timestamps for freshness checks.
             self.user_voice_checked_at = normalized_checked_at if normalized_status else None
+            self.user_voice_user_id = normalized_user_id if normalized_status else None
+            self.user_voice_user_display_name = normalized_user_display_name if normalized_status else None
+            self.user_voice_match_source = normalized_match_source if normalized_status else None
             self._safe_persist_snapshot(event_on_error="voice_assessment_snapshot_failed")
 
     def apply_live_config(self, config) -> None:
@@ -685,15 +703,28 @@ class TwinrRuntimeContextMixin:
                 self.user_voice_status = None
                 self.user_voice_confidence = None
                 self.user_voice_checked_at = None
+                self.user_voice_user_id = None
+                self.user_voice_user_display_name = None
+                self.user_voice_match_source = None
                 self._safe_persist_snapshot(event_on_error="voice_assessment_expiry_snapshot_failed")
                 return None
 
+            matched_user_name = self._coerce_optional_text(getattr(self, "user_voice_user_display_name", None))
+            matched_user_id = self._coerce_optional_text(getattr(self, "user_voice_user_id", None))
             if status == "likely_user":
                 signal = "likely match to the enrolled main-user voice profile"
+            elif status == "known_other_user":
+                identity_label = matched_user_name or matched_user_id or "another enrolled household user"
+                signal = f"matches enrolled household voice identity {identity_label}, not the main-user voice profile"
+            elif status == "uncertain_match":
+                identity_label = matched_user_name or matched_user_id or "an enrolled household user"
+                signal = f"partial match to enrolled household voice identity {identity_label}"
+            elif status == "ambiguous_match":
+                signal = "could match more than one enrolled household voice identity"
             elif status == "uncertain":
                 signal = "partial match to the enrolled main-user voice profile"
             else:
-                signal = "does not match the enrolled main-user voice profile closely enough"
+                signal = "does not match the enrolled household voice identities closely enough"
 
             parts = [
                 "Live speaker signal for this turn. Treat it as a local verification signal, not proof of identity.",

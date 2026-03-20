@@ -17,8 +17,12 @@ and presence-session state used to arm wakeword listening and proactive checks.
 - Fuse the single primary camera anchor with ReSpeaker direction confidence into a conservative speaker-association fact
 - Derive a bounded multimodal initiative state that can force display-first or skip later proactive work when room context is ambiguous
 - Derive an explicit `ambiguous_room_guard` before person-targeted runtime inference proceeds
-- Derive a conservative `known_user_hint` from fresh voice-profile state plus clear single-person room context
+- Derive a bounded `identity_fusion` surface from voice, portrait, household-voice user candidates, visual-anchor history, and presence-session memory without promoting it to identity proof
+- Derive a conservative `portrait_match` claim from local identity evidence plus clear single-person room context
+- Derive a conservative `known_user_hint` from fresh voice-profile state plus optional temporal identity fusion and clear single-person room context
 - Derive a prompt-only `affect_proxy` surface from coarse posture, attention, quiet, and motion cues without claiming emotion as fact
+- Drive calm HDMI face attention-follow cues from the current visible primary-person anchor without polluting the generic runtime snapshot schema
+- Run a bounded local HDMI attention-refresh cadence that keeps gaze-follow responsive even when full proactive inspection is still PIR-gated
 - Export normalized observation facts and ops telemetry from proactive monitoring
 - Export structured ReSpeaker audio-policy facts, per-claim confidence/source metadata, and presence-session IDs for bounded automation and long-term memory ingestion
 - Inject ReSpeaker XVF3800 signal facts into runtime audio observations when that device is targeted
@@ -41,8 +45,11 @@ and presence-session state used to arm wakeword listening and proactive checks.
 | `__init__.py` | Package export surface |
 | `audio_policy.py` | Conservative ReSpeaker policy-hook, speech-defer, and runtime-alert derivation |
 | `ambiguous_room_guard.py` | Fail-closed room-ambiguity guard for person-targeted runtime inferences |
-| `known_user_hint.py` | Conservative known-user hint from voice-profile state plus clear room context |
+| `identity_fusion.py` | Bounded temporal/session identity fusion over voice, portrait, enrolled household-voice candidates, and visual-anchor history |
+| `portrait_match.py` | Conservative runtime claim surface for local portrait-match observations, including temporal evidence metadata |
+| `known_user_hint.py` | Conservative known-user hint from voice-profile state plus optional temporal identity-fusion evidence |
 | `affect_proxy.py` | Prompt-only affect proxy surface from coarse posture, attention, and quiet cues |
+| `display_attention.py` | Conservative proactive producer and local refresh policy for HDMI gaze-follow face cues |
 | `claim_metadata.py` | Shared `confidence` / `source` / `requires_confirmation` helpers for multimodal runtime claims |
 | `multimodal_initiative.py` | Conservative multimodal initiative readiness and display-first recommendation from camera + ReSpeaker facts |
 | `runtime_contract.py` | Hard startup-blocker contract for XVF3800 DFU/safe-mode states |

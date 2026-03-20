@@ -359,6 +359,15 @@ class _RemoteSnapshotCandidate:
     document_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedSnapshotRead:
+    """Hold one short-lived in-process remote snapshot read-through cache entry."""
+
+    payload: dict[str, object]
+    expires_at_monotonic: float
+    document_id: str | None = None
+
+
 @dataclass(slots=True)
 class LongTermRemoteStateStore:
     """Load and save remote snapshot state for long-term memory.
@@ -377,6 +386,7 @@ class LongTermRemoteStateStore:
     _probe_cache_depth: int = field(init=False, repr=False, default=0)
     _probe_cache: dict[str, LongTermRemoteSnapshotProbe] = field(init=False, repr=False, default_factory=dict)
     _document_id_hints: dict[str, str] = field(init=False, repr=False, default_factory=dict)
+    _snapshot_read_cache: dict[str, _CachedSnapshotRead] = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize the remote namespace once during construction."""
@@ -527,9 +537,9 @@ class LongTermRemoteStateStore:
                 document id before resolving snapshot pointers again. This is
                 enabled by default for ordinary snapshot reads because exact
                 document ids are both faster and more deterministic right after
-                local writes; ordinary reads do not retain fresh hints across
-                calls so a long-lived reader does not keep serving stale
-                snapshots after another runtime updates the same namespace.
+                local writes. Read-through reuse of remote results across
+                ordinary reads is separately controlled by
+                ``long_term_memory_remote_read_cache_ttl_s``.
 
         Returns:
             The loaded snapshot payload, or ``None`` when no usable payload is
@@ -543,6 +553,9 @@ class LongTermRemoteStateStore:
         normalized_snapshot_kind = self._normalize_snapshot_kind(snapshot_kind)  # AUDIT-FIX(#6): Validate snapshot IDs before they become remote keys.
         if not self.enabled:
             return None
+        cached_payload = self._cached_snapshot_read(snapshot_kind=normalized_snapshot_kind)
+        if cached_payload is not None:
+            return cached_payload
         try:
             read_client = self._require_client(self.read_client, operation="read")
         except LongTermRemoteUnavailableError as exc:
@@ -571,6 +584,11 @@ class LongTermRemoteStateStore:
             prefer_cached_document_id=prefer_cached_document_id,
         )
         if probe.payload is not None:
+            self._store_snapshot_read(
+                snapshot_kind=normalized_snapshot_kind,
+                payload=probe.payload,
+                document_id=probe.document_id,
+            )
             return probe.payload
 
         local_payload: dict[str, object] | None = None
@@ -721,6 +739,11 @@ class LongTermRemoteStateStore:
                 snapshot_kind=normalized_snapshot_kind,
                 document_id=document_id,
             )
+        self._store_snapshot_read(
+            snapshot_kind=normalized_snapshot_kind,
+            payload=attested_payload or payload_dict,
+            document_id=document_id,
+        )
         self._clear_cached_probe(snapshot_kind=normalized_snapshot_kind)
         if not self._is_pointer_snapshot_kind(normalized_snapshot_kind):
             self._store_cached_probe(
@@ -1624,6 +1647,61 @@ class LongTermRemoteStateStore:
         with self._state_lock:
             self._probe_cache.pop(snapshot_kind, None)
 
+    def _remote_read_cache_ttl_s(self) -> float:
+        try:
+            ttl_s = float(getattr(self.config, "long_term_memory_remote_read_cache_ttl_s", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        return ttl_s if math.isfinite(ttl_s) and ttl_s > 0.0 else 0.0
+
+    def _cached_snapshot_read(self, *, snapshot_kind: str) -> dict[str, object] | None:
+        if self._remote_read_cache_ttl_s() <= 0.0:
+            return None
+        now = time.monotonic()
+        with self._state_lock:
+            cached = self._snapshot_read_cache.get(snapshot_kind)
+            if cached is None:
+                return None
+            if cached.expires_at_monotonic <= now:
+                self._snapshot_read_cache.pop(snapshot_kind, None)
+                return None
+            payload = dict(cached.payload)
+            document_id = cached.document_id
+        if document_id:
+            self._remember_snapshot_document_id(snapshot_kind=snapshot_kind, document_id=document_id)
+        return payload
+
+    def _store_snapshot_read(
+        self,
+        *,
+        snapshot_kind: str,
+        payload: Mapping[str, object],
+        document_id: str | None,
+    ) -> None:
+        ttl_s = self._remote_read_cache_ttl_s()
+        normalized_document_id = _normalize_snapshot_document_id(document_id)
+        if ttl_s > 0.0 and normalized_document_id is not None:
+            self._remember_snapshot_document_id(
+                snapshot_kind=snapshot_kind,
+                document_id=normalized_document_id,
+            )
+        if ttl_s <= 0.0:
+            return
+        payload_dict = _mapping_dict(payload)
+        if payload_dict is None:
+            return
+        entry = _CachedSnapshotRead(
+            payload=payload_dict,
+            expires_at_monotonic=time.monotonic() + ttl_s,
+            document_id=normalized_document_id,
+        )
+        with self._state_lock:
+            self._snapshot_read_cache[snapshot_kind] = entry
+
+    def _clear_snapshot_read(self, *, snapshot_kind: str) -> None:
+        with self._state_lock:
+            self._snapshot_read_cache.pop(snapshot_kind, None)
+
     def _cached_snapshot_document_id(self, *, snapshot_kind: str) -> str | None:
         with self._state_lock:
             return self._document_id_hints.get(snapshot_kind)
@@ -1638,6 +1716,7 @@ class LongTermRemoteStateStore:
     def _forget_snapshot_document_id(self, *, snapshot_kind: str) -> None:
         with self._state_lock:
             self._document_id_hints.pop(snapshot_kind, None)
+            self._snapshot_read_cache.pop(snapshot_kind, None)
 
     def _cached_probe(self, *, snapshot_kind: str) -> LongTermRemoteSnapshotProbe | None:
         with self._state_lock:

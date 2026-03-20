@@ -43,6 +43,9 @@ class TwinrRuntimeBase:
     user_voice_status: str | None = field(default=None, repr=False)  # AUDIT-FIX(#2): Voice-Metadaten sind privat.
     user_voice_confidence: float | None = field(default=None, repr=False)  # AUDIT-FIX(#2): Voice-Metadaten sind privat.
     user_voice_checked_at: str | None = field(default=None, repr=False)  # AUDIT-FIX(#2): Zeitstempel sind privat.
+    user_voice_user_id: str | None = field(default=None, repr=False)  # AUDIT-FIX(#2): Enrolled local household match ids stay private.
+    user_voice_user_display_name: str | None = field(default=None, repr=False)  # AUDIT-FIX(#2): Household display names are private identity data.
+    user_voice_match_source: str | None = field(default=None, repr=False)  # AUDIT-FIX(#2): Internal match-source metadata stays private.
     _shutdown_lock: threading.RLock = field(
         init=False,
         repr=False,
@@ -155,8 +158,21 @@ class TwinrRuntimeBase:
             and self.config.long_term_memory_remote_required
         )
 
+    def _required_remote_dependency_uses_watchdog_artifact(self) -> bool:
+        """Return whether required-remote checks must trust the external watchdog artifact."""
+
+        mode = str(
+            getattr(self.config, "long_term_memory_remote_runtime_check_mode", "direct") or "direct"
+        ).strip().lower()
+        return mode == "watchdog_artifact"
+
     def check_required_remote_dependency(self, *, force_sync: bool = False) -> None:
         if not self.remote_dependency_required():
+            return
+        if self._required_remote_dependency_uses_watchdog_artifact():
+            from twinr.agent.workflows.required_remote_snapshot import ensure_required_remote_watchdog_snapshot_ready
+
+            ensure_required_remote_watchdog_snapshot_ready(self.config)
             return
         long_term_memory = getattr(self, "long_term_memory", None)
         if long_term_memory is None:

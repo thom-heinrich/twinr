@@ -45,6 +45,20 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("switch from one supported trigger type to another", instructions)
         self.assertIn("propose_skill_learning", instructions)
         self.assertIn("answer_skill_question", instructions)
+        self.assertIn("manage_household_identity", instructions)
+        self.assertIn("enroll_portrait_identity tool", instructions)
+        self.assertIn("guidance_hints", instructions)
+        self.assertIn("Repeated enroll_portrait_identity calls", instructions)
+
+    def test_compact_tool_instructions_cover_portrait_identity_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            instructions = build_compact_tool_agent_instructions(
+                TwinrConfig(openai_api_key="test-key", project_root=temp_dir, personality_dir="personality")
+            )
+
+        self.assertIn("Use enroll_portrait_identity", instructions)
+        self.assertIn("Prefer manage_household_identity", instructions)
+        self.assertIn("guidance_hints and recommended_next_step", instructions)
 
     def test_supervisor_instructions_do_not_embed_full_business_tool_rules(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

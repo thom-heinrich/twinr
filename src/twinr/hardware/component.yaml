@@ -3,12 +3,16 @@ name: hardware
 path: src/twinr/hardware
 kind: python-package
 visibility: internal
-summary: Provide bounded audio, GPIO, camera, printer, and voice-profile adapters for Twinr runtime paths.
+summary: Provide bounded audio, GPIO, camera, printer, voice-profile, and local household-identity adapters for Twinr runtime paths.
 owned_concerns:
   - Capture and play bounded audio for conversation, ambient sensing, and wakeword flows
   - Prove bounded readable-frame microphone capture before runtime layers trust a targeted input path as voice-ready
   - Monitor GPIO buttons and PIR motion across supported Pi backends
-  - Capture still photos via ffmpeg-backed V4L2 integration
+  - Capture still photos via ffmpeg-backed V4L2 integration, with a bounded Pi libcamera fallback for busy unicam-image nodes
+  - Persist local portrait identities with multiple reference images per user
+  - Perform bounded local portrait matching against enrolled identities using still-camera captures, on-device embeddings, and temporal evidence fusion
+  - Persist and assess multi-user local household voice identities on device
+  - Coordinate a bounded local household identity manager across portrait matching, voice matching, explicit feedback, and short session history
   - Run bounded hybrid IMX500 + MediaPipe health, person/object gating, pose enrichment, hand-landmark ROI work, temporal coarse-arm, and fine-hand gesture inference
   - Format and submit bounded receipt print jobs
   - Probe ReSpeaker XVF3800 USB/ALSA readiness and capture typed host-control primitives
@@ -109,7 +113,7 @@ files:
       - edge_name
       - edge_to_action
   - path: camera.py
-    role: ffmpeg-backed still camera adapter with bounded persistence
+    role: still camera adapter with bounded ffmpeg/V4L2 capture, Pi rpicam fallback, and bounded persistence
     exports:
       - CameraError
       - CameraConfigurationError
@@ -117,6 +121,42 @@ files:
       - CameraCaptureFailedError
       - CapturedPhoto
       - V4L2StillCamera
+  - path: portrait_identity.py
+    role: Atomic local portrait identity store with enrolled reference-image management and embedded templates
+    exports:
+      - PortraitIdentityProfile
+      - PortraitIdentityStore
+      - PortraitIdentitySummary
+      - PortraitReferenceImage
+      - portrait_identity_image_dir
+      - portrait_identity_store_path
+  - path: portrait_match.py
+    role: Bounded local portrait-match adapter with enrollment flow, multi-reference scoring, and temporal fusion
+    exports:
+      - OpenCVPortraitEmbeddingBackend
+      - PortraitEnrollmentResult
+      - PortraitEmbeddingResult
+      - PortraitMatchConfig
+      - PortraitMatchObservation
+      - PortraitMatchProvider
+  - path: household_voice_identity.py
+    role: Multi-user local household voice identity store and matcher
+    exports:
+      - HouseholdVoiceAssessment
+      - HouseholdVoiceIdentityMonitor
+      - HouseholdVoiceIdentityStore
+      - HouseholdVoiceProfile
+      - HouseholdVoiceSummary
+  - path: household_identity.py
+    role: Shared local household identity manager over portrait, voice, feedback, and bounded session history
+    exports:
+      - HouseholdIdentityFeedbackEvent
+      - HouseholdIdentityFeedbackStore
+      - HouseholdIdentityManager
+      - HouseholdIdentityMemberStatus
+      - HouseholdIdentityObservation
+      - HouseholdIdentityQuality
+      - HouseholdIdentityStatus
   - path: pir.py
     role: PIR motion adapter layered on the button monitor backend
     exports:
@@ -203,6 +243,7 @@ files:
       - VoiceProfileTemplate
       - extract_voice_embedding_from_pcm16
       - extract_voice_embedding_from_wav_bytes
+      - voice_embedding_confidence
       - voice_profile_store_path
 public_api:
   module: twinr.hardware
@@ -237,6 +278,9 @@ tests:
   - path: test/test_audio.py
   - path: test/test_button_helpers.py
   - path: test/test_camera.py
+  - path: test/test_portrait_match.py
+  - path: test/test_household_voice_identity.py
+  - path: test/test_household_identity.py
   - path: test/test_local_ai_camera_provider.py
   - path: test/test_hand_landmarks.py
   - path: test/test_mediapipe_vision.py

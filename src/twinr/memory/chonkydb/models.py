@@ -641,6 +641,83 @@ class ChonkyDBRetrieveRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ChonkyDBTopKRecordsRequest:
+    """Describe a one-shot retrieval query that returns structured top-k records."""
+
+    query_text: str | None = None
+    mode: str = "advanced"
+    result_limit: int = 10
+    include_content: bool = False
+    include_metadata: bool = True
+    content_mode: str | None = None
+    max_content_chars: int | None = None
+    timeout_seconds: float | None = None
+    filters: Mapping[str, object] | None = None
+    temporal_start: str | None = None
+    temporal_end: str | None = None
+    client_request_id: str | None = None
+    allowed_indexes: tuple[str, ...] | None = None
+    allowed_doc_ids: tuple[str, ...] | None = None
+    namespace: str | None = None
+    scope_ref: str | None = None
+    extra: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "query_text", _coerce_optional_str(self.query_text, field_name="query_text"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "mode", _coerce_required_str(self.mode, field_name="mode"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "result_limit", _coerce_int(self.result_limit, field_name="result_limit", minimum=1))  # AUDIT-FIX(#3)
+        object.__setattr__(self, "include_content", _coerce_bool(self.include_content, field_name="include_content"))  # AUDIT-FIX(#4)
+        object.__setattr__(self, "include_metadata", _coerce_bool(self.include_metadata, field_name="include_metadata"))  # AUDIT-FIX(#4)
+        object.__setattr__(self, "content_mode", _coerce_optional_str(self.content_mode, field_name="content_mode"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "max_content_chars", _coerce_optional_int(self.max_content_chars, field_name="max_content_chars", minimum=1))  # AUDIT-FIX(#3)
+        object.__setattr__(self, "timeout_seconds", _coerce_optional_float(self.timeout_seconds, field_name="timeout_seconds", minimum=0.0, allow_zero=False))  # AUDIT-FIX(#3)
+        object.__setattr__(self, "filters", _coerce_optional_mapping(self.filters, field_name="filters"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "temporal_start", _coerce_optional_str(self.temporal_start, field_name="temporal_start", empty_as_none=True))  # AUDIT-FIX(#6)
+        object.__setattr__(self, "temporal_end", _coerce_optional_str(self.temporal_end, field_name="temporal_end", empty_as_none=True))  # AUDIT-FIX(#6)
+        if self.temporal_start is not None:
+            start_dt = _parse_aware_datetime(self.temporal_start, field_name="temporal_start")  # AUDIT-FIX(#6)
+        else:
+            start_dt = None
+        if self.temporal_end is not None:
+            end_dt = _parse_aware_datetime(self.temporal_end, field_name="temporal_end")  # AUDIT-FIX(#6)
+        else:
+            end_dt = None
+        if start_dt is not None and end_dt is not None and start_dt > end_dt:
+            raise ChonkyDBValidationError("temporal_start must be <= temporal_end")
+        object.__setattr__(self, "client_request_id", _coerce_optional_str(self.client_request_id, field_name="client_request_id", empty_as_none=True))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "allowed_indexes", _coerce_optional_str_tuple(self.allowed_indexes, field_name="allowed_indexes"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "allowed_doc_ids", _coerce_optional_str_tuple(self.allowed_doc_ids, field_name="allowed_doc_ids"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "namespace", _coerce_optional_str(self.namespace, field_name="namespace", empty_as_none=True))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "scope_ref", _coerce_optional_str(self.scope_ref, field_name="scope_ref", empty_as_none=True))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "extra", _normalize_extra_mapping(self.extra) if self.extra is not None else None)  # AUDIT-FIX(#1)
+
+    def to_payload(self) -> JsonDict:
+        """Serialize the one-shot retrieval request into ChonkyDB's payload shape."""
+
+        payload = _drop_none(
+            {
+                "mode": self.mode,
+                "query_text": self.query_text,
+                "result_limit": self.result_limit,
+                "include_content": self.include_content,
+                "include_metadata": self.include_metadata,
+                "content_mode": self.content_mode,
+                "max_content_chars": self.max_content_chars,
+                "timeout_seconds": self.timeout_seconds,
+                "filters": dict(self.filters) if self.filters is not None else None,
+                "temporal_start": self.temporal_start,
+                "temporal_end": self.temporal_end,
+                "client_request_id": self.client_request_id,
+                "allowed_indexes": list(self.allowed_indexes) if self.allowed_indexes is not None else None,
+                "allowed_doc_ids": list(self.allowed_doc_ids) if self.allowed_doc_ids is not None else None,
+                "namespace": self.namespace,
+                "scope_ref": self.scope_ref,
+            }
+        )
+        return _merge_extra(payload, self.extra, reserved_keys=_reserved_payload_keys(self))
+
+
+@dataclass(frozen=True, slots=True)
 class ChonkyDBGraphAddEdgeRequest:
     """Describe a graph-edge write using numeric ChonkyDB node ids."""
 
@@ -905,6 +982,109 @@ class ChonkyDBRetrieveResponse:
             mode=_coerce_stringish(raw.get("mode"), field_name="mode", default="") or "",
             results=results,
             indexes_used=raw.get("indexes_used", ()),
+            raw=raw,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ChonkyDBTopKRecordHit:
+    """Represent one one-shot structured retrieval hit returned by ChonkyDB."""
+
+    payload_id: str | None
+    document_id: str | None
+    score: float | None
+    relevance_score: float | None
+    source_index: str | None
+    candidate_origin: str | None
+    payload_source: str | None
+    payload: Mapping[str, object] | None
+    metadata: Mapping[str, object] | None
+    score_breakdown: Mapping[str, object] | None
+    raw: JsonDict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "payload_id", _coerce_optional_str(self.payload_id, field_name="payload_id"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "document_id", _coerce_optional_str(self.document_id, field_name="document_id"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "score", _coerce_optional_float(self.score, field_name="score"))  # AUDIT-FIX(#7)
+        object.__setattr__(self, "relevance_score", _coerce_optional_float(self.relevance_score, field_name="relevance_score"))  # AUDIT-FIX(#7)
+        object.__setattr__(self, "source_index", _coerce_optional_str(self.source_index, field_name="source_index"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "candidate_origin", _coerce_optional_str(self.candidate_origin, field_name="candidate_origin"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "payload_source", _coerce_optional_str(self.payload_source, field_name="payload_source"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "payload", _coerce_optional_mapping(self.payload, field_name="payload"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "metadata", _coerce_optional_mapping(self.metadata, field_name="metadata"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "score_breakdown", _coerce_optional_mapping(self.score_breakdown, field_name="score_breakdown"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "raw", _copy_raw_payload(self.raw))  # AUDIT-FIX(#8)
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "ChonkyDBTopKRecordHit":
+        """Parse one one-shot hit payload into the typed model."""
+
+        raw = _copy_raw_payload(payload)  # AUDIT-FIX(#8)
+        return cls(
+            payload_id=_coerce_stringish(raw.get("payload_id"), field_name="payload_id"),
+            document_id=_coerce_stringish(raw.get("document_id"), field_name="document_id"),
+            score=raw.get("score"),
+            relevance_score=raw.get("relevance_score"),
+            source_index=_coerce_stringish(raw.get("source_index"), field_name="source_index"),
+            candidate_origin=_coerce_stringish(raw.get("candidate_origin"), field_name="candidate_origin"),
+            payload_source=_coerce_stringish(raw.get("payload_source"), field_name="payload_source"),
+            payload=_coerce_optional_mapping(raw.get("payload"), field_name="payload"),
+            metadata=_coerce_optional_mapping(raw.get("metadata"), field_name="metadata"),
+            score_breakdown=_coerce_optional_mapping(raw.get("score_breakdown"), field_name="score_breakdown"),
+            raw=raw,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ChonkyDBTopKRecordsResponse:
+    """Represent a parsed one-shot structured retrieval response."""
+
+    success: bool
+    mode: str
+    results: tuple[ChonkyDBTopKRecordHit, ...]
+    indexes_used: tuple[str, ...]
+    scope_ref: str | None
+    query_plan: Mapping[str, object] | None
+    raw: JsonDict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "success", _coerce_bool(self.success, field_name="success"))  # AUDIT-FIX(#4)
+        object.__setattr__(self, "mode", _coerce_required_str(self.mode, field_name="mode", allow_empty=True))  # AUDIT-FIX(#5)
+        if isinstance(self.results, (str, bytes, bytearray)) or isinstance(self.results, Mapping) or not isinstance(self.results, Iterable):
+            raise ChonkyDBValidationError("results must be an iterable of ChonkyDBTopKRecordHit instances")
+        normalized_results: list[ChonkyDBTopKRecordHit] = []
+        for index, item in enumerate(self.results):
+            if not isinstance(item, ChonkyDBTopKRecordHit):
+                raise ChonkyDBValidationError(
+                    f"results[{index}] must be a ChonkyDBTopKRecordHit, got {type(item).__name__}"
+                )
+            normalized_results.append(item)
+        object.__setattr__(self, "results", tuple(normalized_results))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "indexes_used", _coerce_optional_str_tuple(self.indexes_used, field_name="indexes_used") or ())  # AUDIT-FIX(#5)
+        object.__setattr__(self, "scope_ref", _coerce_optional_str(self.scope_ref, field_name="scope_ref"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "query_plan", _coerce_optional_mapping(self.query_plan, field_name="query_plan"))  # AUDIT-FIX(#5)
+        object.__setattr__(self, "raw", _copy_raw_payload(self.raw))  # AUDIT-FIX(#8)
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "ChonkyDBTopKRecordsResponse":
+        """Parse a one-shot structured retrieval payload into the typed model."""
+
+        raw = _copy_raw_payload(payload)  # AUDIT-FIX(#8)
+        raw_results = raw.get("results", ())
+        if isinstance(raw_results, (str, bytes, bytearray)) or isinstance(raw_results, Mapping) or not isinstance(raw_results, Iterable):
+            raise ChonkyDBValidationError("results must be an iterable of mappings")
+        results_list: list[ChonkyDBTopKRecordHit] = []
+        for index, item in enumerate(raw_results):
+            if not isinstance(item, Mapping):
+                raise ChonkyDBValidationError(f"results[{index}] must be a mapping, got {type(item).__name__}")
+            results_list.append(ChonkyDBTopKRecordHit.from_payload(item))
+        return cls(
+            success=raw.get("success", False),
+            mode=_coerce_stringish(raw.get("mode"), field_name="mode", default="") or "",
+            results=tuple(results_list),
+            indexes_used=raw.get("indexes_used", ()),
+            scope_ref=_coerce_stringish(raw.get("scope_ref"), field_name="scope_ref"),
+            query_plan=_coerce_optional_mapping(raw.get("query_plan"), field_name="query_plan"),
             raw=raw,
         )
 

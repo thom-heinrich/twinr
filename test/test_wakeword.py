@@ -374,6 +374,30 @@ class WakewordTests(unittest.TestCase):
         self.assertEqual(model.predict_calls[0][1], {})
         self.assertEqual(model.predict_calls[0][2], {})
 
+    def test_openwakeword_spotter_passes_custom_verifier_config_to_model_factory(self) -> None:
+        recorded: dict[str, object] = {}
+        model = FakeOpenWakeWordModel({"twinr_v1": 0.91}, model_names=("twinr_v1",))
+
+        def factory(**kwargs):
+            recorded.update(kwargs)
+            return model
+
+        WakewordOpenWakeWordSpotter(
+            wakeword_models=("twinr_v1.onnx",),
+            phrases=("twinr",),
+            custom_verifier_models={"twinr_v1": "/tmp/twinr_v1.verifier.pkl"},
+            custom_verifier_threshold=0.23,
+            threshold=0.5,
+            transcribe_on_detect=False,
+            model_factory=factory,
+        )
+
+        self.assertEqual(
+            recorded["custom_verifier_models"],
+            {"twinr_v1": "/tmp/twinr_v1.verifier.pkl"},
+        )
+        self.assertEqual(recorded["custom_verifier_threshold"], 0.23)
+
     def test_openwakeword_frame_spotter_detects_streaming_hit_without_transcription(self) -> None:
         model = FakeOpenWakeWordModel(
             [
@@ -402,6 +426,30 @@ class WakewordTests(unittest.TestCase):
         self.assertEqual(len(model.predict_calls), 2)
         self.assertEqual(model.predict_calls[0][1], {})
         self.assertEqual(model.predict_calls[0][2], {})
+
+    def test_openwakeword_frame_spotter_passes_custom_verifier_config_to_model_factory(self) -> None:
+        recorded: dict[str, object] = {}
+        model = FakeOpenWakeWordModel({"twinr_v1": 0.91}, model_names=("twinr_v1",))
+
+        def factory(**kwargs):
+            recorded.update(kwargs)
+            return model
+
+        WakewordOpenWakeWordFrameSpotter(
+            wakeword_models=("twinr_v1.onnx",),
+            phrases=("twinr",),
+            custom_verifier_models={"twinr_v1": "/tmp/twinr_v1.verifier.pkl"},
+            custom_verifier_threshold=0.19,
+            threshold=0.5,
+            patience_frames=1,
+            model_factory=factory,
+        )
+
+        self.assertEqual(
+            recorded["custom_verifier_models"],
+            {"twinr_v1": "/tmp/twinr_v1.verifier.pkl"},
+        )
+        self.assertEqual(recorded["custom_verifier_threshold"], 0.19)
 
     def test_openwakeword_frame_spotter_requires_smoothed_activation(self) -> None:
         model = FakeOpenWakeWordModel(

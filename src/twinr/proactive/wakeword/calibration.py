@@ -26,6 +26,18 @@ def _normalize_optional_text(value: object) -> str | None:
     return normalized or None
 
 
+def _normalize_optional_text_tuple(name: str, value: object | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parts = tuple(part.strip() for part in value.split(",") if part.strip())
+    elif isinstance(value, (list, tuple)):
+        parts = tuple(str(part).strip() for part in value if str(part).strip())
+    else:
+        raise ValueError(f"{name} must be a list of strings or a comma-separated string.")
+    return parts or None
+
+
 def _normalize_probability(name: str, value: object | None) -> float | None:
     if value is None:
         return None
@@ -98,6 +110,7 @@ class WakewordCalibrationProfile:
     fallback_backend: str | None = None
     verifier_mode: str | None = None
     verifier_margin: float | None = None
+    stt_phrases: tuple[str, ...] | None = None
     threshold: float | None = None
     vad_threshold: float | None = None
     patience_frames: int | None = None
@@ -122,6 +135,11 @@ class WakewordCalibrationProfile:
             self,
             "verifier_margin",
             _normalize_probability("verifier_margin", self.verifier_margin),
+        )
+        object.__setattr__(
+            self,
+            "stt_phrases",
+            _normalize_optional_text_tuple("stt_phrases", self.stt_phrases),
         )
         object.__setattr__(self, "threshold", _normalize_probability("threshold", self.threshold))
         object.__setattr__(
@@ -158,6 +176,7 @@ class WakewordCalibrationProfile:
             fallback_backend=data.get("fallback_backend"),
             verifier_mode=data.get("verifier_mode"),
             verifier_margin=data.get("verifier_margin"),
+            stt_phrases=data.get("stt_phrases"),
             threshold=data.get("threshold"),
             vad_threshold=data.get("vad_threshold"),
             patience_frames=data.get("patience_frames"),
@@ -245,6 +264,11 @@ def apply_wakeword_calibration(
             config.wakeword_verifier_margin
             if profile.verifier_margin is None
             else profile.verifier_margin
+        ),
+        wakeword_stt_phrases=(
+            config.wakeword_stt_phrases
+            if profile.stt_phrases is None
+            else profile.stt_phrases
         ),
         wakeword_openwakeword_threshold=(
             config.wakeword_openwakeword_threshold

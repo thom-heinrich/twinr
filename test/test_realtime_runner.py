@@ -2400,6 +2400,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 automation_poll_interval_s=0.0,
                 proactive_governor_global_prompt_cooldown_s=300.0,
                 proactive_governor_source_repeat_cooldown_s=0.0,
+                proactive_quiet_hours_visual_only_enabled=False,
             )
             loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
             entry = loop.runtime.create_time_automation(
@@ -2869,6 +2870,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 reminder_poll_interval_s=0.0,
                 proactive_governor_global_prompt_cooldown_s=300.0,
                 proactive_governor_source_repeat_cooldown_s=0.0,
+                proactive_quiet_hours_visual_only_enabled=False,
             )
             loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(config=config)
             loop.runtime.schedule_reminder(
@@ -3123,10 +3125,10 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertFalse(delivered)
         self.assertEqual(print_backend.proactive_calls, [])
         self.assertEqual(player.played, [])
-        self.assertIn("longterm_proactive_skipped=sensitive_multi_person_context", lines)
+        self.assertIn("longterm_proactive_skipped=multi_person_context", lines)
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0].skip_count, 1)
-        self.assertEqual(history[0].last_skip_reason, "sensitive_multi_person_context")
+        self.assertEqual(history[0].last_skip_reason, "multi_person_context")
 
     def test_idle_loop_blocks_longterm_proactive_candidate_when_multimodal_initiative_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3709,6 +3711,101 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertFalse(reset["enrolled"])
         self.assertIn("voice_profile_tool_call=true", lines)
 
+    def test_portrait_identity_tools_can_enroll_status_and_reset(self) -> None:
+        fake_provider = mock.Mock()
+        fake_provider.capture_and_enroll_reference.return_value = SimpleNamespace(
+            status="enrolled",
+            user_id="main_user",
+            display_name="Thom",
+            reference_id="ref_1",
+            reference_image_count=1,
+        )
+        fake_provider.summary.return_value = SimpleNamespace(
+            user_id="main_user",
+            display_name="Thom",
+            primary_user=True,
+            enrolled=True,
+            reference_image_count=1,
+            updated_at="2026-03-19T12:00:00Z",
+            store_path="/tmp/portrait_identities.json",
+        )
+        fake_provider.observe.return_value = SimpleNamespace(
+            state="likely_reference_user",
+            confidence=0.82,
+            fused_confidence=0.88,
+            temporal_state="stable_match",
+            temporal_observation_count=2,
+            matched_user_id="main_user",
+            matched_user_display_name="Thom",
+            candidate_user_count=1,
+            capture_source_device="/dev/video0",
+        )
+        fake_provider.clear_identity_profile.return_value = SimpleNamespace(
+            status="cleared",
+            user_id="main_user",
+            reference_image_count=0,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                portrait_match_store_path=str(Path(temp_dir) / "state" / "portrait_identities.json"),
+            )
+            loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+            with mock.patch(
+                "twinr.agent.tools.handlers.portrait_identity._get_portrait_provider",
+                return_value=fake_provider,
+            ):
+                enroll = loop._handle_enroll_portrait_identity_tool_call({"display_name": "Thom", "confirmed": True})
+                status = loop._handle_get_portrait_identity_status_tool_call({"confirmed": True})
+                reset = loop._handle_reset_portrait_identity_tool_call({"confirmed": True})
+
+        self.assertEqual(enroll["status"], "enrolled")
+        self.assertTrue(enroll["saved"])
+        self.assertEqual(enroll["reference_id"], "ref_1")
+        self.assertEqual(enroll["coverage_state"], "single_reference")
+        self.assertEqual(enroll["recommended_next_step"], "capture_more_variation")
+        self.assertIn("capture_more_angle_variation", enroll["guidance_hints"])
+        self.assertEqual(status["status"], "ok")
+        self.assertTrue(status["enrolled"])
+        self.assertEqual(status["current_signal"], "likely_reference_user")
+        self.assertEqual(status["current_confidence"], 0.88)
+        self.assertEqual(status["matched_user_id"], "main_user")
+        self.assertEqual(reset["status"], "cleared")
+        self.assertEqual(reset["deleted_reference_count"], 1)
+        self.assertIn("portrait_identity_tool_call=true", lines)
+
+    def test_portrait_identity_tool_returns_retry_guidance_for_quality_failures(self) -> None:
+        fake_provider = mock.Mock()
+        fake_provider.capture_and_enroll_reference.return_value = SimpleNamespace(
+            status="no_face_detected",
+            user_id="main_user",
+            display_name=None,
+            reference_id=None,
+            reference_image_count=0,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+                portrait_match_store_path=str(Path(temp_dir) / "state" / "portrait_identities.json"),
+            )
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+            with mock.patch(
+                "twinr.agent.tools.handlers.portrait_identity._get_portrait_provider",
+                return_value=fake_provider,
+            ):
+                result = loop._handle_enroll_portrait_identity_tool_call({"confirmed": True})
+
+        self.assertEqual(result["status"], "no_face_detected")
+        self.assertEqual(result["quality_state"], "needs_retry")
+        self.assertEqual(result["recommended_next_step"], "retry_capture")
+        self.assertEqual(result["suggested_follow_up_tool"], "inspect_camera")
+        self.assertIn("single_face_in_frame", result["guidance_hints"])
+        self.assertIn("centered", result["suggested_inspection_question"])
+
     def test_inspect_camera_tool_uses_backend_and_reference_image(self) -> None:
         camera = FakeCamera()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3786,7 +3883,9 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn(expected_date, date_context)
 
     def test_social_trigger_speaks_proactive_prompt(self) -> None:
-        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop()
+        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
+            config=TwinrConfig(proactive_quiet_hours_visual_only_enabled=False)
+        )
 
         spoke = loop.handle_social_trigger(
             SocialTriggerDecision(
@@ -3847,7 +3946,8 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             ]
         )
         loop, _lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop(
-            recorder=recorder
+            config=TwinrConfig(proactive_quiet_hours_visual_only_enabled=False),
+            recorder=recorder,
         )
         print_backend.synthesize_sleep_s = 0.12
         feedback_kinds: list[str] = []
@@ -3879,6 +3979,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         )
         loop, lines, realtime_session, print_backend, recorder, player, _printer = self.make_loop(
             config=TwinrConfig(
+                proactive_quiet_hours_visual_only_enabled=False,
                 conversation_follow_up_timeout_s=3.5,
                 audio_follow_up_speech_start_chunks=5,
                 audio_follow_up_ignore_ms=420,

@@ -13,6 +13,7 @@ personalization cues for a single user turn.
 - compile explicit confirmed response-channel policy packets so confirmed ReSpeaker-derived channel preferences can guide later delivery behavior without promoting mere observations
 - compile persistent restart-recall policy packets from stable durable memories so fresh runtime roots retain a small provenance-rich continuity layer
 - compile and render silent personalization cues from graph and episodic memory
+- opportunistically reuse or background-build expensive silent subtext packets so live foreground turns do not stall on cold personalization compilation
 - sanitize recalled memory payloads before prompt serialization or optional LLM use
 - reject compiled personalization payloads that leak schema/JSON/markup structure and fall back to the static subtext path instead of injecting corrupted hidden guidance
 - expose a read-only operator search view over durable, episodic, midterm, graph, and conflict recall without constructing the full runtime service

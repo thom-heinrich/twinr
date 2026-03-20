@@ -67,6 +67,43 @@ class RuntimeContextTests(unittest.TestCase):
             finally:
                 runtime.shutdown(timeout_s=1.0)
 
+    def test_snapshot_restore_preserves_household_voice_identity_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            snapshot = RuntimeSnapshotStore(config.runtime_state_path).save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Das klingt nach dir.",
+                user_voice_status="known_other_user",
+                user_voice_confidence=0.88,
+                user_voice_checked_at="2026-03-15T19:01:00+00:00",
+                user_voice_user_id="eva",
+                user_voice_user_display_name="Eva",
+                user_voice_match_source="household_voice_identity",
+            )
+
+            self.assertEqual(snapshot.user_voice_user_id, "eva")
+            self.assertEqual(snapshot.user_voice_user_display_name, "Eva")
+            self.assertEqual(snapshot.user_voice_match_source, "household_voice_identity")
+
+            runtime = TwinrRuntime(
+                config=TwinrConfig(
+                    project_root=temp_dir,
+                    long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+                    runtime_state_path=str(Path(temp_dir) / "state" / "runtime-state.json"),
+                    restore_runtime_state_on_startup=True,
+                )
+            )
+            try:
+                self.assertEqual(runtime.user_voice_status, "known_other_user")
+                self.assertEqual(runtime.user_voice_user_id, "eva")
+                self.assertEqual(runtime.user_voice_user_display_name, "Eva")
+                self.assertEqual(runtime.user_voice_match_source, "household_voice_identity")
+                self.assertEqual(runtime.user_voice_checked_at, "2026-03-15T19:01:00Z")
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
     def test_search_provider_context_skips_long_term_memory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = TwinrRuntime(config=self._config(temp_dir))
@@ -330,6 +367,31 @@ class RuntimeContextTests(unittest.TestCase):
 
         with self.assertRaises(LongTermRemoteUnavailableError):
             runtime.check_required_remote_dependency()
+
+    def test_check_required_remote_dependency_uses_watchdog_artifact_when_configured(self) -> None:
+        runtime = TwinrRuntime.__new__(TwinrRuntime)
+        runtime.config = TwinrConfig(
+            long_term_memory_enabled=True,
+            long_term_memory_mode="remote_primary",
+            long_term_memory_remote_required=True,
+            long_term_memory_remote_runtime_check_mode="watchdog_artifact",
+        )
+
+        class _GuardedLongTermMemory:
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                raise AssertionError("deep remote check must not run in watchdog_artifact mode")
+
+        runtime.long_term_memory = _GuardedLongTermMemory()
+
+        with patch(
+            "twinr.agent.workflows.required_remote_snapshot.ensure_required_remote_watchdog_snapshot_ready"
+        ) as guard_mock:
+            runtime.check_required_remote_dependency()
+
+        guard_mock.assert_called_once_with(runtime.config)
 
 
 if __name__ == "__main__":

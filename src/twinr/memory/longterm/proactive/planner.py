@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 import logging
 from math import isfinite
 from zoneinfo import ZoneInfo
@@ -22,6 +23,9 @@ from twinr.memory.longterm.core.models import (
     LongTermProactivePlanV1,
 )
 from twinr.text_utils import collapse_whitespace, slugify_identifier
+
+if TYPE_CHECKING:
+    from twinr.proactive.runtime.ambiguous_room_guard import AmbiguousRoomGuardSnapshot
 
 _DEFAULT_TIMEZONE_NAME = "Europe/Berlin"
 _FALLBACK_TIMEZONE_NAMES = (_DEFAULT_TIMEZONE_NAME, "UTC")
@@ -203,6 +207,22 @@ def _has_concerning_body_pose(live_facts: Mapping[str, object] | None) -> bool:
     return body_pose in _CONCERNING_BODY_POSES
 
 
+def _ambiguous_room_guard(live_facts: Mapping[str, object] | None) -> AmbiguousRoomGuardSnapshot | None:
+    """Return the current room-ambiguity guard when live facts are available."""
+
+    if not isinstance(live_facts, Mapping):
+        return None
+    from twinr.proactive.runtime.ambiguous_room_guard import (
+        AmbiguousRoomGuardSnapshot,
+        derive_ambiguous_room_guard,
+    )
+
+    return AmbiguousRoomGuardSnapshot.from_fact_map(live_facts.get("ambiguous_room_guard")) or derive_ambiguous_room_guard(
+        observed_at=_section_value(live_facts, "sensor", "observed_at"),
+        live_facts=live_facts,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class LongTermProactivePlanner:
     """Rank bounded proactive candidates for the long-term memory runtime.
@@ -362,6 +382,9 @@ class LongTermProactivePlanner:
         reference = _coerce_reference_datetime(reference, timezone_name=self.timezone_name)
         # AUDIT-FIX(#1): Distress-like body poses must suppress routine proactive offers in this planner.
         if _has_concerning_body_pose(live_facts):
+            return ()
+        room_guard = _ambiguous_room_guard(live_facts)
+        if room_guard is not None and room_guard.guard_active:
             return ()
         candidates: list[LongTermProactiveCandidateV1] = []
         current_daypart = _daypart_for_datetime(reference)

@@ -84,7 +84,69 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--wakeword-manifest",
         type=Path,
-        help="Optional JSONL manifest of labeled wakeword captures for eval/autotune.",
+        help="Optional JSONL or JSON-array manifest of labeled wakeword captures for eval/autotune/verifier training or post-training acceptance tuning.",
+    )
+    parser.add_argument(
+        "--wakeword-train-model",
+        action="store_true",
+        help="Train a local openWakeWord-compatible Twinr base model from a generated dataset root.",
+    )
+    parser.add_argument(
+        "--wakeword-dataset-root",
+        type=Path,
+        help="Dataset root produced by scripts/generate_multivoice_dataset.py for base-model training.",
+    )
+    parser.add_argument(
+        "--wakeword-model-output",
+        type=Path,
+        help="Where to write the trained wakeword .onnx model.",
+    )
+    parser.add_argument(
+        "--wakeword-model-metadata-output",
+        type=Path,
+        help="Optional metadata .json output path for --wakeword-train-model.",
+    )
+    parser.add_argument(
+        "--wakeword-training-workdir",
+        type=Path,
+        help="Optional working directory for intermediate wakeword training features.",
+    )
+    parser.add_argument(
+        "--wakeword-training-rounds",
+        type=int,
+        default=2,
+        help="How many fixed-length jitter variants to build per training clip.",
+    )
+    parser.add_argument(
+        "--wakeword-training-steps",
+        type=int,
+        default=20000,
+        help="Maximum training steps for the openWakeWord base-model loop.",
+    )
+    parser.add_argument(
+        "--wakeword-training-layer-dim",
+        type=int,
+        default=128,
+        help="Hidden layer width for the trained wakeword detector.",
+    )
+    parser.add_argument(
+        "--wakeword-training-feature-device",
+        default="cpu",
+        help="Feature extraction device for wakeword training: cpu or gpu.",
+    )
+    parser.add_argument(
+        "--wakeword-train-verifier",
+        action="store_true",
+        help="Train a local openWakeWord custom verifier from a labeled wakeword manifest.",
+    )
+    parser.add_argument(
+        "--wakeword-verifier-output",
+        type=Path,
+        help="Where to write the trained wakeword verifier .pkl file.",
+    )
+    parser.add_argument(
+        "--wakeword-verifier-model",
+        help="Optional wakeword model name or local model path used to train the verifier.",
     )
     parser.add_argument(
         "--wakeword-label-capture",
@@ -278,6 +340,20 @@ def _assert_pi_runtime_root(env_file: str | Path, *, command_name: str) -> None:
         )
 
 
+def _default_wakeword_verifier_output_path(model_name: str | None) -> Path | None:
+    """Infer one sibling verifier path for a local wakeword model file."""
+
+    if model_name is None:
+        return None
+    normalized_model_name = str(model_name).strip()
+    if not normalized_model_name:
+        return None
+    candidate = Path(normalized_model_name).expanduser()
+    if not candidate.exists():
+        return None
+    return candidate.resolve(strict=False).with_suffix(".verifier.pkl")
+
+
 def _build_runtime(config: TwinrConfig) -> Any:
     """Create the live runtime lazily so loop locks can be acquired first."""
 
@@ -419,6 +495,16 @@ def _run_whatsapp_channel(
         return loop.run(duration_s=duration_s)
 
 
+def _ensure_remote_watchdog_for_runtime_boot(config: TwinrConfig, env_file: str | Path) -> None:
+    """Start the external remote-memory watchdog before runtime bootstrap when required."""
+
+    if not _should_ensure_remote_watchdog_companion(config, env_file):
+        return
+    from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
+
+    ensure_remote_memory_watchdog_process(config, env_file=env_file)
+
+
 def main() -> int:
     """Dispatch the requested Twinr CLI command and return its exit code."""
 
@@ -512,10 +598,7 @@ def main() -> int:
             from twinr.providers import build_streaming_provider_bundle
             from twinr.providers.openai import OpenAIBackend
 
-            if _should_ensure_remote_watchdog_companion(config, args.env_file):
-                from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
-
-                ensure_remote_memory_watchdog_process(config, env_file=args.env_file)
+            _ensure_remote_watchdog_for_runtime_boot(config, args.env_file)
 
             with loop_instance_lock(config, "streaming-loop"):
                 with optional_display_companion(
@@ -538,6 +621,7 @@ def main() -> int:
                     )
                     return loop.run(duration_s=args.loop_duration)
 
+        _ensure_remote_watchdog_for_runtime_boot(config, args.env_file)
         runtime = _build_runtime(config)
         _print_runtime_banner(runtime, config, env_path)
 
@@ -592,10 +676,6 @@ def main() -> int:
             from twinr.display.companion import optional_display_companion
             from twinr.ops import loop_instance_lock
 
-            if _should_ensure_remote_watchdog_companion(config, args.env_file):
-                from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
-
-                ensure_remote_memory_watchdog_process(config, env_file=args.env_file)
             loop = TwinrRealtimeHardwareLoop(
                 config=config,
                 runtime=runtime,
@@ -673,10 +753,6 @@ def main() -> int:
             from twinr.display.companion import optional_display_companion
             from twinr.ops import loop_instance_lock
 
-            if _should_ensure_remote_watchdog_companion(config, args.env_file):
-                from twinr.ops.remote_memory_watchdog_companion import ensure_remote_memory_watchdog_process
-
-                ensure_remote_memory_watchdog_process(config, env_file=args.env_file)
             loop = TwinrHardwareLoop(
                 config=config,
                 runtime=runtime,
@@ -771,6 +847,71 @@ def main() -> int:
             )
             print(f"wakeword_label_capture={args.wakeword_label_capture}")
             print(f"wakeword_label={entry['data']['label']}")
+            return 0
+
+        if args.wakeword_train_model:
+            if args.wakeword_dataset_root is None:
+                raise RuntimeError("--wakeword-dataset-root is required with --wakeword-train-model")
+            if args.wakeword_model_output is None:
+                raise RuntimeError("--wakeword-model-output is required with --wakeword-train-model")
+            from twinr.proactive.wakeword import train_wakeword_base_model_from_dataset_root
+
+            report = train_wakeword_base_model_from_dataset_root(
+                dataset_root=args.wakeword_dataset_root,
+                output_model_path=args.wakeword_model_output,
+                metadata_path=args.wakeword_model_metadata_output,
+                acceptance_manifest=args.wakeword_manifest,
+                workdir=args.wakeword_training_workdir,
+                training_rounds=args.wakeword_training_rounds,
+                layer_dim=args.wakeword_training_layer_dim,
+                steps=args.wakeword_training_steps,
+                feature_device=str(args.wakeword_training_feature_device or "cpu").strip().lower() or "cpu",
+                evaluation_config=config,
+            )
+            print(f"wakeword_model_dataset_root={report.dataset_root}")
+            print(f"wakeword_model_output={report.output_model_path}")
+            print(f"wakeword_model_metadata={report.metadata_path}")
+            print(f"wakeword_model_total_length_samples={report.total_length_samples}")
+            print(f"wakeword_model_train_positive_clips={report.train_positive_clips}")
+            print(f"wakeword_model_train_negative_clips={report.train_negative_clips}")
+            print(f"wakeword_model_validation_positive_clips={report.validation_positive_clips}")
+            print(f"wakeword_model_validation_negative_clips={report.validation_negative_clips}")
+            print(f"wakeword_model_selected_threshold={report.selected_threshold:.6f}")
+            if report.acceptance_metrics is not None:
+                print(f"wakeword_model_acceptance_precision={report.acceptance_metrics.precision:.4f}")
+                print(f"wakeword_model_acceptance_recall={report.acceptance_metrics.recall:.4f}")
+                print(f"wakeword_model_acceptance_fpr={report.acceptance_metrics.false_positive_rate:.4f}")
+                print(f"wakeword_model_acceptance_fnr={report.acceptance_metrics.false_negative_rate:.4f}")
+            return 0
+
+        if args.wakeword_train_verifier:
+            if args.wakeword_manifest is None:
+                raise RuntimeError("--wakeword-manifest is required with --wakeword-train-verifier")
+            from twinr.proactive.wakeword import train_wakeword_custom_verifier_from_manifest
+
+            configured_models = tuple(str(item).strip() for item in config.wakeword_openwakeword_models if str(item).strip())
+            model_name = str(args.wakeword_verifier_model or (configured_models[0] if configured_models else "")).strip()
+            if not model_name:
+                raise RuntimeError(
+                    "Wakeword verifier training requires --wakeword-verifier-model or one configured openWakeWord model."
+                )
+            output_path = args.wakeword_verifier_output or _default_wakeword_verifier_output_path(model_name)
+            if output_path is None:
+                raise RuntimeError(
+                    "--wakeword-verifier-output is required when the verifier model is not a local file path."
+                )
+            report = train_wakeword_custom_verifier_from_manifest(
+                manifest_path=args.wakeword_manifest,
+                output_path=output_path,
+                model_name=model_name,
+                inference_framework=config.wakeword_openwakeword_inference_framework,
+            )
+            print(f"wakeword_verifier_manifest={report.manifest_path}")
+            print(f"wakeword_verifier_model={report.model_name}")
+            print(f"wakeword_verifier_positive_clips={report.positive_clips}")
+            print(f"wakeword_verifier_negative_clips={report.negative_clips}")
+            print(f"wakeword_verifier_negative_seconds={report.negative_seconds:.3f}")
+            print(f"wakeword_verifier_output={report.output_path}")
             return 0
 
         if args.wakeword_eval:

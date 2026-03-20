@@ -32,6 +32,18 @@ class TwinrTextChannelTurnService:
     error_reply_text: str = "Ich hatte gerade ein internes Problem. Versuch es bitte noch einmal."
     _lock: RLock = field(init=False, repr=False, default_factory=RLock)
 
+    def __post_init__(self) -> None:
+        """Synchronously warm remote-backed memory caches before live traffic."""
+
+        warmup_callback = getattr(getattr(self.runtime, "long_term_memory", None), "prewarm_foreground_read_cache", None)
+        if not callable(warmup_callback):
+            return
+        try:
+            warmup_callback()
+        except Exception:
+            LOGGER.exception("Text-channel warmup failed.")
+            raise
+
     def handle_inbound(self, message: ChannelInboundMessage) -> ChannelOutboundMessage:
         """Run one inbound text message through the Twinr runtime and provider."""
 

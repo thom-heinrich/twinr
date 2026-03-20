@@ -1,4 +1,5 @@
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 import sys
 import tempfile
@@ -19,6 +20,7 @@ class _FakeRuntime:
     def __init__(self) -> None:
         self.status = TwinrStatus.WAITING
         self.events: list[tuple[str, object]] = []
+        self.long_term_memory = None
 
     def begin_listening(self, *, request_source: str, button=None, proactive_trigger=None):
         self.events.append(("begin_listening", request_source))
@@ -140,6 +142,16 @@ class WhatsAppChannelTests(unittest.TestCase):
             backend.calls,
             [("Hallo Twinr", (("system", "memory context"),), None)],
         )
+
+    def test_text_channel_turn_service_warms_memory_before_live_turns_when_available(self) -> None:
+        runtime = _FakeRuntime()
+        backend = _FakeBackend()
+        warmed = Event()
+        runtime.long_term_memory = SimpleNamespace(prewarm_foreground_read_cache=lambda: warmed.set())
+
+        TwinrTextChannelTurnService(runtime=runtime, backend=backend)
+
+        self.assertTrue(warmed.wait(timeout=1.0))
 
     def test_policy_rejects_group_messages_when_groups_are_disabled(self) -> None:
         policy = self._policy()

@@ -45,6 +45,29 @@ def _capture() -> AmbientAudioCaptureWindow:
 
 
 class WakewordDecisionPolicyTests(unittest.TestCase):
+    def test_verifier_accepts_calibrated_twin_alias_for_twinr(self) -> None:
+        verifier = SttWakewordVerifier(
+            backend=FakeBackend("Hallo Twin wie gehts"),
+            phrases=("hallo twinr", "hallo twin", "twinr", "twin"),
+            language="de",
+        )
+
+        verification = verifier.verify(
+            _capture(),
+            detector_match=WakewordMatch(
+                detected=True,
+                transcript="",
+                matched_phrase="twinr",
+                backend="openwakeword",
+                detector_label="twinr",
+                score=0.58,
+            ),
+        )
+
+        self.assertEqual(verification.status, "accepted")
+        self.assertEqual(verification.matched_phrase, "hallo twin")
+        self.assertEqual(verification.remaining_text, "wie gehts")
+
     def test_ambiguity_only_verifies_borderline_openwakeword_hit(self) -> None:
         backend = FakeBackend("hey twinr wie gehts")
         verifier = SttWakewordVerifier(

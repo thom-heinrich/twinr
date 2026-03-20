@@ -29,6 +29,22 @@ class _FakeStore:
         return self._snapshot
 
 
+class _SequencedStore:
+    def __init__(self, snapshots, *, path: str = "/tmp/remote-memory-watchdog.json") -> None:
+        self._snapshots = list(snapshots)
+        self._index = 0
+        self.path = Path(path)
+
+    def load(self):
+        if not self._snapshots:
+            return None
+        if self._index >= len(self._snapshots):
+            return self._snapshots[-1]
+        snapshot = self._snapshots[self._index]
+        self._index += 1
+        return snapshot
+
+
 def _iso_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -172,6 +188,28 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
                 config,
                 store=_FakeStore(snapshot),
             )
+
+    def test_ensure_waits_briefly_for_starting_watchdog_snapshot(self) -> None:
+        now = datetime.now(timezone.utc)
+        starting = _build_snapshot(
+            now=now,
+            pid=os.getpid(),
+            status="starting",
+            ready=False,
+            probe_inflight=True,
+            probe_age_s=0.0,
+        )
+        ok = _build_snapshot(now=now, pid=os.getpid(), status="ok", ready=True)
+        config = TwinrConfig(long_term_memory_remote_watchdog_startup_wait_s=1.0)
+
+        with mock.patch("twinr.agent.workflows.required_remote_snapshot.time.sleep", return_value=None):
+            assessment = ensure_required_remote_watchdog_snapshot_ready(
+                config,
+                store=_SequencedStore((starting, ok)),
+            )
+
+        self.assertTrue(assessment.ready)
+        self.assertEqual(assessment.sample_status, "ok")
 
 
 class TwinrConfigRemoteRuntimeCheckModeTests(unittest.TestCase):

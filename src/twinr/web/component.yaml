@@ -11,6 +11,7 @@ owned_concerns:
   - Expose the self-coding operator page and learned-skill control forms backed by `src/twinr/agent/self_coding`
   - Expose the tabbed debug page for runtime, ChonkyDB, live memory attestation, memory search, Conversation Lab, LLM, events, hardware, and raw artifacts
   - Persist and replay portal Conversation Lab sessions with human-readable turn traces while delegating real text-turn execution to focused helpers
+  - Provide camera-backed helper surfaces for Conversation Lab tool turns such as local portrait enrollment and inspect-camera requests
   - Expose the `/connect/whatsapp` wizard for one-number WhatsApp self-chat setup, including allowlist, runtime, a bounded pairing window, live worker status, and the final self-chat test
   - Persist and read generic per-channel onboarding snapshots so pairing, reconnect, and repair-needed state survive page reloads
   - Centralize request-time config loading, store construction, and safe template rendering through `context.py`
@@ -32,6 +33,8 @@ files:
       - create_app
   - path: conversation_lab.py
     role: Portal conversation-lab session storage and real text-turn execution helper
+  - path: conversation_lab_vision.py
+    role: Camera and reference-image helpers used by Conversation Lab tool owners
   - path: context.py
     role: Shared request-time context, store factories, and safe template renderer
     exports:

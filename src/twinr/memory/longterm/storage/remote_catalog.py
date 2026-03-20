@@ -15,11 +15,17 @@ from dataclasses import dataclass
 import hashlib
 import json
 import logging
+from threading import RLock
 import time
 from urllib.parse import quote
 from uuid import uuid4
 
-from twinr.memory.chonkydb.models import ChonkyDBBulkRecordRequest, ChonkyDBRecordItem, ChonkyDBRetrieveRequest
+from twinr.memory.chonkydb.models import (
+    ChonkyDBBulkRecordRequest,
+    ChonkyDBRecordItem,
+    ChonkyDBRetrieveRequest,
+    ChonkyDBTopKRecordsRequest,
+)
 from twinr.memory.fulltext import FullTextDocument, FullTextSelector
 from twinr.memory.longterm.core.models import LongTermMemoryConflictV1, LongTermMemoryObjectV1, LongTermSourceRefV1
 from twinr.memory.longterm.storage.remote_read_diagnostics import (
@@ -97,6 +103,31 @@ class _RemoteCollectionDefinition:
     uri_segment: str
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedCatalogEntries:
+    entries: tuple[LongTermRemoteCatalogEntry, ...]
+    expires_at_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedItemPayload:
+    payload: dict[str, object]
+    expires_at_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedSearchResult:
+    item_ids: tuple[str, ...]
+    expires_at_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedLocalSearchSelector:
+    selector: FullTextSelector
+    by_item_id: dict[str, LongTermRemoteCatalogEntry]
+    expires_at_monotonic: float
+
+
 _DEFINITIONS: dict[str, _RemoteCollectionDefinition] = {
     "objects": _RemoteCollectionDefinition(
         snapshot_kind="objects",
@@ -132,11 +163,190 @@ class LongTermRemoteCatalogStore:
 
     def __init__(self, remote_state: LongTermRemoteStateStore | None) -> None:
         self.remote_state = remote_state
+        self._cache_lock = RLock()
+        self._catalog_entries_cache: dict[str, _CachedCatalogEntries] = {}
+        self._item_payload_cache: dict[tuple[str, str], _CachedItemPayload] = {}
+        self._search_result_cache: dict[tuple[str, str, int, tuple[str, ...]], _CachedSearchResult] = {}
+        self._local_search_selector_cache: dict[str, _CachedLocalSearchSelector] = {}
 
     def enabled(self) -> bool:
         """Return whether fine-grained remote storage is available."""
 
         return bool(self.remote_state is not None and self.remote_state.enabled)
+
+    def _persistent_read_cache_ttl_s(self) -> float:
+        remote_state = self.remote_state
+        config = None if remote_state is None else getattr(remote_state, "config", None)
+        try:
+            ttl_s = float(getattr(config, "long_term_memory_remote_read_cache_ttl_s", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        return ttl_s if ttl_s > 0.0 else 0.0
+
+    def _cached_catalog_entries(self, *, snapshot_kind: str) -> tuple[LongTermRemoteCatalogEntry, ...] | None:
+        ttl_s = self._persistent_read_cache_ttl_s()
+        if ttl_s <= 0.0:
+            return None
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._catalog_entries_cache.get(snapshot_kind)
+            if cached is None:
+                return None
+            if cached.expires_at_monotonic <= now:
+                self._catalog_entries_cache.pop(snapshot_kind, None)
+                self._local_search_selector_cache.pop(snapshot_kind, None)
+                return None
+            return cached.entries
+
+    def _store_catalog_entries(
+        self,
+        *,
+        snapshot_kind: str,
+        entries: tuple[LongTermRemoteCatalogEntry, ...],
+    ) -> None:
+        ttl_s = self._persistent_read_cache_ttl_s()
+        if ttl_s <= 0.0:
+            return
+        with self._cache_lock:
+            self._catalog_entries_cache[snapshot_kind] = _CachedCatalogEntries(
+                entries=entries,
+                expires_at_monotonic=time.monotonic() + ttl_s,
+            )
+            self._local_search_selector_cache[snapshot_kind] = _CachedLocalSearchSelector(
+                selector=self._build_local_search_selector(entries=entries),
+                by_item_id={entry.item_id: entry for entry in entries},
+                expires_at_monotonic=time.monotonic() + ttl_s,
+            )
+
+    def _build_local_search_selector(
+        self,
+        *,
+        entries: tuple[LongTermRemoteCatalogEntry, ...],
+    ) -> FullTextSelector:
+        """Build one local full-text selector over the current catalog entries."""
+
+        return FullTextSelector(
+            tuple(
+                FullTextDocument(
+                    doc_id=entry.item_id,
+                    category="remote_catalog",
+                    content=self._catalog_entry_search_text(entry),
+                )
+                for entry in entries
+            )
+        )
+
+    def _local_search_selector(
+        self,
+        *,
+        snapshot_kind: str,
+        entries: tuple[LongTermRemoteCatalogEntry, ...],
+    ) -> _CachedLocalSearchSelector | None:
+        """Return one cached local selector for the current snapshot entries."""
+
+        ttl_s = self._persistent_read_cache_ttl_s()
+        if ttl_s <= 0.0:
+            return None
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._local_search_selector_cache.get(snapshot_kind)
+            if cached is None:
+                return None
+            if cached.expires_at_monotonic <= now:
+                self._local_search_selector_cache.pop(snapshot_kind, None)
+                return None
+            if len(cached.by_item_id) != len(entries):
+                self._local_search_selector_cache.pop(snapshot_kind, None)
+                return None
+            return cached
+
+    def _cached_item_payload(self, *, snapshot_kind: str, item_id: str) -> dict[str, object] | None:
+        ttl_s = self._persistent_read_cache_ttl_s()
+        if ttl_s <= 0.0:
+            return None
+        cache_key = (snapshot_kind, item_id)
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._item_payload_cache.get(cache_key)
+            if cached is None:
+                return None
+            if cached.expires_at_monotonic <= now:
+                self._item_payload_cache.pop(cache_key, None)
+                return None
+            return dict(cached.payload)
+
+    def _store_item_payload(
+        self,
+        *,
+        snapshot_kind: str,
+        item_id: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        ttl_s = self._persistent_read_cache_ttl_s()
+        if ttl_s <= 0.0:
+            return
+        payload_dict = dict(payload)
+        with self._cache_lock:
+            self._item_payload_cache[(snapshot_kind, item_id)] = _CachedItemPayload(
+                payload=payload_dict,
+                expires_at_monotonic=time.monotonic() + ttl_s,
+            )
+
+    def _cached_search_result(
+        self,
+        *,
+        snapshot_kind: str,
+        query_text: str,
+        limit: int,
+        filtered_item_ids: tuple[str, ...],
+    ) -> tuple[str, ...] | None:
+        ttl_s = self._persistent_read_cache_ttl_s()
+        if ttl_s <= 0.0:
+            return None
+        cache_key = (snapshot_kind, query_text, limit, filtered_item_ids)
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = self._search_result_cache.get(cache_key)
+            if cached is None:
+                return None
+            if cached.expires_at_monotonic <= now:
+                self._search_result_cache.pop(cache_key, None)
+                return None
+            return cached.item_ids
+
+    def _store_search_result(
+        self,
+        *,
+        snapshot_kind: str,
+        query_text: str,
+        limit: int,
+        filtered_item_ids: tuple[str, ...],
+        selected_item_ids: tuple[str, ...],
+    ) -> None:
+        ttl_s = self._persistent_read_cache_ttl_s()
+        if ttl_s <= 0.0:
+            return
+        cache_key = (snapshot_kind, query_text, limit, filtered_item_ids)
+        with self._cache_lock:
+            self._search_result_cache[cache_key] = _CachedSearchResult(
+                item_ids=selected_item_ids,
+                expires_at_monotonic=time.monotonic() + ttl_s,
+            )
+
+    def _clear_read_cache(self, *, snapshot_kind: str) -> None:
+        with self._cache_lock:
+            self._catalog_entries_cache.pop(snapshot_kind, None)
+            self._local_search_selector_cache.pop(snapshot_kind, None)
+            self._item_payload_cache = {
+                cache_key: cached
+                for cache_key, cached in self._item_payload_cache.items()
+                if cache_key[0] != snapshot_kind
+            }
+            self._search_result_cache = {
+                cache_key: cached
+                for cache_key, cached in self._search_result_cache.items()
+                if cache_key[0] != snapshot_kind
+            }
 
     def is_catalog_payload(self, *, snapshot_kind: str, payload: Mapping[str, object] | None) -> bool:
         """Return whether one remote snapshot payload is a supported item catalog."""
@@ -183,13 +393,23 @@ class LongTermRemoteCatalogStore:
 
         definition = self._require_definition(snapshot_kind)
         if payload is None:
+            cached_entries = self._cached_catalog_entries(snapshot_kind=snapshot_kind)
+            if cached_entries is not None:
+                return cached_entries
+        if payload is None:
             payload = self._load_catalog_payload(snapshot_kind=snapshot_kind)
         if not isinstance(payload, Mapping):
             return ()
         if self._is_segmented_catalog_payload(definition=definition, payload=payload):
-            return self._load_segmented_catalog_entries(definition=definition, payload=payload)
+            entries = self._load_segmented_catalog_entries(definition=definition, payload=payload)
+            if payload is not None:
+                self._store_catalog_entries(snapshot_kind=snapshot_kind, entries=entries)
+            return entries
         if self._is_legacy_catalog_payload(definition=definition, payload=payload):
-            return self._load_legacy_catalog_entries(definition=definition, payload=payload)
+            entries = self._load_legacy_catalog_entries(definition=definition, payload=payload)
+            if payload is not None:
+                self._store_catalog_entries(snapshot_kind=snapshot_kind, entries=entries)
+            return entries
         return ()
 
     def catalog_available(self, *, snapshot_kind: str) -> bool:
@@ -304,6 +524,9 @@ class LongTermRemoteCatalogStore:
         normalized_item_id = self._normalize_item_id(item_id)
         if not normalized_item_id:
             return None
+        cached_payload = self._cached_item_payload(snapshot_kind=snapshot_kind, item_id=normalized_item_id)
+        if cached_payload is not None:
+            return cached_payload
         resolved_uri = uri or self.item_uri(snapshot_kind=snapshot_kind, item_id=normalized_item_id)
         started_monotonic = time.monotonic()
         try:
@@ -362,6 +585,11 @@ class LongTermRemoteCatalogStore:
         )
         if item_payload is None:
             return None
+        self._store_item_payload(
+            snapshot_kind=snapshot_kind,
+            item_id=normalized_item_id,
+            payload=item_payload,
+        )
         return dict(item_payload)
 
     def load_item_payloads(
@@ -376,7 +604,9 @@ class LongTermRemoteCatalogStore:
             entry.item_id: entry
             for entry in self.load_catalog_entries(snapshot_kind=snapshot_kind)
         }
-        selected_entries: list[LongTermRemoteCatalogEntry] = []
+        ordered_item_ids: list[str] = []
+        uncached_entries: list[LongTermRemoteCatalogEntry] = []
+        loaded_by_item_id: dict[str, dict[str, object]] = {}
         for raw_item_id in item_ids:
             item_id = self._normalize_item_id(raw_item_id)
             if not item_id:
@@ -384,15 +614,138 @@ class LongTermRemoteCatalogStore:
             entry = entry_by_id.get(item_id)
             if entry is None:
                 continue
-            selected_entries.append(entry)
-        loaded: list[dict[str, object]] = []
-        for payload in self._load_item_payloads_from_entries(
+            ordered_item_ids.append(item_id)
+            cached_payload = self._cached_item_payload(snapshot_kind=snapshot_kind, item_id=item_id)
+            if cached_payload is not None:
+                loaded_by_item_id[item_id] = cached_payload
+                continue
+            uncached_entries.append(entry)
+        loaded_uncached = self._load_item_payloads_from_entries(
             snapshot_kind=snapshot_kind,
-            entries=selected_entries,
-        ):
+            entries=uncached_entries,
+        )
+        for entry, payload in zip(uncached_entries, loaded_uncached, strict=False):
             if payload is not None:
-                loaded.append(payload)
-        return tuple(loaded)
+                loaded_by_item_id[entry.item_id] = payload
+        return tuple(loaded_by_item_id[item_id] for item_id in ordered_item_ids if item_id in loaded_by_item_id)
+
+    def prewarm_item_payload_cache(self, *, snapshot_kind: str) -> None:
+        """Warm the full current snapshot payload set into the read cache."""
+
+        if self._persistent_read_cache_ttl_s() <= 0.0:
+            return
+        entries = self.load_catalog_entries(snapshot_kind=snapshot_kind)
+        if not entries:
+            return
+        self.load_item_payloads(
+            snapshot_kind=snapshot_kind,
+            item_ids=(entry.item_id for entry in entries),
+        )
+
+    def search_current_item_payloads(
+        self,
+        *,
+        snapshot_kind: str,
+        query_text: str,
+        limit: int,
+        eligible: Callable[[LongTermRemoteCatalogEntry], bool] | None = None,
+    ) -> tuple[dict[str, object], ...] | None:
+        """Search the current remote scope directly without hydrating the full catalog.
+
+        Returns ``None`` when the current backend cannot satisfy one-shot
+        ``scope_ref`` searches and callers should fall back to the older
+        catalog-hydration path. When supported, this keeps query-driven reads
+        bounded to the ranked candidate window instead of fetching every
+        current catalog segment up front.
+        """
+
+        clean_query = self._normalize_text(query_text)
+        if not clean_query:
+            return ()
+        remote_state = self._require_remote_state()
+        read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
+        topk_records = getattr(read_client, "topk_records", None)
+        supports_topk_records = bool(getattr(read_client, "supports_topk_records", callable(topk_records)))
+        if not (supports_topk_records and callable(topk_records)):
+            return None
+        scope_ref, namespace = self._current_scope_request_context(snapshot_kind=snapshot_kind)
+        if not scope_ref or not namespace:
+            return None
+        definition = self._require_definition(snapshot_kind)
+        bounded_limit = max(1, int(limit))
+        max_request_limit = max(bounded_limit, self._retrieve_batch_size())
+        request_limit = self._initial_scope_search_limit(
+            bounded_limit=bounded_limit,
+            max_request_limit=max_request_limit,
+            requires_client_filter=eligible is not None,
+        )
+        selected_payloads: list[dict[str, object]] = []
+        seen_item_ids: set[str] = set()
+        while True:
+            candidates = self._search_remote_candidates(
+                snapshot_kind=snapshot_kind,
+                read_client=read_client,
+                query_text=clean_query,
+                result_limit=request_limit,
+                allowed_doc_ids=(),
+                scope_ref=scope_ref,
+                namespace=namespace,
+                catalog_entry_count=0,
+            )
+            candidate_count = 0
+            for candidate in candidates:
+                candidate_count += 1
+                entry = self._candidate_catalog_entry(definition=definition, payload=candidate)
+                if entry is None or entry.item_id in seen_item_ids:
+                    continue
+                if eligible is not None and not eligible(entry):
+                    continue
+                payload = self._extract_item_payload(
+                    definition=definition,
+                    item_id=entry.item_id,
+                    payload=candidate,
+                )
+                if not isinstance(payload, Mapping):
+                    continue
+                payload_dict = dict(payload)
+                self._store_item_payload(
+                    snapshot_kind=snapshot_kind,
+                    item_id=entry.item_id,
+                    payload=payload_dict,
+                )
+                selected_payloads.append(payload_dict)
+                seen_item_ids.add(entry.item_id)
+                if len(selected_payloads) >= bounded_limit:
+                    return tuple(selected_payloads)
+            if candidate_count < request_limit or request_limit >= max_request_limit:
+                break
+            next_limit = min(max_request_limit, request_limit * 2)
+            if next_limit <= request_limit:
+                break
+            request_limit = next_limit
+        return tuple(selected_payloads)
+
+    def _initial_scope_search_limit(
+        self,
+        *,
+        bounded_limit: int,
+        max_request_limit: int,
+        requires_client_filter: bool,
+    ) -> int:
+        """Choose the first one-shot top-k window for current-scope searches.
+
+        Remote current-scope queries with client-side eligibility filters pay a
+        full Pi-to-ChonkyDB roundtrip for every widening step. Starting with a
+        wider bounded window cuts that latency without hydrating the entire
+        catalog into the foreground turn.
+        """
+
+        if not requires_client_filter:
+            return bounded_limit
+        return min(
+            max_request_limit,
+            max(bounded_limit * 8, min(max_request_limit, 16)),
+        )
 
     def search_catalog_entries(
         self,
@@ -402,18 +755,47 @@ class LongTermRemoteCatalogStore:
         limit: int,
         eligible: Callable[[LongTermRemoteCatalogEntry], bool] | None = None,
     ) -> tuple[LongTermRemoteCatalogEntry, ...]:
-        """Search one catalog through ChonkyDB retrieval restricted to current docs."""
+        """Search one loaded catalog locally against the current remote projection."""
+
+        use_local_cached_search = self._persistent_read_cache_ttl_s() > 0.0
+        all_entries = self.load_catalog_entries(snapshot_kind=snapshot_kind)
+        if not all_entries:
+            return ()
+        entries = tuple(entry for entry in all_entries if eligible is None or eligible(entry))
+        if not entries:
+            return ()
+        result_limit = max(1, int(limit))
+        if len(entries) <= result_limit:
+            return tuple(entries[:result_limit])
+        filtered_item_ids = tuple(entry.item_id for entry in entries)
+        by_item_id = {entry.item_id: entry for entry in entries}
+        cached_search = self._cached_search_result(
+            snapshot_kind=snapshot_kind,
+            query_text=query_text,
+            limit=result_limit,
+            filtered_item_ids=filtered_item_ids,
+        )
+        if cached_search is not None:
+            return tuple(by_item_id[item_id] for item_id in cached_search if item_id in by_item_id)
+        if use_local_cached_search:
+            selected = self._local_search_catalog_entries(
+                snapshot_kind=snapshot_kind,
+                entries=all_entries,
+                query_text=query_text,
+                limit=result_limit,
+                eligible=eligible,
+            )
+            self._store_search_result(
+                snapshot_kind=snapshot_kind,
+                query_text=query_text,
+                limit=result_limit,
+                filtered_item_ids=filtered_item_ids,
+                selected_item_ids=tuple(entry.item_id for entry in selected),
+            )
+            return tuple(selected)
 
         remote_state = self._require_remote_state()
         read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
-        entries = tuple(
-            entry
-            for entry in self.load_catalog_entries(snapshot_kind=snapshot_kind)
-            if eligible is None or eligible(entry)
-        )
-        if not entries:
-            return ()
-        by_item_id = {entry.item_id: entry for entry in entries}
         allowed_doc_ids = [
             entry.document_id
             for entry in entries
@@ -421,59 +803,37 @@ class LongTermRemoteCatalogStore:
         ]
         if not allowed_doc_ids:
             return ()
-        result_limit = max(1, int(limit))
-        if len(entries) <= result_limit:
-            return tuple(entries[:result_limit])
+        topk_scope_ref, topk_namespace = self._topk_scope_request_context(
+            snapshot_kind=snapshot_kind,
+            entries=entries,
+            all_entries=all_entries,
+        )
         started_monotonic = time.monotonic()
+        definition = self._require_definition(snapshot_kind)
         try:
-            response = read_client.retrieve(
-                ChonkyDBRetrieveRequest(
-                    query_text=query_text,
-                    result_limit=result_limit,
-                    include_content=False,
-                    include_metadata=True,
-                    allowed_doc_ids=tuple(allowed_doc_ids),
-                )
+            candidates = self._search_remote_candidates(
+                snapshot_kind=snapshot_kind,
+                read_client=read_client,
+                query_text=query_text,
+                result_limit=result_limit,
+                allowed_doc_ids=tuple(allowed_doc_ids),
+                scope_ref=topk_scope_ref,
+                namespace=topk_namespace,
+                catalog_entry_count=len(entries),
             )
-            record_remote_read_observation(
-                remote_state=remote_state,
-                context=LongTermRemoteReadContext(
-                    snapshot_kind=snapshot_kind,
-                    operation="retrieve_search",
-                    query_text=query_text,
-                    catalog_entry_count=len(entries),
-                    allowed_doc_count=len(allowed_doc_ids),
-                    result_limit=result_limit,
-                ),
-                latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
-                outcome="ok",
-                classification="ok",
-            )
-        except Exception as exc:
-            record_remote_read_diagnostic(
-                remote_state=remote_state,
-                context=LongTermRemoteReadContext(
-                    snapshot_kind=snapshot_kind,
-                    operation="retrieve_search",
-                    query_text=query_text,
-                    catalog_entry_count=len(entries),
-                    allowed_doc_count=len(allowed_doc_ids),
-                    result_limit=result_limit,
-                ),
-                exc=exc,
-                started_monotonic=started_monotonic,
-                outcome="degraded",
-            )
+        except Exception:
             return self._local_search_catalog_entries(
-                entries=entries,
+                snapshot_kind=snapshot_kind,
+                entries=all_entries,
                 query_text=query_text,
                 limit=result_limit,
+                eligible=eligible,
             )
 
         selected: list[LongTermRemoteCatalogEntry] = []
         seen: set[str] = set()
-        for hit in response.results:
-            metadata = getattr(hit, "metadata", None)
+        for candidate in candidates:
+            metadata = candidate.get("metadata")
             if not isinstance(metadata, Mapping):
                 continue
             item_id = self._normalize_item_id(metadata.get("twinr_memory_item_id"))
@@ -482,40 +842,181 @@ class LongTermRemoteCatalogStore:
             entry = by_item_id.get(item_id)
             if entry is None:
                 continue
+            cached_payload = self._extract_item_payload(
+                definition=definition,
+                item_id=item_id,
+                payload=candidate,
+            )
+            if cached_payload is not None:
+                self._store_item_payload(
+                    snapshot_kind=snapshot_kind,
+                    item_id=item_id,
+                    payload=cached_payload,
+                )
             selected.append(entry)
             seen.add(item_id)
             if len(selected) >= max(1, int(limit)):
                 break
+        self._store_search_result(
+            snapshot_kind=snapshot_kind,
+            query_text=query_text,
+            limit=result_limit,
+            filtered_item_ids=filtered_item_ids,
+            selected_item_ids=tuple(entry.item_id for entry in selected),
+        )
         return tuple(selected)
+
+    def _search_remote_candidates(
+        self,
+        *,
+        snapshot_kind: str,
+        read_client: object,
+        query_text: str,
+        result_limit: int,
+        allowed_doc_ids: tuple[str, ...],
+        scope_ref: str | None = None,
+        namespace: str | None = None,
+        catalog_entry_count: int,
+    ) -> tuple[Mapping[str, object], ...]:
+        """Run remote search, preferring one-shot structured top-k responses."""
+
+        remote_state = self._require_remote_state()
+        topk_records = getattr(read_client, "topk_records", None)
+        supports_topk_records = bool(getattr(read_client, "supports_topk_records", callable(topk_records)))
+        if supports_topk_records and callable(topk_records):
+            started_monotonic = time.monotonic()
+            try:
+                response = topk_records(
+                    ChonkyDBTopKRecordsRequest(
+                        query_text=query_text,
+                        result_limit=result_limit,
+                        include_content=False,
+                        include_metadata=True,
+                        allowed_doc_ids=None if scope_ref and namespace else allowed_doc_ids,
+                        namespace=namespace,
+                        scope_ref=scope_ref,
+                    )
+                )
+                record_remote_read_observation(
+                    remote_state=remote_state,
+                    context=LongTermRemoteReadContext(
+                        snapshot_kind=snapshot_kind,
+                        operation="topk_search",
+                        query_text=query_text,
+                        catalog_entry_count=catalog_entry_count,
+                        allowed_doc_count=len(allowed_doc_ids),
+                        result_limit=result_limit,
+                    ),
+                    latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+                    outcome="ok",
+                    classification="ok",
+                )
+                return tuple(self._iter_retrieve_result_candidates(response))
+            except Exception as exc:
+                record_remote_read_diagnostic(
+                    remote_state=remote_state,
+                    context=LongTermRemoteReadContext(
+                        snapshot_kind=snapshot_kind,
+                        operation="topk_search",
+                        query_text=query_text,
+                        catalog_entry_count=catalog_entry_count,
+                        allowed_doc_count=len(allowed_doc_ids),
+                        result_limit=result_limit,
+                    ),
+                    exc=exc,
+                    started_monotonic=started_monotonic,
+                    outcome="fallback",
+                )
+
+        started_monotonic = time.monotonic()
+        try:
+            response = read_client.retrieve(
+                ChonkyDBRetrieveRequest(
+                    query_text=query_text,
+                    result_limit=result_limit,
+                    include_content=False,
+                    include_metadata=True,
+                    allowed_doc_ids=allowed_doc_ids,
+                )
+            )
+        except Exception as exc:
+            record_remote_read_diagnostic(
+                remote_state=remote_state,
+                context=LongTermRemoteReadContext(
+                    snapshot_kind=snapshot_kind,
+                    operation="retrieve_search",
+                    query_text=query_text,
+                    catalog_entry_count=catalog_entry_count,
+                    allowed_doc_count=len(allowed_doc_ids),
+                    result_limit=result_limit,
+                ),
+                exc=exc,
+                started_monotonic=started_monotonic,
+                outcome="degraded",
+            )
+            raise
+        record_remote_read_observation(
+            remote_state=remote_state,
+            context=LongTermRemoteReadContext(
+                snapshot_kind=snapshot_kind,
+                operation="retrieve_search",
+                query_text=query_text,
+                catalog_entry_count=catalog_entry_count,
+                allowed_doc_count=len(allowed_doc_ids),
+                result_limit=result_limit,
+            ),
+            latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+            outcome="ok",
+            classification="ok",
+        )
+        return tuple(self._iter_retrieve_result_candidates(response))
+
+    def _topk_scope_request_context(
+        self,
+        *,
+        snapshot_kind: str,
+        entries: tuple[LongTermRemoteCatalogEntry, ...],
+        all_entries: tuple[LongTermRemoteCatalogEntry, ...],
+    ) -> tuple[str | None, str | None]:
+        """Return the server-side scope context for full current-snapshot searches only."""
+
+        if len(entries) != len(all_entries):
+            return None, None
+        return self._current_scope_request_context(snapshot_kind=snapshot_kind)
 
     def _local_search_catalog_entries(
         self,
         *,
+        snapshot_kind: str,
         entries: tuple[LongTermRemoteCatalogEntry, ...],
         query_text: str,
         limit: int,
+        eligible: Callable[[LongTermRemoteCatalogEntry], bool] | None = None,
     ) -> tuple[LongTermRemoteCatalogEntry, ...]:
-        """Rank already-loaded catalog entries locally when remote search fails."""
+        """Rank already-loaded catalog entries locally through the cached selector."""
 
         bounded_limit = max(1, int(limit))
-        selector = FullTextSelector(
-            tuple(
-                FullTextDocument(
-                    doc_id=entry.item_id,
-                    category="remote_catalog",
-                    content=self._catalog_entry_search_text(entry),
-                )
-                for entry in entries
-            )
-        )
+        cached_selector = self._local_search_selector(snapshot_kind=snapshot_kind, entries=entries)
+        selector = self._build_local_search_selector(entries=entries) if cached_selector is None else cached_selector.selector
+        by_item_id = {entry.item_id: entry for entry in entries} if cached_selector is None else cached_selector.by_item_id
+        search_limit = bounded_limit if eligible is None else len(entries)
         selected_ids = selector.search(
             query_text,
-            limit=bounded_limit,
+            limit=max(1, search_limit),
             category="remote_catalog",
             allow_fallback=False,
         )
-        by_item_id = {entry.item_id: entry for entry in entries}
-        return tuple(by_item_id[item_id] for item_id in selected_ids if item_id in by_item_id)
+        selected: list[LongTermRemoteCatalogEntry] = []
+        for item_id in selected_ids:
+            entry = by_item_id.get(item_id)
+            if entry is None:
+                continue
+            if eligible is not None and not eligible(entry):
+                continue
+            selected.append(entry)
+            if len(selected) >= bounded_limit:
+                break
+        return tuple(selected)
 
     def _catalog_entry_search_text(self, entry: LongTermRemoteCatalogEntry) -> str:
         """Build one local fallback search document from catalog metadata."""
@@ -561,6 +1062,7 @@ class LongTermRemoteCatalogStore:
     ) -> dict[str, object]:
         """Persist individual remote items and return the small current catalog."""
 
+        self._clear_read_cache(snapshot_kind=snapshot_kind)
         remote_state = self._require_remote_state()
         write_client = self._require_client(getattr(remote_state, "write_client", None), operation="write")
         definition = self._require_definition(snapshot_kind)
@@ -667,6 +1169,7 @@ class LongTermRemoteCatalogStore:
     ) -> dict[str, object]:
         """Persist only the current catalog head/segments for existing item docs."""
 
+        self._clear_read_cache(snapshot_kind=snapshot_kind)
         remote_state = self._require_remote_state()
         write_client = self._require_client(getattr(remote_state, "write_client", None), operation="write")
         definition = self._require_definition(snapshot_kind)
@@ -1145,10 +1648,18 @@ class LongTermRemoteCatalogStore:
         ordered_entries = tuple(entries)
         if not ordered_entries:
             return ()
-        loaded_by_item_id = self._load_item_payloads_via_retrieve(
+        loaded_by_item_id: dict[str, dict[str, object]] = {}
+        unresolved_entries: list[LongTermRemoteCatalogEntry] = []
+        for entry in ordered_entries:
+            cached_payload = self._cached_item_payload(snapshot_kind=snapshot_kind, item_id=entry.item_id)
+            if cached_payload is not None:
+                loaded_by_item_id[entry.item_id] = cached_payload
+                continue
+            unresolved_entries.append(entry)
+        loaded_by_item_id.update(self._load_item_payloads_via_retrieve(
             snapshot_kind=snapshot_kind,
-            entries=ordered_entries,
-        )
+            entries=tuple(unresolved_entries),
+        ))
         resolved: list[dict[str, object] | None] = []
         for entry in ordered_entries:
             payload = loaded_by_item_id.get(entry.item_id)
@@ -1158,6 +1669,12 @@ class LongTermRemoteCatalogStore:
                     item_id=entry.item_id,
                     document_id=entry.document_id,
                     uri=entry.uri,
+                )
+            elif isinstance(payload, Mapping):
+                self._store_item_payload(
+                    snapshot_kind=snapshot_kind,
+                    item_id=entry.item_id,
+                    payload=payload,
                 )
             resolved.append(dict(payload) if isinstance(payload, Mapping) else None)
         return tuple(resolved)
@@ -1245,6 +1762,11 @@ class LongTermRemoteCatalogStore:
                     )
                     if payload is not None:
                         loaded[entry.item_id] = dict(payload)
+                        self._store_item_payload(
+                            snapshot_kind=snapshot_kind,
+                            item_id=entry.item_id,
+                            payload=payload,
+                        )
         return loaded
 
     def _load_retrieve_batch_candidates(
@@ -1261,12 +1783,40 @@ class LongTermRemoteCatalogStore:
         remote_state = self._require_remote_state()
 
         def load_one(batch: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...]]:
+            try:
+                return batch, self._load_remote_batch_candidates(
+                    snapshot_kind=snapshot_kind,
+                    read_client=read_client,
+                    batch=batch,
+                )
+            except Exception:
+                return batch, ()
+
+        max_workers = self._remote_read_max_workers(len(batches))
+        if max_workers <= 1:
+            return tuple(load_one(batch) for batch in batches)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            return tuple(executor.map(load_one, batches))
+
+    def _load_remote_batch_candidates(
+        self,
+        *,
+        snapshot_kind: str,
+        read_client: object,
+        batch: tuple[str, ...],
+    ) -> tuple[Mapping[str, object], ...]:
+        """Load one document-id batch, preferring one-shot structured reads."""
+
+        remote_state = self._require_remote_state()
+        topk_records = getattr(read_client, "topk_records", None)
+        supports_topk_records = bool(getattr(read_client, "supports_topk_records", callable(topk_records)))
+        if supports_topk_records and callable(topk_records):
             started_monotonic = time.monotonic()
             try:
-                response = read_client.retrieve(
-                    ChonkyDBRetrieveRequest(
-                        # ChonkyDB currently rejects empty query_text even when
-                        # allowed_doc_ids already fully constrains the candidate set.
+                response = topk_records(
+                    ChonkyDBTopKRecordsRequest(
+                        # ChonkyDB currently requires a query string even when
+                        # allowed_doc_ids already narrows the candidate set.
                         query_text=_ALLOWED_DOC_IDS_RETRIEVE_QUERY,
                         result_limit=len(batch),
                         include_content=False,
@@ -1278,7 +1828,7 @@ class LongTermRemoteCatalogStore:
                     remote_state=remote_state,
                     context=LongTermRemoteReadContext(
                         snapshot_kind=snapshot_kind,
-                        operation="retrieve_batch",
+                        operation="topk_batch",
                         allowed_doc_count=len(batch),
                         result_limit=len(batch),
                         batch_size=len(batch),
@@ -1287,28 +1837,64 @@ class LongTermRemoteCatalogStore:
                     outcome="ok",
                     classification="ok",
                 )
+                return tuple(self._iter_retrieve_result_candidates(response))
             except Exception as exc:
                 record_remote_read_diagnostic(
                     remote_state=remote_state,
                     context=LongTermRemoteReadContext(
                         snapshot_kind=snapshot_kind,
-                        operation="retrieve_batch",
+                        operation="topk_batch",
                         allowed_doc_count=len(batch),
                         result_limit=len(batch),
                         batch_size=len(batch),
                     ),
                     exc=exc,
                     started_monotonic=started_monotonic,
-                    outcome="degraded",
+                    outcome="fallback",
                 )
-                return batch, ()
-            return batch, tuple(self._iter_retrieve_result_candidates(response))
 
-        max_workers = self._remote_read_max_workers(len(batches))
-        if max_workers <= 1:
-            return tuple(load_one(batch) for batch in batches)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            return tuple(executor.map(load_one, batches))
+        started_monotonic = time.monotonic()
+        try:
+            response = read_client.retrieve(
+                ChonkyDBRetrieveRequest(
+                    # ChonkyDB currently rejects empty query_text even when
+                    # allowed_doc_ids already fully constrains the candidate set.
+                    query_text=_ALLOWED_DOC_IDS_RETRIEVE_QUERY,
+                    result_limit=len(batch),
+                    include_content=False,
+                    include_metadata=True,
+                    allowed_doc_ids=batch,
+                )
+            )
+        except Exception as exc:
+            record_remote_read_diagnostic(
+                remote_state=remote_state,
+                context=LongTermRemoteReadContext(
+                    snapshot_kind=snapshot_kind,
+                    operation="retrieve_batch",
+                    allowed_doc_count=len(batch),
+                    result_limit=len(batch),
+                    batch_size=len(batch),
+                ),
+                exc=exc,
+                started_monotonic=started_monotonic,
+                outcome="degraded",
+            )
+            raise
+        record_remote_read_observation(
+            remote_state=remote_state,
+            context=LongTermRemoteReadContext(
+                snapshot_kind=snapshot_kind,
+                operation="retrieve_batch",
+                allowed_doc_count=len(batch),
+                result_limit=len(batch),
+                batch_size=len(batch),
+            ),
+            latency_ms=max(0.0, (time.monotonic() - started_monotonic) * 1000.0),
+            outcome="ok",
+            classification="ok",
+        )
+        return tuple(self._iter_retrieve_result_candidates(response))
 
     def _iter_retrieve_result_candidates(self, payload: object) -> Iterable[Mapping[str, object]]:
         """Yield mapping-shaped raw retrieval hits from typed or fake clients."""
@@ -1409,6 +1995,37 @@ class LongTermRemoteCatalogStore:
         while len(document_ids) < expected:
             document_ids.append(None)
         return tuple(document_ids)
+
+    def _candidate_catalog_entry(
+        self,
+        *,
+        definition: _RemoteCollectionDefinition,
+        payload: Mapping[str, object],
+    ) -> LongTermRemoteCatalogEntry | None:
+        """Build a minimal catalog entry from one live retrieval candidate."""
+
+        item_id: str | None = None
+        metadata: dict[str, object] = {}
+        for candidate in self._iter_record_candidates(payload):
+            if item_id is None:
+                item_id = self._normalize_item_id(candidate.get("twinr_memory_item_id"))
+            candidate_metadata = self._catalog_entry_metadata_from_mapping(candidate)
+            if candidate_metadata:
+                metadata.update(candidate_metadata)
+        if not item_id:
+            return None
+        document_id = (
+            self._normalize_text(payload.get("document_id"))
+            or self._normalize_text(payload.get("payload_id"))
+            or self._normalize_text(payload.get("chonky_id"))
+        )
+        return LongTermRemoteCatalogEntry(
+            snapshot_kind=definition.snapshot_kind,
+            item_id=item_id,
+            document_id=document_id,
+            uri=self.item_uri(snapshot_kind=definition.snapshot_kind, item_id=item_id),
+            metadata=metadata,
+        )
 
     def _extract_item_payload(
         self,
@@ -1745,6 +2362,18 @@ class LongTermRemoteCatalogStore:
             if values:
                 metadata[field_name] = list(values)
         return metadata
+
+    def _current_scope_request_context(self, *, snapshot_kind: str) -> tuple[str | None, str | None]:
+        """Return the current-snapshot scope and namespace for one collection."""
+
+        remote_state = self.remote_state
+        namespace = self._normalize_text(None if remote_state is None else getattr(remote_state, "namespace", None))
+        if not namespace:
+            return None, None
+        definition = self._definition(snapshot_kind)
+        if definition is None:
+            return None, None
+        return f"longterm:{definition.snapshot_kind}:current", namespace
 
     @staticmethod
     def _normalize_text(value: object) -> str | None:

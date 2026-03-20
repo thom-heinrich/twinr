@@ -1,15 +1,19 @@
 # hardware
 
-`hardware` owns Twinr's low-level audio, GPIO, camera, printer, and local
-voice-profile adapters. It exposes bounded device I/O helpers that workflows,
-ops checks, and proactive services compose into higher-level behavior.
+`hardware` owns Twinr's low-level audio, GPIO, camera, printer, local
+voice-profile adapters, and the bounded local household-identity building
+blocks that combine portrait, voice, and explicit feedback on device.
 
 ## Responsibility
 
 `hardware` owns:
 - capture and play bounded audio for conversation and ambient sensing
 - monitor GPIO buttons and PIR motion across supported Pi backends
-- capture still photos from V4L2 cameras
+- capture still photos from V4L2 cameras, with a bounded `rpicam-still` fallback for Pi `unicam-image` devices when the V4L2 node is busy
+- persist local portrait identities with multiple reference images per user
+- perform bounded local portrait matching from enrolled identities plus still-camera captures
+- persist multi-user local household voice identities and assess current-turn audio against enrolled household members
+- coordinate one bounded local household identity manager across portrait matching, multi-user voice matching, explicit confirm or deny feedback, and short session history
 - run bounded hybrid IMX500 + MediaPipe camera inference for proactive sensing, with IMX500 always-on gating, MediaPipe pose enrichment, dedicated hand-landmark ROI work, ROI-guided gesture recognition, coarse motion, coarse-arm gestures, and bounded fine-hand gesture output
 - normalize MediaPipe-bound image buffers centrally so full frames and ROI crops reach the Pi runtime with supported dtype and contiguous layout
 - keep multi-ROI MediaPipe tasks monotonic by advancing and reserving timestamps across candidate inference within a frame
@@ -41,7 +45,11 @@ ops checks, and proactive services compose into higher-level behavior.
 | [hand_landmarks.py](./hand_landmarks.py) | Bounded MediaPipe hand-landmark ROI worker for full-frame-to-hand crop resolution |
 | [mediapipe_vision.py](./mediapipe_vision.py) | Stable compatibility facade for the public MediaPipe camera pipeline surface |
 | [buttons.py](./buttons.py) | GPIO button monitoring backends |
-| [camera.py](./camera.py) | ffmpeg-backed still capture |
+| [camera.py](./camera.py) | bounded still capture with ffmpeg/V4L2 plus Pi `rpicam-still` fallback for `unicam-image` devices |
+| [portrait_identity.py](./portrait_identity.py) | Atomic local portrait-identity store with enrolled reference-image management |
+| [portrait_match.py](./portrait_match.py) | Local YuNet/SFace portrait-match adapter with enrollment flow, multi-reference scoring, and temporal fusion |
+| [household_voice_identity.py](./household_voice_identity.py) | Multi-user local voice-identity store and matcher for enrolled household members |
+| [household_identity.py](./household_identity.py) | Shared local household identity manager for portrait, voice, feedback, and bounded session fusion |
 | [pir.py](./pir.py) | PIR motion wrapper on buttons |
 | [printer.py](./printer.py) | Receipt formatting and CUPS submission |
 | [respeaker/](./respeaker/) | XVF3800 probe, host-control transport, typed primitive snapshots, conservative derived signals, indicator semantics, claim-contract builders, scheduled polling wrapper, and runtime signal provider |
@@ -68,6 +76,13 @@ from twinr.hardware import VoiceProfileMonitor, configured_pir_monitor
 
 voice_monitor = VoiceProfileMonitor.from_config(config)
 pir_monitor = configured_pir_monitor(config)
+```
+
+```python
+from twinr.hardware.household_identity import HouseholdIdentityManager
+
+manager = HouseholdIdentityManager.from_config(config, camera=camera, camera_lock=camera_lock)
+status = manager.status(audio_pcm=current_turn_audio, sample_rate=16000, channels=1)
 ```
 
 ## See also

@@ -8,6 +8,7 @@ subtext retrieval into ``LongTermMemoryContext``. Import
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from enum import Enum
@@ -38,6 +39,18 @@ _MAX_TRANSCRIPT_CHARS = 1200  # AUDIT-FIX(#5): Bound prompt growth from oversize
 _MAX_RESPONSE_CHARS = 1200  # AUDIT-FIX(#5): Bound prompt growth from oversized stored responses.
 _MAX_GENERIC_VALUE_CHARS = 1024  # AUDIT-FIX(#3): Keep fallback string serialization bounded and JSON-safe.
 _MAX_COLLECTION_ITEMS = 64  # AUDIT-FIX(#3): Prevent pathological iterables from exploding prompt size.
+_CONTEXT_READ_MAX_WORKERS = 5
+
+
+@dataclass(frozen=True, slots=True)
+class _LongTermContextInputs:
+    """Hold the independent retrieval sections used to assemble one turn."""
+
+    episodic_entries: list[PersistentMemoryEntry]
+    midterm_packets: tuple[object, ...]
+    durable_objects: tuple[object, ...]
+    conflict_queue: tuple[LongTermConflictQueueItemV1, ...]
+    graph_context: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,22 +105,25 @@ class LongTermRetriever:
         if not query_texts:  # AUDIT-FIX(#2): Blank or garbled input must not trigger broad accidental recall.
             return self._empty_context()
         try:  # AUDIT-FIX(#1): A single broken store or malformed record must not crash the whole turn.
-            episodic_entries = self._select_episodic_entries(query_texts, fallback_limit=0)
-            midterm_packets = self._select_midterm_packets(query_texts)
-            durable_objects = self._select_durable_objects(query_texts)
+            context_inputs = self._load_context_inputs(
+                query_texts=query_texts,
+                retrieval_text=retrieval_text,
+            )
+            episodic_entries = context_inputs.episodic_entries
+            midterm_packets = context_inputs.midterm_packets
+            durable_objects = context_inputs.durable_objects
             adaptive_packets = self._build_adaptive_packets(
                 retrieval_text=self._combine_query_texts(query_texts),
                 durable_objects=durable_objects,
             )
-            conflict_queue = self._select_conflict_queue_for_texts(query_texts)
-            graph_context = self._build_graph_context(retrieval_text)
+            conflict_queue = context_inputs.conflict_queue
+            graph_context = context_inputs.graph_context
             durable_context = self._render_durable_context(durable_objects)
             episodic_context = self._render_episodic_context(episodic_entries)
             conflict_context = self._render_conflict_context(conflict_queue)
-            subtext_context = self._build_subtext_context(
-                query_text=original_query_text,
-                retrieval_query_text=retrieval_text,
-                episodic_entries=self._select_episodic_entries(
+            subtext_entries = episodic_entries
+            if not subtext_entries:
+                subtext_entries = self._select_episodic_entries(
                     query_texts,
                     fallback_limit=self._coerce_limit(
                         self.config.long_term_memory_recall_limit,
@@ -115,7 +131,11 @@ class LongTermRetriever:
                         minimum=1,
                     ),
                     require_query_match=False,
-                ),
+                )
+            subtext_context = self._build_subtext_context(
+                query_text=original_query_text,
+                retrieval_query_text=retrieval_text,
+                episodic_entries=subtext_entries,
             )
             return LongTermMemoryContext(
                 subtext_context=subtext_context,
@@ -130,6 +150,41 @@ class LongTermRetriever:
         except Exception:
             logger.exception("Long-term memory context build failed; returning empty memory context.")
             return self._empty_context()
+
+    def _load_context_inputs(
+        self,
+        *,
+        query_texts: tuple[str, ...],
+        retrieval_text: str,
+    ) -> _LongTermContextInputs:
+        """Load independent retrieval sections in parallel for one turn.
+
+        Episodic, durable, conflict, mid-term, and graph retrieval touch
+        separate remote or local read paths. Running them concurrently reduces
+        the foreground Pi latency for ordinary text turns without changing the
+        merged prompt contract.
+        """
+
+        with ThreadPoolExecutor(
+            max_workers=_CONTEXT_READ_MAX_WORKERS,
+            thread_name_prefix="twinr-ltm-read",
+        ) as executor:
+            episodic_future = executor.submit(
+                self._select_episodic_entries,
+                query_texts,
+                fallback_limit=0,
+            )
+            midterm_future = executor.submit(self._select_midterm_packets, query_texts)
+            durable_future = executor.submit(self._select_durable_objects, query_texts)
+            conflict_future = executor.submit(self._select_conflict_queue_for_texts, query_texts)
+            graph_future = executor.submit(self._build_graph_context, retrieval_text)
+            return _LongTermContextInputs(
+                episodic_entries=episodic_future.result(),
+                midterm_packets=midterm_future.result(),
+                durable_objects=durable_future.result(),
+                conflict_queue=conflict_future.result(),
+                graph_context=graph_future.result(),
+            )
 
     def select_conflict_queue(
         self,

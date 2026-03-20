@@ -44,6 +44,32 @@ class RuntimeClaimMetadata:
             "requires_confirmation": self.requires_confirmation,
         }
 
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, object] | None,
+        *,
+        default_confidence: float = 0.0,
+        default_source: str,
+        default_source_type: str = "observed",
+        default_requires_confirmation: bool = False,
+    ) -> "RuntimeClaimMetadata":
+        """Parse serialized claim metadata while preserving conservative defaults."""
+
+        mapping = coerce_mapping(payload)
+        confidence = coerce_optional_ratio(mapping.get("confidence"))
+        return cls(
+            confidence=(default_confidence if confidence is None else confidence),
+            source=normalize_text(mapping.get("source")) or default_source,
+            source_type=normalize_text(mapping.get("source_type")) or default_source_type,
+            requires_confirmation=(
+                coerce_optional_bool(mapping.get("requires_confirmation"))
+                if "requires_confirmation" in mapping
+                else default_requires_confirmation
+            )
+            is True,
+        )
+
 
 def mean_confidence(values: tuple[float | None, ...]) -> float | None:
     """Return the arithmetic mean of available confidence values."""

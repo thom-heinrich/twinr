@@ -15,11 +15,13 @@ from twinr.proactive.wakeword.evaluation import (
     WakewordEvalEntry,
     WakewordEvalMetrics,
     WakewordEvalReport,
+    WakewordVerifierTrainingReport,
     append_wakeword_capture_label,
     autotune_wakeword_profile,
     load_eval_manifest,
     load_labeled_ops_captures,
     run_wakeword_eval,
+    train_wakeword_custom_verifier_from_manifest,
 )
 from twinr.proactive.wakeword.matching import (
     DEFAULT_WAKEWORD_PHRASES,
@@ -44,6 +46,10 @@ from twinr.proactive.wakeword.spotter import (
     WakewordOpenWakeWordSpotter,
 )
 from twinr.proactive.wakeword.stream import OpenWakeWordStreamingMonitor, WakewordStreamDetection
+from twinr.proactive.wakeword.training import (
+    WakewordBaseModelTrainingReport,
+    train_wakeword_base_model_from_dataset_root,
+)
 
 __all__ = [
     "DEFAULT_WAKEWORD_PHRASES",
@@ -51,6 +57,7 @@ __all__ = [
     "OpenWakeWordStreamingMonitor",
     "SttWakewordVerifier",
     "WakewordAutotuneRecommendation",
+    "WakewordBaseModelTrainingReport",
     "WakewordCalibrationProfile",
     "WakewordCalibrationStore",
     "WakewordDecision",
@@ -58,6 +65,7 @@ __all__ = [
     "WakewordEvalEntry",
     "WakewordEvalMetrics",
     "WakewordEvalReport",
+    "WakewordVerifierTrainingReport",
     "WakewordMatch",
     "WakewordOpenWakeWordFrameSpotter",
     "WakewordOpenWakeWordSpotter",
@@ -75,5 +83,7 @@ __all__ = [
     "normalize_wakeword_verifier_mode",
     "phrase_from_detector_label",
     "run_wakeword_eval",
+    "train_wakeword_custom_verifier_from_manifest",
+    "train_wakeword_base_model_from_dataset_root",
     "wakeword_primary_prompt",
 ]

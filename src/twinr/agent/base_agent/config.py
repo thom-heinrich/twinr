@@ -163,6 +163,71 @@ def _parse_csv_strings(value: str | None, default: tuple[str, ...]) -> tuple[str
     return parsed or default
 
 
+def _parse_csv_mapping(
+    value: str | None,
+    default: tuple[tuple[str, str], ...] = (),
+) -> tuple[tuple[str, str], ...]:
+    """Parse one comma-separated ``key=value`` mapping into a normalized tuple."""
+
+    if value is None or not value.strip():
+        return default
+    parsed: list[tuple[str, str]] = []
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"Expected KEY=VALUE entry, got {part!r}.")
+        key, mapped_value = (piece.strip() for piece in part.split("=", 1))
+        if not key or not mapped_value:
+            raise ValueError(f"Expected non-empty KEY=VALUE entry, got {part!r}.")
+        parsed.append((key, mapped_value))
+    return tuple(parsed) or default
+
+
+def _default_bundled_openwakeword_models(project_root: Path) -> tuple[str, ...]:
+    """Return the bundled Twinr wakeword model when the leading repo ships it."""
+
+    candidate = (
+        project_root / "src" / "twinr" / "proactive" / "wakeword" / "models" / "twinr_v1.onnx"
+    ).resolve(strict=False)
+    if candidate.exists():
+        return (str(candidate),)
+    return ()
+
+
+def _default_bundled_openwakeword_custom_verifier_models(
+    project_root: Path,
+    models: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    """Return bundled verifier assets that live next to configured local models."""
+
+    bundled: list[tuple[str, str]] = []
+    for raw_model in models:
+        model = str(raw_model).strip()
+        if not model or not model.lower().endswith((".onnx", ".tflite")):
+            continue
+        candidate = Path(model).expanduser()
+        if not candidate.is_absolute():
+            candidate = project_root / candidate
+        resolved_model = candidate.resolve(strict=False)
+        verifier_candidate = resolved_model.with_suffix(".verifier.pkl")
+        if verifier_candidate.exists():
+            bundled.append((resolved_model.stem, str(verifier_candidate)))
+    return tuple(bundled)
+
+
+def _default_openwakeword_inference_framework(models: tuple[str, ...]) -> str:
+    """Infer the local runtime from the configured wakeword model paths."""
+
+    normalized_models = tuple(str(item).strip().lower() for item in models if str(item).strip())
+    if normalized_models and all(item.endswith(".onnx") for item in normalized_models):
+        return "onnx"
+    if normalized_models and all(item.endswith(".tflite") for item in normalized_models):
+        return "tflite"
+    return "tflite"
+
+
 @dataclass(frozen=True, slots=True)
 class TwinrConfig:
     """Store the immutable runtime settings snapshot for the base agent.
@@ -337,6 +402,21 @@ class TwinrConfig:
     camera_input_format: str | None = None
     camera_ffmpeg_path: str = "ffmpeg"
     vision_reference_image_path: str | None = None
+    portrait_match_enabled: bool = True
+    portrait_match_detector_model_path: str = "state/opencv/models/face_detection_yunet_2023mar.onnx"
+    portrait_match_recognizer_model_path: str = "state/opencv/models/face_recognition_sface_2021dec.onnx"
+    portrait_match_likely_threshold: float = 0.45
+    portrait_match_uncertain_threshold: float = 0.34
+    portrait_match_max_age_s: float = 45.0
+    portrait_match_capture_lock_timeout_s: float = 5.0
+    portrait_match_store_path: str = "state/portrait_identities.json"
+    portrait_match_reference_image_dir: str = "state/portrait_identities"
+    portrait_match_primary_user_id: str = "main_user"
+    portrait_match_max_reference_images_per_user: int = 6
+    portrait_match_identity_margin: float = 0.05
+    portrait_match_temporal_window_s: float = 300.0
+    portrait_match_temporal_min_observations: int = 2
+    portrait_match_temporal_max_observations: int = 12
     openai_vision_detail: str = "auto"
     proactive_enabled: bool = False
     proactive_vision_provider: str = "local_first"
@@ -384,6 +464,7 @@ class TwinrConfig:
     wakeword_verifier_mode: str = "ambiguity_only"
     wakeword_verifier_margin: float = 0.08
     wakeword_phrases: tuple[str, ...] = DEFAULT_WAKEWORD_PHRASES
+    wakeword_stt_phrases: tuple[str, ...] = DEFAULT_WAKEWORD_PHRASES
     wakeword_sample_ms: int = 1800
     wakeword_presence_grace_s: float = 15.0 * 60.0
     wakeword_motion_grace_s: float = 5.0 * 60.0
@@ -393,6 +474,8 @@ class TwinrConfig:
     wakeword_min_active_ratio: float = 0.08
     wakeword_min_active_chunks: int = 2
     wakeword_openwakeword_models: tuple[str, ...] = ()
+    wakeword_openwakeword_custom_verifier_models: tuple[tuple[str, str], ...] = ()
+    wakeword_openwakeword_custom_verifier_threshold: float = 0.1
     wakeword_openwakeword_threshold: float = 0.5
     wakeword_openwakeword_vad_threshold: float = 0.0
     wakeword_openwakeword_patience_frames: int = 1
@@ -463,6 +546,7 @@ class TwinrConfig:
     long_term_memory_remote_write_timeout_s: float = 15.0
     long_term_memory_remote_keepalive_interval_s: float = 5.0
     long_term_memory_remote_runtime_check_mode: str = "direct"
+    long_term_memory_remote_watchdog_startup_wait_s: float = 30.0
     long_term_memory_remote_watchdog_interval_s: float = 1.0
     long_term_memory_remote_watchdog_history_limit: int = 3600
     long_term_memory_remote_max_content_chars: int = 2_000_000
@@ -470,6 +554,7 @@ class TwinrConfig:
     long_term_memory_remote_retry_attempts: int = 3
     long_term_memory_remote_retry_backoff_s: float = 1.0
     long_term_memory_remote_flush_timeout_s: float = 60.0
+    long_term_memory_remote_read_cache_ttl_s: float = 0.0
     long_term_memory_turn_extractor_model: str | None = None
     long_term_memory_turn_extractor_max_output_tokens: int = 2200
     long_term_memory_midterm_enabled: bool = True
@@ -538,6 +623,7 @@ class TwinrConfig:
     display_wayland_runtime_dir: str | None = None
     display_face_cue_path: str = "artifacts/stores/ops/display_face_cue.json"
     display_face_cue_ttl_s: float = 4.0
+    display_attention_refresh_interval_s: float = 1.25
     display_presentation_path: str = "artifacts/stores/ops/display_presentation.json"
     display_presentation_ttl_s: float = 20.0
     display_vendor_dir: str = "state/display/vendor"
@@ -598,6 +684,10 @@ class TwinrConfig:
         if not math.isfinite(normalized_display_face_cue_ttl_s):
             raise ValueError("display_face_cue_ttl_s must be finite")
         normalized_display_face_cue_ttl_s = max(0.1, normalized_display_face_cue_ttl_s)
+        normalized_display_attention_refresh_interval_s = float(self.display_attention_refresh_interval_s)
+        if not math.isfinite(normalized_display_attention_refresh_interval_s):
+            raise ValueError("display_attention_refresh_interval_s must be finite")
+        normalized_display_attention_refresh_interval_s = max(0.0, normalized_display_attention_refresh_interval_s)
         normalized_display_presentation_ttl_s = float(self.display_presentation_ttl_s)
         if not math.isfinite(normalized_display_presentation_ttl_s):
             raise ValueError("display_presentation_ttl_s must be finite")
@@ -643,6 +733,11 @@ class TwinrConfig:
         object.__setattr__(self, "display_busy_timeout_s", normalized_display_busy_timeout_s)
         object.__setattr__(self, "display_face_cue_path", normalized_display_face_cue_path)
         object.__setattr__(self, "display_face_cue_ttl_s", normalized_display_face_cue_ttl_s)
+        object.__setattr__(
+            self,
+            "display_attention_refresh_interval_s",
+            normalized_display_attention_refresh_interval_s,
+        )
         object.__setattr__(self, "display_presentation_path", normalized_display_presentation_path)
         object.__setattr__(self, "display_presentation_ttl_s", normalized_display_presentation_ttl_s)
         object.__setattr__(self, "display_news_ticker_store_path", normalized_display_news_ticker_store_path)
@@ -786,6 +881,30 @@ class TwinrConfig:
                 if _parse_bool(get_value("TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT"), False)
                 else "ambiguity_only"
             )
+        ).strip().lower()
+        bundled_openwakeword_models = _default_bundled_openwakeword_models(project_root)
+        wakeword_phrases = _parse_csv_strings(
+            get_value("TWINR_WAKEWORD_PHRASES"),
+            DEFAULT_WAKEWORD_PHRASES,
+        )
+        wakeword_stt_phrases = _parse_csv_strings(
+            get_value("TWINR_WAKEWORD_STT_PHRASES"),
+            wakeword_phrases,
+        )
+        wakeword_openwakeword_models = _parse_csv_strings(
+            get_value("TWINR_WAKEWORD_OPENWAKEWORD_MODELS"),
+            bundled_openwakeword_models,
+        )
+        wakeword_openwakeword_custom_verifier_models = _parse_csv_mapping(
+            get_value("TWINR_WAKEWORD_OPENWAKEWORD_CUSTOM_VERIFIER_MODELS"),
+            _default_bundled_openwakeword_custom_verifier_models(
+                project_root,
+                wakeword_openwakeword_models,
+            ),
+        )
+        wakeword_openwakeword_inference_framework = (
+            get_value("TWINR_WAKEWORD_OPENWAKEWORD_INFERENCE_FRAMEWORK")
+            or _default_openwakeword_inference_framework(wakeword_openwakeword_models)
         ).strip().lower()
 
         return cls(
@@ -1199,6 +1318,78 @@ class TwinrConfig:
             camera_input_format=get_value("TWINR_CAMERA_INPUT_FORMAT"),
             camera_ffmpeg_path=get_value("TWINR_CAMERA_FFMPEG_PATH", "ffmpeg") or "ffmpeg",
             vision_reference_image_path=get_value("TWINR_VISION_REFERENCE_IMAGE"),
+            portrait_match_enabled=_parse_bool(get_value("TWINR_PORTRAIT_MATCH_ENABLED"), True),
+            portrait_match_detector_model_path=(
+                get_value(
+                    "TWINR_PORTRAIT_MATCH_DETECTOR_MODEL_PATH",
+                    "state/opencv/models/face_detection_yunet_2023mar.onnx",
+                )
+                or "state/opencv/models/face_detection_yunet_2023mar.onnx"
+            ),
+            portrait_match_recognizer_model_path=(
+                get_value(
+                    "TWINR_PORTRAIT_MATCH_RECOGNIZER_MODEL_PATH",
+                    "state/opencv/models/face_recognition_sface_2021dec.onnx",
+                )
+                or "state/opencv/models/face_recognition_sface_2021dec.onnx"
+            ),
+            portrait_match_likely_threshold=_parse_clamped_float(
+                get_value("TWINR_PORTRAIT_MATCH_LIKELY_THRESHOLD"),
+                0.45,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            portrait_match_uncertain_threshold=_parse_clamped_float(
+                get_value("TWINR_PORTRAIT_MATCH_UNCERTAIN_THRESHOLD"),
+                0.34,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            portrait_match_max_age_s=_parse_float(
+                get_value("TWINR_PORTRAIT_MATCH_MAX_AGE_S"),
+                45.0,
+                minimum=0.0,
+            ),
+            portrait_match_capture_lock_timeout_s=_parse_float(
+                get_value("TWINR_PORTRAIT_MATCH_CAPTURE_LOCK_TIMEOUT_S"),
+                5.0,
+                minimum=0.0,
+            ),
+            portrait_match_store_path=(
+                get_value("TWINR_PORTRAIT_MATCH_STORE_PATH", "state/portrait_identities.json")
+                or "state/portrait_identities.json"
+            ),
+            portrait_match_reference_image_dir=(
+                get_value("TWINR_PORTRAIT_MATCH_REFERENCE_IMAGE_DIR", "state/portrait_identities")
+                or "state/portrait_identities"
+            ),
+            portrait_match_primary_user_id=(
+                get_value("TWINR_PORTRAIT_MATCH_PRIMARY_USER_ID", "main_user")
+                or "main_user"
+            ),
+            portrait_match_max_reference_images_per_user=max(
+                1,
+                int(get_value("TWINR_PORTRAIT_MATCH_MAX_REFERENCE_IMAGES_PER_USER", "6") or "6"),
+            ),
+            portrait_match_identity_margin=_parse_clamped_float(
+                get_value("TWINR_PORTRAIT_MATCH_IDENTITY_MARGIN"),
+                0.05,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            portrait_match_temporal_window_s=_parse_float(
+                get_value("TWINR_PORTRAIT_MATCH_TEMPORAL_WINDOW_S"),
+                300.0,
+                minimum=0.0,
+            ),
+            portrait_match_temporal_min_observations=max(
+                1,
+                int(get_value("TWINR_PORTRAIT_MATCH_TEMPORAL_MIN_OBSERVATIONS", "2") or "2"),
+            ),
+            portrait_match_temporal_max_observations=max(
+                1,
+                int(get_value("TWINR_PORTRAIT_MATCH_TEMPORAL_MAX_OBSERVATIONS", "12") or "12"),
+            ),
             openai_vision_detail=get_value("OPENAI_VISION_DETAIL", "auto") or "auto",
             proactive_enabled=_parse_bool(get_value("TWINR_PROACTIVE_ENABLED"), False),
             proactive_vision_provider=(get_value("TWINR_PROACTIVE_VISION_PROVIDER", "local_first") or "local_first").strip().lower(),
@@ -1349,10 +1540,8 @@ class TwinrConfig:
                 minimum=0.0,
                 maximum=1.0,
             ),
-            wakeword_phrases=_parse_csv_strings(
-                get_value("TWINR_WAKEWORD_PHRASES"),
-                DEFAULT_WAKEWORD_PHRASES,
-            ),
+            wakeword_phrases=wakeword_phrases,
+            wakeword_stt_phrases=wakeword_stt_phrases,
             wakeword_sample_ms=int(get_value("TWINR_WAKEWORD_SAMPLE_MS", "1800") or "1800"),
             wakeword_presence_grace_s=_parse_float(
                 get_value("TWINR_WAKEWORD_PRESENCE_GRACE_S"),
@@ -1381,9 +1570,13 @@ class TwinrConfig:
             wakeword_min_active_chunks=int(
                 get_value("TWINR_WAKEWORD_MIN_ACTIVE_CHUNKS", "2") or "2"
             ),
-            wakeword_openwakeword_models=_parse_csv_strings(
-                get_value("TWINR_WAKEWORD_OPENWAKEWORD_MODELS"),
-                (),
+            wakeword_openwakeword_models=wakeword_openwakeword_models,
+            wakeword_openwakeword_custom_verifier_models=wakeword_openwakeword_custom_verifier_models,
+            wakeword_openwakeword_custom_verifier_threshold=_parse_clamped_float(
+                get_value("TWINR_WAKEWORD_OPENWAKEWORD_CUSTOM_VERIFIER_THRESHOLD"),
+                0.1,
+                minimum=0.0,
+                maximum=1.0,
             ),
             wakeword_openwakeword_threshold=_parse_clamped_float(
                 get_value("TWINR_WAKEWORD_OPENWAKEWORD_THRESHOLD"),
@@ -1415,9 +1608,7 @@ class TwinrConfig:
                 get_value("TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT"),
                 False,
             ),
-            wakeword_openwakeword_inference_framework=(
-                get_value("TWINR_WAKEWORD_OPENWAKEWORD_INFERENCE_FRAMEWORK", "tflite") or "tflite"
-            ).strip().lower(),
+            wakeword_openwakeword_inference_framework=wakeword_openwakeword_inference_framework,
             wakeword_calibration_profile_path=get_value(
                 "TWINR_WAKEWORD_CALIBRATION_PROFILE_PATH",
                 str(project_root / "state" / "wakeword_calibration.json"),
@@ -1656,6 +1847,12 @@ class TwinrConfig:
                 )
                 or default_remote_runtime_check_mode
             ).strip().lower(),
+            long_term_memory_remote_watchdog_startup_wait_s=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_STARTUP_WAIT_S"),
+                30.0,
+                minimum=0.0,
+                maximum=300.0,
+            ),
             long_term_memory_remote_watchdog_interval_s=_parse_float(
                 get_value("TWINR_LONG_TERM_MEMORY_REMOTE_WATCHDOG_INTERVAL_S"),
                 1.0,
@@ -1681,6 +1878,11 @@ class TwinrConfig:
             long_term_memory_remote_flush_timeout_s=_parse_float(
                 get_value("TWINR_LONG_TERM_MEMORY_REMOTE_FLUSH_TIMEOUT_S"),
                 60.0,
+            ),
+            long_term_memory_remote_read_cache_ttl_s=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_REMOTE_READ_CACHE_TTL_S"),
+                0.0,
+                minimum=0.0,
             ),
             long_term_memory_turn_extractor_model=(
                 get_value("TWINR_LONG_TERM_MEMORY_TURN_EXTRACTOR_MODEL") or None
@@ -1856,6 +2058,11 @@ class TwinrConfig:
             )
             or "artifacts/stores/ops/display_face_cue.json",
             display_face_cue_ttl_s=_parse_float(get_value("TWINR_DISPLAY_FACE_CUE_TTL_S"), 4.0, minimum=0.1),
+            display_attention_refresh_interval_s=_parse_float(
+                get_value("TWINR_DISPLAY_ATTENTION_REFRESH_INTERVAL_S"),
+                1.25,
+                minimum=0.0,
+            ),
             display_presentation_path=get_value(
                 "TWINR_DISPLAY_PRESENTATION_PATH",
                 "artifacts/stores/ops/display_presentation.json",

@@ -4,7 +4,9 @@ from datetime import datetime
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -198,6 +200,94 @@ class LongTermRetrieverTests(unittest.TestCase):
             )
 
         self.assertIsNone(context.episodic_context)
+
+    def test_build_context_reuses_nonempty_episodic_matches_for_subtext(self) -> None:
+        episodic_calls: list[tuple[int, bool]] = []
+
+        def _select_episodic_entries(self, query_texts, fallback_limit=0, require_query_match=False):
+            del self
+            del query_texts
+            episodic_calls.append((fallback_limit, require_query_match))
+            return ["episode:one"]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            with (
+                patch.object(LongTermRetriever, "_normalize_query_text", lambda self, query, fallback_text=None: "Hallo"),
+                patch.object(LongTermRetriever, "_query_text_variants", lambda self, query, fallback_text=None: ("Hallo",)),
+                patch.object(LongTermRetriever, "_select_episodic_entries", _select_episodic_entries),
+                patch.object(LongTermRetriever, "_select_midterm_packets", lambda self, query_texts: ()),
+                patch.object(LongTermRetriever, "_select_durable_objects", lambda self, query_texts: ()),
+                patch.object(LongTermRetriever, "_build_adaptive_packets", lambda self, retrieval_text, durable_objects: ()),
+                patch.object(LongTermRetriever, "_select_conflict_queue_for_texts", lambda self, query_texts: ()),
+                patch.object(LongTermRetriever, "_build_graph_context", lambda self, retrieval_text: None),
+                patch.object(LongTermRetriever, "_render_durable_context", lambda self, objects: None),
+                patch.object(LongTermRetriever, "_render_episodic_context", lambda self, entries: "episodic-context"),
+                patch.object(LongTermRetriever, "_render_conflict_context", lambda self, conflicts: None),
+                patch.object(LongTermRetriever, "_render_midterm_context", lambda self, packets: None),
+                patch.object(LongTermRetriever, "_combine_query_texts", lambda self, query_texts: " ".join(query_texts)),
+                patch.object(
+                    LongTermRetriever,
+                    "_build_subtext_context",
+                    lambda self, query_text, retrieval_query_text, episodic_entries: f"subtext:{len(tuple(episodic_entries))}",
+                ),
+            ):
+                context = retriever.build_context(
+                    query=LongTermQueryProfile.from_text("Hallo"),
+                    original_query_text="Hallo",
+                )
+
+        self.assertEqual(episodic_calls, [(0, False)])
+        self.assertEqual(context.episodic_context, "episodic-context")
+        self.assertEqual(context.subtext_context, "subtext:1")
+
+    def test_build_context_loads_independent_sections_in_parallel(self) -> None:
+        episodic_started = threading.Event()
+        durable_started = threading.Event()
+
+        def _select_episodic_entries(self, query_texts, fallback_limit=0, require_query_match=False):
+            del self
+            del query_texts
+            del fallback_limit
+            del require_query_match
+            episodic_started.set()
+            if not durable_started.wait(timeout=1.0):
+                raise AssertionError("episodic retrieval did not overlap with durable retrieval")
+            return []
+
+        def _select_durable_objects(self, query_texts):
+            del self
+            del query_texts
+            durable_started.set()
+            if not episodic_started.wait(timeout=1.0):
+                raise AssertionError("durable retrieval did not overlap with episodic retrieval")
+            return ()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            with (
+                patch.object(LongTermRetriever, "_normalize_query_text", lambda self, query, fallback_text=None: "Hallo"),
+                patch.object(LongTermRetriever, "_query_text_variants", lambda self, query, fallback_text=None: ("Hallo",)),
+                patch.object(LongTermRetriever, "_select_episodic_entries", _select_episodic_entries),
+                patch.object(LongTermRetriever, "_select_midterm_packets", lambda self, query_texts: ()),
+                patch.object(LongTermRetriever, "_select_durable_objects", _select_durable_objects),
+                patch.object(LongTermRetriever, "_build_adaptive_packets", lambda self, retrieval_text, durable_objects: ()),
+                patch.object(LongTermRetriever, "_select_conflict_queue_for_texts", lambda self, query_texts: ()),
+                patch.object(LongTermRetriever, "_build_graph_context", lambda self, retrieval_text: None),
+                patch.object(LongTermRetriever, "_render_durable_context", lambda self, objects: None),
+                patch.object(LongTermRetriever, "_render_episodic_context", lambda self, entries: None),
+                patch.object(LongTermRetriever, "_render_conflict_context", lambda self, conflicts: None),
+                patch.object(LongTermRetriever, "_render_midterm_context", lambda self, packets: None),
+                patch.object(LongTermRetriever, "_combine_query_texts", lambda self, query_texts: " ".join(query_texts)),
+                patch.object(LongTermRetriever, "_build_subtext_context", lambda self, query_text, retrieval_query_text, episodic_entries: None),
+            ):
+                context = retriever.build_context(
+                    query=LongTermQueryProfile.from_text("Hallo"),
+                    original_query_text="Hallo",
+                )
+
+        self.assertIsNone(context.episodic_context)
+        self.assertIsNone(context.durable_context)
 
     def test_select_conflict_queue_respects_canonical_query_profile(self) -> None:
         existing = LongTermMemoryObjectV1(

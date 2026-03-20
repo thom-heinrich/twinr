@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -8,6 +9,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.display.face_cues import DisplayFaceCueStore
+from twinr.hardware.portrait_match import PortraitMatchObservation
 from twinr.hardware.respeaker.models import ReSpeakerSignalSnapshot
 from twinr.hardware.audio import (
     AmbientAudioLevelSample,
@@ -42,9 +45,10 @@ from twinr.runtime import TwinrRuntime
 
 
 class FakeVisionObserver:
-    def __init__(self, observations):
+    def __init__(self, observations, *, supports_attention_refresh: bool = False):
         self.observations = list(observations)
         self.calls = 0
+        self.supports_attention_refresh = supports_attention_refresh
 
     def observe(self):
         self.calls += 1
@@ -157,6 +161,17 @@ class FakeAudioObserver:
         return self.snapshot
 
 
+class FakeClock:
+    def __init__(self, start: float) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, delta: float) -> None:
+        self.now += delta
+
+
 class FailingAudioObserver:
     def __init__(self, error: Exception) -> None:
         self.error = error
@@ -222,6 +237,17 @@ class FakeVisionReviewer:
     def review(self, decision, *, observation):
         self.calls.append((decision, observation))
         return self.review_result
+
+
+class FakePortraitMatchProvider:
+    def __init__(self, observation: PortraitMatchObservation) -> None:
+        self.observation = observation
+        self.backend = SimpleNamespace(name="fake_portrait_backend")
+        self.calls = 0
+
+    def observe(self) -> PortraitMatchObservation:
+        self.calls += 1
+        return self.observation
 
 
 class MutableClock:
@@ -1119,6 +1145,88 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertIn("top_score", observation_events[0]["data"])
         self.assertIn("top_threshold", observation_events[0]["data"])
 
+    def test_coordinator_updates_display_attention_cue_for_visible_person(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=1.0,
+                proactive_motion_window_s=20.0,
+            )
+            runtime = TwinrRuntime(config=config)
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            primary_person_center_x=0.14,
+                            primary_person_center_y=0.48,
+                            body_pose=SocialBodyPose.UPRIGHT,
+                        )
+                    ]
+                ),
+                pir_monitor=FakePirMonitor(events=[True], level=True),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                emit=lambda _line: None,
+                clock=MutableClock(1.0),
+            )
+
+            result = coordinator.tick()
+            cue = DisplayFaceCueStore.from_config(config).load_active()
+
+        self.assertTrue(result.inspected)
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertEqual(cue.source, "proactive_attention_follow")
+        self.assertEqual(cue.gaze_x, -2)
+        self.assertEqual(cue.gaze_y, 0)
+
+    def test_display_attention_refresh_updates_cue_without_pir_motion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                display_driver="hdmi_wayland",
+                display_attention_refresh_interval_s=1.0,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(10.0)
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            primary_person_center_x=0.81,
+                            primary_person_center_y=0.44,
+                            engaged_with_device=True,
+                        )
+                    ],
+                    supports_attention_refresh=True,
+                ),
+                pir_monitor=FakePirMonitor(),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            refreshed = coordinator.refresh_display_attention()
+            cue = DisplayFaceCueStore.from_config(config).load_active()
+
+        self.assertTrue(refreshed)
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertEqual(cue.source, "proactive_attention_follow")
+        self.assertEqual(cue.gaze_x, 2)
+        self.assertEqual(cue.gaze_y, 0)
+
     def test_coordinator_logs_trigger_detection_and_absence_transition(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -1849,6 +1957,172 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(first_facts["audio_policy"]["runtime_alert_code"], "ready")
         self.assertEqual(second_events, ())
         self.assertGreaterEqual(second_facts["camera"]["person_visible_for_s"], 6.0)
+
+    def test_coordinator_exports_portrait_match_and_multimodal_known_user_hint(self) -> None:
+        config = TwinrConfig(
+            proactive_enabled=True,
+            proactive_capture_interval_s=1.0,
+            proactive_motion_window_s=20.0,
+        )
+        runtime = TwinrRuntime(config=config)
+        runtime.user_voice_status = "likely_user"
+        runtime.user_voice_confidence = 0.84
+        runtime.user_voice_checked_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=8)
+        ).isoformat().replace("+00:00", "Z")
+        observations: list[tuple[dict[str, object], tuple[str, ...]]] = []
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(),
+            trigger_handler=lambda _decision: True,
+            vision_observer=FakeVisionObserver(
+                [
+                    SocialVisionObservation(
+                        person_visible=True,
+                        person_count=1,
+                        looking_toward_device=True,
+                        hand_or_object_near_camera=False,
+                        body_pose=SocialBodyPose.UPRIGHT,
+                    )
+                ]
+            ),
+            pir_monitor=FakePirMonitor(events=[True], level=True),
+            audio_observer=FakeAudioObserver(
+                SocialAudioObservation(
+                    speech_detected=False,
+                    room_quiet=True,
+                    recent_speech_age_s=12.0,
+                )
+            ),
+            portrait_match_provider=FakePortraitMatchProvider(
+                PortraitMatchObservation(
+                    checked_at=1.9,
+                    state="likely_reference_user",
+                    matches_reference_user=True,
+                    confidence=0.89,
+                    similarity_score=0.64,
+                    live_face_count=1,
+                    reference_face_count=1,
+                    backend_name="fake_portrait_backend",
+                )
+            ),
+            observation_handler=lambda facts, event_names: observations.append((facts, event_names)),
+            emit=lambda _line: None,
+            clock=lambda: 2.0,
+        )
+
+        coordinator.tick()
+
+        self.assertEqual(len(observations), 1)
+        facts, events = observations[0]
+        self.assertIn("portrait_match.matches_reference_user", events)
+        self.assertEqual(facts["portrait_match"]["state"], "likely_reference_user")
+        self.assertEqual(facts["portrait_match"]["policy_recommendation"], "calm_personalization_only")
+        self.assertEqual(facts["known_user_hint"]["state"], "likely_main_user_multimodal")
+        self.assertEqual(
+            facts["known_user_hint"]["source"],
+            "voice_profile_plus_portrait_match_plus_single_visible_person_context",
+        )
+        self.assertEqual(facts["known_user_hint"]["portrait_match_state"], "likely_reference_user")
+        self.assertTrue(facts["known_user_hint"]["matches_main_user"])
+
+    def test_coordinator_promotes_identity_fusion_after_repeated_stable_ticks(self) -> None:
+        config = TwinrConfig(
+            proactive_enabled=True,
+            proactive_capture_interval_s=1.0,
+            proactive_motion_window_s=20.0,
+        )
+        runtime = TwinrRuntime(config=config)
+        runtime.user_voice_status = "likely_user"
+        runtime.user_voice_confidence = 0.84
+        runtime.user_voice_checked_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=6)
+        ).isoformat().replace("+00:00", "Z")
+        observations: list[tuple[dict[str, object], tuple[str, ...]]] = []
+        clock = FakeClock(2.0)
+        coordinator = ProactiveCoordinator(
+            config=config,
+            runtime=runtime,
+            engine=SocialTriggerEngine(),
+            trigger_handler=lambda _decision: True,
+            vision_observer=FakeVisionObserver(
+                [
+                    SocialVisionObservation(
+                        person_visible=True,
+                        person_count=1,
+                        primary_person_zone=SocialPersonZone.CENTER,
+                        looking_toward_device=True,
+                        engaged_with_device=True,
+                        visual_attention_score=0.84,
+                        body_pose=SocialBodyPose.UPRIGHT,
+                    ),
+                    SocialVisionObservation(
+                        person_visible=True,
+                        person_count=1,
+                        primary_person_zone=SocialPersonZone.CENTER,
+                        looking_toward_device=True,
+                        engaged_with_device=True,
+                        visual_attention_score=0.84,
+                        body_pose=SocialBodyPose.UPRIGHT,
+                    ),
+                    SocialVisionObservation(
+                        person_visible=True,
+                        person_count=1,
+                        primary_person_zone=SocialPersonZone.CENTER,
+                        looking_toward_device=True,
+                        engaged_with_device=True,
+                        visual_attention_score=0.84,
+                        body_pose=SocialBodyPose.UPRIGHT,
+                    ),
+                ]
+            ),
+            pir_monitor=FakePirMonitor(events=[True], level=True),
+            audio_observer=FakeAudioObserver(
+                SocialAudioObservation(
+                    speech_detected=False,
+                    room_quiet=True,
+                    recent_speech_age_s=12.0,
+                )
+            ),
+            portrait_match_provider=FakePortraitMatchProvider(
+                PortraitMatchObservation(
+                    checked_at=1.9,
+                    state="likely_reference_user",
+                    matches_reference_user=True,
+                    confidence=0.89,
+                    fused_confidence=0.93,
+                    temporal_state="stable_match",
+                    temporal_observation_count=3,
+                    similarity_score=0.64,
+                    live_face_count=1,
+                    reference_face_count=1,
+                    reference_image_count=3,
+                    matched_user_id="main_user",
+                    backend_name="fake_portrait_backend",
+                )
+            ),
+            observation_handler=lambda facts, event_names: observations.append((facts, event_names)),
+            emit=lambda _line: None,
+            clock=clock,
+        )
+
+        coordinator.tick()
+        clock.advance(2.0)
+        coordinator.tick()
+        clock.advance(2.0)
+        coordinator.tick()
+
+        self.assertGreaterEqual(len(observations), 2)
+        facts, _events = observations[-1]
+        self.assertEqual(facts["identity_fusion"]["state"], "stable_main_user_multimodal")
+        self.assertEqual(facts["identity_fusion"]["temporal_state"], "stable_multimodal_match")
+        self.assertEqual(facts["known_user_hint"]["state"], "likely_main_user_temporal_multimodal")
+        self.assertEqual(
+            facts["known_user_hint"]["source"],
+            "voice_profile_plus_temporal_portrait_match_plus_track_history_plus_presence_session_memory",
+        )
+        self.assertEqual(facts["known_user_hint"]["identity_fusion_state"], "stable_main_user_multimodal")
 
 
 if __name__ == "__main__":

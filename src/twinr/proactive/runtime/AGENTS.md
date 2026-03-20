@@ -16,8 +16,11 @@ Out of scope:
 ## Key files
 
 - `ambiguous_room_guard.py` — fail-closed room-ambiguity guard for person-targeted runtime inference
-- `known_user_hint.py` — conservative known-user hint from voice-profile state plus clear room context
+- `identity_fusion.py` — bounded temporal/session identity fusion over voice, portrait, household-voice candidates, and visual-anchor history
+- `portrait_match.py` — conservative runtime claim for local portrait-match observations and temporal identity evidence
+- `known_user_hint.py` — conservative known-user hint from voice-profile state plus optional temporal identity-fusion evidence and clear room context
 - `affect_proxy.py` — prompt-only affect proxy surface from coarse posture, attention, and quiet cues
+- `display_attention.py` — conservative proactive producer that steers HDMI eye gaze toward the visible primary person without overwriting foreign face cues, plus the bounded local refresh policy for responsive follow behavior
 - `claim_metadata.py` — shared `confidence` / `source` / `requires_confirmation` helpers for runtime claims
 - `speaker_association.py` — conservative speaker-to-camera-anchor association for the single-primary-person case
 - `multimodal_initiative.py` — confidence-bearing display-first/skip gate for later proactive behavior
@@ -31,9 +34,12 @@ Out of scope:
 - `PresenceSessionController.observe()` must preserve a monotonic internal timeline even when callers pass regressing or malformed timestamps.
 - Wakeword arming must fail closed on malformed sensor flags or unavailable dependencies.
 - `service.py` stays orchestration-focused; trigger scoring and wakeword matching belong in sibling packages.
-- `ambiguous_room_guard`, `known_user_hint`, and `affect_proxy` must remain conservative claim surfaces, not direct product decisions.
-- `known_user_hint` must stay weaker than identity and may only clear calm personalization; sensitive behavior still needs confirmation or stronger gates.
+- `ambiguous_room_guard`, `identity_fusion`, `portrait_match`, `known_user_hint`, and `affect_proxy` must remain conservative claim surfaces, not direct product decisions.
+- `known_user_hint` must stay weaker than identity even when temporal portrait evidence is strong, and may only clear calm personalization; sensitive behavior still needs confirmation or stronger gates.
+- `identity_fusion` may use presence-session memory, enrolled household-voice candidates, and visual-anchor history, but it must stay confirm-first and fail closed on ambiguity or modality conflict.
 - `affect_proxy` must never emit emotion, wellbeing, or diagnosis claims; it may only support prompt-only follow-up cues.
+- `display_attention.py` may only publish its own `proactive_attention_follow` face cues and must fail closed when another display producer currently owns the cue store.
+- The fast HDMI attention-refresh path must stay local-camera-only, bounded, and separate from full proactive trigger evaluation; do not turn it into an always-on generic vision loop.
 - Speaker association and multimodal initiative must fail closed on multi-person or low-confidence room context; do not let weak audio hints force spoken proactivity.
 - `ProactiveMonitorService` lifecycle must remain idempotent, bounded, and safe under partial startup or shutdown failure.
 - `build_default_proactive_monitor()` must not start an inert monitor when no operational sensor path exists.

@@ -52,6 +52,8 @@ class LocalAICameraProviderConfig:
 class LocalAICameraObservationProvider:
     """Return bounded local-first camera observations without cloud dependency."""
 
+    supports_attention_refresh = True
+
     def __init__(
         self,
         *,

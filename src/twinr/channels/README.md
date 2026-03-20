@@ -10,6 +10,7 @@ agent.
 `channels` owns:
 - generic inbound/outbound contracts for text-based messaging channels
 - transport-facing runtime services that convert a text message into one Twinr turn
+- startup warmup hooks for shared text-channel runtime dependencies when a cold remote-only path would otherwise penalize the first live turn
 - channel-specific listener loops, auth/session persistence, reconnect policy, and low-level worker bridges
 
 `channels` does **not** own:

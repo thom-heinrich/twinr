@@ -23,7 +23,7 @@ root imports together while pushing behavior into focused subpackages.
 | File | Purpose |
 |---|---|
 | [__init__.py](./__init__.py) | Lazy root export surface |
-| [config.py](./config.py) | Canonical runtime config |
+| [config.py](./config.py) | Canonical runtime config, including bounded HDMI attention-refresh cadence |
 | [contracts.py](./contracts.py) | Provider/runtime contracts |
 | [conversation/](./conversation/README.md) | Conversation micro-policies |
 | [prompting/](./prompting/README.md) | Hidden instruction assembly |

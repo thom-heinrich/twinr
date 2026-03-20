@@ -42,6 +42,10 @@ _REALTIME_TOOL_BINDINGS: tuple[tuple[str, str], ...] = (
     ("enroll_voice_profile", "handle_enroll_voice_profile"),
     ("get_voice_profile_status", "handle_get_voice_profile_status"),
     ("reset_voice_profile", "handle_reset_voice_profile"),
+    ("enroll_portrait_identity", "handle_enroll_portrait_identity"),
+    ("get_portrait_identity_status", "handle_get_portrait_identity_status"),
+    ("reset_portrait_identity", "handle_reset_portrait_identity"),
+    ("manage_household_identity", "handle_manage_household_identity"),
     ("inspect_camera", "handle_inspect_camera"),
     ("end_conversation", "handle_end_conversation"),
 )

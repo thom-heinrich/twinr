@@ -84,6 +84,15 @@ class TwinrRealtimeToolDelegatesMixin:
     def _handle_reset_voice_profile_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_reset_voice_profile(arguments)
 
+    def _handle_enroll_portrait_identity_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_enroll_portrait_identity(arguments)
+
+    def _handle_get_portrait_identity_status_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_get_portrait_identity_status(arguments)
+
+    def _handle_reset_portrait_identity_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_reset_portrait_identity(arguments)
+
     def _handle_search_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_search_live_info(arguments)
 

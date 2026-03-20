@@ -20,6 +20,8 @@ bounded background writers into the APIs used by agent runtime loops.
 - Reuse successful remote snapshot probes within one bounded readiness pass so watchdog startup does not refetch the same snapshot twice back-to-back
 - Treat successful required snapshot loads as the decisive health proof inside the warm probe instead of re-running per-store backend status checks after bootstrap
 - Fail closed when any required remote snapshot or shard is unreadable
+- Prewarm generic foreground-read paths plus current object/conflict payload caches before live text-channel traffic so the first real remote-only recall turn can hit a warmed remote cache instead of rebuilding selectors and fetching first-hit payloads on demand
+- Reuse remote snapshot/catalog/item reads through TTL-bounded in-process caches so warmed foreground recall stays sub-second on the Pi without changing remote-only truth semantics
 - Wire adaptive retrieval policies derived from confirmed memory, routines, and proactive outcomes into provider context
 - Expose review, retention, proactive, and operator mutation entry points
 

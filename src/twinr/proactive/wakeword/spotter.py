@@ -35,8 +35,8 @@ class WakewordOpenWakeWordFrameSpotter:
     """Detect wakeword hits from exact openWakeWord-sized PCM frames.
 
     This stateful spotter smooths frame scores across a live stream, latches
-    active labels until deactivation, and returns ``WakewordMatch`` objects
-    without transcribing the audio.
+    active labels until deactivation, can load optional local verifier assets,
+    and returns ``WakewordMatch`` objects without transcribing the audio.
     """
 
     _FRAME_SAMPLES = 1280
@@ -53,6 +53,8 @@ class WakewordOpenWakeWordFrameSpotter:
         deactivation_threshold: float = 0.0,
         enable_speex_noise_suppression: bool = False,
         inference_framework: str = "tflite",
+        custom_verifier_models: dict[str, str] | None = None,
+        custom_verifier_threshold: float = 0.1,
         model_factory: Callable[..., Any] | None = None,
     ) -> None:
         # AUDIT-FIX(#6): Konfig-Strings werden kanonisiert, damit Whitespace keine stillen Fehlkonfigurationen ausloest.
@@ -72,6 +74,11 @@ class WakewordOpenWakeWordFrameSpotter:
             deactivation_threshold,
         )
         self.inference_framework = (inference_framework or "tflite").strip().lower() or "tflite"
+        self.custom_verifier_models = _normalize_verifier_model_map(custom_verifier_models)
+        self.custom_verifier_threshold = _coerce_probability_config(
+            "custom_verifier_threshold",
+            custom_verifier_threshold,
+        )
         factory = model_factory or _default_model_factory
         try:
             self._model = factory(
@@ -79,6 +86,8 @@ class WakewordOpenWakeWordFrameSpotter:
                 vad_threshold=self.vad_threshold,
                 enable_speex_noise_suppression=enable_speex_noise_suppression,
                 inference_framework=self.inference_framework,
+                custom_verifier_models=self.custom_verifier_models,
+                custom_verifier_threshold=self.custom_verifier_threshold,
             )
         except Exception as exc:  # pragma: no cover - depends on external package/runtime
             # AUDIT-FIX(#6): Modellinitialisierung liefert jetzt einen klaren operator-tauglichen Fehlerkontext.
@@ -248,8 +257,9 @@ class WakewordOpenWakeWordSpotter:
     """Detect wakewords from buffered captures with optional confirmation.
 
     This spotter resamples audio to 16 kHz for openWakeWord inference and can
-    optionally transcribe successful detector hits to confirm that one of the
-    configured wakeword phrases was actually spoken.
+    optionally load a second-stage local verifier before any optional STT
+    confirmation. This keeps runtime wakeword gating local-first when bundled
+    verifier assets are available.
     """
 
     _TARGET_SAMPLE_RATE = 16000
@@ -268,6 +278,8 @@ class WakewordOpenWakeWordSpotter:
         deactivation_threshold: float = 0.0,
         enable_speex_noise_suppression: bool = False,
         inference_framework: str = "tflite",
+        custom_verifier_models: dict[str, str] | None = None,
+        custom_verifier_threshold: float = 0.1,
         backend: OpenAIBackend | None = None,
         language: str | None = None,
         transcribe_on_detect: bool = True,
@@ -291,6 +303,11 @@ class WakewordOpenWakeWordSpotter:
             deactivation_threshold,
         )
         self.inference_framework = (inference_framework or "tflite").strip().lower() or "tflite"
+        self.custom_verifier_models = _normalize_verifier_model_map(custom_verifier_models)
+        self.custom_verifier_threshold = _coerce_probability_config(
+            "custom_verifier_threshold",
+            custom_verifier_threshold,
+        )
         self.backend = backend
         self.language = (language or "").strip() or None
         self.transcribe_on_detect = bool(transcribe_on_detect)
@@ -307,6 +324,8 @@ class WakewordOpenWakeWordSpotter:
                 vad_threshold=self.vad_threshold,
                 enable_speex_noise_suppression=enable_speex_noise_suppression,
                 inference_framework=self.inference_framework,
+                custom_verifier_models=self.custom_verifier_models,
+                custom_verifier_threshold=self.custom_verifier_threshold,
             )
         except Exception as exc:  # pragma: no cover - depends on external package/runtime
             # AUDIT-FIX(#6): Modellinitialisierung liefert jetzt einen klaren operator-tauglichen Fehlerkontext.
@@ -484,6 +503,7 @@ def _default_model_factory(**kwargs):
     from openwakeword.model import Model
 
     model_names = _normalize_nonempty_strings(tuple(kwargs.get("wakeword_models", [])))
+    custom_verifier_models = _normalize_verifier_model_map(kwargs.get("custom_verifier_models"))
     named_models: list[str] = []
     resolved_model_paths: list[str] = []
     for item in model_names:
@@ -504,8 +524,17 @@ def _default_model_factory(**kwargs):
             raise RuntimeError(
                 f"Failed to download openWakeWord model(s): {', '.join(named_models)}"
             ) from exc
+    resolved_verifier_paths: dict[str, str] = {}
+    for model_name, verifier_path in custom_verifier_models.items():
+        expanded_verifier_path = os.path.abspath(os.path.expanduser(verifier_path))
+        if not os.path.isfile(expanded_verifier_path):
+            raise FileNotFoundError(
+                f"Configured openWakeWord verifier path does not exist: {verifier_path}"
+            )
+        resolved_verifier_paths[model_name] = expanded_verifier_path
     kwargs = dict(kwargs)
     kwargs["wakeword_models"] = resolved_model_paths
+    kwargs["custom_verifier_models"] = resolved_verifier_paths
     return Model(**kwargs)
 
 
@@ -707,6 +736,18 @@ def _normalize_nonempty_strings(values) -> tuple[str, ...]:
         if text:
             normalized.append(text)
     return tuple(normalized)
+
+
+def _normalize_verifier_model_map(values: Any) -> dict[str, str]:
+    if not values or not hasattr(values, "items"):
+        return {}
+    normalized: dict[str, str] = {}
+    for key, value in values.items():
+        normalized_key = str(key).strip()
+        normalized_value = str(value).strip()
+        if normalized_key and normalized_value:
+            normalized[normalized_key] = normalized_value
+    return normalized
 
 
 def _normalize_prediction_map(predictions: Any) -> dict[str, float]:

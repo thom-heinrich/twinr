@@ -134,6 +134,7 @@ class TwinrConfigTests(unittest.TestCase):
                     [
                         "TWINR_DISPLAY_FACE_CUE_PATH=state/custom/face.json",
                         "TWINR_DISPLAY_FACE_CUE_TTL_S=7.5",
+                        "TWINR_DISPLAY_ATTENTION_REFRESH_INTERVAL_S=1.4",
                     ]
                 )
                 + "\n",
@@ -144,6 +145,7 @@ class TwinrConfigTests(unittest.TestCase):
 
         self.assertEqual(config.display_face_cue_path, "state/custom/face.json")
         self.assertEqual(config.display_face_cue_ttl_s, 7.5)
+        self.assertEqual(config.display_attention_refresh_interval_s, 1.4)
 
     def test_from_env_reads_display_presentation_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -402,6 +404,21 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_CAMERA_INPUT_FORMAT=bayer_grbg8",
                         "TWINR_CAMERA_FFMPEG_PATH=/usr/local/bin/ffmpeg",
                         "TWINR_VISION_REFERENCE_IMAGE=/srv/twinr/user-reference.jpg",
+                        "TWINR_PORTRAIT_MATCH_ENABLED=false",
+                        "TWINR_PORTRAIT_MATCH_DETECTOR_MODEL_PATH=/srv/twinr/models/yunet.onnx",
+                        "TWINR_PORTRAIT_MATCH_RECOGNIZER_MODEL_PATH=/srv/twinr/models/sface.onnx",
+                        "TWINR_PORTRAIT_MATCH_LIKELY_THRESHOLD=0.61",
+                        "TWINR_PORTRAIT_MATCH_UNCERTAIN_THRESHOLD=0.44",
+                        "TWINR_PORTRAIT_MATCH_MAX_AGE_S=75.0",
+                        "TWINR_PORTRAIT_MATCH_CAPTURE_LOCK_TIMEOUT_S=7.5",
+                        "TWINR_PORTRAIT_MATCH_STORE_PATH=/srv/twinr/state/portrait_identities.json",
+                        "TWINR_PORTRAIT_MATCH_REFERENCE_IMAGE_DIR=/srv/twinr/state/portrait_identities",
+                        "TWINR_PORTRAIT_MATCH_PRIMARY_USER_ID=thom_main",
+                        "TWINR_PORTRAIT_MATCH_MAX_REFERENCE_IMAGES_PER_USER=9",
+                        "TWINR_PORTRAIT_MATCH_IDENTITY_MARGIN=0.07",
+                        "TWINR_PORTRAIT_MATCH_TEMPORAL_WINDOW_S=420.0",
+                        "TWINR_PORTRAIT_MATCH_TEMPORAL_MIN_OBSERVATIONS=3",
+                        "TWINR_PORTRAIT_MATCH_TEMPORAL_MAX_OBSERVATIONS=14",
                         "OPENAI_VISION_DETAIL=high",
                         "TWINR_PROACTIVE_ENABLED=true",
                         "TWINR_PROACTIVE_POLL_INTERVAL_S=3.0",
@@ -433,6 +450,8 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_WAKEWORD_MIN_ACTIVE_RATIO=0.06",
                         "TWINR_WAKEWORD_MIN_ACTIVE_CHUNKS=2",
                         "TWINR_WAKEWORD_OPENWAKEWORD_MODELS=/twinr/models/wakewords/twinr.tflite, /twinr/models/wakewords/twinna.tflite",
+                        "TWINR_WAKEWORD_OPENWAKEWORD_CUSTOM_VERIFIER_MODELS=twinr=/twinr/models/wakewords/twinr.verifier.pkl, twinna=/twinr/models/wakewords/twinna.verifier.pkl",
+                        "TWINR_WAKEWORD_OPENWAKEWORD_CUSTOM_VERIFIER_THRESHOLD=0.23",
                         "TWINR_WAKEWORD_OPENWAKEWORD_THRESHOLD=0.57",
                         "TWINR_WAKEWORD_OPENWAKEWORD_VAD_THRESHOLD=0.18",
                         "TWINR_WAKEWORD_OPENWAKEWORD_PATIENCE_FRAMES=3",
@@ -711,6 +730,21 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.camera_input_format, "bayer_grbg8")
         self.assertEqual(config.camera_ffmpeg_path, "/usr/local/bin/ffmpeg")
         self.assertEqual(config.vision_reference_image_path, "/srv/twinr/user-reference.jpg")
+        self.assertFalse(config.portrait_match_enabled)
+        self.assertEqual(config.portrait_match_detector_model_path, "/srv/twinr/models/yunet.onnx")
+        self.assertEqual(config.portrait_match_recognizer_model_path, "/srv/twinr/models/sface.onnx")
+        self.assertEqual(config.portrait_match_likely_threshold, 0.61)
+        self.assertEqual(config.portrait_match_uncertain_threshold, 0.44)
+        self.assertEqual(config.portrait_match_max_age_s, 75.0)
+        self.assertEqual(config.portrait_match_capture_lock_timeout_s, 7.5)
+        self.assertEqual(config.portrait_match_store_path, "/srv/twinr/state/portrait_identities.json")
+        self.assertEqual(config.portrait_match_reference_image_dir, "/srv/twinr/state/portrait_identities")
+        self.assertEqual(config.portrait_match_primary_user_id, "thom_main")
+        self.assertEqual(config.portrait_match_max_reference_images_per_user, 9)
+        self.assertEqual(config.portrait_match_identity_margin, 0.07)
+        self.assertEqual(config.portrait_match_temporal_window_s, 420.0)
+        self.assertEqual(config.portrait_match_temporal_min_observations, 3)
+        self.assertEqual(config.portrait_match_temporal_max_observations, 14)
         self.assertEqual(config.openai_vision_detail, "high")
         self.assertTrue(config.proactive_enabled)
         self.assertEqual(config.proactive_poll_interval_s, 3.0)
@@ -733,6 +767,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.wakeword_verifier_mode, "ambiguity_only")
         self.assertEqual(config.wakeword_verifier_margin, 0.11)
         self.assertEqual(config.wakeword_phrases, ("hey twinr", "hey twinna", "twinr", "twinner"))
+        self.assertEqual(config.wakeword_stt_phrases, ("hey twinr", "hey twinna", "twinr", "twinner"))
         self.assertEqual(config.wakeword_sample_ms, 1700)
         self.assertEqual(config.wakeword_presence_grace_s, 600.0)
         self.assertEqual(config.wakeword_motion_grace_s, 180.0)
@@ -745,6 +780,14 @@ class TwinrConfigTests(unittest.TestCase):
             config.wakeword_openwakeword_models,
             ("/twinr/models/wakewords/twinr.tflite", "/twinr/models/wakewords/twinna.tflite"),
         )
+        self.assertEqual(
+            config.wakeword_openwakeword_custom_verifier_models,
+            (
+                ("twinr", "/twinr/models/wakewords/twinr.verifier.pkl"),
+                ("twinna", "/twinr/models/wakewords/twinna.verifier.pkl"),
+            ),
+        )
+        self.assertEqual(config.wakeword_openwakeword_custom_verifier_threshold, 0.23)
         self.assertEqual(config.wakeword_openwakeword_threshold, 0.57)
         self.assertEqual(config.wakeword_openwakeword_vad_threshold, 0.18)
         self.assertEqual(config.wakeword_openwakeword_patience_frames, 3)
@@ -1080,6 +1123,58 @@ class TwinrConfigTests(unittest.TestCase):
 
         self.assertEqual(config.wakeword_primary_backend, "openwakeword")
         self.assertEqual(config.wakeword_verifier_mode, "always")
+
+    def test_from_env_reads_stt_specific_wakeword_phrases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_WAKEWORD_PHRASES=hallo twinr, twinr",
+                        "TWINR_WAKEWORD_STT_PHRASES=hallo twinr, hallo twin, twinr, twin",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.wakeword_phrases, ("hallo twinr", "twinr"))
+        self.assertEqual(config.wakeword_stt_phrases, ("hallo twinr", "hallo twin", "twinr", "twin"))
+
+    def test_from_env_defaults_to_bundled_openwakeword_model_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            model_path = root / "src" / "twinr" / "proactive" / "wakeword" / "models" / "twinr_v1.onnx"
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            model_path.write_bytes(b"fake-onnx-model")
+            env_path.write_text("", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.wakeword_openwakeword_models, (str(model_path),))
+        self.assertEqual(config.wakeword_openwakeword_inference_framework, "onnx")
+
+    def test_from_env_defaults_to_bundled_openwakeword_verifier_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            model_path = root / "src" / "twinr" / "proactive" / "wakeword" / "models" / "twinr_v1.onnx"
+            verifier_path = model_path.with_suffix(".verifier.pkl")
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            model_path.write_bytes(b"fake-onnx-model")
+            verifier_path.write_bytes(b"fake-verifier")
+            env_path.write_text("", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.wakeword_openwakeword_models, (str(model_path),))
+        self.assertEqual(
+            config.wakeword_openwakeword_custom_verifier_models,
+            (("twinr_v1", str(verifier_path)),),
+        )
 
     def test_from_env_defaults_long_term_memory_path_to_project_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

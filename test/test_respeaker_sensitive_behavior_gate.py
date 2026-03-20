@@ -24,6 +24,7 @@ class ReSpeakerSensitiveBehaviorGateTests(unittest.TestCase):
             candidate_sensitivity="private",
             live_facts={
                 "camera": {
+                    "person_visible": True,
                     "person_count": 2,
                 },
                 "audio_policy": {
@@ -37,7 +38,7 @@ class ReSpeakerSensitiveBehaviorGateTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "sensitive_multi_person_context")
+        self.assertEqual(decision.reason, "multi_person_context")
         self.assertTrue(decision.multi_person_likely)
 
     def test_sensitive_behavior_is_blocked_for_low_confidence_audio_context(self) -> None:
@@ -45,6 +46,11 @@ class ReSpeakerSensitiveBehaviorGateTests(unittest.TestCase):
             candidate_sensitivity="sensitive",
             live_facts={
                 "sensor": {"presence_session_id": 17},
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 1,
+                    "person_count_unknown": False,
+                },
                 "audio_policy": {
                     "presence_audio_active": True,
                     "speaker_direction_stable": False,
@@ -56,7 +62,7 @@ class ReSpeakerSensitiveBehaviorGateTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "sensitive_low_confidence_audio_context")
+        self.assertEqual(decision.reason, "low_confidence_audio_direction")
         self.assertTrue(decision.low_confidence_audio)
 
 

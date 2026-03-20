@@ -1,8 +1,10 @@
-"""Evaluate and label wakeword captures against current policy settings.
+"""Evaluate, label, and train wakeword assets from current policy captures.
 
 This module turns manifest or ops-labeled recordings into deterministic
 evaluation metrics, writes the latest eval report, and searches for candidate
-calibration overrides that improve wakeword precision and recall.
+calibration overrides that improve wakeword precision and recall. It also
+trains optional openWakeWord custom verifier assets from labeled room-capture
+manifests.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ _NEGATIVE_LABELS = {
     "negative",
 }
 _IGNORED_LABELS = {"unclear"}
+_MANIFEST_AUDIO_PATH_KEYS = ("captured_audio_path", "audio_path")
 
 
 def _normalize_label(value: object | None) -> str | None:
@@ -134,23 +137,80 @@ class WakewordAutotuneRecommendation:
     profile_path: Path | None = None
 
 
-def load_eval_manifest(manifest_path: str | Path) -> list[WakewordEvalEntry]:
-    """Load labeled wakeword clips from a JSONL manifest."""
+@dataclass(frozen=True, slots=True)
+class WakewordVerifierTrainingReport:
+    """Describe one custom-verifier training run from labeled captures."""
+
+    manifest_path: Path
+    output_path: Path
+    model_name: str
+    positive_clips: int
+    negative_clips: int
+    negative_seconds: float
+
+
+def _load_manifest_payloads(manifest_path: str | Path) -> tuple[Path, list[dict[str, object]]]:
+    """Load one wakeword manifest as either JSONL or one JSON array."""
 
     path = Path(manifest_path).expanduser().resolve(strict=False)
     if not path.exists():
         raise FileNotFoundError(path)
-    entries: list[WakewordEvalEntry] = []
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
+    raw_text = path.read_text(encoding="utf-8")
+    stripped = raw_text.strip()
+    if not stripped:
+        return path, []
+    if stripped.startswith("["):
         payload = json.loads(stripped)
-        if not isinstance(payload, dict):
-            raise ValueError("Wakeword eval manifest lines must be JSON objects.")
-        audio_path = Path(str(payload.get("audio_path") or "")).expanduser()
+        if not isinstance(payload, list):
+            raise ValueError("Wakeword eval manifest must be a JSON array or JSONL file.")
+        raw_entries = payload
+    else:
+        raw_entries = [json.loads(line) for line in raw_text.splitlines() if line.strip()]
+    entries: list[dict[str, object]] = []
+    for item in raw_entries:
+        if not isinstance(item, dict):
+            raise ValueError("Wakeword eval manifest items must be JSON objects.")
+        entries.append(item)
+    return path, entries
+
+
+def _resolve_manifest_audio_path(payload: dict[str, object], *, manifest_path: Path) -> Path:
+    """Resolve the best available audio path for one manifest item."""
+
+    for key in _MANIFEST_AUDIO_PATH_KEYS:
+        raw_value = str(payload.get(key) or "").strip()
+        if not raw_value:
+            continue
+        audio_path = Path(raw_value).expanduser()
         if not audio_path.is_absolute():
-            audio_path = (path.parent / audio_path).resolve(strict=False)
+            audio_path = (manifest_path.parent / audio_path).resolve(strict=False)
+        return audio_path
+    raise ValueError("Wakeword eval manifest items require audio_path or captured_audio_path.")
+
+
+def _wav_duration_seconds(path: Path) -> float:
+    """Return the duration of one WAV file in seconds."""
+
+    with wave.open(str(path), "rb") as wav_file:
+        frame_count = int(wav_file.getnframes())
+        sample_rate = int(wav_file.getframerate())
+    return frame_count / max(1, sample_rate)
+
+
+def _unique_reference_clip_paths(paths: list[Path]) -> list[str]:
+    """Return stable deduplicated clip paths for verifier training."""
+
+    unique_paths = dict.fromkeys(path.expanduser().resolve(strict=False) for path in paths)
+    return [str(path) for path in unique_paths]
+
+
+def load_eval_manifest(manifest_path: str | Path) -> list[WakewordEvalEntry]:
+    """Load labeled wakeword clips from a JSONL manifest."""
+
+    path, raw_entries = _load_manifest_payloads(manifest_path)
+    entries: list[WakewordEvalEntry] = []
+    for payload in raw_entries:
+        audio_path = _resolve_manifest_audio_path(payload, manifest_path=path)
         label = _normalize_label(payload.get("label"))
         expected = _expected_detected(label)
         if expected is None:
@@ -164,6 +224,73 @@ def load_eval_manifest(manifest_path: str | Path) -> list[WakewordEvalEntry]:
             )
         )
     return entries
+
+
+def train_wakeword_custom_verifier_from_manifest(
+    *,
+    manifest_path: str | Path,
+    output_path: str | Path,
+    model_name: str,
+    inference_framework: str = "onnx",
+) -> WakewordVerifierTrainingReport:
+    """Train one local openWakeWord verifier from labeled room captures.
+
+    This follows the official openWakeWord verifier guidance: at least three
+    positive wakeword clips plus roughly ten seconds of negative speech or
+    prior false activations collected close to deployment.
+    """
+
+    manifest, raw_entries = _load_manifest_payloads(manifest_path)
+    positive_paths: list[Path] = []
+    negative_paths: list[Path] = []
+    negative_seconds = 0.0
+    for payload in raw_entries:
+        label = _normalize_label(payload.get("label"))
+        expected = _expected_detected(label)
+        if expected is None:
+            continue
+        audio_path = _resolve_manifest_audio_path(payload, manifest_path=manifest)
+        if not audio_path.exists():
+            raise FileNotFoundError(audio_path)
+        if expected:
+            positive_paths.append(audio_path)
+            continue
+        negative_paths.append(audio_path)
+        negative_seconds += _wav_duration_seconds(audio_path)
+    positive_clips = _unique_reference_clip_paths(positive_paths)
+    negative_clips = _unique_reference_clip_paths(negative_paths)
+    if len(positive_clips) < 3:
+        raise ValueError(
+            "Custom wakeword verifier training requires at least 3 positive clips from the target deployment."
+        )
+    if not negative_clips or negative_seconds < 10.0:
+        raise ValueError(
+            "Custom wakeword verifier training requires at least about 10 seconds of negative speech/background audio."
+        )
+    resolved_output = Path(output_path).expanduser().resolve(strict=False)
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    resolved_model_name = str(model_name or "").strip()
+    candidate_model_path = Path(resolved_model_name).expanduser()
+    if resolved_model_name and (candidate_model_path.is_absolute() or candidate_model_path.exists()):
+        resolved_model_name = str(candidate_model_path.resolve(strict=False))
+
+    import openwakeword
+
+    openwakeword.train_custom_verifier(
+        positive_reference_clips=positive_clips,
+        negative_reference_clips=negative_clips,
+        output_path=str(resolved_output),
+        model_name=resolved_model_name,
+        inference_framework=str(inference_framework or "onnx").strip().lower() or "onnx",
+    )
+    return WakewordVerifierTrainingReport(
+        manifest_path=manifest,
+        output_path=resolved_output,
+        model_name=resolved_model_name,
+        positive_clips=len(positive_clips),
+        negative_clips=len(negative_clips),
+        negative_seconds=negative_seconds,
+    )
 
 
 def append_wakeword_capture_label(
@@ -458,9 +585,11 @@ __all__ = [
     "WakewordEvalEntry",
     "WakewordEvalMetrics",
     "WakewordEvalReport",
+    "WakewordVerifierTrainingReport",
     "append_wakeword_capture_label",
     "autotune_wakeword_profile",
     "load_eval_manifest",
     "load_labeled_ops_captures",
     "run_wakeword_eval",
+    "train_wakeword_custom_verifier_from_manifest",
 ]

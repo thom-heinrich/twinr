@@ -900,3 +900,16 @@ def _weighted_distance(left: tuple[float, ...], right: tuple[float, ...]) -> flo
         for weight, left_value, right_value in zip(_PROFILE_WEIGHTS, left, right, strict=True)
     )
     return weighted_error / max(0.0001, total_weight)
+
+
+def voice_embedding_confidence(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    """Return a bounded similarity confidence for two local voice embeddings.
+
+    The household identity stack reuses the exact same embedding semantics as
+    the legacy single-profile voice path. Exposing this helper keeps both
+    matchers aligned instead of duplicating a second confidence curve in a
+    separate module.
+    """
+
+    distance = _weighted_distance(left, right)
+    return max(0.0, min(1.0, math.exp(-4.0 * distance)))

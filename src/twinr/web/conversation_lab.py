@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 import json
 import secrets
+import threading
 
 from twinr.agent.base_agent import TwinrConfig
 from twinr.agent.base_agent.prompting.personality import load_supervisor_loop_instructions
@@ -36,6 +37,7 @@ from twinr.ops import TwinrUsageStore
 from twinr.ops.paths import TwinrOpsPaths
 from twinr.providers.factory import build_streaming_provider_bundle
 from twinr.providers.openai import OpenAIBackend, OpenAISupervisorDecisionProvider, OpenAIToolCallingAgentProvider
+from twinr.web.conversation_lab_vision import build_vision_images, build_vision_prompt, owner_camera
 from twinr.web.presenters.memory_search import build_memory_search_panel_context
 from twinr.web.support.store import read_text_file, write_text_file
 
@@ -59,6 +61,11 @@ _CONVERSATION_LAB_TOOL_NAMES: tuple[str, ...] = (
     "update_user_profile",
     "update_personality",
     "update_simple_setting",
+    "enroll_portrait_identity",
+    "get_portrait_identity_status",
+    "reset_portrait_identity",
+    "manage_household_identity",
+    "inspect_camera",
     "end_conversation",
 )
 _MAX_SESSION_LIST = 12
@@ -567,6 +574,14 @@ class _ConversationLabToolOwner:
         self.collector = collector
         self._configurable_providers = tuple(configurable_providers)
         self._current_turn_audio_pcm = b""
+        self._camera_instance = None
+        self._camera_lock = threading.Lock()
+
+    @property
+    def camera(self):
+        """Expose one lazily initialized still camera for camera-backed tools."""
+
+        return owner_camera(self)
 
     def emit(self, payload: str) -> None:
         self.collector.emit(payload)
@@ -604,6 +619,16 @@ class _ConversationLabToolOwner:
             seen.add(provider_id)
             if hasattr(provider, "config"):
                 provider.config = updated_config
+
+    def _build_vision_images(self):
+        """Capture the normalized vision-image list for one tool call."""
+
+        return build_vision_images(self)
+
+    def _build_vision_prompt(self, question: str, *, include_reference: bool) -> str:
+        """Build the stable camera-question prompt used by inspect_camera."""
+
+        return build_vision_prompt(question, include_reference=include_reference)
 
 
 def _build_tool_loop(

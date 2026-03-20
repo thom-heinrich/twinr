@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 
@@ -43,6 +45,23 @@ class _FakeBackend:
         return ""
 
 
+class _GateResponses(_FakeResponses):
+    def __init__(self, payload: dict[str, object], gate: threading.Event) -> None:
+        super().__init__(payload)
+        self._gate = gate
+
+    def create(self, **_request):
+        self._gate.wait(timeout=1.0)
+        return super().create(**_request)
+
+
+class _GateBackend(_FakeBackend):
+    def __init__(self, payload: dict[str, object], gate: threading.Event) -> None:
+        self.config = types.SimpleNamespace(default_model="gpt-test")
+        self._responses = _GateResponses(payload, gate)
+        self._client = types.SimpleNamespace(responses=self._responses)
+
+
 def _config(root: str) -> TwinrConfig:
     return TwinrConfig(
         project_root=root,
@@ -56,6 +75,59 @@ def _config(root: str) -> TwinrConfig:
 
 
 class LongTermSubtextBuilderTests(unittest.TestCase):
+    def test_compiler_returns_quick_fallback_on_cache_miss_and_populates_cache_in_background(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = _config(temp_dir)
+            gate = threading.Event()
+            compiler = LongTermSubtextCompiler(
+                config=config,
+                backend=_GateBackend(
+                    {
+                        "use_personalization": True,
+                        "conversation_goal": "Quietly make the reply reassuring.",
+                        "helpful_biases": ["Keep the answer calm and practical."],
+                        "suggested_directions": ["Prefer a short reassuring check-in."],
+                        "follow_up_angles": ["Ask one gentle follow-up if needed."],
+                        "known_people": [],
+                        "avoidances": ["Do not narrate hidden memory."],
+                    },
+                    gate,
+                ),
+                _cache={},
+            )
+            try:
+                started = time.perf_counter()
+                first = compiler.compile(
+                    query_text="na alles klar",
+                    retrieval_query_text="Ask whether everything is okay.",
+                    graph_payload={"graph_cues": ["comfort"]},
+                    recent_threads=(),
+                )
+                elapsed_s = time.perf_counter() - started
+
+                self.assertLess(elapsed_s, 0.2)
+                self.assertIsNone(first)
+
+                gate.set()
+                resolved = None
+                for _ in range(100):
+                    time.sleep(0.01)
+                    resolved = compiler.compile(
+                        query_text="na alles klar",
+                        retrieval_query_text="Ask whether everything is okay.",
+                        graph_payload={"graph_cues": ["comfort"]},
+                        recent_threads=(),
+                    )
+                    if resolved is not None:
+                        break
+
+                self.assertIsNotNone(resolved)
+                self.assertEqual(resolved["conversation_goal"], "Quietly make the reply reassuring.")
+            finally:
+                executor = compiler._compiler_executor
+                if executor is not None:
+                    executor.shutdown(wait=True, cancel_futures=True)
+
     def test_compiled_program_is_used_when_compiler_backend_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = _config(temp_dir)

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
+from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -17,6 +20,7 @@ from twinr.memory.longterm import (
     LongTermConsolidationResultV1,
     LongTermConversationTurn,
     LongTermMemoryConflictV1,
+    LongTermMemoryContext,
     LongTermMemoryObjectV1,
     LongTermMemoryReflector,
     LongTermMemoryService,
@@ -114,6 +118,44 @@ class _BudgetRecordingWriter:
         return self._flush_result
 
 
+class _CountingRemoteState:
+    def __init__(self) -> None:
+        self.enter_count = 0
+
+    @contextmanager
+    def cache_probe_reads(self):
+        self.enter_count += 1
+        yield
+
+
+class _ProbeCachingRetriever:
+    def __init__(self, remote_state: _CountingRemoteState) -> None:
+        self.object_store = type("ObjectStoreStub", (), {"remote_state": remote_state})()
+
+    def build_context(self, *, query: LongTermQueryProfile, original_query_text: str | None = None) -> LongTermMemoryContext:
+        del query
+        del original_query_text
+        return LongTermMemoryContext(episodic_context="remembered")
+
+
+class _PrewarmObjectStore:
+    def __init__(self) -> None:
+        self.remote_state = _CountingRemoteState()
+        self.calls: list[tuple[str, object]] = []
+
+    def select_relevant_episodic_objects(self, *, query_text: str | None, limit: int, fallback_limit: int, require_query_match: bool):
+        self.calls.append(("episodic", query_text, limit, fallback_limit, require_query_match))
+        return ()
+
+    def select_relevant_objects(self, *, query_text: str | None, limit: int):
+        self.calls.append(("durable", query_text, limit))
+        return ()
+
+    def select_open_conflicts(self, *, query_text: str | None, limit: int):
+        self.calls.append(("conflicts", query_text, limit))
+        return ()
+
+
 class LongTermMemoryServiceTests(unittest.TestCase):
     def _source(self, event_id: str = "turn:test") -> LongTermSourceRefV1:
         return LongTermSourceRefV1(
@@ -162,6 +204,51 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIn('Conversation about "Wie wird das Wetter heute?"', entries[0].summary)
         self.assertIn('Twinr answered: "Heute ist es sonnig und mild."', entries[0].details or "")
         self.assertTrue(any(item.kind == "episode" for item in stored_objects))
+
+    def test_build_provider_context_uses_remote_probe_cache_within_one_turn(self) -> None:
+        remote_state = _CountingRemoteState()
+        retriever = _ProbeCachingRetriever(remote_state)
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(project_root=".", personality_dir="personality")
+        service.query_rewriter = _StaticQueryRewriter({})
+        service.retriever = retriever
+        service.object_store = retriever.object_store
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=None),
+            user_store=SimpleNamespace(remote_state=None),
+            personality_store=SimpleNamespace(remote_state=None),
+        )
+        service.graph_store = SimpleNamespace(remote_state=None)
+        service.midterm_store = SimpleNamespace(remote_state=None)
+        service._store_lock = threading.RLock()
+
+        context = service.build_provider_context("na alles klar")
+
+        self.assertEqual(context.episodic_context, "remembered")
+        self.assertEqual(remote_state.enter_count, 1)
+
+    def test_prewarm_foreground_read_cache_primes_lightweight_remote_indexes(self) -> None:
+        object_store = _PrewarmObjectStore()
+        graph_calls: list[str] = []
+        midterm_calls: list[str] = []
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(project_root=".", personality_dir="personality", long_term_memory_recall_limit=3)
+        service.object_store = object_store
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=None),
+            user_store=SimpleNamespace(remote_state=None),
+            personality_store=SimpleNamespace(remote_state=None),
+        )
+        service.graph_store = SimpleNamespace(remote_state=None, load_document=lambda: graph_calls.append("graph"))
+        service.midterm_store = SimpleNamespace(remote_state=None, load_packets=lambda: midterm_calls.append("midterm"))
+        service._store_lock = threading.RLock()
+
+        service.prewarm_foreground_read_cache()
+
+        self.assertEqual(object_store.remote_state.enter_count, 1)
+        self.assertEqual(object_store.calls, [])
+        self.assertEqual(graph_calls, ["graph"])
+        self.assertEqual(midterm_calls, ["midterm"])
 
     def test_background_worker_persists_extracted_graph_edges(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -119,8 +119,12 @@ class _FakeChonkyClient:
         self._next_document_id = 1
         self.max_items_per_bulk = max_items_per_bulk
         self.max_request_bytes = max_request_bytes
+        self.supports_topk_records = False
         self.bulk_calls = 0
         self.retrieve_calls = 0
+        self.topk_records_calls = 0
+        self.topk_records_payloads: list[dict[str, object]] = []
+        self.fetch_full_document_calls = 0
         self.bulk_request_bytes: list[int] = []
         self.bulk_request_schemas: list[tuple[str, ...]] = []
         self.records_by_document_id: dict[str, dict[str, object]] = {}
@@ -164,6 +168,7 @@ class _FakeChonkyClient:
     def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
         del include_content
         del max_content_chars
+        self.fetch_full_document_calls += 1
         if isinstance(document_id, str) and document_id:
             record = self.records_by_document_id.get(document_id)
             if record is not None:
@@ -206,8 +211,51 @@ class _FakeChonkyClient:
             raw={"results": [dict(item) for item in ranked]},
         )
 
+    def topk_records(self, request):
+        payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        query_text = str(payload.get("query_text") or "").lower()
+        allowed = set(str(value) for value in payload.get("allowed_doc_ids", ()) if str(value))
+        self.topk_records_calls += 1
+        self.topk_records_payloads.append(dict(payload))
+        # Preserve legacy retrieve counters for tests that only assert that a remote read happened.
+        self.retrieve_calls += 1
+        ranked = []
+        for document_id, record in self.records_by_document_id.items():
+            if allowed and document_id not in allowed:
+                continue
+            content = str(record.get("content") or "").lower()
+            if query_text == "__allowed_doc_ids__" and allowed:
+                pass
+            elif query_text and query_text not in content:
+                continue
+            ranked.append(
+                {
+                    "payload_id": document_id,
+                    "document_id": document_id,
+                    "relevance_score": 1.0,
+                    "metadata": dict(record.get("metadata") or {}),
+                    "payload": dict(record.get("payload") or {}),
+                    "payload_source": "record.payload",
+                    "source_index": "fulltext",
+                    "candidate_origin": "fulltext",
+                }
+            )
+        return SimpleNamespace(
+            success=True,
+            mode="advanced",
+            results=tuple(SimpleNamespace(**item) for item in ranked),
+            indexes_used=("fulltext",),
+            scope_ref=payload.get("scope_ref"),
+            query_plan={"latency_ms": {"search": 1.0, "materialize": 0.2}},
+            raw={"results": [dict(item) for item in ranked]},
+        )
+
 
 class _LiveShapeChonkyClient(_FakeChonkyClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.supports_topk_records = False
+
     def fetch_full_document(self, *, document_id=None, origin_uri=None, include_content=True, max_content_chars=4000):
         del max_content_chars
         record = None
@@ -1686,6 +1734,309 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertEqual(tuple(item.memory_id for item in relevant), ("fact:janina_spouse",))
 
+    def test_remote_primary_store_reuses_remote_catalog_search_and_item_reads_when_cache_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.config.long_term_memory_remote_read_cache_ttl_s = 60.0
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:tea_preference",
+                        kind="preference_fact",
+                        summary="The user likes black tea.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.9,
+                    ),
+                )
+            )
+            remote_state.client.retrieve_calls = 0
+
+            first = store.select_relevant_objects(query_text="Janina", limit=1)
+            retrieve_calls_after_first = remote_state.client.retrieve_calls
+            second = store.select_relevant_objects(query_text="Janina", limit=1)
+
+        self.assertEqual(tuple(item.memory_id for item in first), ("fact:janina_spouse",))
+        self.assertEqual(tuple(item.memory_id for item in second), ("fact:janina_spouse",))
+        self.assertGreater(retrieve_calls_after_first, 0)
+        self.assertEqual(remote_state.client.retrieve_calls, retrieve_calls_after_first)
+
+    def test_remote_primary_store_prefers_one_shot_topk_records_without_extra_document_fetches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:tea_preference",
+                        kind="preference_fact",
+                        summary="The user likes black tea.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.9,
+                    ),
+                )
+            )
+            remote_catalog = store._remote_catalog
+            self.assertIsNotNone(remote_catalog)
+            entries = remote_catalog.load_catalog_entries(snapshot_kind="objects")
+            janina_entries = tuple(entry for entry in entries if entry.item_id == "fact:janina_spouse")
+            remote_state.client.supports_topk_records = True
+            remote_state.client.fetch_full_document_calls = 0
+            remote_state.client.topk_records_calls = 0
+
+            selected = remote_catalog._search_remote_candidates(
+                snapshot_kind="objects",
+                read_client=remote_state.client,
+                query_text="Janina",
+                result_limit=1,
+                allowed_doc_ids=tuple(entry.document_id for entry in entries if entry.document_id),
+                catalog_entry_count=len(entries),
+            )
+            payloads = remote_catalog._load_item_payloads_from_entries(
+                snapshot_kind="objects",
+                entries=janina_entries,
+            )
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(payloads[0]["memory_id"], "fact:janina_spouse")
+        self.assertGreater(remote_state.client.topk_records_calls, 1)
+        self.assertEqual(remote_state.client.fetch_full_document_calls, 0)
+
+    def test_remote_primary_store_selects_relevant_objects_via_direct_scope_search_without_catalog_hydration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="episode:doctor",
+                        kind="episode",
+                        summary="Janina had an eye doctor appointment yesterday.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.95,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:tea_preference",
+                        kind="preference_fact",
+                        summary="The user likes black tea.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.9,
+                    ),
+                )
+            )
+            remote_state.client.supports_topk_records = True
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            def _fail_catalog_hydration(*args, **kwargs):
+                del args
+                del kwargs
+                raise AssertionError("full catalog hydration should not run for direct scope search")
+
+            remote_catalog.load_catalog_entries = _fail_catalog_hydration  # type: ignore[method-assign]
+            remote_catalog.catalog_available = _fail_catalog_hydration  # type: ignore[method-assign]
+
+            relevant = store.select_relevant_objects(query_text="Janina", limit=1)
+
+        self.assertEqual(tuple(item.memory_id for item in relevant), ("fact:janina_spouse",))
+        payload = remote_state.client.topk_records_payloads[-1]
+        self.assertEqual(payload["namespace"], "test-namespace")
+        self.assertEqual(payload["scope_ref"], "longterm:objects:current")
+        self.assertEqual(remote_state.client.fetch_full_document_calls, 0)
+
+    def test_remote_primary_store_skips_remote_recent_fallback_after_query_scope_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="episode:doctor",
+                        kind="episode",
+                        summary="Janina had an eye doctor appointment yesterday.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.95,
+                    ),
+                )
+            )
+            remote_state.client.supports_topk_records = True
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            def _fail_catalog_hydration(*args, **kwargs):
+                del args
+                del kwargs
+                raise AssertionError("remote query miss must not hydrate the full episodic catalog")
+
+            remote_catalog.load_catalog_entries = _fail_catalog_hydration  # type: ignore[method-assign]
+            remote_catalog.catalog_available = _fail_catalog_hydration  # type: ignore[method-assign]
+
+            relevant = store.select_relevant_episodic_objects(
+                query_text="Hallo",
+                limit=2,
+                fallback_limit=2,
+                require_query_match=False,
+            )
+
+        self.assertEqual(relevant, ())
+        payload = remote_state.client.topk_records_payloads[-1]
+        self.assertEqual(payload["scope_ref"], "longterm:objects:current")
+
+    def test_search_current_item_payloads_oversamples_initial_scope_window_for_client_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="episode:doctor",
+                        kind="episode",
+                        summary="Janina had an eye doctor appointment yesterday.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.95,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                )
+            )
+            remote_state.client.supports_topk_records = True
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            payloads = remote_catalog.search_current_item_payloads(
+                snapshot_kind="objects",
+                query_text="Janina",
+                limit=1,
+                eligible=lambda entry: entry.metadata.get("kind") != "episode",
+            )
+
+        self.assertEqual(tuple(payload["memory_id"] for payload in payloads), ("fact:janina_spouse",))
+        self.assertEqual(remote_state.client.topk_records_payloads[0]["result_limit"], 16)
+
+    def test_search_catalog_entries_uses_scope_ref_for_full_current_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:tea_preference",
+                        kind="preference_fact",
+                        summary="The user likes black tea.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.9,
+                    ),
+                )
+            )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            remote_state.client.supports_topk_records = True
+
+            relevant = remote_catalog.search_catalog_entries(
+                snapshot_kind="objects",
+                query_text="Janina",
+                limit=1,
+            )
+
+        self.assertEqual(tuple(entry.item_id for entry in relevant), ("fact:janina_spouse",))
+        payload = remote_state.client.topk_records_payloads[-1]
+        self.assertEqual(payload["namespace"], "test-namespace")
+        self.assertEqual(payload["scope_ref"], "longterm:objects:current")
+        self.assertNotIn("allowed_doc_ids", payload)
+
+    def test_search_catalog_entries_keeps_explicit_allowlist_for_filtered_subsets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:tea_preference",
+                        kind="preference_fact",
+                        summary="The user likes black tea.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.9,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:morning_walk",
+                        kind="routine_fact",
+                        summary="The user walks every morning.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.88,
+                    ),
+                )
+            )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            remote_state.client.supports_topk_records = True
+
+            relevant = remote_catalog.search_catalog_entries(
+                snapshot_kind="objects",
+                query_text="tea",
+                limit=1,
+                eligible=lambda entry: entry.item_id != "fact:morning_walk",
+            )
+
+        self.assertEqual(tuple(entry.item_id for entry in relevant), ("fact:tea_preference",))
+        payload = remote_state.client.topk_records_payloads[-1]
+        self.assertNotIn("namespace", payload)
+        self.assertNotIn("scope_ref", payload)
+        self.assertEqual(len(payload["allowed_doc_ids"]), 2)
     def test_select_relevant_objects_prefers_query_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = _config(temp_dir)

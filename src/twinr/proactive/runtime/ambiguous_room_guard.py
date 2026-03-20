@@ -14,6 +14,7 @@ from twinr.proactive.runtime.claim_metadata import (
     RuntimeClaimMetadata,
     coerce_mapping,
     coerce_optional_bool,
+    coerce_optional_float,
     coerce_optional_int,
     coerce_optional_ratio,
     mean_confidence,
@@ -78,6 +79,36 @@ class AmbiguousRoomGuardSnapshot:
             "ambiguous_room_guard_policy": self.policy_recommendation,
         }
 
+    @classmethod
+    def from_fact_map(
+        cls,
+        value: object | None,
+    ) -> "AmbiguousRoomGuardSnapshot | None":
+        """Parse one serialized ambiguity-guard payload."""
+
+        payload = coerce_mapping(value)
+        if not payload:
+            return None
+        return cls(
+            observed_at=coerce_optional_float(payload.get("observed_at")),
+            clear=coerce_optional_bool(payload.get("clear")) is True,
+            guard_active=coerce_optional_bool(payload.get("guard_active")) is True,
+            reason=normalize_text(payload.get("reason")) or None,
+            policy_recommendation=normalize_text(payload.get("policy_recommendation")) or "block_targeted_inference",
+            claim=RuntimeClaimMetadata.from_payload(
+                payload,
+                default_source="camera_plus_audio_policy",
+            ),
+            person_visible=coerce_optional_bool(payload.get("person_visible")) is True,
+            camera_person_count=coerce_optional_int(payload.get("camera_person_count")),
+            camera_person_count_unknown=coerce_optional_bool(payload.get("camera_person_count_unknown")) is True,
+            room_busy_or_overlapping=coerce_optional_bool(payload.get("room_busy_or_overlapping")) is True,
+            background_media_likely=coerce_optional_bool(payload.get("background_media_likely")) is True,
+            speaker_direction_stable=coerce_optional_bool(payload.get("speaker_direction_stable")),
+            direction_confidence=coerce_optional_ratio(payload.get("direction_confidence")),
+            audio_context_active=coerce_optional_bool(payload.get("audio_context_active")) is True,
+        )
+
 
 def derive_ambiguous_room_guard(
     *,
@@ -92,7 +123,10 @@ def derive_ambiguous_room_guard(
     audio_policy = coerce_mapping(facts.get("audio_policy"))
     vad = coerce_mapping(facts.get("vad"))
 
-    person_visible = coerce_optional_bool(camera.get("person_visible")) is True
+    explicit_person_visible = coerce_optional_bool(camera.get("person_visible"))
+    person_visible = explicit_person_visible is True or (
+        explicit_person_visible is None and person_count is not None and person_count > 0
+    )
     person_count = coerce_optional_int(camera.get("person_count"))
     person_count_unknown = coerce_optional_bool(camera.get("person_count_unknown")) is True
     room_busy = coerce_optional_bool(audio_policy.get("room_busy_or_overlapping")) is True
