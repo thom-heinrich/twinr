@@ -1,0 +1,30 @@
+schema_version: 1
+name: intelligence
+path: src/twinr/agent/personality/intelligence
+kind: python-package
+visibility: internal
+summary: RSS-backed place/world-intelligence source layer for Twinr personality.
+owned_concerns:
+  - Define persistent RSS/world-intelligence subscription, calibration, and awareness-state models.
+  - Persist subscriptions and timing state through remote-primary snapshots.
+  - Derive topic/region calibration signals from structured conversation and tool evidence.
+  - Discover RSS or Atom feeds from explicit source pages returned by live search.
+  - Recalibrate feed coverage during reflection-style maintenance windows.
+  - Refresh due feeds and translate fresh items into bounded world, continuity, and awareness updates.
+out_of_scope:
+  - Prompt rendering or personality-core policy.
+  - Ordinary one-off live search answers.
+  - Workflow or tool orchestration above the service boundary.
+files:
+  - path: __init__.py
+    role: Package export surface for world-intelligence helpers.
+  - path: calibration.py
+    role: Structured calibration-signal extraction for world-intelligence learning.
+  - path: models.py
+    role: Typed subscriptions, calibration/awareness state, and refresh/config results.
+  - path: store.py
+    role: Remote-primary snapshot seam for subscriptions and refresh/discovery timing.
+  - path: service.py
+    role: Feed discovery, reflection-phase recalibration, and conversion into world/continuity/awareness context.
+tests:
+  - path: test/test_personality_world_intelligence.py

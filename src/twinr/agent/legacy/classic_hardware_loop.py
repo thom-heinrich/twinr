@@ -921,6 +921,10 @@ class TwinrHardwareLoop:
                             self._emit_status(force=True)
                             answer_started = True
                     answer = self.runtime.finalize_agent_turn(tool_response.text)
+                    self.runtime.record_personality_tool_history(
+                        tool_calls=tool_response.tool_calls,
+                        tool_results=tool_response.tool_results,
+                    )
                     flush_pending_segment()
                     response = tool_response
                 else:

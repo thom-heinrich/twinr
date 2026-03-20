@@ -320,11 +320,74 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
 
         self.assertEqual(int(base["width"]), int(cued["width"]))
         self.assertEqual(int(base["height"]), int(cued["height"]))
+        self.assertEqual(int(cued["eye_shift_x"]), int(base["eye_shift_x"]) + 8)
+        self.assertEqual(int(cued["eye_shift_y"]), int(base["eye_shift_y"]) - 6)
         self.assertEqual(int(cued["highlight_dx"]), int(base["highlight_dx"]) + 12)
         self.assertEqual(int(cued["highlight_dy"]), int(base["highlight_dy"]) - 10)
         self.assertEqual(int(cued["brow_raise"]), 0)
         self.assertEqual(str(cued["brow_style"]), "inward_tilt")
         self.assertTrue(bool(cued["blink"]))
+
+    def test_error_eye_baseline_no_longer_stares_off_to_the_side(self) -> None:
+        display = self.make_display()
+        renderer = display._scene_renderer()
+
+        states = [renderer._eye_state("error", frame, "left") for frame in range(6)]
+
+        self.assertLessEqual(max(abs(int(state["highlight_dx"])) for state in states), 2)
+
+    def test_error_scene_keeps_sad_expression_while_preserving_attention_gaze(self) -> None:
+        display = self.make_display()
+        renderer = display._scene_renderer()
+        scene = renderer.build_scene(
+            width=800,
+            height=480,
+            status="error",
+            headline="Check system",
+            helper_text="Twinr prueft das System.",
+            state_fields=(
+                ("Status", "Check system"),
+                ("Internet", "warn"),
+            ),
+            animation_frame=0,
+            face_cue=DisplayFaceCue(gaze_x=2, mouth="speak", brows="raised", blink=True, head_dx=1),
+        )
+
+        self.assertIsNotNone(scene.face_cue)
+        assert scene.face_cue is not None
+        self.assertEqual(scene.face_cue.gaze_x, 2)
+        self.assertEqual(scene.face_cue.head_dx, 1)
+        self.assertTrue(scene.face_cue.blink)
+        self.assertIsNone(scene.face_cue.mouth)
+        self.assertIsNone(scene.face_cue.brows)
+
+        eye = renderer._eye_state("error", 0, "left", face_cue=scene.face_cue)
+
+        self.assertEqual(int(eye["highlight_dx"]), 16)
+        self.assertEqual(int(eye["eye_shift_x"]), 12)
+
+    def test_error_scene_freezes_random_eye_churn_when_directional_cue_is_active(self) -> None:
+        display = self.make_display()
+        renderer = display._scene_renderer()
+        cue = DisplayFaceCue(gaze_x=2, head_dx=1)
+
+        first = renderer._eye_state("error", 0, "left", face_cue=cue)
+        second = renderer._eye_state("error", 4, "left", face_cue=cue)
+
+        self.assertEqual(int(first["highlight_dx"]), int(second["highlight_dx"]))
+        self.assertEqual(int(first["eye_shift_x"]), int(second["eye_shift_x"]))
+        self.assertEqual(bool(first["blink"]), bool(second["blink"]))
+
+    def test_error_face_offset_uses_scaled_head_turn_and_no_error_bob_when_cued(self) -> None:
+        display = self.make_display()
+        renderer = display._scene_renderer()
+        cue = DisplayFaceCue(gaze_x=2, head_dx=2)
+
+        first = renderer._face_offset("error", 0, face_cue=cue)
+        second = renderer._face_offset("error", 4, face_cue=cue)
+
+        self.assertEqual(first, (16, 0))
+        self.assertEqual(second, (16, 0))
 
     def test_external_face_cue_supports_six_brow_styles(self) -> None:
         display = self.make_display()

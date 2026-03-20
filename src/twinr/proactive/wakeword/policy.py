@@ -1,8 +1,9 @@
 """Decide whether wakeword detections should be accepted or verified.
 
-This module normalizes backend selection, optionally rechecks borderline hits
-with STT, and returns structured decisions that the proactive runtime can log
-and act on consistently.
+This module normalizes backend selection, can gate detector hits through a
+local clip-level verifier before any optional STT recheck, and returns
+structured decisions that the proactive runtime can log and act on
+consistently.
 """
 
 from __future__ import annotations
@@ -28,6 +29,14 @@ class WakewordTranscriber(Protocol):
         prompt: str | None = None,
     ) -> str:
         """Transcribe the supplied audio bytes into text."""
+        ...
+
+
+class WakewordCaptureVerifier(Protocol):
+    """Describe one verifier that inspects a localized wakeword capture."""
+
+    def verify(self, capture: AmbientAudioCaptureWindow, *, detector_match: WakewordMatch) -> "WakewordVerification":
+        """Verify the supplied detector hit against the captured audio window."""
         ...
 
 
@@ -77,6 +86,9 @@ class WakewordDecision:
     verifier_used: bool
     verifier_status: str
     verifier_reason: str | None = None
+    local_verifier_used: bool = False
+    local_verifier_status: str = "not_needed"
+    local_verifier_reason: str | None = None
     capture_path: str | None = None
 
 
@@ -155,7 +167,8 @@ class WakewordDecisionPolicy:
         verifier_mode: str = "ambiguity_only",
         verifier_margin: float = 0.08,
         primary_threshold: float | None = None,
-        verifier: SttWakewordVerifier | None = None,
+        verifier: WakewordCaptureVerifier | None = None,
+        local_verifier: WakewordCaptureVerifier | None = None,
     ) -> None:
         self.primary_backend = normalize_wakeword_backend(primary_backend, default="openwakeword")
         normalized_fallback = normalize_wakeword_backend(fallback_backend, default="stt") if fallback_backend else "disabled"
@@ -168,6 +181,7 @@ class WakewordDecisionPolicy:
             else max(0.0, min(float(primary_threshold), 1.0))
         )
         self.verifier = verifier
+        self.local_verifier = local_verifier
 
     def decide(
         self,
@@ -191,6 +205,8 @@ class WakewordDecisionPolicy:
                 verifier_mode=self.verifier_mode,
                 verifier_used=False,
                 verifier_status="not_needed",
+                local_verifier_used=False,
+                local_verifier_status="not_needed",
             )
 
         if backend_used != self.primary_backend:
@@ -206,7 +222,44 @@ class WakewordDecisionPolicy:
                 verifier_mode=self.verifier_mode,
                 verifier_used=False,
                 verifier_status="not_needed",
+                local_verifier_used=False,
+                local_verifier_status="not_needed",
             )
+
+        local_verifier_used = False
+        local_verifier_status = "not_needed"
+        local_verifier_reason: str | None = None
+        if self.local_verifier is not None:
+            if capture is None:
+                local_verification = WakewordVerification(
+                    status="error",
+                    backend="local_sequence",
+                    reason="missing_capture",
+                )
+            else:
+                local_verification = self.local_verifier.verify(capture, detector_match=match)
+            if local_verification.status == "accepted":
+                local_verifier_used = True
+                local_verifier_status = local_verification.status
+                local_verifier_reason = local_verification.reason
+            elif local_verification.status == "skipped":
+                local_verifier_status = "not_needed"
+            else:
+                return WakewordDecision(
+                    detected=False,
+                    outcome="rejected_by_local_verifier",
+                    match=match,
+                    source=source,
+                    backend_used=backend_used,
+                    primary_backend=self.primary_backend,
+                    fallback_backend=self.fallback_backend,
+                    verifier_mode=self.verifier_mode,
+                    verifier_used=False,
+                    verifier_status="not_needed",
+                    local_verifier_used=True,
+                    local_verifier_status=local_verification.status,
+                    local_verifier_reason=local_verification.reason,
+                )
 
         if not self._should_verify(match):
             return WakewordDecision(
@@ -220,6 +273,9 @@ class WakewordDecisionPolicy:
                 verifier_mode=self.verifier_mode,
                 verifier_used=False,
                 verifier_status="not_needed",
+                local_verifier_used=local_verifier_used,
+                local_verifier_status=local_verifier_status,
+                local_verifier_reason=local_verifier_reason,
             )
 
         if capture is None or self.verifier is None:
@@ -235,6 +291,9 @@ class WakewordDecisionPolicy:
                 verifier_used=False,
                 verifier_status="unavailable",
                 verifier_reason="missing_capture_or_verifier",
+                local_verifier_used=local_verifier_used,
+                local_verifier_status=local_verifier_status,
+                local_verifier_reason=local_verifier_reason,
             )
 
         verification = self.verifier.verify(capture, detector_match=match)
@@ -257,6 +316,9 @@ class WakewordDecisionPolicy:
                 verifier_mode=self.verifier_mode,
                 verifier_used=True,
                 verifier_status=verification.status,
+                local_verifier_used=local_verifier_used,
+                local_verifier_status=local_verifier_status,
+                local_verifier_reason=local_verifier_reason,
             )
 
         if verification.status == "rejected":
@@ -276,6 +338,9 @@ class WakewordDecisionPolicy:
                 verifier_mode=self.verifier_mode,
                 verifier_used=True,
                 verifier_status=verification.status,
+                local_verifier_used=local_verifier_used,
+                local_verifier_status=local_verifier_status,
+                local_verifier_reason=local_verifier_reason,
             )
 
         return WakewordDecision(
@@ -290,6 +355,9 @@ class WakewordDecisionPolicy:
             verifier_used=True,
             verifier_status=verification.status,
             verifier_reason=verification.reason,
+            local_verifier_used=local_verifier_used,
+            local_verifier_status=local_verifier_status,
+            local_verifier_reason=local_verifier_reason,
         )
 
     def _should_verify(self, match: WakewordMatch) -> bool:

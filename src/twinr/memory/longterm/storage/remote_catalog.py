@@ -20,6 +20,7 @@ import time
 from urllib.parse import quote
 from uuid import uuid4
 
+from twinr.memory.chonkydb.client import ChonkyDBError
 from twinr.memory.chonkydb.models import (
     ChonkyDBBulkRecordRequest,
     ChonkyDBRecordItem,
@@ -420,6 +421,19 @@ class LongTermRemoteCatalogStore:
             payload=self._load_catalog_payload(snapshot_kind=snapshot_kind),
         )
 
+    def catalog_item_count(self, *, snapshot_kind: str) -> int | None:
+        """Return the current catalog item count when the remote head exposes it."""
+
+        payload = self._load_catalog_payload(snapshot_kind=snapshot_kind)
+        if not isinstance(payload, Mapping):
+            return None
+        raw_count = payload.get("items_count")
+        try:
+            parsed = int(raw_count)
+        except (TypeError, ValueError):
+            return None
+        return max(0, parsed)
+
     def assemble_snapshot_from_catalog(
         self,
         *,
@@ -654,76 +668,97 @@ class LongTermRemoteCatalogStore:
 
         Returns ``None`` when the current backend cannot satisfy one-shot
         ``scope_ref`` searches and callers should fall back to the older
-        catalog-hydration path. When supported, this keeps query-driven reads
-        bounded to the ranked candidate window instead of fetching every
-        current catalog segment up front.
+        catalog-hydration path. When supported, this prefers the remote
+        `topk_records(scope_ref=...)` path even when a local catalog
+        projection is already cached, so the hot path keeps exercising the
+        authoritative remote retrieval engine instead of routing around it.
         """
 
         clean_query = self._normalize_text(query_text)
         if not clean_query:
             return ()
+        cached_entries = self._cached_catalog_entries(snapshot_kind=snapshot_kind)
         remote_state = self._require_remote_state()
         read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
         topk_records = getattr(read_client, "topk_records", None)
         supports_topk_records = bool(getattr(read_client, "supports_topk_records", callable(topk_records)))
-        if not (supports_topk_records and callable(topk_records)):
-            return None
         scope_ref, namespace = self._current_scope_request_context(snapshot_kind=snapshot_kind)
-        if not scope_ref or not namespace:
-            return None
-        definition = self._require_definition(snapshot_kind)
-        bounded_limit = max(1, int(limit))
-        max_request_limit = max(bounded_limit, self._retrieve_batch_size())
-        request_limit = self._initial_scope_search_limit(
-            bounded_limit=bounded_limit,
-            max_request_limit=max_request_limit,
-            requires_client_filter=eligible is not None,
-        )
-        selected_payloads: list[dict[str, object]] = []
-        seen_item_ids: set[str] = set()
-        while True:
-            candidates = self._search_remote_candidates(
-                snapshot_kind=snapshot_kind,
-                read_client=read_client,
-                query_text=clean_query,
-                result_limit=request_limit,
-                allowed_doc_ids=(),
-                scope_ref=scope_ref,
-                namespace=namespace,
-                catalog_entry_count=0,
+        can_scope_search = bool(supports_topk_records and callable(topk_records) and scope_ref and namespace)
+        if can_scope_search:
+            definition = self._require_definition(snapshot_kind)
+            bounded_limit = max(1, int(limit))
+            max_request_limit = max(bounded_limit, self._retrieve_batch_size())
+            request_limit = self._initial_scope_search_limit(
+                bounded_limit=bounded_limit,
+                max_request_limit=max_request_limit,
+                requires_client_filter=eligible is not None,
             )
-            candidate_count = 0
-            for candidate in candidates:
-                candidate_count += 1
-                entry = self._candidate_catalog_entry(definition=definition, payload=candidate)
-                if entry is None or entry.item_id in seen_item_ids:
-                    continue
-                if eligible is not None and not eligible(entry):
-                    continue
-                payload = self._extract_item_payload(
-                    definition=definition,
-                    item_id=entry.item_id,
-                    payload=candidate,
-                )
-                if not isinstance(payload, Mapping):
-                    continue
-                payload_dict = dict(payload)
-                self._store_item_payload(
-                    snapshot_kind=snapshot_kind,
-                    item_id=entry.item_id,
-                    payload=payload_dict,
-                )
-                selected_payloads.append(payload_dict)
-                seen_item_ids.add(entry.item_id)
-                if len(selected_payloads) >= bounded_limit:
+            selected_payloads: list[dict[str, object]] = []
+            seen_item_ids: set[str] = set()
+            while True:
+                try:
+                    candidates = self._search_remote_candidates(
+                        snapshot_kind=snapshot_kind,
+                        read_client=read_client,
+                        query_text=clean_query,
+                        result_limit=request_limit,
+                        allowed_doc_ids=(),
+                        scope_ref=scope_ref,
+                        namespace=namespace,
+                        catalog_entry_count=0,
+                    )
+                except ChonkyDBError:
+                    # Current-scope one-shot search remains authoritative, but
+                    # a local catalog projection can still provide a bounded
+                    # temporary fallback when it is already present in memory.
+                    break
+                candidate_count = 0
+                for candidate in candidates:
+                    candidate_count += 1
+                    entry = self._candidate_catalog_entry(definition=definition, payload=candidate)
+                    if entry is None or entry.item_id in seen_item_ids:
+                        continue
+                    if eligible is not None and not eligible(entry):
+                        continue
+                    payload = self._extract_item_payload(
+                        definition=definition,
+                        item_id=entry.item_id,
+                        payload=candidate,
+                    )
+                    if not isinstance(payload, Mapping):
+                        continue
+                    payload_dict = dict(payload)
+                    self._store_item_payload(
+                        snapshot_kind=snapshot_kind,
+                        item_id=entry.item_id,
+                        payload=payload_dict,
+                    )
+                    selected_payloads.append(payload_dict)
+                    seen_item_ids.add(entry.item_id)
+                    if len(selected_payloads) >= bounded_limit:
+                        return tuple(selected_payloads)
+                if candidate_count < request_limit or request_limit >= max_request_limit:
                     return tuple(selected_payloads)
-            if candidate_count < request_limit or request_limit >= max_request_limit:
-                break
-            next_limit = min(max_request_limit, request_limit * 2)
-            if next_limit <= request_limit:
-                break
-            request_limit = next_limit
-        return tuple(selected_payloads)
+                next_limit = min(max_request_limit, request_limit * 2)
+                if next_limit <= request_limit:
+                    return tuple(selected_payloads)
+                request_limit = next_limit
+
+        if cached_entries is None:
+            return None
+        selected_entries = self._local_search_catalog_entries(
+            snapshot_kind=snapshot_kind,
+            entries=cached_entries,
+            query_text=clean_query,
+            limit=limit,
+            eligible=eligible,
+        )
+        if not selected_entries:
+            return ()
+        return self.load_item_payloads(
+            snapshot_kind=snapshot_kind,
+            item_ids=(entry.item_id for entry in selected_entries),
+        )
 
     def _initial_scope_search_limit(
         self,
@@ -757,7 +792,6 @@ class LongTermRemoteCatalogStore:
     ) -> tuple[LongTermRemoteCatalogEntry, ...]:
         """Search one loaded catalog locally against the current remote projection."""
 
-        use_local_cached_search = self._persistent_read_cache_ttl_s() > 0.0
         all_entries = self.load_catalog_entries(snapshot_kind=snapshot_kind)
         if not all_entries:
             return ()
@@ -767,33 +801,6 @@ class LongTermRemoteCatalogStore:
         result_limit = max(1, int(limit))
         if len(entries) <= result_limit:
             return tuple(entries[:result_limit])
-        filtered_item_ids = tuple(entry.item_id for entry in entries)
-        by_item_id = {entry.item_id: entry for entry in entries}
-        cached_search = self._cached_search_result(
-            snapshot_kind=snapshot_kind,
-            query_text=query_text,
-            limit=result_limit,
-            filtered_item_ids=filtered_item_ids,
-        )
-        if cached_search is not None:
-            return tuple(by_item_id[item_id] for item_id in cached_search if item_id in by_item_id)
-        if use_local_cached_search:
-            selected = self._local_search_catalog_entries(
-                snapshot_kind=snapshot_kind,
-                entries=all_entries,
-                query_text=query_text,
-                limit=result_limit,
-                eligible=eligible,
-            )
-            self._store_search_result(
-                snapshot_kind=snapshot_kind,
-                query_text=query_text,
-                limit=result_limit,
-                filtered_item_ids=filtered_item_ids,
-                selected_item_ids=tuple(entry.item_id for entry in selected),
-            )
-            return tuple(selected)
-
         remote_state = self._require_remote_state()
         read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
         allowed_doc_ids = [
@@ -803,6 +810,8 @@ class LongTermRemoteCatalogStore:
         ]
         if not allowed_doc_ids:
             return ()
+        filtered_item_ids = tuple(entry.item_id for entry in entries)
+        by_item_id = {entry.item_id: entry for entry in entries}
         topk_scope_ref, topk_namespace = self._topk_scope_request_context(
             snapshot_kind=snapshot_kind,
             entries=entries,
@@ -881,8 +890,11 @@ class LongTermRemoteCatalogStore:
         """Run remote search, preferring one-shot structured top-k responses."""
 
         remote_state = self._require_remote_state()
+        scope_search = bool(scope_ref and namespace)
+        retrieve_fallback_allowed = bool(allowed_doc_ids) or not scope_search
         topk_records = getattr(read_client, "topk_records", None)
         supports_topk_records = bool(getattr(read_client, "supports_topk_records", callable(topk_records)))
+        last_topk_error: Exception | None = None
         if supports_topk_records and callable(topk_records):
             started_monotonic = time.monotonic()
             try:
@@ -913,6 +925,7 @@ class LongTermRemoteCatalogStore:
                 )
                 return tuple(self._iter_retrieve_result_candidates(response))
             except Exception as exc:
+                last_topk_error = exc
                 record_remote_read_diagnostic(
                     remote_state=remote_state,
                     context=LongTermRemoteReadContext(
@@ -927,6 +940,13 @@ class LongTermRemoteCatalogStore:
                     started_monotonic=started_monotonic,
                     outcome="fallback",
                 )
+
+        if not retrieve_fallback_allowed:
+            if last_topk_error is not None:
+                raise last_topk_error
+            raise ChonkyDBError(
+                "ChonkyDB topk_records is required for current-scope remote retrieval",
+            )
 
         started_monotonic = time.monotonic()
         try:

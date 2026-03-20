@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import sys
 import unittest
+from contextvars import copy_context
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -15,6 +16,9 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 WorkflowForensics = _MODULE.WorkflowForensics
+bind_workflow_forensics = _MODULE.bind_workflow_forensics
+workflow_event = _MODULE.workflow_event
+workflow_span = _MODULE.workflow_span
 
 
 class WorkflowForensicsTests(unittest.TestCase):
@@ -142,6 +146,66 @@ class WorkflowForensicsTests(unittest.TestCase):
                         os.environ.pop(key, None)
                     else:
                         os.environ[key] = value
+
+    def test_bound_workflow_context_propagates_trace_and_parent_span(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            trace_dir = Path(temp_dir) / "state" / "forensics" / "workflow"
+            previous_env = {
+                key: os.environ.get(key)
+                for key in (
+                    "TWINR_WORKFLOW_TRACE_ENABLED",
+                    "TWINR_WORKFLOW_TRACE_MODE",
+                    "TWINR_WORKFLOW_TRACE_DIR",
+                )
+            }
+            os.environ["TWINR_WORKFLOW_TRACE_ENABLED"] = "1"
+            os.environ["TWINR_WORKFLOW_TRACE_MODE"] = "forensic"
+            os.environ["TWINR_WORKFLOW_TRACE_DIR"] = str(trace_dir)
+            try:
+                tracer = WorkflowForensics.from_env(project_root=Path(temp_dir), service="workflow-test")
+                with bind_workflow_forensics(tracer, trace_id="trace-under-test"):
+                    workflow_event(kind="workflow", msg="outside_span", details={})
+                    with workflow_span(name="outer_span", kind="workflow") as outer:
+                        workflow_event(kind="workflow", msg="inside_outer", details={})
+                        copy_context().run(self._emit_child_span_event)
+                tracer.close()
+
+                run_id = (trace_dir / "LATEST").read_text(encoding="utf-8").strip()
+                records = [
+                    json.loads(line)
+                    for line in (trace_dir / run_id / "run.jsonl").read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                outside_event = next(record for record in records if record["msg"] == "outside_span")
+                outer_span = next(
+                    record
+                    for record in records
+                    if record["msg"] == "outer_span" and record["kind"] == "span_start"
+                )
+                child_span = next(
+                    record
+                    for record in records
+                    if record["msg"] == "child_span" and record["kind"] == "span_start"
+                )
+                child_event = next(record for record in records if record["msg"] == "inside_child")
+
+                self.assertEqual(outside_event["trace_id"], "trace-under-test")
+                self.assertEqual(outer_span["trace_id"], "trace-under-test")
+                self.assertEqual(child_span["trace_id"], "trace-under-test")
+                self.assertEqual(child_event["trace_id"], "trace-under-test")
+                self.assertEqual(child_span["parent_span_id"], outer.span_id)
+                self.assertEqual(child_event["span_id"], child_span["span_id"])
+            finally:
+                for key, value in previous_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    @staticmethod
+    def _emit_child_span_event() -> None:
+        with workflow_span(name="child_span", kind="workflow"):
+            workflow_event(kind="workflow", msg="inside_child", details={})
 
 
 if __name__ == "__main__":

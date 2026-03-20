@@ -234,6 +234,9 @@ combinable API:
 
 Legacy raw labels such as `focus`, `flat`, `line`, or `concern` still
 normalize into the canonical vocabulary so older producer paths do not break.
+The `error` HDMI scene intentionally keeps its own sad mouth/brow expression;
+external cues may still steer gaze, blink, and tiny head drift there, but they
+must not overwrite the status-owned error expression.
 
 The default artifact path is `artifacts/stores/ops/display_face_cue.json` and
 the default cue TTL is `4.0` seconds. Configure them with:

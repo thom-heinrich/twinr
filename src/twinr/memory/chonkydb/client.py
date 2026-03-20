@@ -13,9 +13,12 @@ import math
 from pathlib import Path
 import re
 from typing import Callable, Mapping, Protocol, TypeVar
+import urllib3
+from urllib3 import PoolManager
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.chonkydb.models import (
@@ -49,6 +52,8 @@ _DEFAULT_TIMEOUT_S = 10.0
 _MIN_TIMEOUT_S = 0.1
 _DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 _READ_CHUNK_SIZE = 64 * 1024
+_DEFAULT_POOL_CONNECTIONS = 4
+_DEFAULT_POOL_MAXSIZE = 8
 _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _MODEL_PARSE_EXCEPTIONS = (AssertionError, KeyError, TypeError, ValueError)
 _T = TypeVar("_T")
@@ -59,10 +64,73 @@ class _NoRedirectHandler(HTTPRedirectHandler):
         raise HTTPError(req.full_url, code, f"Unexpected redirect to {newurl}", hdrs, fp)
 
 _DEFAULT_OPENER = build_opener(ProxyHandler({}), _NoRedirectHandler())
+_DEFAULT_POOL_MANAGER = PoolManager(
+    num_pools=_DEFAULT_POOL_CONNECTIONS,
+    maxsize=_DEFAULT_POOL_MAXSIZE,
+    block=True,
+)
+
+
+class _PooledHTTPResponse:
+    """Adapt urllib3 responses to the small file-like boundary used by the client."""
+
+    def __init__(self, response: urllib3.response.BaseHTTPResponse) -> None:
+        self._response = response
+        self._reached_eof = False
+
+    @property
+    def status_code(self) -> int:
+        return int(self._response.status)
+
+    @property
+    def headers(self) -> Mapping[str, str]:
+        return self._response.headers
+
+    @property
+    def reason(self) -> str:
+        return str(getattr(self._response, "reason", "") or "")
+
+    def __enter__(self) -> "_PooledHTTPResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._reached_eof and exc is None:
+            self._response.release_conn()
+            return None
+        self._response.close()
+        return None
+
+    def read(self, amt: int = -1) -> bytes:
+        chunk = self._response.read(amt, decode_content=True)
+        if not chunk:
+            self._reached_eof = True
+        return chunk
+
+
+class _PooledTransport:
+    """Reuse persistent HTTPS connections for repeated ChonkyDB requests."""
+
+    def __init__(self, pool_manager: PoolManager | None = None) -> None:
+        self._pool_manager = pool_manager or _DEFAULT_POOL_MANAGER
+
+    def __call__(self, request: Request, timeout_s: float) -> _ResponseLike:
+        response = self._pool_manager.request(
+            method=request.get_method(),
+            url=request.full_url,
+            body=request.data,
+            headers=dict(request.header_items()),
+            redirect=False,
+            retries=False,
+            preload_content=False,
+            timeout=urllib3.Timeout(connect=timeout_s, read=timeout_s),
+        )
+        return _PooledHTTPResponse(response)
+
 
 def _default_urlopen(request: Request, timeout_s: float) -> _ResponseLike:
-    # AUDIT-FIX(#1): Use a locked-down opener instead of the global urllib opener to avoid proxy autodiscovery and redirects.
-    return _DEFAULT_OPENER.open(request, timeout=timeout_s)
+    # AUDIT-FIX(#1): Use a locked-down persistent pool instead of the global urllib opener so requests avoid proxy autodiscovery,
+    # refuse redirects, and reuse resolved connections across repeated ChonkyDB calls.
+    return _PooledTransport()(request, timeout_s)
 
 @dataclass(frozen=True, slots=True)
 class ChonkyDBError(RuntimeError):
@@ -128,6 +196,19 @@ class ChonkyDBClient:
         payload = self._request_json("GET", "/v1/external/admin/auth")
         # AUDIT-FIX(#4): Wrap schema/shape mismatches from from_payload() so callers always receive a ChonkyDBError.
         return self._parse_model("auth_info()", ChonkyDBAuthInfo.from_payload, payload)
+
+    def clone_with_timeout(self, timeout_s: float) -> "ChonkyDBClient":
+        """Clone the client while reusing transport/auth settings with a new timeout."""
+
+        connection = ChonkyDBConnectionConfig(
+            base_url=self.config.base_url,
+            api_key=self.config.api_key,
+            api_key_header=self.config.api_key_header,
+            allow_bearer_auth=self.config.allow_bearer_auth,
+            timeout_s=timeout_s,
+            max_response_bytes=self.config.max_response_bytes,
+        )
+        return ChonkyDBClient(connection, opener=self._opener)
 
     def list_records(
         self,
@@ -343,6 +424,30 @@ class ChonkyDBClient:
         response_limit = _normalize_max_response_bytes(max_response_bytes or self.config.max_response_bytes)
         try:
             with self._opener(request, self.config.timeout_s) as response:
+                status_code = getattr(response, "status_code", None)
+                if isinstance(status_code, int) and status_code >= 300:
+                    raw = _read_response_bytes(response, max_response_bytes=response_limit)
+                    response_text = _decode_response_bytes(raw)
+                    response_json = _parse_json_text(response_text)
+                    if 300 <= status_code < 400:
+                        location = ""
+                        headers = getattr(response, "headers", {})
+                        if isinstance(headers, Mapping):
+                            location_value = headers.get("location") or headers.get("Location")
+                            if location_value:
+                                location = f" to {location_value}"
+                        raise ChonkyDBError(
+                            f"ChonkyDB request failed for {normalized_method} {normalized_path}: unexpected redirect{location}",
+                            status_code=status_code,
+                            response_text=response_text or None,
+                            response_json=response_json,
+                        )
+                    raise ChonkyDBError(
+                        f"ChonkyDB request failed for {normalized_method} {normalized_path}",
+                        status_code=status_code,
+                        response_text=response_text or None,
+                        response_json=response_json,
+                    )
                 # AUDIT-FIX(#6): Bound response size to protect the RPi process from memory exhaustion.
                 raw = _read_response_bytes(response, max_response_bytes=response_limit)
         except HTTPError as exc:
@@ -357,6 +462,13 @@ class ChonkyDBClient:
         except URLError as exc:
             raise ChonkyDBError(
                 f"ChonkyDB request failed for {normalized_method} {normalized_path}: {exc.reason}"
+            ) from exc
+        except Urllib3HTTPError as exc:
+            reason = getattr(exc, "reason", None)
+            if reason is None:
+                reason = str(exc)
+            raise ChonkyDBError(
+                f"ChonkyDB request failed for {normalized_method} {normalized_path}: {reason}"
             ) from exc
         except OSError as exc:
             raise ChonkyDBError(f"ChonkyDB request failed for {normalized_method} {normalized_path}: {exc}") from exc

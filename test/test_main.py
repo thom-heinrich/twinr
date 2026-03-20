@@ -302,6 +302,8 @@ class MainCliTests(unittest.TestCase):
             )
             fake_runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
             fake_backend = object()
+            built_runtime_config = None
+            lock_runtime_state_path = None
             fake_whatsapp_module = ModuleType("twinr.channels.whatsapp")
             fake_whatsapp_module.TwinrWhatsAppChannelLoop = _FakeWhatsAppLoop
             original_argv = list(sys.argv)
@@ -310,9 +312,21 @@ class MainCliTests(unittest.TestCase):
                 sys.modules.pop("twinr.__main__", None)
                 with patch.dict(sys.modules, {"twinr.channels.whatsapp": fake_whatsapp_module}):
                     main_mod = importlib.import_module("twinr.__main__")
-                    with patch.object(main_mod, "_build_runtime", return_value=fake_runtime):
+
+                    def _build_runtime(config):
+                        nonlocal built_runtime_config
+                        built_runtime_config = config
+                        return fake_runtime
+
+                    @contextmanager
+                    def _recording_lock(config, _name: str):
+                        nonlocal lock_runtime_state_path
+                        lock_runtime_state_path = str(config.runtime_state_path)
+                        yield
+
+                    with patch.object(main_mod, "_build_runtime", side_effect=_build_runtime):
                         with patch("twinr.providers.openai.OpenAIBackend", return_value=fake_backend):
-                            with patch("twinr.ops.loop_instance_lock", _fake_lock):
+                            with patch("twinr.ops.loop_instance_lock", _recording_lock):
                                 sys.argv = [
                                     "twinr",
                                     "--env-file",
@@ -327,6 +341,10 @@ class MainCliTests(unittest.TestCase):
                 sys.modules.pop("twinr.__main__", None)
 
         self.assertEqual(exit_code, 0)
+        self.assertIsNotNone(built_runtime_config)
+        self.assertIn("runtime-scopes/whatsapp-channel", str(built_runtime_config.runtime_state_path))
+        self.assertFalse(built_runtime_config.restore_runtime_state_on_startup)
+        self.assertEqual(lock_runtime_state_path, str(root / "runtime-state.json"))
 
     def test_run_whatsapp_channel_ensures_remote_watchdog_before_runtime_boot_on_pi(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -355,7 +373,7 @@ class MainCliTests(unittest.TestCase):
             fake_watchdog_module = ModuleType("twinr.ops.remote_memory_watchdog_companion")
 
             def _ensure_remote_memory_watchdog_process(_config, *, env_file):
-                events.append(f"watchdog:{env_file}")
+                events.append(f"watchdog:{env_file}:{_config.runtime_state_path}")
                 return 4321
 
             fake_watchdog_module.ensure_remote_memory_watchdog_process = _ensure_remote_memory_watchdog_process
@@ -395,7 +413,7 @@ class MainCliTests(unittest.TestCase):
                 sys.modules.pop("twinr.__main__", None)
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(events, [f"watchdog:{env_path}", "build_runtime"])
+        self.assertEqual(events, [f"watchdog:{env_path}:{root / 'runtime-state.json'}", "build_runtime"])
 
     def test_run_hardware_loop_enables_display_companion_for_pi_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -666,6 +684,115 @@ class MainCliTests(unittest.TestCase):
             ],
         )
         self.assertEqual(events[-2:], ["companion_exit", "lock_exit"])
+
+    def test_streaming_loop_holds_error_state_instead_of_exiting_companion_on_boot_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                "\n".join(
+                    (
+                        f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}",
+                        "TWINR_OPENAI_API_KEY=sk-test",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            events: list[str] = []
+            hold_calls: list[dict[str, object]] = []
+            fake_streaming_module = ModuleType("twinr.agent.workflows.streaming_runner")
+
+            def _raise_loop(**_kwargs):
+                events.append("loop_init")
+                raise RuntimeError("capture unreadable")
+
+            fake_streaming_module.TwinrStreamingHardwareLoop = _raise_loop
+            fake_openai_module = ModuleType("twinr.providers.openai")
+
+            class _FakeBackend:
+                def __init__(self, config) -> None:
+                    del config
+                    events.append("backend_init")
+
+            fake_openai_module.OpenAIBackend = _FakeBackend
+            fake_providers_module = ModuleType("twinr.providers")
+            fake_providers_module.build_streaming_provider_bundle = lambda *args, **kwargs: (
+                events.append("bundle_init")
+                or SimpleNamespace(
+                    print_backend=SimpleNamespace(),
+                    stt=SimpleNamespace(),
+                    agent=SimpleNamespace(),
+                    tts=SimpleNamespace(),
+                    tool_agent=SimpleNamespace(),
+                )
+            )
+            fake_companion_module = ModuleType("twinr.display.companion")
+
+            @contextmanager
+            def _fake_companion(_config, *, enabled: bool):
+                events.append(f"companion_enter:{str(enabled).lower()}")
+                try:
+                    yield
+                finally:
+                    events.append("companion_exit")
+
+            fake_companion_module.optional_display_companion = _fake_companion
+            fake_ops_module = ModuleType("twinr.ops")
+            fake_ops_module.loop_instance_lock = _fake_lock
+            fake_hold_module = ModuleType("twinr.agent.workflows.runtime_error_hold")
+
+            def _fake_hold_runtime_error_state(*, runtime, error, duration_s, **_kwargs):
+                hold_calls.append(
+                    {
+                        "runtime": runtime,
+                        "error": str(error),
+                        "duration_s": duration_s,
+                    }
+                )
+                return 71
+
+            fake_hold_module.hold_runtime_error_state = _fake_hold_runtime_error_state
+            fake_runtime = SimpleNamespace(status=SimpleNamespace(value="waiting"))
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.agent.workflows.streaming_runner": fake_streaming_module,
+                        "twinr.agent.workflows.runtime_error_hold": fake_hold_module,
+                        "twinr.providers": fake_providers_module,
+                        "twinr.providers.openai": fake_openai_module,
+                        "twinr.display.companion": fake_companion_module,
+                        "twinr.ops": fake_ops_module,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch.object(main_mod, "_should_enable_display_companion", return_value=True):
+                        with patch.object(main_mod, "_should_ensure_remote_watchdog_companion", return_value=False):
+                            with patch.object(main_mod, "_assert_pi_runtime_root", return_value=None):
+                                with patch.object(main_mod, "_build_runtime", return_value=fake_runtime):
+                                    sys.argv = [
+                                        "twinr",
+                                        "--env-file",
+                                        str(env_path),
+                                        "--run-streaming-loop",
+                                        "--loop-duration",
+                                        "0",
+                                    ]
+                                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 71)
+        self.assertEqual(len(hold_calls), 1)
+        self.assertIs(hold_calls[0]["runtime"], fake_runtime)
+        self.assertEqual(hold_calls[0]["error"], "capture unreadable")
+        self.assertEqual(hold_calls[0]["duration_s"], 0.0)
+        self.assertEqual(events[-1], "companion_exit")
 
     def test_watch_remote_memory_dispatches_without_runtime_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -978,6 +1105,123 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(calls, [(manifest_path, None)])
 
+    def test_wakeword_stream_eval_dispatches_to_proactive_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
+            manifest_path = root / "manifest.jsonl"
+            manifest_path.write_text("", encoding="utf-8")
+            calls: list[tuple[Path, object | None]] = []
+            fake_proactive_module = ModuleType("twinr.proactive")
+
+            def _run_stream_eval(*, config, manifest_path=None, backend=None):
+                del config
+                calls.append((Path(manifest_path), backend))
+                return SimpleNamespace(
+                    evaluated_entries=2,
+                    metrics=SimpleNamespace(
+                        precision=1.0,
+                        recall=1.0,
+                        false_positive_rate=0.0,
+                        false_negative_rate=0.0,
+                    ),
+                    accepted_detection_count=1,
+                    total_audio_seconds=2.0,
+                    report_path=root / "stream_report.json",
+                )
+
+            fake_proactive_module.run_wakeword_stream_eval = _run_stream_eval
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(sys.modules, {"twinr.proactive": fake_proactive_module}):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    sys.argv = [
+                        "twinr",
+                        "--env-file",
+                        str(env_path),
+                        "--wakeword-stream-eval",
+                        "--wakeword-manifest",
+                        str(manifest_path),
+                    ]
+                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [(manifest_path, None)])
+
+    def test_wakeword_promotion_eval_dispatches_to_proactive_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
+            spec_path = root / "promotion_spec.json"
+            spec_path.write_text("{}\n", encoding="utf-8")
+            calls: list[tuple[Path, object | None]] = []
+            fake_proactive_module = ModuleType("twinr.proactive")
+
+            def _run_promotion_eval(*, config, spec_path=None, backend=None):
+                del config
+                calls.append((Path(spec_path), backend))
+                return SimpleNamespace(
+                    passed=True,
+                    blockers=(),
+                    suite_results=(),
+                    ambient_results=(),
+                    report_path=root / "promotion_report.json",
+                )
+
+            fake_proactive_module.run_wakeword_promotion_eval = _run_promotion_eval
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(sys.modules, {"twinr.proactive": fake_proactive_module}):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    sys.argv = [
+                        "twinr",
+                        "--env-file",
+                        str(env_path),
+                        "--wakeword-promotion-eval",
+                        "--wakeword-promotion-spec",
+                        str(spec_path),
+                    ]
+                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [(spec_path, None)])
+
+    def test_runtime_init_failure_returns_error_without_unbound_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                main_mod = importlib.import_module("twinr.__main__")
+                with patch.object(main_mod, "_ensure_remote_watchdog_for_runtime_boot", return_value=None):
+                    with patch.object(main_mod, "_build_runtime", side_effect=RuntimeError("boom")):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 1)
+
     def test_wakeword_train_verifier_dispatches_to_wakeword_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1037,6 +1281,91 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(calls, [(manifest_path, output_path, str(model_path), "tflite")])
 
+    def test_wakeword_train_sequence_verifier_dispatches_to_wakeword_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
+            manifest_path = root / "captured_manifest.json"
+            manifest_path.write_text("[]\n", encoding="utf-8")
+            model_path = root / "twinr_v2.onnx"
+            model_path.write_bytes(b"model")
+            aux_model_path = root / "twinr_v1.onnx"
+            aux_model_path.write_bytes(b"aux")
+            output_path = root / "twinr_v2.sequence_verifier.pkl"
+            calls: list[tuple[Path, Path, str, tuple[str, ...], str]] = []
+            fake_proactive_module = ModuleType("twinr.proactive")
+            fake_wakeword_module = ModuleType("twinr.proactive.wakeword")
+
+            def _train_sequence_verifier(
+                *,
+                manifest_path,
+                output_path,
+                model_name,
+                auxiliary_models,
+                inference_framework,
+            ):
+                calls.append(
+                    (
+                        Path(manifest_path),
+                        Path(output_path),
+                        model_name,
+                        tuple(auxiliary_models),
+                        inference_framework,
+                    )
+                )
+                return SimpleNamespace(
+                    manifest_path=Path(manifest_path),
+                    output_path=Path(output_path),
+                    model_name=model_name,
+                    auxiliary_models=tuple(auxiliary_models),
+                    positive_clips=3,
+                    negative_clips=2,
+                    negative_seconds=12.0,
+                    total_length_samples=32000,
+                    embedding_frames=16,
+                    feature_dimensions=1584,
+                )
+
+            fake_proactive_module.wakeword = fake_wakeword_module
+            fake_wakeword_module.train_wakeword_sequence_verifier_from_manifest = _train_sequence_verifier
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.proactive": fake_proactive_module,
+                        "twinr.proactive.wakeword": fake_wakeword_module,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    sys.argv = [
+                        "twinr",
+                        "--env-file",
+                        str(env_path),
+                        "--wakeword-train-sequence-verifier",
+                        "--wakeword-manifest",
+                        str(manifest_path),
+                        "--wakeword-sequence-verifier-model",
+                        str(model_path),
+                        "--wakeword-sequence-verifier-aux-model",
+                        str(aux_model_path),
+                        "--wakeword-sequence-verifier-output",
+                        str(output_path),
+                    ]
+                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [(manifest_path, output_path, str(model_path), (str(aux_model_path),), "tflite")],
+        )
+
     def test_wakeword_train_model_dispatches_to_wakeword_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1048,7 +1377,7 @@ class MainCliTests(unittest.TestCase):
             manifest_path.write_text("[]\n", encoding="utf-8")
             model_path = root / "twinr_v2.onnx"
             metadata_path = root / "twinr_v2.metadata.json"
-            calls: list[tuple[Path, Path, Path, Path, int, int, int, str]] = []
+            calls: list[tuple[Path, Path, Path, Path, object, int, str, int, int, str]] = []
             fake_proactive_module = ModuleType("twinr.proactive")
             fake_wakeword_module = ModuleType("twinr.proactive.wakeword")
 
@@ -1060,6 +1389,7 @@ class MainCliTests(unittest.TestCase):
                 acceptance_manifest,
                 workdir,
                 training_rounds,
+                model_type,
                 layer_dim,
                 steps,
                 feature_device,
@@ -1074,6 +1404,7 @@ class MainCliTests(unittest.TestCase):
                         Path(acceptance_manifest),
                         workdir,
                         training_rounds,
+                        model_type,
                         layer_dim,
                         steps,
                         feature_device,
@@ -1121,6 +1452,8 @@ class MainCliTests(unittest.TestCase):
                         str(manifest_path),
                         "--wakeword-training-rounds",
                         "3",
+                        "--wakeword-training-model-type",
+                        "mlp",
                         "--wakeword-training-layer-dim",
                         "256",
                         "--wakeword-training-steps",
@@ -1136,8 +1469,63 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             calls,
-            [(dataset_root, model_path, metadata_path, manifest_path, None, 3, 256, 1234, "gpu")],
+            [(dataset_root, model_path, metadata_path, manifest_path, None, 3, "mlp", 256, 1234, "gpu")],
         )
+
+    def test_wakeword_training_plan_writes_markdown(self) -> None:
+        rendered = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
+            output_path = root / "wakeword_training_plan.md"
+            fake_proactive_module = ModuleType("twinr.proactive")
+            fake_wakeword_module = ModuleType("twinr.proactive.wakeword")
+            calls: list[Path] = []
+
+            def _build_plan(*, project_root):
+                calls.append(Path(project_root))
+                return SimpleNamespace(
+                    stage1_model_name="twinr_family_stage1_vnext",
+                    stage1_phrase_profile="family",
+                )
+
+            def _render_plan(_plan):
+                return "# fake wakeword training plan\n"
+
+            fake_proactive_module.wakeword = fake_wakeword_module
+            fake_wakeword_module.build_default_wakeword_training_plan = _build_plan
+            fake_wakeword_module.render_wakeword_training_plan_markdown = _render_plan
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.proactive": fake_proactive_module,
+                        "twinr.proactive.wakeword": fake_wakeword_module,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    sys.argv = [
+                        "twinr",
+                        "--env-file",
+                        str(env_path),
+                        "--wakeword-training-plan",
+                        "--wakeword-training-plan-output",
+                        str(output_path),
+                    ]
+                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+            rendered = output_path.read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, [root])
+        self.assertEqual(rendered, "# fake wakeword training plan\n")
 
     def test_wakeword_autotune_dispatches_to_proactive_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

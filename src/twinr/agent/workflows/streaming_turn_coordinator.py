@@ -659,10 +659,23 @@ class StreamingTurnCoordinator:
             self.speech_lifecycle.answer_started = True
             self.hooks.trace_event("streaming_print_resume_answering", kind="mutation", details={})
         answer = self.runtime.finalize_agent_turn(response.text)
+        tool_calls = tuple(getattr(response, "tool_calls", ()) or ())
+        tool_results = tuple(getattr(response, "tool_results", ()) or ())
+        record_tool_history = getattr(self.runtime, "record_personality_tool_history", None)
+        if callable(record_tool_history):
+            record_tool_history(
+                tool_calls=tool_calls,
+                tool_results=tool_results,
+            )
         self.hooks.trace_event(
             "streaming_agent_turn_finalized",
             kind="mutation",
-            details={"answer_len": len(answer), "response_text_len": len(response.text)},
+            details={
+                "answer_len": len(answer),
+                "response_text_len": len(response.text),
+                "tool_calls": len(tool_calls),
+                "tool_results": len(tool_results),
+            },
         )
         return answer
 

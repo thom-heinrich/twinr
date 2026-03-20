@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..handlers import automations, household_identity, memory, output, portrait_identity, reminders, self_coding, settings, voice_profile
+from ..handlers import automations, household_identity, intelligence, memory, output, portrait_identity, reminders, self_coding, settings, voice_profile
 
 
 class RealtimeToolExecutor:
@@ -107,6 +107,9 @@ class RealtimeToolExecutor:
 
     def handle_update_personality(self, arguments: dict[str, object]) -> dict[str, object]:
         return memory.handle_update_personality(self.owner, arguments)
+
+    def handle_configure_world_intelligence(self, arguments: dict[str, object]) -> dict[str, object]:
+        return intelligence.handle_configure_world_intelligence(self.owner, arguments)
 
     def handle_update_simple_setting(self, arguments: dict[str, object]) -> dict[str, object]:
         return settings.handle_update_simple_setting(self.owner, arguments)

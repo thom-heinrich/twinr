@@ -12,6 +12,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
 from test.longterm_test_program import make_test_extractor
 from twinr.config import TwinrConfig
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
@@ -137,11 +138,29 @@ class _ProbeCachingRetriever:
         del original_query_text
         return LongTermMemoryContext(episodic_context="remembered")
 
+    def select_conflict_queue(self, *, query: LongTermQueryProfile, limit: int | None = None):
+        del query
+        del limit
+        return ()
+
+    def select_durable_objects(self, *, query: LongTermQueryProfile, limit: int | None = None):
+        del query
+        del limit
+        return ()
+
+    def _render_durable_context(self, durable_objects):
+        del durable_objects
+        return None
+
 
 class _PrewarmObjectStore:
     def __init__(self) -> None:
         self.remote_state = _CountingRemoteState()
         self.calls: list[tuple[str, object]] = []
+        self.catalog_calls: list[str] = []
+        self._remote_catalog = SimpleNamespace(
+            load_catalog_entries=lambda *, snapshot_kind: self.catalog_calls.append(snapshot_kind) or ()
+        )
 
     def select_relevant_episodic_objects(self, *, query_text: str | None, limit: int, fallback_limit: int, require_query_match: bool):
         self.calls.append(("episodic", query_text, limit, fallback_limit, require_query_match))
@@ -154,6 +173,36 @@ class _PrewarmObjectStore:
     def select_open_conflicts(self, *, query_text: str | None, limit: int):
         self.calls.append(("conflicts", query_text, limit))
         return ()
+
+
+class _FailOnEnterLock:
+    def __enter__(self):
+        raise AssertionError("_store_lock must not gate foreground provider-context reads")
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _RecordingPersonalityLearningService:
+    def __init__(self) -> None:
+        self.conversation_calls: list[tuple[LongTermConversationTurn, LongTermConsolidationResultV1]] = []
+        self.tool_history_calls: list[tuple[tuple[AgentToolCall, ...], tuple[AgentToolResult, ...]]] = []
+
+    def record_conversation_consolidation(
+        self,
+        *,
+        turn: LongTermConversationTurn,
+        consolidation: LongTermConsolidationResultV1,
+    ) -> None:
+        self.conversation_calls.append((turn, consolidation))
+
+    def record_tool_history(
+        self,
+        *,
+        tool_calls: tuple[AgentToolCall, ...],
+        tool_results: tuple[AgentToolResult, ...],
+    ) -> None:
+        self.tool_history_calls.append((tool_calls, tool_results))
 
 
 class LongTermMemoryServiceTests(unittest.TestCase):
@@ -227,6 +276,58 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertEqual(context.episodic_context, "remembered")
         self.assertEqual(remote_state.enter_count, 1)
 
+    def test_build_provider_context_does_not_wait_on_shared_store_lock(self) -> None:
+        remote_state = _CountingRemoteState()
+        retriever = _ProbeCachingRetriever(remote_state)
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(project_root=".", personality_dir="personality")
+        service.query_rewriter = _StaticQueryRewriter({})
+        service.retriever = retriever
+        service.object_store = retriever.object_store
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=None),
+            user_store=SimpleNamespace(remote_state=None),
+            personality_store=SimpleNamespace(remote_state=None),
+        )
+        service.graph_store = SimpleNamespace(remote_state=None)
+        service.midterm_store = SimpleNamespace(remote_state=None)
+        service.writer = None
+        service.multimodal_writer = None
+        service._store_lock = _FailOnEnterLock()
+
+        context = service.build_provider_context("na alles klar")
+
+        self.assertEqual(context.episodic_context, "remembered")
+        self.assertEqual(remote_state.enter_count, 1)
+
+    def test_build_tool_provider_context_does_not_wait_on_shared_store_lock(self) -> None:
+        remote_state = _CountingRemoteState()
+        retriever = _ProbeCachingRetriever(remote_state)
+        service = object.__new__(LongTermMemoryService)
+        service.config = TwinrConfig(project_root=".", personality_dir="personality")
+        service.query_rewriter = _StaticQueryRewriter({})
+        service.retriever = retriever
+        service.object_store = retriever.object_store
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(remote_state=None),
+            user_store=SimpleNamespace(remote_state=None),
+            personality_store=SimpleNamespace(remote_state=None),
+        )
+        service.graph_store = SimpleNamespace(
+            remote_state=None,
+            build_prompt_context=lambda *_args, **_kwargs: "graph",
+        )
+        service.midterm_store = SimpleNamespace(remote_state=None)
+        service.writer = None
+        service.multimodal_writer = None
+        service._store_lock = _FailOnEnterLock()
+
+        context = service.build_tool_provider_context("na alles klar")
+
+        self.assertEqual(context.episodic_context, "remembered")
+        self.assertEqual(context.graph_context, "graph")
+        self.assertEqual(remote_state.enter_count, 1)
+
     def test_prewarm_foreground_read_cache_primes_lightweight_remote_indexes(self) -> None:
         object_store = _PrewarmObjectStore()
         graph_calls: list[str] = []
@@ -247,6 +348,7 @@ class LongTermMemoryServiceTests(unittest.TestCase):
 
         self.assertEqual(object_store.remote_state.enter_count, 1)
         self.assertEqual(object_store.calls, [])
+        self.assertEqual(object_store.catalog_calls, ["objects", "conflicts"])
         self.assertEqual(graph_calls, ["graph"])
         self.assertEqual(midterm_calls, ["midterm"])
 
@@ -432,6 +534,78 @@ class LongTermMemoryServiceTests(unittest.TestCase):
 
         self.assertFalse(memory_path.exists())
         self.assertTrue(any(item.kind == "episode" for item in objects))
+
+    def test_persist_longterm_turn_records_personality_learning_from_consolidation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+            )
+            prompt_context_store = PromptContextStore.from_config(config)
+            graph_store = TwinrPersonalGraphStore(
+                Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+            )
+            object_store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb")
+            midterm_store = LongTermMidtermStore(base_path=Path(temp_dir) / "state" / "chonkydb")
+            helper = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            personality_learning = _RecordingPersonalityLearningService()
+            turn = LongTermConversationTurn(
+                transcript="Today I want to go for a walk if the weather is nice.",
+                response="I can keep the weather in mind for your walk.",
+            )
+            try:
+                LongTermMemoryService._persist_longterm_turn(
+                    config=config,
+                    store=prompt_context_store,
+                    graph_store=graph_store,
+                    object_store=object_store,
+                    midterm_store=midterm_store,
+                    extractor=make_test_extractor(),
+                    consolidator=helper.consolidator,
+                    reflector=LongTermMemoryReflector(program=_StubReflectionProgram()),
+                    sensor_memory=helper.sensor_memory,
+                    retention_policy=helper.retention_policy,
+                    personality_learning=personality_learning,
+                    item=turn,
+                )
+            finally:
+                helper.shutdown(timeout_s=1.0)
+
+        self.assertEqual(len(personality_learning.conversation_calls), 1)
+        recorded_turn, recorded_result = personality_learning.conversation_calls[0]
+        self.assertEqual(recorded_turn.transcript, turn.transcript)
+        self.assertEqual(recorded_result.turn_id[:5], "turn:")
+
+    def test_record_personality_tool_history_routes_tool_calls_to_learning_service(self) -> None:
+        service = object.__new__(LongTermMemoryService)
+        service.personality_learning = _RecordingPersonalityLearningService()
+        service._store_lock = threading.RLock()
+        tool_call = AgentToolCall(
+            name="search_live_info",
+            call_id="call:search:1",
+            arguments={"question": "What changed today?"},
+        )
+        tool_result = AgentToolResult(
+            call_id="call:search:1",
+            name="search_live_info",
+            output={"status": "ok", "answer": "Fresh answer"},
+            serialized_output='{"status":"ok"}',
+        )
+
+        service.record_personality_tool_history(
+            tool_calls=(tool_call,),
+            tool_results=(tool_result,),
+        )
+
+        self.assertEqual(len(service.personality_learning.tool_history_calls), 1)
+        recorded_calls, recorded_results = service.personality_learning.tool_history_calls[0]
+        self.assertEqual(recorded_calls[0].name, "search_live_info")
+        self.assertEqual(recorded_results[0].call_id, "call:search:1")
 
     def test_provider_context_combines_recent_episodes_and_graph_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -987,6 +1161,65 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIsNotNone(context.midterm_context)
         self.assertIn("twinr_long_term_midterm_context_v1", context.midterm_context or "")
         self.assertIn("Janina has eye laser treatment today.", context.midterm_context or "")
+
+    def test_service_reflection_triggers_world_intelligence_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            calls: list[str] = []
+
+            class _TrackingPersonalityLearning:
+                def maybe_refresh_world_intelligence(self_nonlocal, *, search_backend=None) -> None:
+                    calls.append("refresh" if search_backend is None else "refresh_with_backend")
+                    return None
+
+            service.personality_learning = _TrackingPersonalityLearning()
+            service.reflector = LongTermMemoryReflector(
+                program=_StubReflectionProgram(),
+                midterm_packet_limit=3,
+                reflection_window_size=12,
+                timezone_name=config.local_timezone_name,
+            )
+            service.run_reflection()
+            service.shutdown()
+
+        self.assertEqual(calls, ["refresh"])
+
+    def test_service_reflection_passes_optional_search_backend_into_world_intelligence_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                user_display_name="Erika",
+            )
+            service = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            calls: list[object | None] = []
+            backend = object()
+
+            class _TrackingPersonalityLearning:
+                def maybe_refresh_world_intelligence(self_nonlocal, *, search_backend=None) -> None:
+                    calls.append(search_backend)
+                    return None
+
+            service.personality_learning = _TrackingPersonalityLearning()
+            service.reflector = LongTermMemoryReflector(
+                program=_StubReflectionProgram(),
+                midterm_packet_limit=3,
+                reflection_window_size=12,
+                timezone_name=config.local_timezone_name,
+            )
+            service.run_reflection(search_backend=backend)
+            service.shutdown()
+
+        self.assertEqual(calls, [backend])
 
     def test_service_can_run_retention_and_remove_old_ephemeral_memory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

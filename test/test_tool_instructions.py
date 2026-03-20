@@ -49,6 +49,8 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("enroll_portrait_identity tool", instructions)
         self.assertIn("guidance_hints", instructions)
         self.assertIn("Repeated enroll_portrait_identity calls", instructions)
+        self.assertIn("configure_world_intelligence tool", instructions)
+        self.assertIn("occasional recalibration", instructions)
 
     def test_compact_tool_instructions_cover_portrait_identity_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

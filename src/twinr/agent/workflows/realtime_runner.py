@@ -207,7 +207,10 @@ class TwinrRealtimeHardwareLoop(
         self._working_feedback_stop: Callable[[], None] | None = None
         self._working_feedback_generation: int = 0
         self._conversation_session_active = False
-        self._sensor_observation_queue: Queue[tuple[dict[str, object], tuple[str, ...]]] = Queue()
+        # Keep only the newest pending sensor observation so high-frequency
+        # proactive updates cannot build an unbounded backlog against
+        # long-term persistence or sensor-triggered automations.
+        self._sensor_observation_queue: Queue[tuple[dict[str, object], tuple[str, ...]]] = Queue(maxsize=1)
         self._latest_sensor_observation_facts: dict[str, object] | None = None
         self._wakeword_ack_cache_lock = Lock()
         self._wakeword_ack_wav_bytes: bytes | None = None

@@ -16,6 +16,8 @@ durability.
 - keep the first-word lane on bounded local context so direct replies never block on remote long-term retrieval
 - keep the supervisor fast lane on the same remote-free path while still surfacing one local on-device memory summary
 - mediate on-device memory, durable memory, reminders, automations, and snapshots
+- forward completed tool history into long-term-backed personality learning after a turn is finalized
+- expose runtime-side RSS/world-intelligence configuration so persistent feed subscriptions can shape Twinr's calm place/world awareness
 
 `runtime` does **not** own:
 - workflow loops or hardware/audio orchestration

@@ -17,7 +17,8 @@ owned_concerns:
   - Derive a conservative portrait-match claim from local face embedding plus temporal local identity evidence and clear room context
   - Derive a conservative known-user hint from fresh voice-profile state plus optional temporal identity-fusion evidence and clear room context
   - Derive prompt-only affect proxies from coarse posture, attention, quiet, and motion cues without claiming emotion as fact
-  - Drive calm HDMI face attention-follow cues from the visible primary-person anchor without teaching the generic runtime snapshot schema about gaze-follow behavior
+  - Derive a bounded multimodal attention-target surface from camera anchor, speaker association, showing-intent cues, and short-lived session focus memory
+  - Drive calm HDMI face attention-follow cues from the current relevant-person anchor without teaching the generic runtime snapshot schema about gaze-follow behavior, while reserving stronger up/down body-language poses for explicit semantic cues and renewing matching cues before they expire
   - Run a bounded local HDMI attention-refresh cadence so gaze-follow stays responsive even when full proactive inspection remains motion-gated
   - Block sensitive proactive behavior when current ReSpeaker plus camera context is ambiguous
   - Coordinate proactive monitor ticks across vision, PIR, ambient audio, and wakeword policy paths
@@ -84,8 +85,14 @@ files:
     exports:
       - AffectProxySnapshot
       - derive_affect_proxy
+  - path: attention_targeting.py
+    role: Bounded multimodal attention-target prioritization for HDMI gaze-follow with horizontal-only normal person-following
+    exports:
+      - MultimodalAttentionTargetConfig
+      - MultimodalAttentionTargetSnapshot
+      - MultimodalAttentionTargetTracker
   - path: display_attention.py
-    role: Conservative proactive producer and local refresh policy for HDMI gaze-follow face cues
+    role: Conservative proactive producer and local refresh policy for HDMI gaze-follow face cues that keep semantic up/down poses out of normal person-following and renew matching cues before they expire
     exports:
       - DisplayAttentionCueDecision
       - DisplayAttentionCuePublishResult
@@ -167,6 +174,7 @@ primary_callers:
   - path: src/twinr/proactive/__init__.py
 tests:
   - path: test/test_display_attention.py
+  - path: test/test_attention_targeting.py
   - path: test/test_proactive_monitor.py
   - path: test/test_governor_inputs.py
   - path: test/test_multimodal_initiative.py

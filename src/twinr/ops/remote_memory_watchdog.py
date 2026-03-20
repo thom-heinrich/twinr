@@ -69,13 +69,16 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     encoded = (json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2) + "\n").encode("utf-8")
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0), 0o600)
+    file_mode = 0o644
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0), file_mode)
     try:
         os.write(fd, encoded)
         os.fsync(fd)
+        os.fchmod(fd, file_mode)
     finally:
         os.close(fd)
     os.replace(tmp_path, path)
+    os.chmod(path, file_mode)
 
 
 class _RemoteMemoryService(Protocol):
@@ -382,7 +385,6 @@ class RemoteMemoryWatchdog:
         """Run one remote-memory readiness probe and persist the rolling state."""
 
         with self._probe_lock:
-            captured_at = _utc_now_iso()
             started = self._monotonic()
             status = "fail"
             ready = False
@@ -452,6 +454,7 @@ class RemoteMemoryWatchdog:
                 self._drop_service_instance()
 
             latency_ms = round(max(0.0, (self._monotonic() - started) * 1000.0), 1)
+            captured_at = _utc_now_iso()
             sample = self._build_sample(
                 captured_at=captured_at,
                 status=status,

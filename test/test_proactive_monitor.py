@@ -161,6 +161,18 @@ class FakeAudioObserver:
         return self.snapshot
 
 
+class FakeSequencedAudioObserver:
+    def __init__(self, observations: list[SocialAudioObservation]) -> None:
+        self.snapshots = [ProactiveAudioSnapshot(observation=item, sample=None) for item in observations]
+        self.calls = 0
+
+    def observe(self):
+        self.calls += 1
+        if len(self.snapshots) > 1:
+            return self.snapshots.pop(0)
+        return self.snapshots[0]
+
+
 class FakeClock:
     def __init__(self, start: float) -> None:
         self.now = start
@@ -1227,6 +1239,117 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(cue.gaze_x, 2)
         self.assertEqual(cue.gaze_y, 0)
 
+    def test_display_attention_refresh_updates_cue_during_error_runtime_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                display_driver="hdmi_wayland",
+                display_attention_refresh_interval_s=1.0,
+            )
+            runtime = TwinrRuntime(config=config)
+            runtime.fail("Remote long-term memory is unavailable.")
+            clock = MutableClock(10.0)
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            primary_person_center_x=0.18,
+                            primary_person_center_y=0.44,
+                            engaged_with_device=True,
+                        )
+                    ],
+                    supports_attention_refresh=True,
+                ),
+                pir_monitor=FakePirMonitor(),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            refreshed = coordinator.refresh_display_attention()
+            cue = DisplayFaceCueStore.from_config(config).load_active()
+
+        self.assertEqual(runtime.status.value, "error")
+        self.assertTrue(refreshed)
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertEqual(cue.source, "proactive_attention_follow")
+        self.assertEqual(cue.gaze_x, -2)
+        self.assertEqual(cue.gaze_y, 0)
+
+    def test_display_attention_refresh_keeps_recent_session_focus_in_multi_person_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                display_driver="hdmi_wayland",
+                display_attention_refresh_interval_s=1.0,
+                display_attention_session_focus_hold_s=5.0,
+            )
+            runtime = TwinrRuntime(config=config)
+            runtime.begin_listening(request_source="test")
+            clock = MutableClock(10.0)
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            person_count=1,
+                            primary_person_center_x=0.16,
+                            primary_person_center_y=0.48,
+                            looking_toward_device=True,
+                        ),
+                        SocialVisionObservation(
+                            person_visible=True,
+                            person_count=2,
+                            person_recently_visible=True,
+                            primary_person_center_x=0.84,
+                            primary_person_center_y=0.5,
+                        ),
+                    ],
+                    supports_attention_refresh=True,
+                ),
+                pir_monitor=FakePirMonitor(),
+                audio_observer=FakeSequencedAudioObserver(
+                    [
+                        SocialAudioObservation(
+                            speech_detected=True,
+                            azimuth_deg=0,
+                            direction_confidence=0.9,
+                        ),
+                        SocialAudioObservation(
+                            speech_detected=False,
+                            azimuth_deg=0,
+                            direction_confidence=0.9,
+                        ),
+                    ]
+                ),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            first_refresh = coordinator.refresh_display_attention()
+            clock.now = 11.5
+            second_refresh = coordinator.refresh_display_attention()
+            cue = DisplayFaceCueStore.from_config(config).load_active()
+
+        self.assertTrue(first_refresh)
+        self.assertTrue(second_refresh)
+        assert cue is not None
+        self.assertEqual(cue.source, "proactive_attention_follow")
+        self.assertEqual(cue.gaze_x, -2)
+        self.assertEqual(cue.gaze_y, 0)
+
     def test_coordinator_logs_trigger_detection_and_absence_transition(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -1718,22 +1841,34 @@ class ProactiveMonitorTests(unittest.TestCase):
             "already_prompted_this_presence_session",
         )
 
-    def test_build_default_monitor_requires_pir(self) -> None:
-        config = TwinrConfig(proactive_enabled=True)
-        runtime = TwinrRuntime(config=config)
-
-        monitor = build_default_proactive_monitor(
-            config=config,
-            runtime=runtime,
-            backend=FakeBackend("person_visible=no"),
-            camera=FakeCamera(),
-            camera_lock=None,
-            audio_lock=None,
-            trigger_handler=lambda _decision: True,
-            emit=lambda _line: None,
+    def test_build_default_monitor_does_not_inspect_without_pir_motion_history(self) -> None:
+        config = TwinrConfig(
+            proactive_enabled=True,
+            display_driver="waveshare_4in2_v2",
+            display_attention_refresh_interval_s=0.0,
         )
+        runtime = TwinrRuntime(config=config)
+        local_provider = FakeVisionObserver([SocialVisionObservation(person_visible=True)])
 
-        self.assertIsNone(monitor)
+        with patch(
+            "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
+            return_value=local_provider,
+        ):
+            monitor = build_default_proactive_monitor(
+                config=config,
+                runtime=runtime,
+                backend=FakeBackend("person_visible=no"),
+                camera=FakeCamera(),
+                camera_lock=None,
+                audio_lock=None,
+                trigger_handler=lambda _decision: True,
+                emit=lambda _line: None,
+            )
+
+        self.assertIsNotNone(monitor)
+        result = monitor.coordinator.tick()
+        self.assertFalse(result.inspected)
+        self.assertEqual(local_provider.calls, 0)
 
     def test_build_default_monitor_falls_back_to_stt_when_openwakeword_models_are_missing(self) -> None:
         config = TwinrConfig(
@@ -1790,6 +1925,42 @@ class ProactiveMonitorTests(unittest.TestCase):
 
         self.assertIsNotNone(monitor)
         self.assertIs(monitor.coordinator.vision_observer, local_provider)
+        build_local_provider.assert_called_once_with(config)
+
+    def test_build_default_monitor_keeps_hdmi_attention_camera_when_proactive_triggers_are_disabled(self) -> None:
+        config = TwinrConfig(
+            proactive_enabled=False,
+            wakeword_enabled=False,
+            display_driver="hdmi_wayland",
+            display_attention_refresh_interval_s=1.25,
+        )
+        runtime = TwinrRuntime(config=config)
+        local_provider = FakeVisionObserver(
+            [SocialVisionObservation(person_visible=False)],
+            supports_attention_refresh=True,
+        )
+
+        with (
+            patch(
+                "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
+                return_value=local_provider,
+            ) as build_local_provider,
+        ):
+            monitor = build_default_proactive_monitor(
+                config=config,
+                runtime=runtime,
+                backend=FakeBackend("person_visible=no"),
+                camera=FakeCamera(),
+                camera_lock=None,
+                audio_lock=None,
+                trigger_handler=lambda _decision: True,
+                emit=lambda _line: None,
+            )
+
+        self.assertIsNotNone(monitor)
+        self.assertIs(monitor.coordinator.vision_observer, local_provider)
+        self.assertEqual(type(monitor.coordinator.engine).__name__, "_NullSocialTriggerEngine")
+        self.assertIsNotNone(monitor.coordinator.audio_observer)
         build_local_provider.assert_called_once_with(config)
 
     def test_build_default_monitor_wraps_audio_with_respeaker_signals_and_warns_on_permission_issue(self) -> None:

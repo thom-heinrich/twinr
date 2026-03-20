@@ -6,7 +6,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample
 from twinr.proactive.wakeword import WakewordMatch
-from twinr.proactive.wakeword.policy import SttWakewordVerifier, WakewordDecisionPolicy
+from twinr.proactive.wakeword.policy import (
+    SttWakewordVerifier,
+    WakewordDecisionPolicy,
+    WakewordVerification,
+)
 
 
 class FakeBackend:
@@ -26,6 +30,22 @@ class FakeBackend:
         del audio_bytes, filename, content_type, language, prompt
         self.calls += 1
         return self.transcript
+
+
+class FakeCaptureVerifier:
+    def __init__(self, status: str, *, reason: str | None = None) -> None:
+        self.status = status
+        self.reason = reason
+        self.calls = 0
+
+    def verify(self, capture, *, detector_match):
+        del capture, detector_match
+        self.calls += 1
+        return WakewordVerification(
+            status=self.status,
+            backend="local_sequence",
+            reason=self.reason,
+        )
 
 
 def _capture() -> AmbientAudioCaptureWindow:
@@ -136,6 +156,81 @@ class WakewordDecisionPolicyTests(unittest.TestCase):
         self.assertEqual(decision.outcome, "rejected_by_verifier")
         self.assertTrue(decision.verifier_used)
         self.assertEqual(decision.verifier_status, "rejected")
+
+    def test_local_sequence_verifier_rejects_before_stt_verification(self) -> None:
+        backend = FakeBackend("hey twinr wie gehts")
+        verifier = SttWakewordVerifier(
+            backend=backend,
+            phrases=("hey twinr", "twinr"),
+            language="de",
+        )
+        local_verifier = FakeCaptureVerifier("rejected", reason="score:0.12")
+        policy = WakewordDecisionPolicy(
+            primary_backend="openwakeword",
+            fallback_backend="stt",
+            verifier_mode="always",
+            primary_threshold=0.5,
+            verifier=verifier,
+            local_verifier=local_verifier,
+        )
+
+        decision = policy.decide(
+            match=WakewordMatch(
+                detected=True,
+                transcript="",
+                matched_phrase="twinr",
+                backend="openwakeword",
+                detector_label="twinr_v2",
+                score=0.91,
+            ),
+            capture=_capture(),
+            source="streaming_spotter",
+        )
+
+        self.assertFalse(decision.detected)
+        self.assertEqual(decision.outcome, "rejected_by_local_verifier")
+        self.assertEqual(decision.local_verifier_status, "rejected")
+        self.assertEqual(decision.local_verifier_reason, "score:0.12")
+        self.assertEqual(local_verifier.calls, 1)
+        self.assertEqual(backend.calls, 0)
+
+    def test_local_sequence_verifier_can_accept_before_stt_verifier_runs(self) -> None:
+        backend = FakeBackend("hey twinr wie gehts")
+        verifier = SttWakewordVerifier(
+            backend=backend,
+            phrases=("hey twinr", "twinr"),
+            language="de",
+        )
+        local_verifier = FakeCaptureVerifier("accepted", reason="score:0.91")
+        policy = WakewordDecisionPolicy(
+            primary_backend="openwakeword",
+            fallback_backend="stt",
+            verifier_mode="ambiguity_only",
+            verifier_margin=0.08,
+            primary_threshold=0.5,
+            verifier=verifier,
+            local_verifier=local_verifier,
+        )
+
+        decision = policy.decide(
+            match=WakewordMatch(
+                detected=True,
+                transcript="",
+                matched_phrase="hey twinr",
+                backend="openwakeword",
+                detector_label="twinr_v2",
+                score=0.54,
+            ),
+            capture=_capture(),
+            source="streaming_spotter",
+        )
+
+        self.assertTrue(decision.detected)
+        self.assertEqual(decision.outcome, "verified")
+        self.assertTrue(decision.local_verifier_used)
+        self.assertEqual(decision.local_verifier_status, "accepted")
+        self.assertEqual(local_verifier.calls, 1)
+        self.assertEqual(backend.calls, 1)
 
     def test_missing_verifier_or_capture_keeps_borderline_hit_unverified(self) -> None:
         policy = WakewordDecisionPolicy(

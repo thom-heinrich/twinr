@@ -135,6 +135,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_DISPLAY_FACE_CUE_PATH=state/custom/face.json",
                         "TWINR_DISPLAY_FACE_CUE_TTL_S=7.5",
                         "TWINR_DISPLAY_ATTENTION_REFRESH_INTERVAL_S=1.4",
+                        "TWINR_DISPLAY_ATTENTION_SESSION_FOCUS_HOLD_S=5.25",
                     ]
                 )
                 + "\n",
@@ -146,6 +147,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_face_cue_path, "state/custom/face.json")
         self.assertEqual(config.display_face_cue_ttl_s, 7.5)
         self.assertEqual(config.display_attention_refresh_interval_s, 1.4)
+        self.assertEqual(config.display_attention_session_focus_hold_s, 5.25)
 
     def test_from_env_reads_display_presentation_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -452,6 +454,8 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_WAKEWORD_OPENWAKEWORD_MODELS=/twinr/models/wakewords/twinr.tflite, /twinr/models/wakewords/twinna.tflite",
                         "TWINR_WAKEWORD_OPENWAKEWORD_CUSTOM_VERIFIER_MODELS=twinr=/twinr/models/wakewords/twinr.verifier.pkl, twinna=/twinr/models/wakewords/twinna.verifier.pkl",
                         "TWINR_WAKEWORD_OPENWAKEWORD_CUSTOM_VERIFIER_THRESHOLD=0.23",
+                        "TWINR_WAKEWORD_OPENWAKEWORD_SEQUENCE_VERIFIER_MODELS=twinr=/twinr/models/wakewords/twinr.sequence_verifier.pkl",
+                        "TWINR_WAKEWORD_OPENWAKEWORD_SEQUENCE_VERIFIER_THRESHOLD=0.61",
                         "TWINR_WAKEWORD_OPENWAKEWORD_THRESHOLD=0.57",
                         "TWINR_WAKEWORD_OPENWAKEWORD_VAD_THRESHOLD=0.18",
                         "TWINR_WAKEWORD_OPENWAKEWORD_PATIENCE_FRAMES=3",
@@ -788,6 +792,11 @@ class TwinrConfigTests(unittest.TestCase):
             ),
         )
         self.assertEqual(config.wakeword_openwakeword_custom_verifier_threshold, 0.23)
+        self.assertEqual(
+            config.wakeword_openwakeword_sequence_verifier_models,
+            (("twinr", "/twinr/models/wakewords/twinr.sequence_verifier.pkl"),),
+        )
+        self.assertEqual(config.wakeword_openwakeword_sequence_verifier_threshold, 0.61)
         self.assertEqual(config.wakeword_openwakeword_threshold, 0.57)
         self.assertEqual(config.wakeword_openwakeword_vad_threshold, 0.18)
         self.assertEqual(config.wakeword_openwakeword_patience_frames, 3)
@@ -1173,6 +1182,25 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.wakeword_openwakeword_models, (str(model_path),))
         self.assertEqual(
             config.wakeword_openwakeword_custom_verifier_models,
+            (("twinr_v1", str(verifier_path)),),
+        )
+
+    def test_from_env_defaults_to_bundled_openwakeword_sequence_verifier_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            model_path = root / "src" / "twinr" / "proactive" / "wakeword" / "models" / "twinr_v1.onnx"
+            verifier_path = model_path.with_suffix(".sequence_verifier.pkl")
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            model_path.write_bytes(b"fake-onnx-model")
+            verifier_path.write_bytes(b"fake-sequence-verifier")
+            env_path.write_text("", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.wakeword_openwakeword_models, (str(model_path),))
+        self.assertEqual(
+            config.wakeword_openwakeword_sequence_verifier_models,
             (("twinr_v1", str(verifier_path)),),
         )
 

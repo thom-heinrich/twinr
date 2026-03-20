@@ -1,13 +1,14 @@
 # prompting
 
 `prompting` assembles the base agent's hidden instruction context from personality
-files and selected runtime state. It exposes the canonical loaders that provider,
+files, structured agent-personality layers, and selected runtime state. It exposes the canonical loaders that provider,
 workflow, and conversation callers use when they need ordered instruction strings.
 
 ## Responsibility
 
 `prompting` owns:
 - load `SYSTEM`, `PERSONALITY`, and `USER` sections from the configured personality directory
+- merge those legacy sections with structured layers from [`../../personality`](../../personality/README.md) when a typed personality snapshot is available
 - merge memory, reminder, and automation context into loop-specific section sets
 - turn ordered sections into model-facing instruction strings
 - provide small instruction-composition helpers shared across callers
@@ -42,4 +43,5 @@ tool_instructions = load_tool_loop_instructions(config)
 - [component.yaml](./component.yaml)
 - [AGENTS.md](./AGENTS.md)
 - [conversation](../conversation/README.md)
+- [../../personality](../../personality/README.md)
 - [tools/prompting](../../tools/prompting/README.md)

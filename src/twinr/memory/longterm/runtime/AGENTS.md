@@ -23,6 +23,7 @@ Out of scope:
 
 - `service.py` stays orchestration-focused. New extraction, reasoning, storage, or policy logic belongs in the package that already owns that concern.
 - All runtime mutations that touch prompt, object, graph, or midterm stores must stay serialized under the shared `_store_lock`.
+- Personality learning stays a downstream sidecar owned by `src/twinr/agent/personality/`; `service.py` may route consolidated turns and tool history into it, but must not reimplement signal taxonomy or evolution policy here.
 - Required remote-primary readiness failures must surface as `LongTermRemoteUnavailableError`; do not degrade them into empty context or silent fallback.
 - Background writers must stay bounded, reject new items after shutdown starts, and preserve exact pending/drop/error state.
 - Service-level flush deadlines must be real wall-clock totals; do not reapply the full timeout independently to multiple writers.
@@ -51,6 +52,7 @@ PYTHONPATH=src pytest test/test_longterm_memory.py test/test_longterm_multimodal
 - `src/twinr/memory/longterm/reasoning/`
 - `src/twinr/memory/longterm/proactive/`
 - `src/twinr/memory/longterm/storage/`
+- `src/twinr/agent/personality/`
 - `src/twinr/agent/base_agent/runtime/base.py`
 - `test/test_longterm_memory.py`
 

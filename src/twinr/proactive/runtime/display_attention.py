@@ -1,9 +1,13 @@
 """Drive calm HDMI gaze-follow cues from conservative proactive sensor facts.
 
 This module translates the current primary visible-person anchor and, when
-available, the current speaker association into small HDMI face cues. It keeps
-that producer path separate from the generic runtime snapshot schema and will
-not overwrite active cues owned by other display producers.
+available, the current speaker association into small HDMI face cues. Normal
+attention-follow stays horizontal-only so stronger "thoughtful" or other
+semantic up/down poses remain reserved for explicit face-expression producers.
+It keeps that producer path separate from the generic runtime snapshot schema
+and will not overwrite active cues owned by other display producers. Matching
+attention cues refresh their TTL shortly before expiry so a stationary person
+does not make the face drift back to center between refresh ticks.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from twinr.display.face_expressions import (
     DisplayFaceMouthStyle,
 )
 
+from .attention_targeting import MultimodalAttentionTargetSnapshot
 from .speaker_association import (
     ReSpeakerSpeakerAssociationSnapshot,
     derive_respeaker_speaker_association,
@@ -32,9 +37,8 @@ from .speaker_association import (
 _SOURCE = "proactive_attention_follow"
 _LEFT_THRESHOLD = 0.36
 _RIGHT_THRESHOLD = 0.64
-_UP_THRESHOLD = 0.38
-_DOWN_THRESHOLD = 0.72
 _MIN_REFRESH_INTERVAL_S = 0.2
+_MATCHING_CUE_REFRESH_LOOKAHEAD_S = 1.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +85,26 @@ def derive_display_attention_cue(
     """Derive one calm HDMI gaze-follow cue from live proactive facts."""
 
     camera = _coerce_mapping(live_facts.get("camera"))
+    attention_target = MultimodalAttentionTargetSnapshot.from_fact_map(live_facts.get("attention_target"))
+    if attention_target is not None and attention_target.active:
+        gaze = _gaze_from_attention_target(attention_target)
+        if gaze is None:
+            return DisplayAttentionCueDecision(reason="no_attention_target")
+        brows = _brows_from_attention_target(attention_target, camera)
+        mouth = DisplayFaceMouthStyle.SPEAK if attention_target.speaker_locked else None
+        head_dx, head_dy = _head_offsets_for_gaze(gaze)
+        return DisplayAttentionCueDecision(
+            active=True,
+            reason=attention_target.state,
+            gaze=gaze,
+            mouth=mouth,
+            brows=brows,
+            head_dx=head_dx,
+            head_dy=head_dy,
+            hold_seconds=_hold_seconds_from_config(config),
+            speaker_locked=attention_target.speaker_locked,
+        )
+
     if _coerce_optional_bool(camera.get("person_visible")) is not True:
         return DisplayAttentionCueDecision(reason="no_visible_person")
 
@@ -105,12 +129,6 @@ def derive_display_attention_cue(
 
     mouth = DisplayFaceMouthStyle.SPEAK if speaking_to_visible_person else None
     head_dx, head_dy = _head_offsets_for_gaze(gaze)
-    refresh_interval_s = resolve_display_attention_refresh_interval(config)
-    hold_seconds = max(
-        float(getattr(config, "display_face_cue_ttl_s", 4.0) or 4.0),
-        (refresh_interval_s if refresh_interval_s is not None else float(getattr(config, "proactive_capture_interval_s", 6.0) or 6.0))
-        + 0.75,
-    )
     return DisplayAttentionCueDecision(
         active=True,
         reason="speaker_visible_person" if speaking_to_visible_person else "visible_person",
@@ -119,7 +137,7 @@ def derive_display_attention_cue(
         brows=brows,
         head_dx=head_dx,
         head_dy=head_dy,
-        hold_seconds=hold_seconds,
+        hold_seconds=_hold_seconds_from_config(config),
         speaker_locked=speaking_to_visible_person,
     )
 
@@ -192,6 +210,22 @@ class DisplayAttentionCuePublisher:
             )
 
         if active_cue is not None and _cue_matches_decision(active_cue, decision):
+            if _matching_cue_needs_refresh(
+                cue=active_cue,
+                decision=decision,
+                now=effective_now,
+            ):
+                self.controller.show_expression(
+                    decision.expression(),
+                    source=self.source,
+                    hold_seconds=decision.hold_seconds,
+                    now=effective_now,
+                )
+                return DisplayAttentionCuePublishResult(
+                    action="refreshed",
+                    decision=decision,
+                    owner=self.source,
+                )
             return DisplayAttentionCuePublishResult(
                 action="unchanged",
                 decision=decision,
@@ -238,6 +272,46 @@ def display_attention_refresh_supported(
     return getattr(vision_observer, "supports_attention_refresh", False) is True
 
 
+def _gaze_from_attention_target(
+    attention_target: MultimodalAttentionTargetSnapshot,
+) -> DisplayFaceGazeDirection | None:
+    """Map one serialized attention target to a discrete display gaze."""
+
+    horizontal = _normalize_text(attention_target.target_horizontal).lower()
+    if horizontal not in {"left", "center", "right"}:
+        return None
+    vertical = "center"
+    return _GAZE_DIRECTION_MAP[(vertical, horizontal)]
+
+
+def _brows_from_attention_target(
+    attention_target: MultimodalAttentionTargetSnapshot,
+    camera: Mapping[str, object],
+) -> DisplayFaceBrowStyle:
+    """Translate one attention-target state into a small brow cue."""
+
+    if attention_target.showing_intent_active:
+        return DisplayFaceBrowStyle.RAISED
+    if attention_target.speaker_locked or attention_target.session_focus_active:
+        return DisplayFaceBrowStyle.SOFT
+    engaged = _coerce_optional_bool(camera.get("engaged_with_device")) is True
+    looking_toward_device = _coerce_optional_bool(camera.get("looking_toward_device")) is True
+    if engaged or looking_toward_device:
+        return DisplayFaceBrowStyle.SOFT
+    return DisplayFaceBrowStyle.STRAIGHT
+
+
+def _hold_seconds_from_config(config: TwinrConfig) -> float:
+    """Return one bounded hold time for HDMI attention cues."""
+
+    refresh_interval_s = resolve_display_attention_refresh_interval(config)
+    return max(
+        float(getattr(config, "display_face_cue_ttl_s", 4.0) or 4.0),
+        (refresh_interval_s if refresh_interval_s is not None else float(getattr(config, "proactive_capture_interval_s", 6.0) or 6.0))
+        + 0.75,
+    )
+
+
 def _speaker_association_from_facts(
     live_facts: Mapping[str, object],
 ) -> ReSpeakerSpeakerAssociationSnapshot:
@@ -256,17 +330,12 @@ def _gaze_from_camera(camera: Mapping[str, object]) -> DisplayFaceGazeDirection 
     """Map the stabilized primary visible-person anchor to one discrete gaze."""
 
     center_x = None if _coerce_optional_bool(camera.get("primary_person_center_x_unknown")) is True else _coerce_optional_ratio(camera.get("primary_person_center_x"))
-    center_y = None if _coerce_optional_bool(camera.get("primary_person_center_y_unknown")) is True else _coerce_optional_ratio(camera.get("primary_person_center_y"))
     zone = None if _coerce_optional_bool(camera.get("primary_person_zone_unknown")) is True else _normalize_text(camera.get("primary_person_zone")).lower()
 
     horizontal = _horizontal_direction(center_x=center_x, zone=zone)
-    vertical = _vertical_direction(center_y)
-    if horizontal is None and vertical is None:
-        return None
     if horizontal is None:
-        horizontal = "center"
-    if vertical is None:
-        vertical = "center"
+        return None
+    vertical = "center"
     return _GAZE_DIRECTION_MAP[(vertical, horizontal)]
 
 
@@ -284,23 +353,13 @@ def _horizontal_direction(*, center_x: float | None, zone: str | None) -> str | 
     return None
 
 
-def _vertical_direction(center_y: float | None) -> str | None:
-    """Return one coarse up/center/down anchor from center-y when available."""
-
-    if center_y is None:
-        return None
-    if center_y <= _UP_THRESHOLD:
-        return "up"
-    if center_y >= _DOWN_THRESHOLD:
-        return "down"
-    return "center"
-
-
 def _head_offsets_for_gaze(gaze: DisplayFaceGazeDirection) -> tuple[int, int]:
     """Add a tiny head drift so the face appears to turn with the eyes."""
 
     gaze_x, gaze_y = gaze.axes()
-    return _sign(gaze_x), _sign(gaze_y)
+    horizontal = gaze_x if gaze_x else 0
+    vertical = 0 if horizontal else _sign(gaze_y)
+    return horizontal, vertical
 
 
 def _cue_matches_decision(cue: DisplayFaceCue, decision: DisplayAttentionCueDecision) -> bool:
@@ -316,6 +375,22 @@ def _cue_matches_decision(cue: DisplayFaceCue, decision: DisplayAttentionCueDeci
         and cue.head_dx == expression.head_dx
         and cue.head_dy == expression.head_dy
     )
+
+
+def _matching_cue_needs_refresh(
+    *,
+    cue: DisplayFaceCue,
+    decision: DisplayAttentionCueDecision,
+    now: datetime,
+) -> bool:
+    """Return whether one unchanged cue should be renewed before expiry."""
+
+    expires_at = _parse_timestamp(cue.expires_at)
+    if expires_at is None:
+        return False
+    seconds_left = (expires_at - now).total_seconds()
+    threshold_s = min(float(decision.hold_seconds), _MATCHING_CUE_REFRESH_LOOKAHEAD_S)
+    return seconds_left <= max(_MIN_REFRESH_INTERVAL_S, threshold_s)
 
 
 def _sign(value: int) -> int:
@@ -372,6 +447,23 @@ def _coerce_optional_ratio(value: object | None) -> float | None:
     if numeric != numeric:
         return None
     return max(0.0, min(1.0, numeric))
+
+
+def _parse_timestamp(value: object | None) -> datetime | None:
+    """Parse one optional ISO timestamp into an aware UTC datetime."""
+
+    text = _normalize_text(value)
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 _GAZE_DIRECTION_MAP: dict[tuple[str, str], DisplayFaceGazeDirection] = {

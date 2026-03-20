@@ -205,6 +205,7 @@ def _read_text_file(path: Path) -> str | None:
 
 def _atomic_write_text(path: Path, text: str) -> None:
     # AUDIT-FIX(#1): Use temp-file + fsync + replace so writes survive power loss and do not tear in place.
+    cross_service_read_mode = 0o644
     parent = path.parent.resolve(strict=False)
     parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.is_dir():
@@ -221,8 +222,10 @@ def _atomic_write_text(path: Path, text: str) -> None:
         with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
             handle.flush()
+            os.fchmod(handle.fileno(), cross_service_read_mode)
             os.fsync(handle.fileno())
         os.replace(str(temp_path), str(path))
+        os.chmod(path, cross_service_read_mode)
         _fsync_directory(parent)
     except Exception:
         with suppress(OSError):

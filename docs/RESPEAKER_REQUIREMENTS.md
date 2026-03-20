@@ -84,7 +84,7 @@ Requirements:
 - [x] Expose one operator-visible health view with device mode, mute state, and capture readiness.
 - [x] Ensure hotplug / reboot recovery does not leave Twinr on a dead audio device.
 - [x] Bound all audio waits and lock contention so the runtime cannot wedge.
-- [x] Keep playback and capture separation intact when Jabra remains the output sink.
+- [x] Keep playback and capture routing explicit when ReSpeaker remains the output sink or operators override it.
 
 Acceptance:
 
@@ -326,7 +326,7 @@ These are not valid reasons to extend the ReSpeaker path on its own:
 
 The ReSpeaker path is not done until these pass on `/twinr`.
 
-- [x] Twinr starts with Jabra output and ReSpeaker input without manual fixes.
+- [x] Twinr starts with ReSpeaker output and ReSpeaker input without manual fixes.
 - [x] Device diagnostics show XVF3800 mode and capture readiness.
 - [x] Proactive runtime reads ReSpeaker signals without blocking the main loop.
 - [x] Wakeword / presence / proactive audio path recovers after supervisor restart.

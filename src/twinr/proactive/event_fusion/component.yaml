@@ -1,0 +1,110 @@
+schema_version: 1
+name: event_fusion
+path: src/twinr/proactive/event_fusion
+kind: python-package
+visibility: internal
+summary: Fuse short rolling audio and vision history into conservative event-like claims for Twinr.
+owned_concerns:
+  - Keep RAM-only rolling buffers for recent multimodal history
+  - Derive bounded audio micro-events from normalized audio observations
+  - Derive short temporal vision sequences from recent camera observations
+  - Assemble conservative fused claims with explicit V1 delivery gates
+  - Select compact keyframe-review candidates from fused evidence windows
+out_of_scope:
+  - Proactive monitor orchestration and worker lifecycle
+  - Social-trigger prompt wording or delivery cooldown policy
+  - Raw camera, microphone, or PIR adapter implementations
+  - Emotion, wellbeing, or diagnosis claims
+files:
+  - path: __init__.py
+    role: Package export surface for event-fusion helpers
+    exports:
+      - AudioClassifierHints
+      - AudioEventConfig
+      - AudioEventKind
+      - AudioMicroEvent
+      - EventFusionPolicyContext
+      - FusedEventClaim
+      - FusionActionLevel
+      - MultimodalEventFusionConfig
+      - MultimodalEventFusionTracker
+      - RollingWindowBuffer
+      - TimedSample
+      - VisionSequenceConfig
+      - VisionSequenceEvent
+      - VisionSequenceKind
+      - build_fused_claim
+      - derive_audio_micro_events
+      - derive_fused_event_claims
+      - derive_vision_sequences
+  - path: buffers.py
+    role: RAM-only rolling buffer primitive for timestamped history
+    exports:
+      - RollingWindowBuffer
+      - TimedSample
+  - path: audio_events.py
+    role: Bounded audio micro-event derivation from normalized observations and optional classifier hints
+    exports:
+      - AudioClassifierHints
+      - AudioEventConfig
+      - AudioEventKind
+      - AudioMicroEvent
+      - derive_audio_micro_events
+  - path: vision_sequences.py
+    role: Temporal vision-sequence derivation from the recent observation window
+    exports:
+      - VisionSequenceConfig
+      - VisionSequenceEvent
+      - VisionSequenceKind
+      - derive_vision_sequences
+  - path: claims.py
+    role: Fused claim contract and V1 delivery gates
+    exports:
+      - EventFusionPolicyContext
+      - FusedEventClaim
+      - FusionActionLevel
+      - build_fused_claim
+  - path: review.py
+    role: Relevance-plus-coverage keyframe-review planning from fused evidence windows
+    exports:
+      - KeyframeReviewConfig
+      - KeyframeReviewPlan
+      - ReviewKeyframeCandidate
+      - build_keyframe_review_plan
+  - path: fusion.py
+    role: Stateful tracker that combines audio events and vision sequences into decayed multi-scale fused claims
+    exports:
+      - MultimodalEventFusionConfig
+      - MultimodalEventFusionTracker
+      - derive_fused_event_claims
+public_api:
+  module: twinr.proactive.event_fusion
+  exports:
+    - AudioClassifierHints
+    - AudioEventConfig
+    - AudioEventKind
+    - AudioMicroEvent
+    - EventFusionPolicyContext
+    - FusedEventClaim
+    - FusionActionLevel
+    - KeyframeReviewConfig
+    - KeyframeReviewPlan
+    - MultimodalEventFusionConfig
+    - MultimodalEventFusionTracker
+    - ReviewKeyframeCandidate
+    - RollingWindowBuffer
+    - TimedSample
+    - VisionSequenceConfig
+    - VisionSequenceEvent
+    - VisionSequenceKind
+    - build_fused_claim
+    - build_keyframe_review_plan
+    - derive_audio_micro_events
+    - derive_fused_event_claims
+    - derive_vision_sequences
+primary_callers:
+  - path: src/twinr/proactive/social/engine.py
+  - path: src/twinr/proactive/runtime/service.py
+  - path: docs/MULTIMODAL_EVENT_FUSION_V1.md
+tests:
+  - path: test/test_event_fusion.py

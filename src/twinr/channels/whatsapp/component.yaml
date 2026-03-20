@@ -6,6 +6,7 @@ visibility: internal
 summary: Baileys-backed consumer WhatsApp transport for Twinr internal messaging tests.
 owned_concerns:
   - Adapt the global Twinr config into focused WhatsApp runtime settings.
+  - Resolve relative auth, worker, and Node runtime paths against Twinr's project root before the worker changes cwd.
   - Enforce allowlist, self-chat, and outbound-echo policy for the WhatsApp channel.
   - Supervise the Node/Baileys worker and relay normalized inbound and outbound messages.
   - Emit pairing QR updates for both terminal fallback use and portal rendering.
@@ -18,6 +19,8 @@ files:
     role: Public export surface for the WhatsApp loop and focused config/policy types
   - path: config.py
     role: Focused WhatsApp config parsing and normalization
+  - path: node_runtime.py
+    role: Resolve the pinned local Node.js runtime under state/tools for the Baileys worker
   - path: policy.py
     role: Allowlist, self-chat, and outbound-echo policy
   - path: worker_bridge.py

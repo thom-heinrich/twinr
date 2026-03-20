@@ -13,6 +13,7 @@ that own core runtime, tool, and workflow behavior.
 
 `agent` does **not** own:
 - base-agent implementation details in [`base_agent`](./base_agent/README.md)
+- structured evolving-personality state, background learning, and prompt-layer planning inside [`personality`](./personality/README.md)
 - tool prompt, schema, handler, or tool-runtime logic in [`tools`](./tools/README.md)
 - workflow-loop orchestration details in [`workflows`](./workflows/README.md)
 - concrete self-coding runtime behavior at the package-root level; compile contracts, compiler validation, local Codex driver status, and related work belong in the focused `self_coding/` subpackage
@@ -24,6 +25,7 @@ that own core runtime, tool, and workflow behavior.
 | [__init__.py](./__init__.py) | Lazy root export surface |
 | [component.yaml](./component.yaml) | Structured package metadata |
 | [base_agent/README.md](./base_agent/README.md) | Core runtime package |
+| [personality/README.md](./personality/README.md) | Evolving companion-state package |
 | [tools/README.md](./tools/README.md) | Tool stack package |
 | [workflows/README.md](./workflows/README.md) | Workflow package |
 | [self_coding/README.md](./self_coding/README.md) | Adaptive Skill Engine core package |
@@ -44,6 +46,7 @@ runtime = TwinrRuntime(config=config)
 - [component.yaml](./component.yaml)
 - [AGENTS.md](./AGENTS.md)
 - [base_agent](./base_agent/README.md)
+- [personality](./personality/README.md)
 - [tools](./tools/README.md)
 - [workflows](./workflows/README.md)
 - [self_coding](./self_coding/README.md)

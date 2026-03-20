@@ -229,7 +229,14 @@ class LongTermRemoteHealthProbe:
             )
         probe_loader = getattr(remote_state, "probe_snapshot_load", None)
         if callable(probe_loader):
-            probe = probe_loader(snapshot_kind=normalized_kind)
+            # Ordinary warm health checks should reuse learned exact snapshot
+            # document ids before re-walking current pointers. That keeps the
+            # probe fail-closed while avoiding repeated multi-second origin
+            # lookups for hot current snapshots such as objects/conflicts.
+            probe = probe_loader(
+                snapshot_kind=normalized_kind,
+                prefer_cached_document_id=True,
+            )
         else:
             payload = remote_state.load_snapshot(snapshot_kind=normalized_kind)
             probe = LongTermRemoteSnapshotProbe(

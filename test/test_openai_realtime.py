@@ -313,6 +313,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "remember_plan": lambda _arguments: {"status": "created"},
                 "update_user_profile": lambda _arguments: {"status": "updated"},
                 "update_personality": lambda _arguments: {"status": "updated"},
+                "configure_world_intelligence": lambda _arguments: {"status": "ok"},
                 "update_simple_setting": lambda _arguments: {"status": "updated"},
                 "enroll_voice_profile": lambda _arguments: {"status": "enrolled"},
                 "get_voice_profile_status": lambda _arguments: {"status": "ok"},
@@ -351,6 +352,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "remember_plan",
                 "update_user_profile",
                 "update_personality",
+                "configure_world_intelligence",
                 "update_simple_setting",
                 "enroll_voice_profile",
                 "get_voice_profile_status",
@@ -395,6 +397,9 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("confirmed", tools_by_name["update_user_profile"]["parameters"]["properties"])
         self.assertIn("instruction", tools_by_name["update_personality"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["update_personality"]["parameters"]["properties"])
+        self.assertIn("action", tools_by_name["configure_world_intelligence"]["parameters"]["properties"])
+        self.assertIn("feed_urls", tools_by_name["configure_world_intelligence"]["parameters"]["properties"])
+        self.assertIn("subscription_refs", tools_by_name["configure_world_intelligence"]["parameters"]["properties"])
         self.assertIn("setting", tools_by_name["update_simple_setting"]["parameters"]["properties"])
         self.assertIn("action", tools_by_name["update_simple_setting"]["parameters"]["properties"])
         self.assertIn("value", tools_by_name["update_simple_setting"]["parameters"]["properties"])
@@ -428,6 +433,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("enroll_portrait_identity tool", connection.session.calls[0]["instructions"])
         self.assertIn("guidance_hints", connection.session.calls[0]["instructions"])
         self.assertIn("manage_household_identity", connection.session.calls[0]["instructions"])
+        self.assertIn("configure_world_intelligence tool", connection.session.calls[0]["instructions"])
 
     def test_open_uses_realtime_safe_top_level_tool_schemas(self) -> None:
         session, connection, _manager = self.make_session()

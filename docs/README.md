@@ -115,11 +115,13 @@ Sensor-triggered automations currently support the following operator-facing tri
 
 The proactive monitor now feeds stable PIR, camera, and VAD facts into the automation engine while Twinr is idle. This lets voice-created if-then automations react to sensor facts without exposing raw camera frames or raw audio chunks as tool-level inputs.
 The target-state map for what Twinr should try to derive from PIR, audio, and camera lives in [`SENSOR_FUSION.md`](SENSOR_FUSION.md).
+The short-window rolling-buffer and multimodal event-fusion design for deriving stable `2-8s` event claims from audio plus camera history lives in [`MULTIMODAL_EVENT_FUSION_V1.md`](MULTIMODAL_EVENT_FUSION_V1.md).
 The ReSpeaker-specific requirements and build checklist for turning the XVF3800 into a first-class Twinr sensor live in [`RESPEAKER_REQUIREMENTS.md`](RESPEAKER_REQUIREMENTS.md).
 The camera-side output contract for later runtime integration lives in [`AI_CAMERA_INTEGRATION_CONTRACT.md`](AI_CAMERA_INTEGRATION_CONTRACT.md). That contract now separates `body_pose`, `motion`, `coarse_arm_gesture`, and `fine_hand_gesture` explicitly so Twinr can keep realistic V1 camera requirements and stricter V2 hand-gesture ambitions apart.
 The current fine-hand-gesture evaluation and recommendation path lives in [`AI_CAMERA_FINE_HAND_GESTURE_PATH.md`](AI_CAMERA_FINE_HAND_GESTURE_PATH.md).
 
 Explicit requests to change future user-profile context or future speaking/behavior rules are written into managed sections inside `personality/USER.md` and `personality/PERSONALITY.md`. Twinr reloads those files on the next provider request instead of baking them permanently into code.
+The target-state design for a richer persistent Twinr self now lives in [`persistent_personality_architecture.md`](persistent_personality_architecture.md). That document separates stable core character, relational user model, place intelligence, world intelligence, and bounded reflective evolution instead of treating personality as one growing prompt blob.
 
 ### Long-term memory (optional)
 
@@ -332,22 +334,26 @@ Current implementation notes:
 
 ### Audio
 
-Twinr currently uses the `Jabra SPEAK 510 USB` attached to the Raspberry Pi as its default microphone and speaker.
+Twinr currently uses the `reSpeaker XVF3800 4-Mic Array` as its default playback and microphone device.
+The external speaker attached to the ReSpeaker is driven through that same sink.
 For proactive background listening, Twinr can additionally use the `PlayStation Eye` USB microphone as a separate capture path.
 
 Configure the audio defaults with:
 
 ```bash
 cd /twinr
-sudo hardware/mic/setup_audio.sh --device-match Jabra
+sudo hardware/mic/setup_audio.sh
 ```
 
-To keep Jabra as the main default device while also wiring the PS-Eye microphone into the proactive path, run:
+The setup script also normalizes the selected playback sink and ALSA playback
+controls so the ReSpeaker-attached speaker does not inherit a near-muted output
+level from a previously selected sink.
+
+To keep ReSpeaker as the main default device while also wiring the PS-Eye microphone into the proactive path, run:
 
 ```bash
 cd /twinr
 sudo hardware/mic/setup_audio.sh \
-  --device-match Jabra \
   --proactive-device-match Camera-B4.09.24.1 \
   --proactive-sample-ms 900 \
   --test
@@ -605,6 +611,6 @@ python3.11 -m venv .venv
 PYTHONPATH=src ./.venv/bin/python -m unittest discover -s test -v
 PYTHONPATH=src ./.venv/bin/python -m twinr --demo-transcript "Hello Twinr"
 hardware/buttons/setup_buttons.sh --green 23 --yellow 22
-sudo hardware/mic/setup_audio.sh --device-match Jabra
+sudo hardware/mic/setup_audio.sh
 ./.venv/bin/python hardware/buttons/probe_buttons.py --env-file /twinr/.env --configured --duration 15
 ```

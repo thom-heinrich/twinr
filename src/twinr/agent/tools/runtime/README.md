@@ -11,6 +11,7 @@ streaming APIs.
 - adapt workflow owners into `handle_*` methods for realtime tools
 - validate the canonical tool-name to handler binding registry
 - route the shared local household-identity tool through the same thin executor surface as the legacy portrait and voice tools
+- route the RSS/world-intelligence configuration tool through the same thin executor surface as the other persistent tool handlers
 - dispatch learned-skill control tools and hidden self-coding runtime triggers through the same thin executor surface
 - run the generic streaming tool loop and the supervisor/specialist handoff loop
 - generate LLM-only recovery replies for streaming timeout/error paths

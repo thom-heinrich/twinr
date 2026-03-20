@@ -5,11 +5,13 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from threading import Lock, RLock
 from typing import Any
 
+from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
+from twinr.agent.personality.intelligence import WorldIntelligenceConfigRequest
 from twinr.memory import ManagedContextEntry, MemoryLedgerItem, PersistentMemoryEntry, SearchMemoryEntry
 from twinr.ops.events import compact_text
 
@@ -261,6 +263,27 @@ class TwinrRuntimeMemoryMixin:
             )
         return entry
 
+    def record_personality_tool_history(
+        self,
+        *,
+        tool_calls: Sequence[AgentToolCall],
+        tool_results: Sequence[AgentToolResult],
+    ) -> None:
+        """Record tool-history signals for background personality learning."""
+
+        normalized_tool_calls = tuple(tool_calls)
+        normalized_tool_results = tuple(tool_results)
+        if not normalized_tool_calls and not normalized_tool_results:
+            return
+        try:
+            with self._memory_runtime_lock():
+                self.long_term_memory.record_personality_tool_history(
+                    tool_calls=normalized_tool_calls,
+                    tool_results=normalized_tool_results,
+                )
+        except Exception:
+            LOGGER.exception("Failed to record personality tool-history signals.")
+
     def store_durable_memory(
         self,
         *,
@@ -320,6 +343,20 @@ class TwinrRuntimeMemoryMixin:
             )
             self._flush_long_term_memory_strict(operation="update_personality_context")  # AUDIT-FIX(#2)
         return entry
+
+    def configure_world_intelligence(
+        self,
+        *,
+        request: WorldIntelligenceConfigRequest,
+        search_backend: object | None = None,
+    ):
+        """Configure RSS/world-intelligence feeds for ongoing personality awareness."""
+
+        with self._memory_runtime_lock():
+            return self.long_term_memory.configure_world_intelligence(
+                request=request,
+                search_backend=search_backend,
+            )
 
     def flush_long_term_memory(self, *, timeout_s: float = 2.0) -> bool:
         """Flush queued long-term memory work within the given timeout."""

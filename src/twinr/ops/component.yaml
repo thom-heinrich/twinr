@@ -3,7 +3,7 @@ name: ops
 path: src/twinr/ops
 kind: python-package
 visibility: internal
-summary: Provide Twinr's operational support layer for config checks, health snapshots, device diagnostics, singleton loop locks, file-backed ops stores, detached-runtime audio-session env priming, the rolling remote-memory watchdog, authoritative Pi runtime supervision, Pi-side self-coding Codex bootstrap, self-tests, and support exports.
+summary: Provide Twinr's operational support layer for config checks, health snapshots, device diagnostics, singleton loop locks, file-backed ops stores, detached-runtime audio-session env priming, leading-repo to Pi mirroring, the rolling remote-memory watchdog, authoritative Pi runtime supervision, Pi-side self-coding Codex bootstrap, self-tests, and support exports.
 owned_concerns:
   - Resolve canonical filesystem paths for ops artifacts, stores, self-tests, and support bundles
   - Persist sanitized operational events and provider usage telemetry as bounded JSONL stores
@@ -12,6 +12,8 @@ owned_concerns:
   - Persist structured probe evidence and supervisor-seeded watchdog bootstrap snapshots for required-remote debugging
   - Ensure live Pi runtimes can start that watchdog as a separate companion process
   - Seed detached Pi runtime processes with the minimum user-session audio environment required for Pulse/ALSA default playback
+  - Build scoped runtime configs so auxiliary loops cannot overwrite the primary display/runtime snapshot
+  - Mirror the authoritative leading repo into the Pi acceptance checkout while preserving Pi-local runtime-only paths
   - Supervise the productive Pi streaming loop plus remote watchdog under one authoritative owner
   - Keep display-companion degradation visible through ops health without letting it tear down the productive speech runtime
   - Coordinate singleton loop ownership through secure per-loop lock files
@@ -91,6 +93,8 @@ files:
       - run_config_checks
   - path: self_coding_pi.py
     role: Pi bootstrap for the pinned self-coding Codex bridge, CLI, auth sync, and remote self-test
+  - path: pi_repo_mirror.py
+    role: One-way repo mirror watchdog that keeps /twinr aligned with the authoritative leading repo while preserving Pi-local runtime-only paths
   - path: health.py
     role: Host and service health snapshot assembly, including display-companion assessment via the shared display heartbeat contract
     exports:
@@ -107,6 +111,8 @@ files:
     role: Process-based launcher for the external remote-memory watchdog used by live Pi loops
   - path: runtime_env.py
     role: Seed detached Pi runtime processes with the minimal user-session audio environment
+  - path: runtime_scope.py
+    role: Build scoped runtime configs for auxiliary loops that must not touch the primary display/runtime snapshot
   - path: runtime_supervisor.py
     role: Authoritative supervisor for the productive Pi streaming loop and remote watchdog, including shared display-progress checks
     exports:
@@ -178,6 +184,7 @@ primary_callers:
   - path: src/twinr/proactive/wakeword/evaluation.py
 tests:
   - path: test/test_ops.py
+  - path: test/test_ops_pi_repo_mirror.py
   - path: test/test_ops_health.py
   - path: test/test_devices.py
   - path: test/test_locks.py

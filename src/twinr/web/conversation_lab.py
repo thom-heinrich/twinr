@@ -60,6 +60,7 @@ _CONVERSATION_LAB_TOOL_NAMES: tuple[str, ...] = (
     "remember_plan",
     "update_user_profile",
     "update_personality",
+    "configure_world_intelligence",
     "update_simple_setting",
     "enroll_portrait_identity",
     "get_portrait_identity_status",
@@ -965,6 +966,10 @@ def run_conversation_lab_turn(
             prompt=normalized_prompt,
         )
         response_text = runtime.finalize_agent_turn(_result_text(result))
+        runtime.record_personality_tool_history(
+            tool_calls=tuple(getattr(result, "tool_calls", ()) or ()),
+            tool_results=tuple(getattr(result, "tool_results", ()) or ()),
+        )
         usage_store.append(
             source=_CONVERSATION_LAB_SOURCE,
             request_kind=_CONVERSATION_LAB_REQUEST_KIND,

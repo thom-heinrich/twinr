@@ -217,6 +217,27 @@ def _default_bundled_openwakeword_custom_verifier_models(
     return tuple(bundled)
 
 
+def _default_bundled_openwakeword_sequence_verifier_models(
+    project_root: Path,
+    models: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    """Return bundled Twinr sequence-verifier assets next to local models."""
+
+    bundled: list[tuple[str, str]] = []
+    for raw_model in models:
+        model = str(raw_model).strip()
+        if not model or not model.lower().endswith((".onnx", ".tflite")):
+            continue
+        candidate = Path(model).expanduser()
+        if not candidate.is_absolute():
+            candidate = project_root / candidate
+        resolved_model = candidate.resolve(strict=False)
+        verifier_candidate = resolved_model.with_suffix(".sequence_verifier.pkl")
+        if verifier_candidate.exists():
+            bundled.append((resolved_model.stem, str(verifier_candidate)))
+    return tuple(bundled)
+
+
 def _default_openwakeword_inference_framework(models: tuple[str, ...]) -> str:
     """Infer the local runtime from the configured wakeword model paths."""
 
@@ -476,6 +497,8 @@ class TwinrConfig:
     wakeword_openwakeword_models: tuple[str, ...] = ()
     wakeword_openwakeword_custom_verifier_models: tuple[tuple[str, str], ...] = ()
     wakeword_openwakeword_custom_verifier_threshold: float = 0.1
+    wakeword_openwakeword_sequence_verifier_models: tuple[tuple[str, str], ...] = ()
+    wakeword_openwakeword_sequence_verifier_threshold: float = 0.5
     wakeword_openwakeword_threshold: float = 0.5
     wakeword_openwakeword_vad_threshold: float = 0.0
     wakeword_openwakeword_patience_frames: int = 1
@@ -624,6 +647,7 @@ class TwinrConfig:
     display_face_cue_path: str = "artifacts/stores/ops/display_face_cue.json"
     display_face_cue_ttl_s: float = 4.0
     display_attention_refresh_interval_s: float = 1.25
+    display_attention_session_focus_hold_s: float = 4.5
     display_presentation_path: str = "artifacts/stores/ops/display_presentation.json"
     display_presentation_ttl_s: float = 20.0
     display_vendor_dir: str = "state/display/vendor"
@@ -688,6 +712,10 @@ class TwinrConfig:
         if not math.isfinite(normalized_display_attention_refresh_interval_s):
             raise ValueError("display_attention_refresh_interval_s must be finite")
         normalized_display_attention_refresh_interval_s = max(0.0, normalized_display_attention_refresh_interval_s)
+        normalized_display_attention_session_focus_hold_s = float(self.display_attention_session_focus_hold_s)
+        if not math.isfinite(normalized_display_attention_session_focus_hold_s):
+            raise ValueError("display_attention_session_focus_hold_s must be finite")
+        normalized_display_attention_session_focus_hold_s = max(0.5, normalized_display_attention_session_focus_hold_s)
         normalized_display_presentation_ttl_s = float(self.display_presentation_ttl_s)
         if not math.isfinite(normalized_display_presentation_ttl_s):
             raise ValueError("display_presentation_ttl_s must be finite")
@@ -737,6 +765,11 @@ class TwinrConfig:
             self,
             "display_attention_refresh_interval_s",
             normalized_display_attention_refresh_interval_s,
+        )
+        object.__setattr__(
+            self,
+            "display_attention_session_focus_hold_s",
+            normalized_display_attention_session_focus_hold_s,
         )
         object.__setattr__(self, "display_presentation_path", normalized_display_presentation_path)
         object.__setattr__(self, "display_presentation_ttl_s", normalized_display_presentation_ttl_s)
@@ -898,6 +931,13 @@ class TwinrConfig:
         wakeword_openwakeword_custom_verifier_models = _parse_csv_mapping(
             get_value("TWINR_WAKEWORD_OPENWAKEWORD_CUSTOM_VERIFIER_MODELS"),
             _default_bundled_openwakeword_custom_verifier_models(
+                project_root,
+                wakeword_openwakeword_models,
+            ),
+        )
+        wakeword_openwakeword_sequence_verifier_models = _parse_csv_mapping(
+            get_value("TWINR_WAKEWORD_OPENWAKEWORD_SEQUENCE_VERIFIER_MODELS"),
+            _default_bundled_openwakeword_sequence_verifier_models(
                 project_root,
                 wakeword_openwakeword_models,
             ),
@@ -1578,6 +1618,15 @@ class TwinrConfig:
                 minimum=0.0,
                 maximum=1.0,
             ),
+            wakeword_openwakeword_sequence_verifier_models=(
+                wakeword_openwakeword_sequence_verifier_models
+            ),
+            wakeword_openwakeword_sequence_verifier_threshold=_parse_clamped_float(
+                get_value("TWINR_WAKEWORD_OPENWAKEWORD_SEQUENCE_VERIFIER_THRESHOLD"),
+                0.5,
+                minimum=0.0,
+                maximum=1.0,
+            ),
             wakeword_openwakeword_threshold=_parse_clamped_float(
                 get_value("TWINR_WAKEWORD_OPENWAKEWORD_THRESHOLD"),
                 0.5,
@@ -2062,6 +2111,11 @@ class TwinrConfig:
                 get_value("TWINR_DISPLAY_ATTENTION_REFRESH_INTERVAL_S"),
                 1.25,
                 minimum=0.0,
+            ),
+            display_attention_session_focus_hold_s=_parse_float(
+                get_value("TWINR_DISPLAY_ATTENTION_SESSION_FOCUS_HOLD_S"),
+                4.5,
+                minimum=0.5,
             ),
             display_presentation_path=get_value(
                 "TWINR_DISPLAY_PRESENTATION_PATH",

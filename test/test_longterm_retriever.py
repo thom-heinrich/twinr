@@ -202,22 +202,32 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertIsNone(context.episodic_context)
 
     def test_build_context_reuses_nonempty_episodic_matches_for_subtext(self) -> None:
-        episodic_calls: list[tuple[int, bool]] = []
+        section_calls: list[tuple[str, ...]] = []
 
-        def _select_episodic_entries(self, query_texts, fallback_limit=0, require_query_match=False):
+        def _select_context_object_sections(self, query_texts):
             del self
-            del query_texts
-            episodic_calls.append((fallback_limit, require_query_match))
-            return ["episode:one"]
+            section_calls.append(tuple(query_texts))
+            entry = type(
+                "Entry",
+                (),
+                {
+                    "entry_id": "episode:one",
+                    "kind": "episodic_turn",
+                    "summary": "Stored conversation excerpt",
+                    "details": 'User said: "Hallo"',
+                    "created_at": datetime(2026, 3, 20, 10, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                    "updated_at": datetime(2026, 3, 20, 10, 0, tzinfo=ZoneInfo("Europe/Berlin")),
+                },
+            )()
+            return [entry], ()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
             with (
                 patch.object(LongTermRetriever, "_normalize_query_text", lambda self, query, fallback_text=None: "Hallo"),
                 patch.object(LongTermRetriever, "_query_text_variants", lambda self, query, fallback_text=None: ("Hallo",)),
-                patch.object(LongTermRetriever, "_select_episodic_entries", _select_episodic_entries),
+                patch.object(LongTermRetriever, "_select_context_object_sections", _select_context_object_sections),
                 patch.object(LongTermRetriever, "_select_midterm_packets", lambda self, query_texts: ()),
-                patch.object(LongTermRetriever, "_select_durable_objects", lambda self, query_texts: ()),
                 patch.object(LongTermRetriever, "_build_adaptive_packets", lambda self, retrieval_text, durable_objects: ()),
                 patch.object(LongTermRetriever, "_select_conflict_queue_for_texts", lambda self, query_texts: ()),
                 patch.object(LongTermRetriever, "_build_graph_context", lambda self, retrieval_text: None),
@@ -237,43 +247,85 @@ class LongTermRetrieverTests(unittest.TestCase):
                     original_query_text="Hallo",
                 )
 
-        self.assertEqual(episodic_calls, [(0, False)])
+        self.assertEqual(section_calls, [("Hallo",)])
         self.assertEqual(context.episodic_context, "episodic-context")
         self.assertEqual(context.subtext_context, "subtext:1")
 
-    def test_build_context_loads_independent_sections_in_parallel(self) -> None:
-        episodic_started = threading.Event()
-        durable_started = threading.Event()
+    def test_build_context_skips_subtext_when_no_episodic_matches_exist(self) -> None:
+        subtext_calls: list[tuple[str | None, str, int]] = []
 
-        def _select_episodic_entries(self, query_texts, fallback_limit=0, require_query_match=False):
+        def _select_context_object_sections(self, query_texts):
             del self
             del query_texts
-            del fallback_limit
-            del require_query_match
-            episodic_started.set()
-            if not durable_started.wait(timeout=1.0):
-                raise AssertionError("episodic retrieval did not overlap with durable retrieval")
-            return []
+            return [], ()
 
-        def _select_durable_objects(self, query_texts):
+        def _build_subtext_context(self, query_text, retrieval_query_text, episodic_entries):
             del self
-            del query_texts
-            durable_started.set()
-            if not episodic_started.wait(timeout=1.0):
-                raise AssertionError("durable retrieval did not overlap with episodic retrieval")
-            return ()
+            subtext_calls.append((query_text, retrieval_query_text, len(tuple(episodic_entries))))
+            return "unexpected"
 
         with tempfile.TemporaryDirectory() as temp_dir:
             retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
             with (
                 patch.object(LongTermRetriever, "_normalize_query_text", lambda self, query, fallback_text=None: "Hallo"),
                 patch.object(LongTermRetriever, "_query_text_variants", lambda self, query, fallback_text=None: ("Hallo",)),
-                patch.object(LongTermRetriever, "_select_episodic_entries", _select_episodic_entries),
+                patch.object(LongTermRetriever, "_select_context_object_sections", _select_context_object_sections),
                 patch.object(LongTermRetriever, "_select_midterm_packets", lambda self, query_texts: ()),
-                patch.object(LongTermRetriever, "_select_durable_objects", _select_durable_objects),
                 patch.object(LongTermRetriever, "_build_adaptive_packets", lambda self, retrieval_text, durable_objects: ()),
                 patch.object(LongTermRetriever, "_select_conflict_queue_for_texts", lambda self, query_texts: ()),
                 patch.object(LongTermRetriever, "_build_graph_context", lambda self, retrieval_text: None),
+                patch.object(LongTermRetriever, "_render_durable_context", lambda self, objects: None),
+                patch.object(LongTermRetriever, "_render_episodic_context", lambda self, entries: None),
+                patch.object(LongTermRetriever, "_render_conflict_context", lambda self, conflicts: None),
+                patch.object(LongTermRetriever, "_render_midterm_context", lambda self, packets: None),
+                patch.object(LongTermRetriever, "_combine_query_texts", lambda self, query_texts: " ".join(query_texts)),
+                patch.object(LongTermRetriever, "_build_subtext_context", _build_subtext_context),
+            ):
+                context = retriever.build_context(
+                    query=LongTermQueryProfile.from_text("Hallo"),
+                    original_query_text="Hallo",
+                )
+
+        self.assertEqual(subtext_calls, [])
+        self.assertIsNone(context.subtext_context)
+
+    def test_build_context_overlaps_local_sections_without_parallel_remote_searches(self) -> None:
+        midterm_started = threading.Event()
+        graph_started = threading.Event()
+        selector_threads: list[str] = []
+
+        def _select_context_object_sections(self, query_texts):
+            del self
+            del query_texts
+            selector_threads.append(threading.current_thread().name)
+            return [], ()
+
+        def _select_midterm_packets(self, query_texts):
+            del self
+            del query_texts
+            midterm_started.set()
+            if not graph_started.wait(timeout=1.0):
+                raise AssertionError("midterm retrieval did not overlap with graph retrieval")
+            return ()
+
+        def _build_graph_context(self, retrieval_text):
+            del self
+            del retrieval_text
+            graph_started.set()
+            if not midterm_started.wait(timeout=1.0):
+                raise AssertionError("graph retrieval did not overlap with midterm retrieval")
+            return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, _object_store, _prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
+            with (
+                patch.object(LongTermRetriever, "_normalize_query_text", lambda self, query, fallback_text=None: "Hallo"),
+                patch.object(LongTermRetriever, "_query_text_variants", lambda self, query, fallback_text=None: ("Hallo",)),
+                patch.object(LongTermRetriever, "_select_context_object_sections", _select_context_object_sections),
+                patch.object(LongTermRetriever, "_select_midterm_packets", _select_midterm_packets),
+                patch.object(LongTermRetriever, "_build_adaptive_packets", lambda self, retrieval_text, durable_objects: ()),
+                patch.object(LongTermRetriever, "_select_conflict_queue_for_texts", lambda self, query_texts: ()),
+                patch.object(LongTermRetriever, "_build_graph_context", _build_graph_context),
                 patch.object(LongTermRetriever, "_render_durable_context", lambda self, objects: None),
                 patch.object(LongTermRetriever, "_render_episodic_context", lambda self, entries: None),
                 patch.object(LongTermRetriever, "_render_conflict_context", lambda self, conflicts: None),
@@ -288,6 +340,7 @@ class LongTermRetrieverTests(unittest.TestCase):
 
         self.assertIsNone(context.episodic_context)
         self.assertIsNone(context.durable_context)
+        self.assertEqual(selector_threads, ["MainThread"])
 
     def test_select_conflict_queue_respects_canonical_query_profile(self) -> None:
         existing = LongTermMemoryObjectV1(

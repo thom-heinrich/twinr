@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import logging
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import unittest
@@ -244,6 +245,27 @@ class LongTermMidtermTests(unittest.TestCase):
             remote_state.snapshots["midterm"],
             {"schema": "twinr_memory_midterm_store", "version": 1, "packets": []},
         )
+
+    def test_save_packets_writes_world_readable_midterm_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LongTermMidtermStore(base_path=Path(temp_dir) / "state" / "chonkydb")
+
+            store.save_packets(
+                packets=(
+                    store.packet_type(
+                        packet_id="midterm:tea_preference",
+                        kind="preference_bundle",
+                        summary="The user prefers Oolong tea in the afternoon.",
+                        source_memory_ids=("fact:drink_preference",),
+                        query_hints=("oolong", "tea", "afternoon"),
+                        sensitivity="normal",
+                    ),
+                )
+            )
+
+            mode = stat.S_IMODE(store.packets_path.stat().st_mode)
+
+        self.assertEqual(mode, 0o644)
 
     def test_load_packets_ignores_missing_local_snapshot_without_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

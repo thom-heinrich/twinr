@@ -29,6 +29,28 @@ def _write_wav(path: Path, *, amplitude: int, sample_count: int = 16000) -> None
 
 
 class WakewordTrainingTests(unittest.TestCase):
+    def test_expanded_sample_weights_follow_dataset_provenance(self) -> None:
+        weights = wakeword_training._expanded_sample_weights(
+            audio_paths=[
+                Path("synthetic.wav"),
+                Path("extra_pos_room.wav"),
+            ],
+            rounds=2,
+            positive=True,
+        )
+        negative_weights = wakeword_training._expanded_sample_weights(
+            audio_paths=[
+                Path("synthetic_neg.wav"),
+                Path("extra_neg_room.wav"),
+                Path("mined_neg_confusion.wav"),
+            ],
+            rounds=1,
+            positive=False,
+        )
+
+        self.assertEqual(weights.tolist(), [1.0, 2.0, 1.0, 2.0])
+        self.assertEqual(negative_weights.tolist(), [1.5, 3.0, 6.0])
+
     def test_export_openwakeword_model_to_onnx_forces_single_file_export(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -186,8 +208,47 @@ class WakewordTrainingTests(unittest.TestCase):
         self.assertTrue(output_exists)
         self.assertEqual(report.selected_threshold, 0.12)
         self.assertEqual(metadata["selected_threshold"], 0.12)
+        self.assertEqual(metadata["model_type"], "mlp")
+        self.assertEqual(metadata["acceptance_eval_mode"], "runtime_stream_replay")
         self.assertEqual(metadata["train_positive_clips"], 2)
         self.assertEqual(metadata["train_negative_clips"], 2)
         self.assertEqual(positive_train_features.shape[0], 6)
         self.assertEqual(negative_train_features.shape[0], 6)
         self.assertIn("acceptance_metrics", metadata)
+
+    def test_train_sklearn_mlp_model_exports_twinr_style_onnx(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            rng = np.random.default_rng(1234)
+            positive_train = root / "positive_train.npy"
+            negative_train = root / "negative_train.npy"
+            positive_validation = root / "positive_validation.npy"
+            negative_validation = root / "negative_validation.npy"
+            output_model = root / "twinr_mlp.onnx"
+            np.save(positive_train, rng.normal(loc=0.8, scale=0.2, size=(24, 16, 96)).astype(np.float32))
+            np.save(negative_train, rng.normal(loc=-0.8, scale=0.2, size=(24, 16, 96)).astype(np.float32))
+            np.save(positive_validation, rng.normal(loc=0.8, scale=0.2, size=(8, 16, 96)).astype(np.float32))
+            np.save(negative_validation, rng.normal(loc=-0.8, scale=0.2, size=(8, 16, 96)).astype(np.float32))
+
+            wakeword_training._train_sklearn_mlp_model(
+                positive_train_features_path=positive_train,
+                negative_train_features_path=negative_train,
+                positive_validation_features_path=positive_validation,
+                negative_validation_features_path=negative_validation,
+                output_model_path=output_model,
+                model_name="twinr_mlp",
+                layer_dim=64,
+                steps=500,
+                seed=1234,
+            )
+
+            import onnx
+
+            model = onnx.load(str(output_model))
+            output_exists = output_model.exists()
+
+        self.assertTrue(output_exists)
+        self.assertEqual(model.graph.output[0].name, "twinr_mlp")
+        self.assertEqual(model.graph.node[0].op_type, "Reshape")
+        self.assertIn("Gemm", {node.op_type for node in model.graph.node})
+        self.assertEqual(len(model.graph.initializer), 9)

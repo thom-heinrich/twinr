@@ -56,6 +56,8 @@ _DEFAULT_REALTIME_INSTRUCTIONS = (
     "If the user explicitly asks you to remember a future intention or short plan such as wanting to go for a walk today, use the remember_plan tool. "
     "If the user explicitly asks you to remember an important fact for future turns, use the remember_memory tool. "
     "If the user explicitly asks you to change your future speaking style or behavior, use the update_personality tool. "
+    "If the installer or user explicitly wants to seed, inspect, change, or occasionally recalibrate Twinr's ongoing RSS or Atom sources for local or world awareness, use the configure_world_intelligence tool. "
+    "Use configure_world_intelligence only for persistent feed-source setup or occasional recalibration, not for normal one-off live questions. "
     "If the user explicitly asks you to remember a stable user-profile fact or preference, use the update_user_profile tool. "
     "For remember_memory, remember_contact, remember_preference, remember_plan, update_user_profile, and update_personality, all semantic text fields must be canonical English. "
     "Keep names, phone numbers, email addresses, IDs, codes, and direct quotes verbatim. "

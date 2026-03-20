@@ -1,4 +1,5 @@
 from pathlib import Path
+import stat
 import sys
 import tempfile
 from threading import Lock
@@ -98,6 +99,20 @@ class ContextStoreTests(unittest.TestCase):
         self.assertEqual(first.entry_id, second.entry_id)
         self.assertEqual(entries[0].kind, "appointment")
         self.assertIn("Arzttermin am Montag um 14 Uhr.", rendered)
+
+    def test_memory_store_writes_world_readable_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "MEMORY.md"
+            store = PersistentMemoryMarkdownStore(path, max_entries=3)
+
+            store.remember(
+                kind="appointment",
+                summary="Augenarzt am Dienstag um 10:30.",
+            )
+
+            mode = stat.S_IMODE(path.stat().st_mode)
+
+        self.assertEqual(mode, 0o644)
 
     def test_memory_store_renders_compact_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

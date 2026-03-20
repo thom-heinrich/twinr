@@ -1,0 +1,172 @@
+from pathlib import Path
+import sys
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from twinr.config import TwinrConfig
+from twinr.proactive.runtime.attention_targeting import (
+    MultimodalAttentionTargetTracker,
+)
+from twinr.proactive.runtime.claim_metadata import RuntimeClaimMetadata
+from twinr.proactive.runtime.identity_fusion import MultimodalIdentityFusionSnapshot
+from twinr.proactive.runtime.speaker_association import ReSpeakerSpeakerAssociationSnapshot
+
+
+class MultimodalAttentionTargetTests(unittest.TestCase):
+    def test_prioritizes_visible_speaker_and_records_focus(self) -> None:
+        tracker = MultimodalAttentionTargetTracker.from_config(TwinrConfig())
+
+        snapshot = tracker.observe(
+            observed_at=10.0,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "primary_person_center_x": 0.14,
+                    "primary_person_center_y": 0.14,
+                },
+                "vad": {
+                    "speech_detected": True,
+                },
+            },
+            runtime_status="listening",
+            presence_session_id=7,
+            speaker_association=ReSpeakerSpeakerAssociationSnapshot(
+                state="primary_visible_person_associated",
+                associated=True,
+                confidence=0.87,
+            ),
+        )
+
+        self.assertEqual(snapshot.state, "active_visible_speaker")
+        self.assertTrue(snapshot.active)
+        self.assertTrue(snapshot.speaker_locked)
+        self.assertEqual(snapshot.target_horizontal, "left")
+        self.assertEqual(snapshot.target_vertical, "center")
+        self.assertEqual(snapshot.focus_source, "speaker_association")
+
+    def test_prefers_recent_session_focus_over_new_primary_anchor_in_multi_person_context(self) -> None:
+        tracker = MultimodalAttentionTargetTracker.from_config(TwinrConfig())
+        tracker.observe(
+            observed_at=10.0,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "primary_person_center_x": 0.14,
+                    "primary_person_center_y": 0.5,
+                },
+                "vad": {
+                    "speech_detected": True,
+                },
+            },
+            runtime_status="listening",
+            presence_session_id=9,
+            speaker_association=ReSpeakerSpeakerAssociationSnapshot(
+                state="primary_visible_person_associated",
+                associated=True,
+                confidence=0.88,
+            ),
+        )
+
+        snapshot = tracker.observe(
+            observed_at=11.0,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 2,
+                    "primary_person_center_x": 0.82,
+                    "primary_person_center_y": 0.52,
+                    "person_recently_visible": True,
+                },
+                "vad": {
+                    "speech_detected": False,
+                },
+            },
+            runtime_status="processing",
+            presence_session_id=9,
+        )
+
+        self.assertEqual(snapshot.state, "session_focus_locked")
+        self.assertTrue(snapshot.session_focus_active)
+        self.assertEqual(snapshot.target_horizontal, "left")
+        self.assertEqual(snapshot.focus_source, "speaker_association")
+
+    def test_holds_session_focus_when_visual_anchor_temporarily_missing(self) -> None:
+        tracker = MultimodalAttentionTargetTracker.from_config(TwinrConfig())
+        tracker.observe(
+            observed_at=20.0,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "primary_person_center_x": 0.78,
+                    "primary_person_center_y": 0.42,
+                    "showing_intent_likely": True,
+                },
+                "vad": {
+                    "speech_detected": False,
+                },
+            },
+            runtime_status="listening",
+            presence_session_id=11,
+        )
+
+        snapshot = tracker.observe(
+            observed_at=22.0,
+            live_facts={
+                "camera": {
+                    "person_visible": False,
+                    "person_recently_visible": True,
+                },
+                "vad": {
+                    "speech_detected": False,
+                },
+            },
+            runtime_status="answering",
+            presence_session_id=11,
+        )
+
+        self.assertEqual(snapshot.state, "holding_session_focus")
+        self.assertTrue(snapshot.session_focus_active)
+        self.assertEqual(snapshot.target_horizontal, "right")
+        self.assertEqual(snapshot.focus_source, "showing_intent")
+
+    def test_uses_identity_fusion_track_as_focus_seed_in_multi_person_scene(self) -> None:
+        tracker = MultimodalAttentionTargetTracker.from_config(TwinrConfig())
+
+        snapshot = tracker.observe(
+            observed_at=30.0,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 2,
+                    "primary_person_center_x": 0.82,
+                    "primary_person_center_y": 0.46,
+                },
+                "vad": {
+                    "speech_detected": False,
+                },
+            },
+            runtime_status="processing",
+            presence_session_id=13,
+            identity_fusion=MultimodalIdentityFusionSnapshot(
+                state="stable_main_user_multimodal",
+                temporal_state="stable_multimodal_match",
+                track_consistency_state="stable_anchor",
+                track_anchor_zone="left",
+                presence_session_id=13,
+                claim=RuntimeClaimMetadata(
+                    confidence=0.91,
+                    source="voice_profile_plus_temporal_portrait_match_plus_track_history_plus_presence_session_memory",
+                    requires_confirmation=True,
+                ),
+            ),
+        )
+
+        self.assertEqual(snapshot.state, "session_focus_locked")
+        self.assertTrue(snapshot.session_focus_active)
+        self.assertEqual(snapshot.target_horizontal, "left")
+        self.assertEqual(snapshot.focus_source, "identity_fusion_track")
+
+
+if __name__ == "__main__":
+    unittest.main()

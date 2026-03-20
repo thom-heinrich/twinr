@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import stat
 from types import SimpleNamespace
 import sys
 import tempfile
@@ -66,6 +67,24 @@ class RuntimeContextTests(unittest.TestCase):
                 runtime.provider_conversation_context()
             finally:
                 runtime.shutdown(timeout_s=1.0)
+
+    def test_runtime_snapshot_store_writes_world_readable_snapshot_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            store = RuntimeSnapshotStore(config.runtime_state_path)
+
+            store.save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Bereit.",
+            )
+
+            primary_mode = stat.S_IMODE(Path(config.runtime_state_path).stat().st_mode)
+            backup_mode = stat.S_IMODE(Path(f"{config.runtime_state_path}.bak").stat().st_mode)
+
+        self.assertEqual(primary_mode, 0o644)
+        self.assertEqual(backup_mode, 0o644)
 
     def test_snapshot_restore_preserves_household_voice_identity_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

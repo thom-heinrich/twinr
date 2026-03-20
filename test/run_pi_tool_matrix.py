@@ -259,6 +259,10 @@ def run_text_turn(
         else:
             loop.runtime.begin_answering()
         answer = loop.runtime.finalize_agent_turn(response.text)
+        loop.runtime.record_personality_tool_history(
+            tool_calls=response.tool_calls,
+            tool_results=response.tool_results,
+        )
         loop.runtime.finish_speaking()
         return TurnArtifact(
             prompt=prompt,

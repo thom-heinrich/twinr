@@ -30,6 +30,7 @@ from twinr.text_utils import retrieval_terms
 _MIDTERM_STORE_SCHEMA = "twinr_memory_midterm_store"
 _MIDTERM_STORE_VERSION = 1
 _DEFAULT_RETRIEVAL_LIMIT = 3
+_CROSS_SERVICE_READ_MODE = 0o644
 
 # AUDIT-FIX(#8): Add module-level logging so storage recovery paths are diagnosable in production.
 LOGGER = logging.getLogger(__name__)
@@ -172,10 +173,12 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
             temp_name = handle.name
             handle.write(serialized)
             handle.flush()
+            os.fchmod(handle.fileno(), _CROSS_SERVICE_READ_MODE)
             # AUDIT-FIX(#1): Flush file contents before replace so sudden power loss is less likely to drop state.
             os.fsync(handle.fileno())
 
         os.replace(temp_name, path)
+        os.chmod(path, _CROSS_SERVICE_READ_MODE)
         temp_name = None
         # AUDIT-FIX(#1): Flush the directory entry so the rename itself is durable on Linux-class filesystems.
         _fsync_directory(path.parent)

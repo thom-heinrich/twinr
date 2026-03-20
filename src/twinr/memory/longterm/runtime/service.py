@@ -9,13 +9,13 @@ coordinates those pieces without owning their algorithms.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field  # AUDIT-FIX(#10): keep 3.11-safe dataclass field support for bounded defaults and locks.
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any  # AUDIT-FIX(#12): make fallback return types explicit and 3.11-safe.
+from typing import TYPE_CHECKING, Any  # AUDIT-FIX(#12): make fallback return types explicit and 3.11-safe.
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # AUDIT-FIX(#9): normalize naive/aware datetimes into the configured local timezone.
 import json
 import logging
@@ -23,7 +23,9 @@ import math
 import threading
 import time
 
+from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.workflows.forensics import workflow_event, workflow_span
 from twinr.memory.longterm.ingestion.backfill import (
     LongTermOpsBackfillRunResult,
     LongTermOpsEventBackfiller,
@@ -67,6 +69,10 @@ from twinr.memory.longterm.reasoning.truth import LongTermTruthMaintainer
 from twinr.memory.longterm.runtime.flush_budget import build_flush_budget_plan
 from twinr.memory.longterm.runtime.health import LongTermRemoteHealthProbe, LongTermRemoteWarmResult
 from twinr.memory.longterm.runtime.worker import AsyncLongTermMemoryWriter, AsyncLongTermMultimodalWriter
+
+if TYPE_CHECKING:
+    from twinr.agent.personality.intelligence import WorldIntelligenceConfigRequest
+    from twinr.agent.personality.learning import PersonalityLearningService
 
 
 logger = logging.getLogger(__name__)
@@ -124,6 +130,42 @@ def _coerce_timeout_s(value: object, *, default: float) -> float:
     if not math.isfinite(result) or result < 0:
         return default
     return result
+
+
+def _writer_state_details(writer: object | None) -> dict[str, object] | None:
+    """Return a bounded diagnostic snapshot for one async long-term writer."""
+
+    if writer is None:
+        return None
+    snapshot = getattr(writer, "snapshot_state", None)
+    if not callable(snapshot):
+        return None
+    try:
+        state = snapshot()
+    except Exception as exc:
+        return {"snapshot_error": type(exc).__name__}
+    return {
+        "worker_name": getattr(state, "worker_name", None),
+        "pending_count": getattr(state, "pending_count", None),
+        "inflight_count": getattr(state, "inflight_count", None),
+        "dropped_count": getattr(state, "dropped_count", None),
+        "last_error_message": getattr(state, "last_error_message", None),
+        "accepting": getattr(state, "accepting", None),
+        "worker_alive": getattr(state, "worker_alive", None),
+    }
+
+
+def _context_details(context: LongTermMemoryContext) -> dict[str, object]:
+    """Summarize which context sections were present for one turn."""
+
+    return {
+        "has_subtext_context": bool(getattr(context, "subtext_context", None)),
+        "has_midterm_context": bool(getattr(context, "midterm_context", None)),
+        "has_durable_context": bool(getattr(context, "durable_context", None)),
+        "has_episodic_context": bool(getattr(context, "episodic_context", None)),
+        "has_graph_context": bool(getattr(context, "graph_context", None)),
+        "has_conflict_context": bool(getattr(context, "conflict_context", None)),
+    }
 
 
 @lru_cache(maxsize=16)
@@ -329,6 +371,7 @@ class LongTermMemoryService:
     proactive_policy: LongTermProactivePolicy
     retention_policy: LongTermRetentionPolicy
     restart_recall_policy_compiler: LongTermRestartRecallPolicyCompiler | None = None
+    personality_learning: PersonalityLearningService | None = None
     writer: AsyncLongTermMemoryWriter | None = None
     multimodal_writer: AsyncLongTermMultimodalWriter | None = None
     _store_lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)  # AUDIT-FIX(#1): serialize file-backed state mutations across foreground calls and background workers.
@@ -373,10 +416,17 @@ class LongTermMemoryService:
             config=config,
             state_store=proactive_state_store,
         )
+        remote_state = getattr(store.memory_store, "remote_state", None)
         retention_policy = LongTermRetentionPolicy(
             timezone_name=config.local_timezone_name,
             mode=config.long_term_memory_retention_mode,
             archive_enabled=config.long_term_memory_archive_enabled,
+        )
+        from twinr.agent.personality.learning import PersonalityLearningService
+
+        personality_learning = PersonalityLearningService.from_config(
+            config,
+            remote_state=remote_state,
         )
         subtext_builder = LongTermSubtextBuilder(
             config=config,
@@ -417,6 +467,7 @@ class LongTermMemoryService:
                     reflector=reflector,
                     sensor_memory=sensor_memory,
                     retention_policy=retention_policy,
+                    personality_learning=personality_learning,
                     store_lock=store_lock,
                     timezone_name=config.local_timezone_name,
                     item=item,
@@ -458,6 +509,7 @@ class LongTermMemoryService:
             proactive_policy=proactive_policy,
             retention_policy=retention_policy,
             restart_recall_policy_compiler=LongTermRestartRecallPolicyCompiler(),
+            personality_learning=personality_learning,
             writer=writer,
             multimodal_writer=multimodal_writer,
             _store_lock=store_lock,
@@ -633,11 +685,19 @@ class LongTermMemoryService:
         """Warm remote-backed read caches for the first foreground text turn.
 
         This keeps startup strictly query-agnostic and bounded. Remote object
-        and conflict retrieval now uses one-shot scope queries on demand, so
-        channel startup must not block on hydrating current remote catalogs.
+        and conflict retrieval can reuse the current remote catalog projection
+        when it is already cached, so channel startup primes those small
+        indexes once and leaves larger payload hydration query-driven.
         """
         with self._store_lock:
             with self._temporary_remote_probe_cache():
+                remote_catalog = getattr(getattr(self, "object_store", None), "_remote_catalog", None)
+                load_catalog_entries = getattr(remote_catalog, "load_catalog_entries", None)
+                if callable(load_catalog_entries):
+                    with workflow_span(name="longterm_prewarm_object_catalog", kind="cache"):
+                        load_catalog_entries(snapshot_kind="objects")
+                    with workflow_span(name="longterm_prewarm_conflict_catalog", kind="cache"):
+                        load_catalog_entries(snapshot_kind="conflicts")
                 load_packets = getattr(self.midterm_store, "load_packets", None)
                 if callable(load_packets):
                     load_packets()
@@ -662,12 +722,42 @@ class LongTermMemoryService:
 
         try:
             query = self.query_rewriter.profile(query_text)
-            with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
+            writer_details = _writer_state_details(getattr(self, "writer", None))
+            multimodal_writer_details = _writer_state_details(getattr(self, "multimodal_writer", None))
+            with workflow_span(
+                name="longterm_service_build_provider_context",
+                kind="retrieval",
+                details={
+                    "query_present": bool(str(query_text or "").strip()),
+                    "conversation_writer": writer_details,
+                    "multimodal_writer": multimodal_writer_details,
+                },
+            ):
+                workflow_event(
+                    kind="branch",
+                    msg="longterm_provider_context_shared_lock_skipped",
+                    details={
+                        "lock_used": False,
+                        "conversation_writer": writer_details,
+                        "multimodal_writer": multimodal_writer_details,
+                    },
+                )
                 with self._temporary_remote_probe_cache():
-                    return self.retriever.build_context(
-                        query=query,
-                        original_query_text=query_text,
-                    )
+                    with workflow_span(
+                        name="longterm_service_provider_context_retrieval",
+                        kind="retrieval",
+                        details={"query_present": bool(str(query_text or "").strip())},
+                    ):
+                        context = self.retriever.build_context(
+                            query=query,
+                            original_query_text=query_text,
+                        )
+                workflow_event(
+                    kind="retrieval",
+                    msg="longterm_provider_context_built",
+                    details=_context_details(context),
+                )
+                return context
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
@@ -691,7 +781,26 @@ class LongTermMemoryService:
 
         try:
             query = self.query_rewriter.profile(query_text)
-            with self._store_lock:  # AUDIT-FIX(#1): serialize shared file-backed reads and writes against concurrent background workers.
+            writer_details = _writer_state_details(getattr(self, "writer", None))
+            multimodal_writer_details = _writer_state_details(getattr(self, "multimodal_writer", None))
+            with workflow_span(
+                name="longterm_service_build_tool_provider_context",
+                kind="retrieval",
+                details={
+                    "query_present": bool(str(query_text or "").strip()),
+                    "conversation_writer": writer_details,
+                    "multimodal_writer": multimodal_writer_details,
+                },
+            ):
+                workflow_event(
+                    kind="branch",
+                    msg="longterm_tool_provider_context_shared_lock_skipped",
+                    details={
+                        "lock_used": False,
+                        "conversation_writer": writer_details,
+                        "multimodal_writer": multimodal_writer_details,
+                    },
+                )
                 with self._temporary_remote_probe_cache():
                     context = self.retriever.build_context(
                         query=query,
@@ -730,7 +839,7 @@ class LongTermMemoryService:
                         )
                         and item.memory_id not in conflicting_memory_ids
                     )
-                    return LongTermMemoryContext(
+                    tool_context = LongTermMemoryContext(
                         subtext_context=context.subtext_context,
                         midterm_context=context.midterm_context,
                         durable_context=self.retriever._render_durable_context(filtered_durable_objects),
@@ -741,6 +850,12 @@ class LongTermMemoryService:
                         ),
                         conflict_context=None,
                     )
+                workflow_event(
+                    kind="retrieval",
+                    msg="longterm_tool_provider_context_built",
+                    details=_context_details(tool_context),
+                )
+                return tool_context
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
@@ -795,11 +910,48 @@ class LongTermMemoryService:
                 reflector=self.reflector,
                 sensor_memory=self.sensor_memory,
                 retention_policy=self.retention_policy,
+                personality_learning=self.personality_learning,
                 store_lock=self._store_lock,
                 timezone_name=self.config.local_timezone_name,
                 item=item,
             )
             return None
+
+    def record_personality_tool_history(
+        self,
+        *,
+        tool_calls: Sequence[AgentToolCall],
+        tool_results: Sequence[AgentToolResult],
+    ) -> None:
+        """Record structured tool-history signals for personality learning."""
+
+        if self.personality_learning is None:
+            return
+        normalized_tool_calls = tuple(tool_calls)
+        normalized_tool_results = tuple(tool_results)
+        if not normalized_tool_calls and not normalized_tool_results:
+            return
+        with self._store_lock:
+            self.personality_learning.record_tool_history(
+                tool_calls=normalized_tool_calls,
+                tool_results=normalized_tool_results,
+            )
+
+    def configure_world_intelligence(
+        self,
+        *,
+        request: WorldIntelligenceConfigRequest,
+        search_backend: object | None = None,
+    ):
+        """Apply one explicit RSS/world-intelligence configuration change."""
+
+        if self.personality_learning is None:
+            raise RuntimeError("personality learning is not configured")
+        with self._store_lock:
+            return self.personality_learning.configure_world_intelligence(
+                request=request,
+                search_backend=search_backend,
+            )
 
     def analyze_conversation_turn(
         self,
@@ -893,7 +1045,11 @@ class LongTermMemoryService:
             return None
 
     # AUDIT-FIX(#4): persist sensor-memory midterm packets everywhere reflection results are applied.
-    def run_reflection(self) -> LongTermReflectionResultV1:
+    def run_reflection(
+        self,
+        *,
+        search_backend: object | None = None,
+    ) -> LongTermReflectionResultV1:
         """Run object reflection plus sensor-memory summaries over stored state.
 
         Returns:
@@ -915,12 +1071,18 @@ class LongTermMemoryService:
                 if self._has_reflection_payload(sensor_memory_result):
                     self.object_store.apply_reflection(sensor_memory_result)
                     self.midterm_store.apply_reflection(sensor_memory_result)
-                    return LongTermReflectionResultV1(
+                    combined_result = LongTermReflectionResultV1(
                         reflected_objects=tuple((*result.reflected_objects, *sensor_memory_result.reflected_objects)),
                         created_summaries=tuple((*result.created_summaries, *sensor_memory_result.created_summaries)),
                         midterm_packets=tuple((*result.midterm_packets, *sensor_memory_result.midterm_packets)),
                     )
-                return result
+                else:
+                    combined_result = result
+                if self.personality_learning is not None:
+                    self.personality_learning.maybe_refresh_world_intelligence(
+                        search_backend=search_backend,
+                    )
+                return combined_result
         except LongTermRemoteUnavailableError:
             raise
         except Exception:
@@ -1520,6 +1682,7 @@ class LongTermMemoryService:
         reflector: LongTermMemoryReflector,
         sensor_memory: LongTermSensorMemoryCompiler,
         retention_policy: LongTermRetentionPolicy,
+        personality_learning: PersonalityLearningService | None = None,
         store_lock: threading.RLock | None = None,
         timezone_name: str | None = None,
         item: LongTermConversationTurn,
@@ -1606,6 +1769,11 @@ class LongTermMemoryService:
                         midterm_store.apply_reflection(sensor_reflection)
                 except Exception:
                     logger.exception("Midterm-store update failed after conversation-turn snapshot commit.")
+                if personality_learning is not None:
+                    personality_learning.record_conversation_consolidation(
+                        turn=item,
+                        consolidation=result,
+                    )
                 if config.long_term_memory_mode == "remote_primary":
                     return None
         except LongTermRemoteUnavailableError:

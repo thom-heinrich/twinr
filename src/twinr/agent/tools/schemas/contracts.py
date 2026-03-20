@@ -1237,6 +1237,83 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 },
             }
         )
+    if "configure_world_intelligence" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "configure_world_intelligence",
+                "description": (
+                    "Manage Twinr's ongoing RSS or Atom sources for calm place and world awareness. "
+                    "Use this to list, subscribe, discover, deactivate, or force-refresh feed subscriptions. "
+                    "Do not use it for ordinary one-off live questions; use it only for installer setup, explicit source changes, "
+                    "or occasional recalibration of Twinr's ongoing world-intelligence sources."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": _string_property(
+                            "Which world-intelligence action to run.",
+                            enum=["list", "subscribe", "discover", "deactivate", "refresh_now"],
+                        ),
+                        "query": _string_property(
+                            "Optional discovery query that asks the live web backend to find source pages exposing RSS or Atom feeds.",
+                            min_length=1,
+                        ),
+                        "label": _string_property(
+                            "Optional short label such as Hamburg local politics or Germany energy policy.",
+                            min_length=1,
+                        ),
+                        "location_hint": _string_property(
+                            "Optional city, district, or region that should guide feed discovery or labeling.",
+                            min_length=1,
+                        ),
+                        "region": _string_property(
+                            "Optional region name that should be stored with the subscription and later world signals.",
+                            min_length=1,
+                        ),
+                        "topics": _array_property(
+                            "Optional recurring topics this subscription should cover.",
+                            _string_property("Topic label.", min_length=1),
+                            unique_items=True,
+                        ),
+                        "feed_urls": _array_property(
+                            "Optional explicit RSS or Atom feed URLs to subscribe or deactivate.",
+                            _string_property("Feed URL.", min_length=1),
+                            unique_items=True,
+                        ),
+                        "subscription_refs": _array_property(
+                            "Optional subscription ids to deactivate.",
+                            _string_property("Subscription id.", min_length=1),
+                            unique_items=True,
+                        ),
+                        "scope": _string_property(
+                            "Optional world-awareness scope for new subscriptions.",
+                            enum=["local", "regional", "national", "global", "topic"],
+                        ),
+                        "priority": _number_property(
+                            "Optional salience/priority weight for the subscription between 0 and 1.",
+                            minimum=0.0,
+                            maximum=1.0,
+                        ),
+                        "refresh_interval_hours": _number_property(
+                            "Optional refresh cadence in hours. Keep this calm and infrequent; not less than 24.",
+                            minimum=24.0,
+                        ),
+                        "auto_subscribe": _boolean_property(
+                            "For discover, set true if discovered feed URLs should be persisted immediately."
+                        ),
+                        "refresh_after_change": _boolean_property(
+                            "Set true if Twinr should refresh the subscribed feeds immediately after the change."
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this persistent source change when extra confirmation is needed."
+                        ),
+                    },
+                    "required": ["action"],
+                    "additionalProperties": False,
+                },
+            }
+        )
     if "update_simple_setting" in available:
         tools.append(
             {

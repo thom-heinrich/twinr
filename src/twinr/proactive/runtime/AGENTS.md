@@ -20,7 +20,8 @@ Out of scope:
 - `portrait_match.py` — conservative runtime claim for local portrait-match observations and temporal identity evidence
 - `known_user_hint.py` — conservative known-user hint from voice-profile state plus optional temporal identity-fusion evidence and clear room context
 - `affect_proxy.py` — prompt-only affect proxy surface from coarse posture, attention, and quiet cues
-- `display_attention.py` — conservative proactive producer that steers HDMI eye gaze toward the visible primary person without overwriting foreign face cues, plus the bounded local refresh policy for responsive follow behavior
+- `attention_targeting.py` — bounded multimodal attention-target prioritization over camera anchor, speaker association, showing intent, and short-lived session focus memory
+- `display_attention.py` — conservative proactive producer that steers HDMI eye gaze toward the currently relevant visible person without overwriting foreign face cues, while keeping normal follow behavior horizontal-only and renewing matching cues before they expire
 - `claim_metadata.py` — shared `confidence` / `source` / `requires_confirmation` helpers for runtime claims
 - `speaker_association.py` — conservative speaker-to-camera-anchor association for the single-primary-person case
 - `multimodal_initiative.py` — confidence-bearing display-first/skip gate for later proactive behavior
@@ -38,8 +39,11 @@ Out of scope:
 - `known_user_hint` must stay weaker than identity even when temporal portrait evidence is strong, and may only clear calm personalization; sensitive behavior still needs confirmation or stronger gates.
 - `identity_fusion` may use presence-session memory, enrolled household-voice candidates, and visual-anchor history, but it must stay confirm-first and fail closed on ambiguity or modality conflict.
 - `affect_proxy` must never emit emotion, wellbeing, or diagnosis claims; it may only support prompt-only follow-up cues.
+- `attention_targeting.py` may prioritize the latest visible speaker, showing-intent person, or short-lived session focus, but it must not invent per-person identity or private routing in multi-person scenes, and it must not spend the reserved up/down "thoughtful" body-language poses on ordinary person-following.
 - `display_attention.py` may only publish its own `proactive_attention_follow` face cues and must fail closed when another display producer currently owns the cue store.
+- Matching `display_attention.py` cues must refresh their TTL before expiry so a stable visible-person target does not fall back to center between local attention-refresh ticks.
 - The fast HDMI attention-refresh path must stay local-camera-only, bounded, and separate from full proactive trigger evaluation; do not turn it into an always-on generic vision loop.
+- The fast HDMI attention-refresh path may stay active while the main runtime is in `error`, but only for local face-cue following; it must not be used to re-enable agent turns, remote-memory work, or other degraded runtime behavior.
 - Speaker association and multimodal initiative must fail closed on multi-person or low-confidence room context; do not let weak audio hints force spoken proactivity.
 - `ProactiveMonitorService` lifecycle must remain idempotent, bounded, and safe under partial startup or shutdown failure.
 - `build_default_proactive_monitor()` must not start an inert monitor when no operational sensor path exists.

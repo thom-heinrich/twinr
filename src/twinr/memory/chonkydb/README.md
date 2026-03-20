@@ -8,6 +8,7 @@ used by Twinr's long-term memory flows.
 
 `chonkydb` owns:
 - call the ChonkyDB external API through a validated client boundary
+- keep that client on a pooled, redirect-fail-closed transport so repeated Pi memory reads/writes do not pay a fresh DNS/TLS setup every call
 - define typed request and response models for record, retrieve, and graph endpoints
 - expose a one-shot `topk_records` retrieval contract that returns structured payloads from ChonkyDB in a single roundtrip
 - carry Twinr's `namespace + scope_ref` contract for current-snapshot retrieval so server-side scope resolution can replace oversized client allowlists

@@ -48,6 +48,7 @@ _ARCHIVE_STORE_MANIFEST_SCHEMA = "twinr_memory_archive_store_manifest"
 _ARCHIVE_STORE_SHARD_SCHEMA = "twinr_memory_archive_store_shard"
 _SNAPSHOT_WRITTEN_AT_KEY = "written_at"
 _MIN_AWARE_DATETIME = datetime.min.replace(tzinfo=timezone.utc)
+_CROSS_SERVICE_READ_MODE = 0o644
 
 _LOG = logging.getLogger(__name__)
 
@@ -134,9 +135,11 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
         ) as handle:
             handle.write(serialized)
             handle.flush()
+            os.fchmod(handle.fileno(), _CROSS_SERVICE_READ_MODE)
             os.fsync(handle.fileno())
             temp_path = Path(handle.name)
         temp_path.replace(path)
+        os.chmod(path, _CROSS_SERVICE_READ_MODE)
         _fsync_directory(path.parent)  # AUDIT-FIX(#1): Fsync the parent directory so the atomic rename survives power loss / sudden reboot.
     except Exception:
         if temp_path is not None:
@@ -971,6 +974,13 @@ class LongTermStructuredStore:
             return None
         bounded_limit = max(1, limit)
         clean_query = _normalize_text(query_text)
+        try:
+            if remote_catalog.catalog_item_count(snapshot_kind="conflicts") == 0:
+                return ()
+        except Exception:
+            if self._remote_is_required():
+                raise
+            return None
         if not clean_query:
             try:
                 if not remote_catalog.catalog_available(snapshot_kind="conflicts"):
@@ -1626,6 +1636,113 @@ class LongTermStructuredStore:
                 objects_by_id=objects_by_id,
             )
 
+    def select_relevant_context_objects(
+        self,
+        *,
+        query_text: str | None,
+        episodic_limit: int,
+        durable_limit: int,
+    ) -> tuple[tuple[LongTermMemoryObjectV1, ...], tuple[LongTermMemoryObjectV1, ...]]:
+        """Select episodic and durable objects from one shared query pass.
+
+        Provider-context assembly needs both sections for the same user query.
+        Running two independent remote searches makes the Pi pay the same
+        ChonkyDB roundtrip twice, so this helper ranks one shared object window
+        and then partitions it into episodic and durable sections.
+        """
+
+        resolved_episodic_limit = max(0, int(episodic_limit))
+        resolved_durable_limit = max(0, int(durable_limit))
+        if resolved_episodic_limit <= 0 and resolved_durable_limit <= 0:
+            return (), ()
+
+        clean_query = _normalize_text(query_text)
+        if not clean_query:
+            return (), ()
+
+        remote_catalog = self._remote_catalog
+        shared_limit = self._shared_context_object_limit(
+            episodic_limit=resolved_episodic_limit,
+            durable_limit=resolved_durable_limit,
+        )
+        retry_limit = max(resolved_episodic_limit, resolved_durable_limit, 1)
+        if self._remote_catalog_enabled() and remote_catalog is not None:
+            attempted_limits: list[int] = []
+            for candidate_limit in (shared_limit, retry_limit):
+                if candidate_limit in attempted_limits:
+                    continue
+                attempted_limits.append(candidate_limit)
+                try:
+                    direct_payloads = remote_catalog.search_current_item_payloads(
+                        snapshot_kind="objects",
+                        query_text=clean_query,
+                        limit=candidate_limit,
+                    )
+                except Exception:
+                    if self._remote_is_required():
+                        raise
+                    direct_payloads = None
+                if direct_payloads is None:
+                    continue
+                shared_objects = self._load_remote_objects_from_payloads(payloads=direct_payloads)
+                return self._partition_context_objects(
+                    query_text=clean_query,
+                    objects=shared_objects,
+                    episodic_limit=resolved_episodic_limit,
+                    durable_limit=resolved_durable_limit,
+                )
+            try:
+                if not remote_catalog.catalog_available(snapshot_kind="objects"):
+                    return (), ()
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                return (), ()
+            entries = remote_catalog.search_catalog_entries(
+                snapshot_kind="objects",
+                query_text=clean_query,
+                limit=shared_limit,
+            )
+            shared_objects = self._load_remote_objects_from_entries(
+                entries=entries,
+                snapshot_kind="objects",
+            )
+            return self._partition_context_objects(
+                query_text=clean_query,
+                objects=shared_objects,
+                episodic_limit=resolved_episodic_limit,
+                durable_limit=resolved_durable_limit,
+            )
+
+        with self._lock:  # AUDIT-FIX(#3): Keep local fallback retrieval consistent with concurrent writes.
+            objects = tuple(
+                sorted(
+                    (
+                        item
+                        for item in self.load_objects()
+                        if item.status in {"active", "candidate", "uncertain"}
+                    ),
+                    key=lambda item: (
+                        _coerce_aware_utc(item.updated_at),
+                        _coerce_aware_utc(item.created_at),
+                        item.memory_id,
+                    ),
+                    reverse=True,
+                )
+            )
+            if not objects:
+                return (), ()
+            selector = self._object_selector(objects)
+            selected_ids = selector.search(clean_query, limit=shared_limit)
+            by_id = {item.memory_id: item for item in objects}
+            selected = tuple(by_id[memory_id] for memory_id in selected_ids if memory_id in by_id)
+            return self._partition_context_objects(
+                query_text=clean_query,
+                objects=selected,
+                episodic_limit=resolved_episodic_limit,
+                durable_limit=resolved_durable_limit,
+            )
+
     def _load_memory_objects_from_payload(
         self,
         payload: dict[str, object] | None,
@@ -1818,6 +1935,64 @@ class LongTermStructuredStore:
             reverse=True,
         )
         return tuple(item for _index, item in ranked[:bounded_limit])
+
+    def _shared_context_object_limit(
+        self,
+        *,
+        episodic_limit: int,
+        durable_limit: int,
+    ) -> int:
+        """Choose one ranked candidate window for shared context-object search."""
+
+        max_limit = max(episodic_limit, durable_limit, 1)
+        return max(12, max_limit * 4)
+
+    def _partition_context_objects(
+        self,
+        *,
+        query_text: str,
+        objects: Iterable[LongTermMemoryObjectV1],
+        episodic_limit: int,
+        durable_limit: int,
+    ) -> tuple[tuple[LongTermMemoryObjectV1, ...], tuple[LongTermMemoryObjectV1, ...]]:
+        """Split one shared ranked object pool into episodic and durable sections."""
+
+        eligible_objects = tuple(
+            item
+            for item in objects
+            if item.status in {"active", "candidate", "uncertain"}
+        )
+        episodic_candidates = [item for item in eligible_objects if item.kind == "episode"]
+        durable_candidates = [item for item in eligible_objects if item.kind != "episode"]
+        episodic_filtered = self._filter_query_relevant_objects(
+            query_text,
+            selected=episodic_candidates,
+            limit=max(episodic_limit, 1),
+        )
+        durable_filtered = self._filter_query_relevant_objects(
+            query_text,
+            selected=durable_candidates,
+            limit=max(durable_limit, 1),
+        )
+        episodic_ranked = (
+            self.rank_selected_objects(
+                query_texts=(query_text,),
+                objects=episodic_filtered,
+                limit=episodic_limit,
+            )
+            if episodic_limit > 0
+            else ()
+        )
+        durable_ranked = (
+            self.rank_selected_objects(
+                query_texts=(query_text,),
+                objects=durable_filtered,
+                limit=durable_limit,
+            )
+            if durable_limit > 0
+            else ()
+        )
+        return episodic_ranked, durable_ranked
 
     def _object_search_text(self, item: LongTermMemoryObjectV1) -> str:
         parts = [

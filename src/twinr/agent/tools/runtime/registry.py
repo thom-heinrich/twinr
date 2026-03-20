@@ -38,6 +38,7 @@ _REALTIME_TOOL_BINDINGS: tuple[tuple[str, str], ...] = (
     ("remember_plan", "handle_remember_plan"),
     ("update_user_profile", "handle_update_user_profile"),
     ("update_personality", "handle_update_personality"),
+    ("configure_world_intelligence", "handle_configure_world_intelligence"),
     ("update_simple_setting", "handle_update_simple_setting"),
     ("enroll_voice_profile", "handle_enroll_voice_profile"),
     ("get_voice_profile_status", "handle_get_voice_profile_status"),

@@ -8,10 +8,12 @@ StartLimitIntervalSec=0
 Type=simple
 User=thh
 WorkingDirectory=/twinr
-Environment=TWINR_PYTHON=/twinr/.venv/bin/python
-ExecStart=/usr/bin/env bash -lc 'cd /twinr && PYTHONPATH=src "${TWINR_PYTHON}" -m twinr --env-file .env --run-whatsapp-channel'
+Environment=PYTHONPATH=src
+ExecStart=/twinr/.venv/bin/python -m twinr --env-file .env --run-whatsapp-channel
 Restart=always
 RestartSec=2
+KillSignal=SIGINT
+SuccessExitStatus=130 143
 TimeoutStopSec=30
 KillMode=control-group
 StandardOutput=journal

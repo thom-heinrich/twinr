@@ -34,6 +34,8 @@ files:
     role: Install the XVF3800 udev rule so the runtime user can read libusb host-control without sudo
   - path: ops/bootstrap_self_coding_pi.py
     role: Reproducibly sync the pinned self-coding Codex bridge/auth to the Pi and run the remote readiness self-test
+  - path: ops/install_whatsapp_node_runtime.py
+    role: Download, verify, and stage the pinned local Node.js runtime under state/tools for the WhatsApp Baileys worker
   - path: ops/twinr-runtime-supervisor.service
     role: Authoritatively supervise the productive streaming loop plus remote watchdog on the Pi
   - path: piaicam/fetch_mediapipe_models.py

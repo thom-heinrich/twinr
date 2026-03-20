@@ -20,6 +20,7 @@ from threading import RLock
 from typing import Any, Sequence
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.workflows.forensics import workflow_event, workflow_span
 from twinr.llm_json import request_structured_json_object
 from twinr.memory.chonkydb.personal_graph import TwinrPersonalGraphStore
 from twinr.memory.context_store import PersistentMemoryEntry
@@ -419,75 +420,99 @@ class LongTermSubtextCompiler:
             fails validation.
         """
 
-        if self.backend is None:
-            return None
-
-        prompt_string_max_chars = _get_config_int(
-            self.config,
-            "long_term_memory_subtext_max_input_chars",
-            _DEFAULT_PROMPT_STRING_MAX_CHARS,
-            minimum=64,
-            maximum=4000,
-        )
-        collection_max_items = _get_config_int(
-            self.config,
-            "long_term_memory_subtext_max_payload_items",
-            _DEFAULT_COLLECTION_MAX_ITEMS,
-            minimum=1,
-            maximum=256,
-        )
-
-        safe_query_text = _normalize_free_text(query_text, max_chars=prompt_string_max_chars)
-        safe_retrieval_query_text = _normalize_free_text(retrieval_query_text, max_chars=prompt_string_max_chars)
-
-        payload: dict[str, object] = {}
-        safe_graph_payload = _sanitize_structured_dict(
-            graph_payload,
-            string_max_chars=prompt_string_max_chars,
-            collection_max_items=collection_max_items,
-        )
-        if safe_graph_payload:
-            payload["graph_cues"] = safe_graph_payload
-        safe_recent_threads = _sanitize_structured_value(
-            list(recent_threads),
-            string_max_chars=prompt_string_max_chars,
-            collection_max_items=collection_max_items,
-        )
-        if isinstance(safe_recent_threads, list) and safe_recent_threads:
-            payload["recent_threads"] = safe_recent_threads
-        if not payload:
-            return None
-
-        cache_key = _safe_json_dumps(
-            {
-                "query": safe_query_text,
-                "retrieval_query": safe_retrieval_query_text,
-                "payload": payload,
+        with workflow_span(
+            name="longterm_subtext_compiler_compile",
+            kind="llm_call",
+            details={
+                "backend_enabled": self.backend is not None,
+                "recent_threads": len(recent_threads),
+                "has_graph_payload": bool(graph_payload),
             },
-            sort_keys=True,
-            string_max_chars=prompt_string_max_chars,
-            collection_max_items=collection_max_items,
-        )
-        cached = self._cache_get(cache_key)
-        if cached is not None:
-            return cached
+        ):
+            if self.backend is None:
+                return None
 
-        pending = self._ensure_pending_compile(
-            cache_key=cache_key,
-            query_text=safe_query_text,
-            retrieval_query_text=safe_retrieval_query_text,
-            payload=payload,
-            prompt_string_max_chars=prompt_string_max_chars,
-            collection_max_items=collection_max_items,
-        )
-        if pending is None:
-            return None
-        self._await_pending_compile(
-            cache_key=cache_key,
-            future=pending,
-            timeout_s=_DEFAULT_COMPILER_IMMEDIATE_WAIT_S,
-        )
-        return self._cache_get(cache_key)
+            prompt_string_max_chars = _get_config_int(
+                self.config,
+                "long_term_memory_subtext_max_input_chars",
+                _DEFAULT_PROMPT_STRING_MAX_CHARS,
+                minimum=64,
+                maximum=4000,
+            )
+            collection_max_items = _get_config_int(
+                self.config,
+                "long_term_memory_subtext_max_payload_items",
+                _DEFAULT_COLLECTION_MAX_ITEMS,
+                minimum=1,
+                maximum=256,
+            )
+
+            safe_query_text = _normalize_free_text(query_text, max_chars=prompt_string_max_chars)
+            safe_retrieval_query_text = _normalize_free_text(retrieval_query_text, max_chars=prompt_string_max_chars)
+
+            payload: dict[str, object] = {}
+            safe_graph_payload = _sanitize_structured_dict(
+                graph_payload,
+                string_max_chars=prompt_string_max_chars,
+                collection_max_items=collection_max_items,
+            )
+            if safe_graph_payload:
+                payload["graph_cues"] = safe_graph_payload
+            safe_recent_threads = _sanitize_structured_value(
+                list(recent_threads),
+                string_max_chars=prompt_string_max_chars,
+                collection_max_items=collection_max_items,
+            )
+            if isinstance(safe_recent_threads, list) and safe_recent_threads:
+                payload["recent_threads"] = safe_recent_threads
+            if not payload:
+                workflow_event(
+                    kind="branch",
+                    msg="longterm_subtext_compiler_empty_payload",
+                    details={"recent_threads": len(recent_threads), "has_graph_payload": bool(graph_payload)},
+                )
+                return None
+
+            cache_key = _safe_json_dumps(
+                {
+                    "query": safe_query_text,
+                    "retrieval_query": safe_retrieval_query_text,
+                    "payload": payload,
+                },
+                sort_keys=True,
+                string_max_chars=prompt_string_max_chars,
+                collection_max_items=collection_max_items,
+            )
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                workflow_event(
+                    kind="cache",
+                    msg="longterm_subtext_compiler_cache_hit",
+                    details={"recent_threads": len(recent_threads), "has_graph_payload": bool(graph_payload)},
+                )
+                return cached
+
+            pending = self._ensure_pending_compile(
+                cache_key=cache_key,
+                query_text=safe_query_text,
+                retrieval_query_text=safe_retrieval_query_text,
+                payload=payload,
+                prompt_string_max_chars=prompt_string_max_chars,
+                collection_max_items=collection_max_items,
+            )
+            if pending is None:
+                return None
+            with workflow_span(
+                name="longterm_subtext_compiler_await_pending",
+                kind="queue",
+                details={"immediate_wait_s": _DEFAULT_COMPILER_IMMEDIATE_WAIT_S},
+            ):
+                self._await_pending_compile(
+                    cache_key=cache_key,
+                    future=pending,
+                    timeout_s=_DEFAULT_COMPILER_IMMEDIATE_WAIT_S,
+                )
+            return self._cache_get(cache_key)
 
     def _ensure_pending_compile(
         self,
@@ -738,69 +763,120 @@ class LongTermSubtextBuilder:
             available.
         """
 
-        safe_query_text = _normalize_query_text(query_text)
-        effective_retrieval_query = _normalize_query_text(retrieval_query_text) or safe_query_text
+        with workflow_span(
+            name="longterm_subtext_build",
+            kind="retrieval",
+            details={
+                "episodic_entries": len(episodic_entries),
+                "compiler_enabled": self.compiler is not None,
+            },
+        ):
+            safe_query_text = _normalize_query_text(query_text)
+            effective_retrieval_query = _normalize_query_text(retrieval_query_text) or safe_query_text
 
-        payload_string_max_chars = _get_config_int(
-            self.config,
-            "long_term_memory_subtext_max_input_chars",
-            _DEFAULT_PROMPT_STRING_MAX_CHARS,
-            minimum=64,
-            maximum=4000,
-        )
-        payload_collection_max_items = _get_config_int(
-            self.config,
-            "long_term_memory_subtext_max_payload_items",
-            _DEFAULT_COLLECTION_MAX_ITEMS,
-            minimum=1,
-            maximum=256,
-        )
-
-        graph_payload: dict[str, object] | None = None
-        try:
-            # AUDIT-FIX(#6): Use a normalized effective retrieval query and degrade cleanly if the graph store is unavailable or corrupted.
-            raw_graph_payload = self.graph_store.build_subtext_payload(effective_retrieval_query)
-        except Exception:
-            _LOGGER.exception("Long-term graph subtext payload build failed; continuing without graph cues.")
-        else:
-            graph_payload = _sanitize_structured_dict(
-                raw_graph_payload,
-                string_max_chars=payload_string_max_chars,
-                collection_max_items=payload_collection_max_items,
+            payload_string_max_chars = _get_config_int(
+                self.config,
+                "long_term_memory_subtext_max_input_chars",
+                _DEFAULT_PROMPT_STRING_MAX_CHARS,
+                minimum=64,
+                maximum=4000,
+            )
+            payload_collection_max_items = _get_config_int(
+                self.config,
+                "long_term_memory_subtext_max_payload_items",
+                _DEFAULT_COLLECTION_MAX_ITEMS,
+                minimum=1,
+                maximum=256,
             )
 
-        recent_threads = self._episodic_threads(episodic_entries)
-        if not graph_payload and not recent_threads:
-            return None
+            graph_payload: dict[str, object] | None = None
+            with workflow_span(name="longterm_subtext_graph_payload", kind="retrieval"):
+                try:
+                    # AUDIT-FIX(#6): Use a normalized effective retrieval query and degrade cleanly if the graph store is unavailable or corrupted.
+                    raw_graph_payload = self.graph_store.build_subtext_payload(effective_retrieval_query)
+                except Exception:
+                    _LOGGER.exception("Long-term graph subtext payload build failed; continuing without graph cues.")
+                else:
+                    graph_payload = _sanitize_structured_dict(
+                        raw_graph_payload,
+                        string_max_chars=payload_string_max_chars,
+                        collection_max_items=payload_collection_max_items,
+                    )
 
-        compiled_program = None
-        if self.compiler is not None:
-            compiled_program = self.compiler.compile(
-                query_text=safe_query_text,
-                retrieval_query_text=effective_retrieval_query,
-                graph_payload=graph_payload,
-                recent_threads=recent_threads,
-            )
-        if compiled_program is not None:
-            directive_lines = self._render_compiled_directives(compiled_program)
-            payload: dict[str, object] = {
-                "schema": _COMPILED_PROGRAM_SCHEMA,
+            with workflow_span(name="longterm_subtext_recent_threads", kind="retrieval"):
+                recent_threads = self._episodic_threads(episodic_entries)
+            if not graph_payload and not recent_threads:
+                workflow_event(
+                    kind="branch",
+                    msg="longterm_subtext_no_payload",
+                    details={"episodic_entries": len(episodic_entries)},
+                )
+                return None
+
+            compiled_program = None
+            if self.compiler is not None:
+                compiled_program = self.compiler.compile(
+                    query_text=safe_query_text,
+                    retrieval_query_text=effective_retrieval_query,
+                    graph_payload=graph_payload,
+                    recent_threads=recent_threads,
+                )
+            if compiled_program is not None:
+                with workflow_span(name="longterm_subtext_render_compiled_directives", kind="retrieval"):
+                    directive_lines = self._render_compiled_directives(compiled_program)
+                payload: dict[str, object] = {
+                    "schema": _COMPILED_PROGRAM_SCHEMA,
+                    "query": safe_query_text,
+                    "canonical_retrieval_query": effective_retrieval_query,
+                    "program": compiled_program,
+                }
+                if directive_lines:
+                    payload["rendered_guidance"] = directive_lines
+                rendered_directives = ""
+                if directive_lines:
+                    rendered_directives = "\n".join(f"- {line}" for line in directive_lines) + "\n"
+                workflow_event(
+                    kind="retrieval",
+                    msg="longterm_subtext_compiled_program_used",
+                    details={"directive_lines": len(directive_lines)},
+                )
+                return (
+                    "Silent personalization operating directives for this turn. Internal memory is canonical English. "
+                    "Apply the following directives when they improve the reply, and keep them implicit. "
+                    "If a concrete recommendation or decision is being made and one of these cues is clearly relevant, let at least one relevant cue materially shape the answer. "
+                    "Do not narrate that these cues came from memory.\n"
+                    + rendered_directives
+                    + "Structured program JSON for audit and grounding:\n"
+                    + _safe_json_dumps(
+                        payload,
+                        indent=2,
+                        sort_keys=True,
+                        string_max_chars=payload_string_max_chars,
+                        collection_max_items=payload_collection_max_items,
+                    )
+                )
+            payload = {
+                "schema": _FALLBACK_CONTEXT_SCHEMA,
                 "query": safe_query_text,
-                "canonical_retrieval_query": effective_retrieval_query,
-                "program": compiled_program,
+                "principles": [
+                    "Let relevant familiarity shape priorities, suggestions, and tone without announcing hidden memory.",
+                    "Use remembered preferences and ongoing situations only when they genuinely help the current reply.",
+                    "Prefer natural continuity over overt memory announcements unless direct recall is the point.",
+                    "For known people, prefer implicit familiarity over explicitly naming remembered roles unless identity clarification or safety truly requires it.",
+                    "When a known person matters, prefer concrete reasons to contact them or concrete follow-up questions over restating the remembered role.",
+                    "Do not force a personal detail into every answer.",
+                    "Do not invent pets, routines, relationships, or other personal details that are not in the request or memory context.",
+                    "Do not say earlier, before, last time, neulich, or similar unless the user explicitly asks about past conversation.",
+                ],
             }
-            if directive_lines:
-                payload["rendered_guidance"] = directive_lines
-            rendered_directives = ""
-            if directive_lines:
-                rendered_directives = "\n".join(f"- {line}" for line in directive_lines) + "\n"
+            if graph_payload:
+                payload["graph_cues"] = graph_payload
+            if recent_threads:
+                payload["recent_threads"] = recent_threads
             return (
-                "Silent personalization operating directives for this turn. Internal memory is canonical English. "
-                "Apply the following directives when they improve the reply, and keep them implicit. "
-                "If a concrete recommendation or decision is being made and one of these cues is clearly relevant, let at least one relevant cue materially shape the answer. "
-                "Do not narrate that these cues came from memory.\n"
-                + rendered_directives
-                + "Structured program JSON for audit and grounding:\n"
+                "Silent personalization background for this turn. Internal memory is canonical English. "
+                "Use it as conversational subtext, not as a script or a fact dump. "
+                "Keep it implicit unless explicit recall is necessary.\n"
                 + _safe_json_dumps(
                     payload,
                     indent=2,
@@ -809,36 +885,6 @@ class LongTermSubtextBuilder:
                     collection_max_items=payload_collection_max_items,
                 )
             )
-        payload = {
-            "schema": _FALLBACK_CONTEXT_SCHEMA,
-            "query": safe_query_text,
-            "principles": [
-                "Let relevant familiarity shape priorities, suggestions, and tone without announcing hidden memory.",
-                "Use remembered preferences and ongoing situations only when they genuinely help the current reply.",
-                "Prefer natural continuity over overt memory announcements unless direct recall is the point.",
-                "For known people, prefer implicit familiarity over explicitly naming remembered roles unless identity clarification or safety truly requires it.",
-                "When a known person matters, prefer concrete reasons to contact them or concrete follow-up questions over restating the remembered role.",
-                "Do not force a personal detail into every answer.",
-                "Do not invent pets, routines, relationships, or other personal details that are not in the request or memory context.",
-                "Do not say earlier, before, last time, neulich, or similar unless the user explicitly asks about past conversation.",
-            ],
-        }
-        if graph_payload:
-            payload["graph_cues"] = graph_payload
-        if recent_threads:
-            payload["recent_threads"] = recent_threads
-        return (
-            "Silent personalization background for this turn. Internal memory is canonical English. "
-            "Use it as conversational subtext, not as a script or a fact dump. "
-            "Keep it implicit unless explicit recall is necessary.\n"
-            + _safe_json_dumps(
-                payload,
-                indent=2,
-                sort_keys=True,
-                string_max_chars=payload_string_max_chars,
-                collection_max_items=payload_collection_max_items,
-            )
-        )
 
     def _render_compiled_directives(self, compiled_program: dict[str, object]) -> list[str]:
         """Convert a compiled program into short operator-style directives."""

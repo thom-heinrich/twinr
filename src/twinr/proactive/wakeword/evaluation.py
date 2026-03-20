@@ -20,6 +20,7 @@ from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSam
 from twinr.ops import TwinrOpsEventStore, resolve_ops_paths_for_config
 
 from .calibration import WakewordCalibrationProfile, WakewordCalibrationStore, apply_wakeword_calibration
+from .cascade import WakewordSequenceCaptureVerifier
 from .policy import SttWakewordVerifier, WakewordDecisionPolicy
 from .spotter import WakewordOpenWakeWordSpotter
 
@@ -403,6 +404,14 @@ def evaluate_wakeword_entries(
             language=config.openai_realtime_language,
         )
     )
+    local_verifier = (
+        None
+        if not config.wakeword_openwakeword_sequence_verifier_models
+        else WakewordSequenceCaptureVerifier(
+            verifier_models=dict(config.wakeword_openwakeword_sequence_verifier_models),
+            threshold=config.wakeword_openwakeword_sequence_verifier_threshold,
+        )
+    )
     policy = WakewordDecisionPolicy(
         primary_backend=config.wakeword_primary_backend,
         fallback_backend=config.wakeword_fallback_backend,
@@ -410,6 +419,7 @@ def evaluate_wakeword_entries(
         verifier_margin=config.wakeword_verifier_margin,
         primary_threshold=config.wakeword_openwakeword_threshold,
         verifier=verifier,
+        local_verifier=local_verifier,
     )
     spotter = WakewordOpenWakeWordSpotter(
         wakeword_models=config.wakeword_openwakeword_models,

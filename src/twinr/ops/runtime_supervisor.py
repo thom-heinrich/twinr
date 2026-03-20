@@ -41,6 +41,7 @@ from twinr.ops.runtime_env import prime_user_session_audio_env
 
 
 RUNTIME_SUPERVISOR_ENV_KEY = "TWINR_RUNTIME_SUPERVISOR_ACTIVE"
+EXTERNAL_WATCHDOG_ENV_KEY = "TWINR_REMOTE_MEMORY_WATCHDOG_MANAGED_EXTERNALLY"
 _DEFAULT_POLL_INTERVAL_S = 1.0
 _DEFAULT_WATCHDOG_STARTUP_GRACE_S = 6.0
 _DEFAULT_WATCHDOG_STARTUP_TIMEOUT_S = 60.0
@@ -149,6 +150,13 @@ def _default_utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _env_flag(name: str) -> bool:
+    """Interpret one conventional environment flag as a boolean."""
+
+    value = str(os.environ.get(name, "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def _default_process_factory(
     argv: tuple[str, ...],
     *,
@@ -242,6 +250,10 @@ class TwinrRuntimeSupervisor:
             streaming restart is triggered.
         restart_backoff_s: Minimum delay between restarts of the same child.
         stop_timeout_s: Graceful shutdown timeout for child termination.
+        manage_watchdog: When false, the supervisor consumes an externally
+            managed watchdog artifact/service instead of spawning and recycling
+            its own watchdog child. This keeps the remote-memory watchdog warm
+            across supervisor restarts on the Pi.
     """
 
     def __init__(
@@ -267,6 +279,7 @@ class TwinrRuntimeSupervisor:
         max_snapshot_age_s: float = _DEFAULT_MAX_SNAPSHOT_AGE_S,
         restart_backoff_s: float = _DEFAULT_RESTART_BACKOFF_S,
         stop_timeout_s: float = _DEFAULT_STOP_TIMEOUT_S,
+        manage_watchdog: bool | None = None,
     ) -> None:
         self.config = config
         self.env_file = str(env_file)
@@ -288,6 +301,11 @@ class TwinrRuntimeSupervisor:
         self.max_snapshot_age_s = max(1.0, float(max_snapshot_age_s))
         self.restart_backoff_s = max(0.0, float(restart_backoff_s))
         self.stop_timeout_s = max(0.1, float(stop_timeout_s))
+        self.manage_watchdog = (
+            not _env_flag(EXTERNAL_WATCHDOG_ENV_KEY)
+            if manage_watchdog is None
+            else bool(manage_watchdog)
+        )
         self.project_root = Path(config.project_root).expanduser().resolve()
         self.remote_watchdog_store = RemoteMemoryWatchdogStore.from_config(config)
         self._watchdog = _ManagedChild(
@@ -299,15 +317,18 @@ class TwinrRuntimeSupervisor:
             label="streaming loop",
         )
         self._last_streaming_gate_reason: str | None = None
+        self._run_started_at_monotonic: float = -1.0
 
     def run(self, *, duration_s: float | None = None) -> int:
         """Run the authoritative supervisor loop."""
 
         resolved_duration = None if duration_s is None else max(0.0, float(duration_s))
-        deadline = None if resolved_duration is None else self._monotonic() + resolved_duration
+        self._run_started_at_monotonic = self._monotonic()
+        deadline = None if resolved_duration is None else self._run_started_at_monotonic + resolved_duration
         self._emit_payload(
             "runtime_supervisor_started",
             env_file=self.env_file,
+            manage_watchdog=self.manage_watchdog,
             poll_interval_s=self.poll_interval_s,
             watchdog_startup_grace_s=self.watchdog_startup_grace_s,
             watchdog_startup_timeout_s=self.watchdog_startup_timeout_s,
@@ -325,12 +346,14 @@ class TwinrRuntimeSupervisor:
         try:
             while True:
                 now_monotonic = self._monotonic()
-                self._ensure_child_running(self._watchdog, now_monotonic, reason="startup")
+                if self.manage_watchdog:
+                    self._ensure_child_running(self._watchdog, now_monotonic, reason="startup")
                 assessment = self._assess_watchdog()
-                self._maybe_restart_watchdog_for_health(
-                    now_monotonic=now_monotonic,
-                    assessment=assessment,
-                )
+                if self.manage_watchdog:
+                    self._maybe_restart_watchdog_for_health(
+                        now_monotonic=now_monotonic,
+                        assessment=assessment,
+                    )
                 self._ensure_streaming_running(
                     now_monotonic=now_monotonic,
                     assessment=assessment,
@@ -350,7 +373,8 @@ class TwinrRuntimeSupervisor:
             return 0
         finally:
             self._stop_child(self._streaming, reason="supervisor_stop")
-            self._stop_child(self._watchdog, reason="supervisor_stop")
+            if self.manage_watchdog:
+                self._stop_child(self._watchdog, reason="supervisor_stop")
             self._emit_payload("runtime_supervisor_stopped")
             self._append_event(
                 event="runtime_supervisor_stopped",
@@ -394,12 +418,21 @@ class TwinrRuntimeSupervisor:
     ) -> str | None:
         if assessment.ready:
             return None
-        if self._watchdog.age_s(now_monotonic) >= self.watchdog_startup_grace_s:
+        if self._watchdog_startup_age_s(now_monotonic) >= self.watchdog_startup_grace_s:
             return None
         return compact_text(
             assessment.detail or "Waiting for remote memory watchdog startup.",
             limit=160,
         )
+
+    def _watchdog_startup_age_s(self, now_monotonic: float) -> float:
+        """Return the effective startup age for the active watchdog owner."""
+
+        if self.manage_watchdog:
+            return self._watchdog.age_s(now_monotonic)
+        if self._run_started_at_monotonic < 0.0:
+            return 0.0
+        return max(0.0, now_monotonic - self._run_started_at_monotonic)
 
     def _ensure_child_running(
         self,

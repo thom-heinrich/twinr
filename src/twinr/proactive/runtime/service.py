@@ -58,6 +58,10 @@ from .ambiguous_room_guard import (
     AmbiguousRoomGuardSnapshot,
     derive_ambiguous_room_guard,
 )
+from .attention_targeting import (
+    MultimodalAttentionTargetSnapshot,
+    MultimodalAttentionTargetTracker,
+)
 from .display_attention import DisplayAttentionCuePublisher
 from .display_attention import (
     display_attention_refresh_supported,
@@ -96,6 +100,7 @@ _MAX_WAKEWORD_STREAM_EVENTS_PER_CYCLE = 8
 _DEFAULT_CLOSE_JOIN_TIMEOUT_S = 5.0
 _MAX_CAPTURE_PHRASE_TOKEN_LEN = 64
 _DISPLAY_ATTENTION_ACTIVE_RUNTIME_STATES = frozenset({"waiting", "listening", "processing", "answering"})
+_DISPLAY_ATTENTION_CUE_ONLY_RUNTIME_STATES = frozenset({"error"})
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -214,6 +219,18 @@ def _respeaker_capture_probe_duration_ms(config: TwinrConfig) -> int:
     chunk_ms = max(20, int(getattr(config, "audio_chunk_ms", 100) or 100))
     requested_ms = max(chunk_ms, int(getattr(config, "proactive_audio_sample_ms", chunk_ms) or chunk_ms))
     return min(requested_ms, max(250, chunk_ms * 3))
+
+
+def _display_attention_refresh_allowed_runtime_status(runtime_status_value: object) -> bool:
+    """Return whether bounded local HDMI eye-follow may refresh in this runtime state."""
+
+    normalized = str(runtime_status_value or "").strip().lower()
+    if normalized in _DISPLAY_ATTENTION_ACTIVE_RUNTIME_STATES:
+        return True
+    # Keep required-remote outages fail-closed for the actual agent/runtime while
+    # still allowing purely local HDMI face-follow cues to run from on-device
+    # camera/audio signals.
+    return normalized in _DISPLAY_ATTENTION_CUE_ONLY_RUNTIME_STATES
 
 
 def _respeaker_dead_capture_payload(
@@ -500,8 +517,10 @@ class ProactiveCoordinator:
         self.latest_portrait_match_snapshot: PortraitMatchSnapshot | None = None
         self.latest_known_user_hint_snapshot: KnownUserHintSnapshot | None = None
         self.latest_affect_proxy_snapshot: AffectProxySnapshot | None = None
+        self.latest_attention_target_snapshot: MultimodalAttentionTargetSnapshot | None = None
         self.audio_policy_tracker = ReSpeakerAudioPolicyTracker.from_config(config)
         self.identity_fusion_tracker = TemporalIdentityFusionTracker.from_config(config)
+        self.attention_target_tracker = MultimodalAttentionTargetTracker.from_config(config)
 
     # AUDIT-FIX(#1): Route all module-local emits through a non-throwing wrapper.
     def _emit(self, line: str) -> None:
@@ -1511,7 +1530,7 @@ class ProactiveCoordinator:
                 error=exc,
             )
             return False
-        if runtime_status_value not in _DISPLAY_ATTENTION_ACTIVE_RUNTIME_STATES:
+        if not _display_attention_refresh_allowed_runtime_status(runtime_status_value):
             return False
         audio_snapshot = self._observe_audio_safe()
         audio_policy_snapshot = self._observe_audio_policy(
@@ -1657,6 +1676,9 @@ class ProactiveCoordinator:
             None if self.latest_known_user_hint_snapshot is None else self.latest_known_user_hint_snapshot.claim.confidence,
             None if self.latest_affect_proxy_snapshot is None else self.latest_affect_proxy_snapshot.state,
             None if self.latest_affect_proxy_snapshot is None else self.latest_affect_proxy_snapshot.claim.confidence,
+            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.state,
+            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_horizontal,
+            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.focus_source,
         )
         if observation_key == self._last_observation_key:
             return
@@ -1719,6 +1741,8 @@ class ProactiveCoordinator:
             data.update(self.latest_known_user_hint_snapshot.event_data())
         if self.latest_affect_proxy_snapshot is not None:
             data.update(self.latest_affect_proxy_snapshot.event_data())
+        if self.latest_attention_target_snapshot is not None:
+            data.update(self.latest_attention_target_snapshot.event_data())
         if audio_policy_snapshot is not None:
             data.update(
                 {
@@ -1972,11 +1996,15 @@ class ProactiveCoordinator:
                     "verifier_mode": decision.verifier_mode,
                     "verifier_used": decision.verifier_used,
                     "verifier_status": decision.verifier_status,
+                    "local_verifier_used": decision.local_verifier_used,
+                    "local_verifier_status": decision.local_verifier_status,
                     "capture_path": decision.capture_path,
                 }
             )
             if decision.verifier_reason:
                 data["verifier_reason"] = decision.verifier_reason
+            if decision.local_verifier_reason:
+                data["local_verifier_reason"] = decision.local_verifier_reason
         if match.transcript:
             data["transcript_preview"] = match.transcript[:160]
         if match.normalized_transcript:
@@ -2009,6 +2037,9 @@ class ProactiveCoordinator:
                 "verifier_used": decision.verifier_used,
                 "verifier_status": decision.verifier_status,
                 "verifier_reason": decision.verifier_reason,
+                "local_verifier_used": decision.local_verifier_used,
+                "local_verifier_status": decision.local_verifier_status,
+                "local_verifier_reason": decision.local_verifier_reason,
                 "matched_phrase": decision.match.matched_phrase,
                 "remaining_text": decision.match.remaining_text,
                 "detector_label": decision.match.detector_label,
@@ -2321,11 +2352,13 @@ class ProactiveCoordinator:
         audio_observation,
         audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
     ) -> None:
-        """Update the HDMI face so it calmly follows the visible primary person."""
+        """Update the HDMI face so it calmly follows the most relevant person."""
 
         publisher = self.display_attention_publisher
         if publisher is None:
             return
+        presence_snapshot = self.latest_presence_snapshot
+        presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
         live_facts = {
             "camera": camera_snapshot.to_automation_facts(),
             "vad": {
@@ -2341,6 +2374,22 @@ class ProactiveCoordinator:
                 ),
             },
         }
+        speaker_association = derive_respeaker_speaker_association(
+            observed_at=observed_at,
+            live_facts=live_facts,
+        )
+        self.latest_speaker_association_snapshot = speaker_association
+        attention_target = self.attention_target_tracker.observe(
+            observed_at=observed_at,
+            live_facts=live_facts,
+            runtime_status=getattr(getattr(self.runtime, "status", None), "value", None),
+            presence_session_id=presence_session_id,
+            speaker_association=speaker_association,
+            identity_fusion=self.latest_identity_fusion_snapshot,
+        )
+        self.latest_attention_target_snapshot = attention_target
+        live_facts["speaker_association"] = speaker_association.to_automation_facts()
+        live_facts["attention_target"] = attention_target.to_automation_facts()
         try:
             publisher.publish_from_facts(
                 config=self.config,
@@ -2542,11 +2591,20 @@ class ProactiveCoordinator:
             live_facts=facts,
             ambiguous_room_guard=ambiguous_room_guard,
         )
+        attention_target = self.attention_target_tracker.observe(
+            observed_at=now,
+            live_facts=facts,
+            runtime_status=getattr(getattr(self.runtime, "status", None), "value", None),
+            presence_session_id=presence_session_id,
+            speaker_association=speaker_association,
+            identity_fusion=identity_fusion,
+        )
         self.latest_ambiguous_room_guard_snapshot = ambiguous_room_guard
         self.latest_identity_fusion_snapshot = identity_fusion
         self.latest_portrait_match_snapshot = portrait_match
         self.latest_known_user_hint_snapshot = known_user_hint
         self.latest_affect_proxy_snapshot = affect_proxy
+        self.latest_attention_target_snapshot = attention_target
         facts["speaker_association"] = speaker_association.to_automation_facts()
         facts["multimodal_initiative"] = multimodal_initiative.to_automation_facts()
         facts["ambiguous_room_guard"] = ambiguous_room_guard.to_automation_facts()
@@ -2554,6 +2612,7 @@ class ProactiveCoordinator:
         facts["portrait_match"] = portrait_match.to_automation_facts()
         facts["known_user_hint"] = known_user_hint.to_automation_facts()
         facts["affect_proxy"] = affect_proxy.to_automation_facts()
+        facts["attention_target"] = attention_target.to_automation_facts()
         return facts
 
     def _derive_sensor_events(
@@ -2579,6 +2638,7 @@ class ProactiveCoordinator:
             "portrait_match.matches_reference_user": bool(facts["portrait_match"]["matches_reference_user"]),
             "known_user_hint.matches_main_user": bool(facts["known_user_hint"]["matches_main_user"]),
             "affect_proxy.concern_cue": facts["affect_proxy"]["state"] == "concern_cue",
+            "attention_target.session_focus_active": bool(facts["attention_target"]["session_focus_active"]),
         }
         event_names: list[str] = list(camera_event_names)
         for key, value in current_flags.items():
@@ -2881,7 +2941,11 @@ def build_default_proactive_monitor(
     """Build the default proactive monitor stack from Twinr runtime services."""
 
     config = _load_wakeword_runtime_config(config=config, runtime=runtime, emit=emit)
-    if not config.proactive_enabled and not config.wakeword_enabled:
+    display_attention_enabled = (
+        resolve_display_attention_refresh_interval(config) is not None
+        and str(getattr(config, "display_driver", "") or "").strip().lower().startswith("hdmi")
+    )
+    if not config.proactive_enabled and not config.wakeword_enabled and not display_attention_enabled:
         return None
 
     try:
@@ -3104,7 +3168,7 @@ def build_default_proactive_monitor(
             )
 
     vision_observer = None
-    if config.proactive_enabled:
+    if config.proactive_enabled or display_attention_enabled:
         try:
             provider_name = (getattr(config, "proactive_vision_provider", "local_first") or "local_first").strip().lower()
             if provider_name == "openai":
@@ -3163,13 +3227,14 @@ def build_default_proactive_monitor(
         pir_monitor is None
         and wakeword_stream is None
         and isinstance(audio_observer, NullAudioObservationProvider)
+        and vision_observer is None
     ):
         _record_component_warning(
             runtime=runtime,
             emit=emit,
             reason="no_operational_sensor_path",
             detail=(
-                "No operational PIR, streaming wakeword, or ambient audio path could be initialized. "
+                "No operational PIR, streaming wakeword, ambient audio, or HDMI attention camera path could be initialized. "
                 "The proactive monitor was not started."
             ),
         )
@@ -3235,6 +3300,15 @@ def _build_wakeword_policy(
 ) -> WakewordDecisionPolicy:
     """Build the runtime wakeword policy and optional STT verifier."""
 
+    local_verifier = None
+    if config.wakeword_openwakeword_sequence_verifier_models:
+        from twinr.proactive.wakeword.cascade import WakewordSequenceCaptureVerifier
+
+        local_verifier = WakewordSequenceCaptureVerifier(
+            verifier_models=dict(config.wakeword_openwakeword_sequence_verifier_models),
+            threshold=config.wakeword_openwakeword_sequence_verifier_threshold,
+        )
+
     verifier = None
     if config.wakeword_verifier_mode != "disabled":
         verifier = SttWakewordVerifier(
@@ -3249,6 +3323,7 @@ def _build_wakeword_policy(
         verifier_margin=config.wakeword_verifier_margin,
         primary_threshold=config.wakeword_openwakeword_threshold,
         verifier=verifier,
+        local_verifier=local_verifier,
     )
 
 

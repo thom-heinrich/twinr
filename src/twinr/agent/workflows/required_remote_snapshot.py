@@ -126,9 +126,22 @@ def _max_allowed_heartbeat_age_s(
     config: TwinrConfig,
     snapshot: RemoteMemoryWatchdogSnapshot,
 ) -> float:
-    """Return how old a persisted watchdog heartbeat may be before it is stale."""
+    """Return how old a persisted watchdog heartbeat may be before it is stale.
 
-    return max(_keepalive_floor_s(config), _watchdog_interval_s(config, snapshot) * 3.0)
+    The watchdog persists timestamps with second resolution and relies on a
+    Python loop plus atomic fsync-heavy file writes. On the Pi this can miss a
+    nominal 1s beat by a small margin even while the watchdog process stays
+    healthy and the deep remote probe is still running. A bounded slack keeps
+    the live runtime from false-failing these in-flight probes while still
+    treating genuinely stuck heartbeats as stale within a few seconds.
+    """
+
+    base_budget_s = max(
+        _keepalive_floor_s(config),
+        _watchdog_interval_s(config, snapshot) * 3.0,
+    )
+    timing_slack_s = max(1.0, _watchdog_interval_s(config, snapshot) * 2.0)
+    return base_budget_s + timing_slack_s
 
 
 def _max_allowed_inflight_probe_age_s(

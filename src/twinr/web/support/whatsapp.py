@@ -11,6 +11,7 @@ import time
 from twinr.agent.base_agent import TwinrConfig
 from twinr.channels import ChannelTransportError
 from twinr.channels.whatsapp.config import WhatsAppChannelConfig, normalize_whatsapp_digits
+from twinr.channels.whatsapp.node_runtime import resolve_whatsapp_node_binary
 from twinr.channels.whatsapp.worker_bridge import (
     WhatsAppWorkerBridge,
     WhatsAppWorkerExitedError,
@@ -181,7 +182,10 @@ def probe_whatsapp_runtime(config: TwinrConfig, *, env_path: Path) -> WhatsAppRu
     """Collect bounded local runtime facts for the WhatsApp wizard."""
 
     project_root = Path(config.project_root).expanduser().resolve(strict=False)
-    node_binary = str(getattr(config, "whatsapp_node_binary", "node") or "node").strip() or "node"
+    node_binary = resolve_whatsapp_node_binary(
+        project_root,
+        str(getattr(config, "whatsapp_node_binary", "node") or "node"),
+    )
     auth_dir = _resolve_project_path(project_root, str(getattr(config, "whatsapp_auth_dir", "")))
     worker_root = _resolve_project_path(project_root, str(getattr(config, "whatsapp_worker_root", "")))
 

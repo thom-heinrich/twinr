@@ -3,7 +3,7 @@ name: handlers
 path: src/twinr/agent/tools/handlers
 kind: python-package
 visibility: internal
-summary: Concrete realtime tool handlers and shared guard helpers for automation, memory, reminder, output, self-coding, settings, voice-profile, portrait-identity, and shared household-identity tool calls.
+summary: Concrete realtime tool handlers and shared guard helpers for automation, memory, reminder, world-intelligence, output, self-coding, settings, voice-profile, portrait-identity, and shared household-identity tool calls.
 owned_concerns:
   - Validate and normalize tool-call payloads at the handler boundary
   - Translate tool requests into bounded runtime reads and mutations
@@ -12,6 +12,7 @@ owned_concerns:
   - Return structured portrait-enrollment guidance so the model can drive camera retries naturally
   - Return structured shared household-identity guidance for local face, voice, status, and explicit confirm or deny feedback flows
   - Bridge the self-coding front-stage learning flow into deterministic ASE modules
+  - Expose one explicit tool handler for RSS/world-intelligence subscription setup and occasional recalibration
 out_of_scope:
   - Tool registry, binding, schemas, or prompt instruction assembly
   - Runtime, store, provider, backend, or web-dashboard implementations
@@ -42,6 +43,10 @@ files:
       - handle_remember_plan
       - handle_update_user_profile
       - handle_update_personality
+  - path: intelligence.py
+    role: RSS/world-intelligence subscription and refresh-config handler
+    exports:
+      - handle_configure_world_intelligence
   - path: output.py
     role: Print, search, camera, and conversation-output handlers
     exports:

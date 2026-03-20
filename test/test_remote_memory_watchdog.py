@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -266,6 +267,53 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(loaded.heartbeat_at, "2026-03-16T18:00:05Z")
         self.assertFalse(loaded.probe_inflight)
 
+    def test_store_save_makes_snapshot_world_readable_for_cross_service_health(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+            )
+            store = RemoteMemoryWatchdogStore.from_config(config)
+            sample = RemoteMemoryWatchdogSample(
+                seq=1,
+                captured_at="2026-03-16T18:00:05Z",
+                status="ok",
+                ready=True,
+                mode="remote_primary",
+                required=True,
+                latency_ms=42.0,
+                consecutive_ok=1,
+                consecutive_fail=0,
+                detail=None,
+            )
+            store.save(
+                RemoteMemoryWatchdogSnapshot(
+                    schema_version=1,
+                    started_at="2026-03-16T18:00:00Z",
+                    updated_at="2026-03-16T18:00:05Z",
+                    hostname="picarx",
+                    pid=123,
+                    interval_s=1.0,
+                    history_limit=3600,
+                    sample_count=1,
+                    failure_count=0,
+                    last_ok_at="2026-03-16T18:00:05Z",
+                    last_failure_at=None,
+                    artifact_path=str(store.path),
+                    current=sample,
+                    recent_samples=(sample,),
+                    heartbeat_at="2026-03-16T18:00:05Z",
+                    probe_inflight=False,
+                    probe_started_at=None,
+                    probe_age_s=None,
+                )
+            )
+
+            mode = store.path.stat().st_mode & 0o777
+
+        self.assertEqual(mode, 0o644)
+
     def test_probe_once_persists_rolling_snapshot_and_transition_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -488,6 +536,35 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         warm_result = snapshot.current.probe["steps"][0]["warm_result"]
         self.assertEqual(warm_result["failed_snapshot_kind"], "prompt_memory")
         self.assertEqual(warm_result["checks"][0]["attempts"][0]["status_code"], 503)
+
+    def test_probe_once_timestamps_sample_at_probe_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            monotonic_values = iter((100.0, 104.2))
+            with mock.patch(
+                "twinr.ops.remote_memory_watchdog._utc_now_iso",
+                side_effect=("2026-03-16T18:00:00Z", "2026-03-16T18:00:04Z"),
+            ):
+                watchdog = RemoteMemoryWatchdog(
+                    config=config,
+                    service_factory=lambda: _DeepProbeSequencedRemoteService(["ok"]),
+                    store=RemoteMemoryWatchdogStore.from_config(config),
+                    event_store=TwinrOpsEventStore.from_config(config),
+                    emit=lambda _line: None,
+                    monotonic=lambda: next(monotonic_values),
+                )
+                snapshot = watchdog.probe_once()
+
+        self.assertEqual(snapshot.current.captured_at, "2026-03-16T18:00:04Z")
+        self.assertEqual(snapshot.updated_at, "2026-03-16T18:00:04Z")
+        self.assertEqual(snapshot.heartbeat_at, "2026-03-16T18:00:04Z")
+        self.assertEqual(snapshot.current.latency_ms, 4200.0)
 
     def test_probe_once_carries_remote_write_context_into_sample_and_transition_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

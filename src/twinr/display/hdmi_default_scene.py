@@ -366,6 +366,7 @@ class HdmiDefaultSceneRenderer:
             resolved_face_cue = presentation_graph.face_cue
         if resolved_face_cue is None and ambient_moment is not None:
             resolved_face_cue = ambient_moment.face_cue
+        resolved_face_cue = self._effective_face_cue(status=status, face_cue=resolved_face_cue)
         return HdmiDefaultScene(
             status=status,
             animation_frame=animation_frame,
@@ -381,6 +382,29 @@ class HdmiDefaultSceneRenderer:
             face_cue=resolved_face_cue,
             ambient_moment=ambient_moment,
             presentation_graph=presentation_graph,
+        )
+
+    def _effective_face_cue(
+        self,
+        *,
+        status: str,
+        face_cue: DisplayFaceCue | None,
+    ) -> DisplayFaceCue | None:
+        """Keep status-owned expressions authoritative while allowing local gaze-follow."""
+
+        if face_cue is None:
+            return None
+        if status != "error":
+            return face_cue
+        return DisplayFaceCue(
+            source=face_cue.source,
+            updated_at=face_cue.updated_at,
+            expires_at=face_cue.expires_at,
+            gaze_x=face_cue.gaze_x,
+            gaze_y=face_cue.gaze_y,
+            head_dx=face_cue.head_dx,
+            head_dy=face_cue.head_dy,
+            blink=face_cue.blink,
         )
 
     def _layout_for_size(self, *, width: int, height: int, reserve_ticker: bool) -> HdmiDefaultSceneLayout:
@@ -1775,6 +1799,9 @@ class HdmiDefaultSceneRenderer:
         *,
         face_cue: DisplayFaceCue | None = None,
     ) -> tuple[int, int]:
+        cue_driven_error = status == "error" and face_cue is not None and (
+            face_cue.gaze_x != 0 or face_cue.gaze_y != 0 or face_cue.head_dx != 0 or face_cue.head_dy != 0
+        )
         if status == "waiting":
             base = (
                 (0, 0),
@@ -1799,12 +1826,17 @@ class HdmiDefaultSceneRenderer:
         elif status == "printing":
             base = ((0, 0), (1, 0), (0, 0), (-1, 0), (0, 0), (0, 0))[animation_frame % 6]
         elif status == "error":
-            base = ((0, 1), (0, 0), (0, 1), (0, 0), (0, 1), (0, 0))[animation_frame % 6]
+            base = (0, 0) if cue_driven_error else ((0, 1), (0, 0), (0, 1), (0, 0), (0, 1), (0, 0))[animation_frame % 6]
         else:
             base = (0, 0)
         if face_cue is None:
             return base
-        return (base[0] + face_cue.head_dx, base[1] + face_cue.head_dy)
+        head_scale_x = 8 if status == "error" else 5
+        head_scale_y = 3 if status == "error" else 2
+        return (
+            base[0] + (face_cue.head_dx * head_scale_x),
+            base[1] + (face_cue.head_dy * head_scale_y),
+        )
 
     def _eye_state(
         self,
@@ -1814,6 +1846,10 @@ class HdmiDefaultSceneRenderer:
         *,
         face_cue: DisplayFaceCue | None = None,
     ) -> dict[str, object]:
+        face_cue = self._effective_face_cue(status=status, face_cue=face_cue)
+        cue_driven_error = status == "error" and face_cue is not None and (
+            face_cue.gaze_x != 0 or face_cue.gaze_y != 0 or face_cue.head_dx != 0 or face_cue.head_dy != 0
+        )
         state: dict[str, object] = {
             "width": 56,
             "height": 74,
@@ -1868,14 +1904,14 @@ class HdmiDefaultSceneRenderer:
         elif status == "error":
             frame = animation_frame % 6
             state["width"] = 54
-            state["height"] = (60, 58, 56, 58, 60, 58)[frame]
-            state["highlight_dx"] = (-12, -11, -10, -9, -10, -11)[frame]
+            state["height"] = 58 if cue_driven_error else (60, 58, 56, 58, 60, 58)[frame]
+            state["highlight_dx"] = 0 if cue_driven_error else (-2, -1, 0, 1, 0, -1)[frame]
             state["highlight_dy"] = -14
             state["brow_raise"] = 2
             state["brow_slant"] = 8
-            state["eye_shift_y"] = 2
-            state["blink"] = frame == 3
-        return self._apply_face_cue_to_eye_state(state, face_cue=face_cue)
+            state["eye_shift_y"] = 1 if cue_driven_error else 2
+            state["blink"] = False if cue_driven_error else frame == 3
+        return self._apply_face_cue_to_eye_state(state, status=status, face_cue=face_cue)
 
     def _face_scale_for_box(self, box: tuple[int, int, int, int]) -> float:
         """Return the visible face scale for one face box, including widescreen growth."""
@@ -1903,14 +1939,22 @@ class HdmiDefaultSceneRenderer:
         self,
         state: dict[str, object],
         *,
+        status: str,
         face_cue: DisplayFaceCue | None,
     ) -> dict[str, object]:
         if face_cue is None:
             return state
 
         merged = dict(state)
-        merged["highlight_dx"] = int(merged["highlight_dx"]) + (face_cue.gaze_x * 6)
-        merged["highlight_dy"] = int(merged["highlight_dy"]) + (face_cue.gaze_y * 5)
+        horizontal_eye_scale = 6 if status == "error" else 4
+        vertical_eye_scale = 1 if status == "error" else 3
+        horizontal_highlight_scale = 8 if status == "error" else 6
+        vertical_highlight_scale = 3 if status == "error" else 5
+        merged["eye_shift_x"] = int(merged["eye_shift_x"]) + (face_cue.gaze_x * horizontal_eye_scale)
+        vertical_shift = face_cue.gaze_y * (1 if status == "error" else 3)
+        merged["eye_shift_y"] = int(merged["eye_shift_y"]) + (face_cue.gaze_y * vertical_eye_scale)
+        merged["highlight_dx"] = int(merged["highlight_dx"]) + (face_cue.gaze_x * horizontal_highlight_scale)
+        merged["highlight_dy"] = int(merged["highlight_dy"]) + (face_cue.gaze_y * vertical_highlight_scale)
         if face_cue.blink is not None:
             merged["blink"] = face_cue.blink
 

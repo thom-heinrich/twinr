@@ -13,7 +13,9 @@ bounded.
 - coordinate conversation turns, print delivery, and streamed speech output
 - keep the yellow print button latency-safe by queuing prints from local short-term context only instead of synchronously rebuilding remote provider context before the print lane starts
 - route beep, feedback, and spoken playback through one priority-aware playback coordinator instead of scattered per-call locks
+- keep fatal Pi loop/bootstrap failures on one stable error screen by holding the runtime in `error` and refreshing its snapshot instead of crashing back to the desktop and letting the supervisor ping-pong
 - execute each completed streaming transcript turn under one authoritative coordinator/state-machine owner for deadlines, speech lifecycle, cancellation, and completion
+- forward the completed tool-call history of a turn into runtime-side personality learning once the authoritative answer has been finalized
 - keep GPIO polling responsive while long turns are active by dispatching button presses off the poll thread and interrupting active turns on a second green press
 - keep required remote-memory checks off the GPIO polling thread by gating live loops from the external remote-memory watchdog artifact while still failing closed when remote memory becomes unavailable
 - keep streamed TTS abortable even before the first chunk arrives so a stalled provider request does not pin the runtime in `answering`
@@ -51,6 +53,7 @@ bounded.
 | [runner.py](./runner.py) | Compatibility shim to the legacy classic loop in `src/twinr/agent/legacy/classic_hardware_loop.py` |
 | [realtime_runner.py](./realtime_runner.py) | Realtime session loop that delegates guidance and transcript-verifier policy to focused runtime helpers |
 | [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell |
+| [runtime_error_hold.py](./runtime_error_hold.py) | Stable runtime-error hold that keeps the display companion alive and the snapshot fresh after fatal loop failures |
 | [turn_guidance.py](./turn_guidance.py) | Bounded turn-controller context and label-aware conversation guidance |
 | [streaming_transcript_verifier.py](./streaming_transcript_verifier.py) | Streaming transcript recovery plus explicit verifier KPI gates |
 | [streaming_capture.py](./streaming_capture.py) | Streaming microphone capture, timeout handling, and batch-STT fallback |
@@ -64,7 +67,7 @@ bounded.
 | [realtime_runtime/support.py](./realtime_runtime/support.py) | Active emit/media/config helpers used by the realtime loop |
 | [realtime_runner_background.py](./realtime_runner_background.py) | Compatibility shim for background helpers |
 | [realtime_runner_support.py](./realtime_runner_support.py) | Compatibility shim for support helpers |
-| [realtime_runner_tools.py](./realtime_runner_tools.py) | Tool delegate mixin |
+| [realtime_runner_tools.py](./realtime_runner_tools.py) | Tool delegate mixin, including RSS/world-intelligence configuration wiring |
 | [button_dispatch.py](./button_dispatch.py) | Non-blocking button dispatch and busy-turn interruption |
 | [required_remote_watch.py](./required_remote_watch.py) | Background required-remote readiness watch for fail-closed runtimes |
 | [required_remote_snapshot.py](./required_remote_snapshot.py) | Cheap external-watchdog snapshot evaluation for live runtime gating |

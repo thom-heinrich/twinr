@@ -7,7 +7,11 @@ socket, auth persistence, QR login, and low-level reconnect handling.
 
 Current Baileys releases require `Node.js 20+`. The Python bridge checks this
 up front and fails closed when the configured `TWINR_WHATSAPP_NODE_BINARY`
-points to an older runtime.
+points to an older runtime. When the config still uses the generic `node`
+default, Twinr automatically prefers the pinned project-local runtime under
+`state/tools/node-v20.20.1-<platform>-<arch>/bin/node` once it has been staged.
+Relative `TWINR_WHATSAPP_*` filesystem paths are resolved against Twinr's
+`project_root`, not against the worker subprocess cwd.
 
 ## Responsibility
 
@@ -45,3 +49,14 @@ The runtime reads the following env-backed fields from `TwinrConfig`:
 Run the channel loop once, scan the QR shown in the dashboard wizard or the
 terminal fallback with WhatsApp's "Linked Devices" flow, and keep the
 persisted auth directory stable between restarts.
+
+## Local Node runtime
+
+Stage the pinned local Node.js runtime with:
+
+```bash
+python3 hardware/ops/install_whatsapp_node_runtime.py
+```
+
+That installs the official Node.js archive into `state/tools/` and lets Twinr
+use the staged runtime without relying on a system-wide `node` binary.

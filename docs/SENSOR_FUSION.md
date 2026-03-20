@@ -12,6 +12,10 @@ Here, `IR` means the current PIR motion sensor, not a thermal camera, depth came
 
 The goal is not to guess hidden inner states. The goal is to decide what Twinr can reasonably observe, how good that signal can get on a Raspberry Pi 4, and what kind of action is justified.
 
+The detailed design for short rolling audio/video buffers and `2-8s`
+multimodal event fusion lives in
+[`MULTIMODAL_EVENT_FUSION_V1.md`](./MULTIMODAL_EVENT_FUSION_V1.md).
+
 ## Quality Legend
 
 - `High`

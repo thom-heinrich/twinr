@@ -9,6 +9,8 @@ owned_concerns:
   - Build provider and tool-facing long-term memory context for runtime prompts
   - Rebuild and persist restart-recall continuity packets after durable-memory mutations so confirmed stable facts survive fresh-reader restarts
   - Persist conversation turns and multimodal evidence through bounded workers and synchronous fallback paths
+  - Route consolidated turns and post-turn tool history into the structured personality-learning service
+  - Route explicit RSS/world-intelligence configuration plus reflection-phase feed refresh and recalibration into the structured personality-learning service
   - Enforce true total-deadline flush budgeting across multiple background writers
   - Verify remote-primary snapshot readiness before runtime loops depend on long-term memory state
   - Preserve per-snapshot pointer/origin probe evidence for fail-closed remote readiness

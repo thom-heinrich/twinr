@@ -45,7 +45,12 @@ class _FakeCamera:
 class _BackgroundHarness(TwinrRealtimeBackgroundMixin):
     def __init__(self, runtime: TwinrRuntime) -> None:
         self.runtime = runtime
-        self._sensor_observation_queue: Queue[tuple[dict[str, object], tuple[str, ...]]] = Queue()
+        self._sensor_observation_queue: Queue[tuple[dict[str, object], tuple[str, ...]]] = Queue(maxsize=1)
+        self._conversation_session_active = False
+        self.emit = lambda _line: None
+
+    def _run_matching_sensor_automations(self, *, facts: dict[str, object], event_names: tuple[str, ...]) -> bool:
+        return False
 
 
 class _SupportHarness(TwinrRealtimeSupportMixin):
@@ -273,6 +278,8 @@ class LongTermMultimodalTests(unittest.TestCase):
 
             harness.handle_sensor_observation(_sensor_facts(), ("pir.motion_detected", "camera.person_visible"))
             queued_facts, queued_events = harness._sensor_observation_queue.get_nowait()
+            harness.handle_sensor_observation(_sensor_facts(), ("pir.motion_detected", "camera.person_visible"))
+            harness._maybe_run_sensor_automation()
             runtime.flush_long_term_memory(timeout_s=2.0)
             objects = tuple(runtime.long_term_memory.object_store.load_objects())
             runtime.shutdown(timeout_s=2.0)
@@ -285,6 +292,22 @@ class LongTermMultimodalTests(unittest.TestCase):
                 for item in objects
             )
         )
+
+    def test_background_sensor_handler_keeps_only_latest_pending_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = TwinrRuntime(config=_config(temp_dir))
+            harness = _BackgroundHarness(runtime)
+            first_facts = _sensor_facts()
+            second_facts = _sensor_facts()
+            second_facts["camera"]["person_visible_for_s"] = 42.0
+
+            harness.handle_sensor_observation(first_facts, ("camera.person_visible",))
+            harness.handle_sensor_observation(second_facts, ("camera.person_visible", "pir.motion_detected"))
+            queued_facts, queued_events = harness._sensor_observation_queue.get_nowait()
+            runtime.shutdown(timeout_s=2.0)
+
+        self.assertEqual(queued_facts["camera"]["person_visible_for_s"], 42.0)
+        self.assertEqual(queued_events, ("camera.person_visible", "pir.motion_detected"))
 
     def test_support_camera_capture_enqueues_multimodal_camera_usage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

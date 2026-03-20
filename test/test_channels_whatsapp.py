@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.agent.base_agent.state.machine import TwinrStatus
 from twinr.channels import ChannelInboundMessage, ChannelTransportError, TwinrTextChannelTurnService
 from twinr.channels.whatsapp import WhatsAppChannelConfig, WhatsAppMessagePolicy
+from twinr.channels.whatsapp.node_runtime import detect_whatsapp_node_runtime_spec, resolve_whatsapp_node_binary
 from twinr.channels.whatsapp.worker_bridge import WhatsAppWorkerBridge, WhatsAppWorkerStatusEvent
 from twinr.web.support.channel_onboarding import FileBackedChannelOnboardingStore, InProcessChannelPairingRegistry
 from twinr.web.support.whatsapp import WhatsAppPairingCoordinator
@@ -222,6 +223,77 @@ class WhatsAppChannelTests(unittest.TestCase):
             )
             with self.assertRaises(ChannelTransportError):
                 bridge._assert_supported_node_runtime()
+
+    def test_from_twinr_config_resolves_relative_paths_against_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            auth_dir = project_root / "state" / "channels" / "whatsapp" / "auth"
+            worker_root = project_root / "src" / "twinr" / "channels" / "whatsapp" / "worker"
+            node_binary = project_root / "state" / "tools" / "node-v20" / "bin" / "node"
+            worker_root.mkdir(parents=True, exist_ok=True)
+            auth_dir.mkdir(parents=True, exist_ok=True)
+            node_binary.parent.mkdir(parents=True, exist_ok=True)
+            (worker_root / "package.json").write_text("{\"name\": \"worker\"}\n", encoding="utf-8")
+            node_binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+            focused = WhatsAppChannelConfig.from_twinr_config(
+                SimpleNamespace(
+                    project_root=str(project_root),
+                    whatsapp_allow_from="+491711234567",
+                    whatsapp_auth_dir="state/channels/whatsapp/auth",
+                    whatsapp_worker_root="src/twinr/channels/whatsapp/worker",
+                    whatsapp_node_binary="state/tools/node-v20/bin/node",
+                    whatsapp_groups_enabled=False,
+                    whatsapp_self_chat_mode=True,
+                    whatsapp_reconnect_base_delay_s=2.0,
+                    whatsapp_reconnect_max_delay_s=30.0,
+                    whatsapp_send_timeout_s=20.0,
+                    whatsapp_sent_cache_ttl_s=180.0,
+                    whatsapp_sent_cache_max_entries=256,
+                )
+            )
+
+        self.assertEqual(focused.auth_dir, auth_dir)
+        self.assertEqual(focused.worker_root, worker_root)
+        self.assertEqual(focused.node_binary, str(node_binary))
+
+    def test_from_twinr_config_prefers_staged_local_node_runtime_when_config_uses_default_node(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            auth_dir = project_root / "state" / "channels" / "whatsapp" / "auth"
+            worker_root = project_root / "src" / "twinr" / "channels" / "whatsapp" / "worker"
+            local_runtime = detect_whatsapp_node_runtime_spec(project_root)
+            worker_root.mkdir(parents=True, exist_ok=True)
+            auth_dir.mkdir(parents=True, exist_ok=True)
+            local_runtime.binary_path.parent.mkdir(parents=True, exist_ok=True)
+            (worker_root / "package.json").write_text("{\"name\": \"worker\"}\n", encoding="utf-8")
+            local_runtime.binary_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+            focused = WhatsAppChannelConfig.from_twinr_config(
+                SimpleNamespace(
+                    project_root=str(project_root),
+                    whatsapp_allow_from="+491711234567",
+                    whatsapp_auth_dir="state/channels/whatsapp/auth",
+                    whatsapp_worker_root="src/twinr/channels/whatsapp/worker",
+                    whatsapp_node_binary="node",
+                    whatsapp_groups_enabled=False,
+                    whatsapp_self_chat_mode=True,
+                    whatsapp_reconnect_base_delay_s=2.0,
+                    whatsapp_reconnect_max_delay_s=30.0,
+                    whatsapp_send_timeout_s=20.0,
+                    whatsapp_sent_cache_ttl_s=180.0,
+                    whatsapp_sent_cache_max_entries=256,
+                )
+            )
+
+        self.assertEqual(focused.node_binary, str(local_runtime.binary_path))
+
+    def test_resolve_whatsapp_node_binary_returns_explicit_relative_project_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_root = Path(temp_dir)
+            resolved = resolve_whatsapp_node_binary(project_root, "state/tools/node-v20/bin/node")
+
+        self.assertEqual(str(project_root / "state" / "tools" / "node-v20" / "bin" / "node"), resolved)
 
     def test_worker_bridge_parses_qr_svg_status_payload(self) -> None:
         config = WhatsAppChannelConfig(

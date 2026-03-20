@@ -691,17 +691,6 @@ class TwinrRealtimeBackgroundMixin:
                     event_names=list(normalized_event_names),
                 )
 
-        self._safe_enqueue_multimodal_evidence(
-            event_name="sensor_observation",
-            modality="sensor",
-            source="proactive_monitor",
-            message="Changed multimodal sensor observation recorded.",
-            data={
-                "facts": copied_facts,
-                "event_names": list(normalized_event_names),
-            },
-        )
-
     def _maybe_deliver_due_reminder(self) -> bool:
         # AUDIT-FIX(#9): Validate timer state and poll interval before touching reminder delivery logic.
         now_monotonic = time.monotonic()
@@ -803,6 +792,18 @@ class TwinrRealtimeBackgroundMixin:
                 return False
             try:
                 normalized_event_names = self._normalize_event_names(event_names)
+                # Persist the coalesced observation that the idle loop is
+                # actually acting on instead of every raw producer update.
+                self._safe_enqueue_multimodal_evidence(
+                    event_name="sensor_observation",
+                    modality="sensor",
+                    source="proactive_monitor",
+                    message="Changed multimodal sensor observation recorded.",
+                    data={
+                        "facts": facts,
+                        "event_names": list(normalized_event_names),
+                    },
+                )
                 if self._run_matching_sensor_automations(facts=facts, event_names=normalized_event_names):
                     return True
             except Exception as exc:

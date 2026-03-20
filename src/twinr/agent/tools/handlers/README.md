@@ -3,8 +3,8 @@
 `handlers` owns the concrete realtime tool handlers used during live turns. It
 translates tool payloads into bounded runtime reads or mutations for automations,
 memory, reminders, output, self-coding, settings, voice-profile, portrait-
-identity, and shared household-identity flows, and keeps shared voice/argument
-guards close to that boundary.
+identity, shared household-identity flows, and RSS/world-intelligence source
+configuration, and keeps shared voice/argument guards close to that boundary.
 
 ## Responsibility
 
@@ -16,6 +16,7 @@ guards close to that boundary.
 - translate local camera-driven portrait-enrollment results into structured guidance for the model
 - expose one shared local household-identity tool surface for face, voice, status, and explicit confirm or deny feedback
 - bridge the self-coding front-stage flow plus learned-skill control/runtime hooks into deterministic ASE modules
+- expose one explicit tool surface for RSS/world-intelligence subscription setup and occasional recalibration
 
 `handlers` does **not** own:
 - tool registry, binding, schemas, or prompt instruction assembly
@@ -28,6 +29,7 @@ guards close to that boundary.
 | File | Purpose |
 |---|---|
 | [automations.py](./automations.py) | Automation CRUD handlers |
+| [intelligence.py](./intelligence.py) | RSS/world-intelligence subscription and refresh-config handler |
 | [memory.py](./memory.py) | Durable-memory tool handlers |
 | [output.py](./output.py) | Print, search, and camera handlers |
 | [household_identity.py](./household_identity.py) | Shared local household identity manager tool handler |

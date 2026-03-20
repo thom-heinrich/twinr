@@ -1,13 +1,14 @@
 [Unit]
 Description=Twinr Authoritative Runtime Supervisor
-Wants=network-online.target
-After=network-online.target
+Wants=network-online.target twinr-remote-memory-watchdog.service
+After=network-online.target twinr-remote-memory-watchdog.service
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory=/twinr
 Environment=TWINR_PYTHON=/twinr/.venv/bin/python
+Environment=TWINR_REMOTE_MEMORY_WATCHDOG_MANAGED_EXTERNALLY=1
 ExecStart=/usr/bin/env bash -lc 'cd /twinr && PYTHONPATH=src "${TWINR_PYTHON}" -m twinr --env-file .env --run-runtime-supervisor'
 Restart=always
 RestartSec=2

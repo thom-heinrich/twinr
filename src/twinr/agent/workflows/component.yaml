@@ -7,6 +7,8 @@ summary: Orchestrate the active realtime and streaming Twinr hardware loops plus
 owned_concerns:
   - Orchestrate button, wakeword, and proactive entry points for Twinr hardware loops
   - Coordinate live conversation sessions, print delivery, and bounded speech output
+  - Hold fatal loop/bootstrap failures in a stable runtime error state so the Pi display companion and supervisor do not flap back to the desktop
+  - Forward completed tool-call history into runtime-side personality learning after turn finalization
   - Keep turn-guidance context shaping and transcript-verifier gate policy outside the active loop classes
   - Serialize beep, feedback, and spoken playback under one priority-aware speaker coordinator
   - Keep required remote-memory fail-closed checks off the GPIO polling thread
@@ -40,6 +42,10 @@ files:
     role: Streaming loop entrypoint and turn orchestration shell that delegates capture, speculation, planning, and turn execution
     exports:
       - TwinrStreamingHardwareLoop
+  - path: runtime_error_hold.py
+    role: Stable runtime-error hold helper that keeps the display companion alive and refreshes runtime snapshots after fatal loop failures
+    exports:
+      - hold_runtime_error_state
   - path: turn_guidance.py
     role: Bounded turn-controller context selection and turn-label guidance runtime
     exports:
@@ -60,7 +66,7 @@ files:
   - path: streaming_lane_planner.py
     role: Streaming lane-plan construction, final-lane path selection, and LLM recovery callback wiring
   - path: streaming_turn_coordinator.py
-    role: Authoritative streaming turn state machine for speech lifecycle, deadlines, cancellation, and completion
+    role: Authoritative streaming turn state machine for speech lifecycle, deadlines, cancellation, completion, and post-turn tool-history forwarding
     exports:
       - StreamingTurnCoordinator
       - StreamingTurnCoordinatorHooks
@@ -103,7 +109,7 @@ files:
     exports:
       - TwinrRealtimeSupportMixin
   - path: realtime_runner_tools.py
-    role: Thin realtime tool-callback delegate mixin
+    role: Thin realtime tool-callback delegate mixin, including RSS/world-intelligence configuration wiring
     exports:
       - TwinrRealtimeToolDelegatesMixin
   - path: button_dispatch.py

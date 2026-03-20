@@ -21,6 +21,7 @@ from twinr.memory.chonkydb import (
     ChonkyDBTopKRecordsRequest,
     chonkydb_data_path,
 )
+from twinr.memory.chonkydb.client import _PooledTransport
 
 
 class FakeHTTPResponse:
@@ -70,6 +71,49 @@ class FakeOpener:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class FakePoolResponse:
+    def __init__(
+        self,
+        payload: dict[str, object],
+        *,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+        reason: str = "OK",
+    ) -> None:
+        self.status = status
+        self.headers = headers or {}
+        self.reason = reason
+        self._payload = json.dumps(payload).encode("utf-8")
+        self._offset = 0
+        self.closed = False
+        self.released = False
+
+    def read(self, amt: int = -1, decode_content: bool = True) -> bytes:
+        if self._offset >= len(self._payload):
+            return b""
+        if amt < 0:
+            amt = len(self._payload) - self._offset
+        chunk = self._payload[self._offset : self._offset + amt]
+        self._offset += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+    def release_conn(self) -> None:
+        self.released = True
+
+
+class FakePoolManager:
+    def __init__(self, response: FakePoolResponse) -> None:
+        self.response = response
+        self.calls: list[dict[str, object]] = []
+
+    def request(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.response
 
 
 class ChonkyDBClientTests(unittest.TestCase):
@@ -308,6 +352,51 @@ class ChonkyDBClientTests(unittest.TestCase):
         error = exc_info.exception
         self.assertEqual(error.status_code, 400)
         self.assertEqual(error.response_json, {"type": "validation_error", "detail": "bad request"})
+
+    def test_pooled_transport_reuses_connections_and_disables_redirects(self) -> None:
+        pool_response = FakePoolResponse(
+            {
+                "success": True,
+                "service": "ccodex_memory",
+                "ready": True,
+                "auth_enabled": True,
+            }
+        )
+        pool_manager = FakePoolManager(pool_response)
+        client = ChonkyDBClient(
+            ChonkyDBConnectionConfig(base_url="https://memory.test", api_key="secret-key"),
+            opener=_PooledTransport(pool_manager),
+        )
+
+        instance = client.instance()
+
+        self.assertTrue(instance.ready)
+        self.assertEqual(pool_manager.calls[0]["redirect"], False)
+        self.assertEqual(pool_manager.calls[0]["retries"], False)
+        self.assertEqual(pool_manager.calls[0]["preload_content"], False)
+        self.assertEqual(pool_manager.calls[0]["headers"]["X-api-key"], "secret-key")
+        self.assertTrue(pool_response.released)
+        self.assertFalse(pool_response.closed)
+
+    def test_pooled_transport_rejects_redirect_responses(self) -> None:
+        pool_response = FakePoolResponse(
+            {"detail": "redirect"},
+            status=302,
+            headers={"Location": "https://other.example/v1/external/instance"},
+            reason="Found",
+        )
+        client = ChonkyDBClient(
+            ChonkyDBConnectionConfig(base_url="https://memory.test"),
+            opener=_PooledTransport(FakePoolManager(pool_response)),
+        )
+
+        with self.assertRaises(ChonkyDBError) as exc_info:
+            client.instance()
+
+        error = exc_info.exception
+        self.assertEqual(error.status_code, 302)
+        self.assertIn("unexpected redirect", str(error))
+        self.assertEqual(error.response_json, {"detail": "redirect"})
 
     def test_fetch_full_document_accepts_large_snapshot_payload_within_configured_response_limit(self) -> None:
         opener = FakeOpener()

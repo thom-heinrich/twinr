@@ -9,6 +9,7 @@ traced without scattering JSON-writing logic across the orchestration code.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -120,6 +121,19 @@ _ENV_WHITELIST: tuple[str, ...] = (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+_ACTIVE_TRACER: ContextVar["WorkflowForensics | None"] = ContextVar(
+    "twinr_workflow_active_tracer",
+    default=None,
+)
+_ACTIVE_TRACE_ID: ContextVar[str | None] = ContextVar(
+    "twinr_workflow_active_trace_id",
+    default=None,
+)
+_ACTIVE_SPAN_ID: ContextVar[str | None] = ContextVar(
+    "twinr_workflow_active_span_id",
+    default=None,
+)
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -297,6 +311,23 @@ def _exception_type_from_record(record: dict[str, object]) -> str:
         if normalized:
             return normalized.split(":", 1)[0].strip() or "unknown"
     return "unknown"
+
+
+def _normalize_legacy_exception_details(details: dict[str, object] | None) -> dict[str, object]:
+    """Promote legacy string exceptions into structured type/message payloads."""
+
+    if not isinstance(details, dict):
+        return dict(details or {})
+    payload = dict(details)
+    exception_payload = payload.get("exception")
+    if isinstance(exception_payload, str):
+        normalized = exception_payload.strip()
+        if normalized:
+            payload["exception"] = {
+                "type": normalized.split(":", 1)[0].strip() or "unknown",
+                "message": normalized,
+            }
+    return payload
 
 
 def _task_id() -> int | None:
@@ -782,7 +813,10 @@ class WorkflowForensics:
             },
             "kind": _bounded_text(kind, default="event"),
             "msg": _bounded_text(msg, default="unknown"),
-            "details": _sanitize_details(details or {}, allow_raw_text=self.allow_raw_text),
+            "details": _sanitize_details(
+                _normalize_legacy_exception_details(details),
+                allow_raw_text=self.allow_raw_text,
+            ),
             "kpi": _sanitize_details(kpi or {}, allow_raw_text=True),
             "reason": _sanitize_details(reason or {}, allow_raw_text=self.allow_raw_text),
         }
@@ -1156,3 +1190,143 @@ class WorkflowForensics:
                 sys.__stderr__.flush()
             except Exception:
                 _LOGGER.warning("Workflow forensics failed to write to stderr fallback.", exc_info=True)
+
+
+def current_workflow_forensics() -> WorkflowForensics | None:
+    """Return the tracer currently bound to this execution context."""
+
+    tracer = _ACTIVE_TRACER.get()
+    if isinstance(tracer, WorkflowForensics) and tracer.enabled:
+        return tracer
+    return None
+
+
+def current_workflow_trace_id() -> str | None:
+    """Return the trace identifier currently bound to this execution context."""
+
+    return _ACTIVE_TRACE_ID.get()
+
+
+def current_workflow_span_id() -> str | None:
+    """Return the span identifier currently bound to this execution context."""
+
+    return _ACTIVE_SPAN_ID.get()
+
+
+@contextmanager
+def bind_workflow_forensics(
+    tracer: WorkflowForensics | None,
+    *,
+    trace_id: str | None = None,
+) -> Iterator[str | None]:
+    """Bind one tracer and optional trace id to the current execution context."""
+
+    active_tracer = tracer if isinstance(tracer, WorkflowForensics) and tracer.enabled else None
+    tracer_token = _ACTIVE_TRACER.set(active_tracer)
+    trace_token = _ACTIVE_TRACE_ID.set(trace_id or _ACTIVE_TRACE_ID.get())
+    span_token = _ACTIVE_SPAN_ID.set(None)
+    try:
+        yield _ACTIVE_TRACE_ID.get()
+    finally:
+        _ACTIVE_SPAN_ID.reset(span_token)
+        _ACTIVE_TRACE_ID.reset(trace_token)
+        _ACTIVE_TRACER.reset(tracer_token)
+
+
+def workflow_event(
+    *,
+    kind: str,
+    msg: str,
+    details: dict[str, object] | None = None,
+    reason: dict[str, object] | None = None,
+    kpi: dict[str, object] | None = None,
+    level: str = "INFO",
+) -> None:
+    """Emit one structured event on the currently bound workflow trace."""
+
+    tracer = current_workflow_forensics()
+    if tracer is None:
+        return
+    tracer.event(
+        kind=kind,
+        msg=msg,
+        details=details,
+        reason=reason,
+        kpi=kpi,
+        level=level,
+        trace_id=current_workflow_trace_id(),
+        span_id=current_workflow_span_id(),
+        parent_span_id=None,
+        loc_skip=2,
+    )
+
+
+def workflow_decision(
+    *,
+    msg: str,
+    question: str,
+    selected: dict[str, object],
+    options: list[dict[str, object]],
+    context: dict[str, object] | None = None,
+    confidence: object | None = None,
+    guardrails: list[str] | None = None,
+    kpi_impact_estimate: dict[str, object] | None = None,
+) -> None:
+    """Emit one decision record on the currently bound workflow trace."""
+
+    tracer = current_workflow_forensics()
+    if tracer is None:
+        return
+    tracer.decision(
+        msg=msg,
+        question=question,
+        selected=selected,
+        options=options,
+        context=context,
+        confidence=confidence,
+        guardrails=guardrails,
+        kpi_impact_estimate=kpi_impact_estimate,
+        trace_id=current_workflow_trace_id(),
+        span_id=current_workflow_span_id(),
+        parent_span_id=None,
+    )
+
+
+@contextmanager
+def workflow_span(
+    *,
+    name: str,
+    kind: str = "span",
+    details: dict[str, object] | None = None,
+) -> Iterator[_SpanState]:
+    """Create one child span on the currently bound workflow trace context."""
+
+    tracer = current_workflow_forensics()
+    trace_id = current_workflow_trace_id() or _token()
+    parent_span_id = current_workflow_span_id()
+    if tracer is None:
+        state = _SpanState(
+            trace_id=trace_id,
+            span_id=_token()[:16],
+            parent_span_id=parent_span_id,
+            started_mono_ns=time.monotonic_ns(),
+            name=name,
+            kind=kind,
+            details=details or {},
+        )
+        yield state
+        return
+    with tracer.span(
+        name=name,
+        kind=kind,
+        details=details,
+        trace_id=trace_id,
+        parent_span_id=parent_span_id,
+    ) as state:
+        trace_token = _ACTIVE_TRACE_ID.set(state.trace_id)
+        span_token = _ACTIVE_SPAN_ID.set(state.span_id)
+        try:
+            yield state
+        finally:
+            _ACTIVE_SPAN_ID.reset(span_token)
+            _ACTIVE_TRACE_ID.reset(trace_token)

@@ -1,0 +1,61 @@
+name: personality
+path: src/twinr/agent/personality
+kind: python-package
+summary: Typed evolving-personality models, background learning, and prompt-layer planning for Twinr's companion identity.
+responsibilities:
+  - Define structured personality, conversation-style, humor, relationship, continuity, place/world, and reflection models.
+  - Translate structured personality state into ordered prompt layers that preserve the legacy section contract.
+  - Provide clean persistence seams for remote snapshot state that can later be backed directly by ChonkyDB-derived personality objects.
+  - Extract structured interaction, continuity, place, and world signals from long-term consolidation output and tool history.
+  - Gate background learning so repeated signals can evolve the durable personality snapshot without one-off drift.
+  - Manage RSS/Atom subscriptions and refresh their calm place/world context into bounded world and continuity updates.
+  - Decay stale world and relationship context and reject contradictory or sensitive-context personality drift.
+out_of_scope:
+  - Provider-specific prompt phrasing.
+  - Memory, reminder, automation, and graph persistence implementations.
+  - Workflow-loop selection of dynamic context sections.
+files:
+  - path: __init__.py
+    role: Narrow package export surface for structured personality helpers.
+  - path: models.py
+    role: Typed evolving-personality state including conversation style, relationship stance, and prompt-layer contracts.
+  - path: context_builder.py
+    role: Ordered prompt-layer assembly.
+  - path: store.py
+    role: Remote snapshot persistence seam for snapshots, signals, and deltas.
+  - path: evolution.py
+    role: Policy-gated background evolution loop with contradiction, sensitivity, and decay maintenance.
+  - path: signals.py
+    role: Structured signal taxonomy plus extraction from consolidation and tool history.
+  - path: learning.py
+    role: Runtime-facing bridge from extracted signals into background evolution.
+  - path: intelligence
+    role: RSS/world-intelligence subscription, discovery, refresh, and remote-state helpers.
+  - path: service.py
+    role: Prompting-facing service.
+public_api:
+  module: twinr.agent.personality
+  exports:
+    - BackgroundPersonalityEvolutionLoop
+    - ConversationStyleProfile
+    - InteractionSignal
+    - PersonalityLearningService
+    - PersonalityContextBuilder
+    - PersonalityContextService
+    - PersonalityEvolutionLoop
+    - PersonalityEvolutionPolicy
+    - PersonalitySignalBatch
+    - PersonalitySignalExtractor
+    - PersonalitySnapshot
+    - PersonalityPromptPlan
+    - PlaceSignal
+    - RemoteStatePersonalityEvolutionStore
+    - RemoteStatePersonalitySnapshotStore
+    - RemoteStateWorldIntelligenceStore
+    - WorldFeedSubscription
+    - WorldIntelligenceConfigRequest
+    - WorldIntelligenceService
+    - WorldSignal
+tests:
+  - path: test/test_agent_personality.py
+  - path: test/test_personality.py

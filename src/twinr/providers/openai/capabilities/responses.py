@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Callable
 
 from twinr.agent.base_agent.personality import merge_instructions
+from twinr.agent.workflows.forensics import workflow_span
 from twinr.ops.usage import extract_model_name, extract_token_usage
 
 from ..core.types import ConversationLike, OpenAIImageInput, OpenAITextResponse
@@ -255,15 +256,36 @@ class OpenAIResponseMixin:
             An ``OpenAITextResponse`` containing text, IDs, model, and usage.
         """
 
-        request = self._build_text_request(
-            prompt,
-            conversation=conversation,
-            instructions=instructions,
-            allow_web_search=allow_web_search,
-            prompt_cache_scope="response",
-        )
-        response = self._create_response(request, operation="respond_with_metadata")
-        return self._build_text_response(response, request)
+        with workflow_span(
+            name="openai_response_build_text_request",
+            kind="llm_call",
+            details={
+                "conversation_messages": len(conversation or ()),
+                "allow_web_search": allow_web_search,
+            },
+        ):
+            request = self._build_text_request(
+                prompt,
+                conversation=conversation,
+                instructions=instructions,
+                allow_web_search=allow_web_search,
+                prompt_cache_scope="response",
+            )
+        with workflow_span(
+            name="openai_response_create",
+            kind="llm_call",
+            details={
+                "model": request.get("model"),
+                "allow_web_search": allow_web_search,
+            },
+        ):
+            response = self._create_response(request, operation="respond_with_metadata")
+        with workflow_span(
+            name="openai_response_build_text_response",
+            kind="llm_call",
+            details={"model": request.get("model")},
+        ):
+            return self._build_text_response(response, request)
 
     def respond_to_images(
         self,

@@ -10,6 +10,8 @@ owned_concerns:
   - Drive state-machine transitions for listening, answering, printing, and failures
   - Assemble provider-facing conversation context, adaptive timing, and voice guidance
   - Mediate on-device memory, durable memory, reminders, automations, and runtime snapshot persistence
+  - Forward completed tool history into long-term-backed personality learning after turn finalization
+  - Expose runtime-side RSS/world-intelligence configuration so persistent feed subscriptions can shape calm place/world awareness
 out_of_scope:
   - Workflow loops and hardware/audio orchestration in src/twinr/agent/workflows
   - Provider transport adapters or instruction authoring

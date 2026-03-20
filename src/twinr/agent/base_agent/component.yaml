@@ -6,7 +6,7 @@ visibility: internal
 summary: Canonical base-agent package surface for config, contracts, focused subpackages, and compatibility re-exports.
 owned_concerns:
   - Expose the canonical import surface for base-agent config, runtime, state, prompting, and conversation helpers
-  - Define the immutable environment-backed TwinrConfig dataclass and env-loading path, including bounded HDMI attention-refresh cadence
+  - Define the immutable environment-backed TwinrConfig dataclass and env-loading path, including bounded HDMI attention-refresh cadence plus session-focus hold tuning for gaze-follow
   - Define provider/runtime protocols, tool-call value objects, and composite provider helpers
   - Preserve thin compatibility wrappers while behavior moves into focused subpackages
 out_of_scope:

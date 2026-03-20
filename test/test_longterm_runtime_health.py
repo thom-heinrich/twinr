@@ -8,7 +8,11 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.memory.longterm.runtime.health import LongTermRemoteHealthProbe
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteSnapshotProbe,
+    LongTermRemoteStatus,
+    LongTermRemoteUnavailableError,
+)
 
 
 class _FakeRemoteState:
@@ -27,6 +31,37 @@ class _FakeRemoteState:
         if isinstance(payload, Exception):
             raise payload
         return payload
+
+
+class _ProbeAwareFakeRemoteState(_FakeRemoteState):
+    def __init__(self, payloads: dict[str, dict[str, object] | Exception]) -> None:
+        super().__init__(payloads)
+        self.probe_calls: list[dict[str, object]] = []
+
+    def probe_snapshot_load(
+        self,
+        *,
+        snapshot_kind: str,
+        local_path=None,
+        prefer_cached_document_id: bool = False,
+    ):
+        del local_path
+        self.probe_calls.append(
+            {
+                "snapshot_kind": snapshot_kind,
+                "prefer_cached_document_id": prefer_cached_document_id,
+            }
+        )
+        payload = self._payloads[snapshot_kind]
+        if isinstance(payload, Exception):
+            raise payload
+        return LongTermRemoteSnapshotProbe(
+            snapshot_kind=snapshot_kind,
+            status="found",
+            latency_ms=1.0,
+            selected_source="cached_document",
+            payload=dict(payload),
+        )
 
 
 class LongTermRemoteHealthProbeTests(unittest.TestCase):
@@ -113,6 +148,35 @@ class LongTermRemoteHealthProbeTests(unittest.TestCase):
                 graph_state=graph_state,
                 midterm_state=midterm_state,
             ).ensure_operational()
+
+    def test_probe_operational_prefers_cached_document_id_hints_for_probeable_states(self) -> None:
+        prompt_state = _ProbeAwareFakeRemoteState(
+            {
+                "prompt_memory": {"schema": "prompt_memory", "entries": []},
+                "user_context": {"schema": "managed_context", "entries": []},
+                "personality_context": {"schema": "managed_context", "entries": []},
+            }
+        )
+        object_state = _ProbeAwareFakeRemoteState(
+            {
+                "objects": {"schema": "twinr_memory_object_catalog_v2", "version": 2, "items": []},
+                "conflicts": {"schema": "conflicts", "conflicts": []},
+                "archive": {"schema": "twinr_memory_archive_catalog_v2", "version": 2, "items": []},
+            }
+        )
+        graph_state = _ProbeAwareFakeRemoteState({"graph": {"schema": "graph", "nodes": [], "edges": []}})
+        midterm_state = _ProbeAwareFakeRemoteState({"midterm": {"schema": "midterm", "packets": []}})
+
+        result = self._probe(
+            prompt_state=prompt_state,
+            object_state=object_state,
+            graph_state=graph_state,
+            midterm_state=midterm_state,
+        ).probe_operational()
+
+        self.assertTrue(result.ready)
+        for state in (prompt_state, object_state, graph_state, midterm_state):
+            self.assertTrue(all(call["prefer_cached_document_id"] for call in state.probe_calls))
 
 
 if __name__ == "__main__":

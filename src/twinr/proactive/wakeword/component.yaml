@@ -3,13 +3,14 @@ name: wakeword
 path: src/twinr/proactive/wakeword
 kind: python-package
 visibility: internal
-summary: Provide wakeword matching, openWakeWord spotting, optional local verifier support, verification policy, calibration profiles, streaming detection, and offline evaluation/training helpers for proactive runtime.
+summary: Provide wakeword matching, openWakeWord spotting, optional local verifier support, sequence-aware cascade verification, verification policy, calibration profiles, streaming detection, runtime-faithful promotion replay, and offline evaluation/training helpers for proactive runtime.
 owned_concerns:
   - Normalize wakeword transcripts, configured phrases, and detector labels
-  - Run local openWakeWord clip and frame spotting plus optional local verifier and STT verification
+  - Run local openWakeWord clip and frame spotting plus optional local verifier, sequence-aware cascade verification, and STT verification
   - Persist and apply per-device wakeword calibration overrides
-  - Replay labeled captures for evaluation, operator labeling, verifier training, autotune recommendations, and post-training acceptance checks
+  - Replay labeled captures for evaluation, operator labeling, verifier training, autotune recommendations, post-training acceptance checks, and runtime-faithful promotion guards
   - Train reproducible Twinr base models from generated wakeword datasets and export local ONNX assets
+  - Render the canonical Stage-1 family, hard-negative mining, and Pi acceptance plan for future retrains
   - Stream bounded PCM frames into wakeword detections for proactive runtime
 out_of_scope:
   - Presence-session arming and proactive monitor orchestration in src/twinr/proactive/runtime
@@ -38,6 +39,9 @@ files:
       - WakewordOpenWakeWordFrameSpotter
       - WakewordOpenWakeWordSpotter
       - WakewordPhraseSpotter
+      - WakewordSequenceCaptureVerifier
+      - WakewordSequenceVerifier
+      - WakewordSequenceVerifierTrainingReport
       - WakewordStreamDetection
       - WakewordVerification
       - append_wakeword_capture_label
@@ -53,7 +57,15 @@ files:
       - run_wakeword_eval
       - train_wakeword_base_model_from_dataset_root
       - train_wakeword_custom_verifier_from_manifest
+      - train_wakeword_sequence_verifier_from_manifest
       - wakeword_primary_prompt
+  - path: cascade.py
+    role: Train and run Twinr's second-stage sequence verifier assets with temporal alignment over localized captures
+    exports:
+      - WakewordSequenceCaptureVerifier
+      - WakewordSequenceVerifier
+      - WakewordSequenceVerifierTrainingReport
+      - train_wakeword_sequence_verifier_from_manifest
   - path: matching.py
     role: Transcript normalization and phrase matching
     exports:
@@ -99,11 +111,33 @@ files:
       - load_labeled_ops_captures
       - run_wakeword_eval
       - train_wakeword_custom_verifier_from_manifest
+  - path: promotion.py
+    role: Runtime-faithful stream replay, promotion spec loading, suite gating, and ambient false-accepts/hour reports
+    exports:
+      - WakewordAmbientGuardResult
+      - WakewordAmbientGuardSpec
+      - WakewordPromotionReport
+      - WakewordPromotionSpec
+      - WakewordPromotionSuiteResult
+      - WakewordPromotionSuiteSpec
+      - WakewordStreamEvalReport
+      - evaluate_wakeword_stream_entries
+      - load_wakeword_promotion_spec
+      - run_wakeword_promotion_eval
+      - run_wakeword_stream_eval
   - path: training.py
-    role: Base-model training, ONNX export, and acceptance-threshold selection
+    role: Base-model training, ONNX export, and runtime-faithful acceptance-threshold selection
     exports:
       - WakewordBaseModelTrainingReport
       - train_wakeword_base_model_from_dataset_root
+  - path: training_plan.py
+    role: Canonical Stage-1 family, hard-negative mining, and Pi acceptance plan rendering
+    exports:
+      - WakewordAcceptanceMetricPlan
+      - WakewordTrainingCommand
+      - WakewordTrainingPlan
+      - build_default_wakeword_training_plan
+      - render_wakeword_training_plan_markdown
   - path: stream.py
     role: Bounded arecord-based streaming monitor
     exports:
@@ -116,6 +150,8 @@ public_api:
     - OpenWakeWordPrediction
     - OpenWakeWordStreamingMonitor
     - SttWakewordVerifier
+    - WakewordAmbientGuardResult
+    - WakewordAmbientGuardSpec
     - WakewordAutotuneRecommendation
     - WakewordBaseModelTrainingReport
     - WakewordCalibrationProfile
@@ -130,21 +166,39 @@ public_api:
     - WakewordOpenWakeWordFrameSpotter
     - WakewordOpenWakeWordSpotter
     - WakewordPhraseSpotter
+    - WakewordPromotionReport
+    - WakewordPromotionSpec
+    - WakewordPromotionSuiteResult
+    - WakewordPromotionSuiteSpec
+    - WakewordSequenceCaptureVerifier
+    - WakewordSequenceVerifier
+    - WakewordSequenceVerifierTrainingReport
+    - WakewordStreamEvalReport
     - WakewordStreamDetection
+    - WakewordTrainingCommand
+    - WakewordTrainingPlan
     - WakewordVerification
+    - WakewordAcceptanceMetricPlan
     - append_wakeword_capture_label
     - apply_wakeword_calibration
     - autotune_wakeword_profile
+    - build_default_wakeword_training_plan
+    - evaluate_wakeword_stream_entries
     - load_eval_manifest
+    - load_wakeword_promotion_spec
     - load_labeled_ops_captures
     - match_wakeword_transcript
     - normalize_detector_label
     - normalize_wakeword_backend
     - normalize_wakeword_verifier_mode
     - phrase_from_detector_label
+    - render_wakeword_training_plan_markdown
+    - run_wakeword_promotion_eval
     - run_wakeword_eval
+    - run_wakeword_stream_eval
     - train_wakeword_base_model_from_dataset_root
     - train_wakeword_custom_verifier_from_manifest
+    - train_wakeword_sequence_verifier_from_manifest
     - wakeword_primary_prompt
 compatibility_reexports:
   - path: src/twinr/proactive/__init__.py
@@ -153,6 +207,8 @@ compatibility_reexports:
       - OpenWakeWordPrediction
       - OpenWakeWordStreamingMonitor
       - SttWakewordVerifier
+      - WakewordAmbientGuardResult
+      - WakewordAmbientGuardSpec
       - WakewordAutotuneRecommendation
       - WakewordBaseModelTrainingReport
       - WakewordCalibrationProfile
@@ -167,21 +223,39 @@ compatibility_reexports:
       - WakewordOpenWakeWordFrameSpotter
       - WakewordOpenWakeWordSpotter
       - WakewordPhraseSpotter
+      - WakewordPromotionReport
+      - WakewordPromotionSpec
+      - WakewordPromotionSuiteResult
+      - WakewordPromotionSuiteSpec
+      - WakewordSequenceCaptureVerifier
+      - WakewordSequenceVerifier
+      - WakewordSequenceVerifierTrainingReport
+      - WakewordStreamEvalReport
       - WakewordStreamDetection
+      - WakewordTrainingCommand
+      - WakewordTrainingPlan
       - WakewordVerification
+      - WakewordAcceptanceMetricPlan
       - append_wakeword_capture_label
       - apply_wakeword_calibration
       - autotune_wakeword_profile
+      - build_default_wakeword_training_plan
+      - evaluate_wakeword_stream_entries
       - load_eval_manifest
+      - load_wakeword_promotion_spec
       - load_labeled_ops_captures
       - match_wakeword_transcript
       - normalize_detector_label
       - normalize_wakeword_backend
       - normalize_wakeword_verifier_mode
       - phrase_from_detector_label
+      - render_wakeword_training_plan_markdown
+      - run_wakeword_promotion_eval
       - run_wakeword_eval
+      - run_wakeword_stream_eval
       - train_wakeword_base_model_from_dataset_root
       - train_wakeword_custom_verifier_from_manifest
+      - train_wakeword_sequence_verifier_from_manifest
       - wakeword_primary_prompt
 primary_callers:
   - path: src/twinr/proactive/runtime/service.py
@@ -192,6 +266,9 @@ tests:
   - path: test/test_wakeword_policy.py
   - path: test/test_wakeword_eval.py
   - path: test/test_wakeword_training.py
+  - path: test/test_wakeword_promotion.py
+  - path: test/test_wakeword_cascade.py
+  - path: test/test_wakeword_training_plan.py
   - path: test/test_proactive_monitor.py
   - path: test/test_main.py
   - path: test/test_generate_multivoice_dataset.py

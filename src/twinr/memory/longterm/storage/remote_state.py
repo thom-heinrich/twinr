@@ -24,7 +24,7 @@ from typing import Iterable, Iterator, Mapping
 from urllib.parse import quote  # AUDIT-FIX(#6): Encode URI path segments safely.
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig, ChonkyDBError
+from twinr.memory.chonkydb import ChonkyDBClient, ChonkyDBConnectionConfig, ChonkyDBError, chonkydb_data_path
 from twinr.memory.chonkydb.models import ChonkyDBRecordRequest
 from twinr.memory.longterm.storage.remote_read_diagnostics import (
     LongTermRemoteWriteContext,
@@ -39,6 +39,8 @@ _SNAPSHOT_SCHEMA = "twinr_remote_snapshot_v1"
 _SNAPSHOT_POINTER_SCHEMA = "twinr_remote_snapshot_pointer_v1"
 _SNAPSHOT_POINTER_VERSION = 1
 _SNAPSHOT_POINTER_PREFIX = "__pointer__:"
+_DOCUMENT_ID_HINTS_SCHEMA = "twinr_remote_snapshot_document_hints_v1"
+_DOCUMENT_ID_HINTS_FILENAME = "remote_snapshot_document_hints.json"
 _DEFAULT_REMOTE_READ_TIMEOUT_S = 10.0  # AUDIT-FIX(#7): Safe fallback defaults for malformed .env values.
 _DEFAULT_REMOTE_WRITE_TIMEOUT_S = 15.0
 _DEFAULT_RETRY_ATTEMPTS = 3
@@ -47,8 +49,11 @@ _DEFAULT_MAX_CONTENT_CHARS = 262_144
 _DEFAULT_MAX_CONTENT_CHARS_CAP = 8_388_608  # 8 MiB cap for RPi-friendly snapshot fetches.
 _DEFAULT_LOCAL_SNAPSHOT_MAX_BYTES = 8_388_608
 _DEFAULT_CIRCUIT_BREAKER_COOLDOWN_S = 15.0
+_DEFAULT_ORIGIN_RESOLUTION_BOOTSTRAP_TIMEOUT_S = 20.0
+_DEFAULT_ORIGIN_RESOLUTION_BOOTSTRAP_TIMEOUT_CAP_S = 30.0
 _MAX_NAMESPACE_LENGTH = 255
 _MAX_SNAPSHOT_KIND_LENGTH = 255
+_MAX_DOCUMENT_HINTS_BYTES = 262_144
 
 
 def _utcnow_iso() -> str:
@@ -397,6 +402,7 @@ class LongTermRemoteStateStore:
             field_name="namespace",
             max_length=_MAX_NAMESPACE_LENGTH,
         )
+        self._load_persisted_document_id_hints()
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermRemoteStateStore":
@@ -738,6 +744,7 @@ class LongTermRemoteStateStore:
             self._remember_snapshot_document_id(
                 snapshot_kind=normalized_snapshot_kind,
                 document_id=document_id,
+                persist=True,
             )
         self._store_snapshot_read(
             snapshot_kind=normalized_snapshot_kind,
@@ -882,10 +889,13 @@ class LongTermRemoteStateStore:
         backoff_s = self._retry_backoff_s()
         attempt_records: list[LongTermRemoteFetchAttempt] = []
         started = time.monotonic()
+        effective_client = client
+        if document_id is None:
+            effective_client = self._origin_resolution_client(client)
         for attempt in range(attempts):
             attempt_started = time.monotonic()
             try:
-                payload = client.fetch_full_document(
+                payload = effective_client.fetch_full_document(
                     document_id=document_id,
                     origin_uri=None if document_id else self._snapshot_uri(snapshot_kind),
                     include_content=True,
@@ -1038,13 +1048,25 @@ class LongTermRemoteStateStore:
         *,
         snapshot_kind: str,
         local_path: Path | None = None,
+        prefer_cached_document_id: bool = False,
     ) -> LongTermRemoteSnapshotProbe:
-        """Probe one remote snapshot read and preserve pointer/origin evidence."""
+        """Probe one remote snapshot read and preserve pointer/origin evidence.
+
+        Args:
+            snapshot_kind: Logical snapshot name to resolve remotely.
+            local_path: Optional local recovery path used only for detail parity
+                in the probe evidence.
+            prefer_cached_document_id: When true, probe via an already learned
+                exact ChonkyDB document id before falling back to the slower
+                pointer/origin walk. Health checks use this to prove that the
+                current remote snapshot is still readable without paying the
+                full pointer-resolution cost on every warm probe.
+        """
 
         return self._probe_snapshot_load_internal(
             snapshot_kind=snapshot_kind,
             local_path=local_path,
-            prefer_cached_document_id=False,
+            prefer_cached_document_id=prefer_cached_document_id,
         )
 
     def _probe_snapshot_load_internal(
@@ -1706,17 +1728,33 @@ class LongTermRemoteStateStore:
         with self._state_lock:
             return self._document_id_hints.get(snapshot_kind)
 
-    def _remember_snapshot_document_id(self, *, snapshot_kind: str, document_id: str) -> None:
+    def _remember_snapshot_document_id(
+        self,
+        *,
+        snapshot_kind: str,
+        document_id: str,
+        persist: bool = False,
+    ) -> None:
         normalized_document_id = _normalize_snapshot_document_id(document_id)
         if normalized_document_id is None:
             return
+        snapshot_hints: dict[str, str] | None = None
         with self._state_lock:
             self._document_id_hints[snapshot_kind] = normalized_document_id
+            if persist:
+                snapshot_hints = self._persistent_document_id_hints_locked()
+        if snapshot_hints is not None:
+            self._persist_document_id_hints(snapshot_hints=snapshot_hints)
 
     def _forget_snapshot_document_id(self, *, snapshot_kind: str) -> None:
+        snapshot_hints: dict[str, str] | None = None
         with self._state_lock:
-            self._document_id_hints.pop(snapshot_kind, None)
+            removed = self._document_id_hints.pop(snapshot_kind, None)
             self._snapshot_read_cache.pop(snapshot_kind, None)
+            if removed is not None:
+                snapshot_hints = self._persistent_document_id_hints_locked()
+        if snapshot_hints is not None:
+            self._persist_document_id_hints(snapshot_hints=snapshot_hints)
 
     def _cached_probe(self, *, snapshot_kind: str) -> LongTermRemoteSnapshotProbe | None:
         with self._state_lock:
@@ -1735,6 +1773,147 @@ class LongTermRemoteStateStore:
             payload=payload,
             attempts=cached.attempts,
         )
+
+    def _origin_resolution_client(self, client: ChonkyDBClient) -> ChonkyDBClient:
+        """Return one client tuned for cold `origin_uri` resolution."""
+
+        target_timeout_s = self._origin_resolution_bootstrap_timeout_s()
+        if float(client.config.timeout_s) >= target_timeout_s:
+            return client
+        return client.clone_with_timeout(target_timeout_s)
+
+    def _origin_resolution_bootstrap_timeout_s(self) -> float:
+        """Return the bounded timeout used for cold current-head resolution."""
+
+        read_timeout_s = _coerce_timeout_s(
+            getattr(self.config, "long_term_memory_remote_read_timeout_s", _DEFAULT_REMOTE_READ_TIMEOUT_S),
+            default=_DEFAULT_REMOTE_READ_TIMEOUT_S,
+        )
+        candidate = max(
+            _DEFAULT_ORIGIN_RESOLUTION_BOOTSTRAP_TIMEOUT_S,
+            read_timeout_s * 3.0,
+        )
+        return _coerce_float(
+            candidate,
+            default=_DEFAULT_ORIGIN_RESOLUTION_BOOTSTRAP_TIMEOUT_S,
+            minimum=read_timeout_s,
+            maximum=_DEFAULT_ORIGIN_RESOLUTION_BOOTSTRAP_TIMEOUT_CAP_S,
+        )
+
+    def _document_id_hints_path(self) -> Path | None:
+        """Return the local durable hint path when the storage root is valid."""
+
+        try:
+            base_dir = chonkydb_data_path(self.config)
+        except Exception:
+            return None
+        return base_dir / _DOCUMENT_ID_HINTS_FILENAME
+
+    def _load_persisted_document_id_hints(self) -> None:
+        """Load durable write-learned snapshot document ids from local state."""
+
+        hints_path = self._document_id_hints_path()
+        if hints_path is None:
+            return
+        try:
+            path_stat = hints_path.lstat()
+        except OSError:
+            return
+        if not stat.S_ISREG(path_stat.st_mode):
+            return
+        if path_stat.st_size > _MAX_DOCUMENT_HINTS_BYTES:
+            _LOGGER.warning(
+                "Ignoring remote snapshot document-id hints at %s because the file exceeds %d bytes.",
+                hints_path,
+                _MAX_DOCUMENT_HINTS_BYTES,
+            )
+            return
+        try:
+            payload = json.loads(
+                hints_path.read_text(encoding="utf-8"),
+                parse_constant=_reject_non_finite_json_constant,
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, Mapping):
+            return
+        if payload.get("schema") != _DOCUMENT_ID_HINTS_SCHEMA:
+            return
+        if _normalize_text(payload.get("namespace")) != self.namespace:
+            return
+        raw_hints = payload.get("document_ids")
+        if not isinstance(raw_hints, Mapping):
+            return
+        loaded_hints: dict[str, str] = {}
+        for raw_kind, raw_document_id in raw_hints.items():
+            try:
+                normalized_kind = self._normalize_snapshot_kind(str(raw_kind))
+            except ValueError:
+                continue
+            if self._is_pointer_snapshot_kind(normalized_kind):
+                continue
+            normalized_document_id = _normalize_snapshot_document_id(raw_document_id)
+            if normalized_document_id is None:
+                continue
+            loaded_hints[normalized_kind] = normalized_document_id
+        if not loaded_hints:
+            return
+        with self._state_lock:
+            self._document_id_hints.update(loaded_hints)
+
+    def _persistent_document_id_hints_locked(self) -> dict[str, str]:
+        """Return the persistable document-id hints while the state lock is held."""
+
+        return {
+            snapshot_kind: document_id
+            for snapshot_kind, document_id in self._document_id_hints.items()
+            if not self._is_pointer_snapshot_kind(snapshot_kind)
+        }
+
+    def _persist_document_id_hints(self, *, snapshot_hints: Mapping[str, str]) -> None:
+        """Atomically persist the current write-learned snapshot document ids."""
+
+        hints_path = self._document_id_hints_path()
+        if hints_path is None:
+            return
+        try:
+            hints_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _LOGGER.warning(
+                "Failed to create remote snapshot hint directory %s: %s",
+                hints_path.parent,
+                self._safe_exception_text(exc),
+            )
+            return
+        payload = {
+            "schema": _DOCUMENT_ID_HINTS_SCHEMA,
+            "namespace": self.namespace,
+            "updated_at": _utcnow_iso(),
+            "document_ids": dict(sorted(snapshot_hints.items())),
+        }
+        try:
+            json_text = _safe_json_text(payload)
+        except (TypeError, ValueError):
+            return
+        temp_path = hints_path.with_name(
+            f"{hints_path.name}.tmp-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+        )
+        try:
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                handle.write(json_text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, hints_path)
+        except OSError as exc:
+            _LOGGER.warning(
+                "Failed to persist remote snapshot document-id hints at %s: %s",
+                hints_path,
+                self._safe_exception_text(exc),
+            )
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
     def _store_cached_probe(self, probe: LongTermRemoteSnapshotProbe) -> None:
         if probe.snapshot_kind.startswith(_SNAPSHOT_POINTER_PREFIX):

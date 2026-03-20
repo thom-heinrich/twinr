@@ -215,6 +215,23 @@ class TwinrRealtimeSupportMixin:
         except (TypeError, ValueError):
             return _DEFAULT_REQUIRED_REMOTE_HEALTHCHECK_INTERVAL_SECONDS
 
+    def _required_remote_dependency_recovery_hold_seconds(self) -> float:
+        """Return how long watchdog-artifact readiness must stay stable before recovery."""
+
+        if not self._required_remote_dependency_uses_watchdog_artifact():
+            return 0.0
+        interval_s = self._required_remote_dependency_interval_seconds()
+        raw_keepalive = getattr(
+            getattr(self, "config", None),
+            "long_term_memory_remote_keepalive_interval_s",
+            interval_s,
+        )
+        try:
+            keepalive_s = max(0.0, float(raw_keepalive))
+        except (TypeError, ValueError):
+            keepalive_s = interval_s
+        return max(interval_s * 3.0, keepalive_s)
+
     def _remote_dependency_is_required(self) -> bool:
         runtime = getattr(self, "runtime", None)
         checker = getattr(runtime, "remote_dependency_required", None)
@@ -300,6 +317,7 @@ class TwinrRealtimeSupportMixin:
         )
         active = bool(getattr(self, "_required_remote_dependency_error_active", False))
         self._required_remote_dependency_cached_ready = False
+        self._required_remote_dependency_recovery_started_at = None
         self._required_remote_dependency_next_check_at = (
             time.monotonic() + self._required_remote_dependency_interval_seconds()
         )
@@ -356,6 +374,7 @@ class TwinrRealtimeSupportMixin:
             if not self._remote_dependency_is_required():
                 self._required_remote_dependency_error_active = False
                 self._required_remote_dependency_cached_ready = True
+                self._required_remote_dependency_recovery_started_at = None
                 self._required_remote_dependency_next_check_at = 0.0
                 self._trace_event(
                     "required_remote_not_required",
@@ -447,7 +466,36 @@ class TwinrRealtimeSupportMixin:
                 self._enter_required_remote_error(exc)
                 return False
 
+            recovery_hold_s = self._required_remote_dependency_recovery_hold_seconds()
+            if (
+                recovery_hold_s > 0.0
+                and getattr(self, "_required_remote_dependency_error_active", False)
+                and getattr(getattr(self.runtime, "status", None), "value", None) == "error"
+            ):
+                recovery_started_at = getattr(self, "_required_remote_dependency_recovery_started_at", None)
+                if recovery_started_at is None:
+                    recovery_started_at = now
+                    self._required_remote_dependency_recovery_started_at = now
+                stable_ready_s = max(0.0, now - float(recovery_started_at))
+                if stable_ready_s < recovery_hold_s:
+                    self._required_remote_dependency_cached_ready = False
+                    self._required_remote_dependency_next_check_at = (
+                        now + self._required_remote_dependency_interval_seconds()
+                    )
+                    self._trace_event(
+                        "required_remote_restore_pending",
+                        kind="cache",
+                        details={
+                            "force": force,
+                            "force_sync": force_sync,
+                            "stable_ready_s": round(stable_ready_s, 3),
+                            "required_stable_s": round(recovery_hold_s, 3),
+                        },
+                    )
+                    return False
+
             self._required_remote_dependency_cached_ready = True
+            self._required_remote_dependency_recovery_started_at = None
             self._required_remote_dependency_next_check_at = now + self._required_remote_dependency_interval_seconds()
             self._trace_event(
                 "required_remote_refresh_succeeded",

@@ -16,6 +16,7 @@ from pathlib import Path
 from threading import Lock
 
 from twinr.automations import AutomationStore
+from twinr.agent.personality import PersonalityContextService
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError, LongTermRemoteStateStore
@@ -29,6 +30,7 @@ _SECTION_FILES = (
     ("PERSONALITY", "PERSONALITY.md"),
     ("USER", "USER.md"),
 )
+_PERSONALITY_CONTEXT_SERVICE = PersonalityContextService()
 _REMOTE_CONTEXT_WARNING_LOCK = Lock()
 _REMOTE_CONTEXT_WARNINGS: set[str] = set()
 
@@ -153,28 +155,48 @@ def _load_common_sections(config: TwinrConfig) -> list[tuple[str, str]]:
 
 def _load_static_sections(config: TwinrConfig) -> list[tuple[str, str]]:
     directory = _resolve_personality_directory(config)  # AUDIT-FIX(#2): Keep personality files inside the trusted project root.
+    remote_state = LongTermRemoteStateStore.from_config(config)
+    legacy_sections = _load_legacy_static_sections(
+        directory=directory,
+        remote_state=remote_state,
+    )
+    structured_sections = _PERSONALITY_CONTEXT_SERVICE.build_static_sections(
+        legacy_sections=tuple(legacy_sections),
+        config=config,
+        remote_state=remote_state,
+    )
+    return list(structured_sections)
+
+
+def _load_legacy_static_sections(
+    *,
+    directory: Path | None,
+    remote_state: LongTermRemoteStateStore,
+) -> list[tuple[str, str]]:
+    """Load the legacy static personality files before structured layering."""
+
     sections: list[tuple[str, str]] = []
-    if directory is not None:
-        remote_state = LongTermRemoteStateStore.from_config(config)
-        for title, filename in _SECTION_FILES:
-            if title == "SYSTEM":
-                content = _read_optional_text_file(directory, filename, source_label=filename)  # AUDIT-FIX(#3): Use a single secure open instead of exists()+read_text().
-            elif title == "USER":
-                content = _render_managed_static_section(
-                    directory / filename,
-                    section_title="Twinr managed user updates",
-                    snapshot_kind="user_context",
-                    remote_state=remote_state,
-                )
-            else:
-                content = _render_managed_static_section(
-                    directory / filename,
-                    section_title="Twinr managed personality updates",
-                    snapshot_kind="personality_context",
-                    remote_state=remote_state,
-                )
-            if content is not None:
-                sections.append((title, content))
+    if directory is None:
+        return sections
+    for title, filename in _SECTION_FILES:
+        if title == "SYSTEM":
+            content = _read_optional_text_file(directory, filename, source_label=filename)  # AUDIT-FIX(#3): Use a single secure open instead of exists()+read_text().
+        elif title == "USER":
+            content = _render_managed_static_section(
+                directory / filename,
+                section_title="Twinr managed user updates",
+                snapshot_kind="user_context",
+                remote_state=remote_state,
+            )
+        else:
+            content = _render_managed_static_section(
+                directory / filename,
+                section_title="Twinr managed personality updates",
+                snapshot_kind="personality_context",
+                remote_state=remote_state,
+            )
+        if content is not None:
+            sections.append((title, content))
     return sections
 
 

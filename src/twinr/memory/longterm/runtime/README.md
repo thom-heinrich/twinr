@@ -13,6 +13,9 @@ bounded background writers into the APIs used by agent runtime loops.
 - Expose confirmed durable-memory state explicitly in provider/tool context so meta-memory questions can distinguish stored current facts from generic neighbors
 - Rebuild and persist provenance-rich restart-recall packets after durable-memory mutations so fresh runtime roots retain immediate continuity
 - Persist conversation turns and multimodal evidence through bounded workers
+- Coalesce high-frequency sensor observations onto a latest-only idle-loop handoff before they hit multimodal long-term persistence, so proactive sensor churn cannot build an unbounded remote write backlog
+- Route consolidated conversation turns and post-turn tool history into the structured personality-learning service without mixing that policy into the core memory algorithms
+- Route explicit RSS/world-intelligence configuration plus reflection-phase feed refresh/recalibration into the structured personality-learning service without mixing that source logic into the core memory algorithms
 - Split one service-level flush timeout into explicit per-writer budgets so wall-clock runtime deadlines stay real
 - Keep low-signal multimodal writes on the deterministic reflection path while skipping optional midterm compilation that would otherwise duplicate per-turn remote latency
 - Verify remote-primary snapshot readiness before runtime loops start
@@ -22,6 +25,7 @@ bounded background writers into the APIs used by agent runtime loops.
 - Fail closed when any required remote snapshot or shard is unreadable
 - Prewarm generic foreground-read paths plus current object/conflict payload caches before live text-channel traffic so the first real remote-only recall turn can hit a warmed remote cache instead of rebuilding selectors and fetching first-hit payloads on demand
 - Reuse remote snapshot/catalog/item reads through TTL-bounded in-process caches so warmed foreground recall stays sub-second on the Pi without changing remote-only truth semantics
+- Keep foreground provider-context reads on the stores' own consistency boundaries instead of queueing them behind the shared background-writer mutation lock
 - Wire adaptive retrieval policies derived from confirmed memory, routines, and proactive outcomes into provider context
 - Expose review, retention, proactive, and operator mutation entry points
 
@@ -53,6 +57,10 @@ context = service.build_provider_context(query_text)
 service.enqueue_conversation_turn(
     transcript=user_text,
     response=assistant_text,
+)
+service.record_personality_tool_history(
+    tool_calls=tool_calls,
+    tool_results=tool_results,
 )
 ```
 

@@ -4,6 +4,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import stat
 import socket
 import sys
 import tempfile
@@ -249,6 +250,39 @@ class _FakeChonkyClient:
             query_plan={"latency_ms": {"search": 1.0, "materialize": 0.2}},
             raw={"results": [dict(item) for item in ranked]},
         )
+
+
+class _TimeoutingScopeTopKClient(_FakeChonkyClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.supports_topk_records = True
+        self._failed_scope_queries = 0
+
+    def topk_records(self, request):
+        payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        if payload.get("scope_ref") and self._failed_scope_queries == 0:
+            self._failed_scope_queries += 1
+            raise ChonkyDBError(
+                "ChonkyDB request failed for POST /v1/external/retrieve/topk_records: The read operation timed out"
+            )
+        return super().topk_records(request)
+
+
+class _LargeWindowTimeoutingScopeTopKClient(_FakeChonkyClient):
+    def __init__(self, *, max_ok_limit: int) -> None:
+        super().__init__()
+        self.supports_topk_records = True
+        self.max_ok_limit = max_ok_limit
+        self.attempted_limits: list[int] = []
+
+    def topk_records(self, request):
+        payload = request.to_payload() if hasattr(request, "to_payload") else dict(request)
+        self.attempted_limits.append(int(payload.get("result_limit") or 0))
+        if payload.get("scope_ref") and int(payload.get("result_limit") or 0) > self.max_ok_limit:
+            raise ChonkyDBError(
+                "ChonkyDB request failed for POST /v1/external/retrieve/topk_records: The read operation timed out"
+            )
+        return super().topk_records(request)
 
 
 class _LiveShapeChonkyClient(_FakeChonkyClient):
@@ -644,6 +678,16 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertIn(payload["writer"], range(8))
 
+    def test_atomic_json_write_makes_structured_snapshot_world_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "objects.json"
+
+            _write_json_atomic(target, {"writer": 1})
+
+            mode = stat.S_IMODE(target.stat().st_mode)
+
+        self.assertEqual(mode, 0o644)
+
     def test_apply_consolidation_persists_objects_and_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = LongTermStructuredStore.from_config(_config(temp_dir))
@@ -967,6 +1011,21 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         alert_data = dict(alert_event["data"])
         self.assertEqual(alert_data["classification"], "timeout")
         self.assertEqual(alert_data["alert_kind"], "timeout")
+
+    def test_select_open_conflicts_short_circuits_when_remote_conflict_catalog_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client.supports_topk_records = True
+            store = LongTermStructuredStore(
+                base_path=Path(temp_dir) / "state" / "chonkydb",
+                remote_state=remote_state,
+            )
+            store.write_snapshot(objects=(), conflicts=(), archived_objects=())
+
+            conflicts = store.select_open_conflicts(query_text="phone number", limit=3)
+
+        self.assertEqual(conflicts, ())
+        self.assertEqual(remote_state.client.topk_records_calls, 0)
 
     def test_select_relevant_objects_records_remote_read_histograms_for_search_and_batch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1948,6 +2007,194 @@ class LongTermStructuredStoreTests(unittest.TestCase):
 
         self.assertEqual(tuple(payload["memory_id"] for payload in payloads), ("fact:janina_spouse",))
         self.assertEqual(remote_state.client.topk_records_payloads[0]["result_limit"], 16)
+
+    def test_search_current_item_payloads_returns_none_when_scope_topk_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _TimeoutingScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                )
+            )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            payloads = remote_catalog.search_current_item_payloads(
+                snapshot_kind="objects",
+                query_text="Janina",
+                limit=1,
+            )
+
+        self.assertIsNone(payloads)
+        self.assertEqual(remote_state.client.retrieve_calls, 0)
+
+    def test_search_current_item_payloads_prefers_remote_topk_even_with_cached_catalog_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client.supports_topk_records = True
+            remote_state.config.long_term_memory_remote_read_cache_ttl_s = 60.0
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="episode:doctor",
+                        kind="episode",
+                        summary="Janina had an eye doctor appointment yesterday.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.95,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                )
+            )
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+            self.assertGreater(len(remote_catalog.load_catalog_entries(snapshot_kind="objects")), 0)
+
+            def _fail_local(*args, **kwargs):
+                del args
+                del kwargs
+                raise AssertionError("current-scope reads must prefer remote topk before the local cached selector")
+
+            remote_catalog._local_search_catalog_entries = _fail_local  # type: ignore[method-assign]
+
+            payloads = remote_catalog.search_current_item_payloads(
+                snapshot_kind="objects",
+                query_text="Janina",
+                limit=2,
+            )
+
+        self.assertEqual(tuple(payload["memory_id"] for payload in payloads), ("episode:doctor", "fact:janina_spouse"))
+        self.assertEqual(remote_state.client.topk_records_calls, 1)
+
+    def test_select_relevant_context_objects_uses_one_scope_search_for_both_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="episode:doctor",
+                        kind="episode",
+                        summary="Janina had an eye doctor appointment yesterday.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.95,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                )
+            )
+            remote_state.client.supports_topk_records = True
+
+            episodic, durable = store.select_relevant_context_objects(
+                query_text="Janina",
+                episodic_limit=1,
+                durable_limit=1,
+            )
+
+        self.assertEqual(tuple(item.memory_id for item in episodic), ("episode:doctor",))
+        self.assertEqual(tuple(item.memory_id for item in durable), ("fact:janina_spouse",))
+        self.assertEqual(remote_state.client.topk_records_calls, 1)
+
+    def test_select_relevant_context_objects_retries_with_smaller_scope_window_after_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _LargeWindowTimeoutingScopeTopKClient(max_ok_limit=3)
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="episode:doctor",
+                        kind="episode",
+                        summary="Janina had an eye doctor appointment yesterday.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.95,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                )
+            )
+
+            episodic, durable = store.select_relevant_context_objects(
+                query_text="Janina",
+                episodic_limit=3,
+                durable_limit=3,
+            )
+
+        self.assertEqual(tuple(item.memory_id for item in episodic), ("episode:doctor",))
+        self.assertEqual(tuple(item.memory_id for item in durable), ("fact:janina_spouse",))
+        self.assertEqual(
+            tuple(remote_state.client.attempted_limits[:2]),
+            (12, 3),
+        )
+
+    def test_select_relevant_objects_falls_back_to_catalog_search_after_scope_topk_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _TimeoutingScopeTopKClient()
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:janina_spouse",
+                        kind="relationship_fact",
+                        summary="Janina is the user's wife.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.98,
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:tea_preference",
+                        kind="preference_fact",
+                        summary="The user likes black tea.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.9,
+                    ),
+                )
+            )
+
+            relevant = store.select_relevant_objects(query_text="Janina", limit=1)
+
+        self.assertEqual(tuple(item.memory_id for item in relevant), ("fact:janina_spouse",))
+        self.assertGreaterEqual(remote_state.client.topk_records_calls, 2)
+        self.assertEqual(remote_state.client.retrieve_calls, remote_state.client.topk_records_calls)
 
     def test_search_catalog_entries_uses_scope_ref_for_full_current_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

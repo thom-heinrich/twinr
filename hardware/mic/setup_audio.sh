@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Configure Twinr audio defaults for playback, capture, and proactive sensing.
 #
-# Selects the target ALSA/PipeWire devices, optionally persists proactive-audio
-# env keys, and can run a short playback/capture smoke test on the Pi.
+# Selects the target ALSA/PipeWire devices, defaults playback/capture matching
+# to the ReSpeaker path used on the Pi, optionally persists proactive-audio env
+# keys, and can run a short playback/capture smoke test on the Pi.
 
 set -euo pipefail
 
@@ -10,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ENV_FILE="${TWINR_ENV_FILE:-$REPO_ROOT/.env}"
 PYTHON_BIN=""
-DEVICE_MATCH="${TWINR_AUDIO_DEVICE_MATCH:-Jabra}"
+DEVICE_MATCH="${TWINR_AUDIO_DEVICE_MATCH:-reSpeaker}"
 CARD_INDEX=""
 DEVICE_INDEX=0
 CAPTURE_DEVICE_MATCH="${TWINR_AUDIO_CAPTURE_DEVICE_MATCH:-}"
@@ -20,8 +21,11 @@ PROACTIVE_DEVICE="${TWINR_PROACTIVE_AUDIO_DEVICE:-}"
 PROACTIVE_DEVICE_MATCH="${TWINR_PROACTIVE_AUDIO_DEVICE_MATCH:-}"
 PROACTIVE_DEVICE_INDEX=0
 PROACTIVE_SAMPLE_MS=""
+SINK_VOLUME_PERCENT="${TWINR_AUDIO_OUTPUT_VOLUME_PERCENT:-100}"
+CARD_PLAYBACK_VOLUME_PERCENT="${TWINR_AUDIO_CARD_PLAYBACK_VOLUME_PERCENT:-100}"
 SKIP_ALSA=0
 SKIP_PULSE=0
+SKIP_PLAYBACK_VOLUME=0
 RUN_TEST=0
 
 usage() {
@@ -32,7 +36,7 @@ Configure Twinr audio defaults for the Raspberry Pi.
 
 Options:
   --env-file PATH      Path to .env file for proactive audio updates (default: /twinr/.env)
-  --device-match TEXT  Match substring for the playback device (default: Jabra)
+  --device-match TEXT  Match substring for the playback device (default: reSpeaker)
   --card-index N       Explicit ALSA playback card index to use
   --device-index N     ALSA playback device index (default: 0)
   --capture-device-match TEXT
@@ -48,8 +52,14 @@ Options:
                       ALSA device index for proactive capture auto-detection (default: 0)
   --proactive-sample-ms N
                       Persist TWINR_PROACTIVE_AUDIO_SAMPLE_MS in the env file
+  --sink-volume-percent N
+                      Set the selected PipeWire/Pulse sink volume to N percent (default: 100)
+  --card-playback-volume-percent N
+                      Set playback mixer controls on the selected ALSA card to N percent (default: 100)
   --skip-alsa          Do not write /etc/asound.conf
   --skip-pulse         Do not set PipeWire/Pulse default sink/source
+  --skip-playback-volume
+                      Do not normalize sink or ALSA playback volume for the selected output card
   --test               Run a short playback and capture smoke test
   -h, --help           Show this help text
 HELP
@@ -109,6 +119,112 @@ run_pactl() {
     return
   fi
   pactl "$@"
+}
+
+run_wpctl() {
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    local runtime_dir
+    runtime_dir="/run/user/$(id -u "$SUDO_USER")"
+    sudo -u "$SUDO_USER" env XDG_RUNTIME_DIR="$runtime_dir" wpctl "$@"
+    return
+  fi
+  wpctl "$@"
+}
+
+# Apply one bounded output volume to the selected PipeWire/Pulse sink so the
+# active playback path does not inherit a stale near-muted level.
+set_sink_volume_percent() {
+  local sink_name="$1"
+  local sink_id="$2"
+  local percent="$3"
+
+  if [[ -n "$sink_name" ]]; then
+    run_pactl set-sink-volume "$sink_name" "${percent}%"
+  fi
+  if command -v wpctl >/dev/null 2>&1 && [[ -n "$sink_id" ]]; then
+    run_wpctl set-volume "$sink_id" "${percent}%"
+  fi
+}
+
+# Raise all playback-capable mixer controls on the selected card to one
+# operator-visible level without touching capture-only controls.
+set_card_playback_controls_percent() {
+  local card_index="$1"
+  local percent="$2"
+  local line=""
+  local control_name=""
+  local control_index=""
+  local control_ref=""
+  local control_dump=""
+
+  command -v amixer >/dev/null 2>&1 || fail "amixer not found"
+
+  while IFS= read -r line; do
+    [[ "$line" == "Simple mixer control "* ]] || continue
+    control_name="${line#Simple mixer control \'}"
+    control_name="${control_name%%\'*}"
+    control_index="${line##*,}"
+    control_ref="${control_name},${control_index}"
+    control_dump="$(amixer -c "$card_index" sget "$control_ref" 2>/dev/null || true)"
+    case "$control_dump" in
+      *"Playback channels:"*|*"Capabilities: pvolume"*|*"Capabilities: pswitch"*|*"Capabilities: pvolume pswitch"*|*"Capabilities: pvolume pvolume-joined pswitch pswitch-joined"*)
+        amixer -c "$card_index" sset "$control_ref" "${percent}%" unmute >/dev/null 2>&1 || true
+        ;;
+    esac
+  done < <(amixer -c "$card_index" scontrols)
+}
+
+detect_wpctl_id() {
+  local table="$1"
+  local match="$2"
+
+  [[ -n "$match" ]] || return 0
+  run_wpctl status 2>/dev/null | awk -v wanted_table="$table" -v needle="$match" '
+    function normalize(value) {
+      value = tolower(value)
+      gsub(/[_-]+/, " ", value)
+      gsub(/[[:space:]]+/, " ", value)
+      return value
+    }
+
+    /^Audio$/ {
+      in_audio = 1
+      next
+    }
+
+    !in_audio {
+      next
+    }
+
+    /Sinks:/ {
+      current = "sinks"
+      next
+    }
+
+    /Sources:/ {
+      current = "sources"
+      next
+    }
+
+    /Sink endpoints:/ || /Source endpoints:/ || /^Video$/ || /^Settings$/ {
+      current = ""
+      next
+    }
+
+    current == wanted_table && normalize($0) ~ normalize(needle) {
+      for (i = 1; i <= NF; i++) {
+        token = $i
+        if (token == "*") {
+          continue
+        }
+        if (token ~ /^[0-9]+\.$/) {
+          sub(/\.$/, "", token)
+          print token
+          exit
+        }
+      }
+    }
+  '
 }
 
 resolve_python_bin() {
@@ -184,12 +300,26 @@ while [[ $# -gt 0 ]]; do
       PROACTIVE_SAMPLE_MS="$2"
       shift 2
       ;;
+    --sink-volume-percent)
+      [[ $# -ge 2 ]] || fail "Missing value for --sink-volume-percent"
+      SINK_VOLUME_PERCENT="$2"
+      shift 2
+      ;;
+    --card-playback-volume-percent)
+      [[ $# -ge 2 ]] || fail "Missing value for --card-playback-volume-percent"
+      CARD_PLAYBACK_VOLUME_PERCENT="$2"
+      shift 2
+      ;;
     --skip-alsa)
       SKIP_ALSA=1
       shift
       ;;
     --skip-pulse)
       SKIP_PULSE=1
+      shift
+      ;;
+    --skip-playback-volume)
+      SKIP_PLAYBACK_VOLUME=1
       shift
       ;;
     --test)
@@ -218,6 +348,10 @@ fi
 if [[ -n "$PROACTIVE_SAMPLE_MS" ]]; then
   [[ "$PROACTIVE_SAMPLE_MS" =~ ^[0-9]+$ ]] || fail "--proactive-sample-ms must be an integer"
 fi
+[[ "$SINK_VOLUME_PERCENT" =~ ^[0-9]+$ ]] || fail "--sink-volume-percent must be an integer"
+[[ "$CARD_PLAYBACK_VOLUME_PERCENT" =~ ^[0-9]+$ ]] || fail "--card-playback-volume-percent must be an integer"
+(( SINK_VOLUME_PERCENT >= 0 && SINK_VOLUME_PERCENT <= 150 )) || fail "--sink-volume-percent must be between 0 and 150"
+(( CARD_PLAYBACK_VOLUME_PERCENT >= 0 && CARD_PLAYBACK_VOLUME_PERCENT <= 100 )) || fail "--card-playback-volume-percent must be between 0 and 100"
 
 if [[ -z "$CARD_INDEX" ]]; then
   CARD_INDEX="$(detect_card_index aplay "$DEVICE_MATCH")"
@@ -324,29 +458,62 @@ fi
 
 SINK_NAME=""
 SOURCE_NAME=""
+WPCTL_SINK_ID=""
+WPCTL_SOURCE_ID=""
+SOURCE_MATCH="${CAPTURE_DEVICE_MATCH:-$DEVICE_MATCH}"
 if command -v pactl >/dev/null 2>&1; then
   SINK_NAME="$(detect_pactl_name sinks "$DEVICE_MATCH")"
-  SOURCE_MATCH="${CAPTURE_DEVICE_MATCH:-$DEVICE_MATCH}"
   SOURCE_NAME="$(detect_pactl_name sources "$SOURCE_MATCH" 1)"
+fi
+if command -v wpctl >/dev/null 2>&1; then
+  WPCTL_SINK_ID="$(detect_wpctl_id sinks "$DEVICE_MATCH")"
+  WPCTL_SOURCE_ID="$(detect_wpctl_id sources "$SOURCE_MATCH")"
 fi
 
 if [[ "$SKIP_PULSE" -eq 0 ]]; then
   command -v pactl >/dev/null 2>&1 || fail "pactl not found"
   [[ -n "$SINK_NAME" ]] || fail "Could not detect a Pulse/PipeWire sink matching: $DEVICE_MATCH"
-  [[ -n "$SOURCE_NAME" ]] || fail "Could not detect a Pulse/PipeWire source matching: $SOURCE_MATCH"
   run_pactl set-default-sink "$SINK_NAME"
-  run_pactl set-default-source "$SOURCE_NAME"
+  if [[ -n "$SOURCE_NAME" ]]; then
+    run_pactl set-default-source "$SOURCE_NAME"
+  fi
+  if command -v wpctl >/dev/null 2>&1; then
+    [[ -n "$WPCTL_SINK_ID" ]] || fail "Could not detect a WirePlumber sink matching: $DEVICE_MATCH"
+    run_wpctl set-default "$WPCTL_SINK_ID"
+    if [[ -n "$WPCTL_SOURCE_ID" ]]; then
+      run_wpctl set-default "$WPCTL_SOURCE_ID"
+    fi
+  fi
+fi
+
+if [[ "$SKIP_PLAYBACK_VOLUME" -eq 0 ]]; then
+  if [[ "$SKIP_PULSE" -eq 0 ]]; then
+    set_sink_volume_percent "$SINK_NAME" "$WPCTL_SINK_ID" "$SINK_VOLUME_PERCENT"
+  fi
+  set_card_playback_controls_percent "$CARD_INDEX" "$CARD_PLAYBACK_VOLUME_PERCENT"
 fi
 
 printf 'playback_card=%s\n' "$CARD_INDEX"
 printf 'capture_card=%s\n' "$CAPTURE_CARD_INDEX"
 printf 'playback_device=%s\n' "$DEVICE_INDEX"
 printf 'capture_device=%s\n' "$CAPTURE_DEVICE_INDEX"
+printf 'sink_volume_percent=%s\n' "$SINK_VOLUME_PERCENT"
+printf 'card_playback_volume_percent=%s\n' "$CARD_PLAYBACK_VOLUME_PERCENT"
 if [[ -n "$SINK_NAME" ]]; then
   printf 'pulse_sink=%s\n' "$SINK_NAME"
 fi
 if [[ -n "$SOURCE_NAME" ]]; then
   printf 'pulse_source=%s\n' "$SOURCE_NAME"
+else
+  printf 'pulse_source=unavailable\n'
+fi
+if [[ -n "$WPCTL_SINK_ID" ]]; then
+  printf 'wpctl_sink_id=%s\n' "$WPCTL_SINK_ID"
+fi
+if [[ -n "$WPCTL_SOURCE_ID" ]]; then
+  printf 'wpctl_source_id=%s\n' "$WPCTL_SOURCE_ID"
+else
+  printf 'wpctl_source_id=unavailable\n'
 fi
 if [[ -n "$PROACTIVE_DEVICE" ]]; then
   printf 'proactive_audio_device=%s\n' "$PROACTIVE_DEVICE"

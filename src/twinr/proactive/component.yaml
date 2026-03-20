@@ -3,14 +3,15 @@ name: proactive
 path: src/twinr/proactive
 kind: python-package
 visibility: internal
-summary: Provide the package-root compatibility surface and boundary between Twinr's proactive runtime, social-trigger, governance, and wakeword subsystems.
+summary: Provide the package-root compatibility surface and boundary between Twinr's proactive runtime, social-trigger, event-fusion, governance, and wakeword subsystems.
 owned_concerns:
   - Expose the broad `twinr.proactive` compatibility import surface across proactive child packages
-  - Define the package boundary between `runtime`, `social`, `governance`, and `wakeword`
+  - Define the package boundary between `runtime`, `social`, `event_fusion`, `governance`, and `wakeword`
   - Route new work into the correct proactive child package instead of growing the package root
 out_of_scope:
   - Proactive monitor orchestration and presence-session logic inside src/twinr/proactive/runtime
   - Social-trigger scoring, observation providers, and vision review inside src/twinr/proactive/social
+  - Short-window multimodal event buffering, sequence derivation, and fused claims inside src/twinr/proactive/event_fusion
   - Delivery reservation and cooldown policy inside src/twinr/proactive/governance
   - Wakeword matching, calibration, streaming, and evaluation logic inside src/twinr/proactive/wakeword
 files:
@@ -91,6 +92,8 @@ files:
       - wakeword_primary_prompt
       - weighted_trigger_score
 subpackages:
+  - path: event_fusion
+    role: Short-window multimodal event fusion
   - path: governance
     role: Delivery reservation and cooldown policy
   - path: runtime

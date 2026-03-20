@@ -24,6 +24,7 @@ from twinr.ops import (
     run_config_checks,
 )
 from twinr.ops.locks import loop_instance_lock
+from twinr.ops.runtime_scope import build_scoped_runtime_config, resolve_scoped_runtime_state_path
 
 
 def _fake_respeaker_snapshot(
@@ -85,6 +86,24 @@ def _fake_respeaker_snapshot(
 
 
 class OpsModuleTests(unittest.TestCase):
+    def test_build_scoped_runtime_config_isolates_auxiliary_runtime_snapshot(self) -> None:
+        config = TwinrConfig(
+            project_root="/tmp/twinr-project",
+            runtime_state_path="state/runtime-state.json",
+            restore_runtime_state_on_startup=True,
+        )
+
+        scoped = build_scoped_runtime_config(
+            config,
+            scope_name="whatsapp-channel",
+            restore_runtime_state_on_startup=False,
+        )
+        scoped_path = resolve_scoped_runtime_state_path(config, scope_name="whatsapp-channel")
+
+        self.assertEqual(scoped.runtime_state_path, str(scoped_path))
+        self.assertIn("runtime-scopes/whatsapp-channel/runtime-state.json", scoped.runtime_state_path)
+        self.assertFalse(scoped.restore_runtime_state_on_startup)
+
     def test_event_store_tail_returns_latest_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = TwinrOpsEventStore(Path(temp_dir) / "events.jsonl")

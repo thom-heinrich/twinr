@@ -1,11 +1,13 @@
-"""Train reproducible openWakeWord-compatible Twinr base models.
+"""Train reproducible wakeword base models against runtime-faithful acceptance.
 
 This module owns the offline base-model training path for Twinr wakeword
 detectors. It turns a generated wakeword dataset root with
 ``positive_train``/``negative_train``/``positive_test``/``negative_test``
-directories into fixed-length embedding features, runs the upstream
-``openwakeword.train.Model`` training loop, exports a local ONNX detector, and
-optionally tunes the operating threshold against a labeled acceptance manifest.
+directories into fixed-length embedding features, trains either Twinr's
+scikit-learn MLP export path or the upstream ``openwakeword.train.Model``
+loop, exports a local ONNX detector, and optionally tunes the operating
+threshold against a labeled acceptance manifest using the same stream replay
+path that Twinr runs on the Pi.
 """
 
 from __future__ import annotations
@@ -22,10 +24,15 @@ from scipy.signal import resample_poly
 
 from twinr.agent.base_agent.config import TwinrConfig
 
-from .evaluation import WakewordEvalMetrics, evaluate_wakeword_entries, load_eval_manifest
+from .evaluation import WakewordEvalMetrics, load_eval_manifest
 from .matching import DEFAULT_WAKEWORD_PHRASES
+from .promotion import evaluate_wakeword_stream_entries
 
 _THRESHOLD_CANDIDATES = (
+    0.00005,
+    0.0001,
+    0.0002,
+    0.0003,
     0.0005,
     0.001,
     0.0015,
@@ -176,6 +183,36 @@ def _compute_feature_array(
     return np.vstack(feature_batches)
 
 
+def _dataset_sample_weight(path: Path, *, positive: bool) -> float:
+    """Assign one provenance-aware training weight for a dataset clip."""
+
+    name = path.name.lower()
+    if positive:
+        if name.startswith("extra_pos_"):
+            return 2.0
+        return 1.0
+    if name.startswith("mined_neg_"):
+        return 6.0
+    if name.startswith("extra_neg_"):
+        return 3.0
+    return 1.5
+
+
+def _expanded_sample_weights(
+    *,
+    audio_paths: list[Path],
+    rounds: int,
+    positive: bool,
+) -> np.ndarray:
+    """Repeat one per-clip provenance weight to match feature-array order."""
+
+    weights: list[float] = []
+    for _round_index in range(max(1, int(rounds))):
+        for audio_path in audio_paths:
+            weights.append(_dataset_sample_weight(audio_path, positive=positive))
+    return np.asarray(weights, dtype=np.float32)
+
+
 def _flatten_false_positive_validation_features(feature_array: np.ndarray) -> np.ndarray:
     """Collapse per-clip feature tensors into one continuous false-positive stream."""
 
@@ -202,12 +239,21 @@ def _default_evaluation_config(model_path: Path) -> TwinrConfig:
     )
 
 
-def _score_acceptance_metrics(metrics: WakewordEvalMetrics) -> float:
-    """Convert wakeword acceptance metrics into one threshold-selection score."""
+def _threshold_selection_key(metrics: WakewordEvalMetrics) -> tuple[int, int, float, float]:
+    """Rank candidate thresholds with false negatives as the primary blocker.
 
-    score = (metrics.precision * 0.6) + (metrics.recall * 0.4)
-    score -= metrics.false_positive_rate
-    return score
+    Twinr promotion guards fail closed on new false negatives. Threshold search
+    must therefore minimize false negatives first, then false positives, and
+    only then prefer stronger precision/recall ratios among equally safe
+    candidates.
+    """
+
+    return (
+        int(metrics.false_negative),
+        int(metrics.false_positive),
+        -float(metrics.precision),
+        -float(metrics.recall),
+    )
 
 
 def _select_acceptance_threshold(
@@ -216,7 +262,7 @@ def _select_acceptance_threshold(
     manifest_path: Path,
     evaluation_config: TwinrConfig | None,
 ) -> tuple[float, WakewordEvalMetrics]:
-    """Search one operating threshold against a labeled acceptance manifest."""
+    """Search one operating threshold against a runtime-faithful manifest replay."""
 
     entries = load_eval_manifest(manifest_path)
     if not entries:
@@ -224,7 +270,7 @@ def _select_acceptance_threshold(
     base_config = evaluation_config or _default_evaluation_config(model_path)
     best_threshold = float(base_config.wakeword_openwakeword_threshold)
     best_metrics: WakewordEvalMetrics | None = None
-    best_score = float("-inf")
+    best_key: tuple[int, int, float, float] | None = None
     for threshold in _THRESHOLD_CANDIDATES:
         candidate_config = replace(
             base_config,
@@ -234,21 +280,164 @@ def _select_acceptance_threshold(
             wakeword_openwakeword_inference_framework="onnx",
             wakeword_openwakeword_threshold=threshold,
         )
-        report = evaluate_wakeword_entries(config=candidate_config, entries=entries)
-        candidate_score = _score_acceptance_metrics(report.metrics)
+        report = evaluate_wakeword_stream_entries(config=candidate_config, entries=entries)
         if (
             best_metrics is None
-            or candidate_score > best_score
-            or (
-                candidate_score == best_score
-                and report.metrics.false_positive_rate < best_metrics.false_positive_rate
-            )
+            or best_key is None
+            or _threshold_selection_key(report.metrics) < best_key
         ):
             best_threshold = threshold
             best_metrics = report.metrics
-            best_score = candidate_score
+            best_key = _threshold_selection_key(report.metrics)
     assert best_metrics is not None
     return best_threshold, best_metrics
+
+
+def _export_sklearn_mlp_to_onnx(
+    *,
+    scaler,
+    classifier,
+    output_model_path: Path,
+    model_name: str,
+) -> None:
+    """Export one fitted StandardScaler + MLP stack to Twinr's ONNX layout."""
+
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    output_model_path.parent.mkdir(parents=True, exist_ok=True)
+    if len(classifier.coefs_) != 3 or len(classifier.intercepts_) != 3:
+        raise ValueError("Twinr MLP export currently requires exactly two hidden layers and one output layer.")
+
+    flatten_shape = np.asarray([0, -1], dtype=np.int64)
+    mean = np.asarray(scaler.mean_, dtype=np.float32)
+    scale = np.asarray(scaler.scale_, dtype=np.float32)
+    if mean.shape != scale.shape:
+        raise ValueError("StandardScaler mean_ and scale_ must share one flattened feature shape.")
+
+    initializers = [
+        numpy_helper.from_array(flatten_shape, name="flatten_shape"),
+        numpy_helper.from_array(mean, name="feature_mean"),
+        numpy_helper.from_array(scale, name="feature_scale"),
+        numpy_helper.from_array(np.asarray(classifier.coefs_[0], dtype=np.float32), name="layer_1_weights"),
+        numpy_helper.from_array(np.asarray(classifier.intercepts_[0], dtype=np.float32), name="layer_1_bias"),
+        numpy_helper.from_array(np.asarray(classifier.coefs_[1], dtype=np.float32), name="layer_2_weights"),
+        numpy_helper.from_array(np.asarray(classifier.intercepts_[1], dtype=np.float32), name="layer_2_bias"),
+        numpy_helper.from_array(np.asarray(classifier.coefs_[2], dtype=np.float32), name="layer_3_weights"),
+        numpy_helper.from_array(np.asarray(classifier.intercepts_[2], dtype=np.float32), name="layer_3_bias"),
+    ]
+
+    nodes = [
+        helper.make_node("Reshape", ["input", "flatten_shape"], ["flattened_features"], name="reshape_input"),
+        helper.make_node("Sub", ["flattened_features", "feature_mean"], ["centered_features"], name="center_features"),
+        helper.make_node("Div", ["centered_features", "feature_scale"], ["scaled_features"], name="scale_features"),
+        helper.make_node("Gemm", ["scaled_features", "layer_1_weights", "layer_1_bias"], ["layer_1_linear"], name="layer_1_gemm"),
+        helper.make_node("Relu", ["layer_1_linear"], ["layer_1_relu"], name="layer_1_relu_node"),
+        helper.make_node("Gemm", ["layer_1_relu", "layer_2_weights", "layer_2_bias"], ["layer_2_linear"], name="layer_2_gemm"),
+        helper.make_node("Relu", ["layer_2_linear"], ["layer_2_relu"], name="layer_2_relu_node"),
+        helper.make_node("Gemm", ["layer_2_relu", "layer_3_weights", "layer_3_bias"], ["layer_3_linear"], name="layer_3_gemm"),
+        helper.make_node("Sigmoid", ["layer_3_linear"], [model_name], name="output_probability"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        name=model_name,
+        inputs=[helper.make_tensor_value_info("input", TensorProto.FLOAT, [None, 16, 96])],
+        outputs=[helper.make_tensor_value_info(model_name, TensorProto.FLOAT, [None, 1])],
+        initializer=initializers,
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 13)],
+        producer_name="twinr",
+    )
+    onnx.checker.check_model(model)
+    onnx.save_model(model, str(output_model_path), save_as_external_data=False)
+
+
+def _train_sklearn_mlp_model(
+    *,
+    positive_train_features_path: Path,
+    negative_train_features_path: Path,
+    positive_validation_features_path: Path,
+    negative_validation_features_path: Path,
+    output_model_path: Path,
+    model_name: str,
+    layer_dim: int,
+    steps: int,
+    seed: int,
+    positive_train_weights: np.ndarray | None = None,
+    negative_train_weights: np.ndarray | None = None,
+) -> None:
+    """Train Twinr's production-aligned StandardScaler + MLP wakeword model."""
+
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.preprocessing import StandardScaler
+
+    positive_train = np.load(positive_train_features_path).astype(np.float32)
+    negative_train = np.load(negative_train_features_path).astype(np.float32)
+    positive_validation = np.load(positive_validation_features_path).astype(np.float32)
+    negative_validation = np.load(negative_validation_features_path).astype(np.float32)
+
+    train_features = np.vstack((positive_train, negative_train))
+    train_labels = np.hstack(
+        (
+            np.ones(positive_train.shape[0], dtype=np.int64),
+            np.zeros(negative_train.shape[0], dtype=np.int64),
+        )
+    )
+    sample_weight = None
+    if positive_train_weights is not None or negative_train_weights is not None:
+        resolved_positive_weights = (
+            positive_train_weights
+            if positive_train_weights is not None
+            else np.ones(positive_train.shape[0], dtype=np.float32)
+        )
+        resolved_negative_weights = (
+            negative_train_weights
+            if negative_train_weights is not None
+            else np.ones(negative_train.shape[0], dtype=np.float32)
+        )
+        if resolved_positive_weights.shape[0] != positive_train.shape[0]:
+            raise ValueError("positive_train_weights must match positive_train feature count.")
+        if resolved_negative_weights.shape[0] != negative_train.shape[0]:
+            raise ValueError("negative_train_weights must match negative_train feature count.")
+        sample_weight = np.hstack((resolved_positive_weights, resolved_negative_weights)).astype(np.float32)
+    validation_features = np.vstack((positive_validation, negative_validation))
+    validation_labels = np.hstack(
+        (
+            np.ones(positive_validation.shape[0], dtype=np.int64),
+            np.zeros(negative_validation.shape[0], dtype=np.int64),
+        )
+    )
+
+    flattened_train = train_features.reshape(train_features.shape[0], -1)
+    flattened_validation = validation_features.reshape(validation_features.shape[0], -1)
+    scaler = StandardScaler()
+    scaler.fit(flattened_train)
+    classifier = MLPClassifier(
+        hidden_layer_sizes=(max(32, int(layer_dim)), max(16, int(layer_dim) // 4)),
+        activation="relu",
+        solver="adam",
+        batch_size=min(256, max(32, flattened_train.shape[0] // 4 or 1)),
+        learning_rate_init=0.001,
+        max_iter=max(50, int(round(max(1, int(steps)) / 100.0))),
+        early_stopping=True,
+        validation_fraction=0.15,
+        n_iter_no_change=12,
+        random_state=int(seed),
+    )
+    classifier.fit(scaler.transform(flattened_train), train_labels, sample_weight=sample_weight)
+
+    validation_predictions = classifier.predict(scaler.transform(flattened_validation))
+    if validation_predictions.shape[0] != validation_labels.shape[0]:
+        raise RuntimeError("MLP validation output shape did not match validation labels.")
+
+    _export_sklearn_mlp_to_onnx(
+        scaler=scaler,
+        classifier=classifier,
+        output_model_path=output_model_path,
+        model_name=model_name,
+    )
 
 
 def _train_openwakeword_model(
@@ -424,7 +613,7 @@ def train_wakeword_base_model_from_dataset_root(
     acceptance_manifest: str | Path | None = None,
     workdir: str | Path | None = None,
     training_rounds: int = 2,
-    model_type: str = "dnn",
+    model_type: str = "mlp",
     layer_dim: int = 128,
     steps: int = 20_000,
     positive_per_batch: int = 96,
@@ -524,23 +713,63 @@ def train_wakeword_base_model_from_dataset_root(
         _flatten_false_positive_validation_features(negative_validation_features),
     )
 
-    trainer = train_backend or _train_openwakeword_model
-    trainer(
-        positive_train_features_path=positive_train_features_path,
-        negative_train_features_path=negative_train_features_path,
-        positive_validation_features_path=positive_validation_features_path,
-        negative_validation_features_path=negative_validation_features_path,
-        false_positive_validation_features_path=false_positive_validation_features_path,
-        output_model_path=output_model,
-        model_name=model_stem,
-        model_type=model_type,
-        layer_dim=int(layer_dim),
-        steps=int(steps),
-        positive_per_batch=int(positive_per_batch),
-        negative_per_batch=int(negative_per_batch),
-        max_negative_weight=int(max_negative_weight),
-        target_false_positives_per_hour=float(target_false_positives_per_hour),
-    )
+    resolved_model_type = str(model_type or "mlp").strip().lower() or "mlp"
+    if train_backend is not None:
+        train_backend(
+            positive_train_features_path=positive_train_features_path,
+            negative_train_features_path=negative_train_features_path,
+            positive_validation_features_path=positive_validation_features_path,
+            negative_validation_features_path=negative_validation_features_path,
+            false_positive_validation_features_path=false_positive_validation_features_path,
+            output_model_path=output_model,
+            model_name=model_stem,
+            model_type=resolved_model_type,
+            layer_dim=int(layer_dim),
+            steps=int(steps),
+            positive_per_batch=int(positive_per_batch),
+            negative_per_batch=int(negative_per_batch),
+            max_negative_weight=int(max_negative_weight),
+            target_false_positives_per_hour=float(target_false_positives_per_hour),
+        )
+    elif resolved_model_type == "mlp":
+        _train_sklearn_mlp_model(
+            positive_train_features_path=positive_train_features_path,
+            negative_train_features_path=negative_train_features_path,
+            positive_validation_features_path=positive_validation_features_path,
+            negative_validation_features_path=negative_validation_features_path,
+            output_model_path=output_model,
+            model_name=model_stem,
+            layer_dim=int(layer_dim),
+            steps=int(steps),
+            seed=int(seed),
+            positive_train_weights=_expanded_sample_weights(
+                audio_paths=positive_train_paths,
+                rounds=max(1, int(training_rounds)),
+                positive=True,
+            ),
+            negative_train_weights=_expanded_sample_weights(
+                audio_paths=negative_train_paths,
+                rounds=max(1, int(training_rounds)),
+                positive=False,
+            ),
+        )
+    else:
+        _train_openwakeword_model(
+            positive_train_features_path=positive_train_features_path,
+            negative_train_features_path=negative_train_features_path,
+            positive_validation_features_path=positive_validation_features_path,
+            negative_validation_features_path=negative_validation_features_path,
+            false_positive_validation_features_path=false_positive_validation_features_path,
+            output_model_path=output_model,
+            model_name=model_stem,
+            model_type=resolved_model_type,
+            layer_dim=int(layer_dim),
+            steps=int(steps),
+            positive_per_batch=int(positive_per_batch),
+            negative_per_batch=int(negative_per_batch),
+            max_negative_weight=int(max_negative_weight),
+            target_false_positives_per_hour=float(target_false_positives_per_hour),
+        )
 
     selected_threshold = (
         float(evaluation_config.wakeword_openwakeword_threshold)
@@ -563,7 +792,7 @@ def train_wakeword_base_model_from_dataset_root(
         "dataset_root": str(dataset_root_path),
         "working_dir": str(working_dir),
         "model_name": model_stem,
-        "model_type": model_type,
+        "model_type": resolved_model_type,
         "layer_dim": int(layer_dim),
         "steps": int(steps),
         "training_rounds": int(training_rounds),
@@ -581,6 +810,7 @@ def train_wakeword_base_model_from_dataset_root(
             if acceptance_manifest is not None
             else None
         ),
+        "acceptance_eval_mode": "runtime_stream_replay" if acceptance_manifest is not None else None,
     }
     if acceptance_metrics is not None:
         metadata_payload["acceptance_metrics"] = {
