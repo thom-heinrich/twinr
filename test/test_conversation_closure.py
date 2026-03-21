@@ -1,5 +1,6 @@
 from pathlib import Path
 from threading import Event
+import json
 import sys
 import time
 import unittest
@@ -11,13 +12,21 @@ from twinr.agent.base_agent.conversation.closure import (
     ToolCallingConversationClosureEvaluator,
 )
 from twinr.agent.base_agent.contracts import AgentToolCall, ToolCallingTurnResponse
+from twinr.agent.personality.steering import ConversationTurnSteeringCue
 from twinr.config import TwinrConfig
 
 
 class FakeClosureToolAgentProvider:
-    def __init__(self, config: TwinrConfig, *, close_now: bool = True) -> None:
+    def __init__(
+        self,
+        config: TwinrConfig,
+        *,
+        close_now: bool = True,
+        matched_topics: tuple[str, ...] = (),
+    ) -> None:
         self.config = config
         self.close_now = close_now
+        self.matched_topics = matched_topics
         self.calls: list[dict[str, object]] = []
 
     def start_turn_streaming(
@@ -51,6 +60,7 @@ class FakeClosureToolAgentProvider:
                         "close_now": self.close_now,
                         "confidence": 0.93 if self.close_now else 0.22,
                         "reason": "explicit_goodbye" if self.close_now else "still_engaged",
+                        "matched_topics": list(self.matched_topics),
                     },
                     raw_arguments='{"close_now":true,"confidence":0.93,"reason":"explicit_goodbye"}'
                     if self.close_now
@@ -126,6 +136,87 @@ class ConversationClosureEvaluatorTests(unittest.TestCase):
 
         self.assertFalse(decision.close_now)
         self.assertEqual(decision.reason, "still_engaged")
+
+    def test_evaluator_serializes_turn_steering_and_parses_matched_topics(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+        )
+        provider = FakeClosureToolAgentProvider(
+            config,
+            close_now=False,
+            matched_topics=("AI companions",),
+        )
+        evaluator = ToolCallingConversationClosureEvaluator(config=config, provider=provider)
+
+        decision = evaluator.evaluate(
+            user_transcript="Und bei KI-Begleitern gerade?",
+            assistant_response="Kurz gesagt geht gerade viel in Richtung alltagstauglicher Begleiter.",
+            request_source="button",
+            turn_steering_cues=(
+                ConversationTurnSteeringCue(
+                    title="AI companions",
+                    salience=0.92,
+                    attention_state="shared_thread",
+                    open_offer="brief_update_if_open",
+                    user_pull="one_calm_follow_up",
+                    positive_engagement_action="invite_follow_up",
+                ),
+            ),
+        )
+
+        self.assertEqual(decision.matched_topics, ("AI companions",))
+        prompt_payload = json.loads(provider.calls[0]["prompt"])
+        self.assertIn("turn_steering", prompt_payload)
+        self.assertEqual(prompt_payload["turn_steering"]["topics"][0]["title"], "AI companions")
+        self.assertEqual(
+            prompt_payload["turn_steering"]["topics"][0]["positive_engagement_action"],
+            "invite_follow_up",
+        )
+        self.assertEqual(
+            prompt_payload["turn_steering"]["topics"][0]["match_summary"],
+            "",
+        )
+        self.assertIn("Use both title and match_summary", prompt_payload["turn_steering"]["instruction"])
+
+    def test_evaluator_serializes_semantic_match_summary_for_disambiguation(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+        )
+        provider = FakeClosureToolAgentProvider(
+            config,
+            close_now=False,
+            matched_topics=("Hamburg local politics",),
+        )
+        evaluator = ToolCallingConversationClosureEvaluator(config=config, provider=provider)
+
+        decision = evaluator.evaluate(
+            user_transcript="What changed in Hamburg local politics today?",
+            assistant_response="Mostly concrete civic and municipal decisions.",
+            request_source="button",
+            turn_steering_cues=(
+                ConversationTurnSteeringCue(
+                    title="Hamburg local politics",
+                    salience=0.81,
+                    attention_state="growing",
+                    open_offer="mention_if_clearly_relevant",
+                    user_pull="wait_for_user_pull",
+                    observe_mode="mostly_observe_until_user_pull",
+                    positive_engagement_action="hint",
+                    match_summary="Municipal decisions, civic policy, and local public changes that affect daily life in Hamburg.",
+                ),
+            ),
+        )
+
+        self.assertEqual(decision.matched_topics, ("Hamburg local politics",))
+        prompt_payload = json.loads(provider.calls[0]["prompt"])
+        self.assertEqual(
+            prompt_payload["turn_steering"]["topics"][0]["match_summary"],
+            "Municipal decisions, civic policy, and local public changes that affect daily life in Hamburg.",
+        )
 
     def test_evaluator_enforces_wall_clock_timeout_without_adapter_timeout_kwarg(self) -> None:
         config = TwinrConfig(

@@ -2,8 +2,9 @@
 
 This module translates the current primary visible-person anchor and, when
 available, the current speaker association into small HDMI face cues. Normal
-attention-follow stays horizontal-only so stronger "thoughtful" or other
-semantic up/down poses remain reserved for explicit face-expression producers.
+attention-follow uses bounded vertical drift only for clearly above/below
+camera people, so stronger "thoughtful" or other semantic up/down poses remain
+reserved for explicit face-expression producers.
 It mirrors camera-space left/right anchors into user-facing screen gaze, keeps
 that producer path separate from the generic runtime snapshot schema, and will
 not overwrite active cues owned by other display producers. Matching attention
@@ -48,8 +49,17 @@ _MIN_REFRESH_INTERVAL_S = 0.2
 _MATCHING_CUE_REFRESH_LOOKAHEAD_S = 1.5
 _MIN_DIRECTION_HOLD_S = 0.35
 _MAX_DIRECTION_HOLD_S = 1.25
+_MAX_DYNAMIC_GAZE_AXIS = 3
+_GAZE_SOFT_OFFSET_THRESHOLD = 0.025
+_GAZE_STRONG_OFFSET_THRESHOLD = 0.13
+_GAZE_VERTICAL_SOFT_OFFSET_THRESHOLD = 0.08
+_GAZE_VERTICAL_STRONG_OFFSET_THRESHOLD = 0.16
 _HEAD_SOFT_OFFSET_THRESHOLD = 0.04
 _HEAD_STRONG_OFFSET_THRESHOLD = 0.18
+_HEAD_VERTICAL_SOFT_OFFSET_THRESHOLD = 0.09
+_HEAD_VERTICAL_STRONG_OFFSET_THRESHOLD = 0.2
+_UP_ENTER_THRESHOLD = 0.38
+_DOWN_ENTER_THRESHOLD = 0.62
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +70,8 @@ class DisplayAttentionCueDecision:
     reason: str = "inactive"
     source: str = _SOURCE
     gaze: DisplayFaceGazeDirection = DisplayFaceGazeDirection.CENTER
+    cue_gaze_x: int = 0
+    cue_gaze_y: int = 0
     mouth: DisplayFaceMouthStyle | None = None
     brows: DisplayFaceBrowStyle | None = None
     head_dx: int = 0
@@ -78,6 +90,19 @@ class DisplayAttentionCueDecision:
             brows=self.brows,
             head_dx=self.head_dx,
             head_dy=self.head_dy,
+        )
+
+    def cue(self) -> DisplayFaceCue:
+        """Translate the decision into one persisted HDMI face cue."""
+
+        return DisplayFaceCue(
+            source=self.source,
+            gaze_x=self.cue_gaze_x,
+            gaze_y=self.cue_gaze_y,
+            head_dx=self.head_dx,
+            head_dy=self.head_dy,
+            mouth=(None if self.mouth is None else self.mouth.value),
+            brows=(None if self.brows is None else self.brows.value),
         )
 
 
@@ -101,29 +126,40 @@ def derive_display_attention_cue(
     center_x = None if _coerce_optional_bool(camera.get("primary_person_center_x_unknown")) is True else _coerce_optional_ratio(camera.get("primary_person_center_x"))
     zone = None if _coerce_optional_bool(camera.get("primary_person_zone_unknown")) is True else _normalize_text(camera.get("primary_person_zone")).lower()
     attention_target = MultimodalAttentionTargetSnapshot.from_fact_map(live_facts.get("attention_target"))
-    if attention_target is not None and attention_target.active:
+    if attention_target is not None and attention_target.active and not _camera_attention_unavailable(camera):
+        target_center_x = attention_target.target_center_x
+        target_zone = _normalize_text(attention_target.target_zone).lower() or zone
+        cue_gaze_x, cue_gaze_y = _cue_axes_for_target(
+            camera_center_x=(center_x if target_center_x is None else target_center_x),
+            camera_center_y=attention_target.target_center_y,
+            camera_zone=target_zone,
+        )
         gaze = _gaze_from_attention_target(attention_target)
         if gaze is None:
             return DisplayAttentionCueDecision(reason="no_attention_target")
         brows = _brows_from_attention_target(attention_target, camera)
         mouth = DisplayFaceMouthStyle.SPEAK if attention_target.speaker_locked else None
-        head_dx, head_dy = _head_offsets_for_gaze(
-            gaze,
-            camera_center_x=center_x,
-            camera_zone=zone,
+        head_dx, head_dy = _head_offsets_for_target(
+            cue_gaze_x=cue_gaze_x,
+            cue_gaze_y=cue_gaze_y,
+            camera_center_x=(center_x if target_center_x is None else target_center_x),
+            camera_center_y=attention_target.target_center_y,
+            camera_zone=target_zone,
         )
         return DisplayAttentionCueDecision(
             active=True,
             reason=attention_target.state,
             gaze=gaze,
+            cue_gaze_x=cue_gaze_x,
+            cue_gaze_y=cue_gaze_y,
             mouth=mouth,
             brows=brows,
             head_dx=head_dx,
             head_dy=head_dy,
             hold_seconds=_hold_seconds_from_config(config),
             speaker_locked=attention_target.speaker_locked,
-            camera_center_x=center_x,
-            camera_zone=zone,
+            camera_center_x=(center_x if target_center_x is None else target_center_x),
+            camera_zone=target_zone,
         )
 
     if _coerce_optional_bool(camera.get("person_visible")) is not True:
@@ -132,6 +168,11 @@ def derive_display_attention_cue(
     gaze = _gaze_from_camera(camera)
     if gaze is None:
         return DisplayAttentionCueDecision(reason="no_visual_anchor")
+    cue_gaze_x, cue_gaze_y = _cue_axes_for_target(
+        camera_center_x=center_x,
+        camera_center_y=None if _coerce_optional_bool(camera.get("primary_person_center_y_unknown")) is True else _coerce_optional_ratio(camera.get("primary_person_center_y")),
+        camera_zone=zone,
+    )
 
     speaker_association = _speaker_association_from_facts(live_facts)
     speaking_to_visible_person = (
@@ -149,15 +190,19 @@ def derive_display_attention_cue(
         brows = DisplayFaceBrowStyle.RAISED
 
     mouth = DisplayFaceMouthStyle.SPEAK if speaking_to_visible_person else None
-    head_dx, head_dy = _head_offsets_for_gaze(
-        gaze,
+    head_dx, head_dy = _head_offsets_for_target(
+        cue_gaze_x=cue_gaze_x,
+        cue_gaze_y=cue_gaze_y,
         camera_center_x=center_x,
+        camera_center_y=None if _coerce_optional_bool(camera.get("primary_person_center_y_unknown")) is True else _coerce_optional_ratio(camera.get("primary_person_center_y")),
         camera_zone=zone,
     )
     return DisplayAttentionCueDecision(
         active=True,
         reason="speaker_visible_person" if speaking_to_visible_person else "visible_person",
         gaze=gaze,
+        cue_gaze_x=cue_gaze_x,
+        cue_gaze_y=cue_gaze_y,
         mouth=mouth,
         brows=brows,
         head_dx=head_dx,
@@ -166,6 +211,13 @@ def derive_display_attention_cue(
         speaker_locked=speaking_to_visible_person,
         camera_center_x=center_x,
         camera_zone=zone,
+    )
+
+
+def _camera_attention_unavailable(camera: Mapping[str, object]) -> bool:
+    return (
+        _coerce_optional_bool(camera.get("camera_online")) is False
+        or _coerce_optional_bool(camera.get("camera_ready")) is False
     )
 
 
@@ -255,9 +307,8 @@ class DisplayAttentionCuePublisher:
                 decision=decision,
                 now=effective_now,
             ):
-                self.controller.show_expression(
-                    decision.expression(),
-                    source=self.source,
+                self.store.save(
+                    decision.cue(),
                     hold_seconds=decision.hold_seconds,
                     now=effective_now,
                 )
@@ -272,9 +323,8 @@ class DisplayAttentionCuePublisher:
                 owner=active_owner,
             )
 
-        self.controller.show_expression(
-            decision.expression(),
-            source=self.source,
+        self.store.save(
+            decision.cue(),
             hold_seconds=decision.hold_seconds,
             now=effective_now,
         )
@@ -317,11 +367,17 @@ def _gaze_from_attention_target(
 ) -> DisplayFaceGazeDirection | None:
     """Map one camera-space attention target to a user-facing display gaze."""
 
-    horizontal = _normalize_text(attention_target.target_horizontal).lower()
+    horizontal = _horizontal_direction(
+        center_x=attention_target.target_center_x,
+        zone=_normalize_text(attention_target.target_horizontal).lower(),
+    )
     if horizontal not in {"left", "center", "right"}:
         return None
     horizontal = _mirror_camera_horizontal(horizontal)
-    vertical = "center"
+    vertical = _vertical_direction(
+        center_y=attention_target.target_center_y,
+        fallback=_normalize_text(attention_target.target_vertical).lower(),
+    )
     return _GAZE_DIRECTION_MAP[(vertical, horizontal)]
 
 
@@ -377,8 +433,54 @@ def _gaze_from_camera(camera: Mapping[str, object]) -> DisplayFaceGazeDirection 
     if horizontal is None:
         return None
     horizontal = _mirror_camera_horizontal(horizontal)
-    vertical = "center"
+    vertical = _vertical_direction(
+        center_y=(
+            None
+            if _coerce_optional_bool(camera.get("primary_person_center_y_unknown")) is True
+            else _coerce_optional_ratio(camera.get("primary_person_center_y"))
+        ),
+        fallback=None,
+    )
     return _GAZE_DIRECTION_MAP[(vertical, horizontal)]
+
+
+def _cue_axes_for_target(
+    *,
+    camera_center_x: float | None,
+    camera_center_y: float | None,
+    camera_zone: str | None,
+) -> tuple[int, int]:
+    """Return one bounded direct cue axis from the current target position."""
+
+    display_offset = _display_offset_from_camera(
+        camera_center_x=camera_center_x,
+        camera_zone=camera_zone,
+    )
+    if display_offset is None:
+        gaze_x = 0
+    else:
+        magnitude = abs(display_offset)
+        if magnitude < _GAZE_SOFT_OFFSET_THRESHOLD:
+            gaze_x = 0
+        elif magnitude < _GAZE_STRONG_OFFSET_THRESHOLD:
+            gaze_x = 1 if display_offset > 0.0 else -1
+        else:
+            scaled = (magnitude / 0.5) * _MAX_DYNAMIC_GAZE_AXIS
+            strength = max(1, min(_MAX_DYNAMIC_GAZE_AXIS, int(round(scaled))))
+            gaze_x = strength if display_offset > 0.0 else -strength
+    vertical_offset = _vertical_offset_from_camera(camera_center_y=camera_center_y)
+    if vertical_offset is None:
+        return gaze_x, 0
+    vertical_magnitude = abs(vertical_offset)
+    if vertical_magnitude < _GAZE_VERTICAL_SOFT_OFFSET_THRESHOLD:
+        return gaze_x, 0
+    if vertical_magnitude < _GAZE_VERTICAL_STRONG_OFFSET_THRESHOLD:
+        vertical_strength = 2
+    else:
+        scaled_vertical = (vertical_magnitude / 0.5) * _MAX_DYNAMIC_GAZE_AXIS
+        vertical_strength = max(2, min(_MAX_DYNAMIC_GAZE_AXIS, int(round(scaled_vertical))))
+    gaze_y = vertical_strength if vertical_offset > 0.0 else -vertical_strength
+    return gaze_x, gaze_y
 
 
 def _horizontal_direction(*, center_x: float | None, zone: str | None) -> str | None:
@@ -395,10 +497,36 @@ def _horizontal_direction(*, center_x: float | None, zone: str | None) -> str | 
     return None
 
 
+def _head_offsets_for_target(
+    *,
+    cue_gaze_x: int,
+    cue_gaze_y: int,
+    camera_center_x: float | None,
+    camera_center_y: float | None,
+    camera_zone: str | None,
+) -> tuple[int, int]:
+    """Add a bounded head drift aligned with the direct eye cue."""
+
+    horizontal = 0
+    if cue_gaze_x:
+        horizontal = _sign(cue_gaze_x) * min(2, max(1, abs(cue_gaze_x)))
+    else:
+        horizontal = _head_dx_from_camera(
+            camera_center_x=camera_center_x,
+            camera_zone=camera_zone,
+        )
+    vertical = _head_dy_from_camera(
+        cue_gaze_y=cue_gaze_y,
+        camera_center_y=camera_center_y,
+    )
+    return horizontal, vertical
+
+
 def _head_offsets_for_gaze(
     gaze: DisplayFaceGazeDirection,
     *,
     camera_center_x: float | None,
+    camera_center_y: float | None,
     camera_zone: str | None,
 ) -> tuple[int, int]:
     """Add a bounded head drift so the face turns before full eye commits."""
@@ -413,7 +541,10 @@ def _head_offsets_for_gaze(
             camera_center_x=camera_center_x,
             camera_zone=camera_zone,
         )
-    vertical = 0 if horizontal else _sign(gaze_y)
+    vertical = _head_dy_from_camera(
+        cue_gaze_y=gaze_y,
+        camera_center_y=camera_center_y,
+    )
     return horizontal, vertical
 
 
@@ -452,7 +583,7 @@ def _stabilize_center_decision(
 
     if config is None or active_cue is None:
         return decision
-    if not decision.active or decision.gaze != DisplayFaceGazeDirection.CENTER:
+    if not decision.active or decision.cue_gaze_x != 0 or decision.cue_gaze_y != 0:
         return decision
     if str(active_cue.source or "").strip() != decision.source:
         return decision
@@ -476,6 +607,8 @@ def _stabilize_center_decision(
         decision,
         reason=f"{decision.reason}_held_direction",
         gaze=held_gaze,
+        cue_gaze_x=active_cue.gaze_x,
+        cue_gaze_y=active_cue.gaze_y,
         head_dx=active_cue.head_dx,
         head_dy=active_cue.head_dy,
     )
@@ -513,7 +646,13 @@ def _stabilize_inactive_decision(
 def _gaze_from_axes(gaze_x: int, gaze_y: int) -> DisplayFaceGazeDirection | None:
     """Translate persisted cue axes back into one display gaze direction."""
 
-    return _GAZE_FROM_AXES.get((gaze_x, gaze_y))
+    horizontal = "center"
+    vertical = "center"
+    if abs(int(gaze_x)) >= 2:
+        horizontal = "right" if gaze_x > 0 else "left"
+    if abs(int(gaze_y)) >= 2:
+        vertical = "down" if gaze_y > 0 else "up"
+    return _GAZE_DIRECTION_MAP.get((vertical, horizontal))
 
 
 def _decision_from_cue(
@@ -542,6 +681,8 @@ def _decision_from_cue(
         reason=reason,
         source=str(cue.source or _SOURCE).strip() or _SOURCE,
         gaze=gaze,
+        cue_gaze_x=cue.gaze_x,
+        cue_gaze_y=cue.gaze_y,
         mouth=mouth,
         brows=brows,
         head_dx=cue.head_dx,
@@ -589,6 +730,47 @@ def _display_offset_from_camera(
     return None
 
 
+def _vertical_offset_from_camera(*, camera_center_y: float | None) -> float | None:
+    """Return one vertical screen offset in ``[-0.5, 0.5]``."""
+
+    if camera_center_y is None:
+        return None
+    return max(-0.5, min(0.5, camera_center_y - 0.5))
+
+
+def _vertical_direction(*, center_y: float | None, fallback: str | None) -> str:
+    """Return one coarse up/center/down anchor from center-y."""
+
+    if center_y is not None:
+        if center_y <= _UP_ENTER_THRESHOLD:
+            return "up"
+        if center_y >= _DOWN_ENTER_THRESHOLD:
+            return "down"
+        return "center"
+    if fallback in {"up", "center", "down"}:
+        return fallback
+    return "center"
+
+
+def _head_dy_from_camera(
+    *,
+    cue_gaze_y: int,
+    camera_center_y: float | None,
+) -> int:
+    """Return one small vertical head drift aligned with the eye cue."""
+
+    if cue_gaze_y:
+        return _sign(cue_gaze_y) * (2 if abs(cue_gaze_y) >= 3 else 1)
+    vertical_offset = _vertical_offset_from_camera(camera_center_y=camera_center_y)
+    if vertical_offset is None:
+        return 0
+    magnitude = abs(vertical_offset)
+    if magnitude < _HEAD_VERTICAL_SOFT_OFFSET_THRESHOLD:
+        return 0
+    strength = 2 if magnitude >= _HEAD_VERTICAL_STRONG_OFFSET_THRESHOLD else 1
+    return strength if vertical_offset > 0.0 else -strength
+
+
 def _should_hold_center_direction(
     *,
     config: TwinrConfig,
@@ -629,7 +811,7 @@ def _spatially_matches_active_side(
 def _cue_matches_decision(cue: DisplayFaceCue, decision: DisplayAttentionCueDecision) -> bool:
     """Return whether one active cue already represents the desired decision."""
 
-    expression = decision.expression().to_cue(source=decision.source)
+    expression = decision.cue()
     return (
         cue.source == decision.source
         and cue.gaze_x == expression.gaze_x
@@ -742,10 +924,6 @@ _GAZE_DIRECTION_MAP: dict[tuple[str, str], DisplayFaceGazeDirection] = {
     ("down", "right"): DisplayFaceGazeDirection.DOWN_RIGHT,
 }
 
-_GAZE_FROM_AXES: dict[tuple[int, int], DisplayFaceGazeDirection] = {
-    direction.axes(): direction
-    for direction in DisplayFaceGazeDirection
-}
 
 
 __all__ = [

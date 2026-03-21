@@ -78,6 +78,22 @@ class AICameraFineHandGesture(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class AICameraVisiblePerson:
+    """Describe one visible person anchor before higher-level tracking."""
+
+    box: AICameraBox | None
+    zone: AICameraZone = AICameraZone.UNKNOWN
+    confidence: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Normalize person-anchor metadata into stable bounded values."""
+
+        object.__setattr__(self, "box", _coerce_box(self.box))
+        object.__setattr__(self, "zone", _coerce_zone(self.zone))
+        object.__setattr__(self, "confidence", _clamp_ratio(self.confidence, default=0.0))
+
+
+@dataclass(frozen=True, slots=True)
 class AICameraBox:
     """Describe one normalized bounding box."""
 
@@ -167,6 +183,7 @@ class AICameraObservation:
     person_count: int = 0
     primary_person_box: AICameraBox | None = None
     primary_person_zone: AICameraZone = AICameraZone.UNKNOWN
+    visible_persons: tuple[AICameraVisiblePerson, ...] = ()
     looking_toward_device: bool | None = None
     person_near_device: bool | None = None
     engaged_with_device: bool | None = None
@@ -190,11 +207,24 @@ class AICameraObservation:
         # AUDIT-FIX(#2): Coerce nested payloads and keep person presence internally consistent when upstream emits raw dicts/lists.
         primary_person_box = _coerce_box(self.primary_person_box)
         objects = _coerce_objects(self.objects)
+        visible_persons = _coerce_visible_persons(self.visible_persons)
         person_count = _coerce_non_negative_int(self.person_count, default=0)
         if primary_person_box is not None and person_count < 1:
             person_count = 1
         if person_count < 1 and any(obj.label == "person" and obj.confidence > 0.0 for obj in objects):
             person_count = 1
+        if visible_persons and person_count < len(visible_persons):
+            person_count = len(visible_persons)
+        if primary_person_box is None and visible_persons:
+            primary_person_box = visible_persons[0].box
+        if primary_person_box is not None and not visible_persons:
+            visible_persons = (
+                AICameraVisiblePerson(
+                    box=primary_person_box,
+                    zone=self.primary_person_zone,
+                    confidence=1.0,
+                ),
+            )
 
         # AUDIT-FIX(#1): Parse readiness booleans strictly and collapse impossible state combinations.
         camera_online = _coerce_bool(self.camera_online, default=False)
@@ -226,6 +256,7 @@ class AICameraObservation:
         object.__setattr__(self, "person_count", person_count)
         object.__setattr__(self, "primary_person_box", primary_person_box)
         object.__setattr__(self, "primary_person_zone", _coerce_zone(self.primary_person_zone))
+        object.__setattr__(self, "visible_persons", visible_persons)
         object.__setattr__(self, "looking_toward_device", _coerce_optional_bool(self.looking_toward_device))
         object.__setattr__(self, "person_near_device", _coerce_optional_bool(self.person_near_device))
         object.__setattr__(self, "engaged_with_device", _coerce_optional_bool(self.engaged_with_device))
@@ -506,6 +537,53 @@ def _coerce_objects(value: object) -> tuple[AICameraObjectDetection, ...]:
     return tuple(detections)
 
 
+def _coerce_visible_person(value: object) -> AICameraVisiblePerson | None:
+    """Coerce one person-like payload to ``AICameraVisiblePerson``."""
+
+    if value is None:
+        return None
+    if isinstance(value, AICameraVisiblePerson):
+        return value
+    if isinstance(value, Mapping):
+        if not any(key in value for key in ("box", "zone", "confidence")):
+            return None
+        return AICameraVisiblePerson(
+            box=value.get("box"),
+            zone=value.get("zone", AICameraZone.UNKNOWN),
+            confidence=value.get("confidence", 0.0),
+        )
+    if all(hasattr(value, attr) for attr in ("box", "zone", "confidence")):
+        return AICameraVisiblePerson(
+            box=getattr(value, "box"),
+            zone=getattr(value, "zone"),
+            confidence=getattr(value, "confidence"),
+        )
+    box = _coerce_box(value)
+    if box is None:
+        return None
+    return AICameraVisiblePerson(box=box, zone=AICameraZone.UNKNOWN, confidence=1.0)
+
+
+def _coerce_visible_persons(value: object) -> tuple[AICameraVisiblePerson, ...]:
+    """Materialize visible-person anchors as a stable immutable tuple."""
+
+    if value is None:
+        return ()
+    single = _coerce_visible_person(value)
+    if single is not None:
+        return (single,)
+    if isinstance(value, (str, bytes, bytearray)):
+        return ()
+    if not isinstance(value, (list, tuple)):
+        return ()
+    people: list[AICameraVisiblePerson] = []
+    for item in value:
+        person = _coerce_visible_person(item)
+        if person is not None and person.box is not None:
+            people.append(person)
+    return tuple(people)
+
+
 # AUDIT-FIX(#7): Reject booleans as numeric ratios so malformed payloads cannot become false 0.0/1.0 confidences or edges.
 def _clamp_ratio(value: object, *, default: float) -> float:
     """Clamp one numeric value into ``[0.0, 1.0]``."""
@@ -535,5 +613,6 @@ __all__ = [
     "AICameraMotionState",
     "AICameraObjectDetection",
     "AICameraObservation",
+    "AICameraVisiblePerson",
     "AICameraZone",
 ]

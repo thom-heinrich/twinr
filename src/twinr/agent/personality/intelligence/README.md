@@ -17,11 +17,14 @@ threads.
 - translate explicit topic aversion into durable `avoid` state so Twinr backs off both conversationally and in source calibration
 - track bounded user engagement with those interests so Twinr can prioritize the topics that repeatedly draw the user back in
 - classify each learned topic into `resonant`, `warm`, `uncertain`, `cooling`, or `avoid`, separating healthy interest from exposure-aware non-uptake
+- persist a slower `ongoing interest` layer so feed discovery and refresh can follow the topics that stay alive over repeated returns instead of re-deriving that judgment ad hoc
+- persist a bounded `co-attention` layer so Twinr can distinguish a merely interesting topic from a genuinely shared running thread that both the user and the RSS/world layer keep returning to
 - derive mild cross-session cooling from repeated topic switches or non-reengagement, but only when there was prior positive exposure evidence
 - discover RSS or Atom feeds from source pages returned by the live web backend
 - recalibrate feed coverage during reflection-style maintenance windows instead of treating discovery as a daily poll
 - refresh due feeds on a calm cadence and translate fresh items into world signals, continuity threads, and condensed awareness threads
-- decay stale engagement and relax boosted feed priority/cadence back to each subscription's baseline when the topic stops pulling the user in
+- only let `co-attention` grow on genuinely new shared evidence such as fresh unseen feed items or new awareness-thread updates, not on every successful stale refresh
+- decay stale engagement, ongoing interest, and co-attention so boosted feed priority/cadence falls back to baseline when the topic stops pulling the user in
 
 `intelligence` does **not** own:
 - prompt-layer rendering

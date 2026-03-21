@@ -280,6 +280,8 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_PROACTIVE_LOCAL_CAMERA_PRIMARY_PERSON_UPPER_BODY_RATIO=0.81",
                         "TWINR_PROACTIVE_LOCAL_CAMERA_WRIST_ROI_SCALE=0.39",
                         "TWINR_PROACTIVE_LOCAL_CAMERA_FINE_HAND_EXPLICIT_HOLD_S=0.52",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_FINE_HAND_EXPLICIT_CONFIRM_SAMPLES=3",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_FINE_HAND_EXPLICIT_MIN_CONFIDENCE=0.81",
                     ]
                 )
                 + "\n",
@@ -319,6 +321,8 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_local_camera_primary_person_upper_body_ratio, 0.81)
         self.assertEqual(config.proactive_local_camera_wrist_roi_scale, 0.39)
         self.assertEqual(config.proactive_local_camera_fine_hand_explicit_hold_s, 0.52)
+        self.assertEqual(config.proactive_local_camera_fine_hand_explicit_confirm_samples, 3)
+        self.assertEqual(config.proactive_local_camera_fine_hand_explicit_min_confidence, 0.81)
 
     def test_local_camera_defaults_favor_interactive_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -329,6 +333,8 @@ class TwinrConfigTests(unittest.TestCase):
 
         self.assertEqual(config.proactive_local_camera_metadata_wait_s, 0.75)
         self.assertEqual(config.proactive_local_camera_pose_refresh_s, 0.75)
+        self.assertEqual(config.proactive_local_camera_fine_hand_explicit_confirm_samples, 1)
+        self.assertEqual(config.proactive_local_camera_fine_hand_explicit_min_confidence, 0.72)
 
     def test_from_env_defaults_hdmi_display_to_fast_local_hci_cadence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -336,6 +342,13 @@ class TwinrConfigTests(unittest.TestCase):
             env_path.write_text("", encoding="utf-8")
 
             config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_driver, "hdmi_fbdev")
+        self.assertAlmostEqual(config.display_attention_refresh_interval_s, 0.2, places=3)
+        self.assertAlmostEqual(config.display_poll_interval_s, 0.12, places=3)
+
+    def test_direct_constructor_defaults_hdmi_display_to_fast_local_hci_cadence(self) -> None:
+        config = TwinrConfig()
 
         self.assertEqual(config.display_driver, "hdmi_fbdev")
         self.assertAlmostEqual(config.display_attention_refresh_interval_s, 0.2, places=3)

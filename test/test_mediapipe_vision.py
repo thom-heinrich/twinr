@@ -114,6 +114,16 @@ class MediaPipeVisionTests(unittest.TestCase):
         self.assertEqual(gesture, AICameraFineHandGesture.OK_SIGN)
         self.assertAlmostEqual(confidence or 0.0, 0.91, places=3)
 
+    def test_fine_gesture_mapping_suppresses_custom_positive_when_none_wins(self) -> None:
+        gesture, confidence = _resolve_fine_hand_gesture(
+            result=_GestureResult([[_Category("none", 0.82), _Category("ok_sign", 0.78)]]),
+            category_map={"ok_sign": AICameraFineHandGesture.OK_SIGN},
+            min_score=0.55,
+        )
+
+        self.assertEqual(gesture, AICameraFineHandGesture.NONE)
+        self.assertIsNone(confidence)
+
     def test_temporal_classifier_detects_wave_from_lateral_raised_hand_motion(self) -> None:
         frames = (
             _Frame(
@@ -207,7 +217,7 @@ class MediaPipeVisionTests(unittest.TestCase):
 
         self.assertIn("mediapipe_custom_gesture_model_missing", str(context.exception))
 
-    def test_pipeline_prefers_roi_gesture_match_over_full_frame_none(self) -> None:
+    def test_pipeline_uses_stable_full_frame_gesture_track_even_when_roi_detections_exist(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             pipeline = MediaPipeVisionPipeline(
                 config=MediaPipeVisionConfig(
@@ -224,7 +234,7 @@ class MediaPipeVisionTests(unittest.TestCase):
                     "recognize_for_video": staticmethod(
                         lambda image, timestamp_ms: (
                             _GestureResult([[_Category("Pointing_Up", 0.93)]])
-                            if image == "roi-crop"
+                            if image == "full-frame"
                             else _GestureResult([])
                         )
                     )
@@ -260,7 +270,7 @@ class MediaPipeVisionTests(unittest.TestCase):
 
         self.assertEqual(choice, (AICameraFineHandGesture.POINTING, 0.87))
 
-    def test_pipeline_uses_monotonic_timestamps_across_roi_and_full_frame_candidates(self) -> None:
+    def test_pipeline_uses_single_full_frame_timestamp_for_stable_gesture_tracking(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             pipeline = MediaPipeVisionPipeline(
                 config=MediaPipeVisionConfig(
@@ -302,8 +312,8 @@ class MediaPipeVisionTests(unittest.TestCase):
                 ),
             )
 
-        self.assertEqual(timestamps, [7, 8])
-        self.assertEqual(pipeline._last_timestamp_ms, 8)
+        self.assertEqual(timestamps, [7])
+        self.assertEqual(pipeline._last_timestamp_ms, 7)
 
     def test_pipeline_reserves_hand_landmark_final_timestamp_even_without_detections(self) -> None:
         pipeline = MediaPipeVisionPipeline(

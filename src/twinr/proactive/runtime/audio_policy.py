@@ -306,6 +306,8 @@ def _presence_audio_active(
         return None
     return (
         audio.speech_detected is True
+        and audio.non_speech_audio_likely is not True
+        and audio.background_media_likely is not True
         and room_busy_or_overlapping is not True
         and mute_blocks_voice_capture is not True
     )

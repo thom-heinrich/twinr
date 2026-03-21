@@ -264,6 +264,22 @@ class SocialDetectedObject:
         object.__setattr__(self, "box", _coerce_spatial_box(self.box))
 
 
+@dataclass(frozen=True, slots=True)
+class SocialVisiblePerson:
+    """Describe one visible person anchor for short-lived runtime targeting."""
+
+    box: SocialSpatialBox | None = None
+    zone: SocialPersonZone = SocialPersonZone.UNKNOWN
+    confidence: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Normalize person-anchor metadata into bounded values."""
+
+        object.__setattr__(self, "box", _coerce_spatial_box(self.box))
+        object.__setattr__(self, "zone", _coerce_person_zone(self.zone))
+        object.__setattr__(self, "confidence", _normalize_unit_interval(self.confidence, default=0.0))
+
+
 def _coerce_body_pose(value: object) -> SocialBodyPose:
     """Coerce one value to a known body pose."""
 
@@ -425,6 +441,37 @@ def _coerce_detected_objects(value: object) -> tuple[SocialDetectedObject, ...]:
     return tuple(items)
 
 
+def _coerce_visible_person(value: object) -> SocialVisiblePerson | None:
+    """Coerce one person-like payload to ``SocialVisiblePerson``."""
+
+    if isinstance(value, SocialVisiblePerson):
+        return value
+    if isinstance(value, dict):
+        return SocialVisiblePerson(
+            box=value.get("box"),
+            zone=value.get("zone", SocialPersonZone.UNKNOWN),
+            confidence=value.get("confidence", 0.0),
+        )
+    return None
+
+
+def _coerce_visible_persons(value: object) -> tuple[SocialVisiblePerson, ...]:
+    """Coerce one iterable payload to a tuple of visible-person anchors."""
+
+    if value is None:
+        return ()
+    if isinstance(value, tuple) and all(isinstance(item, SocialVisiblePerson) for item in value):
+        return value
+    if not isinstance(value, (tuple, list)):
+        return ()
+    items: list[SocialVisiblePerson] = []
+    for item in value:
+        person = _coerce_visible_person(item)
+        if person is not None:
+            items.append(person)
+    return tuple(items)
+
+
 def _is_floor_like_pose(body_pose: SocialBodyPose) -> bool:
     """Return whether one coarse pose should count as floor-like."""
 
@@ -461,6 +508,7 @@ class SocialVisionObservation:
     person_disappeared_at: float | None = None
     primary_person_zone: SocialPersonZone = SocialPersonZone.UNKNOWN
     primary_person_box: SocialSpatialBox | None = None
+    visible_persons: tuple[SocialVisiblePerson, ...] = ()
     primary_person_center_x: float | None = None
     primary_person_center_y: float | None = None
     looking_toward_device: bool = False

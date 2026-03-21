@@ -913,24 +913,30 @@ class LongTermStructuredStore:
                 query_text=clean_query,
                 limit=bounded_limit,
                 eligible=eligible,
+                allow_catalog_fallback=not include_episodes,
             )
         except Exception:
             if self._remote_is_required():
                 raise
             direct_payloads = None
         if direct_payloads is not None:
-            selected = list(self._load_remote_objects_from_payloads(payloads=direct_payloads))
-            filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
-            if filtered:
-                return self.rank_selected_objects(
-                    query_texts=(clean_query,),
-                    objects=filtered,
-                    limit=bounded_limit,
-                )
-            # Query-driven remote scope searches stay bounded to ranked hits.
-            # Falling back to "recent" items here would rehydrate the full
-            # remote catalog and reintroduce the 10s+ Pi startup regression.
-            return ()
+            if direct_payloads:
+                selected = list(self._load_remote_objects_from_payloads(payloads=direct_payloads))
+                filtered = list(self._filter_query_relevant_objects(clean_query, selected=selected, limit=bounded_limit))
+                if filtered:
+                    return self.rank_selected_objects(
+                        query_texts=(clean_query,),
+                        objects=filtered,
+                        limit=bounded_limit,
+                    )
+                # Query-driven remote scope searches stay bounded to ranked hits.
+                # Falling back to "recent" items here would rehydrate the full
+                # remote catalog and reintroduce the 10s+ Pi startup regression.
+                return ()
+            if include_episodes:
+                # Empty episodic scope misses stay authoritative so one off-topic
+                # query does not hydrate the full episodic catalog into the turn.
+                return ()
 
         try:
             if not remote_catalog.catalog_available(snapshot_kind="objects"):
@@ -1036,6 +1042,13 @@ class LongTermStructuredStore:
                 _LOG.warning("Skipping invalid remote long-term conflict payload during selective load.", exc_info=True)
         if not clean_query:
             return tuple(conflicts[:bounded_limit])
+        filtered_without_objects = self._filter_query_relevant_conflicts(
+            clean_query,
+            selected=conflicts,
+            limit=bounded_limit,
+        )
+        if filtered_without_objects or not conflicts:
+            return filtered_without_objects
         related_ids = tuple(
             dict.fromkeys(
                 memory_id
@@ -1694,6 +1707,7 @@ class LongTermStructuredStore:
                         snapshot_kind="objects",
                         query_text=clean_query,
                         limit=candidate_limit,
+                        allow_catalog_fallback=True,
                     )
                 except Exception:
                     if self._remote_is_required():
@@ -1702,12 +1716,20 @@ class LongTermStructuredStore:
                 if direct_payloads is None:
                     continue
                 shared_objects = self._load_remote_objects_from_payloads(payloads=direct_payloads)
-                return self._partition_context_objects(
+                partitioned = self._partition_context_objects(
                     query_text=clean_query,
                     objects=shared_objects,
                     episodic_limit=resolved_episodic_limit,
                     durable_limit=resolved_durable_limit,
                 )
+                # Current-scope hits can briefly deserialize into payloads that
+                # no longer survive the active/candidate/uncertain partition
+                # after a fresh confirmation or supersede write. In that case,
+                # keep going into catalog-backed rescue instead of returning an
+                # empty provider-context durable section.
+                if direct_payloads and not partitioned[0] and not partitioned[1]:
+                    continue
+                return partitioned
             try:
                 if not remote_catalog.catalog_available(snapshot_kind="objects"):
                     return (), ()

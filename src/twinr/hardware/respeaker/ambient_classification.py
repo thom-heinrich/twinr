@@ -15,6 +15,7 @@ import math  # AUDIT-FIX(#2): Reject non-finite numeric inputs and bound only sm
 from dataclasses import dataclass
 
 from twinr.hardware.audio import AmbientAudioLevelSample
+from twinr.hardware.respeaker.pcm_content_classifier import classify_pcm_speech_likeness
 from twinr.hardware.respeaker.models import ReSpeakerSignalSnapshot
 
 
@@ -23,6 +24,10 @@ logger = logging.getLogger(__name__)  # AUDIT-FIX(#1): Boundary errors should re
 _MIN_ACTIVE_CHUNKS = 3
 _NON_SPEECH_ACTIVE_RATIO = 0.45
 _BACKGROUND_MEDIA_ACTIVE_RATIO = 0.72
+_NON_SPEECH_AVERAGE_RMS = 350
+_NON_SPEECH_PEAK_RMS = 500
+_BACKGROUND_MEDIA_PEAK_TO_AVERAGE_MAX = 1.8
+_CORROBORATED_DIRECTION_CONFIDENCE_MIN = 0.75
 _RATIO_BOUND_TOLERANCE = 1e-6  # AUDIT-FIX(#2): Clamp tiny overshoot only; reject clearly corrupted ratios.
 
 
@@ -39,6 +44,9 @@ def classify_respeaker_ambient_audio(
     *,
     signal_snapshot: ReSpeakerSignalSnapshot,
     sample: AmbientAudioLevelSample | None,
+    pcm_bytes: bytes | None = None,
+    sample_rate: int | None = None,
+    channels: int | None = None,
 ) -> ReSpeakerAmbientClassification:
     """Classify one ReSpeaker capture window into bounded non-speech facts.
 
@@ -51,10 +59,21 @@ def classify_respeaker_ambient_audio(
 
     active_ratio = _active_ratio(sample)  # AUDIT-FIX(#3): Snapshot sample-derived values once to avoid mixed-window classification.
     active_chunk_count = _active_chunk_count(sample)  # AUDIT-FIX(#3): Snapshot sample-derived values once to avoid mixed-window classification.
+    average_rms = _average_rms(sample)
+    peak_rms = _peak_rms(sample)
+    pcm_speech_evidence = classify_pcm_speech_likeness(
+        pcm_bytes,
+        sample_rate=sample_rate,
+        channels=channels,
+    )
     audio_activity_detected = _audio_activity_detected_from_values(
         active_chunk_count=active_chunk_count,
         active_ratio=active_ratio,
+        average_rms=average_rms,
+        peak_rms=peak_rms,
     )
+    if audio_activity_detected is False and pcm_speech_evidence.strong_non_speech is True:
+        audio_activity_detected = True
     if audio_activity_detected is False:
         return ReSpeakerAmbientClassification(
             audio_activity_detected=False,
@@ -76,21 +95,91 @@ def classify_respeaker_ambient_audio(
         )
     if host_control_ready is not True:
         return ReSpeakerAmbientClassification(audio_activity_detected=True)
-    if speech_detected is True:
+    corroborated_speech = _speech_signal_corroborated(
+        signal_snapshot=signal_snapshot,
+        speech_detected=speech_detected,
+    )
+    if pcm_speech_evidence.strong_non_speech is True:
+        return ReSpeakerAmbientClassification(
+            audio_activity_detected=True,
+            non_speech_audio_likely=True,
+            background_media_likely=_background_media_likely_from_values(
+                active_ratio=active_ratio,
+                average_rms=average_rms,
+                peak_rms=peak_rms,
+            ),
+        )
+    if corroborated_speech:
         return ReSpeakerAmbientClassification(
             audio_activity_detected=True,
             non_speech_audio_likely=False,
             background_media_likely=False,
         )
+    if speech_detected is True:
+        if pcm_speech_evidence.speech_likely is True:
+            return ReSpeakerAmbientClassification(
+                audio_activity_detected=True,
+                non_speech_audio_likely=False,
+                background_media_likely=False,
+            )
+        non_speech_audio_likely = True
+        background_media_likely = _background_media_likely_from_values(
+            active_ratio=active_ratio,
+            average_rms=average_rms,
+            peak_rms=peak_rms,
+        )
+        return ReSpeakerAmbientClassification(
+            audio_activity_detected=True,
+            non_speech_audio_likely=non_speech_audio_likely,
+            background_media_likely=background_media_likely,
+        )
     if speech_detected is not False:
         return ReSpeakerAmbientClassification(audio_activity_detected=True)
     non_speech_audio_likely = True
-    background_media_likely = active_ratio is not None and active_ratio >= _BACKGROUND_MEDIA_ACTIVE_RATIO
+    background_media_likely = _background_media_likely_from_values(
+        active_ratio=active_ratio,
+        average_rms=average_rms,
+        peak_rms=peak_rms,
+    )
     return ReSpeakerAmbientClassification(
         audio_activity_detected=True,
         non_speech_audio_likely=non_speech_audio_likely,
         background_media_likely=background_media_likely,
     )
+
+
+def _speech_signal_corroborated(
+    *,
+    signal_snapshot: ReSpeakerSignalSnapshot,
+    speech_detected: bool | None,
+) -> bool:
+    """Return whether XVF3800 speech is backed by directional beam evidence.
+
+    The raw DOA speech flag can overfire on some bounded non-speech stimuli. For
+    suppression decisions we therefore only treat speech as authoritative when
+    the snapshot also carries corroborating beam or direction evidence.
+    """
+
+    if speech_detected is not True:
+        return False
+    speech_overlap_likely = _snapshot_flag(signal_snapshot, "speech_overlap_likely")
+    direction_confidence = _safe_optional_float(
+        _safe_getattr(signal_snapshot, "direction_confidence")
+    )
+    if direction_confidence is not None:
+        return (
+            speech_overlap_likely is not True
+            and direction_confidence >= _CORROBORATED_DIRECTION_CONFIDENCE_MIN
+        )
+    beam_activity = _safe_float_tuple(_safe_getattr(signal_snapshot, "beam_activity"))
+    if beam_activity is None:
+        return False
+    fixed_beam_speech_count = sum(1 for value in beam_activity[:2] if value > 0.0)
+    if fixed_beam_speech_count <= 0:
+        return False
+    if speech_overlap_likely is True:
+        return False
+    return fixed_beam_speech_count == 1
 
 
 def _audio_activity_detected(sample: AmbientAudioLevelSample | None) -> bool | None:
@@ -99,6 +188,8 @@ def _audio_activity_detected(sample: AmbientAudioLevelSample | None) -> bool | N
     return _audio_activity_detected_from_values(  # AUDIT-FIX(#3): Reuse normalized helpers so direct callers get the same deterministic logic.
         active_chunk_count=_active_chunk_count(sample),
         active_ratio=_active_ratio(sample),
+        average_rms=_average_rms(sample),
+        peak_rms=_peak_rms(sample),
     )
 
 
@@ -106,12 +197,43 @@ def _audio_activity_detected_from_values(  # AUDIT-FIX(#3): Keep one-window clas
     *,
     active_chunk_count: int | None,
     active_ratio: float | None,
+    average_rms: int | None,
+    peak_rms: int | None,
 ) -> bool | None:
     """Return whether normalized ambient values show sustained activity."""
 
-    if active_ratio is None or active_chunk_count is None:
-        return None
-    return active_chunk_count >= _MIN_ACTIVE_CHUNKS and active_ratio >= _NON_SPEECH_ACTIVE_RATIO
+    ratio_activity_known = active_ratio is not None and active_chunk_count is not None
+    ratio_activity = (
+        ratio_activity_known
+        and active_chunk_count >= _MIN_ACTIVE_CHUNKS
+        and active_ratio >= _NON_SPEECH_ACTIVE_RATIO
+    )
+    rms_activity_known = average_rms is not None and peak_rms is not None
+    rms_activity = (
+        rms_activity_known
+        and average_rms >= _NON_SPEECH_AVERAGE_RMS
+        and peak_rms >= _NON_SPEECH_PEAK_RMS
+    )
+    if ratio_activity_known or rms_activity_known:
+        return bool(ratio_activity or rms_activity)
+    return None
+
+
+def _background_media_likely_from_values(
+    *,
+    active_ratio: float | None,
+    average_rms: int | None,
+    peak_rms: int | None,
+) -> bool:
+    """Return whether one ambient window looks more like steady media than speech."""
+
+    if active_ratio is not None and active_ratio >= _BACKGROUND_MEDIA_ACTIVE_RATIO:
+        return True
+    if average_rms is None or peak_rms is None or average_rms <= 0:
+        return False
+    if average_rms < _NON_SPEECH_AVERAGE_RMS or peak_rms < _NON_SPEECH_PEAK_RMS:
+        return False
+    return (peak_rms / average_rms) <= _BACKGROUND_MEDIA_PEAK_TO_AVERAGE_MAX
 
 
 def _active_chunk_count(sample: AmbientAudioLevelSample | None) -> int | None:
@@ -143,6 +265,22 @@ def _active_ratio(sample: AmbientAudioLevelSample | None) -> float | None:
     if ratio > 1.0:
         return 1.0
     return ratio
+
+
+def _average_rms(sample: AmbientAudioLevelSample | None) -> int | None:
+    """Return one normalized average RMS value when present."""
+
+    if sample is None:
+        return None
+    return _coerce_non_negative_int(_safe_getattr(sample, "average_rms"))
+
+
+def _peak_rms(sample: AmbientAudioLevelSample | None) -> int | None:
+    """Return one normalized peak RMS value when present."""
+
+    if sample is None:
+        return None
+    return _coerce_non_negative_int(_safe_getattr(sample, "peak_rms"))
 
 
 def _coerce_non_negative_int(value: object) -> int | None:
@@ -180,6 +318,34 @@ def _coerce_non_negative_int(value: object) -> int | None:
     except Exception:
         return None
     return number
+
+
+def _safe_optional_float(value: object) -> float | None:
+    """Return one finite float or ``None``."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _safe_float_tuple(value: object) -> tuple[float, ...] | None:
+    """Return one finite float tuple or ``None`` when malformed."""
+
+    if not isinstance(value, tuple):
+        return None
+    normalized: list[float] = []
+    for item in value:
+        number = _safe_optional_float(item)
+        if number is None:
+            return None
+        normalized.append(number)
+    return tuple(normalized)
 
 
 def _snapshot_flag(  # AUDIT-FIX(#1): Normalize snapshot flags into strict True/False/None values.

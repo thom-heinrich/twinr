@@ -224,6 +224,30 @@ def _response_json_keys(exc: BaseException) -> list[str]:
     return []
 
 
+def _response_json_value(exc: BaseException, key: str) -> str | None:
+    normalized_key = str(key or "").strip()
+    if not normalized_key:
+        return None
+    for item in _exception_chain(exc):
+        if not isinstance(item, ChonkyDBError) or not isinstance(item.response_json, dict):
+            continue
+        value = item.response_json.get(normalized_key)
+        text = _normalize_text(value)
+        if text:
+            return text
+    return None
+
+
+def _response_text_excerpt(exc: BaseException) -> str | None:
+    for item in _exception_chain(exc):
+        if not isinstance(item, ChonkyDBError):
+            continue
+        text = _normalize_text(item.response_text)
+        if text:
+            return text
+    return None
+
+
 def _query_sha256(query_text: str | None) -> str | None:
     normalized = " ".join(str(query_text or "").split()).strip()
     if not normalized:
@@ -338,6 +362,17 @@ def _record_remote_request_diagnostic(
     response_keys = _response_json_keys(exc)
     if response_keys:
         data["response_json_keys"] = response_keys
+    response_detail = _response_json_value(exc, "detail")
+    if response_detail is None:
+        response_detail = _response_text_excerpt(exc)
+    if response_detail is not None:
+        data["response_detail"] = _compact_text(response_detail, limit=_MAX_ERROR_TEXT_CHARS)
+    response_error = _response_json_value(exc, "error")
+    if response_error is not None:
+        data["response_error"] = _compact_text(response_error, limit=_MAX_ERROR_TEXT_CHARS)
+    response_error_type = _response_json_value(exc, "error_type")
+    if response_error_type is not None:
+        data["response_error_type"] = _compact_text(response_error_type, limit=80)
 
     event_name = (
         f"longterm_remote_{normalized_request_kind}_failed"

@@ -32,6 +32,7 @@ from twinr.agent.base_agent.conversation.closure import (
     ConversationClosureDecision,
     ToolCallingConversationClosureEvaluator,
 )
+from twinr.agent.workflows.follow_up_steering import FollowUpSteeringRuntime
 from twinr.agent.base_agent.runtime import TwinrRuntime
 from twinr.agent.tools import RealtimeToolExecutor, bind_realtime_tool_handlers
 from twinr.hardware.audio import (
@@ -196,6 +197,7 @@ class TwinrRealtimeHardwareLoop(
         )
         self.emit = emit or _default_emit
         self.turn_guidance_runtime = TurnGuidanceRuntime(self)
+        self.follow_up_steering_runtime = FollowUpSteeringRuntime(self)
         self.streaming_transcript_verifier_runtime = StreamingTranscriptVerifierRuntime(self)
         self.sleep = sleep
         self.error_reset_seconds = error_reset_seconds
@@ -577,22 +579,12 @@ class TwinrRealtimeHardwareLoop(
         request_source: str,
         proactive_trigger: str | None,
     ) -> ConversationClosureEvaluation:
-        evaluator = self.conversation_closure_evaluator
-        if evaluator is None or not self.config.conversation_closure_guard_enabled:
-            return ConversationClosureEvaluation()
-        if not self._follow_up_allowed_for_source(initial_source=request_source):
-            return ConversationClosureEvaluation()
-        try:
-            decision = evaluator.evaluate(
-                user_transcript=user_transcript,
-                assistant_response=assistant_response,
-                request_source=request_source,
-                proactive_trigger=proactive_trigger,
-                conversation=self.runtime.conversation_context(),
-            )
-        except Exception as exc:
-            return ConversationClosureEvaluation(error_type=type(exc).__name__)
-        return ConversationClosureEvaluation(decision=decision)
+        return self.follow_up_steering_runtime.evaluate_closure(
+            user_transcript=user_transcript,
+            assistant_response=assistant_response,
+            request_source=request_source,
+            proactive_trigger=proactive_trigger,
+        )
 
     def _apply_follow_up_closure_evaluation(
         self,
@@ -601,28 +593,12 @@ class TwinrRealtimeHardwareLoop(
         request_source: str,
         proactive_trigger: str | None,
     ) -> bool:
-        if evaluation.error_type:
-            self.emit(f"conversation_closure_fallback={evaluation.error_type}")
-            return False
-        decision = evaluation.decision
-        if decision is None:
-            return False
-        self._emit_closure_decision(decision)
-        if not decision.close_now:
-            return False
-        min_confidence = max(0.0, min(1.0, float(self.config.conversation_closure_min_confidence)))
-        if decision.confidence < min_confidence:
-            self.emit("conversation_closure_below_threshold=true")
-            return False
-        self._record_event(
-            "conversation_closure_detected",
-            "Twinr suppressed automatic follow-up listening because the exchange clearly ended for now.",
+        decision = self.follow_up_steering_runtime.apply_closure_evaluation(
+            evaluation=evaluation,
             request_source=request_source,
             proactive_trigger=proactive_trigger,
-            confidence=decision.confidence,
-            reason=decision.reason,
         )
-        return True
+        return decision.force_close
 
     def _emit_closure_decision(self, decision: ConversationClosureDecision) -> None:
         self.emit(f"conversation_closure_close_now={str(decision.close_now).lower()}")

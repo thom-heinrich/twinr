@@ -252,7 +252,9 @@ def _derive_conversation_appetite(
         elif item.source in {"relationship", "situational_awareness", "regional_news", "local_news"} and item.salience >= 0.82:
             interest = "growing"
     else:
-        if state == "resonant" or matching_signal.engagement_score >= 0.86 or matching_signal.engagement_count >= 4:
+        if matching_signal.ongoing_interest in {"active", "growing", "peripheral"}:
+            interest = matching_signal.ongoing_interest
+        elif state == "resonant" or matching_signal.engagement_score >= 0.86 or matching_signal.engagement_count >= 4:
             interest = "active"
         elif state == "warm" or matching_signal.engagement_score >= 0.62 or matching_signal.engagement_count >= 2:
             interest = "growing"
@@ -300,6 +302,13 @@ def _derive_conversation_appetite(
             follow_up = _shift_level(follow_up, levels=_APPETITE_FOLLOW_UP_LEVELS, delta=1)
             proactivity = _shift_level(proactivity, levels=_APPETITE_PROACTIVITY_LEVELS, delta=1)
 
+    if matching_signal is not None:
+        if matching_signal.co_attention_state == "shared_thread" and state in {"warm", "resonant"}:
+            follow_up = _shift_level(follow_up, levels=_APPETITE_FOLLOW_UP_LEVELS, delta=1)
+            proactivity = _shift_level(proactivity, levels=_APPETITE_PROACTIVITY_LEVELS, delta=1)
+        elif matching_signal.co_attention_state == "forming" and state in {"warm", "resonant"}:
+            follow_up = _shift_level(follow_up, levels=_APPETITE_FOLLOW_UP_LEVELS, delta=0)
+
     return ConversationAppetiteCue(
         state=state,
         interest=interest,
@@ -338,7 +347,7 @@ def _stable_rng(snapshot: PersonalitySnapshot | None, items: tuple[CompanionMind
     gentle variation as the snapshot evolves.
     """
 
-    parts = [snapshot.generated_at if snapshot else ""]
+    parts = [_normalized_text(snapshot.generated_at) if snapshot else ""]
     parts.extend(
         f"{item.source}|{_normalized_text(item.title)}|{item.salience:.4f}"
         for item in items
@@ -601,6 +610,17 @@ def _render_interest_label(value: str) -> str:
     return "keep this in peripheral awareness unless the user pulls it forward"
 
 
+def _render_co_attention_label(value: str | None) -> str:
+    """Render one co-attention state into prompt-facing language."""
+
+    normalized = _normalized_text(value).casefold()
+    if normalized == "shared_thread":
+        return "this has become a shared running thread between Twinr and the user"
+    if normalized == "forming":
+        return "this is becoming a shared thread Twinr is actively keeping up with"
+    return "this stays background awareness rather than a shared thread"
+
+
 def render_self_expression_policy(
     snapshot: PersonalitySnapshot | None,
     *,
@@ -635,6 +655,9 @@ def render_self_expression_policy(
             "- Repeated user returns to a topic may also increase Twinr's own ongoing interest in it: active-interest topics can feel more alive and more worth keeping an eye on, while peripheral topics should stay lighter."
         ),
         (
+            "- When a topic becomes a genuine shared thread between Twinr and the user, it may surface a little more naturally as something both sides keep returning to, but still without becoming repetitive or pushy."
+        ),
+        (
             "- Use each surfaced topic's appetite cue: let depth say how far to elaborate, follow-up say whether one calm next question is appropriate, and proactivity say whether to volunteer the topic at all."
         ),
         (
@@ -662,10 +685,15 @@ def render_mindshare_block(
         ),
     ]
     for item in items:
+        matching_signal = _matching_engagement_signal(
+            item,
+            engagement_signals=engagement_signals,
+        )
         lines.append(
             (
                 f"- {item.title}: {item.summary} "
                 f"(salience {_format_score(item.salience)}, source {item.source}, appetite {item.appetite.state}, interest {_render_interest_label(item.appetite.interest)}; "
+                f"co-attention {_render_co_attention_label(matching_signal.co_attention_state if matching_signal is not None else None)}; "
                 f"depth {_render_depth_label(item.appetite.depth)}; "
                 f"follow-up {_render_follow_up_label(item.appetite.follow_up)}; "
                 f"proactivity {_render_proactivity_label(item.appetite.proactivity)})"

@@ -397,8 +397,9 @@ class WorldIntelligenceService:
         *,
         force: bool = False,
         search_backend: object | None = None,
+        allow_recalibration: bool = True,
     ) -> WorldIntelligenceRefreshResult:
-        """Recalibrate if due, then refresh due feed subscriptions."""
+        """Recalibrate if allowed and due, then refresh feed subscriptions."""
 
         subscriptions = list(
             self.store.load_subscriptions(config=self.config, remote_state=self.remote_state)
@@ -413,13 +414,14 @@ class WorldIntelligenceService:
                 now=now,
             ),
         )
-        subscriptions, state = self._maybe_recalibrate(
-            subscriptions=subscriptions,
-            state=state,
-            now=now,
-            force=force,
-            search_backend=search_backend,
-        )
+        if allow_recalibration:
+            subscriptions, state = self._maybe_recalibrate(
+                subscriptions=subscriptions,
+                state=state,
+                now=now,
+                force=force,
+                search_backend=search_backend,
+            )
         due_subscriptions = [
             subscription
             for subscription in subscriptions
@@ -439,6 +441,7 @@ class WorldIntelligenceService:
         continuity_threads: list[ContinuityThread] = []
         updated_awareness_threads = tuple(state.awareness_threads)
         updated_subscriptions: list[WorldFeedSubscription] = []
+        subscriptions_with_new_items: set[str] = set()
 
         for subscription in subscriptions:
             if subscription.subscription_id not in {item.subscription_id for item in due_subscriptions}:
@@ -462,6 +465,7 @@ class WorldIntelligenceService:
                     )
                 )
                 if unseen_items:
+                    subscriptions_with_new_items.add(subscription.subscription_id)
                     awareness_thread = self._merge_awareness_thread(
                         existing_threads=updated_awareness_threads,
                         subscription=subscription,
@@ -506,6 +510,15 @@ class WorldIntelligenceService:
                     )
                 )
 
+        synchronized_state = self._synchronize_interest_policy_state(
+            state=replace(
+                state,
+                awareness_threads=updated_awareness_threads,
+            ),
+            subscriptions=updated_subscriptions,
+            shared_evidence_subscription_ids=tuple(subscriptions_with_new_items),
+        )
+
         self.store.save_subscriptions(
             config=self.config,
             subscriptions=updated_subscriptions,
@@ -514,7 +527,7 @@ class WorldIntelligenceService:
         self.store.save_state(
             config=self.config,
             state=replace(
-                state,
+                synchronized_state,
                 last_refreshed_at=now_iso,
                 awareness_threads=updated_awareness_threads,
             ),
@@ -730,7 +743,11 @@ class WorldIntelligenceService:
             now_iso=now_iso,
         )
         updated_state = replace(
-            state,
+            self._synchronize_interest_policy_state(
+                state=state,
+                subscriptions=current_subscriptions,
+                shared_evidence_subscription_ids=(),
+            ),
             last_recalibrated_at=now_iso,
         )
         if search_backend is None:
@@ -814,10 +831,17 @@ class WorldIntelligenceService:
                 item
                 for item in state.interest_signals
                 if item.engagement_state not in {"cooling", "avoid"}
+                and (
+                    item.ongoing_interest in {"active", "growing"}
+                    or (item.explicit and item.engagement_score >= 0.72)
+                )
             ),
             key=lambda item: (
+                self._ongoing_interest_rank(item.ongoing_interest),
                 self._engagement_state_rank(item.engagement_state),
+                self._co_attention_state_rank(item.co_attention_state),
                 item.explicit,
+                item.ongoing_interest_score,
                 item.engagement_score,
                 item.engagement_count,
                 item.salience,
@@ -872,6 +896,24 @@ class WorldIntelligenceService:
     def _interest_priority(self, signal: WorldInterestSignal) -> float:
         """Map one learned interest to a bounded subscription priority."""
 
+        if signal.ongoing_interest == "active":
+            return _clamp(
+                max(
+                    signal.salience * 0.84,
+                    (signal.engagement_score * 0.52) + (signal.ongoing_interest_score * 0.44),
+                ),
+                minimum=0.52,
+                maximum=0.98,
+            )
+        if signal.ongoing_interest == "growing":
+            return _clamp(
+                max(
+                    signal.salience * 0.74,
+                    (signal.engagement_score * 0.46) + (signal.ongoing_interest_score * 0.34),
+                ),
+                minimum=0.4,
+                maximum=0.9,
+            )
         if signal.engagement_state == "resonant":
             return _clamp(
                 max(signal.salience, (signal.salience * 0.74) + (signal.engagement_score * 0.5)),
@@ -903,6 +945,10 @@ class WorldIntelligenceService:
             return max(self.default_refresh_interval_hours, 168)
         if signal.engagement_state == "cooling":
             return max(self.default_refresh_interval_hours, 120)
+        if signal.ongoing_interest == "active" and signal.engagement_state in {"resonant", "warm"}:
+            return 24
+        if signal.ongoing_interest == "growing":
+            return 48
         if signal.engagement_state == "uncertain":
             return self.default_refresh_interval_hours
         if signal.engagement_state == "resonant" and (signal.explicit or signal.engagement_score >= 0.9):
@@ -940,8 +986,12 @@ class WorldIntelligenceService:
             matching = [
                 signal
                 for signal in state.interest_signals
-                if signal.engagement_state in {"resonant", "warm"}
-                and signal.engagement_score >= 0.6
+                if signal.engagement_state != "avoid"
+                and (
+                    signal.ongoing_interest in {"active", "growing"}
+                    or signal.engagement_state in {"resonant", "warm"}
+                )
+                and signal.engagement_score >= 0.52
                 and self._subscription_covers_interest(subscription, signal)
             ]
             if not matching:
@@ -957,7 +1007,10 @@ class WorldIntelligenceService:
             strongest = max(
                 matching,
                 key=lambda item: (
+                    self._ongoing_interest_rank(item.ongoing_interest),
                     item.explicit,
+                    self._co_attention_state_rank(item.co_attention_state),
+                    item.ongoing_interest_score,
                     item.engagement_score,
                     item.engagement_count,
                     item.salience,
@@ -998,6 +1051,8 @@ class WorldIntelligenceService:
             decay_steps = int((age_days - float(self.interest_decay_grace_days)) // float(self.interest_decay_step_days)) + 1
             min_engagement = 0.42 if signal.explicit else 0.2
             min_salience = 0.38 if signal.explicit else 0.16
+            ongoing_interest_floor = 0.42 if signal.explicit and signal.engagement_state not in {"cooling", "avoid"} else 0.04
+            co_attention_floor = 0.0
             decayed_signal = WorldInterestSignal(
                 signal_id=signal.signal_id,
                 topic=signal.topic,
@@ -1014,6 +1069,27 @@ class WorldIntelligenceService:
                     signal.engagement_score - (decay_steps * self.interest_decay_engagement_step),
                     minimum=min_engagement,
                     maximum=1.0,
+                ),
+                ongoing_interest_score=_clamp(
+                    signal.ongoing_interest_score
+                    - (decay_steps * max(self.interest_decay_engagement_step, 0.08))
+                    - (signal.non_reengagement_count * 0.03)
+                    - (signal.deflection_count * 0.06),
+                    minimum=ongoing_interest_floor,
+                    maximum=1.0,
+                ),
+                co_attention_score=_clamp(
+                    signal.co_attention_score
+                    - (decay_steps * max(self.interest_decay_engagement_step, 0.09))
+                    - (0.06 if signal.engagement_state == "cooling" else 0.12 if signal.engagement_state == "avoid" else 0.0),
+                    minimum=co_attention_floor,
+                    maximum=1.0,
+                ),
+                co_attention_count=max(
+                    0,
+                    signal.co_attention_count
+                    - max(1, decay_steps // 2)
+                    - (1 if signal.engagement_state in {"cooling", "avoid"} else 0),
                 ),
                 evidence_count=max(1, signal.evidence_count - max(0, decay_steps // 2)),
                 engagement_count=max(0, signal.engagement_count - decay_steps),
@@ -1033,6 +1109,8 @@ class WorldIntelligenceService:
                 and age_days >= float(self.interest_retention_days)
                 and decayed_signal.engagement_score <= 0.24
                 and decayed_signal.salience <= 0.2
+                and decayed_signal.ongoing_interest == "peripheral"
+                and decayed_signal.co_attention_count == 0
                 and decayed_signal.engagement_state in {"uncertain", "cooling"}
             ):
                 continue
@@ -1040,8 +1118,11 @@ class WorldIntelligenceService:
         ranked = sorted(
             decayed,
             key=lambda item: (
+                self._ongoing_interest_rank(item.ongoing_interest),
                 self._engagement_state_rank(item.engagement_state),
+                self._co_attention_state_rank(item.co_attention_state),
                 item.explicit,
+                item.ongoing_interest_score,
                 item.engagement_score,
                 item.engagement_count,
                 item.salience,
@@ -1098,6 +1179,33 @@ class WorldIntelligenceService:
                     maximum=1.0,
                 )
             )
+            merged_co_attention_count = (
+                max(
+                    0,
+                    current.co_attention_count
+                    - (2 if signal.deflection_count > 0 else 1 if signal.non_reengagement_count > 0 else 0),
+                )
+                if incoming_negative
+                else max(current.co_attention_count, signal.co_attention_count)
+            )
+            merged_ongoing_interest_score = (
+                _clamp(
+                    min(current.ongoing_interest_score, signal.ongoing_interest_score, merged_score + 0.12)
+                    - 0.12
+                    - (signal.non_reengagement_count * 0.05)
+                    - (signal.deflection_count * 0.08),
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+                if incoming_negative
+                else _clamp(
+                    max(current.ongoing_interest_score, signal.ongoing_interest_score)
+                    + incoming_positive_bonus
+                    - (existing_negative_penalty * 0.55),
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+            )
             merged[key] = WorldInterestSignal(
                 signal_id=current.signal_id,
                 topic=signal.topic,
@@ -1111,6 +1219,8 @@ class WorldIntelligenceService:
                 ),
                 confidence=_clamp(max(current.confidence, signal.confidence), minimum=0.0, maximum=1.0),
                 engagement_score=merged_score,
+                ongoing_interest_score=merged_ongoing_interest_score,
+                co_attention_count=merged_co_attention_count,
                 evidence_count=current.evidence_count + signal.evidence_count,
                 engagement_count=current.engagement_count + signal.engagement_count,
                 positive_signal_count=current.positive_signal_count + signal.positive_signal_count,
@@ -1126,8 +1236,11 @@ class WorldIntelligenceService:
         ranked = sorted(
             merged.values(),
             key=lambda item: (
+                self._ongoing_interest_rank(item.ongoing_interest),
                 self._engagement_state_rank(item.engagement_state),
+                self._co_attention_state_rank(item.co_attention_state),
                 item.explicit,
+                item.ongoing_interest_score,
                 item.engagement_score,
                 item.engagement_count,
                 item.salience,
@@ -1163,6 +1276,192 @@ class WorldIntelligenceService:
         if normalized == "avoid":
             return 0
         return 2
+
+    def _ongoing_interest_rank(self, state: str | None) -> int:
+        """Map one ongoing-interest state onto a stable ranking priority."""
+
+        normalized = _clean_text(state).casefold()
+        if normalized == "active":
+            return 2
+        if normalized == "growing":
+            return 1
+        return 0
+
+    def _co_attention_state_rank(self, state: str | None) -> int:
+        """Map one co-attention state onto a stable ranking priority."""
+
+        normalized = _clean_text(state).casefold()
+        if normalized == "shared_thread":
+            return 2
+        if normalized == "forming":
+            return 1
+        return 0
+
+    def _synchronize_interest_policy_state(
+        self,
+        *,
+        state: WorldIntelligenceState,
+        subscriptions: Sequence[WorldFeedSubscription],
+        shared_evidence_subscription_ids: Sequence[str],
+    ) -> WorldIntelligenceState:
+        """Project coverage and new shared evidence back onto durable interests."""
+
+        synchronized = self._synchronize_interest_signals(
+            signals=state.interest_signals,
+            subscriptions=subscriptions,
+            awareness_threads=state.awareness_threads,
+            shared_evidence_subscription_ids=shared_evidence_subscription_ids,
+        )
+        return replace(
+            state,
+            interest_signals=synchronized,
+        )
+
+    def _synchronize_interest_signals(
+        self,
+        *,
+        signals: Sequence[WorldInterestSignal],
+        subscriptions: Sequence[WorldFeedSubscription],
+        awareness_threads: Sequence[SituationalAwarenessThread],
+        shared_evidence_subscription_ids: Sequence[str],
+    ) -> tuple[WorldInterestSignal, ...]:
+        """Fold feed coverage back into durable interest and co-attention state."""
+
+        refreshed_ids = {
+            subscription_id
+            for subscription_id in shared_evidence_subscription_ids
+            if _clean_text(subscription_id)
+        }
+        synchronized: list[WorldInterestSignal] = []
+        for signal in signals:
+            covering_subscriptions = tuple(
+                subscription
+                for subscription in subscriptions
+                if subscription.active and self._subscription_covers_interest(subscription, signal)
+            )
+            matching_thread = self._matching_awareness_thread(
+                signal=signal,
+                awareness_threads=awareness_threads,
+            )
+            has_coverage = bool(covering_subscriptions)
+            has_shared_refresh = bool(
+                matching_thread is not None
+                and any(subscription.subscription_id in refreshed_ids for subscription in covering_subscriptions)
+            )
+            co_attention_count = signal.co_attention_count
+            if signal.engagement_state in {"cooling", "avoid"} or signal.ongoing_interest == "peripheral":
+                co_attention_count = max(
+                    0,
+                    co_attention_count
+                    - (2 if signal.engagement_state == "avoid" else 1 if signal.engagement_state == "cooling" else 0),
+                )
+                if not has_coverage:
+                    co_attention_count = 0
+            else:
+                if has_coverage:
+                    co_attention_count = max(co_attention_count, 1)
+                if has_shared_refresh:
+                    co_attention_count = min(6, co_attention_count + 1)
+
+            ongoing_interest_score = signal.ongoing_interest_score
+            co_attention_score = signal.co_attention_score
+            if signal.engagement_state not in {"cooling", "avoid"}:
+                if has_coverage:
+                    ongoing_interest_score = _clamp(
+                        ongoing_interest_score + 0.04,
+                        minimum=0.0,
+                        maximum=1.0,
+                    )
+                    co_attention_score = _clamp(
+                        co_attention_score + 0.08,
+                        minimum=0.0,
+                        maximum=1.0,
+                    )
+                if has_shared_refresh:
+                    ongoing_interest_score = _clamp(
+                        ongoing_interest_score + 0.06,
+                        minimum=0.0,
+                        maximum=1.0,
+                    )
+                    co_attention_score = _clamp(
+                        co_attention_score + 0.18,
+                        minimum=0.0,
+                        maximum=1.0,
+                    )
+            else:
+                ongoing_interest_score = min(
+                    ongoing_interest_score,
+                    0.48 if signal.engagement_state == "cooling" else 0.2,
+                )
+                co_attention_score = min(
+                    co_attention_score,
+                    0.26 if signal.engagement_state == "cooling" else 0.08,
+                )
+
+            synchronized.append(
+                WorldInterestSignal(
+                    signal_id=signal.signal_id,
+                    topic=signal.topic,
+                    summary=signal.summary,
+                    region=signal.region,
+                    scope=signal.scope,
+                    salience=signal.salience,
+                    confidence=signal.confidence,
+                    engagement_score=signal.engagement_score,
+                    engagement_state=signal.engagement_state,
+                    ongoing_interest_score=ongoing_interest_score,
+                    co_attention_score=co_attention_score,
+                    co_attention_count=co_attention_count,
+                    evidence_count=signal.evidence_count,
+                    engagement_count=signal.engagement_count,
+                    positive_signal_count=signal.positive_signal_count,
+                    exposure_count=signal.exposure_count,
+                    non_reengagement_count=signal.non_reengagement_count,
+                    deflection_count=signal.deflection_count,
+                    explicit=signal.explicit,
+                    source_event_ids=signal.source_event_ids,
+                    updated_at=signal.updated_at,
+                )
+            )
+        ranked = sorted(
+            synchronized,
+            key=lambda item: (
+                self._ongoing_interest_rank(item.ongoing_interest),
+                self._engagement_state_rank(item.engagement_state),
+                self._co_attention_state_rank(item.co_attention_state),
+                item.ongoing_interest_score,
+                item.engagement_score,
+                item.salience,
+                item.updated_at or "",
+            ),
+            reverse=True,
+        )
+        return tuple(ranked[: self.max_interest_signals])
+
+    def _matching_awareness_thread(
+        self,
+        *,
+        signal: WorldInterestSignal,
+        awareness_threads: Sequence[SituationalAwarenessThread],
+    ) -> SituationalAwarenessThread | None:
+        """Return the strongest awareness thread that structurally covers one interest."""
+
+        signal_tokens = _token_set(signal.topic)
+        if not signal_tokens:
+            return None
+        ranked = sorted(
+            awareness_threads,
+            key=lambda item: (item.salience, item.update_count, item.updated_at or "", item.title),
+            reverse=True,
+        )
+        for thread in ranked:
+            if signal.region and thread.region:
+                if _clean_text(signal.region).casefold() != _clean_text(thread.region).casefold():
+                    continue
+            candidate_tokens = _token_set(thread.topic) | _token_set(thread.title)
+            if signal_tokens & candidate_tokens:
+                return thread
+        return None
 
     def _unseen_items(
         self,

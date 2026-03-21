@@ -2607,13 +2607,20 @@ class ProactiveCoordinator:
             camera_snapshot.person_visible_unknown,
             camera_snapshot.person_count,
             camera_snapshot.person_count_unknown,
+            len(camera_snapshot.visible_persons),
             camera_snapshot.primary_person_zone.value,
             _round_optional_ratio(camera_snapshot.primary_person_center_x),
             None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.state,
             None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_horizontal,
+            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_track_id,
+            _round_optional_ratio(
+                None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_center_x
+            ),
             None if publish_result is None else publish_result.action,
             None if decision is None else decision.reason,
             None if decision is None else decision.gaze.value,
+            None if decision is None else decision.cue_gaze_x,
+            None if decision is None else decision.cue_gaze_y,
             None if decision is None else decision.head_dx,
             None if decision is None else decision.speaker_locked,
         )
@@ -2634,9 +2641,16 @@ class ProactiveCoordinator:
                 "person_visible_unknown": camera_snapshot.person_visible_unknown,
                 "camera_person_count": camera_snapshot.person_count,
                 "camera_person_count_unknown": camera_snapshot.person_count_unknown,
+                "camera_visible_person_count": len(camera_snapshot.visible_persons),
+                "camera_visible_persons_unknown": camera_snapshot.visible_persons_unknown,
                 "camera_primary_person_zone": camera_snapshot.primary_person_zone.value,
                 "camera_primary_person_center_x": _round_optional_ratio(camera_snapshot.primary_person_center_x),
                 "camera_primary_person_center_y": _round_optional_ratio(camera_snapshot.primary_person_center_y),
+                "camera_frame_age_s": _round_optional_seconds(
+                    None
+                    if camera_snapshot.last_camera_frame_at is None
+                    else max(0.0, observed_at - float(camera_snapshot.last_camera_frame_at))
+                ),
                 "attention_target_state": (
                     None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.state
                 ),
@@ -2646,6 +2660,15 @@ class ProactiveCoordinator:
                 "attention_target_horizontal": (
                     None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_horizontal
                 ),
+                "attention_target_track_id": (
+                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_track_id
+                ),
+                "attention_target_center_x": _round_optional_ratio(
+                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_center_x
+                ),
+                "attention_target_velocity_x": _round_optional_ratio(
+                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_velocity_x
+                ),
                 "attention_target_focus_source": (
                     None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.focus_source
                 ),
@@ -2653,6 +2676,8 @@ class ProactiveCoordinator:
                 "publish_owner": None if publish_result is None else publish_result.owner,
                 "decision_reason": None if decision is None else decision.reason,
                 "decision_gaze": None if decision is None else decision.gaze.value,
+                "decision_cue_gaze_x": None if decision is None else decision.cue_gaze_x,
+                "decision_cue_gaze_y": None if decision is None else decision.cue_gaze_y,
                 "decision_head_dx": None if decision is None else decision.head_dx,
                 "decision_head_dy": None if decision is None else decision.head_dy,
                 "decision_speaker_locked": None if decision is None else decision.speaker_locked,

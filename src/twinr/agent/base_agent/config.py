@@ -498,6 +498,8 @@ class TwinrConfig:
     proactive_local_camera_primary_person_upper_body_ratio: float = 0.78
     proactive_local_camera_wrist_roi_scale: float = 0.34
     proactive_local_camera_fine_hand_explicit_hold_s: float = 0.45
+    proactive_local_camera_fine_hand_explicit_confirm_samples: int = 1
+    proactive_local_camera_fine_hand_explicit_min_confidence: float = 0.72
     proactive_poll_interval_s: float = 4.0
     proactive_capture_interval_s: float = 6.0
     proactive_motion_window_s: float = 20.0
@@ -711,7 +713,7 @@ class TwinrConfig:
     display_full_refresh_interval: int = 0
     display_busy_timeout_s: float = 20.0
     display_runtime_trace_enabled: bool = False
-    display_poll_interval_s: float = 0.5
+    display_poll_interval_s: float = 0.12
     display_layout: str = "default"
     display_news_ticker_enabled: bool = False
     display_news_ticker_feed_urls: tuple[str, ...] = ()
@@ -1641,6 +1643,13 @@ class TwinrConfig:
             proactive_local_camera_fine_hand_explicit_hold_s=_parse_float(
                 get_value("TWINR_PROACTIVE_LOCAL_CAMERA_FINE_HAND_EXPLICIT_HOLD_S"),
                 0.45,
+            ),
+            proactive_local_camera_fine_hand_explicit_confirm_samples=int(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_FINE_HAND_EXPLICIT_CONFIRM_SAMPLES", "1") or "1"
+            ),
+            proactive_local_camera_fine_hand_explicit_min_confidence=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_FINE_HAND_EXPLICIT_MIN_CONFIDENCE"),
+                0.72,
             ),
             proactive_poll_interval_s=_parse_float(get_value("TWINR_PROACTIVE_POLL_INTERVAL_S"), 4.0),
             proactive_capture_interval_s=_parse_float(get_value("TWINR_PROACTIVE_CAPTURE_INTERVAL_S"), 6.0),

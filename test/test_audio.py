@@ -7,6 +7,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from twinr.hardware.audio_env import build_audio_subprocess_env
 from twinr.hardware.audio import (
     AmbientAudioSampler,
     AudioCaptureReadinessError,
@@ -90,6 +91,69 @@ class DynamicPauseThresholdTests(unittest.TestCase):
         )
 
         self.assertEqual((pause_ms, pause_grace_ms), (880, 230))
+
+
+class AudioEnvTests(unittest.TestCase):
+    def test_build_audio_subprocess_env_strips_display_vars_and_mismatched_session_audio(self) -> None:
+        base_env = {
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            "PULSE_SERVER": "unix:/run/user/1000/pulse/native",
+            "WAYLAND_DISPLAY": "wayland-0",
+            "QT_QPA_PLATFORM": "wayland",
+            "SDL_VIDEODRIVER": "wayland",
+            "KEEP_ME": "1",
+        }
+        with (
+            mock.patch("twinr.hardware.audio_env.os.getuid", return_value=0),
+            mock.patch("twinr.hardware.audio_env.runtime_dir_owner_uid", return_value=1000),
+        ):
+            env = build_audio_subprocess_env(base_env)
+
+        self.assertNotIn("XDG_RUNTIME_DIR", env)
+        self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", env)
+        self.assertNotIn("PULSE_SERVER", env)
+        self.assertNotIn("WAYLAND_DISPLAY", env)
+        self.assertNotIn("QT_QPA_PLATFORM", env)
+        self.assertNotIn("SDL_VIDEODRIVER", env)
+        self.assertEqual(env["KEEP_ME"], "1")
+
+    def test_build_audio_subprocess_env_keeps_same_owner_session_audio(self) -> None:
+        base_env = {
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            "PULSE_SERVER": "unix:/run/user/1000/pulse/native",
+            "WAYLAND_DISPLAY": "wayland-0",
+            "KEEP_ME": "1",
+        }
+        with (
+            mock.patch("twinr.hardware.audio_env.os.getuid", return_value=1000),
+            mock.patch("twinr.hardware.audio_env.runtime_dir_owner_uid", return_value=1000),
+        ):
+            env = build_audio_subprocess_env(base_env)
+
+        self.assertEqual(env["XDG_RUNTIME_DIR"], "/run/user/1000")
+        self.assertEqual(env["DBUS_SESSION_BUS_ADDRESS"], "unix:path=/run/user/1000/bus")
+        self.assertEqual(env["PULSE_SERVER"], "unix:/run/user/1000/pulse/native")
+        self.assertNotIn("WAYLAND_DISPLAY", env)
+        self.assertEqual(env["KEEP_ME"], "1")
+
+    def test_spawn_audio_process_uses_sanitized_env(self) -> None:
+        fake_process = _FakeCaptureProcess()
+        with (
+            mock.patch("twinr.hardware.audio.build_audio_subprocess_env", return_value={"KEEP_ME": "1"}) as env_builder,
+            mock.patch("twinr.hardware.audio.subprocess.Popen", return_value=fake_process) as popen,
+        ):
+            process = __import__("twinr.hardware.audio", fromlist=["_spawn_audio_process"])._spawn_audio_process(
+                ["arecord", "-D", "default"],
+                stdout=-1,
+                stderr=-1,
+                purpose="Audio capture",
+            )
+
+        self.assertIs(process, fake_process)
+        env_builder.assert_called_once_with()
+        self.assertEqual(popen.call_args.kwargs["env"], {"KEEP_ME": "1"})
 
 
 class _FakePlaybackProcess:

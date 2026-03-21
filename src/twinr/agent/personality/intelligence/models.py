@@ -27,6 +27,8 @@ _ALLOWED_WORLD_ACTIONS = frozenset(
 )
 _ALLOWED_WORLD_SCOPES = frozenset({"local", "regional", "national", "global", "topic"})
 _ALLOWED_ENGAGEMENT_STATES = frozenset({"resonant", "warm", "uncertain", "cooling", "avoid"})
+_ALLOWED_ONGOING_INTEREST_STATES = frozenset({"active", "growing", "peripheral"})
+_ALLOWED_CO_ATTENTION_STATES = frozenset({"latent", "forming", "shared_thread"})
 
 
 def _clean_text(value: object | None) -> str:
@@ -189,6 +191,138 @@ def _derive_engagement_state(
     if engagement_score >= 0.62 or engagement_count >= 2 or positive_signal_count >= 1 or explicit:
         return "warm"
     return "uncertain"
+
+
+def _derive_ongoing_interest_score(
+    *,
+    salience: float,
+    engagement_score: float,
+    engagement_state: str | None,
+    engagement_count: int,
+    positive_signal_count: int,
+    non_reengagement_count: int,
+    deflection_count: int,
+    explicit: bool,
+) -> float:
+    """Summarize whether one topic keeps feeling worth following over time."""
+
+    normalized_state = _clean_text(engagement_state).casefold()
+    positive_pull = (
+        (engagement_score * 0.7)
+        + (salience * 0.18)
+        + (min(max(positive_signal_count, 0), 4) * 0.04)
+        + (min(max(engagement_count, 0), 5) * 0.03)
+    )
+    if explicit and positive_signal_count > 0 and deflection_count == 0:
+        positive_pull = max(positive_pull, 0.76)
+    penalty = (non_reengagement_count * 0.11) + (deflection_count * 0.18)
+    if normalized_state == "cooling":
+        penalty += 0.18
+    elif normalized_state == "avoid":
+        penalty += 0.38
+    return _normalize_float(
+        positive_pull - penalty,
+        field_name="ongoing_interest_score",
+        default=0.5,
+    )
+
+
+def _derive_ongoing_interest_state(
+    *,
+    ongoing_interest_score: float,
+    engagement_state: str | None,
+    engagement_count: int,
+    positive_signal_count: int,
+    non_reengagement_count: int,
+    deflection_count: int,
+) -> str:
+    """Classify how alive one topic currently feels in Twinr's attention."""
+
+    normalized_state = _clean_text(engagement_state).casefold()
+    if normalized_state == "avoid" or deflection_count >= 1:
+        return "peripheral"
+    if normalized_state == "cooling" and (non_reengagement_count >= 1 or ongoing_interest_score < 0.62):
+        return "peripheral"
+    if (
+        normalized_state == "uncertain"
+        and positive_signal_count == 0
+        and engagement_count <= 1
+        and ongoing_interest_score < 0.68
+    ):
+        return "peripheral"
+    if (
+        ongoing_interest_score >= 0.84
+        or (normalized_state == "resonant" and positive_signal_count >= 2)
+        or engagement_count >= 5
+    ):
+        return "active"
+    if (
+        ongoing_interest_score >= 0.58
+        or normalized_state in {"warm", "resonant"}
+        or positive_signal_count >= 1
+        or engagement_count >= 2
+    ):
+        return "growing"
+    return "peripheral"
+
+
+def _derive_co_attention_score(
+    *,
+    ongoing_interest_score: float,
+    ongoing_interest: str,
+    engagement_state: str | None,
+    co_attention_count: int,
+    non_reengagement_count: int,
+    deflection_count: int,
+) -> float:
+    """Summarize whether a topic has become a shared ongoing thread."""
+
+    normalized_state = _clean_text(engagement_state).casefold()
+    base = (ongoing_interest_score * 0.66) + (min(max(co_attention_count, 0), 4) * 0.12)
+    if ongoing_interest == "active":
+        base += 0.12
+    elif ongoing_interest == "growing":
+        base += 0.05
+    penalty = (non_reengagement_count * 0.05) + (deflection_count * 0.12)
+    if normalized_state == "cooling":
+        penalty += 0.18
+    elif normalized_state == "avoid":
+        penalty += 0.36
+    return _normalize_float(
+        base - penalty,
+        field_name="co_attention_score",
+        default=0.0,
+    )
+
+
+def _derive_co_attention_state(
+    *,
+    co_attention_score: float,
+    co_attention_count: int,
+    ongoing_interest: str,
+    engagement_state: str | None,
+) -> str:
+    """Classify whether Twinr and the user now share an ongoing thread."""
+
+    normalized_state = _clean_text(engagement_state).casefold()
+    if normalized_state == "avoid":
+        return "latent"
+    if (
+        co_attention_count >= 2
+        and ongoing_interest == "active"
+        and normalized_state not in {"cooling", "avoid"}
+        and co_attention_score >= 0.78
+    ):
+        return "shared_thread"
+    if co_attention_score >= 0.86 and ongoing_interest != "peripheral":
+        return "shared_thread"
+    if (
+        co_attention_count >= 1
+        and ongoing_interest in {"active", "growing"}
+        and normalized_state not in {"cooling", "avoid"}
+    ):
+        return "forming"
+    return "latent"
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +536,15 @@ class WorldInterestSignal:
     - ``uncertain`` means Twinr should stay lightweight and observant
     - ``cooling`` means repeated exposure is not turning into renewed uptake
     - ``avoid`` means Twinr should actively back off
+
+    Two slower derivative layers make the policy reusable across prompting and
+    RSS calibration:
+
+    - ``ongoing_interest`` says whether the topic currently feels active,
+      growing, or merely peripheral in Twinr's continuing attention
+    - ``co_attention`` says whether the topic is still latent, is becoming a
+      shared thread, or has become a durable shared running topic between the
+      user and Twinr's world-intelligence layer
     """
 
     signal_id: str
@@ -413,6 +556,11 @@ class WorldInterestSignal:
     confidence: float = 0.5
     engagement_score: float = 0.5
     engagement_state: str | None = None
+    ongoing_interest_score: float | None = None
+    ongoing_interest: str | None = None
+    co_attention_score: float | None = None
+    co_attention_state: str | None = None
+    co_attention_count: int = 0
     evidence_count: int = 1
     engagement_count: int = 1
     positive_signal_count: int = 1
@@ -493,6 +641,84 @@ class WorldInterestSignal:
                 explicit=self.explicit,
             )
         object.__setattr__(self, "engagement_state", normalized_state)
+        derived_ongoing_interest_score = _derive_ongoing_interest_score(
+            salience=self.salience,
+            engagement_score=self.engagement_score,
+            engagement_state=normalized_state,
+            engagement_count=self.engagement_count,
+            positive_signal_count=self.positive_signal_count,
+            non_reengagement_count=self.non_reengagement_count,
+            deflection_count=self.deflection_count,
+            explicit=self.explicit,
+        )
+        object.__setattr__(
+            self,
+            "ongoing_interest_score",
+            _normalize_float(
+                derived_ongoing_interest_score if self.ongoing_interest_score is None else self.ongoing_interest_score,
+                field_name="ongoing_interest_score",
+                default=derived_ongoing_interest_score,
+            ),
+        )
+        normalized_ongoing_interest = _optional_text(self.ongoing_interest)
+        if normalized_ongoing_interest is not None:
+            normalized_ongoing_interest = normalized_ongoing_interest.casefold()
+            if normalized_ongoing_interest not in _ALLOWED_ONGOING_INTEREST_STATES:
+                raise ValueError(
+                    f"ongoing_interest must be one of {sorted(_ALLOWED_ONGOING_INTEREST_STATES)}."
+                )
+        else:
+            normalized_ongoing_interest = _derive_ongoing_interest_state(
+                ongoing_interest_score=self.ongoing_interest_score,
+                engagement_state=normalized_state,
+                engagement_count=self.engagement_count,
+                positive_signal_count=self.positive_signal_count,
+                non_reengagement_count=self.non_reengagement_count,
+                deflection_count=self.deflection_count,
+            )
+        object.__setattr__(self, "ongoing_interest", normalized_ongoing_interest)
+        object.__setattr__(
+            self,
+            "co_attention_count",
+            _normalize_int(
+                self.co_attention_count,
+                field_name="co_attention_count",
+                default=0,
+                minimum=0,
+            ),
+        )
+        derived_co_attention_score = _derive_co_attention_score(
+            ongoing_interest_score=self.ongoing_interest_score,
+            ongoing_interest=self.ongoing_interest,
+            engagement_state=normalized_state,
+            co_attention_count=self.co_attention_count,
+            non_reengagement_count=self.non_reengagement_count,
+            deflection_count=self.deflection_count,
+        )
+        object.__setattr__(
+            self,
+            "co_attention_score",
+            _normalize_float(
+                derived_co_attention_score if self.co_attention_score is None else self.co_attention_score,
+                field_name="co_attention_score",
+                default=derived_co_attention_score,
+            ),
+        )
+        normalized_co_attention_state = _optional_text(self.co_attention_state)
+        if normalized_co_attention_state is not None:
+            normalized_co_attention_state = normalized_co_attention_state.casefold()
+            if normalized_co_attention_state not in _ALLOWED_CO_ATTENTION_STATES:
+                raise ValueError(
+                    f"co_attention_state must be one of {sorted(_ALLOWED_CO_ATTENTION_STATES)}."
+                )
+        else:
+            normalized_co_attention_state = _derive_co_attention_state(
+                co_attention_score=self.co_attention_score,
+                co_attention_count=self.co_attention_count,
+                ongoing_interest=self.ongoing_interest,
+                engagement_state=normalized_state,
+            )
+        object.__setattr__(self, "co_attention_state", normalized_co_attention_state)
         object.__setattr__(
             self,
             "source_event_ids",
@@ -512,6 +738,11 @@ class WorldInterestSignal:
             "confidence": self.confidence,
             "engagement_score": self.engagement_score,
             "engagement_state": self.engagement_state,
+            "ongoing_interest_score": self.ongoing_interest_score,
+            "ongoing_interest": self.ongoing_interest,
+            "co_attention_score": self.co_attention_score,
+            "co_attention_state": self.co_attention_state,
+            "co_attention_count": self.co_attention_count,
             "evidence_count": self.evidence_count,
             "engagement_count": self.engagement_count,
             "positive_signal_count": self.positive_signal_count,
@@ -570,6 +801,11 @@ class WorldInterestSignal:
             confidence=payload.get("confidence"),
             engagement_score=engagement_score,
             engagement_state=payload.get("engagement_state"),
+            ongoing_interest_score=payload.get("ongoing_interest_score"),
+            ongoing_interest=payload.get("ongoing_interest"),
+            co_attention_score=payload.get("co_attention_score"),
+            co_attention_state=payload.get("co_attention_state"),
+            co_attention_count=payload.get("co_attention_count", 0),
             evidence_count=payload.get("evidence_count"),
             engagement_count=engagement_count,
             positive_signal_count=positive_signal_count,

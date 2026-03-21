@@ -35,6 +35,17 @@ CUSTOM_FINE_GESTURE_MAP: Final[dict[str, AICameraFineHandGesture]] = {
     "flip_off": AICameraFineHandGesture.MIDDLE_FINGER,
 }
 
+_NEGATIVE_FINE_GESTURE_LABELS: Final[frozenset[str]] = frozenset(
+    {
+        "none",
+        "no_gesture",
+        "no_hand_gesture",
+        "background",
+        "other",
+        "unknown",
+    }
+)
+
 
 def _safe_ratio(value: object, *, default: float = 0.0) -> float:
     """Clamp one ratio-like value to one finite float within [0.0, 1.0]."""
@@ -77,6 +88,7 @@ def resolve_fine_hand_gesture(
     )  # AUDIT-FIX(#1): Treat malformed or non-iterable recognizer payloads as "no gesture" instead of crashing.
     best_gesture = AICameraFineHandGesture.NONE
     best_score = 0.0
+    best_negative_score = 0.0
     for gesture_set in gestures:
         for category in _safe_iterable(
             gesture_set
@@ -84,19 +96,21 @@ def resolve_fine_hand_gesture(
             label = normalize_category_name(getattr(category, "category_name", None))
             if not label:
                 continue
-            mapped = category_map.get(label)
-            if mapped is None:
-                continue
             score = _safe_ratio(
                 getattr(category, "score", 0.0),
                 default=0.0,
             )  # AUDIT-FIX(#2): Reject non-finite and out-of-range classifier scores deterministically.
+            if label in _NEGATIVE_FINE_GESTURE_LABELS and score > best_negative_score:
+                best_negative_score = score
+            mapped = category_map.get(label)
+            if mapped is None:
+                continue
             if score < min_score or score <= best_score:
                 continue
             best_gesture = mapped
             best_score = score
-    if best_gesture == AICameraFineHandGesture.NONE:
-        return best_gesture, None
+    if best_gesture == AICameraFineHandGesture.NONE or best_negative_score >= best_score:
+        return AICameraFineHandGesture.NONE, None
     return best_gesture, round(best_score, 3)
 
 

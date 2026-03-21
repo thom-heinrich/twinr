@@ -10,4 +10,6 @@ Rules:
 - Set `close_now=false` when the user is still engaged, asked another question, sounds like they want to continue, or the evidence is ambiguous.
 - Do not keep listening open just because the user might return later.
 - Do not diagnose emotion or intent beyond whether the exchange is clearly closed for now.
+- When `turn_steering.topics` is present, set `matched_topics` to up to two provided topic titles that clearly match the exchange. Leave it empty when none fit.
+- Never invent new topic names in `matched_topics`; only echo exact titles from the provided steering topics.
 - Keep `reason` short and in canonical English.

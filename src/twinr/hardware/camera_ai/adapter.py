@@ -13,6 +13,7 @@ from twinr.agent.base_agent.config import TwinrConfig
 
 from .config import AICameraAdapterConfig, MediaPipeVisionConfig
 from .detection import DetectionResult, capture_detection
+from .face_anchors import OpenCVFaceAnchorDetector, merge_detection_with_face_anchors
 from .imx500_runtime import IMX500RuntimeSessionManager
 from .mediapipe_pipeline import MediaPipeVisionPipeline
 from .models import (
@@ -55,6 +56,7 @@ class LocalAICameraAdapter:
         self,
         *,
         config: AICameraAdapterConfig | None = None,
+        face_anchor_detector: object | None = None,
         clock: Any = time.time,
         sleep_fn: Any = time.sleep,
         monotonic_clock: Any = time.monotonic,
@@ -82,12 +84,16 @@ class LocalAICameraAdapter:
         self._last_motion_monotonic: float | None = None  # AUDIT-FIX(#4): Motion deltas must use monotonic time.
         self._last_motion_state = AICameraMotionState.UNKNOWN
         self._last_motion_confidence: float | None = None
+        self._face_anchor_detector = face_anchor_detector
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LocalAICameraAdapter":
         """Build one adapter directly from ``TwinrConfig``."""
 
-        return cls(config=AICameraAdapterConfig.from_config(config))
+        return cls(
+            config=AICameraAdapterConfig.from_config(config),
+            face_anchor_detector=OpenCVFaceAnchorDetector.from_runtime_config(config),
+        )
 
     def close(self) -> None:
         """Close any active Picamera2 and MediaPipe sessions."""
@@ -143,11 +149,25 @@ class LocalAICameraAdapter:
                 )
 
             detection = self._capture_detection(runtime, observed_at=observed_at)
+            detection = self._coerce_detection_result(detection)
+            frame_rgb = None
+            frame_error = None
+            if self._needs_rgb_frame_for_observation(detection=detection):
+                frame_rgb, frame_error = self._capture_optional_rgb_frame(
+                    runtime,
+                    observed_at=observed_at,
+                )
             pose_result, pose_error = self._resolve_pose(
                 runtime,
                 observed_at=observed_at,
                 observed_monotonic=observed_monotonic,
                 detection=detection,
+                frame_rgb=frame_rgb,
+                frame_error=frame_error,
+            )
+            detection = self._supplement_visible_persons(
+                detection=detection,
+                frame_rgb=frame_rgb,
             )
             observation = self._compose_observation(
                 observed_at=observed_at,
@@ -186,6 +206,8 @@ class LocalAICameraAdapter:
         observed_at: float,
         observed_monotonic: float,
         detection: DetectionResult,
+        frame_rgb: Any | None,
+        frame_error: str | None,
     ) -> tuple[PoseResult | None, str | None]:
         """Return one fresh or cached pose result for the current detection frame."""
 
@@ -200,6 +222,8 @@ class LocalAICameraAdapter:
                 observed_at=observed_at,
                 observed_monotonic=observed_monotonic,
                 detection=detection,
+                frame_rgb=frame_rgb,
+                frame_error=frame_error,
             )
         if not self.config.pose_network_path:
             self._clear_pose_cache()  # AUDIT-FIX(#3): Disable stale pose reuse when pose inference is unavailable.
@@ -249,6 +273,8 @@ class LocalAICameraAdapter:
         observed_at: float,
         observed_monotonic: float,
         detection: DetectionResult,
+        frame_rgb: Any | None,
+        frame_error: str | None,
     ) -> tuple[PoseResult | None, str | None]:
         """Run the Pi-side MediaPipe pose and gesture path on the RGB preview frame."""
 
@@ -256,8 +282,13 @@ class LocalAICameraAdapter:
             self._safe_reset_mediapipe_temporal_state_locked()  # AUDIT-FIX(#9): Missing primary boxes should reset temporal state without crashing.
             self._clear_pose_cache()  # AUDIT-FIX(#3): Prevent stale pose reuse when the tracked box disappears.
             return None, None
+        if frame_error is not None:
+            self._safe_close_mediapipe_pipeline_locked()
+            self._clear_pose_cache()
+            return None, frame_error
         try:
-            frame_rgb = self._capture_rgb_frame(runtime, observed_at=observed_at)
+            if frame_rgb is None:
+                frame_rgb = self._capture_rgb_frame(runtime, observed_at=observed_at)
             pipeline = self._ensure_mediapipe_pipeline()
             result = pipeline.analyze(
                 frame_rgb=frame_rgb,
@@ -502,6 +533,7 @@ class LocalAICameraAdapter:
             person_count=detection.person_count,
             primary_person_box=primary_person_box,
             primary_person_zone=primary_person_zone,
+            visible_persons=detection.visible_persons,
             looking_toward_device=looking_toward_device,
             person_near_device=person_near_device,
             engaged_with_device=engaged_with_device,
@@ -519,6 +551,65 @@ class LocalAICameraAdapter:
             objects=detection.objects,
             model=("local-imx500+mediapipe" if self.config.pose_backend == "mediapipe" else "local-imx500"),
         )
+
+    def _coerce_detection_result(self, detection: Any) -> DetectionResult:
+        """Normalize foreign detection stubs into the stable detection contract."""
+
+        if isinstance(detection, DetectionResult):
+            return detection
+        return DetectionResult(
+            person_count=getattr(detection, "person_count", 0),
+            primary_person_box=getattr(detection, "primary_person_box", None),
+            primary_person_zone=getattr(detection, "primary_person_zone", AICameraZone.UNKNOWN),
+            visible_persons=tuple(getattr(detection, "visible_persons", ()) or ()),
+            person_near_device=getattr(detection, "person_near_device", None),
+            hand_or_object_near_camera=bool(getattr(detection, "hand_or_object_near_camera", False)),
+            objects=tuple(getattr(detection, "objects", ()) or ()),
+        )
+
+    def _needs_rgb_frame_for_observation(self, *, detection: DetectionResult) -> bool:
+        """Return whether this observation needs a preview RGB frame."""
+
+        if self.config.pose_backend == "mediapipe" and detection.person_count > 0:
+            return True
+        return self._face_anchor_detector is not None and detection.person_count < 2
+
+    def _capture_optional_rgb_frame(
+        self,
+        runtime: dict[str, Any],
+        *,
+        observed_at: float,
+    ) -> tuple[Any | None, str | None]:
+        """Capture one RGB frame without promoting preview failures to full camera failure."""
+
+        try:
+            return self._capture_rgb_frame(runtime, observed_at=observed_at), None
+        except Exception as exc:
+            code = self._classify_error(exc)
+            logger.warning("Local AI camera RGB preview capture failed with %s.", code)
+            logger.debug("Local AI camera RGB preview exception details.", exc_info=True)
+            return None, code
+
+    def _supplement_visible_persons(
+        self,
+        *,
+        detection: DetectionResult,
+        frame_rgb: Any | None,
+    ) -> DetectionResult:
+        """Add bounded supplemental face anchors when SSD saw fewer than two people."""
+
+        if self._face_anchor_detector is None or frame_rgb is None or detection.person_count >= 2:
+            return detection
+        try:
+            face_result = self._face_anchor_detector.detect(frame_rgb)
+            return merge_detection_with_face_anchors(
+                detection=detection,
+                face_anchors=face_result,
+            )
+        except Exception:
+            logger.warning("Local AI camera supplemental face-anchor detection failed.")
+            logger.debug("Local AI camera face-anchor exception details.", exc_info=True)
+            return detection
 
     def _health_only_observation(
         self,
@@ -572,6 +663,7 @@ class LocalAICameraAdapter:
             person_count=observation.person_count,
             primary_person_box=observation.primary_person_box,
             primary_person_zone=observation.primary_person_zone,
+            visible_persons=observation.visible_persons,
             looking_toward_device=observation.looking_toward_device,
             person_near_device=observation.person_near_device,
             engaged_with_device=observation.engaged_with_device,

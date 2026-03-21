@@ -280,6 +280,9 @@ def _build_respeaker_audio_snapshot(
     ambient_classification = classify_respeaker_ambient_audio(
         signal_snapshot=signal_snapshot,
         sample=None if fallback_snapshot is None else fallback_snapshot.sample,
+        pcm_bytes=None if fallback_snapshot is None else fallback_snapshot.pcm_bytes,
+        sample_rate=None if fallback_snapshot is None else fallback_snapshot.sample_rate,
+        channels=None if fallback_snapshot is None else fallback_snapshot.channels,
     )
     room_quiet = signal_snapshot.room_quiet
     if ambient_classification.non_speech_audio_likely is True:

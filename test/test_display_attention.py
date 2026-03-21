@@ -27,7 +27,7 @@ class DisplayAttentionCueTests(unittest.TestCase):
                 "camera": {
                     "person_visible": True,
                     "primary_person_center_x": 0.12,
-                    "primary_person_center_y": 0.12,
+                    "primary_person_center_y": 0.5,
                     "looking_toward_device": True,
                 },
                 "vad": {
@@ -41,6 +41,47 @@ class DisplayAttentionCueTests(unittest.TestCase):
         self.assertEqual(decision.gaze, DisplayFaceGazeDirection.RIGHT)
         self.assertLess(decision.hold_seconds, 6.0)
         self.assertEqual(decision.head_dx, 2)
+
+    def test_derives_diagonal_upward_gaze_when_person_is_above_camera_level(self) -> None:
+        decision = derive_display_attention_cue(
+            config=TwinrConfig(proactive_capture_interval_s=6.0, display_attention_refresh_interval_s=0.6),
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "primary_person_center_x": 0.12,
+                    "primary_person_center_y": 0.18,
+                    "looking_toward_device": True,
+                },
+                "vad": {
+                    "speech_detected": False,
+                },
+            },
+        )
+
+        self.assertTrue(decision.active)
+        self.assertEqual(decision.gaze, DisplayFaceGazeDirection.UP_RIGHT)
+        self.assertLess(decision.cue_gaze_y, 0)
+        self.assertLess(decision.head_dy, 0)
+
+    def test_derives_downward_gaze_when_person_is_below_camera_level(self) -> None:
+        decision = derive_display_attention_cue(
+            config=TwinrConfig(proactive_capture_interval_s=6.0, display_attention_refresh_interval_s=0.6),
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "primary_person_center_x": 0.50,
+                    "primary_person_center_y": 0.84,
+                },
+                "vad": {
+                    "speech_detected": False,
+                },
+            },
+        )
+
+        self.assertTrue(decision.active)
+        self.assertEqual(decision.gaze, DisplayFaceGazeDirection.DOWN)
+        self.assertGreater(decision.cue_gaze_y, 0)
+        self.assertGreater(decision.head_dy, 0)
 
     def test_derives_subtle_head_turn_before_full_side_gaze(self) -> None:
         decision = derive_display_attention_cue(
@@ -59,9 +100,10 @@ class DisplayAttentionCueTests(unittest.TestCase):
 
         self.assertTrue(decision.active)
         self.assertEqual(decision.gaze, DisplayFaceGazeDirection.CENTER)
+        self.assertEqual(decision.cue_gaze_x, 1)
         self.assertEqual(decision.head_dx, 1)
 
-    def test_committed_side_gaze_keeps_strong_stable_head_turn(self) -> None:
+    def test_committed_side_gaze_uses_small_same_side_step_before_full_edge_lock(self) -> None:
         decision = derive_display_attention_cue(
             config=TwinrConfig(proactive_capture_interval_s=6.0, display_attention_refresh_interval_s=0.6),
             live_facts={
@@ -78,7 +120,8 @@ class DisplayAttentionCueTests(unittest.TestCase):
 
         self.assertTrue(decision.active)
         self.assertEqual(decision.gaze, DisplayFaceGazeDirection.RIGHT)
-        self.assertEqual(decision.head_dx, 2)
+        self.assertEqual(decision.cue_gaze_x, 1)
+        self.assertEqual(decision.head_dx, 1)
 
     def test_derives_speaking_mouth_when_visible_person_is_current_speaker(self) -> None:
         decision = derive_display_attention_cue(
@@ -113,7 +156,7 @@ class DisplayAttentionCueTests(unittest.TestCase):
                     "state": "holding_session_focus",
                     "active": True,
                     "target_horizontal": "left",
-                    "target_vertical": "up",
+                    "target_vertical": "center",
                     "focus_source": "speaker_association",
                     "session_focus_active": True,
                     "speaker_locked": False,
@@ -127,6 +170,32 @@ class DisplayAttentionCueTests(unittest.TestCase):
         self.assertEqual(decision.reason, "holding_session_focus")
         self.assertEqual(decision.gaze, DisplayFaceGazeDirection.RIGHT)
         self.assertEqual(decision.expression().brows, "soft")
+
+    def test_ignores_serialized_attention_target_when_camera_is_explicitly_unavailable(self) -> None:
+        decision = derive_display_attention_cue(
+            config=TwinrConfig(proactive_capture_interval_s=1.0),
+            live_facts={
+                "camera": {
+                    "person_visible": False,
+                    "camera_online": False,
+                    "camera_ready": False,
+                },
+                "attention_target": {
+                    "state": "holding_session_focus",
+                    "active": True,
+                    "target_horizontal": "left",
+                    "target_vertical": "up",
+                    "focus_source": "speaker_association",
+                    "session_focus_active": True,
+                    "speaker_locked": False,
+                    "showing_intent_active": False,
+                    "confidence": 0.81,
+                },
+            },
+        )
+
+        self.assertFalse(decision.active)
+        self.assertEqual(decision.reason, "no_visible_person")
 
     def test_publisher_does_not_overwrite_active_foreign_cue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -343,13 +412,14 @@ class DisplayAttentionCueTests(unittest.TestCase):
             )
             held = publisher.store.load_active(now=datetime(2026, 3, 20, 8, 4, 3, 1000, tzinfo=timezone.utc))
 
-        self.assertTrue(held_result.decision.reason.endswith("held_direction"))
-        self.assertEqual(held_result.decision.gaze, DisplayFaceGazeDirection.RIGHT)
+        self.assertFalse(held_result.decision.reason.endswith("held_direction"))
+        self.assertEqual(held_result.decision.gaze, DisplayFaceGazeDirection.CENTER)
+        self.assertEqual(held_result.decision.cue_gaze_x, 1)
         self.assertIsNotNone(held)
         assert held is not None
-        self.assertEqual(held.gaze_x, 2)
+        self.assertEqual(held.gaze_x, 1)
 
-    def test_publisher_keeps_same_side_gaze_unchanged_when_anchor_moves_within_side(self) -> None:
+    def test_publisher_updates_same_side_gaze_when_anchor_moves_closer_to_center(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 project_root=temp_dir,
@@ -387,7 +457,8 @@ class DisplayAttentionCueTests(unittest.TestCase):
             )
 
         self.assertEqual(first_result.action, "updated")
-        self.assertEqual(same_side_result.action, "unchanged")
+        self.assertEqual(same_side_result.action, "updated")
+        self.assertEqual(same_side_result.decision.cue_gaze_x, 1)
 
     def test_publisher_holds_recent_cue_across_brief_visual_dropout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

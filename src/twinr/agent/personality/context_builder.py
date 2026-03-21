@@ -20,10 +20,12 @@ from twinr.agent.personality.models import (
     PersonalitySnapshot,
     PersonalityTrait,
 )
+from twinr.agent.personality.positive_engagement import render_positive_engagement_policy
 from twinr.agent.personality.self_expression import (
     render_mindshare_block,
     render_self_expression_policy,
 )
+from twinr.agent.personality.steering import render_turn_steering_policy
 
 _LEGACY_PRIORITY_ORDER = ("SYSTEM", "PERSONALITY", "USER")
 
@@ -231,6 +233,14 @@ class PersonalityContextBuilder:
             _render_trait_lines(snapshot.core_traits) if snapshot else None,
             _render_style_block(snapshot.style_profile) if snapshot else None,
             _render_humor_block(snapshot.humor_profile) if snapshot else None,
+            render_turn_steering_policy(
+                snapshot,
+                engagement_signals=engagement_signals,
+            ),
+            render_positive_engagement_policy(
+                snapshot,
+                engagement_signals=engagement_signals,
+            ),
             render_self_expression_policy(
                 snapshot,
                 engagement_signals=engagement_signals,

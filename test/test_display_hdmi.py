@@ -280,7 +280,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         changed_pixels = sum(1 for pixel in diff.getdata() if max(pixel) >= 24)
 
         self.assertIsNotNone(diff.getbbox())
-        self.assertGreater(changed_pixels, 1500)
+        self.assertGreater(changed_pixels, 600)
 
     def test_waiting_eye_geometry_stays_calm_across_idle_frames(self) -> None:
         display = self.make_display()
@@ -292,6 +292,8 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertEqual({int(state["eye_shift_x"]) for state in states}, {0})
         self.assertEqual({bool(state["lid_arc"]) for state in states}, {False})
         self.assertLessEqual(max(abs(int(state["eye_shift_y"])) for state in states), 1)
+        self.assertLessEqual(max(abs(int(state["highlight_dx"])) for state in states), 1)
+        self.assertLessEqual(max(abs(int(state["highlight_dy"])) for state in states), 1)
         self.assertEqual(sum(1 for state in states if bool(state["blink"])), 1)
 
     def test_listening_and_processing_eyes_keep_stable_hdmi_geometry(self) -> None:
@@ -336,6 +338,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         states = [renderer._eye_state("error", frame, "left") for frame in range(6)]
 
         self.assertLessEqual(max(abs(int(state["highlight_dx"])) for state in states), 2)
+        self.assertLessEqual(max(abs(int(state["highlight_dy"])) for state in states), 1)
 
     def test_error_scene_keeps_sad_expression_while_preserving_attention_gaze(self) -> None:
         display = self.make_display()

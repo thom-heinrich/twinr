@@ -9,6 +9,7 @@ owned_concerns:
   - Publish Twinr's builtin integration catalog and manifest lookup helpers
   - Evaluate integration policy decisions and dispatch requests to registered adapters
   - Build managed email and calendar adapters from store and environment state
+  - Expose generic smart-home contracts and provider packages under src/twinr/integrations/smarthome
   - Persist integration configuration and expose integration automation family blocks to the web layer
 out_of_scope:
   - Provider-specific email transport, normalization, and adapter behavior in src/twinr/integrations/email
@@ -87,6 +88,8 @@ files:
     role: Read-only calendar provider package
   - path: email
     role: Email provider package
+  - path: smarthome
+    role: Vendor-neutral smart-home contracts and provider packages
 public_api:
   module: twinr.integrations
   exports:
@@ -137,10 +140,25 @@ public_api:
     - SafetyProfile
     - SecretReference
     - SecretStorage
+    - SmartHomeAdapterSettings
+    - SmartHomeCommand
+    - SmartHomeController
+    - SmartHomeEntity
+    - SmartHomeEntityClass
+    - SmartHomeEntityProvider
+    - SmartHomeEvent
+    - SmartHomeEventBatch
+    - SmartHomeEventKind
+    - SmartHomeIntegrationAdapter
+    - SmartHomeSensorStream
     - TwinrIntegrationStore
+    - HueBridgeClient
+    - HueBridgeConfig
+    - HueSmartHomeProvider
     - builtin_manifests
     - build_calendar_agenda_adapter
     - build_email_mailbox_adapter
+    - build_hue_smart_home_provider
     - build_managed_integrations
     - integration_automation_family_providers
     - integration_store_path
@@ -157,4 +175,6 @@ tests:
   - path: test/test_integrations.py
   - path: test/test_integration_runtime.py
   - path: test/test_integration_store.py
+  - path: test/test_integrations_smarthome.py
+  - path: test/test_integrations_smarthome_hue.py
   - path: test/test_web_app.py

@@ -7,7 +7,10 @@ summary: Coordinate proactive monitor ticks, wakeword presence sessions, and bou
 owned_concerns:
   - Maintain wakeword presence-session state from camera, PIR, and speech activity
   - Derive conservative ReSpeaker policy hooks such as quiet windows, resume windows, and overlap guards
+  - Expose one runtime-faithful ReSpeaker audio-perception diagnostic and guard surface for operator checks and post-recovery sanity validation
   - Derive conservative ReSpeaker speech-delivery defer reasons for display-first proactive routing
+  - Use bounded local PCM-content evidence to veto strong XVF3800 speech false positives before room-context and device-directedness decisions
+  - Let strong PCM non-speech evidence reopen bounded room-activity when the legacy chunk/RMS gate misses playback windows
   - Enforce a hard XVF3800 startup/runtime contract so DFU/safe mode and unreadable enumerated capture block proactive voice monitoring clearly
   - Package current ReSpeaker presence/audio facts into explicit governor-facing input bundles
   - Fuse the primary camera anchor with ReSpeaker direction confidence into a conservative speaker-association fact
@@ -17,7 +20,8 @@ owned_concerns:
   - Derive a conservative portrait-match claim from local face embedding plus temporal local identity evidence and clear room context
   - Derive a conservative known-user hint from fresh voice-profile state plus optional temporal identity-fusion evidence and clear room context
   - Derive prompt-only affect proxies from coarse posture, attention, quiet, and motion cues without claiming emotion as fact
-  - Derive a bounded multimodal attention-target surface from camera anchor, speaker association, showing-intent cues, and short-lived session focus memory
+  - Derive a bounded continuous visible-person target from multi-person camera anchors, motion recency, short-horizon prediction, conservative audio-to-vision speaker handoff, and short stale-track bridging across brief detector misses
+  - Derive a bounded multimodal attention-target surface from camera anchor, visible-person tracks, speaker association, showing-intent cues, and short-lived session focus memory, with speaker and last-motion priority preserved in multi-person scenes
   - Drive calm HDMI face attention-follow cues from the current relevant-person anchor without teaching the generic runtime snapshot schema about gaze-follow behavior, while mirroring camera-space anchors into user-facing gaze, adding small near-center head turns before full side gaze commits, reserving stronger up/down body-language poses for explicit semantic cues, and renewing or briefly holding matching cues before they expire or disappear on short camera dropouts
   - Mirror clear stabilized user camera gestures into short-lived HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues
   - Run a bounded local HDMI attention-refresh cadence so gaze-follow stays responsive even when full proactive inspection remains motion-gated
@@ -56,6 +60,14 @@ files:
       - ReSpeakerAudioPolicySnapshot
       - ReSpeakerAudioPolicyTracker
       - describe_respeaker_runtime_alert
+  - path: audio_perception.py
+    role: Runtime-faithful one-shot ReSpeaker perception diagnostics and conservative room/device-directedness guard summaries
+    exports:
+      - ReSpeakerAudioPerceptionGuardSnapshot
+      - ReSpeakerAudioPerceptionSnapshot
+      - derive_respeaker_audio_perception_guard
+      - observe_audio_perception_once
+      - render_audio_perception_snapshot_lines
   - path: claim_metadata.py
     role: Shared `confidence` / `source` / `requires_confirmation` helpers for multimodal runtime claims
     exports:
@@ -86,8 +98,14 @@ files:
     exports:
       - AffectProxySnapshot
       - derive_affect_proxy
+  - path: continuous_attention.py
+    role: Bounded visible-person track matching, motion recency, and conservative speaker-target handoff for HDMI follow
+    exports:
+      - ContinuousAttentionTargetConfig
+      - ContinuousAttentionTargetSnapshot
+      - ContinuousAttentionTracker
   - path: attention_targeting.py
-    role: Bounded multimodal attention-target prioritization for HDMI gaze-follow with horizontal-only normal person-following
+    role: Bounded multimodal attention-target prioritization for HDMI gaze-follow with continuous visible-person tracks and horizontal-only normal person-following
     exports:
       - MultimodalAttentionTargetConfig
       - MultimodalAttentionTargetSnapshot

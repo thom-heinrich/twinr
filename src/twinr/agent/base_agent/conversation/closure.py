@@ -7,6 +7,7 @@ model output into a safe ``ConversationClosureDecision`` shape.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from threading import Event, Thread
 import inspect
@@ -16,6 +17,7 @@ import time
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.contracts import ConversationLike, ToolCallingAgentProvider
 from twinr.agent.base_agent.prompting.personality import load_conversation_closure_instructions
+from twinr.agent.personality.steering import ConversationTurnSteeringCue, serialize_turn_steering_cues
 from twinr.agent.base_agent.conversation.turn_controller import (
     _coerce_probability,
     _coerce_text,
@@ -50,6 +52,10 @@ _CLOSURE_DECISION_TOOL_SCHEMA: dict[str, object] = {
             "reason": {
                 "type": "string",
             },
+            "matched_topics": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
         },
         "required": ["close_now", "confidence", "reason"],
     },
@@ -66,11 +72,14 @@ class ConversationClosureDecision:
         confidence: Normalized confidence score in the range ``0.0`` to
             ``1.0``.
         reason: Short bounded reason code or summary from the evaluator.
+        matched_topics: Topic titles from the provided turn-steering cues that
+            the evaluator considered relevant to the exchange.
     """
 
     close_now: bool
     confidence: float
     reason: str
+    matched_topics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +88,7 @@ class ConversationClosureEvaluation:
 
     decision: ConversationClosureDecision | None = None
     error_type: str | None = None
+    turn_steering_cues: tuple[ConversationTurnSteeringCue, ...] = ()
 
 
 class ToolCallingConversationClosureEvaluator:
@@ -107,6 +117,7 @@ class ToolCallingConversationClosureEvaluator:
         request_source: str,
         proactive_trigger: str | None = None,
         conversation: ConversationLike | None = None,
+        turn_steering_cues: Sequence[ConversationTurnSteeringCue] = (),
     ) -> ConversationClosureDecision:
         """Evaluate whether Twinr should close follow-up listening now.
 
@@ -117,6 +128,8 @@ class ToolCallingConversationClosureEvaluator:
             proactive_trigger: Optional proactive trigger name that opened the
                 exchange.
             conversation: Optional recent conversation history for context.
+            turn_steering_cues: Current machine-readable steering cues that may
+                map the exchange onto a shared thread or a cooling topic.
 
         Returns:
             A bounded structured decision describing whether follow-up listening
@@ -147,6 +160,7 @@ class ToolCallingConversationClosureEvaluator:
             request_source=request_source,
             proactive_trigger=proactive_trigger,
             conversation=compact_conversation,
+            turn_steering_cues=turn_steering_cues,
         )
         timeout_seconds = _config_float(
             self.config,
@@ -185,6 +199,7 @@ class ToolCallingConversationClosureEvaluator:
         request_source: str,
         proactive_trigger: str | None,
         conversation: tuple[tuple[str, str], ...],
+        turn_steering_cues: Sequence[ConversationTurnSteeringCue],
     ) -> str:
         payload = {
             "task": "Decide whether Twinr should suppress any automatic follow-up listening because the exchange has clearly ended for now.",
@@ -213,6 +228,14 @@ class ToolCallingConversationClosureEvaluator:
                 "proactive_trigger": _coerce_text(proactive_trigger, max_chars=128) or None,
                 "recent_turn_count": len(conversation),
             },
+            "turn_steering": {
+                "topics": serialize_turn_steering_cues(turn_steering_cues),
+                "instruction": (
+                    "If one or two of these topics clearly match the exchange, echo exactly those provided titles in matched_topics. "
+                    "Use both title and match_summary. Do not match merely because something sounds adjacent, local, communal, or loosely related. "
+                    "Do not invent topic names."
+                ),
+            },
         }
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
@@ -232,7 +255,30 @@ class ToolCallingConversationClosureEvaluator:
                 ),
             )
             or "closure_controller_fallback",
+            matched_topics=self._coerce_matched_topics(payload.get("matched_topics")),
         )
+
+    def _coerce_matched_topics(self, value: object) -> tuple[str, ...]:
+        """Coerce matched topic titles into a bounded normalized tuple."""
+
+        if value is None:
+            return ()
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+            return ()
+        topics: list[str] = []
+        seen: set[str] = set()
+        for raw_topic in value:
+            normalized = _coerce_text(raw_topic, max_chars=96)
+            if not normalized:
+                continue
+            key = normalized.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            topics.append(normalized)
+            if len(topics) >= 2:
+                break
+        return tuple(topics)
 
     def _detect_provider_timeout_kwarg(self) -> str | None:
         try:

@@ -25,6 +25,7 @@ import wave
 from threading import Lock
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.hardware.audio_env import build_audio_subprocess_env
 
 _SAMPLE_WIDTH_BYTES = 2
 # AUDIT-FIX(#3): Bound blocking device I/O so broken ALSA devices cannot wedge the process forever.
@@ -113,6 +114,7 @@ def _spawn_audio_process(
     try:
         return subprocess.Popen(
             command,
+            env=build_audio_subprocess_env(),
             stdin=stdin,
             stdout=stdout,
             stderr=stderr,

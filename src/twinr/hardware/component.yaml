@@ -7,13 +7,16 @@ summary: Provide bounded audio, GPIO, camera, printer, voice-profile, and local 
 owned_concerns:
   - Capture and play bounded audio for conversation, ambient sensing, and wakeword flows
   - Prove bounded readable-frame microphone capture before runtime layers trust a targeted input path as voice-ready
+  - Keep ALSA child-process env independent from borrowed Wayland/user-session sockets when the Pi runtime runs under a different UID than the visible desktop session
   - Monitor GPIO buttons and PIR motion across supported Pi backends
   - Capture still photos via ffmpeg-backed V4L2 integration, with a bounded Pi libcamera fallback for busy unicam-image nodes
   - Persist local portrait identities with multiple reference images per user
   - Perform bounded local portrait matching against enrolled identities using still-camera captures, on-device embeddings, and temporal evidence fusion
   - Persist and assess multi-user local household voice identities on device
   - Coordinate a bounded local household identity manager across portrait matching, voice matching, explicit feedback, and short session history
-  - Run bounded hybrid IMX500 + MediaPipe health, person/object gating, pose enrichment, hand-landmark ROI work, temporal coarse-arm, and fine-hand gesture inference
+  - Run bounded hybrid IMX500 + MediaPipe health, multi-person visibility, person/object gating, pose enrichment, hand-landmark ROI work, temporal coarse-arm, and stable full-frame fine-hand gesture inference
+  - Honor recognizer negative classes such as `none` when resolving user-facing fine-hand symbols so weak custom-model positives do not leak through as false gestures
+  - Supplement zero/one-person SSD frames with bounded local YuNet face anchors so multi-person attention can still recover visible speakers in seated table scenes
   - Format and submit bounded receipt print jobs
   - Probe ReSpeaker XVF3800 USB/ALSA readiness and capture typed host-control primitives
   - Derive conservative XVF3800 runtime facts such as direction confidence, overlap, mute state, and busy-state interruption hints
@@ -57,8 +60,13 @@ files:
       - pcm16_to_wav_bytes
       - resolve_dynamic_pause_thresholds
       - resolve_pause_resume_confirmation
+  - path: audio_env.py
+    role: Sanitize ALSA child-process env so root-run Pi audio helpers do not inherit mismatched Wayland or Pulse session sockets
+    exports:
+      - build_audio_subprocess_env
+      - runtime_dir_owner_uid
   - path: ai_camera.py
-    role: Stable compatibility facade for the public local AI-camera adapter surface
+    role: Stable compatibility facade for the public local AI-camera adapter surface, including bounded multi-person visibility observations
     exports:
       - AICameraAdapterConfig
       - AICameraBodyPose
@@ -71,7 +79,7 @@ files:
       - AICameraZone
       - LocalAICameraAdapter
   - path: camera_ai/
-    role: Internal SoC package for AI-camera contracts, IMX500 runtime, MediaPipe runtime, pose, motion, and gesture modules
+    role: Internal SoC package for AI-camera contracts, IMX500 runtime, MediaPipe runtime, supplemental face anchors, pose, motion, and gesture modules
   - path: ai_camera_diagnostics.py
     role: Bounded diagnostics for IMX500 pose candidate selection and keypoint support on the Pi
     exports:

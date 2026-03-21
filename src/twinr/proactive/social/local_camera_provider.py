@@ -24,6 +24,7 @@ from .engine import (
     SocialMotionState,
     SocialPersonZone,
     SocialSpatialBox,
+    SocialVisiblePerson,
     SocialVisionObservation,
 )
 from .observers import ProactiveVisionSnapshot
@@ -119,6 +120,23 @@ class LocalAICameraObservationProvider:
             person_count=observation.person_count,
             primary_person_zone=_map_zone(observation.primary_person_zone),
             primary_person_box=primary_person_box,
+            visible_persons=tuple(
+                SocialVisiblePerson(
+                    box=(
+                        None
+                        if item.box is None
+                        else SocialSpatialBox(
+                            top=item.box.top,
+                            left=item.box.left,
+                            bottom=item.box.bottom,
+                            right=item.box.right,
+                        )
+                    ),
+                    zone=_map_zone(item.zone),
+                    confidence=item.confidence,
+                )
+                for item in observation.visible_persons
+            ),
             primary_person_center_x=observation.primary_person_center_x,
             primary_person_center_y=observation.primary_person_center_y,
             looking_toward_device=bool(observation.looking_toward_device),

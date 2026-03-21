@@ -319,7 +319,7 @@ _CANONICAL_BUILTIN_MANIFESTS: Final[tuple[IntegrationManifest, ...]] = (
         integration_id="smart_home_hub",
         domain=IntegrationDomain.SMART_HOME,
         title="Smart Home Hub",
-        summary="Read device state and trigger non-critical routines with explicit confirmation.",
+        summary="Read device state, control approved low-risk devices, and consume bounded sensor streams.",
         required_secrets=(
             SecretReference("smart_home_endpoint", "TWINR_SMART_HOME_ENDPOINT"),
             SecretReference("smart_home_token", "TWINR_SMART_HOME_TOKEN"),
@@ -329,7 +329,29 @@ _CANONICAL_BUILTIN_MANIFESTS: Final[tuple[IntegrationManifest, ...]] = (
                 operation_id="read_device_state",
                 label="Read device state",
                 action=IntegrationAction.QUERY,
-                summary="Read current state for lights, temperature, or safe appliances.",
+                summary="Read current state for known smart-home entities such as lights or sensors.",
+                safety=SafetyProfile(
+                    risk=RiskLevel.LOW,
+                    sensitivity=DataSensitivity.NORMAL,
+                    allow_background_polling=True,
+                ),
+            ),
+            IntegrationOperation(
+                operation_id="list_entities",
+                label="List smart-home entities",
+                action=IntegrationAction.QUERY,
+                summary="List bounded smart-home entities with their current state and control capabilities.",
+                safety=SafetyProfile(
+                    risk=RiskLevel.LOW,
+                    sensitivity=DataSensitivity.NORMAL,
+                    allow_background_polling=True,
+                ),
+            ),
+            IntegrationOperation(
+                operation_id="read_sensor_stream",
+                label="Read sensor stream",
+                action=IntegrationAction.READ,
+                summary="Read a bounded batch of normalized smart-home sensor or device events.",
                 safety=SafetyProfile(
                     risk=RiskLevel.LOW,
                     sensitivity=DataSensitivity.NORMAL,
@@ -344,11 +366,24 @@ _CANONICAL_BUILTIN_MANIFESTS: Final[tuple[IntegrationManifest, ...]] = (
                 safety=SafetyProfile(
                     risk=RiskLevel.MODERATE,
                     confirmation=ConfirmationMode.USER,
+                    allow_background_polling=True,
+                ),
+            ),
+            IntegrationOperation(
+                operation_id="control_entities",
+                label="Control smart-home entities",
+                action=IntegrationAction.CONTROL,
+                summary="Control approved low-risk smart-home entities such as lights, light groups, or scenes.",
+                safety=SafetyProfile(
+                    risk=RiskLevel.MODERATE,
+                    confirmation=ConfirmationMode.USER,
+                    allow_background_polling=True,
                 ),
             ),
         ),
         notes=(
             "Critical actuations such as door unlock or alarm disarm are intentionally excluded.",
+            "Background automations should only target pre-approved low-risk devices or scenes.",
         ),
     ),
     IntegrationManifest(

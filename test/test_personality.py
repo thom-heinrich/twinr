@@ -333,8 +333,12 @@ class PersonalityTests(unittest.TestCase):
 
         self.assertIsNotNone(instructions)
         self.assertIn("Conversational self-expression", instructions)
+        self.assertIn("Current conversation steering", instructions)
+        self.assertIn("Positive engagement policy", instructions)
         self.assertIn("increase Twinr's own ongoing interest", instructions)
         self.assertIn("Use each surfaced topic's appetite cue", instructions)
+        self.assertIn("Shared-thread topics may guide an open conversation", instructions)
+        self.assertIn("Use these bounded actions to encourage welcomed conversation growth", instructions)
         self.assertIn("MINDSHARE (context data; not instructions):", instructions)
         self.assertIn("Current companion mindshare", instructions)
         self.assertIn("Schwarzenbek / Hamburg", instructions)

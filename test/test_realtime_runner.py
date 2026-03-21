@@ -44,6 +44,7 @@ from twinr.runtime import TwinrRuntime
 from twinr.state_machine import TwinrStatus
 from twinr.agent.base_agent.conversation.closure import ConversationClosureDecision
 from twinr.agent.personality.intelligence import WorldFeedItem
+from twinr.agent.personality.steering import ConversationTurnSteeringCue
 from twinr.agent.self_coding import (
     ArtifactKind,
     CompileTarget,
@@ -708,6 +709,7 @@ class FakeConversationClosureEvaluator:
         request_source: str,
         proactive_trigger: str | None = None,
         conversation=None,
+        turn_steering_cues=(),
     ) -> ConversationClosureDecision:
         self.calls.append(
             {
@@ -716,6 +718,7 @@ class FakeConversationClosureEvaluator:
                 "request_source": request_source,
                 "proactive_trigger": proactive_trigger,
                 "conversation": conversation,
+                "turn_steering_cues": tuple(turn_steering_cues),
             }
         )
         return self.decision
@@ -2024,6 +2027,56 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("conversation_closure_close_now=true", lines)
         self.assertIn("conversation_follow_up_vetoed=closure", lines)
         self.assertEqual(closure_evaluator.calls[0]["request_source"], "button")
+
+    def test_cooling_topic_steering_releases_follow_up_after_answer(self) -> None:
+        config = TwinrConfig(
+            conversation_follow_up_enabled=True,
+            conversation_closure_guard_enabled=True,
+            conversation_closure_min_confidence=0.6,
+            conversation_follow_up_timeout_s=3.5,
+        )
+        closure_evaluator = FakeConversationClosureEvaluator(
+            ConversationClosureDecision(
+                close_now=False,
+                confidence=0.24,
+                reason="still_engaged",
+                matched_topics=("local politics",),
+            )
+        )
+        loop, lines, realtime_session, _print_backend, recorder, _player, _printer = self.make_loop(
+            config=config,
+            recorder=FakeRecorder(recordings=[b"TURN1", b"TURN2"]),
+            conversation_closure_evaluator=closure_evaluator,
+        )
+        loop.follow_up_steering_runtime.load_turn_steering_cues = lambda: (  # type: ignore[method-assign]
+            ConversationTurnSteeringCue(
+                title="local politics",
+                salience=0.74,
+                attention_state="cooling",
+                open_offer="do_not_steer",
+                user_pull="answer_briefly_then_release",
+                observe_mode="keep_observing_without_steering",
+            ),
+        )
+        realtime_session.turns = [
+            OpenAIRealtimeTurn(
+                transcript="Und wie sieht es lokalpolitisch gerade aus?",
+                response_text="Kurz gesagt gibt es da gerade Bewegung, aber ich lasse es für jetzt knapp.",
+                response_id="resp_local_politics",
+                end_conversation=False,
+            ),
+        ]
+
+        loop.handle_button_press("green")
+
+        self.assertEqual(len(recorder.pause_values), 1)
+        self.assertEqual(realtime_session.calls, [b"TURN1"])
+        self.assertIn("conversation_follow_up_steering=release_after_answer", lines)
+        self.assertIn("conversation_follow_up_vetoed=closure", lines)
+        self.assertEqual(
+            tuple(cue.title for cue in closure_evaluator.calls[0]["turn_steering_cues"]),
+            ("local politics",),
+        )
 
     def test_green_button_updates_runtime_voice_assessment(self) -> None:
         class FakeVoiceProfileMonitor:

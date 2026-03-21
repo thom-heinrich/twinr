@@ -25,6 +25,7 @@ bounded.
 - package the latest ReSpeaker presence/audio policy facts into explicit governor-input context so proactive reservations carry the same channel/session/runtime view that chose display-first or speech
 - rearm spoken follow-up turns directly from `answering` back to `listening` so the display and operator cues do not briefly fall through `waiting` between a reply and the reopened microphone window
 - start the post-response closure guard while streamed speech is still draining so follow-up beeps do not sit behind a second model wait after the audible answer ends
+- translate structured personality turn-steering state into real follow-up runtime decisions so shared-thread topics can stay gently open while cooling topics are answered briefly and then released
 - keep turn-controller context selection, label-aware guidance, and transcript-verifier gate policy in dedicated runtime components instead of inlining them into the active loop classes
 - recover suspicious or empty streaming transcripts with one bounded full-audio STT retry before surfacing a failed turn
 - wire the optional OpenAI streaming-transcript verifier from the provider bundle into the live streaming loop so suspicious short Deepgram turns, including empty results after a late speech start, are rechecked against the real captured audio before Twinr drops the turn
@@ -54,6 +55,7 @@ bounded.
 | [runner.py](./runner.py) | Compatibility shim to the legacy classic loop in `src/twinr/agent/legacy/classic_hardware_loop.py` |
 | [realtime_runner.py](./realtime_runner.py) | Realtime session loop that delegates guidance and transcript-verifier policy to focused runtime helpers |
 | [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell |
+| [follow_up_steering.py](./follow_up_steering.py) | Runtime bridge from personality steering cues into follow-up reopening decisions |
 | [runtime_error_hold.py](./runtime_error_hold.py) | Stable runtime-error hold that keeps the display companion alive and the snapshot fresh after fatal loop failures |
 | [turn_guidance.py](./turn_guidance.py) | Bounded turn-controller context and label-aware conversation guidance |
 | [streaming_transcript_verifier.py](./streaming_transcript_verifier.py) | Streaming transcript recovery plus explicit verifier KPI gates |

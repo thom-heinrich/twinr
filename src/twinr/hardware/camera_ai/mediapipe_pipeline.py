@@ -277,27 +277,23 @@ class MediaPipeVisionPipeline:
         timestamp_ms: int,
         hand_landmark_result: HandLandmarkResult | None,
     ) -> tuple[AICameraFineHandGesture, float | None]:
-        """Recognize one fine hand gesture from built-in and optional custom models."""
+        """Recognize one fine hand gesture from a stable full-frame video stream.
+
+        MediaPipe's video-mode gesture tracking expects a temporally stable image
+        stream. Feeding alternating wrist crops and full frames into the same
+        recognizer breaks that assumption, increases latency, and makes live
+        tracking jittery because the internal hand tracker keeps seeing a new
+        coordinate system. Twinr already has a separate bounded hand-landmark
+        worker for ROI-derived context, so the gesture recognizer itself stays
+        on the full frame and uses its own tracker.
+        """
 
         best_builtin = (AICameraFineHandGesture.NONE, None)
         best_custom = (AICameraFineHandGesture.NONE, None)
-        candidate_images: list[Any] = []
-
-        detections = getattr(hand_landmark_result, "detections", ()) or ()
-        for detection in detections:
-            roi_frame_rgb = getattr(detection, "roi_frame_rgb", None)
-            if roi_frame_rgb is None:
-                continue
-            try:
-                candidate_images.append(self._build_image(runtime, frame_rgb=roi_frame_rgb))
-            except Exception:
-                logger.exception("Failed to build fine-gesture ROI image")  # AUDIT-FIX(#7): Skip only the bad ROI.
-
-        candidate_images.append(image)
         self._reserve_timestamp_window(
             start_timestamp_ms=timestamp_ms,
-            slots=len(candidate_images),
-        )  # AUDIT-FIX(#2): Reserve the full timestamp range before recognition, even if later candidates fail.
+            slots=1,
+        )  # AUDIT-FIX(#2): Reserve exactly one timestamp slot for the stable full-frame gesture pass.
 
         gesture_recognizer: Any | None = None
         try:
@@ -316,47 +312,39 @@ class MediaPipeVisionPipeline:
             except Exception:
                 logger.exception("Failed to initialize custom gesture recognizer")  # AUDIT-FIX(#1): Continue without custom model.
 
-        for index, candidate_image in enumerate(candidate_images):
-            candidate_timestamp_ms = timestamp_ms + index
-            if gesture_recognizer is not None:
-                try:
-                    builtin_choice = resolve_fine_hand_gesture(
-                        result=gesture_recognizer.recognize_for_video(
-                            candidate_image,
-                            candidate_timestamp_ms,
-                        ),
-                        category_map=BUILTIN_FINE_GESTURE_MAP,
-                        min_score=self.config.builtin_gesture_min_score,
-                    )
-                    best_builtin = prefer_gesture_choice(
-                        best_builtin,
-                        _sanitize_gesture_choice(builtin_choice),
-                    )  # AUDIT-FIX(#7): Normalize malformed resolver outputs before comparison.
-                except Exception:
-                    logger.exception(
-                        "Built-in fine gesture inference failed for candidate index=%s",
-                        index,
-                    )
+        if gesture_recognizer is not None:
+            try:
+                builtin_choice = resolve_fine_hand_gesture(
+                    result=gesture_recognizer.recognize_for_video(
+                        image,
+                        timestamp_ms,
+                    ),
+                    category_map=BUILTIN_FINE_GESTURE_MAP,
+                    min_score=self.config.builtin_gesture_min_score,
+                )
+                best_builtin = prefer_gesture_choice(
+                    best_builtin,
+                    _sanitize_gesture_choice(builtin_choice),
+                )  # AUDIT-FIX(#7): Normalize malformed resolver outputs before comparison.
+            except Exception:
+                logger.exception("Built-in fine gesture inference failed for full-frame candidate")
 
-            if custom_gesture_recognizer is not None:
-                try:
-                    custom_choice = resolve_fine_hand_gesture(
-                        result=custom_gesture_recognizer.recognize_for_video(
-                            candidate_image,
-                            candidate_timestamp_ms,
-                        ),
-                        category_map=CUSTOM_FINE_GESTURE_MAP,
-                        min_score=self.config.custom_gesture_min_score,
-                    )
-                    best_custom = prefer_gesture_choice(
-                        best_custom,
-                        _sanitize_gesture_choice(custom_choice),
-                    )
-                except Exception:
-                    logger.exception(
-                        "Custom fine gesture inference failed for candidate index=%s",
-                        index,
-                    )
+        if custom_gesture_recognizer is not None:
+            try:
+                custom_choice = resolve_fine_hand_gesture(
+                    result=custom_gesture_recognizer.recognize_for_video(
+                        image,
+                        timestamp_ms,
+                    ),
+                    category_map=CUSTOM_FINE_GESTURE_MAP,
+                    min_score=self.config.custom_gesture_min_score,
+                )
+                best_custom = prefer_gesture_choice(
+                    best_custom,
+                    _sanitize_gesture_choice(custom_choice),
+                )
+            except Exception:
+                logger.exception("Custom fine gesture inference failed for full-frame candidate")
 
         if best_custom[0] != AICameraFineHandGesture.NONE:
             return best_custom

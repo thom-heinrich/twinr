@@ -338,6 +338,14 @@ class ChonkyDBClient:
         body = request.to_payload() if isinstance(request, ChonkyDBBulkRecordRequest) else dict(request)
         return self._request_json("POST", "/v1/external/records/bulk", body=body)
 
+    def job_status(self, job_id: str) -> JsonDict:
+        """Fetch the status payload for one async ChonkyDB job."""
+
+        normalized_job_id = str(job_id or "").strip()
+        if not normalized_job_id:
+            raise ValueError("job_id must not be blank")
+        return self._request_json("GET", f"/v1/external/jobs/{quote(normalized_job_id, safe='')}")
+
     def retrieve(self, request: ChonkyDBRetrieveRequest | Mapping[str, object]) -> ChonkyDBRetrieveResponse:
         """Run a validated retrieval request against ChonkyDB indexes."""
 

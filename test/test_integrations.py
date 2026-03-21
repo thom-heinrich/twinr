@@ -49,6 +49,18 @@ class IntegrationCatalogTests(unittest.TestCase):
         self.assertIsNotNone(manifest)
         self.assertEqual(manifest.title, "Calendar Agenda")
 
+    def test_smart_home_manifest_exposes_read_control_and_stream_operations(self) -> None:
+        manifest = manifest_for_id("smart_home_hub")
+        assert manifest is not None
+
+        operations = {operation.operation_id for operation in manifest.operations}
+
+        self.assertIn("read_device_state", operations)
+        self.assertIn("list_entities", operations)
+        self.assertIn("control_entities", operations)
+        self.assertIn("read_sensor_stream", operations)
+        self.assertIn("run_safe_scene", operations)
+
 
 class IntegrationRequestTests(unittest.TestCase):
     def test_redacted_parameters_hide_message_body(self) -> None:

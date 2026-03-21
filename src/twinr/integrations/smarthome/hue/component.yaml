@@ -1,0 +1,32 @@
+schema_version: 1
+name: integrations.smarthome.hue
+path: src/twinr/integrations/smarthome/hue
+kind: python-package
+visibility: internal
+summary: Provide the Philips Hue bridge implementation for Twinr's generic smart-home contracts.
+owned_concerns:
+  - Speak the local Hue bridge JSON and event-stream APIs
+  - Normalize Hue lights, scenes, motion sensors, and connectivity resources into generic smart-home entities and events
+  - Map generic control commands onto Hue CLIP v2 resource updates
+out_of_scope:
+  - Generic smart-home contracts in the parent package
+  - Automation trigger registration outside src/twinr/integrations
+  - Remote/cloud Hue APIs
+files:
+  - path: __init__.py
+    role: Package export surface
+  - path: models.py
+    role: Hue bridge configuration
+    exports:
+      - HueBridgeConfig
+  - path: client.py
+    role: Local Hue bridge HTTPS and event-stream transport
+    exports:
+      - HueBridgeClient
+  - path: adapter.py
+    role: Hue provider that implements Twinr's generic smart-home protocols
+    exports:
+      - HueSmartHomeProvider
+      - build_hue_smart_home_provider
+tests:
+  - path: test/test_integrations_smarthome_hue.py

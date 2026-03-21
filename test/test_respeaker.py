@@ -4,6 +4,8 @@ import sys
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.hardware.respeaker import (
@@ -26,6 +28,7 @@ from twinr.hardware.respeaker import (
 )
 from twinr.hardware.audio import AmbientAudioLevelSample
 from twinr.hardware.respeaker.ambient_classification import classify_respeaker_ambient_audio
+from twinr.hardware.respeaker.pcm_content_classifier import classify_pcm_speech_likeness
 from twinr.hardware.respeaker.models import (
     ReSpeakerCaptureDevice,
     ReSpeakerDirectionSnapshot,
@@ -34,7 +37,93 @@ from twinr.hardware.respeaker.models import (
 )
 
 
+def _encode_pcm16(samples: np.ndarray) -> bytes:
+    """Return one clipped PCM16 payload from normalized float samples."""
+
+    clipped = np.clip(samples, -1.0, 1.0)
+    return (clipped * 32767.0).astype(np.int16).tobytes()
+
+
+def _speech_like_pcm_bytes(*, sample_rate: int = 16_000) -> bytes:
+    """Return one bounded speech-like harmonic burst pattern."""
+
+    rng = np.random.default_rng(7)
+    duration_s = 0.96
+    t = np.arange(int(sample_rate * duration_s), dtype=np.float32) / float(sample_rate)
+    fundamental_hz = 120.0 + 30.0 * np.sin(2.0 * math.pi * 0.5 * t)
+    phase = np.cumsum((2.0 * math.pi * fundamental_hz) / float(sample_rate))
+    voiced = (
+        np.sin(phase)
+        + 0.50 * np.sin(2.0 * phase)
+        + 0.25 * np.sin(3.0 * phase)
+        + 0.10 * np.sin(4.0 * phase)
+    )
+    syllable_mask = (np.sin(2.0 * math.pi * 4.3 * t) > -0.2).astype(np.float32)
+    smoothing = np.hanning(401).astype(np.float32)
+    smoothing /= float(np.sum(smoothing))
+    envelope = np.convolve(syllable_mask, smoothing, mode="same")
+    envelope /= float(np.max(envelope) + 1e-6)
+    samples = (0.65 * voiced * envelope) + (0.01 * rng.normal(size=t.shape[0]))
+    return _encode_pcm16(samples)
+
+
+def _music_like_pcm_bytes(*, sample_rate: int = 16_000) -> bytes:
+    """Return one bounded steady tonal media-like pattern."""
+
+    duration_s = 0.64
+    t = np.arange(int(sample_rate * duration_s), dtype=np.float32) / float(sample_rate)
+    tremolo = 0.78 + (0.18 * np.sin(2.0 * math.pi * 2.0 * t))
+    chord = (
+        0.38 * np.sin(2.0 * math.pi * 220.0 * t)
+        + 0.26 * np.sin(2.0 * math.pi * 330.0 * t)
+        + 0.18 * np.sin(2.0 * math.pi * 440.0 * t)
+    )
+    return _encode_pcm16(chord * tremolo)
+
+
+def _noise_like_pcm_bytes(*, sample_rate: int = 16_000) -> bytes:
+    """Return one bounded colored-noise pattern."""
+
+    rng = np.random.default_rng(11)
+    duration_s = 0.64
+    sample_count = int(sample_rate * duration_s)
+    noise = rng.normal(size=sample_count).astype(np.float32)
+    kernel = np.ones(48, dtype=np.float32) / 48.0
+    colored = np.convolve(noise, kernel, mode="same")
+    colored /= float(np.max(np.abs(colored)) + 1e-6)
+    return _encode_pcm16(0.55 * colored)
+
+
 class ReSpeakerProbeTests(unittest.TestCase):
+    def test_pcm_speech_likeness_ranks_speech_above_music_and_noise(self) -> None:
+        speech = classify_pcm_speech_likeness(
+            _speech_like_pcm_bytes(),
+            sample_rate=16_000,
+            channels=1,
+        )
+        music = classify_pcm_speech_likeness(
+            _music_like_pcm_bytes(),
+            sample_rate=16_000,
+            channels=1,
+        )
+        noise = classify_pcm_speech_likeness(
+            _noise_like_pcm_bytes(),
+            sample_rate=16_000,
+            channels=1,
+        )
+
+        assert speech.speech_probability is not None
+        assert music.speech_probability is not None
+        assert noise.speech_probability is not None
+        self.assertGreater(speech.speech_probability, 0.50)
+        self.assertLess(music.speech_probability, 0.30)
+        self.assertLess(noise.speech_probability, 0.30)
+        self.assertGreater(speech.speech_probability, music.speech_probability)
+        self.assertGreater(speech.speech_probability, noise.speech_probability)
+        self.assertTrue(music.strong_non_speech)
+        self.assertTrue(noise.strong_non_speech)
+        self.assertTrue(speech.speech_likely)
+
     def test_config_targets_respeaker_detects_known_device_strings(self) -> None:
         self.assertTrue(config_targets_respeaker("plughw:CARD=Array,DEV=0"))
         self.assertTrue(config_targets_respeaker("alsa_input.usb-Seeed_Studio_reSpeaker_XVF3800_4-Mic_Array-00.mono-fallback"))
@@ -318,6 +407,232 @@ class ReSpeakerProbeTests(unittest.TestCase):
         self.assertTrue(classification.audio_activity_detected)
         self.assertTrue(classification.non_speech_audio_likely)
         self.assertTrue(classification.background_media_likely)
+
+    def test_classify_respeaker_ambient_audio_treats_uncorroborated_speech_as_non_speech(self) -> None:
+        classification = classify_respeaker_ambient_audio(
+            signal_snapshot=type(
+                "SignalSnapshot",
+                (),
+                {
+                    "assistant_output_active": False,
+                    "host_control_ready": True,
+                    "speech_detected": True,
+                    "direction_confidence": None,
+                    "beam_activity": (0.0, 0.0, 0.0, 0.0),
+                },
+            )(),
+            sample=AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=10,
+                active_chunk_count=8,
+                average_rms=1800,
+                peak_rms=3200,
+                active_ratio=0.8,
+            ),
+        )
+
+        self.assertTrue(classification.audio_activity_detected)
+        self.assertTrue(classification.non_speech_audio_likely)
+        self.assertTrue(classification.background_media_likely)
+
+    def test_classify_respeaker_ambient_audio_uses_rms_fallback_for_low_level_music(self) -> None:
+        classification = classify_respeaker_ambient_audio(
+            signal_snapshot=type(
+                "SignalSnapshot",
+                (),
+                {
+                    "assistant_output_active": False,
+                    "host_control_ready": True,
+                    "speech_detected": True,
+                    "direction_confidence": None,
+                    "beam_activity": (0.0, 0.0, 0.0, 0.0),
+                },
+            )(),
+            sample=AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=10,
+                active_chunk_count=0,
+                average_rms=400,
+                peak_rms=550,
+                active_ratio=0.0,
+            ),
+        )
+
+        self.assertTrue(classification.audio_activity_detected)
+        self.assertTrue(classification.non_speech_audio_likely)
+        self.assertTrue(classification.background_media_likely)
+
+    def test_classify_respeaker_ambient_audio_keeps_low_rms_quiet_unknown(self) -> None:
+        classification = classify_respeaker_ambient_audio(
+            signal_snapshot=type(
+                "SignalSnapshot",
+                (),
+                {
+                    "assistant_output_active": False,
+                    "host_control_ready": True,
+                    "speech_detected": True,
+                    "direction_confidence": None,
+                    "beam_activity": (0.0, 0.0, 0.0, 0.0),
+                },
+            )(),
+            sample=AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=10,
+                active_chunk_count=0,
+                average_rms=180,
+                peak_rms=260,
+                active_ratio=0.0,
+            ),
+        )
+
+        self.assertFalse(classification.audio_activity_detected)
+        self.assertFalse(classification.non_speech_audio_likely)
+        self.assertFalse(classification.background_media_likely)
+
+    def test_classify_respeaker_ambient_audio_keeps_corroborated_speech_suppressed(self) -> None:
+        classification = classify_respeaker_ambient_audio(
+            signal_snapshot=type(
+                "SignalSnapshot",
+                (),
+                {
+                    "assistant_output_active": False,
+                    "host_control_ready": True,
+                    "speech_detected": True,
+                    "direction_confidence": 0.91,
+                    "beam_activity": (1200.0, 0.0, 0.0, 1200.0),
+                },
+            )(),
+            sample=AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=10,
+                active_chunk_count=8,
+                average_rms=1800,
+                peak_rms=3200,
+                active_ratio=0.8,
+            ),
+        )
+
+        self.assertTrue(classification.audio_activity_detected)
+        self.assertFalse(classification.non_speech_audio_likely)
+        self.assertFalse(classification.background_media_likely)
+
+    def test_classify_respeaker_ambient_audio_rejects_low_confidence_overlap_as_speech(self) -> None:
+        classification = classify_respeaker_ambient_audio(
+            signal_snapshot=type(
+                "SignalSnapshot",
+                (),
+                {
+                    "assistant_output_active": False,
+                    "host_control_ready": True,
+                    "speech_detected": True,
+                    "speech_overlap_likely": True,
+                    "direction_confidence": 0.49,
+                    "beam_activity": (2480953.5, 405761.25, 1759086.375, 2480953.5),
+                },
+            )(),
+            sample=AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=10,
+                active_chunk_count=4,
+                average_rms=758,
+                peak_rms=2186,
+                active_ratio=0.4,
+            ),
+        )
+
+        self.assertTrue(classification.audio_activity_detected)
+        self.assertTrue(classification.non_speech_audio_likely)
+        self.assertFalse(classification.background_media_likely)
+
+    def test_classify_respeaker_ambient_audio_pcm_vetoes_host_control_false_speech(self) -> None:
+        classification = classify_respeaker_ambient_audio(
+            signal_snapshot=type(
+                "SignalSnapshot",
+                (),
+                {
+                    "assistant_output_active": False,
+                    "host_control_ready": True,
+                    "speech_detected": True,
+                    "direction_confidence": 0.98,
+                    "beam_activity": (1200.0, 0.0, 0.0, 0.0),
+                },
+            )(),
+            sample=AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=10,
+                active_chunk_count=8,
+                average_rms=1800,
+                peak_rms=3200,
+                active_ratio=0.8,
+            ),
+            pcm_bytes=_music_like_pcm_bytes(),
+            sample_rate=16_000,
+            channels=1,
+        )
+
+        self.assertTrue(classification.audio_activity_detected)
+        self.assertTrue(classification.non_speech_audio_likely)
+        self.assertTrue(classification.background_media_likely)
+
+    def test_classify_respeaker_ambient_audio_keeps_pcm_backed_speech(self) -> None:
+        classification = classify_respeaker_ambient_audio(
+            signal_snapshot=type(
+                "SignalSnapshot",
+                (),
+                {
+                    "assistant_output_active": False,
+                    "host_control_ready": True,
+                    "speech_detected": True,
+                    "direction_confidence": None,
+                    "beam_activity": (0.0, 0.0, 0.0, 0.0),
+                },
+            )(),
+            sample=AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=10,
+                active_chunk_count=8,
+                average_rms=1800,
+                peak_rms=3200,
+                active_ratio=0.8,
+            ),
+            pcm_bytes=_speech_like_pcm_bytes(),
+            sample_rate=16_000,
+            channels=1,
+        )
+
+        self.assertTrue(classification.audio_activity_detected)
+        self.assertFalse(classification.non_speech_audio_likely)
+        self.assertFalse(classification.background_media_likely)
+
+    def test_classify_respeaker_ambient_audio_pcm_non_speech_can_raise_activity_without_sample_gate(self) -> None:
+        classification = classify_respeaker_ambient_audio(
+            signal_snapshot=type(
+                "SignalSnapshot",
+                (),
+                {
+                    "assistant_output_active": False,
+                    "host_control_ready": True,
+                    "speech_detected": True,
+                    "direction_confidence": 0.97,
+                    "beam_activity": (1200.0, 0.0, 0.0, 0.0),
+                },
+            )(),
+            sample=AmbientAudioLevelSample(
+                duration_ms=1000,
+                chunk_count=10,
+                active_chunk_count=0,
+                average_rms=120,
+                peak_rms=180,
+                active_ratio=0.0,
+            ),
+            pcm_bytes=_music_like_pcm_bytes(),
+            sample_rate=16_000,
+            channels=1,
+        )
+
+        self.assertTrue(classification.audio_activity_detected)
+        self.assertTrue(classification.non_speech_audio_likely)
+        self.assertFalse(classification.background_media_likely)
 
     def test_snapshot_service_degrades_when_transport_is_unavailable(self) -> None:
         class FakeTransport:

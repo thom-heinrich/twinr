@@ -11,7 +11,8 @@ owned_concerns:
   - Overlay direct ReSpeaker XVF3800 signal facts onto normalized audio observations
   - Preserve conservative ReSpeaker busy-state and direction-quality facts for downstream policy consumers
   - Map the local-first IMX500 adapter onto the normalized social vision contract
-  - Stabilize automation-facing camera snapshots, person-count/zone anchors, coarse motion, and rising-edge coarse/fine gesture events
+  - Stabilize automation-facing camera snapshots, bounded visible-person anchors, coarse motion, and rising-edge coarse/fine gesture events
+  - Confirm explicit fine-hand symbols conservatively before the UI or policy layers see them, so random single-frame positives do not become user-facing acknowledgements
   - Route prompt mode and render bounded evidence facts for proactive prompting
   - Buffer recent frames and request conservative visual second opinions
 out_of_scope:
@@ -56,7 +57,7 @@ files:
       - recent_progress
       - weighted_trigger_score
   - path: engine.py
-    role: Stateful social-trigger models, thresholds, and selection logic
+    role: Stateful social-trigger models, thresholds, selection logic, and normalized visible-person observations
     exports:
       - SocialAudioObservation
       - SocialBodyPose
@@ -74,14 +75,14 @@ files:
       - SocialTriggerThresholds
       - SocialVisionObservation
   - path: camera_surface.py
-    role: Debounced camera snapshot plus coarse-motion and coarse/fine gesture event stabilization
+    role: Debounced camera snapshot plus visible-person, coarse-motion, and coarse/fine gesture event stabilization
     exports:
       - ProactiveCameraSnapshot
       - ProactiveCameraSurface
       - ProactiveCameraSurfaceConfig
       - ProactiveCameraSurfaceUpdate
   - path: local_camera_provider.py
-    role: Local-first IMX500 + MediaPipe provider mapped onto the social vision contract, including motion plus coarse/fine gesture output
+    role: Local-first IMX500 + MediaPipe provider mapped onto the social vision contract, including bounded multi-person visibility plus motion and coarse/fine gesture output
     exports:
       - LocalAICameraObservationProvider
       - LocalAICameraProviderConfig

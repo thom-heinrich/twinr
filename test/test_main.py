@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from io import StringIO
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -1702,6 +1703,61 @@ class MainCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(calls, [(manifest_path, None)])
+
+    def test_proactive_audio_observe_once_prints_runtime_faithful_perception_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text(
+                f"TWINR_RUNTIME_STATE_PATH={root / 'runtime-state.json'}\n",
+                encoding="utf-8",
+            )
+            fake_audio_perception_module = ModuleType("twinr.proactive.runtime.audio_perception")
+            calls: list[object] = []
+            fake_snapshot = SimpleNamespace(name="snapshot")
+
+            def _observe(config):
+                calls.append(config)
+                return fake_snapshot
+
+            def _render(snapshot):
+                self.assertIs(snapshot, fake_snapshot)
+                return (
+                    "proactive_audio_room_context=speech",
+                    "proactive_device_directed_speech_candidate=true",
+                    "proactive_background_media_likely=false",
+                )
+
+            fake_audio_perception_module.observe_audio_perception_once = _observe
+            fake_audio_perception_module.render_audio_perception_snapshot_lines = _render
+            original_argv = list(sys.argv)
+            stdout = StringIO()
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {"twinr.proactive.runtime.audio_perception": fake_audio_perception_module},
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    with patch("sys.stdout", stdout):
+                        sys.argv = [
+                            "twinr",
+                            "--env-file",
+                            str(env_path),
+                            "--proactive-audio-observe-once",
+                        ]
+                        exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(calls), 1)
+        output_lines = stdout.getvalue().splitlines()
+        self.assertIn("proactive_audio_room_context=speech", output_lines)
+        self.assertIn("proactive_device_directed_speech_candidate=true", output_lines)
+        self.assertIn("proactive_background_media_likely=false", output_lines)
 
 
 if __name__ == "__main__":

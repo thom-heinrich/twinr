@@ -16,7 +16,7 @@ from typing import Any
 
 from .config import AICameraAdapterConfig, _coerce_float
 from .geometry import box_from_detection, zone_from_center
-from .models import AICameraBox, AICameraObjectDetection, AICameraZone
+from .models import AICameraBox, AICameraObjectDetection, AICameraVisiblePerson, AICameraZone
 
 
 LOGGER = logging.getLogger(__name__)  # AUDIT-FIX(#1): Emit capture/parse failures without taking down the caller.
@@ -34,6 +34,7 @@ class DetectionResult:
     person_count: int
     primary_person_box: AICameraBox | None
     primary_person_zone: AICameraZone
+    visible_persons: tuple[AICameraVisiblePerson, ...]
     person_near_device: bool | None
     hand_or_object_near_camera: bool
     objects: tuple[AICameraObjectDetection, ...]
@@ -126,6 +127,14 @@ def capture_detection(
         person_boxes.sort(key=lambda item: (item[0], item[1]), reverse=True)  # AUDIT-FIX(#7): Prefer higher confidence, then larger box.
         primary_person_box = person_boxes[0][2] if person_boxes else None
         person_count = len(person_boxes)
+        visible_persons = tuple(
+            AICameraVisiblePerson(
+                box=box,
+                zone=_safe_zone_from_center(box.center_x),
+                confidence=score,
+            )
+            for score, _area, box in person_boxes
+        )
         person_near_device = None
         primary_zone = AICameraZone.UNKNOWN
         if primary_person_box is not None:
@@ -147,6 +156,7 @@ def capture_detection(
         person_count=person_count,
         primary_person_box=primary_person_box,
         primary_person_zone=primary_zone,
+        visible_persons=visible_persons,
         person_near_device=person_near_device,
         hand_or_object_near_camera=hand_or_object_near_camera,
         objects=tuple(object_detections),
@@ -160,6 +170,7 @@ def _empty_detection_result() -> DetectionResult:  # AUDIT-FIX(#1): Standardize 
         person_count=0,
         primary_person_box=None,
         primary_person_zone=AICameraZone.UNKNOWN,
+        visible_persons=(),
         person_near_device=None,
         hand_or_object_near_camera=False,
         objects=(),

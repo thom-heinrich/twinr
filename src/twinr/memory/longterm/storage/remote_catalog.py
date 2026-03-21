@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import logging
+import math
 from threading import RLock
 import time
 from urllib.parse import quote
@@ -50,6 +51,13 @@ _DEFAULT_BULK_BATCH_SIZE = 64
 _DEFAULT_BULK_REQUEST_MAX_BYTES = 512 * 1024
 _DEFAULT_RETRIEVE_BATCH_SIZE = 500
 _DEFAULT_REMOTE_READ_MAX_WORKERS = 4
+_DEFAULT_REMOTE_READ_TIMEOUT_S = 8.0
+_DEFAULT_REMOTE_WRITE_TIMEOUT_S = 15.0
+_DEFAULT_REMOTE_RETRY_ATTEMPTS = 3
+_DEFAULT_REMOTE_RETRY_BACKOFF_S = 1.0
+_DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_S = 20.0
+_DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S = 45.0
+_DEFAULT_ASYNC_ATTESTATION_POLL_S = 0.05
 _ALLOWED_DOC_IDS_RETRIEVE_QUERY = "__allowed_doc_ids__"
 _CATALOG_ENTRY_TEXT_FIELDS = (
     "kind",
@@ -663,6 +671,7 @@ class LongTermRemoteCatalogStore:
         query_text: str,
         limit: int,
         eligible: Callable[[LongTermRemoteCatalogEntry], bool] | None = None,
+        allow_catalog_fallback: bool = False,
     ) -> tuple[dict[str, object], ...] | None:
         """Search the current remote scope directly without hydrating the full catalog.
 
@@ -688,12 +697,14 @@ class LongTermRemoteCatalogStore:
             definition = self._require_definition(snapshot_kind)
             bounded_limit = max(1, int(limit))
             max_request_limit = max(bounded_limit, self._retrieve_batch_size())
+            scope_search_failed = False
             request_limit = self._initial_scope_search_limit(
                 bounded_limit=bounded_limit,
                 max_request_limit=max_request_limit,
                 requires_client_filter=eligible is not None,
             )
             selected_payloads: list[dict[str, object]] = []
+            selected_entries: list[LongTermRemoteCatalogEntry] = []
             seen_item_ids: set[str] = set()
             while True:
                 try:
@@ -711,6 +722,7 @@ class LongTermRemoteCatalogStore:
                     # Current-scope one-shot search remains authoritative, but
                     # a local catalog projection can still provide a bounded
                     # temporary fallback when it is already present in memory.
+                    scope_search_failed = True
                     break
                 candidate_count = 0
                 for candidate in candidates:
@@ -734,15 +746,31 @@ class LongTermRemoteCatalogStore:
                         payload=payload_dict,
                     )
                     selected_payloads.append(payload_dict)
+                    selected_entries.append(entry)
                     seen_item_ids.add(entry.item_id)
                     if len(selected_payloads) >= bounded_limit:
-                        return tuple(selected_payloads)
+                        break
+                if len(selected_payloads) >= bounded_limit:
+                    break
                 if candidate_count < request_limit or request_limit >= max_request_limit:
-                    return tuple(selected_payloads)
+                    break
                 next_limit = min(max_request_limit, request_limit * 2)
                 if next_limit <= request_limit:
-                    return tuple(selected_payloads)
+                    break
                 request_limit = next_limit
+            if not scope_search_failed:
+                if allow_catalog_fallback:
+                    rescued = self._rescue_scope_search_payloads_with_current_catalog(
+                        snapshot_kind=snapshot_kind,
+                        query_text=clean_query,
+                        limit=bounded_limit,
+                        eligible=eligible,
+                        selected_entries=tuple(selected_entries),
+                        selected_payloads=tuple(selected_payloads),
+                    )
+                    if rescued is not None:
+                        return rescued
+                return tuple(selected_payloads)
 
         if cached_entries is None:
             return None
@@ -758,6 +786,59 @@ class LongTermRemoteCatalogStore:
         return self.load_item_payloads(
             snapshot_kind=snapshot_kind,
             item_ids=(entry.item_id for entry in selected_entries),
+        )
+
+    def _rescue_scope_search_payloads_with_current_catalog(
+        self,
+        *,
+        snapshot_kind: str,
+        query_text: str,
+        limit: int,
+        eligible: Callable[[LongTermRemoteCatalogEntry], bool] | None,
+        selected_entries: tuple[LongTermRemoteCatalogEntry, ...],
+        selected_payloads: tuple[dict[str, object], ...],
+    ) -> tuple[dict[str, object], ...] | None:
+        """Reconcile empty/stale scope-search hits against the current catalog head.
+
+        ChonkyDB ``scope_ref`` retrieval can briefly lag behind the already-updated
+        current catalog snapshot after Twinr just wrote or confirmed memory. In
+        that window, the direct scope query may return nothing or payloads whose
+        hashes no longer match the current catalog head. Rescue those cases by
+        searching the authoritative current catalog and then loading the payloads
+        addressed by its current document ids.
+        """
+
+        current_entries = self.load_catalog_entries(snapshot_kind=snapshot_kind)
+        if not current_entries:
+            return ()
+        current_by_id = {entry.item_id: entry for entry in current_entries}
+        needs_rescue = not selected_payloads
+        if not needs_rescue:
+            for entry, payload in zip(selected_entries, selected_payloads, strict=False):
+                current_entry = current_by_id.get(entry.item_id)
+                if current_entry is None:
+                    needs_rescue = True
+                    break
+                current_sha256 = self._normalize_text(current_entry.metadata.get("payload_sha256"))
+                if not current_sha256:
+                    continue
+                if self._payload_sha256(payload) != current_sha256:
+                    needs_rescue = True
+                    break
+        if not needs_rescue:
+            return None
+        selected_catalog_entries = self._local_search_catalog_entries(
+            snapshot_kind=snapshot_kind,
+            entries=current_entries,
+            query_text=query_text,
+            limit=limit,
+            eligible=eligible,
+        )
+        if not selected_catalog_entries:
+            return ()
+        return self.load_item_payloads(
+            snapshot_kind=snapshot_kind,
+            item_ids=(entry.item_id for entry in selected_catalog_entries),
         )
 
     def _initial_scope_search_limit(
@@ -838,6 +919,14 @@ class LongTermRemoteCatalogStore:
                 limit=result_limit,
                 eligible=eligible,
             )
+        if not candidates:
+            return self._local_search_catalog_entries(
+                snapshot_kind=snapshot_kind,
+                entries=all_entries,
+                query_text=query_text,
+                limit=result_limit,
+                eligible=eligible,
+            )
 
         selected: list[LongTermRemoteCatalogEntry] = []
         seen: set[str] = set()
@@ -866,6 +955,14 @@ class LongTermRemoteCatalogStore:
             seen.add(item_id)
             if len(selected) >= max(1, int(limit)):
                 break
+        if not selected:
+            return self._local_search_catalog_entries(
+                snapshot_kind=snapshot_kind,
+                entries=all_entries,
+                query_text=query_text,
+                limit=result_limit,
+                eligible=eligible,
+            )
         self._store_search_result(
             snapshot_kind=snapshot_kind,
             query_text=query_text,
@@ -1596,6 +1693,7 @@ class LongTermRemoteCatalogStore:
             request_correlation_id = self._new_remote_write_correlation_id()
             request = ChonkyDBBulkRecordRequest(
                 items=tuple(batch),
+                execution_mode="async",
                 timeout_seconds=self._remote_write_timeout_s(),
                 client_request_id=request_correlation_id,
                 finalize_vector_segments=index + 1 >= len(batches),
@@ -1604,6 +1702,30 @@ class LongTermRemoteCatalogStore:
             started_monotonic = time.monotonic()
             try:
                 result = getattr(write_client, "store_records_bulk")(request)
+                failure_detail = self._store_result_failure_detail(result)
+                if failure_detail:
+                    raise ChonkyDBError(
+                        f"ChonkyDB rejected remote catalog write: {failure_detail}",
+                        response_json=dict(result) if isinstance(result, Mapping) else None,
+                    )
+                extracted_document_ids = self._extract_document_ids(result, expected=len(batch))
+                job_document_ids = self._await_async_job_document_ids(
+                    write_client,
+                    result=result,
+                    expected=len(batch),
+                )
+                if job_document_ids is not None:
+                    extracted_document_ids = job_document_ids
+                if all(isinstance(value, str) and value for value in extracted_document_ids):
+                    document_ids.extend(extracted_document_ids)
+                else:
+                    document_ids.extend(
+                        self._attest_record_batch_readback(
+                            snapshot_kind=snapshot_kind,
+                            record_items=batch,
+                            document_ids=extracted_document_ids,
+                        )
+                    )
             except Exception as exc:
                 remote_state = self._require_remote_state()
                 remote_write_context = {
@@ -1638,7 +1760,6 @@ class LongTermRemoteCatalogStore:
                 )
                 setattr(unavailable, "remote_write_context", remote_write_context)
                 raise unavailable from exc
-            document_ids.extend(self._extract_document_ids(result, expected=len(batch)))
         return tuple(document_ids)
 
     @staticmethod
@@ -1656,6 +1777,284 @@ class LongTermRemoteCatalogStore:
         except (TypeError, ValueError):
             return None
         return timeout_s if timeout_s > 0.0 else None
+
+    def _remote_retry_attempts(self) -> int:
+        config = getattr(getattr(self, "remote_state", None), "config", None)
+        try:
+            resolved = int(getattr(config, "long_term_memory_remote_retry_attempts", _DEFAULT_REMOTE_RETRY_ATTEMPTS))
+        except (TypeError, ValueError):
+            return _DEFAULT_REMOTE_RETRY_ATTEMPTS
+        return min(10, max(1, resolved))
+
+    def _remote_retry_backoff_s(self) -> float:
+        config = getattr(getattr(self, "remote_state", None), "config", None)
+        try:
+            resolved = float(getattr(config, "long_term_memory_remote_retry_backoff_s", _DEFAULT_REMOTE_RETRY_BACKOFF_S))
+        except (TypeError, ValueError):
+            return _DEFAULT_REMOTE_RETRY_BACKOFF_S
+        return min(30.0, max(0.0, resolved))
+
+    def _async_attestation_visibility_timeout_s(self) -> float:
+        config = getattr(getattr(self, "remote_state", None), "config", None)
+        try:
+            read_timeout_s = float(getattr(config, "long_term_memory_remote_read_timeout_s", _DEFAULT_REMOTE_READ_TIMEOUT_S))
+        except (TypeError, ValueError):
+            read_timeout_s = _DEFAULT_REMOTE_READ_TIMEOUT_S
+        try:
+            write_timeout_s = float(getattr(config, "long_term_memory_remote_write_timeout_s", _DEFAULT_REMOTE_WRITE_TIMEOUT_S))
+        except (TypeError, ValueError):
+            write_timeout_s = _DEFAULT_REMOTE_WRITE_TIMEOUT_S
+        candidate = max(
+            _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_S,
+            read_timeout_s,
+            min(write_timeout_s * 2.0, _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S),
+        )
+        return min(
+            _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S,
+            max(_DEFAULT_ASYNC_ATTESTATION_POLL_S, candidate),
+        )
+
+    def _attest_record_batch_readback(
+        self,
+        *,
+        snapshot_kind: str,
+        record_items: tuple[ChonkyDBRecordItem, ...],
+        document_ids: tuple[str | None, ...],
+    ) -> tuple[str | None, ...]:
+        remote_state = self._require_remote_state()
+        read_client = self._require_client(getattr(remote_state, "read_client", None), operation="read")
+        resolved: list[str | None] = []
+        for index, item in enumerate(record_items):
+            document_id = document_ids[index] if index < len(document_ids) else None
+            resolved.append(
+                self._attest_record_readback(
+                    read_client,
+                    snapshot_kind=snapshot_kind,
+                    record_item=item,
+                    document_id=document_id,
+                )
+            )
+        return tuple(resolved)
+
+    def _await_async_job_document_ids(
+        self,
+        client: object,
+        *,
+        result: object,
+        expected: int,
+    ) -> tuple[str | None, ...] | None:
+        if not isinstance(result, Mapping):
+            return None
+        initial_document_ids = self._extract_document_ids(result, expected=expected)
+        if all(isinstance(value, str) and value for value in initial_document_ids):
+            return initial_document_ids
+        job_id = self._normalize_text(result.get("job_id"))
+        job_status = getattr(client, "job_status", None)
+        if not job_id or not callable(job_status):
+            return None
+        poll_interval_s = max(self._remote_retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
+        total_timeout_s = self._async_attestation_visibility_timeout_s()
+        attempts = max(1, int(math.ceil(total_timeout_s / poll_interval_s)))
+        last_failure_detail = "async job did not expose document ids"
+        for attempt in range(attempts):
+            payload = job_status(job_id)
+            if not isinstance(payload, Mapping):
+                last_failure_detail = "async job status returned a non-mapping payload"
+            else:
+                status = self._normalize_text(payload.get("status")).lower()
+                if status in {"failed", "cancelled", "rejected"}:
+                    detail = self._store_result_failure_detail(payload.get("result"))
+                    if not detail:
+                        detail = (
+                            self._normalize_text(payload.get("error"))
+                            or self._normalize_text(payload.get("error_type"))
+                            or f"async job status={status}"
+                        )
+                    raise LongTermRemoteUnavailableError(
+                        f"Accepted async remote write job {job_id!r} failed before readback: {detail}"
+                    )
+                document_ids = self._extract_document_ids(payload.get("result"), expected=expected)
+                if not all(document_ids):
+                    document_ids = self._extract_document_ids(payload, expected=expected)
+                if all(isinstance(value, str) and value for value in document_ids):
+                    return document_ids
+                if status in {"succeeded", "done"}:
+                    last_failure_detail = "async job finished without exposing document ids"
+                elif status:
+                    last_failure_detail = f"async job status={status}"
+            if attempt + 1 >= attempts:
+                break
+            if poll_interval_s > 0.0:
+                time.sleep(poll_interval_s)
+        raise LongTermRemoteUnavailableError(
+            f"Accepted async remote write job {job_id!r} could not be resolved to document ids: {last_failure_detail}"
+        )
+
+    def _attest_record_readback(
+        self,
+        read_client: object,
+        *,
+        snapshot_kind: str,
+        record_item: ChonkyDBRecordItem,
+        document_id: str | None,
+    ) -> str | None:
+        expected_payloads = self._expected_record_payload_candidates(record_item)
+        if not expected_payloads:
+            return document_id
+        resolved_uri = self._normalize_text(getattr(record_item, "uri", None))
+        if document_id is None and not resolved_uri:
+            raise LongTermRemoteUnavailableError(
+                f"Accepted remote long-term {snapshot_kind!r} write cannot be attested without document id or uri."
+            )
+        resolved_attempts = 1 if document_id else self._remote_retry_attempts()
+        poll_interval_s = 0.0 if document_id else max(self._remote_retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
+        if document_id is None and poll_interval_s > 0.0:
+            resolved_attempts = max(
+                resolved_attempts,
+                int(math.ceil(self._async_attestation_visibility_timeout_s() / poll_interval_s)),
+            )
+        last_detail = "Remote write attestation did not observe the accepted payload."
+        for attempt in range(resolved_attempts):
+            try:
+                envelope = read_client.fetch_full_document(
+                    document_id=document_id,
+                    origin_uri=None if document_id else resolved_uri,
+                    include_content=True,
+                    max_content_chars=self._max_content_chars(),
+                )
+            except Exception as exc:
+                last_detail = str(exc)
+            else:
+                matched_document_id = self._match_attested_record_document_id(
+                    envelope,
+                    expected_payloads=expected_payloads,
+                )
+                if matched_document_id is not None:
+                    return matched_document_id
+                last_detail = "Remote write attestation read back a different same-uri document."
+            if document_id is not None or attempt + 1 >= resolved_attempts:
+                break
+            if poll_interval_s > 0.0:
+                time.sleep(poll_interval_s)
+        raise LongTermRemoteUnavailableError(
+            f"Accepted remote long-term {snapshot_kind!r} write could not be read back: {last_detail}"
+        )
+
+    def _expected_record_payload_candidates(
+        self,
+        record_item: ChonkyDBRecordItem,
+    ) -> tuple[Mapping[str, object], ...]:
+        candidates: list[Mapping[str, object]] = []
+        direct_payload = getattr(record_item, "payload", None)
+        if isinstance(direct_payload, Mapping):
+            candidates.append(dict(direct_payload))
+        metadata = getattr(record_item, "metadata", None)
+        if isinstance(metadata, Mapping):
+            twinr_payload = metadata.get("twinr_payload")
+            if isinstance(twinr_payload, Mapping):
+                candidates.append(dict(twinr_payload))
+        content = getattr(record_item, "content", None)
+        if isinstance(content, str):
+            parsed_content = self._parse_json_mapping(content)
+            if isinstance(parsed_content, Mapping):
+                candidates.append(dict(parsed_content))
+        unique: list[Mapping[str, object]] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            marker = json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique.append(candidate)
+        return tuple(unique)
+
+    def _match_attested_record_document_id(
+        self,
+        payload: object,
+        *,
+        expected_payloads: tuple[Mapping[str, object], ...],
+    ) -> str | None:
+        if not isinstance(payload, Mapping):
+            return None
+        for candidate, candidate_document_id in self._iter_attestation_candidates(payload):
+            if any(candidate == expected for expected in expected_payloads):
+                return candidate_document_id
+        return None
+
+    def _iter_attestation_candidates(
+        self,
+        payload: Mapping[str, object],
+        *,
+        inherited_document_id: str | None = None,
+    ) -> Iterable[tuple[Mapping[str, object], str | None]]:
+        current_document_id = (
+            self._normalize_text(payload.get("document_id"))
+            or self._normalize_text(payload.get("payload_id"))
+            or self._normalize_text(payload.get("chonky_id"))
+            or inherited_document_id
+        )
+        yield payload, current_document_id
+        direct_payload = payload.get("payload")
+        if isinstance(direct_payload, Mapping):
+            yield direct_payload, current_document_id
+        metadata = payload.get("metadata")
+        if isinstance(metadata, Mapping):
+            yield metadata, current_document_id
+            nested_payload = metadata.get("twinr_payload")
+            if isinstance(nested_payload, Mapping):
+                yield nested_payload, current_document_id
+        content = payload.get("content")
+        if isinstance(content, str):
+            parsed_content = self._parse_json_mapping(content)
+            if isinstance(parsed_content, Mapping):
+                yield parsed_content, current_document_id
+        for field_name in ("record", "document"):
+            nested = payload.get(field_name)
+            if isinstance(nested, Mapping):
+                yield from self._iter_attestation_candidates(
+                    nested,
+                    inherited_document_id=current_document_id,
+                )
+        chunks = payload.get("chunks")
+        if isinstance(chunks, list):
+            for chunk in chunks:
+                if not isinstance(chunk, Mapping):
+                    continue
+                yield from self._iter_attestation_candidates(
+                    chunk,
+                    inherited_document_id=current_document_id,
+                )
+
+    @staticmethod
+    def _store_result_failure_detail(result: object) -> str | None:
+        if not isinstance(result, Mapping):
+            return None
+        failures: list[str] = []
+        items = result.get("items")
+        if isinstance(items, list):
+            for index, item in enumerate(items):
+                if not isinstance(item, Mapping):
+                    continue
+                if item.get("success") is False:
+                    error_type = " ".join(str(item.get("error_type") or "").split()).strip()
+                    error_text = " ".join(str(item.get("error") or "").split()).strip()
+                    if error_type and error_text:
+                        failures.append(f"item[{index}] {error_type}: {error_text}")
+                    elif error_text:
+                        failures.append(f"item[{index}] {error_text}")
+                    else:
+                        failures.append(f"item[{index}] rejected")
+        if failures:
+            return "; ".join(failures)
+        if result.get("success") is False:
+            error_type = " ".join(str(result.get("error_type") or "").split()).strip()
+            error_text = " ".join(str(result.get("error") or "").split()).strip()
+            if error_type and error_text:
+                return f"{error_type}: {error_text}"
+            if error_text:
+                return error_text
+            return "request rejected"
+        return None
 
     def _load_item_payloads_from_entries(
         self,

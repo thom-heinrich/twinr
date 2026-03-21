@@ -14,13 +14,18 @@ blocks that combine portrait, voice, and explicit feedback on device.
 - perform bounded local portrait matching from enrolled identities plus still-camera captures
 - persist multi-user local household voice identities and assess current-turn audio against enrolled household members
 - coordinate one bounded local household identity manager across portrait matching, multi-user voice matching, explicit confirm or deny feedback, and short session history
-- run bounded hybrid IMX500 + MediaPipe camera inference for proactive sensing, with IMX500 always-on gating, MediaPipe pose enrichment, dedicated hand-landmark ROI work, ROI-guided gesture recognition, coarse motion, coarse-arm gestures, and bounded fine-hand gesture output
+- run bounded hybrid IMX500 + MediaPipe camera inference for proactive sensing, with IMX500 always-on gating, MediaPipe pose enrichment, dedicated hand-landmark ROI work, stable full-frame gesture recognition, coarse motion, coarse-arm gestures, and bounded fine-hand gesture output
+- preserve bounded multi-person IMX500 person anchors in the camera contract so downstream runtime layers can track visible people continuously instead of collapsing every frame to a single primary box
+- supplement the IMX500 person path with bounded local YuNet face anchors when SSD only sees zero or one person, so table-side multi-person attention can still recover more than one visible target without cloud vision
+- when a YuNet face falls inside an existing person box, retarget that visible-person anchor to the face box for downstream eye-follow, so Twinr looks toward the head instead of the torso centroid while keeping the primary body box for body-pose and presence semantics
 - surface IMX500 detection/runtime failures explicitly instead of collapsing them into healthy-looking empty no-person frames, so downstream gaze and gesture consumers can distinguish camera faults from real absence
 - expose bounded Pi-side tuning for live hand-gesture responsiveness, including camera FPS, hand-detection/tracking thresholds, gesture score floors, and hand ROI sizing
 - keep local AI-camera metadata waits and pose-refresh reuse windows short enough for interactive face-follow and gesture acknowledgement; multi-second waits or stale 10s+ pose reuse are not acceptable for the Pi HCI path
 - auto-enable the staged local custom gesture model at `state/mediapipe/models/custom_gesture.task` when it exists, so fine-hand symbols such as `OK_SIGN` do not require a separate env override on deployed Pi images
+- treat negative custom labels such as `none` as authoritative suppression, so a weak `ok_sign`/other symbol does not win when the classifier itself prefers "no gesture"
 - normalize MediaPipe-bound image buffers centrally so full frames and ROI crops reach the Pi runtime with supported dtype and contiguous layout
 - keep multi-ROI MediaPipe tasks monotonic by advancing and reserving timestamps across candidate inference within a frame
+- keep MediaPipe gesture recognition on a stable full-frame video stream; ROI crops may support hand context, but alternating crop/full-frame inputs must not break the recognizer's tracking assumptions
 - format and submit bounded receipt print jobs
 - probe ReSpeaker XVF3800 runtime state and expose typed host-control signals
 - derive conservative XVF3800 runtime facts such as direction confidence and busy-state interruption hints
@@ -29,6 +34,7 @@ blocks that combine portrait, voice, and explicit feedback on device.
 - resolve one calm XVF3800 indicator contract so future ring/LED control can mirror listening and mute state without twitching on weak audio evidence
 - attach a per-claim ReSpeaker confidence/source contract that later runtime and memory layers can inspect without guessing
 - derive conservative XVF3800 non-speech and background-media suppression facts from the same capture path
+- scrub borrowed Wayland/user-session env from root-owned ALSA subprocesses so Pi audio probes do not inherit non-root Pulse/PipeWire runtime sockets from the HDMI surface
 - persist and score local voice profiles on device
 
 `hardware` does **not** own:
@@ -43,6 +49,7 @@ blocks that combine portrait, voice, and explicit feedback on device.
 |---|---|
 | [__init__.py](./__init__.py) | Narrow package export surface |
 | [audio.py](./audio.py) | Bounded audio capture, readable-frame probing, and playback |
+| [audio_env.py](./audio_env.py) | Sanitize child-process env for ALSA helpers when the Pi runtime borrows a different user's Wayland session |
 | [camera_ai/](./camera_ai/) | Internal SoC package for camera contracts, IMX500 runtime, MediaPipe runtime, pose, motion, and gesture modules |
 | [ai_camera.py](./ai_camera.py) | Stable compatibility facade for the public local AI-camera adapter surface |
 | [ai_camera_diagnostics.py](./ai_camera_diagnostics.py) | Bounded Pi-facing diagnostics for pose candidate selection and keypoint support |

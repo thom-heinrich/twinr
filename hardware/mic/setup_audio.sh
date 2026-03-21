@@ -543,10 +543,27 @@ PY
   if [[ -n "$PROACTIVE_DEVICE" ]]; then
     arecord -D "$PROACTIVE_DEVICE" -f S16_LE -r 16000 -c 1 -d 2 /tmp/twinr_proactive_audio_capture.wav >/dev/null 2>&1 \
       || fail "Proactive audio smoke test failed for $PROACTIVE_DEVICE"
+    # Re-run the repo's runtime-faithful audio-perception path so recovery
+    # checks prove semantic ReSpeaker facts, not only bare readable frames.
+    PROACTIVE_AUDIO_PERCEPTION_OUTPUT="$(
+      cd "$REPO_ROOT" && PYTHONPATH=src "$PYTHON_BIN" -m twinr --env-file "$ENV_FILE" --proactive-audio-observe-once
+    )" || fail "Proactive audio perception sanity check failed for $PROACTIVE_DEVICE"
+    printf '%s\n' "$PROACTIVE_AUDIO_PERCEPTION_OUTPUT"
+    for required_key in \
+      proactive_audio_room_context \
+      proactive_non_speech_audio_likely \
+      proactive_background_media_likely \
+      proactive_device_directed_speech_candidate \
+      proactive_audio_policy_runtime_alert_code
+    do
+      printf '%s\n' "$PROACTIVE_AUDIO_PERCEPTION_OUTPUT" | grep -q "^${required_key}=" \
+        || fail "Proactive audio perception sanity output is missing ${required_key}"
+    done
   fi
   rm -f /tmp/twinr_audio_test.wav /tmp/twinr_audio_capture.wav /tmp/twinr_proactive_audio_capture.wav
   printf 'audio_smoke_test=ok\n'
   if [[ -n "$PROACTIVE_DEVICE" ]]; then
     printf 'proactive_audio_smoke_test=ok\n'
+    printf 'proactive_audio_perception_test=ok\n'
   fi
 fi

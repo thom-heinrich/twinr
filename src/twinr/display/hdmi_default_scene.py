@@ -1899,8 +1899,8 @@ class HdmiDefaultSceneRenderer:
             "height": 74,
             "eye_shift_x": 0,
             "eye_shift_y": 0,
-            "highlight_dx": -10,
-            "highlight_dy": -18,
+            "highlight_dx": 0,
+            "highlight_dy": 0,
             "brow_raise": 0,
             "brow_slant": 4,
             "brow_style": "",
@@ -1911,14 +1911,16 @@ class HdmiDefaultSceneRenderer:
         if status == "waiting":
             if directional_cue_active:
                 state["eye_shift_y"] = 0
-                state["highlight_dx"] = -10
+                state["highlight_dx"] = 0
+                state["highlight_dy"] = 0
                 state["blink"] = False
             else:
                 frame = animation_frame % 12
-                # HDMI renders the face white-on-black, so calm idle motion reads
-                # best when the eye shape stays stable and only gaze/blink drift.
-                state["eye_shift_y"] = (-1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0)[frame]
-                state["highlight_dx"] = (-10, -8, -6, -3, 1, 5, 8, 5, 1, -3, -7, -9)[frame]
+                # No live target should read as calm eye contact, not as an
+                # off-axis idle scan. Keep only tiny vertical easing and blink.
+                state["eye_shift_y"] = (0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0)[frame]
+                state["highlight_dx"] = (0, 0, 0, 0, 1, 0, 0, 0, -1, 0, 0, 0)[frame]
+                state["highlight_dy"] = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)[frame]
                 state["blink"] = frame == 9
         elif status == "listening":
             frame = animation_frame % 6
@@ -1955,7 +1957,7 @@ class HdmiDefaultSceneRenderer:
             state["width"] = 54
             state["height"] = 58 if cue_driven_error else (60, 58, 56, 58, 60, 58)[frame]
             state["highlight_dx"] = 0 if cue_driven_error else (-2, -1, 0, 1, 0, -1)[frame]
-            state["highlight_dy"] = -14
+            state["highlight_dy"] = 0
             state["brow_raise"] = 2
             state["brow_slant"] = 8
             state["eye_shift_y"] = 1 if cue_driven_error else 2

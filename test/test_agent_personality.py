@@ -11,6 +11,7 @@ from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality import (
     BackgroundPersonalityEvolutionLoop,
+    build_positive_engagement_policies,
     ConversationStyleProfile,
     DEFAULT_PERSONALITY_SNAPSHOT_KIND,
     ContinuityThread,
@@ -35,6 +36,7 @@ from twinr.agent.personality import (
     WorldInterestSignal,
 )
 from twinr.agent.personality.self_expression import build_mindshare_items
+from twinr.agent.personality.steering import build_turn_steering_cues, resolve_follow_up_steering
 from twinr.memory.longterm.core.models import (
     LongTermConsolidationResultV1,
     LongTermConversationTurn,
@@ -198,6 +200,8 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertIn("initiative: gently proactive", dict(sections)["PERSONALITY"])
         self.assertIn("light dry humor", dict(sections)["PERSONALITY"])
         self.assertIn("Conversational self-expression", dict(sections)["PERSONALITY"])
+        self.assertIn("Current conversation steering", dict(sections)["PERSONALITY"])
+        self.assertIn("Positive engagement policy", dict(sections)["PERSONALITY"])
         self.assertIn("local politics", dict(sections)["USER"])
         self.assertIn("Current companion mindshare", dict(sections)["MINDSHARE"])
         self.assertIn("Hamburg region", dict(sections)["MINDSHARE"])
@@ -468,6 +472,319 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertEqual(item_by_title["local politics"].appetite.depth, "brief")
         self.assertEqual(item_by_title["local politics"].appetite.follow_up, "wait_for_user_pull")
         self.assertEqual(item_by_title["local politics"].appetite.proactivity, "only_if_clearly_relevant")
+
+    def test_build_turn_steering_cues_promotes_shared_threads_and_holds_back_cooling_topics(self) -> None:
+        snapshot = PersonalitySnapshot(
+            generated_at="2026-03-21T07:00:00+00:00",
+            style_profile=ConversationStyleProfile(
+                verbosity=0.58,
+                initiative=0.64,
+            ),
+            relationship_signals=(
+                RelationshipSignal(
+                    topic="AI companions",
+                    summary="This topic keeps turning into a living shared thread.",
+                    salience=0.92,
+                    source="conversation",
+                ),
+                RelationshipSignal(
+                    topic="world politics",
+                    summary="This is a durable ongoing focus.",
+                    salience=0.83,
+                    source="conversation",
+                ),
+                RelationshipSignal(
+                    topic="local politics",
+                    summary="This topic is relevant, but it recently cooled.",
+                    salience=0.74,
+                    source="conversation",
+                ),
+            ),
+        )
+
+        cues = build_turn_steering_cues(
+            snapshot,
+            engagement_signals=(
+                WorldInterestSignal(
+                    signal_id="interest:ai_companions",
+                    topic="AI companions",
+                    summary="The user and Twinr keep returning to this topic together.",
+                    salience=0.91,
+                    confidence=0.86,
+                    engagement_score=0.95,
+                    engagement_state="resonant",
+                    ongoing_interest="active",
+                    co_attention_state="shared_thread",
+                    co_attention_count=3,
+                    evidence_count=4,
+                    engagement_count=5,
+                    positive_signal_count=4,
+                    updated_at="2026-03-21T06:45:00+00:00",
+                ),
+                WorldInterestSignal(
+                    signal_id="interest:world_politics",
+                    topic="world politics",
+                    summary="This topic is forming into a stronger shared thread.",
+                    salience=0.84,
+                    confidence=0.82,
+                    engagement_score=0.82,
+                    engagement_state="warm",
+                    ongoing_interest="growing",
+                    co_attention_state="forming",
+                    co_attention_count=1,
+                    evidence_count=3,
+                    engagement_count=3,
+                    positive_signal_count=2,
+                    updated_at="2026-03-21T06:40:00+00:00",
+                ),
+                WorldInterestSignal(
+                    signal_id="interest:local_politics",
+                    topic="local politics",
+                    summary="Repeated exposure has cooled this topic for now.",
+                    salience=0.5,
+                    confidence=0.76,
+                    engagement_score=0.22,
+                    engagement_state="cooling",
+                    ongoing_interest="peripheral",
+                    co_attention_state="latent",
+                    co_attention_count=0,
+                    evidence_count=3,
+                    engagement_count=0,
+                    positive_signal_count=0,
+                    exposure_count=3,
+                    non_reengagement_count=2,
+                    updated_at="2026-03-21T06:35:00+00:00",
+                ),
+            ),
+        )
+        cue_by_title = {cue.title: cue for cue in cues}
+
+        self.assertEqual(cue_by_title["AI companions"].attention_state, "shared_thread")
+        self.assertEqual(cue_by_title["AI companions"].positive_engagement_action, "invite_follow_up")
+        self.assertEqual(cue_by_title["AI companions"].open_offer, "brief_update_if_open")
+        self.assertEqual(cue_by_title["AI companions"].user_pull, "one_calm_follow_up")
+        self.assertEqual(cue_by_title["AI companions"].observe_mode, "keep_observing_in_background")
+        self.assertEqual(cue_by_title["world politics"].attention_state, "forming")
+        self.assertEqual(cue_by_title["world politics"].positive_engagement_action, "ask_one")
+        self.assertEqual(cue_by_title["world politics"].open_offer, "mention_if_clearly_relevant")
+        self.assertEqual(cue_by_title["world politics"].user_pull, "one_gentle_follow_up")
+        self.assertEqual(cue_by_title["local politics"].attention_state, "cooling")
+        self.assertEqual(cue_by_title["local politics"].positive_engagement_action, "silent")
+        self.assertEqual(cue_by_title["local politics"].open_offer, "do_not_steer")
+        self.assertEqual(cue_by_title["local politics"].user_pull, "answer_briefly_then_release")
+
+    def test_build_positive_engagement_policies_derives_generic_turn_actions(self) -> None:
+        snapshot = PersonalitySnapshot(
+            generated_at="2026-03-21T07:00:00+00:00",
+            style_profile=ConversationStyleProfile(
+                verbosity=0.6,
+                initiative=0.66,
+            ),
+            relationship_signals=(
+                RelationshipSignal(
+                    topic="quiet technology",
+                    summary="The user keeps returning to this as a living companion thread.",
+                    salience=0.91,
+                    source="conversation",
+                ),
+                RelationshipSignal(
+                    topic="regional affairs",
+                    summary="This is relevant and still warming up.",
+                    salience=0.8,
+                    source="conversation",
+                ),
+                RelationshipSignal(
+                    topic="celebrity gossip",
+                    summary="This has visibly cooled down.",
+                    salience=0.62,
+                    source="conversation",
+                ),
+            ),
+        )
+
+        policies = build_positive_engagement_policies(
+            snapshot,
+            engagement_signals=(
+                WorldInterestSignal(
+                    signal_id="interest:quiet_technology",
+                    topic="quiet technology",
+                    summary="A strong shared thread with durable pull.",
+                    salience=0.88,
+                    confidence=0.84,
+                    engagement_score=0.93,
+                    engagement_state="resonant",
+                    ongoing_interest="active",
+                    co_attention_state="shared_thread",
+                    co_attention_count=3,
+                    evidence_count=4,
+                    engagement_count=5,
+                    positive_signal_count=4,
+                    updated_at="2026-03-21T06:45:00+00:00",
+                ),
+                WorldInterestSignal(
+                    signal_id="interest:regional_affairs",
+                    topic="regional affairs",
+                    summary="This is becoming a stronger shared thread.",
+                    salience=0.79,
+                    confidence=0.8,
+                    engagement_score=0.72,
+                    engagement_state="warm",
+                    ongoing_interest="growing",
+                    co_attention_state="forming",
+                    co_attention_count=1,
+                    evidence_count=3,
+                    engagement_count=2,
+                    positive_signal_count=2,
+                    updated_at="2026-03-21T06:40:00+00:00",
+                ),
+                WorldInterestSignal(
+                    signal_id="interest:celebrity_gossip",
+                    topic="celebrity gossip",
+                    summary="Repeated exposure cooled this topic off.",
+                    salience=0.42,
+                    confidence=0.75,
+                    engagement_score=0.18,
+                    engagement_state="cooling",
+                    ongoing_interest="peripheral",
+                    co_attention_state="latent",
+                    exposure_count=3,
+                    non_reengagement_count=2,
+                    evidence_count=3,
+                    updated_at="2026-03-21T06:35:00+00:00",
+                ),
+            ),
+        )
+
+        policy_by_title = {policy.title: policy for policy in policies}
+        self.assertEqual(policy_by_title["quiet technology"].action, "invite_follow_up")
+        self.assertEqual(policy_by_title["quiet technology"].reason, "shared_thread_invite")
+        self.assertEqual(policy_by_title["regional affairs"].action, "ask_one")
+        self.assertEqual(policy_by_title["regional affairs"].reason, "forming_thread_ask_one")
+        self.assertEqual(policy_by_title["celebrity gossip"].action, "silent")
+        self.assertEqual(policy_by_title["celebrity gossip"].reason, "cooling_back_off")
+
+    def test_build_turn_steering_cues_qualify_regional_topics_and_keep_match_summary(self) -> None:
+        snapshot = PersonalitySnapshot(
+            generated_at="2026-03-21T07:05:00+00:00",
+            relationship_signals=(
+                RelationshipSignal(
+                    topic="local politics",
+                    summary="Keep municipal decisions that affect daily life in view.",
+                    salience=0.79,
+                    source="conversation",
+                ),
+            ),
+        )
+
+        cues = build_turn_steering_cues(
+            snapshot,
+            engagement_signals=(
+                WorldInterestSignal(
+                    signal_id="interest:hamburg_local_politics",
+                    topic="local politics",
+                    summary="Municipal decisions and civic changes in Hamburg that affect daily life.",
+                    region="Hamburg",
+                    scope="local",
+                    salience=0.83,
+                    confidence=0.81,
+                    engagement_score=0.74,
+                    engagement_state="warm",
+                    ongoing_interest="growing",
+                    co_attention_state="forming",
+                    co_attention_count=1,
+                    evidence_count=3,
+                    engagement_count=2,
+                    positive_signal_count=1,
+                    updated_at="2026-03-21T07:00:00+00:00",
+                ),
+            ),
+        )
+
+        self.assertEqual(len(cues), 1)
+        self.assertEqual(cues[0].title, "Hamburg local politics")
+        self.assertEqual(
+            cues[0].match_summary,
+            "Municipal decisions and civic changes in Hamburg that affect daily life.",
+        )
+
+    def test_resolve_follow_up_steering_keeps_shared_threads_open_and_releases_cooling_topics(self) -> None:
+        cues = (
+            PersonalitySnapshot(
+                generated_at="2026-03-21T07:00:00+00:00",
+                style_profile=ConversationStyleProfile(verbosity=0.58, initiative=0.64),
+                relationship_signals=(
+                    RelationshipSignal(
+                        topic="AI companions",
+                        summary="Living shared thread.",
+                        salience=0.92,
+                        source="conversation",
+                    ),
+                    RelationshipSignal(
+                        topic="local politics",
+                        summary="Recently cooled topic.",
+                        salience=0.74,
+                        source="conversation",
+                    ),
+                ),
+            ),
+        )
+        steering_cues = build_turn_steering_cues(
+            cues[0],
+            engagement_signals=(
+                WorldInterestSignal(
+                    signal_id="interest:ai_companions",
+                    topic="AI companions",
+                    summary="Shared thread.",
+                    salience=0.91,
+                    confidence=0.86,
+                    engagement_score=0.95,
+                    engagement_state="resonant",
+                    ongoing_interest="active",
+                    co_attention_state="shared_thread",
+                    co_attention_count=3,
+                    evidence_count=4,
+                    engagement_count=5,
+                    positive_signal_count=4,
+                    updated_at="2026-03-21T06:45:00+00:00",
+                ),
+                WorldInterestSignal(
+                    signal_id="interest:local_politics",
+                    topic="local politics",
+                    summary="Repeated exposure cooled it.",
+                    salience=0.5,
+                    confidence=0.76,
+                    engagement_score=0.22,
+                    engagement_state="cooling",
+                    ongoing_interest="peripheral",
+                    co_attention_state="latent",
+                    co_attention_count=0,
+                    evidence_count=3,
+                    engagement_count=0,
+                    positive_signal_count=0,
+                    exposure_count=3,
+                    non_reengagement_count=2,
+                    updated_at="2026-03-21T06:35:00+00:00",
+                ),
+            ),
+        )
+
+        shared_thread_decision = resolve_follow_up_steering(
+            steering_cues,
+            matched_topics=("AI companions",),
+        )
+        cooling_decision = resolve_follow_up_steering(
+            steering_cues,
+            matched_topics=("local politics",),
+        )
+
+        self.assertTrue(shared_thread_decision.keep_open)
+        self.assertFalse(shared_thread_decision.force_close)
+        self.assertEqual(shared_thread_decision.positive_engagement_action, "invite_follow_up")
+        self.assertEqual(shared_thread_decision.reason, "follow_up_allowed")
+        self.assertTrue(cooling_decision.force_close)
+        self.assertFalse(cooling_decision.keep_open)
+        self.assertEqual(cooling_decision.positive_engagement_action, "silent")
+        self.assertEqual(cooling_decision.reason, "release_after_answer")
 
     def test_remote_state_store_parses_snapshot_payload(self) -> None:
         payload = {

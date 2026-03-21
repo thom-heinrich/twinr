@@ -51,8 +51,21 @@ from twinr.agent.personality.models import (
     WORLD_SIGNAL_SNAPSHOT_KIND,
     WorldSignal,
 )
+from twinr.agent.personality.positive_engagement import (
+    PositiveEngagementTopicPolicy,
+    build_positive_engagement_policies,
+    render_positive_engagement_policy,
+)
 from twinr.agent.personality.service import PersonalityContextService
 from twinr.agent.personality.signals import PersonalitySignalBatch, PersonalitySignalExtractor
+from twinr.agent.personality.steering import (
+    ConversationTurnSteeringCue,
+    FollowUpSteeringDecision,
+    build_turn_steering_cues,
+    resolve_follow_up_steering,
+    render_turn_steering_policy,
+    serialize_turn_steering_cues,
+)
 from twinr.agent.personality.store import (
     PersonalityEvolutionStore,
     PersonalitySnapshotStore,
@@ -63,10 +76,12 @@ from twinr.agent.personality.store import (
 __all__ = [
     "BackgroundPersonalityEvolutionLoop",
     "ConversationStyleProfile",
+    "ConversationTurnSteeringCue",
     "DEFAULT_PERSONALITY_SNAPSHOT_KIND",
     "DEFAULT_WORLD_INTELLIGENCE_STATE_KIND",
     "DEFAULT_WORLD_INTELLIGENCE_SUBSCRIPTIONS_KIND",
     "ContinuityThread",
+    "FollowUpSteeringDecision",
     "HumorProfile",
     "INTERACTION_SIGNAL_SNAPSHOT_KIND",
     "InteractionSignal",
@@ -89,12 +104,19 @@ __all__ = [
     "PlaceFocus",
     "PlaceSignal",
     "PLACE_SIGNAL_SNAPSHOT_KIND",
+    "PositiveEngagementTopicPolicy",
     "ReflectionDelta",
     "RemoteStateWorldIntelligenceStore",
     "RemoteStatePersonalityEvolutionStore",
     "RelationshipSignal",
     "RemoteStatePersonalitySnapshotStore",
     "SituationalAwarenessThread",
+    "build_positive_engagement_policies",
+    "build_turn_steering_cues",
+    "resolve_follow_up_steering",
+    "render_positive_engagement_policy",
+    "render_turn_steering_policy",
+    "serialize_turn_steering_cues",
     "WorldFeedItem",
     "WorldFeedSubscription",
     "WorldIntelligenceConfigRequest",

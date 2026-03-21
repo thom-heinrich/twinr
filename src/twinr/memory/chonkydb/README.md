@@ -11,6 +11,7 @@ used by Twinr's long-term memory flows.
 - keep that client on a pooled, redirect-fail-closed transport so repeated Pi memory reads/writes do not pay a fresh DNS/TLS setup every call
 - define typed request and response models for record, retrieve, and graph endpoints
 - expose a one-shot `topk_records` retrieval contract that returns structured payloads from ChonkyDB in a single roundtrip
+- expose async job-status reads so higher-level remote-memory writers can turn accepted async writes into exact `document_id` attestation instead of over-relying on eventually-consistent same-URI heads
 - carry Twinr's `namespace + scope_ref` contract for current-snapshot retrieval so server-side scope resolution can replace oversized client allowlists
 - define the canonical Twinr personal-graph schema and its local store
 - keep the personal-graph inter-process lock on a runtime-shared lock path so

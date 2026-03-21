@@ -332,6 +332,19 @@ class ChonkyDBClientTests(unittest.TestCase):
         self.assertIn("include_content=false", opener.calls[1]["full_url"])
         self.assertEqual(document["document_id"], "doc-7")
 
+    def test_job_status_builds_status_endpoint_url(self) -> None:
+        opener = FakeOpener()
+        opener.queue_json({"success": True, "job_id": "job-bulk-1", "status": "done"})
+        client = ChonkyDBClient(
+            ChonkyDBConnectionConfig(base_url="https://memory.test"),
+            opener=opener,
+        )
+
+        payload = client.job_status("job-bulk-1")
+
+        self.assertEqual(payload["status"], "done")
+        self.assertEqual(opener.calls[0]["full_url"], "https://memory.test/v1/external/jobs/job-bulk-1")
+
     def test_http_errors_raise_chonkydb_error_with_json_body(self) -> None:
         opener = FakeOpener()
         opener.queue_http_error(

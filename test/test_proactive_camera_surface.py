@@ -171,6 +171,7 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
             config=ProactiveCameraSurfaceConfig(
                 gesture_event_cooldown_s=0.0,
                 fine_hand_explicit_hold_s=0.5,
+                fine_hand_explicit_confirm_samples=1,
             )
         )
 
@@ -211,6 +212,67 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
         self.assertIn("camera.fine_hand_gesture_detected", first.event_names)
         self.assertEqual(held.snapshot.fine_hand_gesture, SocialFineHandGesture.THUMBS_UP)
         self.assertEqual(expired.snapshot.fine_hand_gesture, SocialFineHandGesture.NONE)
+
+    def test_surface_requires_two_confirming_frames_for_explicit_fine_hand_gesture(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                gesture_event_cooldown_s=0.0,
+                fine_hand_explicit_confirm_samples=2,
+                fine_hand_explicit_min_confidence=0.72,
+            )
+        )
+
+        first = surface.observe(
+            inspected=True,
+            observed_at=1.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.86,
+            ),
+        )
+        second = surface.observe(
+            inspected=True,
+            observed_at=1.2,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.83,
+            ),
+        )
+
+        self.assertEqual(first.snapshot.fine_hand_gesture, SocialFineHandGesture.NONE)
+        self.assertNotIn("camera.fine_hand_gesture_detected", first.event_names)
+        self.assertEqual(second.snapshot.fine_hand_gesture, SocialFineHandGesture.THUMBS_UP)
+        self.assertIn("camera.fine_hand_gesture_detected", second.event_names)
+
+    def test_surface_rejects_weak_explicit_fine_hand_gesture(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                gesture_event_cooldown_s=0.0,
+                fine_hand_explicit_confirm_samples=1,
+                fine_hand_explicit_min_confidence=0.72,
+            )
+        )
+
+        update = surface.observe(
+            inspected=True,
+            observed_at=1.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.OK_SIGN,
+                fine_hand_gesture_confidence=0.58,
+            ),
+        )
+
+        self.assertEqual(update.snapshot.fine_hand_gesture, SocialFineHandGesture.NONE)
+        self.assertNotIn("camera.fine_hand_gesture_detected", update.event_names)
 
     def test_surface_treats_local_camera_health_failure_as_unknown_not_no_person(self) -> None:
         surface = ProactiveCameraSurface(

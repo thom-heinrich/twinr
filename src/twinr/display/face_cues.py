@@ -20,7 +20,8 @@ from twinr.agent.base_agent.config import TwinrConfig
 
 _DEFAULT_FACE_CUE_TTL_S = 4.0
 _DEFAULT_FACE_CUE_PATH = "artifacts/stores/ops/display_face_cue.json"
-_MAX_AXIS = 2
+_MAX_GAZE_AXIS = 3
+_MAX_HEAD_AXIS = 2
 _MOUTH_ALIASES = {
     "concern": "sad",
     "line": "neutral",
@@ -85,14 +86,14 @@ def _format_timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
-def _clamp_axis(value: object | None) -> int:
+def _clamp_axis(value: object | None, *, maximum: int) -> int:
     """Normalize one signed cue-axis value into the supported range."""
 
     try:
         parsed = int(round(float(value or 0)))
     except (TypeError, ValueError):
         return 0
-    return max(-_MAX_AXIS, min(_MAX_AXIS, parsed))
+    return max(-maximum, min(maximum, parsed))
 
 
 def _normalize_style(
@@ -147,10 +148,10 @@ class DisplayFaceCue:
         """Normalize direct constructor calls into the canonical cue vocabulary."""
 
         object.__setattr__(self, "source", str(self.source or "").strip() or "external")
-        object.__setattr__(self, "gaze_x", _clamp_axis(self.gaze_x))
-        object.__setattr__(self, "gaze_y", _clamp_axis(self.gaze_y))
-        object.__setattr__(self, "head_dx", _clamp_axis(self.head_dx))
-        object.__setattr__(self, "head_dy", _clamp_axis(self.head_dy))
+        object.__setattr__(self, "gaze_x", _clamp_axis(self.gaze_x, maximum=_MAX_GAZE_AXIS))
+        object.__setattr__(self, "gaze_y", _clamp_axis(self.gaze_y, maximum=_MAX_GAZE_AXIS))
+        object.__setattr__(self, "head_dx", _clamp_axis(self.head_dx, maximum=_MAX_HEAD_AXIS))
+        object.__setattr__(self, "head_dy", _clamp_axis(self.head_dy, maximum=_MAX_HEAD_AXIS))
         object.__setattr__(self, "mouth", _normalize_style(self.mouth, allowed=_ALLOWED_MOUTHS, aliases=_MOUTH_ALIASES))
         object.__setattr__(self, "brows", _normalize_style(self.brows, allowed=_ALLOWED_BROWS, aliases=_BROW_ALIASES))
         object.__setattr__(self, "blink", _normalize_optional_bool(self.blink))
@@ -175,10 +176,10 @@ class DisplayFaceCue:
             source=source,
             updated_at=_format_timestamp(updated_at),
             expires_at=_format_timestamp(expires_at),
-            gaze_x=_clamp_axis(payload.get("gaze_x")),
-            gaze_y=_clamp_axis(payload.get("gaze_y")),
-            head_dx=_clamp_axis(payload.get("head_dx")),
-            head_dy=_clamp_axis(payload.get("head_dy")),
+            gaze_x=_clamp_axis(payload.get("gaze_x"), maximum=_MAX_GAZE_AXIS),
+            gaze_y=_clamp_axis(payload.get("gaze_y"), maximum=_MAX_GAZE_AXIS),
+            head_dx=_clamp_axis(payload.get("head_dx"), maximum=_MAX_HEAD_AXIS),
+            head_dy=_clamp_axis(payload.get("head_dy"), maximum=_MAX_HEAD_AXIS),
             mouth=_normalize_style(payload.get("mouth"), allowed=_ALLOWED_MOUTHS, aliases=_MOUTH_ALIASES),
             brows=_normalize_style(payload.get("brows"), allowed=_ALLOWED_BROWS, aliases=_BROW_ALIASES),
             blink=_normalize_optional_bool(payload.get("blink")),

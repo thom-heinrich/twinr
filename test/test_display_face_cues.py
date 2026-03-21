@@ -34,8 +34,8 @@ class DisplayFaceCueTests(unittest.TestCase):
             default_ttl_s=6.0,
         )
 
-        self.assertEqual(cue.gaze_x, 2)
-        self.assertEqual(cue.gaze_y, -2)
+        self.assertEqual(cue.gaze_x, 3)
+        self.assertEqual(cue.gaze_y, -3)
         self.assertEqual(cue.head_dx, 2)
         self.assertEqual(cue.head_dy, -2)
         self.assertEqual(cue.mouth, "smile")

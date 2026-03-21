@@ -11,6 +11,7 @@ post-response closure checks.
 - Build bounded language instructions for user replies and memory text
 - Evaluate streaming turn boundaries through tool-calling providers
 - Evaluate whether follow-up listening should close after a response with a hard wall-clock watchdog even when a provider adapter ignores timeout kwargs
+- Accept machine-readable turn-steering cues, including compact semantic match summaries, so closure decisions can return matched shared-thread or cooling topics back to the runtime without over-matching nearby themes
 
 `conversation` does **not** own:
 - Audio capture, playback, or hardware control
@@ -25,7 +26,7 @@ post-response closure checks.
 | `adaptive_timing.py` | Persist bounded listening profile |
 | `language.py` | Build language and memory instructions |
 | `turn_controller.py` | Evaluate streaming turn boundaries |
-| `closure.py` | Evaluate post-response closure |
+| `closure.py` | Evaluate post-response closure and echo matched steering topics |
 | `__init__.py` | Mark package only |
 
 ## Usage

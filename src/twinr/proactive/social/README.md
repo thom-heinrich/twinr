@@ -14,6 +14,7 @@ scored proactive trigger candidates and optional visual second opinions.
 - Wrap ambient-audio, ReSpeaker XVF3800, legacy OpenAI vision, and local-first AI-camera observations into bounded conservative snapshots
 - Preserve conservative ReSpeaker facts such as `assistant_output_active`, `direction_confidence`, `speech_overlap_likely`, and `barge_in_detected`
 - Stabilize automation-facing camera snapshots, including person-count/zone anchors, coarse motion, and coarse/fine gesture event surfaces
+- Preserve bounded multi-person camera anchors, not just the single primary person box, so higher runtime layers can track who moved last or which visible person is most relevant without treating that as identity
 - Treat local camera health faults as `unknown` camera semantics instead of authoritative "no person" ticks, so short IMX500/runtime problems do not instantly erase the last stable person anchor
 - Smooth small primary-person center jitter before it reaches the HDMI gaze path, so box wobble does not read as nervous eye movement when the user is standing still
 - Keep that center smoothing short enough for live HDMI HCI, so person-following stays calm without adding second-scale lag
@@ -26,6 +27,7 @@ scored proactive trigger candidates and optional visual second opinions.
 `social` does **not** own:
 - Proactive monitor orchestration or worker lifecycle
 - Delivery-governance cooldown policy after a candidate is emitted
+- Conservative fine-hand stabilization for explicit symbols (`thumbs_up`, `thumbs_down`, `pointing`, `ok_sign`): require short confirmation and a minimum confidence before raising user-facing events, then hold only across brief dropouts
 - Raw hardware driver implementations outside runtime-facing wrappers
 - Speech delivery, printing, or long-term proactive planning
 
@@ -34,9 +36,9 @@ scored proactive trigger candidates and optional visual second opinions.
 | File | Purpose |
 |---|---|
 | `__init__.py` | Package export surface |
-| `camera_surface.py` | Debounced camera snapshot, person-count/zone anchor, coarse motion, and rising-edge coarse/fine gesture event surface |
-| `engine.py` | Stateful social-trigger scoring engine and normalized vision contract |
-| `local_camera_provider.py` | Maps the local IMX500 + MediaPipe adapter onto the social vision contract, including motion plus coarse/fine gesture output |
+| `camera_surface.py` | Debounced camera snapshot, bounded multi-person anchor surface, coarse motion, and rising-edge coarse/fine gesture event surface |
+| `engine.py` | Stateful social-trigger scoring engine and normalized vision contract, including visible-person anchor payloads |
+| `local_camera_provider.py` | Maps the local IMX500 + MediaPipe adapter onto the social vision contract, including visible-person anchors, motion, and coarse/fine gesture output |
 | `observers.py` | Audio, ReSpeaker overlay, and vision observation providers |
 | `prompting.py` | Prompt routing and evidence rendering |
 | `scoring.py` | Weighted scoring primitives |

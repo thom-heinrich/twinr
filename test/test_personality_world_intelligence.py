@@ -151,6 +151,11 @@ class WorldIntelligenceTests(unittest.TestCase):
                     engagement_count=5,
                     positive_signal_count=4,
                     exposure_count=4,
+                    ongoing_interest_score=0.94,
+                    ongoing_interest="active",
+                    co_attention_score=0.66,
+                    co_attention_state="forming",
+                    co_attention_count=1,
                     updated_at="2026-03-20T09:30:00+00:00",
                 ),
             ),
@@ -185,6 +190,11 @@ class WorldIntelligenceTests(unittest.TestCase):
         self.assertEqual(loaded_state.interest_signals[0].engagement_count, 5)
         self.assertEqual(loaded_state.interest_signals[0].engagement_state, "resonant")
         self.assertEqual(loaded_state.interest_signals[0].positive_signal_count, 4)
+        self.assertEqual(loaded_state.interest_signals[0].ongoing_interest, "active")
+        self.assertAlmostEqual(loaded_state.interest_signals[0].ongoing_interest_score, 0.94)
+        self.assertEqual(loaded_state.interest_signals[0].co_attention_state, "forming")
+        self.assertAlmostEqual(loaded_state.interest_signals[0].co_attention_score, 0.66)
+        self.assertEqual(loaded_state.interest_signals[0].co_attention_count, 1)
 
     def test_legacy_interest_signals_backfill_engagement_defaults(self) -> None:
         state = WorldIntelligenceState.from_payload(
@@ -207,6 +217,7 @@ class WorldIntelligenceTests(unittest.TestCase):
         self.assertGreater(state.interest_signals[0].engagement_score, 0.7)
         self.assertEqual(state.interest_signals[0].engagement_count, 3)
         self.assertEqual(state.interest_signals[0].engagement_state, "resonant")
+        self.assertEqual(state.interest_signals[0].ongoing_interest, "active")
 
     def test_service_discovers_feeds_from_search_sources_and_persists_subscriptions(self) -> None:
         remote_state = _FakeRemoteState()
@@ -864,6 +875,7 @@ class WorldIntelligenceTests(unittest.TestCase):
 
         refresh = service.maybe_refresh(search_backend=None)
         subscriptions = service.store.load_subscriptions(config=config, remote_state=remote_state)
+        state = service.store.load_state(config=config, remote_state=remote_state)
 
         self.assertEqual(refresh.status, "skipped")
         self.assertEqual(len(subscriptions), 1)
@@ -871,6 +883,59 @@ class WorldIntelligenceTests(unittest.TestCase):
         self.assertEqual(subscriptions[0].refresh_interval_hours, 24)
         self.assertAlmostEqual(subscriptions[0].base_priority, 0.52)
         self.assertEqual(subscriptions[0].base_refresh_interval_hours, 96)
+        self.assertEqual(state.interest_signals[0].ongoing_interest, "active")
+        self.assertEqual(state.interest_signals[0].co_attention_state, "forming")
+        self.assertGreaterEqual(state.interest_signals[0].co_attention_count, 1)
+
+    def test_recalibration_prefers_active_interest_for_new_feed_discovery(self) -> None:
+        remote_state = _FakeRemoteState()
+        config = TwinrConfig(project_root=".")
+        service = WorldIntelligenceService(
+            config=config,
+            remote_state=remote_state,
+            feed_reader=lambda feed_url, *, max_items, timeout_s: (),
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+        )
+
+        candidates = service._select_recalibration_candidates(
+            subscriptions=(),
+            state=WorldIntelligenceState(
+                interest_signals=(
+                    WorldInterestSignal(
+                        signal_id="interest:ai_companions",
+                        topic="AI companions",
+                        summary="This topic keeps drawing the user back in.",
+                        salience=0.74,
+                        confidence=0.84,
+                        engagement_score=0.8,
+                        engagement_state="warm",
+                        ongoing_interest="active",
+                        ongoing_interest_score=0.9,
+                        evidence_count=3,
+                        engagement_count=4,
+                        positive_signal_count=3,
+                        updated_at="2026-03-20T11:30:00+00:00",
+                    ),
+                    WorldInterestSignal(
+                        signal_id="interest:world_politics",
+                        topic="world politics",
+                        summary="This topic remains relevant but less sticky.",
+                        salience=0.88,
+                        confidence=0.86,
+                        engagement_score=0.86,
+                        engagement_state="resonant",
+                        ongoing_interest="growing",
+                        ongoing_interest_score=0.72,
+                        evidence_count=3,
+                        engagement_count=3,
+                        positive_signal_count=2,
+                        updated_at="2026-03-20T11:40:00+00:00",
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(tuple(item.topic for item in candidates), ("AI companions", "world politics"))
 
     def test_recalibration_ignores_cooling_interest_for_new_feed_discovery(self) -> None:
         remote_state = _FakeRemoteState()
@@ -976,6 +1041,152 @@ class WorldIntelligenceTests(unittest.TestCase):
         self.assertLess(state.interest_signals[0].salience, 0.7)
         self.assertLess(state.interest_signals[0].engagement_count, 5)
         self.assertIn(state.interest_signals[0].engagement_state, {"warm", "uncertain"})
+        self.assertEqual(state.interest_signals[0].ongoing_interest, "peripheral")
+        self.assertEqual(state.interest_signals[0].co_attention_state, "latent")
+
+    def test_refresh_promotes_active_interest_into_shared_co_attention_thread(self) -> None:
+        remote_state = _FakeRemoteState()
+        config = TwinrConfig(project_root=".")
+        service = WorldIntelligenceService(
+            config=config,
+            remote_state=remote_state,
+            feed_reader=lambda feed_url, *, max_items, timeout_s: (
+                WorldFeedItem(
+                    feed_url=feed_url,
+                    source="AI Companion News",
+                    title="Companion models now hold longer-lived memory threads",
+                    link="https://example.com/ai/companion-memory",
+                    published_at="2026-03-20T11:00:00+00:00",
+                ),
+            ),
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+        )
+        service.store.save_subscriptions(
+            config=config,
+            remote_state=remote_state,
+            subscriptions=(
+                WorldFeedSubscription(
+                    subscription_id="feed:ai_companions",
+                    label="AI companions",
+                    feed_url="https://example.com/ai/rss.xml",
+                    topics=("AI companions",),
+                    priority=0.86,
+                    refresh_interval_hours=24,
+                    created_by="reflection",
+                    created_at="2026-03-20T08:00:00+00:00",
+                ),
+            ),
+        )
+        service.store.save_state(
+            config=config,
+            remote_state=remote_state,
+            state=WorldIntelligenceState(
+                interest_signals=(
+                    WorldInterestSignal(
+                        signal_id="interest:ai_companions",
+                        topic="AI companions",
+                        summary="The user keeps asking to return to AI companions.",
+                        salience=0.81,
+                        confidence=0.88,
+                        engagement_score=0.94,
+                        engagement_state="resonant",
+                        ongoing_interest="active",
+                        ongoing_interest_score=0.92,
+                        evidence_count=4,
+                        engagement_count=5,
+                        positive_signal_count=4,
+                        updated_at="2026-03-20T11:30:00+00:00",
+                    ),
+                ),
+            ),
+        )
+
+        refresh = service.maybe_refresh()
+        state = service.store.load_state(config=config, remote_state=remote_state)
+
+        self.assertEqual(refresh.status, "refreshed")
+        self.assertEqual(state.interest_signals[0].ongoing_interest, "active")
+        self.assertEqual(state.interest_signals[0].co_attention_state, "shared_thread")
+        self.assertGreaterEqual(state.interest_signals[0].co_attention_count, 2)
+        self.assertGreaterEqual(state.interest_signals[0].co_attention_score, 0.8)
+
+    def test_repeated_refresh_without_new_items_does_not_keep_increasing_co_attention(self) -> None:
+        remote_state = _FakeRemoteState()
+        config = TwinrConfig(project_root=".")
+        service = WorldIntelligenceService(
+            config=config,
+            remote_state=remote_state,
+            feed_reader=lambda feed_url, *, max_items, timeout_s: (
+                WorldFeedItem(
+                    feed_url=feed_url,
+                    source="AI Companion News",
+                    title="Companion models now hold longer-lived memory threads",
+                    link="https://example.com/ai/companion-memory",
+                    published_at="2026-03-20T11:00:00+00:00",
+                ),
+            ),
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+        )
+        service.store.save_subscriptions(
+            config=config,
+            remote_state=remote_state,
+            subscriptions=(
+                WorldFeedSubscription(
+                    subscription_id="feed:ai_companions",
+                    label="AI companions",
+                    feed_url="https://example.com/ai/rss.xml",
+                    topics=("AI companions",),
+                    priority=0.86,
+                    refresh_interval_hours=24,
+                    created_by="reflection",
+                    created_at="2026-03-20T08:00:00+00:00",
+                ),
+            ),
+        )
+        service.store.save_state(
+            config=config,
+            remote_state=remote_state,
+            state=WorldIntelligenceState(
+                interest_signals=(
+                    WorldInterestSignal(
+                        signal_id="interest:ai_companions",
+                        topic="AI companions",
+                        summary="This topic is already a strong ongoing focus.",
+                        salience=0.82,
+                        confidence=0.86,
+                        engagement_score=0.93,
+                        engagement_state="resonant",
+                        ongoing_interest="active",
+                        ongoing_interest_score=0.9,
+                        co_attention_state="forming",
+                        co_attention_count=1,
+                        evidence_count=4,
+                        engagement_count=5,
+                        positive_signal_count=4,
+                        updated_at="2026-03-20T11:30:00+00:00",
+                    ),
+                ),
+            ),
+        )
+
+        first_refresh = service.maybe_refresh(force=True)
+        first_state = service.store.load_state(config=config, remote_state=remote_state)
+        second_refresh = service.maybe_refresh(force=True)
+        second_state = service.store.load_state(config=config, remote_state=remote_state)
+
+        self.assertEqual(first_refresh.status, "refreshed")
+        self.assertEqual(second_refresh.status, "refreshed")
+        self.assertNotEqual(first_refresh.continuity_threads, ())
+        self.assertEqual(second_refresh.continuity_threads, ())
+        self.assertEqual(second_refresh.world_signals, ())
+        self.assertEqual(
+            second_state.interest_signals[0].co_attention_count,
+            first_state.interest_signals[0].co_attention_count,
+        )
+        self.assertEqual(
+            second_state.interest_signals[0].co_attention_state,
+            first_state.interest_signals[0].co_attention_state,
+        )
 
     def test_learning_service_records_conversation_interest_signals_in_world_intelligence_state(self) -> None:
         remote_state = _FakeRemoteState()

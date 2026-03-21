@@ -1059,23 +1059,14 @@ def main() -> int:
                 print(f"proactive_model={snapshot.model}")
 
         if args.proactive_audio_observe_once:
-            from twinr.hardware.audio import AmbientAudioSampler
-            from twinr.proactive import AmbientAudioObservationProvider
-
-            observer = AmbientAudioObservationProvider(
-                sampler=AmbientAudioSampler.from_config(config),
-                audio_lock=Lock(),
-                sample_ms=config.proactive_audio_sample_ms,
-                distress_enabled=config.proactive_audio_distress_enabled,
+            from twinr.proactive.runtime.audio_perception import (
+                observe_audio_perception_once,
+                render_audio_perception_snapshot_lines,
             )
-            snapshot = observer.observe()
-            print(f"proactive_speech_detected={str(snapshot.observation.speech_detected).lower()}")
-            if snapshot.observation.distress_detected is not None:
-                print(f"proactive_distress_detected={str(snapshot.observation.distress_detected).lower()}")
-            if snapshot.sample is not None:
-                print(f"proactive_audio_peak_rms={snapshot.sample.peak_rms}")
-                print(f"proactive_audio_average_rms={snapshot.sample.average_rms}")
-                print(f"proactive_audio_active_ratio={snapshot.sample.active_ratio:.2f}")
+
+            snapshot = observe_audio_perception_once(config)
+            for line in render_audio_perception_snapshot_lines(snapshot):
+                print(line)
 
         if args.wakeword_label_capture:
             if not args.wakeword_label:

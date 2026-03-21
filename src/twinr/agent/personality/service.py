@@ -10,6 +10,11 @@ from twinr.agent.personality.context_builder import PersonalityContextBuilder
 from twinr.agent.personality.intelligence.models import WorldInterestSignal
 from twinr.agent.personality.intelligence.store import RemoteStateWorldIntelligenceStore
 from twinr.agent.personality.models import PersonalitySnapshot
+from twinr.agent.personality.positive_engagement import (
+    PositiveEngagementTopicPolicy,
+    build_positive_engagement_policies,
+)
+from twinr.agent.personality.steering import ConversationTurnSteeringCue, build_turn_steering_cues
 from twinr.agent.personality.store import (
     PersonalitySnapshotStore,
     RemoteStatePersonalitySnapshotStore,
@@ -70,6 +75,57 @@ class PersonalityContextService:
             engagement_signals=engagement_signals,
         )
         return plan.as_sections()
+
+    def load_turn_steering_cues(
+        self,
+        *,
+        config: TwinrConfig,
+        remote_state: LongTermRemoteStateStore | None = None,
+        max_items: int = 3,
+    ) -> tuple[ConversationTurnSteeringCue, ...]:
+        """Load the bounded steering cues that may influence one turn.
+
+        Args:
+            config: Runtime configuration that points to remote personality and
+                world-intelligence state.
+            remote_state: Optional shared remote-state instance to reuse.
+            max_items: Maximum number of cues to surface for the current turn.
+
+        Returns:
+            The current bounded steering cues derived from structured
+            personality and world-intelligence state.
+        """
+
+        snapshot = self.load_snapshot(config=config, remote_state=remote_state)
+        engagement_signals = self._load_engagement_signals(
+            config=config,
+            remote_state=remote_state,
+        )
+        return build_turn_steering_cues(
+            snapshot,
+            engagement_signals=engagement_signals,
+            max_items=max_items,
+        )
+
+    def load_positive_engagement_policies(
+        self,
+        *,
+        config: TwinrConfig,
+        remote_state: LongTermRemoteStateStore | None = None,
+        max_items: int = 3,
+    ) -> tuple[PositiveEngagementTopicPolicy, ...]:
+        """Load the current bounded positive-engagement topic actions."""
+
+        snapshot = self.load_snapshot(config=config, remote_state=remote_state)
+        engagement_signals = self._load_engagement_signals(
+            config=config,
+            remote_state=remote_state,
+        )
+        return build_positive_engagement_policies(
+            snapshot,
+            engagement_signals=engagement_signals,
+            max_items=max_items,
+        )
 
     def _load_engagement_signals(
         self,

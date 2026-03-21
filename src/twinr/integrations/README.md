@@ -11,6 +11,7 @@ dashboard metadata that provider packages plug into.
 - publish builtin manifest lookups for supported integration domains
 - evaluate policy and dispatch requests to registered adapters
 - assemble managed email/calendar adapters from store and environment state
+- expose vendor-neutral smart-home contracts plus provider packages such as Hue
 - persist integration settings and expose integration-family blocks to `src/twinr/web`
 
 `integrations` does **not** own:
@@ -33,6 +34,7 @@ dashboard metadata that provider packages plug into.
 | [web_automation_families.py](./web_automation_families.py) | Dashboard family blocks |
 | [calendar/](./calendar) | Calendar provider package |
 | [email/](./email) | Email provider package |
+| [smarthome/](./smarthome) | Generic smart-home contracts and provider packages |
 
 ## Usage
 

@@ -20,6 +20,7 @@ from .engine import (
     SocialMotionState,
     SocialPersonZone,
     SocialSpatialBox,
+    SocialVisiblePerson,
     SocialVisionObservation,
 )
 
@@ -79,6 +80,8 @@ class ProactiveCameraSurfaceConfig:
     motion_event_cooldown_s: float = 9.0
     gesture_event_cooldown_s: float = 9.0
     fine_hand_explicit_hold_s: float = 0.45
+    fine_hand_explicit_confirm_samples: int = 1
+    fine_hand_explicit_min_confidence: float = 0.72
     primary_person_center_smoothing_alpha: float = 0.58
     primary_person_center_deadband: float = 0.028
     primary_person_center_smoothing_window_s: float = 1.4
@@ -137,6 +140,16 @@ class ProactiveCameraSurfaceConfig:
         _require_non_negative_float(self.motion_event_cooldown_s, field_name="motion_event_cooldown_s")
         _require_non_negative_float(self.gesture_event_cooldown_s, field_name="gesture_event_cooldown_s")
         _require_non_negative_float(self.fine_hand_explicit_hold_s, field_name="fine_hand_explicit_hold_s")
+        _require_positive_int(
+            self.fine_hand_explicit_confirm_samples,
+            field_name="fine_hand_explicit_confirm_samples",
+        )
+        _require_bounded_ratio(
+            self.fine_hand_explicit_min_confidence,
+            field_name="fine_hand_explicit_min_confidence",
+            minimum=0.0,
+            maximum=1.0,
+        )
         _require_bounded_ratio(
             self.primary_person_center_smoothing_alpha,
             field_name="primary_person_center_smoothing_alpha",
@@ -173,6 +186,9 @@ class ProactiveCameraSurfaceConfig:
         cooldown_s = max(interval_s, interval_s * 1.5)
         gesture_cooldown_s = max(0.8, min(2.0, attention_refresh_s * 2.0))
         fine_hand_explicit_hold_s = max(0.2, min(0.8, attention_refresh_s * 0.75))
+        fine_hand_explicit_min_confidence = _coerce_optional_ratio(
+            getattr(config, "proactive_local_camera_fine_hand_explicit_min_confidence", 0.72)
+        )
         # HDMI face-follow must still suppress tiny box wobble, but the old
         # 4x refresh window made person anchors feel visibly delayed on the Pi.
         center_smoothing_window_s = max(
@@ -203,6 +219,13 @@ class ProactiveCameraSurfaceConfig:
             fine_hand_explicit_hold_s=_coerce_non_negative_float(
                 getattr(config, "proactive_local_camera_fine_hand_explicit_hold_s", fine_hand_explicit_hold_s),
                 default=fine_hand_explicit_hold_s,
+            ),
+            fine_hand_explicit_confirm_samples=_coerce_positive_int(
+                getattr(config, "proactive_local_camera_fine_hand_explicit_confirm_samples", 1),
+                default=1,
+            ),
+            fine_hand_explicit_min_confidence=(
+                0.72 if fine_hand_explicit_min_confidence is None else float(fine_hand_explicit_min_confidence)
             ),
             primary_person_center_smoothing_alpha=0.76,
             primary_person_center_deadband=center_deadband,
@@ -287,6 +310,8 @@ class ProactiveCameraSnapshot:
     fine_hand_gesture_confidence_unknown: bool
     objects: tuple[SocialDetectedObject, ...]
     objects_unknown: bool
+    visible_persons: tuple[SocialVisiblePerson, ...] = ()
+    visible_persons_unknown: bool = False
 
     @property
     def coarse_arm_gesture(self) -> SocialGestureEvent:
@@ -331,6 +356,7 @@ class ProactiveCameraSnapshot:
                 self.person_disappeared_at_unknown,
                 self.primary_person_zone_unknown,
                 self.primary_person_box_unknown,
+                self.visible_persons_unknown,
                 self.primary_person_center_x_unknown,
                 self.primary_person_center_y_unknown,
                 self.looking_toward_device_unknown,
@@ -388,6 +414,8 @@ class ProactiveCameraSnapshot:
             "primary_person_zone_unknown": self.primary_person_zone_unknown,
             "primary_person_box": _serialize_box(self.primary_person_box),
             "primary_person_box_unknown": self.primary_person_box_unknown,
+            "visible_persons": _serialize_visible_persons(self.visible_persons),
+            "visible_persons_unknown": self.visible_persons_unknown,
             "primary_person_center_x": self.primary_person_center_x,
             "primary_person_center_x_unknown": self.primary_person_center_x_unknown,
             "primary_person_center_y": self.primary_person_center_y,
@@ -713,6 +741,8 @@ class ProactiveCameraSurface:
         self._last_primary_person_zone_at: float | None = None
         self._last_primary_person_box: SocialSpatialBox | None = None
         self._last_primary_person_box_at: float | None = None
+        self._last_visible_persons: tuple[SocialVisiblePerson, ...] = ()
+        self._last_visible_persons_at: float | None = None
         self._last_primary_person_center_x: float | None = None
         self._last_primary_person_center_x_at: float | None = None
         self._last_primary_person_center_y: float | None = None
@@ -736,6 +766,9 @@ class ProactiveCameraSurface:
         self._last_explicit_fine_hand_gesture = SocialFineHandGesture.NONE
         self._last_explicit_fine_hand_gesture_at: float | None = None
         self._last_explicit_fine_hand_gesture_confidence: float | None = None
+        self._pending_explicit_fine_hand_gesture = SocialFineHandGesture.NONE
+        self._pending_explicit_fine_hand_gesture_count = 0
+        self._pending_explicit_fine_hand_gesture_confidence: float | None = None
         self._has_seen_person = False
         self._last_authoritative_person_visible = False
         self._last_person_seen_at: float | None = None
@@ -785,6 +818,14 @@ class ProactiveCameraSurface:
             person_visible=person_sample.value,
             observed_at=now,
             primary_person_box=getattr(observation, "primary_person_box", None),
+        )
+        visible_persons, visible_persons_unknown = self._resolve_visible_persons(
+            inspected=camera_semantics_authoritative,
+            person_visible=person_sample.value,
+            observed_at=now,
+            visible_persons=getattr(observation, "visible_persons", ()),
+            primary_person_box=primary_person_box,
+            primary_person_zone=primary_person_zone,
         )
         primary_person_center_x, primary_person_center_x_unknown = self._resolve_primary_person_center(
             inspected=camera_semantics_authoritative,
@@ -999,6 +1040,8 @@ class ProactiveCameraSurface:
             primary_person_zone_unknown=primary_person_zone_unknown,
             primary_person_box=primary_person_box,
             primary_person_box_unknown=primary_person_box_unknown,
+            visible_persons=visible_persons,
+            visible_persons_unknown=visible_persons_unknown,
             primary_person_center_x=primary_person_center_x,
             primary_person_center_x_unknown=primary_person_center_x_unknown,
             primary_person_center_y=primary_person_center_y,
@@ -1174,6 +1217,39 @@ class ProactiveCameraSurface:
             value=self._last_primary_person_box,
             last_seen_at=self._last_primary_person_box_at,
             fallback=None,
+            observed_at=observed_at,
+        )
+
+    def _resolve_visible_persons(
+        self,
+        *,
+        inspected: bool,
+        person_visible: bool,
+        observed_at: float,
+        visible_persons: object,
+        primary_person_box: SocialSpatialBox | None,
+        primary_person_zone: SocialPersonZone,
+    ) -> tuple[tuple[SocialVisiblePerson, ...], bool]:
+        if inspected:
+            if not person_visible:
+                people: tuple[SocialVisiblePerson, ...] = ()
+            else:
+                people = _coerce_visible_persons(visible_persons)
+                if not people and primary_person_box is not None:
+                    people = (
+                        SocialVisiblePerson(
+                            box=primary_person_box,
+                            zone=primary_person_zone,
+                            confidence=1.0,
+                        ),
+                    )
+            self._last_visible_persons = people
+            self._last_visible_persons_at = _coerce_timestamp(observed_at)
+            return people, False
+        return self._hold_secondary(
+            value=self._last_visible_persons,
+            last_seen_at=self._last_visible_persons_at,
+            fallback=(),
             observed_at=observed_at,
         )
 
@@ -1533,6 +1609,29 @@ class ProactiveCameraSurface:
         """
 
         if event in _EXPLICIT_FINE_HAND_GESTURES:
+            current_confidence = 0.0 if confidence is None else confidence
+            if current_confidence < self.config.fine_hand_explicit_min_confidence:
+                self._clear_pending_explicit_fine_hand_gesture()
+                event = SocialFineHandGesture.NONE
+                confidence = None
+            else:
+                if event == self._pending_explicit_fine_hand_gesture:
+                    self._pending_explicit_fine_hand_gesture_count += 1
+                    pending_confidence = self._pending_explicit_fine_hand_gesture_confidence
+                    if pending_confidence is None or current_confidence > pending_confidence:
+                        self._pending_explicit_fine_hand_gesture_confidence = current_confidence
+                else:
+                    self._pending_explicit_fine_hand_gesture = event
+                    self._pending_explicit_fine_hand_gesture_count = 1
+                    self._pending_explicit_fine_hand_gesture_confidence = current_confidence
+                if self._pending_explicit_fine_hand_gesture_count < self.config.fine_hand_explicit_confirm_samples:
+                    return SocialFineHandGesture.NONE, None
+                confidence = self._pending_explicit_fine_hand_gesture_confidence
+                self._clear_pending_explicit_fine_hand_gesture()
+        else:
+            self._clear_pending_explicit_fine_hand_gesture()
+
+        if event in _EXPLICIT_FINE_HAND_GESTURES:
             self._last_explicit_fine_hand_gesture = event
             self._last_explicit_fine_hand_gesture_at = now
             self._last_explicit_fine_hand_gesture_confidence = confidence
@@ -1554,6 +1653,13 @@ class ProactiveCameraSurface:
         ):
             return held_event, held_confidence
         return event, confidence
+
+    def _clear_pending_explicit_fine_hand_gesture(self) -> None:
+        """Forget one unconfirmed explicit fine-hand candidate."""
+
+        self._pending_explicit_fine_hand_gesture = SocialFineHandGesture.NONE
+        self._pending_explicit_fine_hand_gesture_count = 0
+        self._pending_explicit_fine_hand_gesture_confidence = None
 
     def _gesture_ready_to_emit(
         self,
@@ -1705,6 +1811,21 @@ def _serialize_objects(objects: tuple[SocialDetectedObject, ...]) -> list[dict[s
                 "zone": item.zone.value,
                 "stable": item.stable,
                 "box": _serialize_box(item.box),
+            }
+        )
+    return rendered
+
+
+def _serialize_visible_persons(people: tuple[SocialVisiblePerson, ...]) -> list[dict[str, object]]:
+    """Render visible-person anchors into JSON-friendly dictionaries."""
+
+    rendered: list[dict[str, object]] = []
+    for item in people:
+        rendered.append(
+            {
+                "box": _serialize_box(item.box),
+                "zone": item.zone.value,
+                "confidence": round(item.confidence, 4),
             }
         )
     return rendered
@@ -1867,6 +1988,18 @@ def _coerce_optional_ratio(value: object) -> float | None:
     return number
 
 
+def _coerce_positive_int(value: object, *, default: int) -> int:
+    """Coerce one positive integer with a safe fallback."""
+
+    if isinstance(value, bool):
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return default if number < 1 else number
+
+
 def _coerce_spatial_box(value: object) -> SocialSpatialBox | None:
     """Coerce one box-like payload into ``SocialSpatialBox``."""
 
@@ -1913,6 +2046,32 @@ def _coerce_detected_objects(value: object) -> tuple[SocialDetectedObject, ...]:
                 zone=_coerce_person_zone(item.get("zone")),
                 stable=bool(item.get("stable", False)),
                 box=_coerce_spatial_box(item.get("box")),
+            )
+        )
+    return tuple(parsed)
+
+
+def _coerce_visible_persons(value: object) -> tuple[SocialVisiblePerson, ...]:
+    """Coerce one list-like payload to visible-person anchors."""
+
+    if value is None:
+        return ()
+    if isinstance(value, tuple) and all(isinstance(item, SocialVisiblePerson) for item in value):
+        return value
+    if not isinstance(value, (tuple, list)):
+        return ()
+    parsed: list[SocialVisiblePerson] = []
+    for item in value:
+        if isinstance(item, SocialVisiblePerson):
+            parsed.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        parsed.append(
+            SocialVisiblePerson(
+                box=_coerce_spatial_box(item.get("box")),
+                zone=_coerce_person_zone(item.get("zone")),
+                confidence=_coerce_optional_ratio(item.get("confidence")) or 0.0,
             )
         )
     return tuple(parsed)

@@ -192,6 +192,10 @@ swings or inverse-color eyelid strokes that read like extra eyebrows on the
 black background. When a directional external face cue is active, that cue
 should dominate the `waiting` face instead of being overpainted by the normal
 idle side-to-side churn.
+When there is no live attention target, the default `waiting` and `error`
+baseline should still read as calm eye contact from the front rather than an
+up-left idle stare; no-target motion should come from tiny blink/easing only,
+not from an off-axis scan.
 
 That only works if the HDMI loop itself stays fast. The default HDMI display
 poll cadence is intentionally sub-second so local face cues and emoji
@@ -246,6 +250,12 @@ schema stable while still allowing other modules to steer:
 - `blink`
 - `head_dx` / `head_dy`
 
+`gaze_x` / `gaze_y` are intentionally finer-grained than the producer-facing
+emotion presets: low-level cues may use bounded multi-step eye offsets in the
+range `-3..3` so physical HCI paths like person-following can look smoother on
+the Pi instead of snapping between only a few coarse positions. `head_dx` /
+`head_dy` stay tighter and smaller.
+
 Producer modules should use `face_expressions.py` instead of writing raw JSON.
 That helper keeps the low-level cue artifact stable while exposing a richer
 combinable API:
@@ -273,7 +283,7 @@ One bounded low-level payload still looks like:
 ```json
 {
   "source": "camera_surface",
-  "gaze_x": 2,
+  "gaze_x": 3,
   "gaze_y": -1,
   "mouth": "smile",
   "brows": "raised",

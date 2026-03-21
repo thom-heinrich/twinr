@@ -12,8 +12,15 @@ from twinr.hardware.ai_camera import (
     AICameraFineHandGesture,
     AICameraGestureEvent,
     AICameraMotionState,
+    AICameraVisiblePerson,
+    AICameraZone,
     AICameraAdapterConfig,
     LocalAICameraAdapter,
+)
+from twinr.hardware.camera_ai.detection import DetectionResult
+from twinr.hardware.camera_ai.face_anchors import (
+    SupplementalFaceAnchorResult,
+    merge_detection_with_face_anchors,
 )
 from twinr.hardware.camera_ai.config import MediaPipeVisionConfig
 from twinr.hardware.camera_ai.mediapipe_pipeline import MediaPipeVisionResult
@@ -187,6 +194,91 @@ class AICameraTests(unittest.TestCase):
         self.assertFalse(observation.camera_ai_ready)
         self.assertEqual(observation.camera_error, "camera_busy")
         self.assertEqual(observation.person_count, 0)
+
+    def test_adapter_supplements_second_visible_person_from_face_anchors(self) -> None:
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(pose_backend="imx500"),
+            face_anchor_detector=SimpleNamespace(
+                detect=lambda frame: SupplementalFaceAnchorResult(
+                    state="ok",
+                    visible_persons=(
+                        AICameraVisiblePerson(
+                            box=AICameraBox(top=0.18, left=0.08, bottom=0.42, right=0.28),
+                            zone=AICameraZone.LEFT,
+                            confidence=0.91,
+                        ),
+                    ),
+                    face_count=1,
+                )
+            ),
+        )
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+            person_count=1,
+            primary_person_box=AICameraBox(top=0.12, left=0.62, bottom=0.94, right=0.94),
+            primary_person_zone=AICameraZone.RIGHT,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=AICameraBox(top=0.12, left=0.62, bottom=0.94, right=0.94),
+                    zone=AICameraZone.RIGHT,
+                    confidence=0.78,
+                ),
+            ),
+            person_near_device=False,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: SimpleNamespace(shape=(480, 640, 3))
+        adapter._resolve_motion = lambda **_: (AICameraMotionState.STILL, 0.57)
+
+        observation = adapter.observe()
+
+        self.assertEqual(observation.person_count, 2)
+        self.assertEqual(len(observation.visible_persons), 2)
+        self.assertEqual(observation.visible_persons[0].zone, AICameraZone.RIGHT)
+        self.assertEqual(observation.visible_persons[1].zone, AICameraZone.LEFT)
+
+    def test_merge_detection_with_face_anchors_retargets_matching_person_to_face_box(self) -> None:
+        detection = DetectionResult(
+            person_count=1,
+            primary_person_box=AICameraBox(top=0.10, left=0.30, bottom=0.95, right=0.82),
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=AICameraBox(top=0.10, left=0.30, bottom=0.95, right=0.82),
+                    zone=AICameraZone.CENTER,
+                    confidence=0.73,
+                ),
+            ),
+            person_near_device=False,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+
+        merged = merge_detection_with_face_anchors(
+            detection=detection,
+            face_anchors=SupplementalFaceAnchorResult(
+                state="ok",
+                visible_persons=(
+                    AICameraVisiblePerson(
+                        box=AICameraBox(top=0.18, left=0.44, bottom=0.36, right=0.58),
+                        zone=AICameraZone.CENTER,
+                        confidence=0.93,
+                    ),
+                ),
+                face_count=1,
+            ),
+        )
+
+        self.assertEqual(merged.person_count, 1)
+        self.assertEqual(len(merged.visible_persons), 1)
+        self.assertEqual(merged.primary_person_box, detection.primary_person_box)
+        self.assertEqual(
+            merged.visible_persons[0].box,
+            AICameraBox(top=0.18, left=0.44, bottom=0.36, right=0.58),
+        )
+        self.assertEqual(merged.visible_persons[0].zone, AICameraZone.CENTER)
 
     def test_adapter_config_exposes_live_hand_gesture_tuning_through_to_worker_config(self) -> None:
         twinr_config = TwinrConfig(

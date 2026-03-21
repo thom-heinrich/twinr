@@ -17,6 +17,7 @@ from .camera_ai.models import (
     AICameraMotionState,
     AICameraObjectDetection,
     AICameraObservation,
+    AICameraVisiblePerson,
     AICameraZone,
 )
 from .camera_ai.motion import infer_motion_state as _infer_motion_state
@@ -43,6 +44,7 @@ __all__ = [
     "AICameraMotionState",
     "AICameraObjectDetection",
     "AICameraObservation",
+    "AICameraVisiblePerson",
     "AICameraZone",
     "LocalAICameraAdapter",
 ]
