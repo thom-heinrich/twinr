@@ -1224,6 +1224,60 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         self.assertEqual(conflicts[0].slot_key, "contact:person:corinna_maier:phone")
         self.assertFalse(any(event.get("event") == "longterm_remote_read_failed" for event in events))
 
+    def test_select_open_conflicts_falls_back_when_scope_topk_returns_false_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.client = _TermOverlapChonkyClient()
+            remote_state.client.supports_topk_records = True
+            remote_state.read_client = remote_state.client
+            remote_state.write_client = remote_state.client
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            store.write_snapshot(
+                objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_old",
+                        kind="fact",
+                        summary="Deine Lieblingsmarmelade ist Erdbeermarmelade.",
+                        details="Aeltere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="active",
+                        confidence=0.94,
+                        slot_key="preference:breakfast:jam",
+                        value_key="strawberry",
+                    ),
+                    LongTermMemoryObjectV1(
+                        memory_id="fact:jam_preference_new",
+                        kind="fact",
+                        summary="Inzwischen magst du lieber Aprikosenmarmelade.",
+                        details="Neuere Vorliebe fuer das Fruehstueck.",
+                        source=_source(),
+                        status="uncertain",
+                        confidence=0.95,
+                        slot_key="preference:breakfast:jam",
+                        value_key="apricot",
+                    ),
+                ),
+                conflicts=(
+                    LongTermMemoryConflictV1(
+                        slot_key="preference:breakfast:jam",
+                        candidate_memory_id="fact:jam_preference_new",
+                        existing_memory_ids=("fact:jam_preference_old",),
+                        question="Welche Marmelade stimmt gerade?",
+                        reason="Widerspruechliche Marmeladenpraeferenzen liegen vor.",
+                    ),
+                ),
+                archived_objects=(),
+            )
+
+            conflicts = store.select_open_conflicts(
+                query_text="Welche Marmeladen stehen gerade im Widerspruch?",
+                limit=3,
+            )
+
+        self.assertGreater(remote_state.client.topk_records_calls, 0)
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].slot_key, "preference:breakfast:jam")
+
     def test_write_snapshot_logs_remote_bulk_write_failure_diagnostic(self) -> None:
         class _BulkWriteFailingClient(_FakeChonkyClient):
             def store_records_bulk(self, request):

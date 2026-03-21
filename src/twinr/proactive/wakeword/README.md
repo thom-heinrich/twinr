@@ -45,7 +45,7 @@ orchestration and above raw audio/hardware adapters.
 | `cascade.py` | Twinr-specific second-stage DTW-aligned sequence verifier assets and runtime gate |
 | `matching.py` | Transcript and label matching |
 | `kws.py` | sherpa-onnx KWS clip and frame spotting |
-| `kws_assets.py` | Official sherpa-onnx bundle provisioning and Twinr keyword-file generation |
+| `kws_assets.py` | Official sherpa-onnx bundle provisioning, optional phone-lexicon overlays, and Twinr keyword-file generation |
 | `spotter.py` | openWakeWord clip and frame spotting plus optional local verifier loading |
 | `policy.py` | Acceptance, fallback, local cascade gating, and STT verification |
 | `promotion.py` | Runtime-faithful stream replay, promotion specs, suite guards, and ambient false-accepts/hour reports |
@@ -94,6 +94,25 @@ Provision the bundle reproducibly from the leading repo before switching runtime
 PYTHONPATH=src python3 -m twinr \
   --env-file .env \
   --wakeword-kws-provision \
+  --wakeword-kws-force
+```
+
+Phone-based bundles such as `zh_en_3m_phone_int8` can take explicit
+pronunciation overlays during provisioning:
+
+```bash
+PYTHONPATH=src python3 -m twinr \
+  --env-file .env \
+  --wakeword-kws-provision \
+  --wakeword-kws-bundle zh_en_3m_phone_int8 \
+  --wakeword-kws-keyword Twinna \
+  --wakeword-kws-keyword Twina \
+  --wakeword-kws-keyword Twinner \
+  --wakeword-kws-keyword Twinr \
+  --wakeword-kws-lexicon-entry 'Twinna=T W IY1 N AH0' \
+  --wakeword-kws-lexicon-entry 'Twina=T W IY1 N AH0' \
+  --wakeword-kws-lexicon-entry 'Twinner=T W IY1 N ER0' \
+  --wakeword-kws-lexicon-entry 'Twinr=T W IY1 N ER0' \
   --wakeword-kws-force
 ```
 
@@ -161,7 +180,7 @@ PYTHONPATH=src python3 scripts/generate_multivoice_dataset.py \
 - Hard-negative mining is mandatory before another promotion attempt, with priority on real Pi false activations and the confusion family `Twin`, `Winner`, `Winter`, `Tina`, `Timer`, and `Twitter`.
 - Promotion is blocked unless the candidate passes the held-out suites plus the long-form Pi ambient false-accepts/hour guard on the real Twinr runtime evaluation path, driven by `promotion.py` and `twinr --wakeword-promotion-eval`.
 - The new `kws` backend is a professional runtime path built around `sherpa-onnx` streaming keyword spotting. It requires an explicit asset bundle (`tokens.txt`, `encoder.onnx`, `decoder.onnx`, `joiner.onnx`, `keywords.txt`) and stays fail-closed when the bundle is missing or incomplete.
-- `kws_assets.py` provisions the official upstream bundle plus Twinr-specific `keywords_raw.txt`, `keywords.txt`, `bpe.model`, and `bundle_metadata.json` so `/twinr` can be switched without ad-hoc shell work or guessed token sequences.
+- `kws_assets.py` provisions the official upstream bundle plus Twinr-specific `keywords_raw.txt`, `keywords.txt`, optional `bpe.model`, optional phone lexicon files such as `en.phone`, and `bundle_metadata.json` so `/twinr` can be switched without ad-hoc shell work or silently dropped custom wakewords.
 
 ## See also
 

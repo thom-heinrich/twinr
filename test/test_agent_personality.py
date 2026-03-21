@@ -32,6 +32,7 @@ from twinr.agent.personality import (
     RelationshipSignal,
     RemoteStatePersonalitySnapshotStore,
     WorldSignal,
+    WorldInterestSignal,
 )
 from twinr.agent.personality.self_expression import build_mindshare_items
 from twinr.memory.longterm.core.models import (
@@ -275,6 +276,198 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertEqual(len(items), 2)
         self.assertEqual(titles, ["local democracy", "AI companions"])
         self.assertNotIn("Schwarzenbek / Hamburg", titles)
+
+    def test_build_mindshare_items_boosts_topics_with_persisted_engagement(self) -> None:
+        snapshot = PersonalitySnapshot(
+            generated_at="2026-03-20T20:40:00+00:00",
+            relationship_signals=(
+                RelationshipSignal(
+                    topic="AI companions",
+                    summary="The user reliably lights up when companion systems evolve.",
+                    salience=0.72,
+                    source="conversation",
+                ),
+                RelationshipSignal(
+                    topic="world politics",
+                    summary="The user also wants calm awareness of world affairs.",
+                    salience=0.81,
+                    source="conversation",
+                ),
+            ),
+        )
+
+        items = build_mindshare_items(
+            snapshot,
+            max_items=1,
+            engagement_signals=(
+                WorldInterestSignal(
+                    signal_id="interest:ai_companions",
+                    topic="AI companions",
+                    summary="Repeated searches and follow-up questions show strong engagement.",
+                    salience=0.72,
+                    confidence=0.84,
+                    engagement_score=0.94,
+                    evidence_count=3,
+                    engagement_count=5,
+                    updated_at="2026-03-20T20:35:00+00:00",
+                ),
+            ),
+        )
+
+        self.assertEqual([item.title for item in items], ["AI companions"])
+
+    def test_build_mindshare_items_suppresses_topics_in_avoid_state(self) -> None:
+        snapshot = PersonalitySnapshot(
+            generated_at="2026-03-20T20:45:00+00:00",
+            relationship_signals=(
+                RelationshipSignal(
+                    topic="AI companions",
+                    summary="This used to be important, but the user has cooled on it.",
+                    salience=0.86,
+                    source="conversation",
+                ),
+                RelationshipSignal(
+                    topic="world politics",
+                    summary="This remains part of the user's active attention.",
+                    salience=0.8,
+                    source="conversation",
+                ),
+            ),
+        )
+
+        items = build_mindshare_items(
+            snapshot,
+            max_items=2,
+            engagement_signals=(
+                WorldInterestSignal(
+                    signal_id="interest:ai_companions",
+                    topic="AI companions",
+                    summary="Twinr should back off this topic for now.",
+                    salience=0.48,
+                    confidence=0.74,
+                    engagement_score=0.16,
+                    engagement_state="avoid",
+                    engagement_count=0,
+                    positive_signal_count=0,
+                    exposure_count=3,
+                    non_reengagement_count=2,
+                    deflection_count=1,
+                    evidence_count=2,
+                    updated_at="2026-03-20T20:40:00+00:00",
+                    explicit=True,
+                ),
+                WorldInterestSignal(
+                    signal_id="interest:world_politics",
+                    topic="world politics",
+                    summary="The user still leans into this topic.",
+                    salience=0.82,
+                    confidence=0.84,
+                    engagement_score=0.88,
+                    engagement_state="resonant",
+                    engagement_count=4,
+                    positive_signal_count=3,
+                    exposure_count=3,
+                    evidence_count=3,
+                    updated_at="2026-03-20T20:40:00+00:00",
+                ),
+            ),
+        )
+
+        self.assertEqual([item.title for item in items], ["world politics"])
+
+    def test_build_mindshare_items_derive_topic_specific_conversation_appetite(self) -> None:
+        snapshot = PersonalitySnapshot(
+            generated_at="2026-03-20T21:00:00+00:00",
+            style_profile=ConversationStyleProfile(
+                verbosity=0.69,
+                initiative=0.71,
+            ),
+            relationship_signals=(
+                RelationshipSignal(
+                    topic="AI companions",
+                    summary="This topic keeps pulling the user back into the conversation.",
+                    salience=0.88,
+                    source="conversation",
+                ),
+                RelationshipSignal(
+                    topic="world politics",
+                    summary="This matters, but the user does not always want to stay with it for long.",
+                    salience=0.76,
+                    source="conversation",
+                ),
+                RelationshipSignal(
+                    topic="local politics",
+                    summary="This topic has recently cooled after repeated exposure.",
+                    salience=0.73,
+                    source="conversation",
+                ),
+            ),
+        )
+
+        items = build_mindshare_items(
+            snapshot,
+            max_items=3,
+            engagement_signals=(
+                WorldInterestSignal(
+                    signal_id="interest:ai_companions",
+                    topic="AI companions",
+                    summary="Repeated follow-up questions keep this topic resonant.",
+                    salience=0.9,
+                    confidence=0.84,
+                    engagement_score=0.95,
+                    engagement_state="resonant",
+                    engagement_count=5,
+                    positive_signal_count=4,
+                    evidence_count=4,
+                    updated_at="2026-03-20T20:58:00+00:00",
+                ),
+                WorldInterestSignal(
+                    signal_id="interest:world_politics",
+                    topic="world politics",
+                    summary="The user still engages, but less intensely.",
+                    salience=0.77,
+                    confidence=0.8,
+                    engagement_score=0.72,
+                    engagement_state="warm",
+                    engagement_count=2,
+                    positive_signal_count=2,
+                    evidence_count=3,
+                    updated_at="2026-03-20T20:58:00+00:00",
+                ),
+                WorldInterestSignal(
+                    signal_id="interest:local_politics",
+                    topic="local politics",
+                    summary="This topic has not pulled the user back in after several mentions.",
+                    salience=0.48,
+                    confidence=0.74,
+                    engagement_score=0.22,
+                    engagement_state="cooling",
+                    engagement_count=0,
+                    positive_signal_count=0,
+                    exposure_count=3,
+                    non_reengagement_count=2,
+                    evidence_count=3,
+                    updated_at="2026-03-20T20:58:00+00:00",
+                ),
+            ),
+        )
+        item_by_title = {item.title: item for item in items}
+
+        self.assertEqual(item_by_title["AI companions"].appetite.state, "resonant")
+        self.assertEqual(item_by_title["AI companions"].appetite.interest, "active")
+        self.assertEqual(item_by_title["AI companions"].appetite.depth, "deeper")
+        self.assertEqual(item_by_title["AI companions"].appetite.follow_up, "okay_to_explore")
+        self.assertEqual(item_by_title["AI companions"].appetite.proactivity, "brief_offer_if_open")
+        self.assertEqual(item_by_title["world politics"].appetite.state, "warm")
+        self.assertEqual(item_by_title["world politics"].appetite.interest, "growing")
+        self.assertEqual(item_by_title["world politics"].appetite.depth, "deeper")
+        self.assertEqual(item_by_title["world politics"].appetite.follow_up, "okay_to_explore")
+        self.assertEqual(item_by_title["world politics"].appetite.proactivity, "brief_offer_if_open")
+        self.assertEqual(item_by_title["local politics"].appetite.state, "cooling")
+        self.assertEqual(item_by_title["local politics"].appetite.interest, "peripheral")
+        self.assertEqual(item_by_title["local politics"].appetite.depth, "brief")
+        self.assertEqual(item_by_title["local politics"].appetite.follow_up, "wait_for_user_pull")
+        self.assertEqual(item_by_title["local politics"].appetite.proactivity, "only_if_clearly_relevant")
 
     def test_remote_state_store_parses_snapshot_payload(self) -> None:
         payload = {
@@ -855,7 +1048,9 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertAlmostEqual(by_topic["recent topic"].salience, 0.5, places=3)
 
     def test_evolution_loop_updates_world_context_without_mutating_personality(self) -> None:
-        loop = PersonalityEvolutionLoop()
+        loop = PersonalityEvolutionLoop(
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+        )
         snapshot = PersonalitySnapshot(
             humor_profile=HumorProfile(
                 style="gentle observational humor",
@@ -1043,9 +1238,138 @@ class AgentPersonalityTests(unittest.TestCase):
             signals_by_kind["topic_aversion"].delta_target,
             "relationship.topic_aversion:celebrity gossip",
         )
-        self.assertEqual(len(batch.continuity_threads), 1)
-        self.assertEqual(batch.continuity_threads[0].title, "garden renovation")
-        self.assertIn("garden renovation", batch.continuity_threads[0].summary)
+
+    def test_signal_extractor_derives_explicit_topic_engagement_signals_from_consolidation(self) -> None:
+        extractor = PersonalitySignalExtractor(
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+        )
+        turn = LongTermConversationTurn(
+            transcript="Erzaehl mir mehr ueber AI companions, darueber will ich oefter sprechen.",
+            response="Ich bleibe gern bei dem Thema und halte weitere Entwicklungen im Blick.",
+        )
+        consolidation = LongTermConsolidationResultV1(
+            turn_id="turn:topic_engagement",
+            occurred_at=datetime(2026, 3, 20, 11, 45, tzinfo=timezone.utc),
+            episodic_objects=(),
+            durable_objects=(
+                LongTermMemoryObjectV1(
+                    memory_id="pref:topic_follow_up:ai_companions",
+                    kind="fact",
+                    summary="The user explicitly asked to keep talking about AI companions.",
+                    source=self._source("turn:topic_engagement"),
+                    status="active",
+                    confidence=0.9,
+                    attributes={
+                        "memory_domain": "preference",
+                        "fact_type": "preference",
+                        "preference_type": "topic_follow_up",
+                        "topic": "AI companions",
+                        "support_count": 2,
+                    },
+                ),
+                LongTermMemoryObjectV1(
+                    memory_id="feedback:topic:local_politics",
+                    kind="fact",
+                    summary="The user leaned into the local politics thread and wanted a deeper follow-up.",
+                    source=self._source("turn:topic_engagement"),
+                    status="active",
+                    confidence=0.82,
+                    attributes={
+                        "memory_domain": "preference",
+                        "fact_type": "feedback",
+                        "feedback_target": "topic_engagement",
+                        "topic": "local politics",
+                        "feedback_polarity": "positive",
+                        "support_count": 2,
+                    },
+                ),
+            ),
+            deferred_objects=(),
+            conflicts=(),
+            graph_edges=(),
+        )
+
+        batch = extractor.extract_from_consolidation(
+            turn=turn,
+            consolidation=consolidation,
+        )
+        engagement_signals = {
+            signal.target: signal
+            for signal in batch.interaction_signals
+            if signal.signal_kind == "topic_engagement"
+        }
+
+        self.assertEqual(len(engagement_signals), 2)
+        self.assertTrue(engagement_signals["AI companions"].explicit_user_requested)
+        self.assertFalse(engagement_signals["local politics"].explicit_user_requested)
+        self.assertGreaterEqual(engagement_signals["AI companions"].evidence_count, 2)
+        self.assertEqual(batch.continuity_threads, ())
+
+    def test_signal_extractor_requires_repeated_exposure_for_topic_cooling(self) -> None:
+        extractor = PersonalitySignalExtractor(
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+        )
+        turn = LongTermConversationTurn(
+            transcript="Vielleicht lieber etwas anderes.",
+            response="Kein Problem, wir wechseln das Thema.",
+        )
+        consolidation = LongTermConsolidationResultV1(
+            turn_id="turn:topic_cooling",
+            occurred_at=datetime(2026, 3, 20, 11, 50, tzinfo=timezone.utc),
+            episodic_objects=(),
+            durable_objects=(
+                LongTermMemoryObjectV1(
+                    memory_id="pattern:topic_non_reengagement:ai_companions:weak",
+                    kind="pattern",
+                    summary="AI companions was surfaced once but there is not enough evidence yet to cool it down.",
+                    source=self._source("turn:topic_cooling"),
+                    status="active",
+                    confidence=0.76,
+                    attributes={
+                        "memory_domain": "pattern",
+                        "pattern_type": "topic_non_reengagement",
+                        "topic": "AI companions",
+                        "exposure_count": 1,
+                        "non_reengagement_count": 1,
+                    },
+                ),
+                LongTermMemoryObjectV1(
+                    memory_id="pattern:topic_non_reengagement:local_politics:strong",
+                    kind="pattern",
+                    summary="Local politics has been surfaced repeatedly without drawing the user back in.",
+                    source=self._source("turn:topic_cooling"),
+                    status="active",
+                    confidence=0.83,
+                    attributes={
+                        "memory_domain": "pattern",
+                        "pattern_type": "topic_non_reengagement",
+                        "topic": "local politics",
+                        "exposure_count": 3,
+                        "non_reengagement_count": 2,
+                        "exposure_aware": True,
+                    },
+                ),
+            ),
+            deferred_objects=(),
+            conflicts=(),
+            graph_edges=(),
+        )
+
+        batch = extractor.extract_from_consolidation(
+            turn=turn,
+            consolidation=consolidation,
+        )
+        cooling_signals = [
+            signal
+            for signal in batch.interaction_signals
+            if signal.signal_kind == "topic_cooling"
+        ]
+
+        self.assertEqual(len(cooling_signals), 1)
+        self.assertEqual(cooling_signals[0].target, "local politics")
+        self.assertFalse(cooling_signals[0].explicit_user_requested)
+        self.assertEqual(cooling_signals[0].metadata["exposure_count"], 3)
+        self.assertEqual(cooling_signals[0].metadata["non_reengagement_count"], 2)
 
     def test_signal_extractor_derives_world_and_place_signals_from_search_tool_history(self) -> None:
         extractor = PersonalitySignalExtractor(

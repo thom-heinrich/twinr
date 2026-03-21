@@ -269,6 +269,17 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_PROACTIVE_LOCAL_CAMERA_MEDIAPIPE_NUM_HANDS=1",
                         "TWINR_PROACTIVE_LOCAL_CAMERA_SEQUENCE_WINDOW_S=2.4",
                         "TWINR_PROACTIVE_LOCAL_CAMERA_SEQUENCE_MIN_FRAMES=6",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_FRAME_RATE=18",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_BUILTIN_GESTURE_MIN_SCORE=0.31",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_CUSTOM_GESTURE_MIN_SCORE=0.44",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_MIN_HAND_DETECTION_CONFIDENCE=0.27",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_MIN_HAND_PRESENCE_CONFIDENCE=0.28",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_MIN_HAND_TRACKING_CONFIDENCE=0.29",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_MAX_ROI_CANDIDATES=5",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_PRIMARY_PERSON_ROI_PADDING=0.22",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_PRIMARY_PERSON_UPPER_BODY_RATIO=0.81",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_WRIST_ROI_SCALE=0.39",
+                        "TWINR_PROACTIVE_LOCAL_CAMERA_FINE_HAND_EXPLICIT_HOLD_S=0.52",
                     ]
                 )
                 + "\n",
@@ -297,6 +308,51 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_local_camera_mediapipe_num_hands, 1)
         self.assertEqual(config.proactive_local_camera_sequence_window_s, 2.4)
         self.assertEqual(config.proactive_local_camera_sequence_min_frames, 6)
+        self.assertEqual(config.proactive_local_camera_frame_rate, 18)
+        self.assertEqual(config.proactive_local_camera_builtin_gesture_min_score, 0.31)
+        self.assertEqual(config.proactive_local_camera_custom_gesture_min_score, 0.44)
+        self.assertEqual(config.proactive_local_camera_min_hand_detection_confidence, 0.27)
+        self.assertEqual(config.proactive_local_camera_min_hand_presence_confidence, 0.28)
+        self.assertEqual(config.proactive_local_camera_min_hand_tracking_confidence, 0.29)
+        self.assertEqual(config.proactive_local_camera_max_roi_candidates, 5)
+        self.assertEqual(config.proactive_local_camera_primary_person_roi_padding, 0.22)
+        self.assertEqual(config.proactive_local_camera_primary_person_upper_body_ratio, 0.81)
+        self.assertEqual(config.proactive_local_camera_wrist_roi_scale, 0.39)
+        self.assertEqual(config.proactive_local_camera_fine_hand_explicit_hold_s, 0.52)
+
+    def test_local_camera_defaults_favor_interactive_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.proactive_local_camera_metadata_wait_s, 0.75)
+        self.assertEqual(config.proactive_local_camera_pose_refresh_s, 0.75)
+
+    def test_from_env_defaults_hdmi_display_to_fast_local_hci_cadence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_driver, "hdmi_fbdev")
+        self.assertAlmostEqual(config.display_attention_refresh_interval_s, 0.2, places=3)
+        self.assertAlmostEqual(config.display_poll_interval_s, 0.12, places=3)
+
+    def test_from_env_keeps_slower_display_poll_default_for_waveshare(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "TWINR_DISPLAY_DRIVER=waveshare_4in2_v2\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.display_driver, "waveshare_4in2_v2")
+        self.assertAlmostEqual(config.display_poll_interval_s, 0.5, places=3)
 
     def test_reads_openai_button_and_printer_settings_from_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

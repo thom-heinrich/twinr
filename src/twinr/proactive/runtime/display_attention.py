@@ -289,9 +289,9 @@ def resolve_display_attention_refresh_interval(config: TwinrConfig) -> float | N
     """Return the bounded local refresh cadence for HDMI attention-follow."""
 
     try:
-        interval_s = float(getattr(config, "display_attention_refresh_interval_s", 0.6) or 0.0)
+        interval_s = float(getattr(config, "display_attention_refresh_interval_s", 0.35) or 0.0)
     except (TypeError, ValueError):
-        return 0.6
+        return 0.35
     if not math.isfinite(interval_s) or interval_s <= 0.0:
         return None
     return max(_MIN_REFRESH_INTERVAL_S, interval_s)
@@ -404,12 +404,15 @@ def _head_offsets_for_gaze(
     """Add a bounded head drift so the face turns before full eye commits."""
 
     gaze_x, gaze_y = gaze.axes()
-    horizontal = _head_dx_from_camera(
-        camera_center_x=camera_center_x,
-        camera_zone=camera_zone,
-    )
-    if horizontal == 0 and gaze_x:
-        horizontal = _sign(gaze_x)
+    if gaze_x:
+        # Keep committed side gazes visually stable. Small box jitter inside the
+        # same side should not make the head wobble between soft/strong turns.
+        horizontal = 2 * _sign(gaze_x)
+    else:
+        horizontal = _head_dx_from_camera(
+            camera_center_x=camera_center_x,
+            camera_zone=camera_zone,
+        )
     vertical = 0 if horizontal else _sign(gaze_y)
     return horizontal, vertical
 
@@ -432,9 +435,9 @@ def _direction_hold_seconds(config: TwinrConfig) -> float:
         try:
             refresh_interval_s = float(getattr(config, "proactive_capture_interval_s", 6.0) or 6.0)
         except (TypeError, ValueError):
-            refresh_interval_s = 0.6
+            refresh_interval_s = 0.35
     if not math.isfinite(refresh_interval_s) or refresh_interval_s <= 0.0:
-        refresh_interval_s = 0.6
+        refresh_interval_s = 0.35
     return max(_MIN_DIRECTION_HOLD_S, min(_MAX_DIRECTION_HOLD_S, refresh_interval_s * 1.8))
 
 

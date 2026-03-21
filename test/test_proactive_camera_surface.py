@@ -166,6 +166,160 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
         self.assertIn("camera.fine_hand_gesture_detected", first.event_names)
         self.assertNotIn("camera.fine_hand_gesture_detected", repeated.event_names)
 
+    def test_surface_holds_explicit_fine_hand_gesture_across_brief_none_dropout(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                gesture_event_cooldown_s=0.0,
+                fine_hand_explicit_hold_s=0.5,
+            )
+        )
+
+        first = surface.observe(
+            inspected=True,
+            observed_at=1.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.THUMBS_UP,
+                fine_hand_gesture_confidence=0.84,
+            ),
+        )
+        held = surface.observe(
+            inspected=True,
+            observed_at=1.25,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.NONE,
+                fine_hand_gesture_confidence=None,
+            ),
+        )
+        expired = surface.observe(
+            inspected=True,
+            observed_at=1.7,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.NONE,
+                fine_hand_gesture_confidence=None,
+            ),
+        )
+
+        self.assertIn("camera.fine_hand_gesture_detected", first.event_names)
+        self.assertEqual(held.snapshot.fine_hand_gesture, SocialFineHandGesture.THUMBS_UP)
+        self.assertEqual(expired.snapshot.fine_hand_gesture, SocialFineHandGesture.NONE)
+
+    def test_surface_treats_local_camera_health_failure_as_unknown_not_no_person(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                person_visible_unknown_hold_s=5.0,
+                secondary_unknown_hold_s=5.0,
+            )
+        )
+
+        first = surface.observe(
+            inspected=True,
+            observed_at=1.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                primary_person_zone=SocialPersonZone.LEFT,
+                primary_person_center_x=0.18,
+                camera_online=True,
+                camera_ready=True,
+                camera_ai_ready=True,
+                last_camera_frame_at=1.0,
+            ),
+        )
+        degraded = surface.observe(
+            inspected=True,
+            observed_at=1.8,
+            observation=SocialVisionObservation(
+                person_visible=False,
+                person_count=0,
+                camera_online=True,
+                camera_ready=False,
+                camera_ai_ready=False,
+                camera_error="camera_busy",
+                last_camera_frame_at=1.0,
+            ),
+        )
+
+        self.assertTrue(first.snapshot.person_visible)
+        self.assertTrue(degraded.snapshot.person_visible)
+        self.assertTrue(degraded.snapshot.person_visible_unknown)
+        self.assertEqual(degraded.snapshot.person_count, 1)
+        self.assertTrue(degraded.snapshot.person_count_unknown)
+        self.assertEqual(degraded.snapshot.primary_person_zone, SocialPersonZone.LEFT)
+        self.assertTrue(degraded.snapshot.primary_person_zone_unknown)
+        self.assertAlmostEqual(degraded.snapshot.primary_person_center_x or 0.0, 0.18, places=3)
+        self.assertTrue(degraded.snapshot.primary_person_center_x_unknown)
+
+    def test_surface_smooths_primary_person_center_across_small_box_jitter(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                primary_person_center_smoothing_alpha=0.5,
+                primary_person_center_deadband=0.02,
+                primary_person_center_smoothing_window_s=2.0,
+            )
+        )
+
+        first = surface.observe(
+            inspected=True,
+            observed_at=1.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                primary_person_box=SocialSpatialBox(top=0.1, left=0.18, bottom=0.85, right=0.48),
+            ),
+        )
+        second = surface.observe(
+            inspected=True,
+            observed_at=1.3,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                primary_person_box=SocialSpatialBox(top=0.1, left=0.27, bottom=0.85, right=0.57),
+            ),
+        )
+
+        self.assertAlmostEqual(first.snapshot.primary_person_center_x or 0.0, 0.33, places=3)
+        self.assertAlmostEqual(second.snapshot.primary_person_center_x or 0.0, 0.375, places=3)
+
+    def test_surface_holds_primary_person_center_when_jitter_stays_inside_deadband(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                primary_person_center_smoothing_alpha=0.5,
+                primary_person_center_deadband=0.03,
+                primary_person_center_smoothing_window_s=2.0,
+            )
+        )
+
+        first = surface.observe(
+            inspected=True,
+            observed_at=1.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                primary_person_center_x=0.49,
+            ),
+        )
+        second = surface.observe(
+            inspected=True,
+            observed_at=1.2,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                primary_person_center_x=0.51,
+            ),
+        )
+
+        self.assertAlmostEqual(first.snapshot.primary_person_center_x or 0.0, 0.49, places=3)
+        self.assertAlmostEqual(second.snapshot.primary_person_center_x or 0.0, 0.49, places=3)
+
     def test_surface_accepts_legacy_gesture_event_alias_without_coarse_arm_field(self) -> None:
         surface = ProactiveCameraSurface(
             config=ProactiveCameraSurfaceConfig(
@@ -233,6 +387,18 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(config.gesture_event_cooldown_s, 1.2, places=3)
+
+    def test_from_config_keeps_primary_person_center_smoothing_subsecond(self) -> None:
+        config = ProactiveCameraSurfaceConfig.from_config(
+            SimpleNamespace(
+                proactive_capture_interval_s=6.0,
+                display_attention_refresh_interval_s=0.2,
+            )
+        )
+
+        self.assertAlmostEqual(config.primary_person_center_smoothing_alpha, 0.76, places=3)
+        self.assertAlmostEqual(config.primary_person_center_deadband, 0.012, places=3)
+        self.assertAlmostEqual(config.primary_person_center_smoothing_window_s, 0.35, places=3)
 
     def test_surface_holds_visible_state_through_brief_unknown_gap(self) -> None:
         surface = ProactiveCameraSurface(

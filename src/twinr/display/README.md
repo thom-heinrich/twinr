@@ -193,6 +193,10 @@ black background. When a directional external face cue is active, that cue
 should dominate the `waiting` face instead of being overpainted by the normal
 idle side-to-side churn.
 
+That only works if the HDMI loop itself stays fast. The default HDMI display
+poll cadence is intentionally sub-second so local face cues and emoji
+acknowledgements do not feel delayed by a slow generic status loop.
+
 That senior-facing HDMI surface is now modeled as its own scene module instead
 of being inlined into the framebuffer adapter. `hdmi_default_scene.py` owns the
 default-scene layout, face animation, header model, and reserved right-hand

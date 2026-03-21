@@ -160,10 +160,14 @@ class PiRepoMirrorWatchdog:
         self,
         *,
         apply_sync: bool = True,
-        checksum: bool = False,
+        checksum: bool = True,
         max_change_lines: int = 40,
     ) -> PiRepoMirrorCycleResult:
-        """Run one drift probe and optionally heal the Pi checkout."""
+        """Run one drift probe and optionally heal the Pi checkout.
+
+        By default this compares file contents via ``rsync --checksum`` so a
+        same-size, same-mtime drift cannot be misclassified as clean.
+        """
 
         if max_change_lines <= 0:
             raise ValueError("max_change_lines must be greater than zero")
@@ -205,14 +209,18 @@ class PiRepoMirrorWatchdog:
         interval_s: float = 5.0,
         duration_s: float | None = None,
         checksum_every_s: float | None = 300.0,
-        checksum_always: bool = False,
+        checksum_always: bool = True,
         apply_sync: bool = True,
         max_change_lines: int = 40,
         on_cycle: _CycleCallback | None = None,
         on_error: _ErrorCallback | None = None,
         max_cycles: int | None = None,
     ) -> PiRepoMirrorRunResult:
-        """Run the mirror loop for a bounded duration or until interrupted."""
+        """Run the mirror loop for a bounded duration or until interrupted.
+
+        Exact-content checks are the default on every cycle. ``checksum_every_s``
+        only matters when callers explicitly opt into metadata-only probes.
+        """
 
         if interval_s <= 0:
             raise ValueError("interval_s must be greater than zero")
@@ -297,8 +305,10 @@ class PiRepoMirrorWatchdog:
             args.append("--dry-run")
         if checksum:
             args.append("--checksum")
+        # Perishable filters keep Pi-local runtime paths at the remote root
+        # without pinning unrelated deleted directory trees in place.
         for pattern in self.protected_patterns:
-            args.append(f"--exclude={pattern}")
+            args.append(f"--filter=-p {pattern}")
         args.append(f"{self.project_root}/")
         args.append(
             f"{self.connection_settings.user}@{self.connection_settings.host}:{self.remote_root}/"

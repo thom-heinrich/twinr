@@ -33,6 +33,20 @@ _GESTURE_EVENT = "camera.gesture_detected"
 _COARSE_ARM_GESTURE_EVENT = "camera.coarse_arm_gesture_detected"
 _FINE_HAND_GESTURE_EVENT = "camera.fine_hand_gesture_detected"
 _OBJECT_STABLE_EVENT = "camera.object_detected_stable"
+_EXPLICIT_FINE_HAND_GESTURES = frozenset(
+    {
+        SocialFineHandGesture.THUMBS_UP,
+        SocialFineHandGesture.THUMBS_DOWN,
+        SocialFineHandGesture.POINTING,
+        SocialFineHandGesture.OK_SIGN,
+    }
+)
+_MIN_CENTER_SMOOTHING_ALPHA = 0.1
+_MAX_CENTER_SMOOTHING_ALPHA = 1.0
+_MIN_CENTER_DEADBAND = 0.0
+_MAX_CENTER_DEADBAND = 0.25
+_MIN_CENTER_SMOOTHING_WINDOW_S = 0.1
+_MAX_CENTER_SMOOTHING_WINDOW_S = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +78,10 @@ class ProactiveCameraSurfaceConfig:
     hand_or_object_near_camera_event_cooldown_s: float = 9.0
     motion_event_cooldown_s: float = 9.0
     gesture_event_cooldown_s: float = 9.0
+    fine_hand_explicit_hold_s: float = 0.45
+    primary_person_center_smoothing_alpha: float = 0.58
+    primary_person_center_deadband: float = 0.028
+    primary_person_center_smoothing_window_s: float = 1.4
     object_on_samples: int = 2
     object_off_samples: int = 2
     object_unknown_hold_s: float = 9.0
@@ -118,6 +136,25 @@ class ProactiveCameraSurfaceConfig:
         )
         _require_non_negative_float(self.motion_event_cooldown_s, field_name="motion_event_cooldown_s")
         _require_non_negative_float(self.gesture_event_cooldown_s, field_name="gesture_event_cooldown_s")
+        _require_non_negative_float(self.fine_hand_explicit_hold_s, field_name="fine_hand_explicit_hold_s")
+        _require_bounded_ratio(
+            self.primary_person_center_smoothing_alpha,
+            field_name="primary_person_center_smoothing_alpha",
+            minimum=_MIN_CENTER_SMOOTHING_ALPHA,
+            maximum=_MAX_CENTER_SMOOTHING_ALPHA,
+        )
+        _require_bounded_ratio(
+            self.primary_person_center_deadband,
+            field_name="primary_person_center_deadband",
+            minimum=_MIN_CENTER_DEADBAND,
+            maximum=_MAX_CENTER_DEADBAND,
+        )
+        _require_bounded_float(
+            self.primary_person_center_smoothing_window_s,
+            field_name="primary_person_center_smoothing_window_s",
+            minimum=_MIN_CENTER_SMOOTHING_WINDOW_S,
+            maximum=_MAX_CENTER_SMOOTHING_WINDOW_S,
+        )
         _require_positive_int(self.object_on_samples, field_name="object_on_samples")
         _require_positive_int(self.object_off_samples, field_name="object_off_samples")
         _require_non_negative_float(self.object_unknown_hold_s, field_name="object_unknown_hold_s")
@@ -135,6 +172,17 @@ class ProactiveCameraSurfaceConfig:
         unknown_hold_s = max(interval_s + 1.0, interval_s * 1.5)
         cooldown_s = max(interval_s, interval_s * 1.5)
         gesture_cooldown_s = max(0.8, min(2.0, attention_refresh_s * 2.0))
+        fine_hand_explicit_hold_s = max(0.2, min(0.8, attention_refresh_s * 0.75))
+        # HDMI face-follow must still suppress tiny box wobble, but the old
+        # 4x refresh window made person anchors feel visibly delayed on the Pi.
+        center_smoothing_window_s = max(
+            _MIN_CENTER_SMOOTHING_WINDOW_S,
+            min(_MAX_CENTER_SMOOTHING_WINDOW_S, attention_refresh_s * 1.75),
+        )
+        center_deadband = max(
+            0.012,
+            min(_MAX_CENTER_DEADBAND, attention_refresh_s * 0.05),
+        )
         return cls(
             person_visible_unknown_hold_s=unknown_hold_s,
             person_visible_event_cooldown_s=cooldown_s,
@@ -152,6 +200,13 @@ class ProactiveCameraSurfaceConfig:
             hand_or_object_near_camera_event_cooldown_s=cooldown_s,
             motion_event_cooldown_s=cooldown_s,
             gesture_event_cooldown_s=gesture_cooldown_s,
+            fine_hand_explicit_hold_s=_coerce_non_negative_float(
+                getattr(config, "proactive_local_camera_fine_hand_explicit_hold_s", fine_hand_explicit_hold_s),
+                default=fine_hand_explicit_hold_s,
+            ),
+            primary_person_center_smoothing_alpha=0.76,
+            primary_person_center_deadband=center_deadband,
+            primary_person_center_smoothing_window_s=center_smoothing_window_s,
             object_unknown_hold_s=unknown_hold_s,
             secondary_unknown_hold_s=unknown_hold_s,
         )
@@ -678,6 +733,9 @@ class ProactiveCameraSurface:
         self._last_fine_hand_gesture_confidence_at: float | None = None
         self._last_fine_hand_gesture_emitted_at: float | None = None
         self._last_fine_hand_gesture_emitted_event = SocialFineHandGesture.NONE
+        self._last_explicit_fine_hand_gesture = SocialFineHandGesture.NONE
+        self._last_explicit_fine_hand_gesture_at: float | None = None
+        self._last_explicit_fine_hand_gesture_confidence: float | None = None
         self._has_seen_person = False
         self._last_authoritative_person_visible = False
         self._last_person_seen_at: float | None = None
@@ -699,36 +757,37 @@ class ProactiveCameraSurface:
         """Consume one raw observation and return the stabilized camera update."""
 
         now = _coerce_timestamp(observed_at)
+        camera_semantics_authoritative = inspected and _camera_semantics_authoritative(observation)
         person_sample = self._person_visible.observe(
-            observation.person_visible if inspected else None,
+            observation.person_visible if camera_semantics_authoritative else None,
             observed_at=now,
         )
         person_returned_after_absence = self._resolve_person_returned(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             observed_at=now,
             person_visible=person_sample.value,
             person_visible_rising=person_sample.rising_edge,
         )
         person_count, person_count_unknown = self._resolve_person_count(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             person_visible=person_sample.value,
             observed_at=now,
             person_count=getattr(observation, "person_count", 0),
         )
         primary_person_zone, primary_person_zone_unknown = self._resolve_primary_person_zone(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             person_visible=person_sample.value,
             observed_at=now,
             primary_person_zone=getattr(observation, "primary_person_zone", SocialPersonZone.UNKNOWN),
         )
         primary_person_box, primary_person_box_unknown = self._resolve_primary_person_box(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             person_visible=person_sample.value,
             observed_at=now,
             primary_person_box=getattr(observation, "primary_person_box", None),
         )
         primary_person_center_x, primary_person_center_x_unknown = self._resolve_primary_person_center(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             person_visible=person_sample.value,
             observed_at=now,
             raw_center=getattr(observation, "primary_person_center_x", None),
@@ -736,7 +795,7 @@ class ProactiveCameraSurface:
             axis="x",
         )
         primary_person_center_y, primary_person_center_y_unknown = self._resolve_primary_person_center(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             person_visible=person_sample.value,
             observed_at=now,
             raw_center=getattr(observation, "primary_person_center_y", None),
@@ -745,82 +804,86 @@ class ProactiveCameraSurface:
         )
 
         looking_sample = self._looking_toward_device.observe(
-            (person_sample.value and observation.looking_toward_device) if inspected else None,
+            (person_sample.value and observation.looking_toward_device) if camera_semantics_authoritative else None,
             observed_at=now,
         )
         person_near_sample = self._person_near_device.observe(
-            (person_sample.value and bool(getattr(observation, "person_near_device", False))) if inspected else None,
+            (
+                person_sample.value and bool(getattr(observation, "person_near_device", False))
+            ) if camera_semantics_authoritative else None,
             observed_at=now,
         )
         engaged_sample = self._engaged_with_device.observe(
-            (person_sample.value and bool(getattr(observation, "engaged_with_device", False))) if inspected else None,
+            (
+                person_sample.value and bool(getattr(observation, "engaged_with_device", False))
+            ) if camera_semantics_authoritative else None,
             observed_at=now,
         )
         hand_sample = self._hand_near_camera.observe(
-            (bool(observation.hand_or_object_near_camera) if inspected else None),
+            (bool(observation.hand_or_object_near_camera) if camera_semantics_authoritative else None),
             observed_at=now,
         )
         showing_sample = self._showing_intent.observe(
             (
                 bool(getattr(observation, "showing_intent_likely", False))
-                if inspected
+                if camera_semantics_authoritative
                 else None
             ),
             observed_at=now,
         )
         self._resolve_showing_started_at(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             observed_at=now,
             showing_rising=showing_sample.rising_edge,
         )
 
         visual_attention_score, visual_attention_score_unknown = self._resolve_visual_attention_score(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             person_visible=person_sample.value,
             observed_at=now,
             raw_score=getattr(observation, "visual_attention_score", None),
         )
         body_pose, body_pose_unknown = self._resolve_body_pose(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             person_visible=person_sample.value,
             observed_at=now,
             raw_pose=observation.body_pose,
         )
         pose_confidence, pose_confidence_unknown = self._resolve_pose_confidence(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             person_visible=person_sample.value,
             observed_at=now,
             raw_confidence=getattr(observation, "pose_confidence", None),
         )
         body_state_changed_at, body_state_changed_at_unknown = self._resolve_body_state_changed_at(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             observed_at=now,
         )
         motion_state, motion_state_unknown, motion_rising = self._resolve_motion_state(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             person_visible=person_sample.value,
             observed_at=now,
             raw_state=getattr(observation, "motion_state", SocialMotionState.UNKNOWN),
         )
         motion_confidence, motion_confidence_unknown = self._resolve_motion_confidence(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             person_visible=person_sample.value,
             observed_at=now,
             raw_confidence=getattr(observation, "motion_confidence", None),
         )
         motion_state_changed_at, motion_state_changed_at_unknown = self._resolve_motion_state_changed_at(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             observed_at=now,
         )
         smiling, smiling_unknown = self._resolve_smiling(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             person_visible=person_sample.value,
             observed_at=now,
             smiling=observation.smiling,
         )
         gesture_event, gesture_event_unknown, gesture_confidence, gesture_confidence_unknown, gesture_rising = (
             self._resolve_gesture(
-                inspected=inspected,
+                inspected=camera_semantics_authoritative,
                 observed_at=now,
                 gesture_event=_coalesce_coarse_gesture_aliases(observation),
                 gesture_confidence=getattr(observation, "gesture_confidence", None),
@@ -833,13 +896,13 @@ class ProactiveCameraSurface:
             fine_hand_gesture_confidence_unknown,
             fine_hand_gesture_rising,
         ) = self._resolve_fine_hand_gesture(
-            inspected=inspected,
+            inspected=camera_semantics_authoritative,
             observed_at=now,
             fine_hand_gesture=getattr(observation, "fine_hand_gesture", SocialFineHandGesture.NONE),
             fine_hand_gesture_confidence=getattr(observation, "fine_hand_gesture_confidence", None),
         )
         objects_view = self._object_tracker.observe(
-            _coerce_detected_objects(getattr(observation, "objects", ())) if inspected else None,
+            _coerce_detected_objects(getattr(observation, "objects", ())) if camera_semantics_authoritative else None,
             observed_at=now,
         )
 
@@ -1131,6 +1194,11 @@ class ProactiveCameraSurface:
                 value = box.center_x if axis == "x" else box.center_y
             else:
                 value = _coerce_optional_ratio(raw_center)
+            value = self._smooth_primary_person_center(
+                axis=axis,
+                observed_at=observed_at,
+                value=value,
+            )
             if axis == "x":
                 self._last_primary_person_center_x = value
                 self._last_primary_person_center_x_at = _coerce_timestamp(observed_at)
@@ -1152,6 +1220,38 @@ class ProactiveCameraSurface:
             fallback=None,
             observed_at=observed_at,
         )
+
+    def _smooth_primary_person_center(
+        self,
+        *,
+        axis: str,
+        observed_at: float,
+        value: float | None,
+    ) -> float | None:
+        """Dampen primary-person center jitter without making target switches sluggish."""
+
+        if value is None:
+            return None
+        previous_value = (
+            self._last_primary_person_center_x if axis == "x" else self._last_primary_person_center_y
+        )
+        previous_at = (
+            self._last_primary_person_center_x_at if axis == "x" else self._last_primary_person_center_y_at
+        )
+        if previous_value is None or previous_at is None:
+            return value
+        previous_seen_at = _coerce_timestamp(previous_at)
+        current_seen_at = _coerce_timestamp(observed_at)
+        if previous_seen_at is None or current_seen_at is None:
+            return value
+        if (current_seen_at - previous_seen_at) > self.config.primary_person_center_smoothing_window_s:
+            return value
+        delta = value - previous_value
+        if abs(delta) <= self.config.primary_person_center_deadband:
+            return previous_value
+        alpha = self.config.primary_person_center_smoothing_alpha
+        smoothed = previous_value + (delta * alpha)
+        return max(0.0, min(1.0, smoothed))
 
     def _resolve_visual_attention_score(
         self,
@@ -1379,8 +1479,13 @@ class ProactiveCameraSurface:
 
         now = _coerce_timestamp(observed_at)
         if inspected:
-            event = _coerce_fine_hand_gesture(fine_hand_gesture)
-            confidence = _coerce_optional_ratio(fine_hand_gesture_confidence)
+            raw_event = _coerce_fine_hand_gesture(fine_hand_gesture)
+            raw_confidence = _coerce_optional_ratio(fine_hand_gesture_confidence)
+            event, confidence = self._stabilize_fine_hand_gesture(
+                event=raw_event,
+                confidence=raw_confidence,
+                now=now,
+            )
             self._last_fine_hand_gesture = event
             self._last_fine_hand_gesture_at = now
             self._last_fine_hand_gesture_confidence = confidence
@@ -1411,6 +1516,44 @@ class ProactiveCameraSurface:
             observed_at=observed_at,
         )
         return event, event_unknown, confidence, confidence_unknown, False
+
+    def _stabilize_fine_hand_gesture(
+        self,
+        *,
+        event: SocialFineHandGesture,
+        confidence: float | None,
+        now: float,
+    ) -> tuple[SocialFineHandGesture, float | None]:
+        """Preserve explicit hand symbols across brief motion/dropout jitter.
+
+        Explicit symbols like thumbs-up or OK-sign are harder for the live Pi
+        path than a generic open palm. Keep the last explicit symbol briefly
+        when the current frame drops to ``none`` or weakly collapses to
+        ``open_palm`` so users do not need to freeze unnaturally.
+        """
+
+        if event in _EXPLICIT_FINE_HAND_GESTURES:
+            self._last_explicit_fine_hand_gesture = event
+            self._last_explicit_fine_hand_gesture_at = now
+            self._last_explicit_fine_hand_gesture_confidence = confidence
+            return event, confidence
+
+        held_event = self._last_explicit_fine_hand_gesture
+        held_at = self._last_explicit_fine_hand_gesture_at
+        if held_event not in _EXPLICIT_FINE_HAND_GESTURES or held_at is None:
+            return event, confidence
+        if (now - held_at) > self.config.fine_hand_explicit_hold_s:
+            return event, confidence
+        held_confidence = self._last_explicit_fine_hand_gesture_confidence
+        current_confidence = 0.0 if confidence is None else confidence
+        if event in {SocialFineHandGesture.NONE, SocialFineHandGesture.UNKNOWN}:
+            return held_event, held_confidence
+        if (
+            event == SocialFineHandGesture.OPEN_PALM
+            and (held_confidence or 0.0) >= max(0.55, current_confidence + 0.1)
+        ):
+            return held_event, held_confidence
+        return event, confidence
 
     def _gesture_ready_to_emit(
         self,
@@ -1800,6 +1943,41 @@ def _coerce_non_negative_int(value: object, *, default: int) -> int:
     return number
 
 
+def _camera_health_surface_present(observation: SocialVisionObservation) -> bool:
+    """Return whether the observation carries meaningful local camera health."""
+
+    return any(
+        (
+            bool(getattr(observation, "camera_online", False)),
+            bool(getattr(observation, "camera_ready", False)),
+            bool(getattr(observation, "camera_ai_ready", False)),
+            bool(str(getattr(observation, "camera_error", "") or "").strip()),
+            getattr(observation, "last_camera_frame_at", None) is not None,
+            getattr(observation, "last_camera_health_change_at", None) is not None,
+        )
+    )
+
+
+def _camera_semantics_authoritative(observation: SocialVisionObservation) -> bool:
+    """Return whether person/pose/gesture fields describe one real camera frame.
+
+    The local AI-camera path can emit explicit health failures. Those failures
+    must make camera semantics unknown, not concrete "no person" facts, so the
+    gaze/gesture layers can hold the last stable target through brief runtime
+    faults instead of clearing immediately.
+    """
+
+    if not _camera_health_surface_present(observation):
+        return True
+    if not bool(getattr(observation, "camera_online", False)):
+        return False
+    if not bool(getattr(observation, "camera_ready", False)):
+        return False
+    if not bool(getattr(observation, "camera_ai_ready", False)):
+        return False
+    return not bool(str(getattr(observation, "camera_error", "") or "").strip())
+
+
 def _coerce_positive_float(value: object, *, default: float) -> float:
     """Return a finite positive float, falling back to ``default`` when needed."""
 
@@ -1807,6 +1985,17 @@ def _coerce_positive_float(value: object, *, default: float) -> float:
         return default
     number = float(value)
     if not math.isfinite(number) or number <= 0.0:
+        return default
+    return number
+
+
+def _coerce_non_negative_float(value: object, *, default: float) -> float:
+    """Return one finite non-negative float, falling back to ``default``."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0:
         return default
     return number
 
@@ -1829,6 +2018,40 @@ def _require_non_negative_float(value: object, *, field_name: str) -> float:
     if not math.isfinite(number) or number < 0.0:
         raise ValueError(f"{field_name} must be a non-negative float")
     return number
+
+
+def _require_bounded_float(
+    value: object,
+    *,
+    field_name: str,
+    minimum: float,
+    maximum: float,
+) -> float:
+    """Validate and return one bounded float config value."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be a finite float")
+    number = float(value)
+    if not math.isfinite(number) or number < minimum or number > maximum:
+        raise ValueError(f"{field_name} must be between {minimum} and {maximum}")
+    return number
+
+
+def _require_bounded_ratio(
+    value: object,
+    *,
+    field_name: str,
+    minimum: float,
+    maximum: float,
+) -> float:
+    """Validate and return one bounded ratio-like float config value."""
+
+    return _require_bounded_float(
+        value,
+        field_name=field_name,
+        minimum=minimum,
+        maximum=maximum,
+    )
 
 
 __all__ = [

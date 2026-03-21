@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -63,14 +64,15 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertFalse(result.drift_detected)
         self.assertFalse(result.sync_applied)
         self.assertTrue(result.verified_clean)
-        self.assertFalse(result.checksum_used)
+        self.assertTrue(result.checksum_used)
         self.assertEqual(result.change_count, 0)
         self.assertEqual(len(commands), 1)
         joined = " ".join(commands[0])
         self.assertIn("sshpass -e rsync", joined)
+        self.assertIn("--checksum", joined)
         self.assertIn("--delete", joined)
         self.assertIn("--itemize-changes", joined)
-        self.assertIn("--exclude=.env", joined)
+        self.assertIn("--filter=-p .env", joined)
         self.assertNotIn("--dry-run", commands[0])
         self.assertEqual(envs[0]["SSHPASS"], "chaos")
 
@@ -117,7 +119,7 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
             (">f+++++++++ src/app.py", "*deleting   stale.py"),
         )
         self.assertEqual(len(commands), 2)
-        self.assertNotIn("--checksum", commands[0])
+        self.assertIn("--checksum", commands[0])
         self.assertIn("--dry-run", commands[1])
         self.assertIn("--checksum", commands[1])
 
@@ -193,7 +195,6 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
 
             result = watchdog.run(
                 interval_s=1.0,
-                checksum_always=True,
                 max_cycles=2,
                 on_cycle=cycles.append,
                 on_error=lambda exc, failure_count: errors.append((str(exc), failure_count)),
@@ -208,6 +209,32 @@ class PiRepoMirrorWatchdogTests(unittest.TestCase):
         self.assertEqual(len(commands), 2)
         self.assertIn("--checksum", commands[0])
         self.assertIn("--checksum", commands[1])
+
+    @unittest.skipUnless(shutil.which("rsync"), "rsync required")
+    def test_perishable_filters_preserve_root_env_but_allow_nested_tree_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as dest_dir:
+            source = Path(source_dir)
+            destination = Path(dest_dir)
+            (destination / ".env").write_text("PI_ONLY=1\n", encoding="utf-8")
+            nested_root = destination / "home" / "thh" / "twinr"
+            nested_root.mkdir(parents=True)
+            (nested_root / ".env").write_text("STALE=1\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    "rsync",
+                    "-ai",
+                    "--delete",
+                    "--filter=-p .env",
+                    f"{source}/",
+                    f"{destination}/",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertTrue((destination / ".env").exists())
+            self.assertFalse((destination / "home").exists())
 
 
 if __name__ == "__main__":

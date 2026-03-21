@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from pathlib import PurePath
+from pathlib import Path, PurePath
 
 from twinr.agent.base_agent.config import TwinrConfig
 
@@ -25,11 +25,12 @@ _DEFAULT_POSE_BACKEND = "mediapipe"
 _DEFAULT_MEDIAPIPE_POSE_MODEL = "state/mediapipe/models/pose_landmarker_full.task"
 _DEFAULT_MEDIAPIPE_HAND_LANDMARKER_MODEL = "state/mediapipe/models/hand_landmarker.task"
 _DEFAULT_MEDIAPIPE_GESTURE_MODEL = "state/mediapipe/models/gesture_recognizer.task"
+_DEFAULT_MEDIAPIPE_CUSTOM_GESTURE_MODEL = "state/mediapipe/models/custom_gesture.task"
 _DEFAULT_MAIN_SIZE = (640, 480)
-_DEFAULT_FRAME_RATE = 10
+_DEFAULT_FRAME_RATE = 15
 _DEFAULT_LOCK_TIMEOUT_S = 5.0
 _DEFAULT_STARTUP_WARMUP_S = 0.8
-_DEFAULT_METADATA_WAIT_S = 3.0
+_DEFAULT_METADATA_WAIT_S = 0.75
 _DEFAULT_PERSON_CONFIDENCE = 0.40
 _DEFAULT_OBJECT_CONFIDENCE = 0.55
 _DEFAULT_PERSON_NEAR_AREA = 0.20
@@ -38,9 +39,9 @@ _DEFAULT_OBJECT_NEAR_AREA = 0.08
 _DEFAULT_ATTENTION_SCORE_THRESHOLD = 0.62
 _DEFAULT_ENGAGED_SCORE_THRESHOLD = 0.45
 _DEFAULT_POSE_CONFIDENCE = 0.30
-_DEFAULT_POSE_REFRESH_S = 12.0
-_DEFAULT_SEQUENCE_WINDOW_S = 1.6
-_DEFAULT_SEQUENCE_MIN_FRAMES = 4
+_DEFAULT_POSE_REFRESH_S = 0.75
+_DEFAULT_SEQUENCE_WINDOW_S = 0.75
+_DEFAULT_SEQUENCE_MIN_FRAMES = 3
 
 _ALLOWED_POSE_BACKENDS = frozenset({"imx500", "mediapipe"})  # AUDIT-FIX(#3): Limit pose backends to the supported runtime choices.
 _ALLOWED_RPK_SUFFIXES = (".rpk",)  # AUDIT-FIX(#2): Restrict network assets to expected local IMX500 package files.
@@ -64,6 +65,8 @@ _MIN_SEQUENCE_WINDOW_S = 0.1  # AUDIT-FIX(#1): Keep temporal windows finite and 
 _MAX_SEQUENCE_WINDOW_S = 10.0  # AUDIT-FIX(#1): Keep temporal windows finite and usable.
 _MIN_SEQUENCE_MIN_FRAMES = 2  # AUDIT-FIX(#1): Require at least a minimally meaningful temporal sequence.
 _MAX_SEQUENCE_MIN_FRAMES = 120  # AUDIT-FIX(#1): Prevent impossible gesture windows and runaway buffering.
+_MIN_ROI_CANDIDATES = 1  # AUDIT-FIX(#11): Keep ROI fan-out bounded on the Pi.
+_MAX_ROI_CANDIDATES = 6  # AUDIT-FIX(#11): Bound per-frame MediaPipe hand ROI work.
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +97,15 @@ class AICameraAdapterConfig:
     pose_refresh_s: float = _DEFAULT_POSE_REFRESH_S
     sequence_window_s: float = _DEFAULT_SEQUENCE_WINDOW_S
     sequence_min_frames: int = _DEFAULT_SEQUENCE_MIN_FRAMES
+    builtin_gesture_min_score: float = 0.35
+    custom_gesture_min_score: float = 0.45
+    min_hand_detection_confidence: float = 0.35
+    min_hand_presence_confidence: float = 0.35
+    min_hand_tracking_confidence: float = 0.35
+    max_roi_candidates: int = 4
+    primary_person_roi_padding: float = 0.18
+    primary_person_upper_body_ratio: float = 0.78
+    wrist_roi_scale: float = 0.34
 
     def __post_init__(self) -> None:
         """Enforce safe bounds even for direct dataclass construction."""
@@ -259,6 +271,56 @@ class AICameraAdapterConfig:
         )
         object.__setattr__(
             self,
+            "builtin_gesture_min_score",
+            _clamp_ratio(self.builtin_gesture_min_score, default=0.35),
+        )
+        object.__setattr__(
+            self,
+            "custom_gesture_min_score",
+            _clamp_ratio(self.custom_gesture_min_score, default=0.45),
+        )
+        object.__setattr__(
+            self,
+            "min_hand_detection_confidence",
+            _clamp_ratio(self.min_hand_detection_confidence, default=0.35),
+        )
+        object.__setattr__(
+            self,
+            "min_hand_presence_confidence",
+            _clamp_ratio(self.min_hand_presence_confidence, default=0.35),
+        )
+        object.__setattr__(
+            self,
+            "min_hand_tracking_confidence",
+            _clamp_ratio(self.min_hand_tracking_confidence, default=0.35),
+        )
+        object.__setattr__(
+            self,
+            "max_roi_candidates",
+            _coerce_bounded_int(
+                self.max_roi_candidates,
+                default=4,
+                minimum=_MIN_ROI_CANDIDATES,
+                maximum=_MAX_ROI_CANDIDATES,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "primary_person_roi_padding",
+            _clamp_ratio(self.primary_person_roi_padding, default=0.18),
+        )
+        object.__setattr__(
+            self,
+            "primary_person_upper_body_ratio",
+            _clamp_ratio(self.primary_person_upper_body_ratio, default=0.78),
+        )
+        object.__setattr__(
+            self,
+            "wrist_roi_scale",
+            _clamp_ratio(self.wrist_roi_scale, default=0.34),
+        )
+        object.__setattr__(
+            self,
             "pose_refresh_s",
             _coerce_bounded_float(
                 self.pose_refresh_s,
@@ -326,10 +388,13 @@ class AICameraAdapterConfig:
                 "proactive_local_camera_mediapipe_gesture_model_path",
                 _DEFAULT_MEDIAPIPE_GESTURE_MODEL,
             ),
-            mediapipe_custom_gesture_model_path=_safe_getattr(
-                config,
-                "proactive_local_camera_mediapipe_custom_gesture_model_path",
-                None,
+            mediapipe_custom_gesture_model_path=(
+                _safe_getattr(
+                    config,
+                    "proactive_local_camera_mediapipe_custom_gesture_model_path",
+                    None,
+                )
+                or _resolve_default_custom_gesture_model_path(config)
             ),
             mediapipe_num_hands=_safe_getattr(
                 config,
@@ -405,6 +470,51 @@ class AICameraAdapterConfig:
                 "proactive_local_camera_pose_refresh_s",
                 _DEFAULT_POSE_REFRESH_S,
             ),
+            builtin_gesture_min_score=_safe_getattr(
+                config,
+                "proactive_local_camera_builtin_gesture_min_score",
+                0.35,
+            ),
+            custom_gesture_min_score=_safe_getattr(
+                config,
+                "proactive_local_camera_custom_gesture_min_score",
+                0.45,
+            ),
+            min_hand_detection_confidence=_safe_getattr(
+                config,
+                "proactive_local_camera_min_hand_detection_confidence",
+                0.35,
+            ),
+            min_hand_presence_confidence=_safe_getattr(
+                config,
+                "proactive_local_camera_min_hand_presence_confidence",
+                0.35,
+            ),
+            min_hand_tracking_confidence=_safe_getattr(
+                config,
+                "proactive_local_camera_min_hand_tracking_confidence",
+                0.35,
+            ),
+            max_roi_candidates=_safe_getattr(
+                config,
+                "proactive_local_camera_max_roi_candidates",
+                4,
+            ),
+            primary_person_roi_padding=_safe_getattr(
+                config,
+                "proactive_local_camera_primary_person_roi_padding",
+                0.18,
+            ),
+            primary_person_upper_body_ratio=_safe_getattr(
+                config,
+                "proactive_local_camera_primary_person_upper_body_ratio",
+                0.78,
+            ),
+            wrist_roi_scale=_safe_getattr(
+                config,
+                "proactive_local_camera_wrist_roi_scale",
+                0.34,
+            ),
             sequence_window_s=_safe_getattr(
                 config,
                 "proactive_local_camera_sequence_window_s",
@@ -428,16 +538,20 @@ class MediaPipeVisionConfig:
     custom_gesture_model_path: str | None = None
     num_hands: int = 2
     attention_score_threshold: float = 0.62
-    sequence_window_s: float = 1.6
-    sequence_min_frames: int = 4
-    builtin_gesture_min_score: float = 0.50
-    custom_gesture_min_score: float = 0.55
+    sequence_window_s: float = 1.0
+    sequence_min_frames: int = 3
+    builtin_gesture_min_score: float = 0.35
+    custom_gesture_min_score: float = 0.45
     min_pose_detection_confidence: float = 0.50
     min_pose_presence_confidence: float = 0.50
     min_pose_tracking_confidence: float = 0.50
-    min_hand_detection_confidence: float = 0.50
-    min_hand_presence_confidence: float = 0.50
-    min_hand_tracking_confidence: float = 0.50
+    min_hand_detection_confidence: float = 0.35
+    min_hand_presence_confidence: float = 0.35
+    min_hand_tracking_confidence: float = 0.35
+    max_roi_candidates: int = 4
+    primary_person_roi_padding: float = 0.18
+    primary_person_upper_body_ratio: float = 0.78
+    wrist_roi_scale: float = 0.34
 
     def __post_init__(self) -> None:
         """Enforce safe bounds even for direct dataclass construction."""
@@ -520,12 +634,12 @@ class MediaPipeVisionConfig:
         object.__setattr__(
             self,
             "builtin_gesture_min_score",
-            _clamp_ratio(self.builtin_gesture_min_score, default=0.50),
+            _clamp_ratio(self.builtin_gesture_min_score, default=0.35),
         )
         object.__setattr__(
             self,
             "custom_gesture_min_score",
-            _clamp_ratio(self.custom_gesture_min_score, default=0.55),
+            _clamp_ratio(self.custom_gesture_min_score, default=0.45),
         )
         object.__setattr__(
             self,
@@ -545,17 +659,42 @@ class MediaPipeVisionConfig:
         object.__setattr__(
             self,
             "min_hand_detection_confidence",
-            _clamp_ratio(self.min_hand_detection_confidence, default=0.50),
+            _clamp_ratio(self.min_hand_detection_confidence, default=0.35),
         )
         object.__setattr__(
             self,
             "min_hand_presence_confidence",
-            _clamp_ratio(self.min_hand_presence_confidence, default=0.50),
+            _clamp_ratio(self.min_hand_presence_confidence, default=0.35),
         )
         object.__setattr__(
             self,
             "min_hand_tracking_confidence",
-            _clamp_ratio(self.min_hand_tracking_confidence, default=0.50),
+            _clamp_ratio(self.min_hand_tracking_confidence, default=0.35),
+        )
+        object.__setattr__(
+            self,
+            "max_roi_candidates",
+            _coerce_bounded_int(
+                self.max_roi_candidates,
+                default=4,
+                minimum=_MIN_ROI_CANDIDATES,
+                maximum=_MAX_ROI_CANDIDATES,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "primary_person_roi_padding",
+            _clamp_ratio(self.primary_person_roi_padding, default=0.18),
+        )
+        object.__setattr__(
+            self,
+            "primary_person_upper_body_ratio",
+            _clamp_ratio(self.primary_person_upper_body_ratio, default=0.78),
+        )
+        object.__setattr__(
+            self,
+            "wrist_roi_scale",
+            _clamp_ratio(self.wrist_roi_scale, default=0.34),
         )
 
     @classmethod
@@ -621,14 +760,18 @@ class MediaPipeVisionConfig:
             ),
             sequence_window_s=sequence_window_s,
             sequence_min_frames=min(requested_sequence_min_frames, max_feasible_frames),
-            builtin_gesture_min_score=_safe_getattr(config, "builtin_gesture_min_score", 0.50),
-            custom_gesture_min_score=_safe_getattr(config, "custom_gesture_min_score", 0.55),
+            builtin_gesture_min_score=_safe_getattr(config, "builtin_gesture_min_score", 0.35),
+            custom_gesture_min_score=_safe_getattr(config, "custom_gesture_min_score", 0.45),
             min_pose_detection_confidence=_safe_getattr(config, "min_pose_detection_confidence", 0.50),
             min_pose_presence_confidence=_safe_getattr(config, "min_pose_presence_confidence", 0.50),
             min_pose_tracking_confidence=_safe_getattr(config, "min_pose_tracking_confidence", 0.50),
-            min_hand_detection_confidence=_safe_getattr(config, "min_hand_detection_confidence", 0.50),
-            min_hand_presence_confidence=_safe_getattr(config, "min_hand_presence_confidence", 0.50),
-            min_hand_tracking_confidence=_safe_getattr(config, "min_hand_tracking_confidence", 0.50),
+            min_hand_detection_confidence=_safe_getattr(config, "min_hand_detection_confidence", 0.35),
+            min_hand_presence_confidence=_safe_getattr(config, "min_hand_presence_confidence", 0.35),
+            min_hand_tracking_confidence=_safe_getattr(config, "min_hand_tracking_confidence", 0.35),
+            max_roi_candidates=_safe_getattr(config, "max_roi_candidates", 4),
+            primary_person_roi_padding=_safe_getattr(config, "primary_person_roi_padding", 0.18),
+            primary_person_upper_body_ratio=_safe_getattr(config, "primary_person_upper_body_ratio", 0.78),
+            wrist_roi_scale=_safe_getattr(config, "wrist_roi_scale", 0.34),
         )
 
 
@@ -639,6 +782,23 @@ def _safe_getattr(source: object, name: str, default: object) -> object:
         return getattr(source, name, default)
     except Exception:
         return default
+
+
+def _resolve_default_custom_gesture_model_path(config: object) -> str | None:
+    """Enable the staged custom gesture model automatically when it exists.
+
+    OK-sign support depends on the optional custom gesture recognizer. Twinr
+    should use the canonical local asset automatically once the deployment
+    already staged it under ``state/mediapipe/models/custom_gesture.task``.
+    """
+
+    project_root = Path(str(getattr(config, "project_root", "") or "").strip())
+    if not project_root.exists():
+        return None
+    candidate = project_root / _DEFAULT_MEDIAPIPE_CUSTOM_GESTURE_MODEL
+    if not candidate.is_file():
+        return None
+    return _DEFAULT_MEDIAPIPE_CUSTOM_GESTURE_MODEL
 
 
 def _coerce_local_path(

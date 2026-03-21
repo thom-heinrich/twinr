@@ -1570,13 +1570,21 @@ class MainCliTests(unittest.TestCase):
             env_path = root / ".env"
             env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
             output_dir = root / "kws"
-            calls: list[tuple[Path, str, tuple[str, ...], bool]] = []
+            calls: list[tuple[Path, str, tuple[str, ...], dict[str, tuple[str, ...]], bool]] = []
             fake_proactive_module = ModuleType("twinr.proactive")
             fake_wakeword_module = ModuleType("twinr.proactive.wakeword")
 
-            def _provision_bundle(*, output_dir, bundle_id, phrases, explicit_keywords, force):
+            def _provision_bundle(*, output_dir, bundle_id, phrases, explicit_keywords, lexicon_entries, force):
                 del phrases
-                calls.append((Path(output_dir), bundle_id, tuple(explicit_keywords), force))
+                calls.append(
+                    (
+                        Path(output_dir),
+                        bundle_id,
+                        tuple(explicit_keywords),
+                        dict(lexicon_entries),
+                        force,
+                    )
+                )
                 return SimpleNamespace(
                     bundle_id=bundle_id,
                     output_dir=Path(output_dir),
@@ -1586,6 +1594,7 @@ class MainCliTests(unittest.TestCase):
                     decoder_path=Path(output_dir) / "decoder.onnx",
                     joiner_path=Path(output_dir) / "joiner.onnx",
                     keywords_path=Path(output_dir) / "keywords.txt",
+                    lexicon_path=Path(output_dir) / "en.phone",
                 )
 
             fake_proactive_module.wakeword = fake_wakeword_module
@@ -1615,6 +1624,10 @@ class MainCliTests(unittest.TestCase):
                         "Twinna",
                         "--wakeword-kws-keyword",
                         "Twinr",
+                        "--wakeword-kws-lexicon-entry",
+                        "Twinna=T W IY1 N AH0",
+                        "--wakeword-kws-lexicon-entry",
+                        "Twinr=T W IY1 N ER0",
                         "--wakeword-kws-force",
                     ]
                     exit_code = main_mod.main()
@@ -1625,7 +1638,18 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             calls,
-            [(output_dir, "gigaspeech_3_3m_bpe_int8", ("Twinna", "Twinr"), True)],
+            [
+                (
+                    output_dir,
+                    "gigaspeech_3_3m_bpe_int8",
+                    ("Twinna", "Twinr"),
+                    {
+                        "Twinna": ("T W IY1 N AH0",),
+                        "Twinr": ("T W IY1 N ER0",),
+                    },
+                    True,
+                )
+            ],
         )
 
     def test_wakeword_autotune_dispatches_to_proactive_helper(self) -> None:

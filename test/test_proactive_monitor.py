@@ -176,6 +176,21 @@ class FakeSequencedAudioObserver:
         return self.snapshots[0]
 
 
+class FastAttentionAudioObserver:
+    def __init__(self, observation: SocialAudioObservation) -> None:
+        self.snapshot = ProactiveAudioSnapshot(observation=observation, sample=None)
+        self.observe_calls = 0
+        self.signal_only_calls = 0
+
+    def observe(self):
+        self.observe_calls += 1
+        raise AssertionError("refresh_display_attention should not call the slow audio path")
+
+    def observe_signal_only(self):
+        self.signal_only_calls += 1
+        return self.snapshot
+
+
 class FakeClock:
     def __init__(self, start: float) -> None:
         self.now = start
@@ -1294,6 +1309,55 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(cue.gaze_x, -2)
         self.assertEqual(cue.gaze_y, 0)
 
+    def test_display_attention_refresh_records_changed_ops_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                display_driver="hdmi_wayland",
+                display_attention_refresh_interval_s=1.0,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(10.0)
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            person_count=1,
+                            primary_person_zone=SocialPersonZone.CENTER,
+                            primary_person_center_x=0.81,
+                            primary_person_center_y=0.44,
+                            engaged_with_device=True,
+                            camera_online=True,
+                            camera_ready=True,
+                            camera_ai_ready=True,
+                            last_camera_frame_at=10.0,
+                        )
+                    ],
+                    supports_attention_refresh=True,
+                ),
+                pir_monitor=FakePirMonitor(),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            refreshed = coordinator.refresh_display_attention()
+            events = runtime.ops_events.tail(limit=10)
+
+        self.assertTrue(refreshed)
+        follow_events = [entry for entry in events if entry.get("event") == "proactive_display_attention_follow"]
+        self.assertTrue(follow_events)
+        follow = follow_events[-1]
+        self.assertEqual(follow["data"]["publish_action"], "updated")
+        self.assertEqual(follow["data"]["camera_primary_person_zone"], "center")
+        self.assertEqual(follow["data"]["attention_target_horizontal"], "right")
+
     def test_display_attention_refresh_acknowledges_fine_hand_gesture_with_emoji(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -1336,6 +1400,55 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(cue.source, "proactive_gesture_ack")
         self.assertEqual(cue.symbol, "thumbs_up")
         self.assertEqual(cue.accent, "success")
+
+    def test_display_attention_refresh_uses_fast_signal_only_audio_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                display_driver="hdmi_wayland",
+                display_attention_refresh_interval_s=1.0,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(10.0)
+            audio_observer = FastAttentionAudioObserver(
+                SocialAudioObservation(
+                    speech_detected=False,
+                    azimuth_deg=0,
+                    direction_confidence=0.92,
+                )
+            )
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=FakeVisionObserver(
+                    [
+                        SocialVisionObservation(
+                            person_visible=True,
+                            primary_person_center_x=0.81,
+                            primary_person_center_y=0.44,
+                            engaged_with_device=True,
+                        )
+                    ],
+                    supports_attention_refresh=True,
+                ),
+                pir_monitor=FakePirMonitor(),
+                audio_observer=audio_observer,
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            refreshed = coordinator.refresh_display_attention()
+            cue = DisplayFaceCueStore.from_config(config).load_active()
+
+        self.assertTrue(refreshed)
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertEqual(audio_observer.signal_only_calls, 1)
+        self.assertEqual(audio_observer.observe_calls, 0)
+        self.assertEqual(cue.gaze_x, -2)
 
     def test_tick_acknowledges_wave_gesture_with_emoji(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

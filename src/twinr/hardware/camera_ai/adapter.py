@@ -841,13 +841,25 @@ class LocalAICameraAdapter:
     def _classify_error(self, exc: Exception) -> str:
         """Return one stable operator-facing error code for the exception."""
 
-        message = str(exc).strip().lower()
+        message = " ".join(self._iter_error_messages(exc))
         if "camera __init__ sequence did not complete" in message or "device or resource busy" in message:
             return "camera_busy"
+        if "session_start_failed" in message:
+            return "camera_session_start_failed"
         if "requested camera dev-node not found" in message:
             return "imx500_not_enumerated"
         if "picamera2_unavailable" in message:
             return "picamera2_unavailable"
+        if "detection_capture_failed" in message:
+            return "detection_capture_failed"
+        if "detection_outputs_missing" in message:
+            return "detection_outputs_missing"
+        if "detection_outputs_invalid_container" in message:
+            return "detection_outputs_invalid_container"
+        if "detection_outputs_incomplete" in message:
+            return "detection_outputs_incomplete"
+        if "detection_parse_failed" in message:
+            return "detection_parse_failed"
         if "metadata_timeout" in message:
             return "metadata_timeout"
         if "mediapipe_custom_gesture_model_missing" in message:
@@ -873,6 +885,21 @@ class LocalAICameraAdapter:
         if isinstance(exc, FileNotFoundError):
             return "model_missing"
         return exc.__class__.__name__.lower()
+
+    def _iter_error_messages(self, exc: BaseException) -> tuple[str, ...]:
+        """Flatten the exception/cause chain into compact lowercase messages."""
+
+        messages: list[str] = []
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            text = " ".join(str(current).strip().lower().split())
+            if text:
+                messages.append(text)
+            next_error = current.__cause__ or current.__context__
+            current = next_error if isinstance(next_error, BaseException) else None
+        return tuple(messages)
 
     def _now(self) -> float:
         """Return one bounded wall-clock timestamp."""

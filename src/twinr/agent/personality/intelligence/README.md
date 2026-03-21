@@ -13,9 +13,15 @@ threads.
 - define typed subscription, calibration-state, situational-awareness, and refresh-result models for RSS/world intelligence
 - persist subscriptions and refresh/discovery timing through remote-primary snapshots
 - derive slow-changing topic/region interest signals from structured conversation or tool evidence
+- derive stronger engagement evidence from explicit structured follow-up reactions so topics the user asks to revisit are weighted above passive affinity
+- translate explicit topic aversion into durable `avoid` state so Twinr backs off both conversationally and in source calibration
+- track bounded user engagement with those interests so Twinr can prioritize the topics that repeatedly draw the user back in
+- classify each learned topic into `resonant`, `warm`, `uncertain`, `cooling`, or `avoid`, separating healthy interest from exposure-aware non-uptake
+- derive mild cross-session cooling from repeated topic switches or non-reengagement, but only when there was prior positive exposure evidence
 - discover RSS or Atom feeds from source pages returned by the live web backend
 - recalibrate feed coverage during reflection-style maintenance windows instead of treating discovery as a daily poll
 - refresh due feeds on a calm cadence and translate fresh items into world signals, continuity threads, and condensed awareness threads
+- decay stale engagement and relax boosted feed priority/cadence back to each subscription's baseline when the topic stops pulling the user in
 
 `intelligence` does **not** own:
 - prompt-layer rendering

@@ -83,10 +83,17 @@ class PersonalityLearningService:
             turn=turn,
             consolidation=consolidation,
         )
+        existing_interest_signals = ()
+        if self.world_intelligence is not None:
+            existing_interest_signals = self.world_intelligence.store.load_state(
+                config=self.world_intelligence.config,
+                remote_state=self.world_intelligence.remote_state,
+            ).interest_signals
         world_interest_batch = self.world_interest_extractor.extract_from_personality_batch(
             turn_id=consolidation.turn_id,
             batch=batch,
             occurred_at=consolidation.occurred_at,
+            existing_interest_signals=existing_interest_signals,
         )
         self._record_world_interest_signals(world_interest_batch.interest_signals)
         return self._commit(batch)

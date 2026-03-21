@@ -78,6 +78,12 @@ The current signal taxonomy is intentionally structured and conservative:
 - RSS-backed world intelligence is separate from ad-hoc live search: discovery is occasional and explicit, calibration learns slowly from structured conversation/tool evidence, refresh is cadence-bound, and feed items become contextual `WORLD`/`CONTINUITY` updates plus slower situational-awareness threads
 - Twinr's conversational self-expression stays bounded: it may speak from `MINDSHARE` when the user invites open conversation or asks what Twinr has been following, but it must not invent secret emotions, private off-screen experiences, or human-like inner life
 - `MINDSHARE` surfacing stays generic and data-driven: selection may vary slightly via bounded stochasticity, but it must be based on source type and salience rather than hardcoded entity names or place-first special cases
+- repeated user engagement with one topic may boost how often matching mindshare items surface and how strongly the RSS intelligence layer continues to watch that topic, but this must remain bounded and evidence-driven
+- explicit structured reactions like follow-up requests may raise topic engagement faster than passive affinity, but the signal must stay typed and auditable
+- boosted topic engagement must decay over time and let RSS tuning fall back to baseline when the user stops leaning into that topic
+- Twinr's engagement model distinguishes `resonant`, `warm`, `uncertain`, `cooling`, and `avoid`; absence alone must not count as dislike unless repeated prior exposure and non-reengagement are structurally evidenced
+- `MINDSHARE` now also derives a topic-specific `conversation appetite` from those engagement states plus the learned global style profile, so each surfaced theme carries bounded cues for `depth`, `follow-up`, and `proactivity` instead of relying on hidden prompt guesswork
+- repeated user returns to a topic may also raise Twinr's derived `ongoing interest` in it; this is the companion analogue of `stop/linger/return` signals in ranking systems, but bounded for dignity and calm rather than optimized for addiction or time-on-device
 
 ## See also
 

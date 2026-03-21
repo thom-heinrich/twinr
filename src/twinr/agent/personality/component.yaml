@@ -6,11 +6,15 @@ responsibilities:
   - Define structured personality, conversation-style, humor, relationship, continuity, place/world, and reflection models.
   - Translate structured personality state into ordered prompt layers that preserve the legacy section contract.
   - Render a bounded conversational self-expression and current-mindshare layer so Twinr can speak naturally from ongoing themes.
+  - Derive bounded per-topic conversation appetite cues so surfaced themes carry explicit depth, follow-up, and proactivity guidance.
+  - Derive bounded ongoing-interest cues from repeated user returns so some themes can become more alive in Twinr's mindshare without becoming addictive or pushy.
   - Provide clean persistence seams for remote snapshot state that can later be backed directly by ChonkyDB-derived personality objects.
   - Extract structured interaction, continuity, place, and world signals from long-term consolidation output and tool history.
+  - Promote explicit structured topic follow-up reactions into stronger engagement evidence for mindshare and world-intelligence calibration.
+  - Track bounded engagement states so resonant topics surface more often while cooling or avoided topics back off without one-turn overreaction.
   - Gate background learning so repeated signals can evolve the durable personality snapshot without one-off drift.
   - Manage RSS/Atom subscriptions and refresh their calm place/world context into bounded world and continuity updates.
-  - Decay stale world and relationship context and reject contradictory or sensitive-context personality drift.
+  - Decay stale world and relationship context, relax stale engagement boosts, and reject contradictory or sensitive-context personality drift.
 out_of_scope:
   - Provider-specific prompt phrasing.
   - Memory, reminder, automation, and graph persistence implementations.

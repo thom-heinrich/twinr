@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -14,6 +15,7 @@ from twinr.hardware.ai_camera import (
     AICameraAdapterConfig,
     LocalAICameraAdapter,
 )
+from twinr.hardware.camera_ai.config import MediaPipeVisionConfig
 from twinr.hardware.camera_ai.mediapipe_pipeline import MediaPipeVisionResult
 from twinr.hardware.camera_ai.motion import infer_motion_state as _infer_motion_state
 from twinr.hardware.camera_ai.pose_classification import (
@@ -23,6 +25,8 @@ from twinr.hardware.camera_ai.pose_classification import (
 from twinr.hardware.camera_ai.pose_features import support_pose_confidence as _support_pose_confidence
 from twinr.hardware.camera_ai.pose_selection import rank_pose_candidates as _rank_pose_candidates
 from twinr.hardware.ai_camera_diagnostics import capture_pose_probe
+from twinr.hardware.hand_landmarks import HandLandmarkWorkerConfig
+from twinr.config import TwinrConfig
 
 
 class AICameraTests(unittest.TestCase):
@@ -159,6 +163,73 @@ class AICameraTests(unittest.TestCase):
         self.assertFalse(observation.camera_ai_ready)
         self.assertEqual(observation.camera_error, "mediapipe_hand_landmarker_model_missing")
         self.assertEqual(observation.fine_hand_gesture, AICameraFineHandGesture.UNKNOWN)
+
+    def test_adapter_reports_detection_capture_failure_as_camera_unready(self) -> None:
+        adapter = LocalAICameraAdapter()
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+
+        def _raise_detection_failure(runtime, observed_at):
+            try:
+                try:
+                    raise OSError("Device or resource busy")
+                except OSError as exc:
+                    raise RuntimeError("session_start_failed") from exc
+            except RuntimeError as exc:
+                raise RuntimeError("detection_capture_failed") from exc
+
+        adapter._capture_detection = _raise_detection_failure
+
+        observation = adapter.observe()
+
+        self.assertTrue(observation.camera_online)
+        self.assertFalse(observation.camera_ready)
+        self.assertFalse(observation.camera_ai_ready)
+        self.assertEqual(observation.camera_error, "camera_busy")
+        self.assertEqual(observation.person_count, 0)
+
+    def test_adapter_config_exposes_live_hand_gesture_tuning_through_to_worker_config(self) -> None:
+        twinr_config = TwinrConfig(
+            proactive_local_camera_frame_rate=18,
+            proactive_local_camera_builtin_gesture_min_score=0.31,
+            proactive_local_camera_custom_gesture_min_score=0.44,
+            proactive_local_camera_min_hand_detection_confidence=0.27,
+            proactive_local_camera_min_hand_presence_confidence=0.28,
+            proactive_local_camera_min_hand_tracking_confidence=0.29,
+            proactive_local_camera_max_roi_candidates=5,
+            proactive_local_camera_primary_person_roi_padding=0.22,
+            proactive_local_camera_primary_person_upper_body_ratio=0.81,
+            proactive_local_camera_wrist_roi_scale=0.39,
+        )
+
+        adapter_config = AICameraAdapterConfig.from_config(twinr_config)
+        vision_config = MediaPipeVisionConfig.from_ai_camera_config(adapter_config)
+        hand_config = HandLandmarkWorkerConfig.from_config(vision_config)
+
+        self.assertEqual(adapter_config.frame_rate, 18)
+        self.assertAlmostEqual(vision_config.builtin_gesture_min_score, 0.31, places=3)
+        self.assertAlmostEqual(vision_config.custom_gesture_min_score, 0.44, places=3)
+        self.assertAlmostEqual(hand_config.min_hand_detection_confidence, 0.27, places=3)
+        self.assertAlmostEqual(hand_config.min_hand_presence_confidence, 0.28, places=3)
+        self.assertAlmostEqual(hand_config.min_hand_tracking_confidence, 0.29, places=3)
+        self.assertEqual(hand_config.max_roi_candidates, 5)
+        self.assertAlmostEqual(hand_config.primary_person_roi_padding, 0.22, places=3)
+        self.assertAlmostEqual(hand_config.primary_person_upper_body_ratio, 0.81, places=3)
+        self.assertAlmostEqual(hand_config.wrist_roi_scale, 0.39, places=3)
+
+    def test_adapter_config_auto_enables_staged_custom_gesture_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            custom_model = Path(temp_dir) / "state" / "mediapipe" / "models" / "custom_gesture.task"
+            custom_model.parent.mkdir(parents=True, exist_ok=True)
+            custom_model.write_bytes(b"custom")
+
+            twinr_config = TwinrConfig(project_root=temp_dir)
+
+            adapter_config = AICameraAdapterConfig.from_config(twinr_config)
+            vision_config = MediaPipeVisionConfig.from_ai_camera_config(adapter_config)
+
+        self.assertEqual(adapter_config.mediapipe_custom_gesture_model_path, "state/mediapipe/models/custom_gesture.task")
+        self.assertEqual(vision_config.custom_gesture_model_path, "state/mediapipe/models/custom_gesture.task")
 
     def test_support_pose_confidence_uses_keypoint_coverage_not_raw_score_alone(self) -> None:
         box = AICameraBox(top=0.10, left=0.35, bottom=0.92, right=0.62)

@@ -12,7 +12,8 @@ Bundled Twinr wakeword model assets live here.
   - `encoder.onnx`
   - `decoder.onnx`
   - `joiner.onnx`
-  - `bpe.model`
+  - optional `bpe.model`
+  - optional phone lexicon such as `en.phone`
   - `keywords_raw.txt`
   - `keywords.txt`
   - `bundle_metadata.json`

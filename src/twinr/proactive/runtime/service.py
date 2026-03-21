@@ -42,6 +42,7 @@ from ..social.camera_surface import ProactiveCameraSnapshot, ProactiveCameraSurf
 from ..social.engine import SocialAudioObservation, SocialObservation, SocialTriggerDecision, SocialTriggerEngine, SocialVisionObservation
 from ..social.local_camera_provider import LocalAICameraObservationProvider
 from ..social.observers import AmbientAudioObservationProvider, NullAudioObservationProvider, OpenAIVisionObservationProvider, ReSpeakerAudioObservationProvider
+from ..social.observers import ProactiveAudioSnapshot
 from ..social.vision_review import (
     OpenAIProactiveVisionReviewer,
     ProactiveVisionFrameBuffer,
@@ -63,7 +64,7 @@ from .attention_targeting import (
     MultimodalAttentionTargetSnapshot,
     MultimodalAttentionTargetTracker,
 )
-from .display_attention import DisplayAttentionCuePublisher
+from .display_attention import DisplayAttentionCuePublishResult, DisplayAttentionCuePublisher
 from .display_attention import (
     display_attention_refresh_supported,
     resolve_display_attention_refresh_interval,
@@ -103,6 +104,7 @@ _DEFAULT_CLOSE_JOIN_TIMEOUT_S = 5.0
 _MAX_CAPTURE_PHRASE_TOKEN_LEN = 64
 _DISPLAY_ATTENTION_ACTIVE_RUNTIME_STATES = frozenset({"waiting", "listening", "processing", "answering"})
 _DISPLAY_ATTENTION_CUE_ONLY_RUNTIME_STATES = frozenset({"error"})
+_ATTENTION_REFRESH_AUDIO_CACHE_MAX_AGE_S = 2.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -508,6 +510,9 @@ class ProactiveCoordinator:
         self._last_motion_at: float | None = None
         self._last_capture_at: float | None = None
         self._last_display_attention_refresh_at: float | None = None
+        self._last_audio_snapshot: ProactiveAudioSnapshot | None = None
+        self._last_audio_snapshot_at: float | None = None
+        self._last_display_attention_follow_key: tuple[object, ...] | None = None
         self._last_observation_key: tuple[object, ...] | None = None
         self._camera_surface = ProactiveCameraSurface.from_config(config)
         self._last_sensor_flags: dict[str, bool] = {}
@@ -590,7 +595,7 @@ class ProactiveCoordinator:
         """Collect one ambient-audio snapshot with null fallback on failure."""
 
         try:
-            return self.audio_observer.observe()
+            snapshot = self.audio_observer.observe()
         except Exception as exc:
             self._record_fault(
                 event="proactive_audio_observe_failed",
@@ -600,7 +605,7 @@ class ProactiveCoordinator:
             if self._respeaker_targeted and isinstance(exc, AudioCaptureReadinessError):
                 self._block_respeaker_dead_capture(exc)
             try:
-                return self._null_audio_observer.observe()
+                snapshot = self._null_audio_observer.observe()
             except Exception as fallback_exc:
                 self._record_fault(
                     event="proactive_null_audio_observe_failed",
@@ -608,6 +613,68 @@ class ProactiveCoordinator:
                     error=fallback_exc,
                 )
                 raise
+        return self._store_audio_snapshot(snapshot=snapshot)
+
+    def _store_audio_snapshot(
+        self,
+        *,
+        snapshot: ProactiveAudioSnapshot,
+        observed_at: float | None = None,
+    ) -> ProactiveAudioSnapshot:
+        """Remember the latest audio snapshot for fast local HCI refresh paths."""
+
+        self._last_audio_snapshot = snapshot
+        self._last_audio_snapshot_at = self.clock() if observed_at is None else float(observed_at)
+        return snapshot
+
+    def _observe_audio_for_attention_refresh(
+        self,
+        *,
+        now: float,
+    ) -> ProactiveAudioSnapshot:
+        """Return a low-latency audio snapshot for HDMI attention refresh.
+
+        The fast HDMI gaze/gesture loop must not block on full ambient PCM
+        sampling windows. Prefer direct signal-only snapshots when the provider
+        supports them, otherwise reuse a recent cached observation or fall back
+        conservatively.
+        """
+
+        fast_observe = getattr(self.audio_observer, "observe_signal_only", None)
+        if callable(fast_observe):
+            try:
+                snapshot = fast_observe()
+            except Exception as exc:
+                self._record_fault(
+                    event="proactive_attention_audio_fast_observe_failed",
+                    message="Fast audio observation failed during HDMI attention refresh; using cached/null audio instead.",
+                    error=exc,
+                )
+                return self._attention_refresh_audio_fallback(now=now)
+            return self._store_audio_snapshot(snapshot=snapshot, observed_at=now)
+
+        if isinstance(self.audio_observer, AmbientAudioObservationProvider):
+            return self._attention_refresh_audio_fallback(now=now)
+
+        return self._observe_audio_safe()
+
+    def _attention_refresh_audio_fallback(
+        self,
+        *,
+        now: float,
+    ) -> ProactiveAudioSnapshot:
+        """Return cached or null audio when the fast loop must stay non-blocking."""
+
+        if (
+            self._last_audio_snapshot is not None
+            and self._last_audio_snapshot_at is not None
+            and (now - self._last_audio_snapshot_at) <= _ATTENTION_REFRESH_AUDIO_CACHE_MAX_AGE_S
+        ):
+            return self._last_audio_snapshot
+        return self._store_audio_snapshot(
+            snapshot=self._null_audio_observer.observe(),
+            observed_at=now,
+        )
 
     # AUDIT-FIX(#6): Vision observation faults should fall back to an uninspected tick so wakeword/presence logic can continue.
     def _observe_vision_safe(self):
@@ -1584,16 +1651,28 @@ class ProactiveCoordinator:
             return False
         if not _display_attention_refresh_allowed_runtime_status(runtime_status_value):
             return False
-        audio_snapshot = self._observe_audio_safe()
-        audio_policy_snapshot = self._observe_audio_policy(
-            now=now,
-            audio_observation=audio_snapshot.observation,
-        )
         snapshot = self._observe_vision_safe()
         if snapshot is None:
             return False
         self._last_display_attention_refresh_at = now
         self._record_vision_snapshot_safe(snapshot)
+        camera_update = self._observe_camera_surface(
+            SocialObservation(
+                observed_at=now,
+                inspected=True,
+                pir_motion_detected=False,
+                low_motion=False,
+                vision=snapshot.observation,
+                audio=SocialAudioObservation(),
+            ),
+            inspected=True,
+        )
+        self._update_display_gesture_emoji_ack(camera_update)
+        audio_snapshot = self._observe_audio_for_attention_refresh(now=now)
+        audio_policy_snapshot = self._observe_audio_policy(
+            now=now,
+            audio_observation=audio_snapshot.observation,
+        )
         observation = SocialObservation(
             observed_at=now,
             inspected=True,
@@ -1602,13 +1681,17 @@ class ProactiveCoordinator:
             vision=snapshot.observation,
             audio=audio_snapshot.observation,
         )
-        camera_update = self._observe_camera_surface(observation, inspected=True)
-        self._update_display_gesture_emoji_ack(camera_update)
-        self._update_display_attention_follow(
+        publish_result = self._update_display_attention_follow(
             observed_at=now,
             camera_snapshot=camera_update.snapshot,
             audio_observation=audio_snapshot.observation,
             audio_policy_snapshot=audio_policy_snapshot,
+        )
+        self._record_display_attention_follow_if_changed(
+            observed_at=now,
+            runtime_status_value=runtime_status_value,
+            camera_snapshot=camera_update.snapshot,
+            publish_result=publish_result,
         )
         return True
 
@@ -2393,11 +2476,17 @@ class ProactiveCoordinator:
         try:
             camera_update = self._observe_camera_surface(observation, inspected=inspected)
             self._update_display_gesture_emoji_ack(camera_update)
-            self._update_display_attention_follow(
+            publish_result = self._update_display_attention_follow(
                 observed_at=observation.observed_at,
                 camera_snapshot=camera_update.snapshot,
                 audio_observation=observation.audio,
                 audio_policy_snapshot=audio_policy_snapshot,
+            )
+            self._record_display_attention_follow_if_changed(
+                observed_at=observation.observed_at,
+                runtime_status_value=getattr(getattr(self.runtime, "status", None), "value", None),
+                camera_snapshot=camera_update.snapshot,
+                publish_result=publish_result,
             )
             if self.observation_handler is None:
                 return
@@ -2425,12 +2514,12 @@ class ProactiveCoordinator:
         camera_snapshot: ProactiveCameraSnapshot,
         audio_observation,
         audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
-    ) -> None:
+    ) -> DisplayAttentionCuePublishResult | None:
         """Update the HDMI face so it calmly follows the most relevant person."""
 
         publisher = self.display_attention_publisher
         if publisher is None:
-            return
+            return None
         presence_snapshot = self.latest_presence_snapshot
         presence_session_id = None if presence_snapshot is None else getattr(presence_snapshot, "session_id", None)
         live_facts = {
@@ -2465,7 +2554,7 @@ class ProactiveCoordinator:
         live_facts["speaker_association"] = speaker_association.to_automation_facts()
         live_facts["attention_target"] = attention_target.to_automation_facts()
         try:
-            publisher.publish_from_facts(
+            return publisher.publish_from_facts(
                 config=self.config,
                 live_facts=live_facts,
             )
@@ -2476,6 +2565,7 @@ class ProactiveCoordinator:
                 error=exc,
                 data={"observed_at": observed_at},
             )
+            return None
 
     def _update_display_gesture_emoji_ack(
         self,
@@ -2495,6 +2585,79 @@ class ProactiveCoordinator:
                 error=exc,
                 data={"event_names": list(camera_update.event_names)},
             )
+
+    def _record_display_attention_follow_if_changed(
+        self,
+        *,
+        observed_at: float,
+        runtime_status_value: object,
+        camera_snapshot: ProactiveCameraSnapshot,
+        publish_result: DisplayAttentionCuePublishResult | None,
+    ) -> None:
+        """Persist one bounded changed-only trace of the HDMI attention-follow path."""
+
+        decision = None if publish_result is None else publish_result.decision
+        key = (
+            str(runtime_status_value or "").strip().lower(),
+            camera_snapshot.camera_online,
+            camera_snapshot.camera_ready,
+            camera_snapshot.camera_ai_ready,
+            camera_snapshot.camera_error,
+            camera_snapshot.person_visible,
+            camera_snapshot.person_visible_unknown,
+            camera_snapshot.person_count,
+            camera_snapshot.person_count_unknown,
+            camera_snapshot.primary_person_zone.value,
+            _round_optional_ratio(camera_snapshot.primary_person_center_x),
+            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.state,
+            None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_horizontal,
+            None if publish_result is None else publish_result.action,
+            None if decision is None else decision.reason,
+            None if decision is None else decision.gaze.value,
+            None if decision is None else decision.head_dx,
+            None if decision is None else decision.speaker_locked,
+        )
+        if key == self._last_display_attention_follow_key:
+            return
+        self._last_display_attention_follow_key = key
+        self._append_ops_event(
+            event="proactive_display_attention_follow",
+            message="Updated the bounded HDMI attention-follow trace.",
+            data={
+                "observed_at": observed_at,
+                "runtime_status": str(runtime_status_value or "").strip().lower() or None,
+                "camera_online": camera_snapshot.camera_online,
+                "camera_ready": camera_snapshot.camera_ready,
+                "camera_ai_ready": camera_snapshot.camera_ai_ready,
+                "camera_error": camera_snapshot.camera_error,
+                "person_visible": camera_snapshot.person_visible,
+                "person_visible_unknown": camera_snapshot.person_visible_unknown,
+                "camera_person_count": camera_snapshot.person_count,
+                "camera_person_count_unknown": camera_snapshot.person_count_unknown,
+                "camera_primary_person_zone": camera_snapshot.primary_person_zone.value,
+                "camera_primary_person_center_x": _round_optional_ratio(camera_snapshot.primary_person_center_x),
+                "camera_primary_person_center_y": _round_optional_ratio(camera_snapshot.primary_person_center_y),
+                "attention_target_state": (
+                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.state
+                ),
+                "attention_target_active": (
+                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.active
+                ),
+                "attention_target_horizontal": (
+                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.target_horizontal
+                ),
+                "attention_target_focus_source": (
+                    None if self.latest_attention_target_snapshot is None else self.latest_attention_target_snapshot.focus_source
+                ),
+                "publish_action": None if publish_result is None else publish_result.action,
+                "publish_owner": None if publish_result is None else publish_result.owner,
+                "decision_reason": None if decision is None else decision.reason,
+                "decision_gaze": None if decision is None else decision.gaze.value,
+                "decision_head_dx": None if decision is None else decision.head_dx,
+                "decision_head_dy": None if decision is None else decision.head_dy,
+                "decision_speaker_locked": None if decision is None else decision.speaker_locked,
+            },
+        )
 
     def _observe_camera_surface(
         self,

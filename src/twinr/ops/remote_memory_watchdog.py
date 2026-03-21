@@ -10,7 +10,7 @@ prints one JSON line per sample for journald/systemd.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread
@@ -33,6 +33,7 @@ _DEFAULT_WATCHDOG_INTERVAL_S = 1.0
 _DEFAULT_HISTORY_LIMIT = 3600
 _SNAPSHOT_SCHEMA_VERSION = 1
 _DEFAULT_DEEP_PROBE_IDLE_FLOOR_S = 5.0
+_PERSISTED_RECENT_SAMPLE_LIMIT = 64
 
 
 def _utc_now_iso() -> str:
@@ -81,6 +82,21 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
         os.close(fd)
     os.replace(tmp_path, path)
     os.chmod(path, file_mode)
+
+
+def _compact_history_sample(sample: "RemoteMemoryWatchdogSample") -> "RemoteMemoryWatchdogSample":
+    """Drop heavy nested probe payloads from persisted history samples.
+
+    The live watchdog only needs recent sample timestamps/status metadata to
+    bridge healthy quiet windows between deep probes. Persisting every
+    historical probe payload inside every heartbeat snapshot turns one cheap
+    heartbeat into a multi-megabyte fsync on the Pi, which then delays later
+    heartbeats enough to create false stale flaps.
+    """
+
+    if sample.probe is None:
+        return sample
+    return replace(sample, probe=None)
 
 
 class _RemoteMemoryService(Protocol):
@@ -365,6 +381,14 @@ class RemoteMemoryWatchdog:
         self._last_status: str | None = None
         self._last_detail: str | None = None
         self._recent_samples: deque[RemoteMemoryWatchdogSample] = deque(maxlen=self.history_limit)
+
+    def _persisted_recent_samples(self) -> tuple[RemoteMemoryWatchdogSample, ...]:
+        """Return a bounded, compact recent history for persisted snapshots."""
+
+        if not self._recent_samples:
+            return ()
+        window = max(1, min(self.history_limit, _PERSISTED_RECENT_SAMPLE_LIMIT))
+        return tuple(_compact_history_sample(sample) for sample in tuple(self._recent_samples)[-window:])
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "RemoteMemoryWatchdog":
@@ -784,7 +808,7 @@ class RemoteMemoryWatchdog:
             last_failure_at=self._last_failure_at,
             artifact_path=str(self.artifact_path),
             current=current,
-            recent_samples=tuple(self._recent_samples),
+            recent_samples=self._persisted_recent_samples(),
             heartbeat_at=current.captured_at,
             probe_inflight=False,
             probe_started_at=None,
@@ -817,7 +841,7 @@ class RemoteMemoryWatchdog:
             last_failure_at=self._last_failure_at,
             artifact_path=str(self.artifact_path),
             current=current,
-            recent_samples=tuple(self._recent_samples),
+            recent_samples=self._persisted_recent_samples(),
             heartbeat_at=heartbeat_at,
             probe_inflight=probe_inflight,
             probe_started_at=probe_started_at,

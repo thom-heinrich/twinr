@@ -136,6 +136,24 @@ class WorldIntelligenceTests(unittest.TestCase):
             last_refreshed_at="2026-03-20T10:00:00+00:00",
             discovery_interval_hours=336,
             last_discovery_query="hamburg local politics rss",
+            interest_signals=(
+                WorldInterestSignal(
+                    signal_id="interest:hamburg_local",
+                    topic="local politics",
+                    summary="The user keeps engaging with Hamburg local politics.",
+                    region="Hamburg",
+                    scope="local",
+                    salience=0.84,
+                    confidence=0.82,
+                    engagement_score=0.91,
+                    engagement_state="resonant",
+                    evidence_count=3,
+                    engagement_count=5,
+                    positive_signal_count=4,
+                    exposure_count=4,
+                    updated_at="2026-03-20T09:30:00+00:00",
+                ),
+            ),
         )
 
         store.save_subscriptions(
@@ -163,6 +181,32 @@ class WorldIntelligenceTests(unittest.TestCase):
         self.assertEqual(loaded_subscriptions[0].label, "Hamburg local politics")
         self.assertEqual(loaded_subscriptions[0].topics, ("local politics", "transit"))
         self.assertEqual(loaded_state.last_discovery_query, "hamburg local politics rss")
+        self.assertAlmostEqual(loaded_state.interest_signals[0].engagement_score, 0.91)
+        self.assertEqual(loaded_state.interest_signals[0].engagement_count, 5)
+        self.assertEqual(loaded_state.interest_signals[0].engagement_state, "resonant")
+        self.assertEqual(loaded_state.interest_signals[0].positive_signal_count, 4)
+
+    def test_legacy_interest_signals_backfill_engagement_defaults(self) -> None:
+        state = WorldIntelligenceState.from_payload(
+            {
+                "schema_version": 1,
+                "interest_signals": [
+                    {
+                        "signal_id": "interest:legacy:ai_companions",
+                        "topic": "AI companions",
+                        "summary": "Legacy seed without explicit engagement fields.",
+                        "scope": "topic",
+                        "salience": 0.86,
+                        "confidence": 0.84,
+                        "evidence_count": 3,
+                    }
+                ],
+            }
+        )
+
+        self.assertGreater(state.interest_signals[0].engagement_score, 0.7)
+        self.assertEqual(state.interest_signals[0].engagement_count, 3)
+        self.assertEqual(state.interest_signals[0].engagement_state, "resonant")
 
     def test_service_discovers_feeds_from_search_sources_and_persists_subscriptions(self) -> None:
         remote_state = _FakeRemoteState()
@@ -395,7 +439,9 @@ class WorldIntelligenceTests(unittest.TestCase):
                     scope="local",
                     salience=0.84,
                     confidence=0.82,
+                    engagement_score=0.84,
                     evidence_count=3,
+                    engagement_count=3,
                     updated_at="2026-03-20T11:00:00+00:00",
                 ),
             ),
@@ -410,6 +456,7 @@ class WorldIntelligenceTests(unittest.TestCase):
         self.assertEqual(updated_state.last_recalibrated_at, "2026-03-20T12:00:00+00:00")
         self.assertEqual(updated_state.last_discovery_query, "Find RSS or Atom feeds for local politics relevant to Hamburg.")
         self.assertEqual(refresh.world_signals[0].topic, "New district transit funding package advances")
+        self.assertAlmostEqual(updated_state.interest_signals[0].engagement_score, 0.84)
 
     def test_refresh_builds_and_updates_situational_awareness_threads(self) -> None:
         remote_state = _FakeRemoteState()
@@ -542,8 +589,393 @@ class WorldIntelligenceTests(unittest.TestCase):
 
         self.assertEqual(conversation_batch.interest_signals[0].region, "Hamburg")
         self.assertEqual(conversation_batch.interest_signals[0].scope, "local")
+        self.assertGreater(conversation_batch.interest_signals[0].engagement_score, 0.6)
         self.assertEqual(tool_batch.interest_signals[0].topic, "What changed in Hamburg local politics today?")
+        self.assertGreater(tool_batch.interest_signals[0].engagement_score, conversation_batch.interest_signals[0].engagement_score)
+        self.assertEqual(tool_batch.interest_signals[0].engagement_count, 2)
         self.assertFalse(tool_batch.interest_signals[0].explicit)
+
+    def test_world_interest_extractor_promotes_explicit_topic_follow_up_into_stronger_interest(self) -> None:
+        extractor = WorldInterestSignalExtractor(
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+        )
+        personality_batch = PersonalitySignalExtractor().extract_from_consolidation(
+            turn=LongTermConversationTurn(
+                transcript="Erzaehl mir mehr ueber AI companions, darueber will ich oefter sprechen.",
+                response="Ich bleibe bei dem Thema und halte weitere Entwicklungen im Blick.",
+            ),
+            consolidation=LongTermConsolidationResultV1(
+                turn_id="turn:follow-up:1",
+                occurred_at=datetime(2026, 3, 20, 11, 30, tzinfo=timezone.utc),
+                episodic_objects=(),
+                durable_objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="pref:topic_follow_up:ai_companions",
+                        kind="fact",
+                        summary="The user explicitly asked to keep talking about AI companions.",
+                        source=self._source("turn:follow-up:1"),
+                        status="active",
+                        confidence=0.91,
+                        attributes={
+                            "memory_domain": "preference",
+                            "fact_type": "preference",
+                            "preference_type": "topic_follow_up",
+                            "topic": "AI companions",
+                            "support_count": 2,
+                        },
+                    ),
+                ),
+                deferred_objects=(),
+                conflicts=(),
+                graph_edges=(),
+            ),
+        )
+
+        conversation_batch = extractor.extract_from_personality_batch(
+            turn_id="turn:follow-up:1",
+            batch=personality_batch,
+            occurred_at=datetime(2026, 3, 20, 11, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(len(conversation_batch.interest_signals), 1)
+        signal = conversation_batch.interest_signals[0]
+        self.assertEqual(signal.topic, "AI companions")
+        self.assertTrue(signal.explicit)
+        self.assertGreaterEqual(signal.engagement_score, 0.88)
+        self.assertGreaterEqual(signal.salience, 0.75)
+        self.assertEqual(signal.engagement_count, 3)
+        self.assertEqual(signal.engagement_state, "resonant")
+        self.assertTrue(signal.signal_id.startswith("interest:engagement:"))
+
+    def test_world_interest_extractor_derives_exposure_aware_cooling_state(self) -> None:
+        extractor = WorldInterestSignalExtractor(
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+        )
+        personality_batch = PersonalitySignalExtractor().extract_from_consolidation(
+            turn=LongTermConversationTurn(
+                transcript="Dann lieber etwas anderes.",
+                response="Alles klar, ich lasse das Thema erstmal ruhen.",
+            ),
+            consolidation=LongTermConsolidationResultV1(
+                turn_id="turn:cooling:1",
+                occurred_at=datetime(2026, 3, 20, 11, 30, tzinfo=timezone.utc),
+                episodic_objects=(),
+                durable_objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="pattern:topic_non_reengagement:ai_companions",
+                        kind="pattern",
+                        summary="AI companions did not draw the user back in after repeated exposure.",
+                        source=self._source("turn:cooling:1"),
+                        status="active",
+                        confidence=0.8,
+                        attributes={
+                            "memory_domain": "pattern",
+                            "pattern_type": "topic_non_reengagement",
+                            "topic": "AI companions",
+                            "exposure_count": 3,
+                            "non_reengagement_count": 2,
+                            "exposure_aware": True,
+                        },
+                    ),
+                ),
+                deferred_objects=(),
+                conflicts=(),
+                graph_edges=(),
+            ),
+        )
+
+        conversation_batch = extractor.extract_from_personality_batch(
+            turn_id="turn:cooling:1",
+            batch=personality_batch,
+            occurred_at=datetime(2026, 3, 20, 11, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(len(conversation_batch.interest_signals), 1)
+        signal = conversation_batch.interest_signals[0]
+        self.assertEqual(signal.topic, "AI companions")
+        self.assertEqual(signal.engagement_state, "cooling")
+        self.assertEqual(signal.positive_signal_count, 0)
+        self.assertEqual(signal.exposure_count, 3)
+        self.assertEqual(signal.non_reengagement_count, 2)
+        self.assertLess(signal.engagement_score, 0.3)
+
+    def test_world_interest_extractor_promotes_explicit_topic_aversion_into_avoid(self) -> None:
+        extractor = WorldInterestSignalExtractor(
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+        )
+        personality_batch = PersonalitySignalExtractor().extract_from_consolidation(
+            turn=LongTermConversationTurn(
+                transcript="Bitte keine Promi-Geschichten mehr.",
+                response="Verstanden, ich lasse das Thema weg.",
+            ),
+            consolidation=LongTermConsolidationResultV1(
+                turn_id="turn:avoid:1",
+                occurred_at=datetime(2026, 3, 20, 11, 40, tzinfo=timezone.utc),
+                episodic_objects=(),
+                durable_objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="pref:topic_aversion:celebrity_gossip",
+                        kind="fact",
+                        summary="The user clearly does not want celebrity gossip.",
+                        source=self._source("turn:avoid:1"),
+                        status="active",
+                        confidence=0.88,
+                        attributes={
+                            "memory_domain": "preference",
+                            "fact_type": "preference",
+                            "preference_type": "topic_aversion",
+                            "topic": "celebrity gossip",
+                            "support_count": 2,
+                        },
+                    ),
+                ),
+                deferred_objects=(),
+                conflicts=(),
+                graph_edges=(),
+            ),
+        )
+
+        conversation_batch = extractor.extract_from_personality_batch(
+            turn_id="turn:avoid:1",
+            batch=personality_batch,
+            occurred_at=datetime(2026, 3, 20, 11, 40, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(len(conversation_batch.interest_signals), 1)
+        signal = conversation_batch.interest_signals[0]
+        self.assertEqual(signal.topic, "celebrity gossip")
+        self.assertEqual(signal.engagement_state, "avoid")
+        self.assertEqual(signal.positive_signal_count, 0)
+        self.assertGreaterEqual(signal.deflection_count, 2)
+        self.assertTrue(signal.explicit)
+
+    def test_world_interest_extractor_derives_follow_through_cooling_from_topic_switch(self) -> None:
+        extractor = WorldInterestSignalExtractor(
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+        )
+        personality_batch = PersonalitySignalExtractor().extract_from_consolidation(
+            turn=LongTermConversationTurn(
+                transcript="Erzaehl mir mehr ueber Weltpolitik und Diplomatie.",
+                response="Ich bleibe bei Diplomatie und globalen Entwicklungen.",
+            ),
+            consolidation=LongTermConsolidationResultV1(
+                turn_id="turn:switch:1",
+                occurred_at=datetime(2026, 3, 20, 11, 50, tzinfo=timezone.utc),
+                episodic_objects=(),
+                durable_objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="pref:topic_follow_up:world_politics",
+                        kind="fact",
+                        summary="The user wanted to stay with world politics.",
+                        source=self._source("turn:switch:1"),
+                        status="active",
+                        confidence=0.9,
+                        attributes={
+                            "memory_domain": "preference",
+                            "fact_type": "preference",
+                            "preference_type": "topic_follow_up",
+                            "topic": "world politics",
+                            "support_count": 2,
+                        },
+                    ),
+                ),
+                deferred_objects=(),
+                conflicts=(),
+                graph_edges=(),
+            ),
+        )
+
+        conversation_batch = extractor.extract_from_personality_batch(
+            turn_id="turn:switch:1",
+            batch=personality_batch,
+            occurred_at=datetime(2026, 3, 20, 11, 50, tzinfo=timezone.utc),
+            existing_interest_signals=(
+                WorldInterestSignal(
+                    signal_id="interest:ai_companions",
+                    topic="AI companions",
+                    summary="This topic had been strongly engaging the user before.",
+                    salience=0.8,
+                    confidence=0.86,
+                    engagement_score=0.92,
+                    engagement_state="resonant",
+                    evidence_count=3,
+                    engagement_count=5,
+                    positive_signal_count=4,
+                    exposure_count=4,
+                    updated_at="2026-03-20T10:30:00+00:00",
+                ),
+            ),
+        )
+
+        signals_by_topic = {signal.topic: signal for signal in conversation_batch.interest_signals}
+        self.assertIn("world politics", signals_by_topic)
+        self.assertIn("AI companions", signals_by_topic)
+        self.assertEqual(signals_by_topic["AI companions"].non_reengagement_count, 1)
+        self.assertEqual(signals_by_topic["AI companions"].positive_signal_count, 0)
+        self.assertLess(signals_by_topic["AI companions"].engagement_score, 0.5)
+
+    def test_recalibration_tunes_existing_subscription_from_engagement(self) -> None:
+        remote_state = _FakeRemoteState()
+        config = TwinrConfig(project_root=".")
+        service = WorldIntelligenceService(
+            config=config,
+            remote_state=remote_state,
+            feed_reader=lambda feed_url, *, max_items, timeout_s: (),
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+        )
+        service.store.save_subscriptions(
+            config=config,
+            remote_state=remote_state,
+            subscriptions=(
+                WorldFeedSubscription(
+                    subscription_id="feed:ai_companions",
+                    label="AI companions",
+                    feed_url="https://example.com/ai/rss.xml",
+                    topics=("AI companions",),
+                    priority=0.52,
+                    refresh_interval_hours=96,
+                    created_by="installer",
+                    created_at="2026-03-20T08:00:00+00:00",
+                    last_checked_at="2026-03-20T10:30:00+00:00",
+                    last_refreshed_at="2026-03-20T10:30:00+00:00",
+                ),
+            ),
+        )
+        service.store.save_state(
+            config=config,
+            remote_state=remote_state,
+            state=WorldIntelligenceState(
+                last_recalibrated_at="2026-03-01T08:00:00+00:00",
+                interest_signals=(
+                    WorldInterestSignal(
+                        signal_id="interest:ai_companions",
+                        topic="AI companions",
+                        summary="The user repeatedly asks follow-up questions about AI companions.",
+                        salience=0.78,
+                        confidence=0.86,
+                        engagement_score=0.94,
+                        evidence_count=3,
+                        engagement_count=5,
+                        updated_at="2026-03-20T11:30:00+00:00",
+                    ),
+                ),
+            ),
+        )
+
+        refresh = service.maybe_refresh(search_backend=None)
+        subscriptions = service.store.load_subscriptions(config=config, remote_state=remote_state)
+
+        self.assertEqual(refresh.status, "skipped")
+        self.assertEqual(len(subscriptions), 1)
+        self.assertGreaterEqual(subscriptions[0].priority, 0.84)
+        self.assertEqual(subscriptions[0].refresh_interval_hours, 24)
+        self.assertAlmostEqual(subscriptions[0].base_priority, 0.52)
+        self.assertEqual(subscriptions[0].base_refresh_interval_hours, 96)
+
+    def test_recalibration_ignores_cooling_interest_for_new_feed_discovery(self) -> None:
+        remote_state = _FakeRemoteState()
+        config = TwinrConfig(project_root=".")
+        service = WorldIntelligenceService(
+            config=config,
+            remote_state=remote_state,
+            page_loader=lambda url: (_ for _ in ()).throw(AssertionError("should not discover cooling topics")),
+            feed_reader=lambda feed_url, *, max_items, timeout_s: (),
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+        )
+        service.store.save_state(
+            config=config,
+            remote_state=remote_state,
+            state=WorldIntelligenceState(
+                last_recalibrated_at="2026-03-01T08:00:00+00:00",
+                interest_signals=(
+                    WorldInterestSignal(
+                        signal_id="interest:ai_companions:cooling",
+                        topic="AI companions",
+                        summary="The topic has cooled after repeated exposure without follow-up.",
+                        salience=0.5,
+                        confidence=0.78,
+                        engagement_score=0.22,
+                        engagement_state="cooling",
+                        evidence_count=2,
+                        engagement_count=0,
+                        positive_signal_count=0,
+                        exposure_count=3,
+                        non_reengagement_count=2,
+                        updated_at="2026-03-20T11:30:00+00:00",
+                    ),
+                ),
+            ),
+        )
+
+        refresh = service.maybe_refresh(search_backend=_FakeSearchBackend(sources=("https://example.com/ai",)))
+        subscriptions = service.store.load_subscriptions(config=config, remote_state=remote_state)
+
+        self.assertEqual(refresh.status, "skipped")
+        self.assertEqual(subscriptions, ())
+
+    def test_recalibration_relaxes_subscription_back_to_baseline_after_engagement_decays(self) -> None:
+        remote_state = _FakeRemoteState()
+        config = TwinrConfig(project_root=".")
+        service = WorldIntelligenceService(
+            config=config,
+            remote_state=remote_state,
+            feed_reader=lambda feed_url, *, max_items, timeout_s: (),
+            now_provider=lambda: datetime(2026, 4, 28, 12, 0, tzinfo=timezone.utc),
+        )
+        service.store.save_subscriptions(
+            config=config,
+            remote_state=remote_state,
+            subscriptions=(
+                WorldFeedSubscription(
+                    subscription_id="feed:ai_companions",
+                    label="AI companions",
+                    feed_url="https://example.com/ai/rss.xml",
+                    topics=("AI companions",),
+                    priority=0.89,
+                    base_priority=0.52,
+                    refresh_interval_hours=24,
+                    base_refresh_interval_hours=96,
+                    created_by="installer",
+                    created_at="2026-03-20T08:00:00+00:00",
+                    last_checked_at="2026-04-28T10:30:00+00:00",
+                    last_refreshed_at="2026-04-28T10:30:00+00:00",
+                ),
+            ),
+        )
+        service.store.save_state(
+            config=config,
+            remote_state=remote_state,
+            state=WorldIntelligenceState(
+                last_recalibrated_at="2026-03-20T08:00:00+00:00",
+                interest_signals=(
+                    WorldInterestSignal(
+                        signal_id="interest:ai_companions",
+                        topic="AI companions",
+                        summary="This topic used to pull the user back in repeatedly.",
+                        salience=0.84,
+                        confidence=0.86,
+                        engagement_score=0.92,
+                        evidence_count=4,
+                        engagement_count=5,
+                        updated_at="2026-03-20T11:30:00+00:00",
+                    ),
+                ),
+            ),
+        )
+
+        refresh = service.maybe_refresh(search_backend=None)
+        subscriptions = service.store.load_subscriptions(config=config, remote_state=remote_state)
+        state = service.store.load_state(config=config, remote_state=remote_state)
+
+        self.assertEqual(refresh.status, "skipped")
+        self.assertEqual(len(subscriptions), 1)
+        self.assertAlmostEqual(subscriptions[0].priority, 0.52)
+        self.assertEqual(subscriptions[0].refresh_interval_hours, 96)
+        self.assertEqual(subscriptions[0].base_refresh_interval_hours, 96)
+        self.assertLess(state.interest_signals[0].engagement_score, 0.6)
+        self.assertLess(state.interest_signals[0].salience, 0.7)
+        self.assertLess(state.interest_signals[0].engagement_count, 5)
+        self.assertIn(state.interest_signals[0].engagement_state, {"warm", "uncertain"})
 
     def test_learning_service_records_conversation_interest_signals_in_world_intelligence_state(self) -> None:
         remote_state = _FakeRemoteState()
@@ -586,6 +1018,88 @@ class WorldIntelligenceTests(unittest.TestCase):
         self.assertEqual(len(state.interest_signals), 1)
         self.assertEqual(state.interest_signals[0].topic, "local politics")
         self.assertEqual(state.interest_signals[0].region, "Hamburg")
+
+    def test_learning_service_accumulates_cross_session_cooling_after_topic_switches(self) -> None:
+        remote_state = _FakeRemoteState()
+        config = TwinrConfig(project_root=".")
+        learning = PersonalityLearningService.from_config(config, remote_state=remote_state)
+
+        learning.record_conversation_consolidation(
+            turn=LongTermConversationTurn(
+                transcript="Erzaehl mir mehr ueber AI companions.",
+                response="Ich bleibe gern bei AI companions und halte Entwicklungen im Blick.",
+            ),
+            consolidation=LongTermConsolidationResultV1(
+                turn_id="turn:session:1",
+                occurred_at=datetime(2026, 3, 20, 10, 0, tzinfo=timezone.utc),
+                episodic_objects=(),
+                durable_objects=(
+                    LongTermMemoryObjectV1(
+                        memory_id="pref:topic_follow_up:ai_companions",
+                        kind="fact",
+                        summary="The user explicitly wanted to continue with AI companions.",
+                        source=self._source("turn:session:1"),
+                        status="active",
+                        confidence=0.92,
+                        attributes={
+                            "memory_domain": "preference",
+                            "fact_type": "preference",
+                            "preference_type": "topic_follow_up",
+                            "topic": "AI companions",
+                            "support_count": 2,
+                        },
+                    ),
+                ),
+                deferred_objects=(),
+                conflicts=(),
+                graph_edges=(),
+            ),
+        )
+
+        for index in range(2, 5):
+            learning.record_conversation_consolidation(
+                turn=LongTermConversationTurn(
+                    transcript="Was gibt es Neues in der Weltpolitik?",
+                    response="Ich schaue auf Diplomatie und internationale Entwicklungen.",
+                ),
+                consolidation=LongTermConsolidationResultV1(
+                    turn_id=f"turn:session:{index}",
+                    occurred_at=datetime(2026, 3, 20, 10 + index, 0, tzinfo=timezone.utc),
+                    episodic_objects=(),
+                    durable_objects=(
+                        LongTermMemoryObjectV1(
+                            memory_id=f"pref:topic_follow_up:world_politics:{index}",
+                            kind="fact",
+                            summary="The user wanted to continue with world politics.",
+                            source=self._source(f"turn:session:{index}"),
+                            status="active",
+                            confidence=0.88,
+                            attributes={
+                                "memory_domain": "preference",
+                                "fact_type": "preference",
+                                "preference_type": "topic_follow_up",
+                                "topic": "world politics",
+                                "support_count": 2,
+                            },
+                        ),
+                    ),
+                    deferred_objects=(),
+                    conflicts=(),
+                    graph_edges=(),
+                ),
+            )
+
+        state = WorldIntelligenceState.from_payload(
+            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_STATE_KIND]
+        )
+        signals_by_topic = {signal.topic: signal for signal in state.interest_signals}
+
+        self.assertIn("AI companions", signals_by_topic)
+        self.assertIn("world politics", signals_by_topic)
+        self.assertGreaterEqual(signals_by_topic["AI companions"].non_reengagement_count, 2)
+        self.assertGreaterEqual(signals_by_topic["AI companions"].exposure_count, 3)
+        self.assertIn(signals_by_topic["AI companions"].engagement_state, {"cooling", "avoid"})
+        self.assertIn(signals_by_topic["world politics"].engagement_state, {"resonant", "warm"})
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ tools.
 - persist structured remote-readiness probe evidence and supervisor-seeded watchdog bootstrap snapshots so restart phases do not look like dead/stale watchdog failures
 - run strict bootstrap/recovery remote probes once, then reuse a cheaper steady-state keepalive that proves current remote readability without reseeding every snapshot on every tick
 - keep fresh watchdog heartbeats authoritative during bounded steady-state idle gaps so the supervisor does not false-fail a healthy remote watchdog between deep probes
+- persist only compact recent-sample summaries in watchdog artifacts so Pi heartbeats stay cheap instead of fsyncing multi-megabyte historical probe payloads every tick
 - keep the heavy `archive` snapshot out of the steady-state watchdog hot path while retaining archive-inclusive bootstrap and recovery proofs
 - persist structured long-term remote-read diagnostics when ChonkyDB retrieve/fetch paths fail or degrade to bounded fallback, so operators can separate backend HTTP flakes, timeouts, and client-contract issues
 - ensure the dedicated remote-memory watchdog process is running for live Pi runtimes
@@ -32,7 +33,7 @@ tools.
 - tolerate bounded display-render inflight windows when evaluating companion health, so long Waveshare refreshes are not misclassified as dead threads
 - coordinate per-loop singleton locks
 - run bounded self-tests and build support bundles
-- mirror the authoritative leading repo into `/twinr` while preserving Pi-local runtime-only paths and healing acceptance drift
+- mirror the authoritative leading repo into `/twinr` while preserving Pi-local runtime-only paths, healing acceptance drift, and using exact-content checks by default so false-clean metadata matches do not slip through
 - bootstrap the Pi-side self-coding Codex runtime prerequisites from the leading repo
 - expose config checks that fail clearly when the self-coding Codex bridge, CLI, or auth is not ready
 
@@ -114,10 +115,17 @@ PYTHONPATH=src python3 -m twinr.ops.remote_memory_watchdog_soak --project-root /
 ```bash
 python3 hardware/ops/watch_pi_repo_mirror.py --once
 python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5
+python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5 --metadata-only
 python3 hardware/ops/bootstrap_self_coding_pi.py
 PYTHONPATH=src python3 -m twinr --env-file .env --self-coding-codex-self-test --self-coding-live-auth-check
 PYTHONPATH=src python3 -m twinr --env-file .env --long-term-memory-live-acceptance
 ```
+
+The repo mirror uses `rsync --checksum` on every cycle by default. Only opt
+into `--metadata-only` when you explicitly accept the weaker quick-check plus
+periodic checksum-audit model.
+Its Pi-local preserve rules are perishable, which keeps root runtime state
+protected while still allowing accidental nested repo copies to be deleted.
 
 ## See also
 

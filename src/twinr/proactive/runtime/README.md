@@ -23,11 +23,14 @@ and presence-session state used to arm wakeword listening and proactive checks.
 - Derive a prompt-only `affect_proxy` surface from coarse posture, attention, quiet, and motion cues without claiming emotion as fact
 - Derive a bounded multimodal `attention_target` surface from the current camera anchor, speaker association, showing-intent cues, and short-lived session focus memory
 - Drive calm HDMI face attention-follow cues from the current relevant person anchor while keeping normal person-following horizontal-only, mirroring camera-space left/right into user-facing screen gaze, using small near-center head turns before full side gaze commits, and renewing or briefly holding cues so stationary people do not cause center drift or blink out on short camera dropouts between refresh ticks
-- Mirror clear stabilized user camera gestures such as thumbs-up or waving into short-lived HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues
+- Keep the HDMI attention-follow cadence genuinely sub-second in production defaults, so the local face-follow path is not visually delayed by legacy status-loop timings
+- Keep the fast HDMI attention-refresh path non-blocking by preferring local signal-only audio snapshots over full ambient PCM windows, so gaze and gesture acknowledgement are not serialized behind one-second audio sampling
+- Mirror clear stabilized user camera gestures such as thumbs-up or waving into short-lived HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues; motion-bearing coarse gestures like waving must outrank a simultaneous generic open-palm hand shape so `👋` does not collapse into a stop-hand acknowledgement
 - Keep HDMI attention-follow available on wakeword/runtime-monitor builds even when `proactive_enabled` remains off for camera-triggered proactive prompts
 - Run a bounded local HDMI attention-refresh cadence that keeps gaze-follow responsive even when full proactive inspection is still PIR-gated, and keep that local cue-only path alive while the main runtime is in `error`
 - Bootstrap one bounded local vision inspection from live speech when wakeword mode is enabled, so a quiet or missing PIR does not leave presence-gated wakeword permanently idle
 - Export normalized observation facts and ops telemetry from proactive monitoring, including raw local-camera readiness/count/gesture fields for Pi-side presence debugging
+- Export a dedicated changed-only HDMI attention-follow ops trace so Pi-side debugging can correlate camera health, stabilized person anchors, attention-target state, and cue-publish decisions without blind tuning
 - Export structured ReSpeaker audio-policy facts, per-claim confidence/source metadata, and presence-session IDs for bounded automation and long-term memory ingestion
 - Inject ReSpeaker XVF3800 signal facts into runtime audio observations when that device is targeted
 - Keep bounded ReSpeaker audio observation alive while Twinr is already speaking so interruption facts do not go blind in `answering`

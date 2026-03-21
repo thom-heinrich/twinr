@@ -1,4 +1,11 @@
-"""Parse IMX500 SSD outputs into Twinr's bounded detection contract."""
+"""Parse IMX500 SSD outputs into Twinr's bounded detection contract.
+
+Real "no person detected" frames must stay distinct from camera/runtime
+failures. When the IMX500 session cannot start, tensors are missing, or parse
+fails, callers need an explicit failure instead of an empty detection result so
+they can keep the last stable user-facing target and expose camera health
+correctly.
+"""
 
 from __future__ import annotations
 
@@ -49,23 +56,23 @@ def capture_detection(
         )
         metadata = runtime_manager.capture_metadata(session, observed_at=observed_at)
         outputs = session.imx500.get_outputs(metadata, add_batch=True)
-    except Exception:  # AUDIT-FIX(#1): Transient hardware/runtime faults must degrade to an empty frame, not a crash.
+    except Exception as exc:  # AUDIT-FIX(#1): Surface capture/runtime faults so callers do not mistake them for "no person".
         LOGGER.warning("ai_camera_detection_capture_failed", exc_info=True)
-        return _empty_detection_result()
+        raise RuntimeError("detection_capture_failed") from exc
 
     if outputs is None:  # AUDIT-FIX(#2): Avoid ambiguous truthiness on ndarray-like outputs.
         LOGGER.warning("ai_camera_detection_outputs_missing")
-        return _empty_detection_result()
+        raise RuntimeError("detection_outputs_missing")
 
     try:
         output_count = len(outputs)
     except TypeError:  # AUDIT-FIX(#2): Reject non-container output payloads deterministically.
         LOGGER.warning("ai_camera_detection_outputs_invalid_container")
-        return _empty_detection_result()
+        raise RuntimeError("detection_outputs_invalid_container")
 
     if output_count < 4:
         LOGGER.warning("ai_camera_detection_outputs_incomplete")
-        return _empty_detection_result()
+        raise RuntimeError("detection_outputs_incomplete")
 
     try:
         labels = tuple(getattr(getattr(session.imx500, "network_intrinsics", None), "labels", ()) or ())
@@ -132,9 +139,9 @@ def capture_detection(
             detection.box.area >= config.object_near_area_threshold
             for detection in object_detections
         )
-    except Exception:  # AUDIT-FIX(#1): Keep malformed parser inputs from propagating into the request lifecycle.
+    except Exception as exc:  # AUDIT-FIX(#1): Parsing faults are camera/runtime failures, not authoritative empty frames.
         LOGGER.warning("ai_camera_detection_parse_failed", exc_info=True)
-        return _empty_detection_result()
+        raise RuntimeError("detection_parse_failed") from exc
 
     return DetectionResult(
         person_count=person_count,

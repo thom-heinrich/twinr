@@ -31,6 +31,8 @@ from twinr.memory.longterm.core.models import (
 from twinr.text_utils import slugify_identifier, truncate_text
 
 INTERACTION_SIGNAL_TOPIC_AFFINITY = "topic_affinity"
+INTERACTION_SIGNAL_TOPIC_ENGAGEMENT = "topic_engagement"
+INTERACTION_SIGNAL_TOPIC_COOLING = "topic_cooling"
 INTERACTION_SIGNAL_VERBOSITY_PREFERENCE = "verbosity_preference"
 INTERACTION_SIGNAL_INITIATIVE_PREFERENCE = "initiative_preference"
 INTERACTION_SIGNAL_HUMOR_FEEDBACK = "humor_feedback"
@@ -87,6 +89,29 @@ _GENERIC_TOPIC_VALUES = frozenset(
 _SENSITIVE_DOMAIN_TOKENS = frozenset({"medical", "health", "distress", "crisis", "emergency", "care"})
 _POSITIVE_SIGNAL_VALUES = frozenset({"positive", "more", "yes", "true", "liked", "helpful", "good"})
 _NEGATIVE_SIGNAL_VALUES = frozenset({"negative", "less", "no", "false", "disliked", "too_much", "bad"})
+_TOPIC_ENGAGEMENT_PREFERENCE_TYPES = frozenset(
+    {"topic_engagement", "topic_follow_up", "topic_recurrence", "topic_deep_dive"}
+)
+_TOPIC_ENGAGEMENT_FEEDBACK_TARGETS = frozenset({"topic", "topic_engagement", "topic_follow_up"})
+_TOPIC_ENGAGEMENT_POSITIVE_VALUES = _POSITIVE_SIGNAL_VALUES | frozenset(
+    {"follow_up", "continue", "deeper", "deep_dive", "more_often", "revisit", "recurring"}
+)
+_TOPIC_COOLING_STRONG_PREFERENCE_TYPES = frozenset(
+    {"topic_deflection", "topic_not_now", "topic_avoid"}
+)
+_TOPIC_COOLING_MILD_PREFERENCE_TYPES = frozenset(
+    {"topic_less_often", "topic_pause", "topic_cooling"}
+)
+_TOPIC_COOLING_PREFERENCE_TYPES = (
+    _TOPIC_COOLING_STRONG_PREFERENCE_TYPES | _TOPIC_COOLING_MILD_PREFERENCE_TYPES
+)
+_TOPIC_COOLING_FEEDBACK_TARGETS = _TOPIC_ENGAGEMENT_FEEDBACK_TARGETS
+_TOPIC_COOLING_NEGATIVE_VALUES = _NEGATIVE_SIGNAL_VALUES | frozenset(
+    {"skip", "move_on", "later", "not_now", "pause", "cooling", "less_often"}
+)
+_TOPIC_COOLING_OBSERVATION_TYPES = frozenset(
+    {"topic_non_reengagement", "topic_deflection", "topic_cooling"}
+)
 
 
 def _utcnow() -> datetime:
@@ -328,6 +353,14 @@ class PersonalitySignalExtractor:
                     turn_id=consolidation.turn_id,
                     memory_objects=relevant_objects,
                 )
+                + self._extract_topic_engagement_signals(
+                    turn_id=consolidation.turn_id,
+                    memory_objects=relevant_objects,
+                )
+                + self._extract_topic_cooling_signals(
+                    turn_id=consolidation.turn_id,
+                    memory_objects=relevant_objects,
+                )
                 + self._extract_style_and_feedback_signals(
                     turn_id=consolidation.turn_id,
                     memory_objects=relevant_objects,
@@ -382,6 +415,189 @@ class PersonalitySignalExtractor:
             world_signals=tuple(world_signals),
             continuity_threads=(),
         )
+
+    def _extract_topic_cooling_signals(
+        self,
+        *,
+        turn_id: str,
+        memory_objects: Sequence[LongTermMemoryObjectV1],
+    ) -> tuple[InteractionSignal, ...]:
+        """Build exposure-aware cooling signals from structured topic reactions.
+
+        Missing follow-up is only treated as negative when there is explicit
+        structured evidence that the topic was surfaced repeatedly and failed to
+        pull the user back in. This avoids equating silence with dislike.
+        """
+
+        signals: list[InteractionSignal] = []
+        turn_slug = slugify_identifier(turn_id, fallback="turn")
+        for memory_object in memory_objects:
+            preference_type = _first_structured_token(
+                memory_object,
+                keys=("preference_type", "engagement_type", "relationship_preference"),
+            )
+            feedback_target = _first_structured_token(
+                memory_object,
+                keys=("feedback_target",),
+            )
+            observation_type = _first_structured_token(
+                memory_object,
+                keys=("observation_type", "pattern_type", "engagement_observation"),
+            )
+            engagement_value = _first_structured_token(
+                memory_object,
+                keys=("preference_value", "feedback_polarity", "reaction", "engagement_level"),
+                fallback=getattr(memory_object, "value_key", None),
+            )
+            explicit_feedback = (
+                preference_type in _TOPIC_COOLING_PREFERENCE_TYPES
+                or (
+                    feedback_target in _TOPIC_COOLING_FEEDBACK_TARGETS
+                    and engagement_value in _TOPIC_COOLING_NEGATIVE_VALUES
+                )
+            )
+            implicit_pattern = observation_type in _TOPIC_COOLING_OBSERVATION_TYPES
+            if not explicit_feedback and not implicit_pattern:
+                continue
+            topic = _first_structured_text(
+                memory_object,
+                keys=("topic", "target_topic", "thread_title"),
+                fallback=getattr(memory_object, "value_key", None),
+            )
+            if topic is None:
+                continue
+
+            attributes = _attributes(memory_object)
+            support_count = _memory_support_count(memory_object)
+            exposure_count = _coerce_positive_int(
+                attributes.get("exposure_count"),
+                default=max(2 if explicit_feedback else 1, support_count),
+            )
+            non_reengagement_count = 0
+            deflection_count = 0
+            negative_kind = "topic_cooling"
+
+            if implicit_pattern:
+                non_reengagement_count = max(
+                    1,
+                    _coerce_positive_int(attributes.get("non_reengagement_count"), default=1),
+                )
+                deflection_count = (
+                    _coerce_positive_int(attributes.get("deflection_count"), default=1)
+                    if observation_type == "topic_deflection"
+                    else 0
+                )
+                exposure_aware = attributes.get("exposure_aware")
+                if isinstance(exposure_aware, bool):
+                    is_exposure_aware = exposure_aware
+                else:
+                    is_exposure_aware = exposure_count >= 2
+                if not is_exposure_aware or exposure_count < 2:
+                    continue
+                negative_kind = observation_type or "topic_non_reengagement"
+            else:
+                if preference_type in _TOPIC_COOLING_STRONG_PREFERENCE_TYPES:
+                    deflection_count = 1
+                    non_reengagement_count = 1
+                    negative_kind = preference_type or "topic_deflection"
+                else:
+                    non_reengagement_count = 1
+                    negative_kind = preference_type or feedback_target or "topic_less_often"
+
+            confidence = _clamp(memory_object.confidence, minimum=0.0, maximum=1.0)
+            topic_slug = slugify_identifier(topic, fallback="topic")
+            signals.append(
+                InteractionSignal(
+                    signal_id=f"signal:interaction:{turn_slug}:{topic_slug}:cooling",
+                    signal_kind=INTERACTION_SIGNAL_TOPIC_COOLING,
+                    target=topic,
+                    summary=truncate_text(memory_object.summary, limit=180),
+                    confidence=confidence,
+                    impact=-(confidence * (0.55 if deflection_count else 0.4)),
+                    evidence_count=max(support_count, non_reengagement_count, deflection_count, 1),
+                    source_event_ids=_coalesce_event_ids((memory_object.source.event_ids,)),
+                    explicit_user_requested=explicit_feedback,
+                    metadata={
+                        "signal_source": PLACE_SIGNAL_SOURCE_CONVERSATION,
+                        "memory_id": memory_object.memory_id,
+                        "engagement_kind": negative_kind,
+                        "engagement_direction": "negative",
+                        "exposure_count": exposure_count,
+                        "non_reengagement_count": non_reengagement_count,
+                        "deflection_count": deflection_count,
+                    },
+                )
+            )
+        return tuple(signals)
+
+    def _extract_topic_engagement_signals(
+        self,
+        *,
+        turn_id: str,
+        memory_objects: Sequence[LongTermMemoryObjectV1],
+    ) -> tuple[InteractionSignal, ...]:
+        """Build stronger topic-engagement signals from structured reactions.
+
+        These signals capture cases where the user not only touches a topic, but
+        explicitly asks to stay with it or where structured feedback indicates a
+        clear follow-up pull. They intentionally rely on structured preference
+        or feedback objects instead of transcript phrase matching.
+        """
+
+        signals: list[InteractionSignal] = []
+        turn_slug = slugify_identifier(turn_id, fallback="turn")
+        for memory_object in memory_objects:
+            preference_type = _first_structured_token(
+                memory_object,
+                keys=("preference_type", "engagement_type", "relationship_preference"),
+            )
+            feedback_target = _first_structured_token(
+                memory_object,
+                keys=("feedback_target",),
+            )
+            if (
+                preference_type not in _TOPIC_ENGAGEMENT_PREFERENCE_TYPES
+                and feedback_target not in _TOPIC_ENGAGEMENT_FEEDBACK_TARGETS
+            ):
+                continue
+            engagement_value = _first_structured_token(
+                memory_object,
+                keys=("preference_value", "feedback_polarity", "reaction", "engagement_level"),
+                fallback=getattr(memory_object, "value_key", None),
+            )
+            explicit_request = preference_type in _TOPIC_ENGAGEMENT_PREFERENCE_TYPES
+            if not explicit_request and engagement_value not in _TOPIC_ENGAGEMENT_POSITIVE_VALUES:
+                continue
+            topic = _first_structured_text(
+                memory_object,
+                keys=("topic", "target_topic", "thread_title"),
+                fallback=getattr(memory_object, "value_key", None),
+            )
+            if topic is None:
+                continue
+            confidence = _clamp(memory_object.confidence, minimum=0.0, maximum=1.0)
+            support_count = _memory_support_count(memory_object)
+            topic_slug = slugify_identifier(topic, fallback="topic")
+            engagement_kind = preference_type or feedback_target or "topic_engagement"
+            signals.append(
+                InteractionSignal(
+                    signal_id=f"signal:interaction:{turn_slug}:{topic_slug}:engagement",
+                    signal_kind=INTERACTION_SIGNAL_TOPIC_ENGAGEMENT,
+                    target=topic,
+                    summary=truncate_text(memory_object.summary, limit=180),
+                    confidence=confidence,
+                    impact=confidence * (0.75 if explicit_request else 0.6),
+                    evidence_count=max(2, support_count),
+                    source_event_ids=_coalesce_event_ids((memory_object.source.event_ids,)),
+                    explicit_user_requested=explicit_request,
+                    metadata={
+                        "signal_source": PLACE_SIGNAL_SOURCE_CONVERSATION,
+                        "memory_id": memory_object.memory_id,
+                        "engagement_kind": engagement_kind,
+                    },
+                )
+            )
+        return tuple(signals)
 
     def _extract_style_and_feedback_signals(
         self,
@@ -554,9 +770,15 @@ class PersonalitySignalExtractor:
                         evidence_count=support_count,
                     ),
                     delta_summary=f"Avoid dwelling on {topic} unless the user explicitly asks.",
+                    explicit_user_requested=True,
                     metadata={
                         "signal_source": PLACE_SIGNAL_SOURCE_CONVERSATION,
                         "memory_id": memory_object.memory_id,
+                        "engagement_direction": "negative",
+                        "engagement_kind": "topic_aversion",
+                        "exposure_count": max(2, support_count),
+                        "non_reengagement_count": 1,
+                        "deflection_count": 2,
                     },
                 )
             )
@@ -622,6 +844,10 @@ class PersonalitySignalExtractor:
             if _clean_token(memory_attributes.get("fact_type")) in {"preference", "feedback"}:
                 continue
             if _clean_token(memory_attributes.get("summary_type")) == "thread":
+                continue
+            if _clean_token(memory_attributes.get("pattern_type")) in _TOPIC_COOLING_OBSERVATION_TYPES:
+                continue
+            if _clean_token(memory_attributes.get("observation_type")) in _TOPIC_COOLING_OBSERVATION_TYPES:
                 continue
             topic = _best_topic_label(memory_object)
             if topic is None:

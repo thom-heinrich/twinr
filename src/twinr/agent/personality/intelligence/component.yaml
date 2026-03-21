@@ -8,6 +8,11 @@ owned_concerns:
   - Define persistent RSS/world-intelligence subscription, calibration, and awareness-state models.
   - Persist subscriptions and timing state through remote-primary snapshots.
   - Derive topic/region calibration signals from structured conversation and tool evidence.
+  - Promote explicit structured follow-up reactions into stronger topic-engagement signals for recalibration.
+  - Convert explicit topic aversion and repeated cross-session non-reengagement into bounded avoid/cooling evidence.
+  - Track bounded user-engagement weight for learned interests so recalibration and feed cadence favor topics the user reliably leans into.
+  - Classify learned topics into bounded engagement states so cooling/avoidance can be treated differently from healthy interest.
+  - Decay stale engagement and return tuned subscriptions to their stored baseline cadence when interest cools off.
   - Discover RSS or Atom feeds from explicit source pages returned by live search.
   - Recalibrate feed coverage during reflection-style maintenance windows.
   - Refresh due feeds and translate fresh items into bounded world, continuity, and awareness updates.

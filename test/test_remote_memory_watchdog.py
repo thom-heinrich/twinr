@@ -630,6 +630,61 @@ class RemoteMemoryWatchdogTests(unittest.TestCase):
         self.assertEqual(warm_result["failed_snapshot_kind"], "prompt_memory")
         self.assertEqual(warm_result["checks"][0]["attempts"][0]["status_code"], 503)
 
+    def test_heartbeat_snapshot_compacts_historical_probe_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+            )
+            store = RemoteMemoryWatchdogStore.from_config(config)
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=_StructuredProbeRemoteService,
+                store=store,
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            watchdog.probe_once()
+            watchdog._emit_heartbeat(
+                probe_started_at="2026-03-16T18:00:00Z",
+                probe_started_monotonic=watchdog._monotonic(),
+                probe_inflight=False,
+            )
+            payload = json.loads(store.path.read_text(encoding="utf-8"))
+
+        self.assertIsNotNone(payload["current"]["probe"])
+        self.assertEqual(len(payload["recent_samples"]), 1)
+        self.assertIsNone(payload["recent_samples"][0]["probe"])
+
+    def test_persisted_snapshot_caps_recent_sample_history_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                runtime_state_path=str(root / "state" / "runtime-state.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_watchdog_history_limit=200,
+            )
+            watchdog = RemoteMemoryWatchdog(
+                config=config,
+                service_factory=lambda: _SequencedRemoteService(["ok"]),
+                store=RemoteMemoryWatchdogStore.from_config(config),
+                event_store=TwinrOpsEventStore.from_config(config),
+                emit=lambda _line: None,
+            )
+
+            for _ in range(80):
+                watchdog.probe_once()
+            payload = json.loads(watchdog.artifact_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["sample_count"], 80)
+        self.assertEqual(len(payload["recent_samples"]), 64)
+
     def test_run_waits_for_keepalive_gap_before_starting_next_deep_probe(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

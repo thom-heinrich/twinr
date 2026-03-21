@@ -1009,7 +1009,7 @@ class LongTermStructuredStore:
                 if self._remote_is_required():
                     raise
                 direct_payloads = None
-            if direct_payloads is not None:
+            if direct_payloads:
                 payloads = direct_payloads
             else:
                 try:
@@ -1036,10 +1036,27 @@ class LongTermStructuredStore:
                 _LOG.warning("Skipping invalid remote long-term conflict payload during selective load.", exc_info=True)
         if not clean_query:
             return tuple(conflicts[:bounded_limit])
+        related_ids = tuple(
+            dict.fromkeys(
+                memory_id
+                for conflict in conflicts
+                for memory_id in (conflict.candidate_memory_id, *conflict.existing_memory_ids)
+                if isinstance(memory_id, str) and memory_id
+            )
+        )
+        objects_by_id: dict[str, LongTermMemoryObjectV1] = {}
+        if related_ids:
+            try:
+                objects_by_id = {item.memory_id: item for item in self.load_objects_by_ids(related_ids)}
+            except Exception:
+                if self._remote_is_required():
+                    raise
+                objects_by_id = {}
         return self._filter_query_relevant_conflicts(
             clean_query,
             selected=conflicts,
             limit=bounded_limit,
+            objects_by_id=objects_by_id,
         )
 
     def select_relevant_episodic_objects(

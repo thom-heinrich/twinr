@@ -218,50 +218,24 @@ class ReSpeakerAudioObservationProvider:
         fallback_snapshot = None
         if signal_snapshot.assistant_output_active is not True:
             fallback_snapshot = _observe_fallback_audio(self.fallback_observer)
-        fallback_observation = (
-            fallback_snapshot.observation if fallback_snapshot is not None else SocialAudioObservation()
-        )
-        ambient_classification = classify_respeaker_ambient_audio(
+        return _build_respeaker_audio_snapshot(
             signal_snapshot=signal_snapshot,
-            sample=None if fallback_snapshot is None else fallback_snapshot.sample,
+            fallback_snapshot=fallback_snapshot,
         )
-        room_quiet = signal_snapshot.room_quiet
-        if ambient_classification.non_speech_audio_likely is True:
-            room_quiet = False
-        observation = SocialAudioObservation(
-            speech_detected=(
-                signal_snapshot.speech_detected
-                if signal_snapshot.speech_detected is not None
-                else fallback_observation.speech_detected
-            ),
-            distress_detected=fallback_observation.distress_detected,
-            room_quiet=room_quiet,
-            recent_speech_age_s=signal_snapshot.recent_speech_age_s,
-            assistant_output_active=signal_snapshot.assistant_output_active,
-            azimuth_deg=signal_snapshot.azimuth_deg,
-            direction_confidence=signal_snapshot.direction_confidence,
-            device_runtime_mode=signal_snapshot.device_runtime_mode,
-            signal_source=signal_snapshot.source,
-            host_control_ready=signal_snapshot.host_control_ready,
-            transport_reason=signal_snapshot.transport_reason,
-            non_speech_audio_likely=ambient_classification.non_speech_audio_likely,
-            background_media_likely=ambient_classification.background_media_likely,
-            speech_overlap_likely=signal_snapshot.speech_overlap_likely,
-            barge_in_detected=signal_snapshot.barge_in_detected,
-            mute_active=signal_snapshot.mute_active,
-        )
-        if fallback_snapshot is None:
-            return ProactiveAudioSnapshot(
-                observation=observation,
-                signal_snapshot=signal_snapshot,
-            )
-        return ProactiveAudioSnapshot(
-            observation=observation,
-            sample=fallback_snapshot.sample,
-            pcm_bytes=fallback_snapshot.pcm_bytes,
-            sample_rate=fallback_snapshot.sample_rate,
-            channels=fallback_snapshot.channels,
+
+    def observe_signal_only(self) -> ProactiveAudioSnapshot:
+        """Return one low-latency snapshot from XVF3800 host-control signals only.
+
+        The HDMI attention-follow loop runs much faster than the general
+        proactive tick. It should not block on multi-hundred-millisecond PCM
+        sampling windows when the device already has direct ReSpeaker speech
+        and direction hints available from host-control.
+        """
+
+        signal_snapshot = self.signal_provider.observe()
+        return _build_respeaker_audio_snapshot(
             signal_snapshot=signal_snapshot,
+            fallback_snapshot=None,
         )
 
     def note_runtime_context(
@@ -291,6 +265,60 @@ class ReSpeakerAudioObservationProvider:
 
         _close_if_supported(self.signal_provider)
         _close_if_supported(self.fallback_observer)
+
+
+def _build_respeaker_audio_snapshot(
+    *,
+    signal_snapshot: ReSpeakerSignalSnapshot,
+    fallback_snapshot: ProactiveAudioSnapshot | None,
+) -> ProactiveAudioSnapshot:
+    """Merge one XVF3800 signal snapshot with optional PCM fallback data."""
+
+    fallback_observation = (
+        fallback_snapshot.observation if fallback_snapshot is not None else SocialAudioObservation()
+    )
+    ambient_classification = classify_respeaker_ambient_audio(
+        signal_snapshot=signal_snapshot,
+        sample=None if fallback_snapshot is None else fallback_snapshot.sample,
+    )
+    room_quiet = signal_snapshot.room_quiet
+    if ambient_classification.non_speech_audio_likely is True:
+        room_quiet = False
+    observation = SocialAudioObservation(
+        speech_detected=(
+            signal_snapshot.speech_detected
+            if signal_snapshot.speech_detected is not None
+            else fallback_observation.speech_detected
+        ),
+        distress_detected=fallback_observation.distress_detected,
+        room_quiet=room_quiet,
+        recent_speech_age_s=signal_snapshot.recent_speech_age_s,
+        assistant_output_active=signal_snapshot.assistant_output_active,
+        azimuth_deg=signal_snapshot.azimuth_deg,
+        direction_confidence=signal_snapshot.direction_confidence,
+        device_runtime_mode=signal_snapshot.device_runtime_mode,
+        signal_source=signal_snapshot.source,
+        host_control_ready=signal_snapshot.host_control_ready,
+        transport_reason=signal_snapshot.transport_reason,
+        non_speech_audio_likely=ambient_classification.non_speech_audio_likely,
+        background_media_likely=ambient_classification.background_media_likely,
+        speech_overlap_likely=signal_snapshot.speech_overlap_likely,
+        barge_in_detected=signal_snapshot.barge_in_detected,
+        mute_active=signal_snapshot.mute_active,
+    )
+    if fallback_snapshot is None:
+        return ProactiveAudioSnapshot(
+            observation=observation,
+            signal_snapshot=signal_snapshot,
+        )
+    return ProactiveAudioSnapshot(
+        observation=observation,
+        sample=fallback_snapshot.sample,
+        pcm_bytes=fallback_snapshot.pcm_bytes,
+        sample_rate=fallback_snapshot.sample_rate,
+        channels=fallback_snapshot.channels,
+        signal_snapshot=signal_snapshot,
+    )
 
 
 class OpenAIVisionObservationProvider:

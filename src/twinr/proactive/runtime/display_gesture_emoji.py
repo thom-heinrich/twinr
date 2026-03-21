@@ -23,6 +23,13 @@ _SOURCE = "proactive_gesture_ack"
 _DEFAULT_HOLD_SECONDS = 2.8
 _COARSE_GESTURE_EVENT_NAMES = frozenset({"camera.gesture_detected", "camera.coarse_arm_gesture_detected"})
 _FINE_GESTURE_EVENT_NAME = "camera.fine_hand_gesture_detected"
+_MOTION_COARSE_GESTURES = frozenset(
+    {
+        SocialGestureEvent.WAVE,
+        SocialGestureEvent.DISMISS,
+        SocialGestureEvent.TWO_HAND_DISMISS,
+    }
+)
 
 _FINE_HAND_GESTURE_MAP: dict[SocialFineHandGesture, tuple[DisplayEmojiSymbol, str]] = {
     SocialFineHandGesture.THUMBS_UP: (DisplayEmojiSymbol.THUMBS_UP, "success"),
@@ -70,6 +77,28 @@ def derive_display_gesture_emoji(
     """Translate one stabilized camera gesture update into one emoji ack."""
 
     names = {str(name or "").strip() for name in event_names}
+    if (
+        snapshot.gesture_event in _MOTION_COARSE_GESTURES
+        and not snapshot.gesture_event_unknown
+        and (
+            _COARSE_GESTURE_EVENT_NAMES.intersection(names)
+            or (
+                _FINE_GESTURE_EVENT_NAME in names
+                and snapshot.fine_hand_gesture == SocialFineHandGesture.OPEN_PALM
+                and not snapshot.fine_hand_gesture_unknown
+            )
+        )
+    ):
+        mapped = _COARSE_GESTURE_MAP.get(snapshot.gesture_event)
+        if mapped is not None:
+            symbol, accent = mapped
+            return DisplayGestureEmojiDecision(
+                active=True,
+                reason=f"motion_coarse_gesture:{snapshot.gesture_event.value}",
+                symbol=symbol,
+                accent=accent,
+            )
+
     if _FINE_GESTURE_EVENT_NAME in names:
         mapped = _FINE_HAND_GESTURE_MAP.get(snapshot.fine_hand_gesture)
         if mapped is not None and not snapshot.fine_hand_gesture_unknown:

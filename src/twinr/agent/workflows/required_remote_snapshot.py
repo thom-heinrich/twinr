@@ -169,9 +169,10 @@ def _max_allowed_steady_state_sample_age_s(
     idle_gap_s = max(watchdog_interval_s, keepalive_floor_s, observed_latency_s)
     recent_cycle_s = _recent_sample_cycle_s(snapshot) or 0.0
     heartbeat_slack_s = max(1.0, watchdog_interval_s * 2.0)
+    sample_clock_slack_s = max(1.0, watchdog_interval_s)
     return max(
-        max_sample_age_s + idle_gap_s,
-        max(recent_cycle_s, idle_gap_s + observed_latency_s) + heartbeat_slack_s,
+        max_sample_age_s + idle_gap_s + sample_clock_slack_s,
+        max(recent_cycle_s, idle_gap_s + observed_latency_s) + heartbeat_slack_s + sample_clock_slack_s,
     )
 
 
@@ -218,6 +219,33 @@ def _max_allowed_steady_state_heartbeat_age_s(
     return max(
         _max_allowed_heartbeat_age_s(config=config, snapshot=snapshot),
         min(max_steady_state_sample_age_s, max_sample_age_s + keepalive_floor_s),
+    )
+
+
+def _max_allowed_inflight_heartbeat_age_s(
+    *,
+    config: TwinrConfig,
+    snapshot: RemoteMemoryWatchdogSnapshot,
+    max_sample_age_s: float,
+) -> float:
+    """Return the heartbeat budget while one deep probe is still running.
+
+    A healthy in-flight probe can leave the last completed sample old for a
+    while, especially when current-scope refreshes take multiple seconds on the
+    Pi. During that bounded window the heartbeat continues to prove forward
+    progress, so the heartbeat budget must follow the in-flight bridge instead
+    of the much smaller generic keepalive-only threshold.
+    """
+
+    keepalive_floor_s = _keepalive_floor_s(config)
+    inflight_probe_budget_s = _max_allowed_inflight_probe_age_s(
+        config=config,
+        snapshot=snapshot,
+        max_sample_age_s=max_sample_age_s,
+    )
+    return max(
+        _max_allowed_heartbeat_age_s(config=config, snapshot=snapshot),
+        min(inflight_probe_budget_s, max_sample_age_s + keepalive_floor_s),
     )
 
 
@@ -332,6 +360,11 @@ def assess_required_remote_watchdog_snapshot(
         max_sample_age_s=max_sample_age_s,
         max_steady_state_sample_age_s=max_steady_state_sample_age_s,
     )
+    max_inflight_heartbeat_age_s = _max_allowed_inflight_heartbeat_age_s(
+        config=config,
+        snapshot=snapshot,
+        max_sample_age_s=max_sample_age_s,
+    )
     inflight_probe_age_s = getattr(snapshot, "probe_age_s", None)
     heartbeat_fresh = (
         heartbeat_age_s is not None
@@ -340,7 +373,9 @@ def assess_required_remote_watchdog_snapshot(
     )
     inflight_heartbeat_fresh = (
         bool(getattr(snapshot, "probe_inflight", False))
-        and heartbeat_fresh
+        and heartbeat_age_s is not None
+        and math.isfinite(heartbeat_age_s)
+        and heartbeat_age_s <= max_inflight_heartbeat_age_s
         and inflight_probe_age_s is not None
         and math.isfinite(float(inflight_probe_age_s))
         and float(inflight_probe_age_s)

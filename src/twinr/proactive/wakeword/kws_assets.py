@@ -17,6 +17,7 @@ import sys
 import tarfile
 import tempfile
 from typing import Callable
+from collections.abc import Mapping, Sequence
 from urllib.request import Request, urlopen
 
 from twinr.proactive.wakeword.matching import DEFAULT_WAKEWORD_PHRASES
@@ -35,11 +36,12 @@ class WakewordKwsProvisionSpec:
     archive_root: str
     tokens_type: str
     tokens_filename: str
-    tokenizer_filename: str
+    tokenizer_filename: str | None
     encoder_filename: str
     decoder_filename: str
     joiner_filename: str
-    readme_filename: str = "README.md"
+    lexicon_filename: str | None = None
+    readme_filename: str | None = "README.md"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +57,8 @@ class ProvisionedWakewordKwsBundle:
     joiner_path: Path
     keywords_raw_path: Path
     keywords_path: Path
-    tokenizer_path: Path
+    tokenizer_path: Path | None
+    lexicon_path: Path | None
     metadata_path: Path
 
 
@@ -76,7 +79,23 @@ def available_builtin_kws_bundle_specs() -> dict[str, WakewordKwsProvisionSpec]:
             encoder_filename="encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
             decoder_filename="decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
             joiner_filename="joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-        )
+        ),
+        "zh_en_3m_phone_int8": WakewordKwsProvisionSpec(
+            bundle_id="zh_en_3m_phone_int8",
+            source_url=(
+                "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+                "kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2"
+            ),
+            archive_root="sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20",
+            tokens_type="phone+ppinyin",
+            tokens_filename="tokens.txt",
+            tokenizer_filename=None,
+            encoder_filename="encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
+            decoder_filename="decoder-epoch-13-avg-2-chunk-16-left-64.onnx",
+            joiner_filename="joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
+            lexicon_filename="en.phone",
+            readme_filename=None,
+        ),
     }
 
 
@@ -112,6 +131,7 @@ def provision_builtin_kws_bundle(
     bundle_id: str = _DEFAULT_BUNDLE_ID,
     phrases: tuple[str, ...] | list[str] | None = None,
     explicit_keywords: tuple[str, ...] | list[str] | None = None,
+    lexicon_entries: Mapping[str, str | Sequence[str]] | None = None,
     force: bool = False,
     archive_path: str | Path | None = None,
     text2token_fn: Callable[..., list[list[str | int]]] | None = None,
@@ -128,6 +148,11 @@ def provision_builtin_kws_bundle(
     keyword_names = derive_kws_keyword_names(phrases=phrases, explicit_keywords=explicit_keywords)
     if not keyword_names:
         raise ValueError("At least one KWS keyword is required to provision a bundle.")
+    normalized_lexicon_entries = _normalize_lexicon_entries(lexicon_entries)
+    if normalized_lexicon_entries and spec.lexicon_filename is None:
+        raise ValueError(
+            f"KWS bundle {spec.bundle_id!r} does not accept custom lexicon entries."
+        )
     output_root = Path(output_dir).expanduser().resolve(strict=False)
     if output_root.exists() and not output_root.is_dir():
         raise NotADirectoryError(f"KWS output path is not a directory: {output_root}")
@@ -142,15 +167,24 @@ def provision_builtin_kws_bundle(
         _stage_bundle_assets(spec=spec, archive_path=archive, staged_root=staged)
         keywords_raw_path = staged / "keywords_raw.txt"
         keywords_path = staged / "keywords.txt"
+        lexicon_path = staged / spec.lexicon_filename if spec.lexicon_filename else None
+        if lexicon_path is not None and normalized_lexicon_entries:
+            _append_lexicon_entries(
+                lexicon_path=lexicon_path,
+                lexicon_entries=normalized_lexicon_entries,
+            )
         raw_lines = tuple(_keyword_raw_line(name) for name in keyword_names)
         keywords_raw_path.write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
         if text2token_fn is not None:
-            token_lines = text2token_fn(
-                list(raw_lines),
-                tokens=str(staged / "tokens.txt"),
-                tokens_type=spec.tokens_type,
-                bpe_model=str(staged / spec.tokenizer_filename),
-            )
+            callback_kwargs = {
+                "tokens": str(staged / "tokens.txt"),
+                "tokens_type": spec.tokens_type,
+            }
+            if spec.tokenizer_filename is not None:
+                callback_kwargs["bpe_model"] = str(staged / spec.tokenizer_filename)
+            if lexicon_path is not None:
+                callback_kwargs["lexicon"] = str(lexicon_path)
+            token_lines = text2token_fn(list(raw_lines), **callback_kwargs)
             keywords_path.write_text(
                 "\n".join(" ".join(str(item) for item in line) for line in token_lines) + "\n",
                 encoding="utf-8",
@@ -161,8 +195,14 @@ def provision_builtin_kws_bundle(
                 output_path=keywords_path,
                 tokens_path=staged / "tokens.txt",
                 tokens_type=spec.tokens_type,
-                tokenizer_path=staged / spec.tokenizer_filename,
+                tokenizer_path=(staged / spec.tokenizer_filename) if spec.tokenizer_filename else None,
+                lexicon_path=lexicon_path,
             )
+        _validate_generated_keywords(
+            keywords_path=keywords_path,
+            expected_keyword_count=len(raw_lines),
+            bundle_id=spec.bundle_id,
+        )
         metadata_path = staged / "bundle_metadata.json"
         metadata_path.write_text(
             json.dumps(
@@ -172,6 +212,10 @@ def provision_builtin_kws_bundle(
                     "archive_root": spec.archive_root,
                     "tokens_type": spec.tokens_type,
                     "keyword_names": list(keyword_names),
+                    "lexicon_entries": {
+                        word: list(pronunciations)
+                        for word, pronunciations in normalized_lexicon_entries.items()
+                    },
                     "spec": asdict(spec),
                 },
                 indent=2,
@@ -181,17 +225,22 @@ def provision_builtin_kws_bundle(
             encoding="utf-8",
         )
         output_root.mkdir(parents=True, exist_ok=True)
-        for filename in (
+        output_filenames = [
             "tokens.txt",
             "encoder.onnx",
             "decoder.onnx",
             "joiner.onnx",
-            spec.tokenizer_filename,
             "keywords_raw.txt",
             "keywords.txt",
             "bundle_metadata.json",
-            "upstream.README.md",
-        ):
+        ]
+        if spec.tokenizer_filename is not None:
+            output_filenames.append(spec.tokenizer_filename)
+        if spec.lexicon_filename is not None:
+            output_filenames.append(spec.lexicon_filename)
+        if spec.readme_filename is not None:
+            output_filenames.append("upstream.README.md")
+        for filename in output_filenames:
             shutil.copy2(staged / filename, output_root / filename)
 
     return ProvisionedWakewordKwsBundle(
@@ -204,7 +253,8 @@ def provision_builtin_kws_bundle(
         joiner_path=output_root / "joiner.onnx",
         keywords_raw_path=output_root / "keywords_raw.txt",
         keywords_path=output_root / "keywords.txt",
-        tokenizer_path=output_root / spec.tokenizer_filename,
+        tokenizer_path=(output_root / spec.tokenizer_filename) if spec.tokenizer_filename else None,
+        lexicon_path=(output_root / spec.lexicon_filename) if spec.lexicon_filename else None,
         metadata_path=output_root / "bundle_metadata.json",
     )
 
@@ -235,12 +285,22 @@ def _stage_bundle_assets(
 ) -> None:
     required_members = {
         f"{spec.archive_root}/{spec.tokens_filename}": staged_root / "tokens.txt",
-        f"{spec.archive_root}/{spec.tokenizer_filename}": staged_root / spec.tokenizer_filename,
         f"{spec.archive_root}/{spec.encoder_filename}": staged_root / "encoder.onnx",
         f"{spec.archive_root}/{spec.decoder_filename}": staged_root / "decoder.onnx",
         f"{spec.archive_root}/{spec.joiner_filename}": staged_root / "joiner.onnx",
-        f"{spec.archive_root}/{spec.readme_filename}": staged_root / "upstream.README.md",
     }
+    if spec.tokenizer_filename is not None:
+        required_members[f"{spec.archive_root}/{spec.tokenizer_filename}"] = (
+            staged_root / spec.tokenizer_filename
+        )
+    if spec.lexicon_filename is not None:
+        required_members[f"{spec.archive_root}/{spec.lexicon_filename}"] = (
+            staged_root / spec.lexicon_filename
+        )
+    if spec.readme_filename is not None:
+        required_members[f"{spec.archive_root}/{spec.readme_filename}"] = (
+            staged_root / "upstream.README.md"
+        )
     with tarfile.open(archive_path, "r:*") as archive:
         members = {member.name: member for member in archive.getmembers()}
         missing = [name for name in required_members if name not in members]
@@ -265,13 +325,78 @@ def _keyword_raw_line(keyword_name: str) -> str:
     return f"{display_phrase} @{detector_label}"
 
 
+def _normalize_lexicon_entries(
+    lexicon_entries: Mapping[str, str | Sequence[str]] | None,
+) -> dict[str, tuple[str, ...]]:
+    if not lexicon_entries:
+        return {}
+    normalized: dict[str, tuple[str, ...]] = {}
+    for raw_word, raw_pronunciations in lexicon_entries.items():
+        normalized_word = folded_lookup_text(str(raw_word or ""))
+        if not normalized_word:
+            raise ValueError("Custom KWS lexicon entries must use a non-empty word.")
+        if " " in normalized_word:
+            raise ValueError(
+                f"Custom KWS lexicon entries must target one normalized word, got {raw_word!r}."
+            )
+        if isinstance(raw_pronunciations, str):
+            raw_values: Sequence[str] = [raw_pronunciations]
+        else:
+            raw_values = [str(item) for item in raw_pronunciations]
+        pronunciations: list[str] = []
+        seen: set[str] = set()
+        for raw_pronunciation in raw_values:
+            normalized_pronunciation = " ".join(str(raw_pronunciation or "").split()).upper()
+            if not normalized_pronunciation or normalized_pronunciation in seen:
+                continue
+            seen.add(normalized_pronunciation)
+            pronunciations.append(normalized_pronunciation)
+        if not pronunciations:
+            raise ValueError(
+                f"Custom KWS lexicon entry for {raw_word!r} must contain at least one pronunciation."
+            )
+        normalized[normalized_word.upper()] = tuple(pronunciations)
+    return normalized
+
+
+def _append_lexicon_entries(
+    *,
+    lexicon_path: Path,
+    lexicon_entries: Mapping[str, tuple[str, ...]],
+) -> None:
+    with lexicon_path.open("a", encoding="utf-8") as handle:
+        for word, pronunciations in lexicon_entries.items():
+            for pronunciation in pronunciations:
+                handle.write(f"{word} {pronunciation}\n")
+
+
+def _validate_generated_keywords(
+    *,
+    keywords_path: Path,
+    expected_keyword_count: int,
+    bundle_id: str,
+) -> None:
+    lines = [
+        line.strip()
+        for line in keywords_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(lines) != int(expected_keyword_count):
+        raise RuntimeError(
+            "sherpa-onnx text2token produced "
+            f"{len(lines)} keyword line(s) for {expected_keyword_count} requested wakewords "
+            f"under bundle {bundle_id!r}. Check the bundle choice and custom lexicon entries."
+        )
+
+
 def _run_text2token_cli(
     *,
     input_path: Path,
     output_path: Path,
     tokens_path: Path,
     tokens_type: str,
-    tokenizer_path: Path,
+    tokenizer_path: Path | None,
+    lexicon_path: Path | None,
 ) -> None:
     cli_path = Path(sys.executable).absolute().with_name("sherpa-onnx-cli")
     command = [
@@ -281,11 +406,13 @@ def _run_text2token_cli(
         str(tokens_path),
         "--tokens-type",
         tokens_type,
-        "--bpe-model",
-        str(tokenizer_path),
         str(input_path),
         str(output_path),
     ]
+    if tokenizer_path is not None:
+        command[6:6] = ["--bpe-model", str(tokenizer_path)]
+    if lexicon_path is not None:
+        command[6:6] = ["--lexicon", str(lexicon_path)]
     try:
         result = subprocess.run(
             command,

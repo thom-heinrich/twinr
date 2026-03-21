@@ -64,8 +64,13 @@ Run the repo mirror watchdog on the development machine, not on the Pi:
 ```bash
 python3 hardware/ops/watch_pi_repo_mirror.py --once
 python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5
-python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5 --checksum-always
+python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5 --metadata-only
 ```
 
 The mirror is intentionally one-way: `/home/thh/twinr` is authoritative, `/twinr`
 is healed toward it, and runtime-only Pi paths stay protected from deletion.
+Exact-content drift detection is the default on every cycle; `--metadata-only`
+is an explicit throughput tradeoff that falls back to periodic checksum audits.
+Protected Pi-local paths use perishable rsync filters so stale nested repo
+copies can still be deleted instead of being pinned by an inner `.env` or
+similar runtime-only file.

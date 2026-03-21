@@ -94,7 +94,7 @@ _EMOJI_GLYPHS: dict[DisplayEmojiSymbol, str] = {
     DisplayEmojiSymbol.THUMBS_UP: "👍",
     DisplayEmojiSymbol.THUMBS_DOWN: "👎",
     DisplayEmojiSymbol.WAVING_HAND: "👋",
-    DisplayEmojiSymbol.RAISED_HAND: "✋",
+    DisplayEmojiSymbol.RAISED_HAND: "🖐️",
     DisplayEmojiSymbol.POINTING_HAND: "👉",
     DisplayEmojiSymbol.OK_HAND: "👌",
     DisplayEmojiSymbol.HEART: "❤️",

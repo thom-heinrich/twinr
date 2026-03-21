@@ -123,6 +123,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit KWS keyword phrase; repeat to override derivation from the configured wakeword phrases.",
     )
     parser.add_argument(
+        "--wakeword-kws-lexicon-entry",
+        action="append",
+        default=[],
+        help=(
+            "Optional custom phone-lexicon entry in the form WORD=PHONE PHONE ...; "
+            "repeat to add multiple pronunciations or words for phone-based bundles."
+        ),
+    )
+    parser.add_argument(
         "--wakeword-kws-force",
         action="store_true",
         help="Overwrite an existing KWS output directory for --wakeword-kws-provision.",
@@ -478,6 +487,25 @@ def _default_wakeword_kws_output_dir(config: TwinrConfig) -> Path:
     return Path(config.project_root).resolve(strict=False) / "src/twinr/proactive/wakeword/models/kws"
 
 
+def _parse_kws_lexicon_entries(values: list[str] | tuple[str, ...]) -> dict[str, tuple[str, ...]]:
+    """Parse repeated WORD=PHONE PHONE CLI flags into one lexicon-entry mapping."""
+
+    parsed: dict[str, list[str]] = {}
+    for raw_value in values:
+        text = str(raw_value or "").strip()
+        if not text:
+            continue
+        word, separator, pronunciation = text.partition("=")
+        word = word.strip()
+        pronunciation = " ".join(pronunciation.split())
+        if separator != "=" or not word or not pronunciation:
+            raise ValueError(
+                "Each --wakeword-kws-lexicon-entry must use WORD=PHONE PHONE ... syntax."
+            )
+        parsed.setdefault(word, []).append(pronunciation)
+    return {word: tuple(pronunciations) for word, pronunciations in parsed.items()}
+
+
 def _build_wakeword_verifier_backend(config: TwinrConfig, backend) -> Any:
     """Build one verifier backend when wakeword verification needs STT."""
 
@@ -735,6 +763,7 @@ def main() -> int:
             bundle_id=str(args.wakeword_kws_bundle or "").strip() or "gigaspeech_3_3m_bpe_int8",
             phrases=config.wakeword_phrases,
             explicit_keywords=tuple(str(item).strip() for item in (args.wakeword_kws_keyword or []) if str(item).strip()),
+            lexicon_entries=_parse_kws_lexicon_entries(args.wakeword_kws_lexicon_entry or []),
             force=args.wakeword_kws_force,
         )
         print(f"wakeword_kws_bundle_id={report.bundle_id}")
@@ -745,6 +774,8 @@ def main() -> int:
         print(f"wakeword_kws_decoder_path={report.decoder_path}")
         print(f"wakeword_kws_joiner_path={report.joiner_path}")
         print(f"wakeword_kws_keywords_file_path={report.keywords_path}")
+        if report.lexicon_path is not None:
+            print(f"wakeword_kws_lexicon_path={report.lexicon_path}")
         return 0
 
     uses_openai = any(

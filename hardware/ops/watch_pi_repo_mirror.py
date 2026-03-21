@@ -15,7 +15,7 @@ Command-line invocation examples::
 
     python3 hardware/ops/watch_pi_repo_mirror.py --once
     python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5
-    python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5 --checksum-always
+    python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5 --metadata-only
 
 Outputs
 -------
@@ -92,12 +92,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--checksum-every-s",
         type=float,
         default=300.0,
-        help="Run one full checksum audit this often during continuous mode.",
+        help="When using --metadata-only, run one full checksum audit this often.",
     )
-    parser.add_argument(
+    checksum_group = parser.add_mutually_exclusive_group()
+    checksum_group.add_argument(
         "--checksum-always",
+        dest="checksum_always",
         action="store_true",
-        help="Use checksum comparison on every cycle instead of periodic audits only.",
+        default=True,
+        help="Compare file contents on every cycle. This is the default.",
+    )
+    checksum_group.add_argument(
+        "--metadata-only",
+        dest="checksum_always",
+        action="store_false",
+        help="Use rsync quick-check (size+mtime) between periodic checksum audits.",
     )
     parser.add_argument(
         "--once",
@@ -119,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--protect",
         action="append",
         default=[],
-        help="Additional rsync exclude pattern to preserve on the Pi.",
+        help="Additional perishable rsync filter pattern to preserve on the Pi.",
     )
     return parser
 

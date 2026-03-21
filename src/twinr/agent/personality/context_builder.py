@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from twinr.agent.personality.intelligence.models import WorldInterestSignal
 from twinr.agent.personality.models import (
     ConversationStyleProfile,
     HumorProfile,
@@ -191,6 +192,7 @@ class PersonalityContextBuilder:
         *,
         legacy_sections: tuple[tuple[str, str], ...],
         snapshot: PersonalitySnapshot | None,
+        engagement_signals: tuple[WorldInterestSignal, ...] = (),
     ) -> PersonalityPromptPlan:
         """Merge legacy prompt sections with structured personality layers.
 
@@ -229,7 +231,10 @@ class PersonalityContextBuilder:
             _render_trait_lines(snapshot.core_traits) if snapshot else None,
             _render_style_block(snapshot.style_profile) if snapshot else None,
             _render_humor_block(snapshot.humor_profile) if snapshot else None,
-            render_self_expression_policy(snapshot),
+            render_self_expression_policy(
+                snapshot,
+                engagement_signals=engagement_signals,
+            ),
         )
         if personality_content:
             layers.append(
@@ -256,7 +261,10 @@ class PersonalityContextBuilder:
                 )
             )
 
-        mindshare_content = render_mindshare_block(snapshot)
+        mindshare_content = render_mindshare_block(
+            snapshot,
+            engagement_signals=engagement_signals,
+        )
         if mindshare_content:
             layers.append(
                 PersonalityPromptLayer(

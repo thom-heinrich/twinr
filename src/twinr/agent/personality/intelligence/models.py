@@ -26,6 +26,7 @@ _ALLOWED_WORLD_ACTIONS = frozenset(
     {"list", "subscribe", "discover", "deactivate", "refresh_now"}
 )
 _ALLOWED_WORLD_SCOPES = frozenset({"local", "regional", "national", "global", "topic"})
+_ALLOWED_ENGAGEMENT_STATES = frozenset({"resonant", "warm", "uncertain", "cooling", "avoid"})
 
 
 def _clean_text(value: object | None) -> str:
@@ -93,6 +94,30 @@ def _normalize_int(
     return max(minimum, parsed)
 
 
+def _legacy_default_engagement_score(payload: Mapping[str, object]) -> float:
+    """Derive one bounded engagement default for older stored interest signals.
+
+    Older snapshots may not yet carry explicit engagement fields. In that case
+    we backfill them from the already persisted salience/confidence/evidence
+    structure so the policy can become useful immediately without requiring a
+    manual reseed.
+    """
+
+    salience = _normalize_float(payload.get("salience"), field_name="salience", default=0.5)
+    confidence = _normalize_float(payload.get("confidence"), field_name="confidence", default=0.5)
+    evidence_count = _normalize_int(
+        payload.get("evidence_count"),
+        field_name="evidence_count",
+        default=1,
+        minimum=1,
+    )
+    explicit = bool(payload.get("explicit", False))
+    base = 0.38 + (salience * 0.24) + (confidence * 0.22) + (min(evidence_count, 4) * 0.05)
+    if explicit:
+        base = max(base, 0.86)
+    return _normalize_float(base, field_name="engagement_score", default=0.5)
+
+
 def _mapping_items(value: object | None, *, field_name: str) -> tuple[Mapping[str, object], ...]:
     """Normalize one payload field into a tuple of mappings."""
 
@@ -121,6 +146,49 @@ def _required_mapping_text(
         if normalized:
             return normalized
     raise ValueError(f"{field_name} is required.")
+
+
+def _derive_engagement_state(
+    *,
+    engagement_score: float,
+    engagement_count: int,
+    positive_signal_count: int,
+    exposure_count: int,
+    non_reengagement_count: int,
+    deflection_count: int,
+    explicit: bool,
+) -> str:
+    """Classify one topic's current engagement state from bounded evidence.
+
+    The states intentionally separate steady positive pull from evidence of
+    cooling:
+
+    - ``resonant``: the topic repeatedly draws the user back in
+    - ``warm``: the topic is still a healthy ongoing interest
+    - ``uncertain``: there is too little evidence either way
+    - ``cooling``: repeated exposure is not converting into renewed uptake
+    - ``avoid``: explicit or repeated stronger deflection says Twinr should back off
+    """
+
+    if deflection_count >= 2:
+        return "avoid"
+    if deflection_count >= 1 and explicit and positive_signal_count == 0:
+        return "avoid"
+    if deflection_count >= 1:
+        return "cooling"
+    if (
+        exposure_count >= 2
+        and non_reengagement_count >= 2
+        and non_reengagement_count >= max(1, positive_signal_count)
+    ):
+        return "cooling"
+    if explicit and exposure_count >= 2 and non_reengagement_count >= 1 and positive_signal_count == 0:
+        return "cooling"
+    if engagement_score >= 0.86 or engagement_count >= 4 or positive_signal_count >= 3:
+        return "resonant"
+    if engagement_score >= 0.62 or engagement_count >= 2 or positive_signal_count >= 1 or explicit:
+        return "warm"
+    return "uncertain"
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,8 +248,10 @@ class WorldFeedSubscription:
     region: str | None = None
     topics: tuple[str, ...] = ()
     priority: float = 0.6
+    base_priority: float | None = None
     active: bool = True
     refresh_interval_hours: int = 72
+    base_refresh_interval_hours: int | None = None
     source_page_url: str | None = None
     source_title: str | None = None
     created_by: str = "installer"
@@ -208,15 +278,38 @@ class WorldFeedSubscription:
         object.__setattr__(self, "scope", normalized_scope)
         object.__setattr__(self, "region", _optional_text(self.region))
         object.__setattr__(self, "topics", _normalize_string_tuple(self.topics, field_name="topics"))
-        object.__setattr__(self, "priority", _normalize_float(self.priority, field_name="priority", default=0.6))
+        normalized_priority = _normalize_float(self.priority, field_name="priority", default=0.6)
+        object.__setattr__(self, "priority", normalized_priority)
+        object.__setattr__(
+            self,
+            "base_priority",
+            _normalize_float(
+                normalized_priority if self.base_priority is None else self.base_priority,
+                field_name="base_priority",
+                default=normalized_priority,
+            ),
+        )
         object.__setattr__(self, "active", bool(self.active))
+        normalized_refresh_interval_hours = _normalize_int(
+            self.refresh_interval_hours,
+            field_name="refresh_interval_hours",
+            default=72,
+            minimum=24,
+        )
         object.__setattr__(
             self,
             "refresh_interval_hours",
+            normalized_refresh_interval_hours,
+        )
+        object.__setattr__(
+            self,
+            "base_refresh_interval_hours",
             _normalize_int(
-                self.refresh_interval_hours,
-                field_name="refresh_interval_hours",
-                default=72,
+                normalized_refresh_interval_hours
+                if self.base_refresh_interval_hours is None
+                else self.base_refresh_interval_hours,
+                field_name="base_refresh_interval_hours",
+                default=normalized_refresh_interval_hours,
                 minimum=24,
             ),
         )
@@ -244,8 +337,10 @@ class WorldFeedSubscription:
             "scope": self.scope,
             "topics": list(self.topics),
             "priority": self.priority,
+            "base_priority": self.base_priority,
             "active": self.active,
             "refresh_interval_hours": self.refresh_interval_hours,
+            "base_refresh_interval_hours": self.base_refresh_interval_hours,
             "created_by": self.created_by,
             "last_item_ids": list(self.last_item_ids),
         }
@@ -279,8 +374,10 @@ class WorldFeedSubscription:
             region=payload.get("region"),
             topics=payload.get("topics"),
             priority=payload.get("priority"),
+            base_priority=payload.get("base_priority"),
             active=payload.get("active", True),
             refresh_interval_hours=payload.get("refresh_interval_hours"),
+            base_refresh_interval_hours=payload.get("base_refresh_interval_hours"),
             source_page_url=payload.get("source_page_url"),
             source_title=payload.get("source_title"),
             created_by=_clean_text(payload.get("created_by")) or "installer",
@@ -295,7 +392,17 @@ class WorldFeedSubscription:
 
 @dataclass(frozen=True, slots=True)
 class WorldInterestSignal:
-    """Capture one slowly learned topic/region interest for source calibration."""
+    """Capture one slowly learned topic/region interest for source calibration.
+
+    ``engagement_score`` remains the compact bounded numeric summary used by
+    ranking paths, while ``engagement_state`` captures the coarser Twinr policy
+    stance:
+
+    - ``resonant`` / ``warm`` mean the topic still actively pulls the user in
+    - ``uncertain`` means Twinr should stay lightweight and observant
+    - ``cooling`` means repeated exposure is not turning into renewed uptake
+    - ``avoid`` means Twinr should actively back off
+    """
 
     signal_id: str
     topic: str
@@ -304,7 +411,14 @@ class WorldInterestSignal:
     scope: str = "topic"
     salience: float = 0.5
     confidence: float = 0.5
+    engagement_score: float = 0.5
+    engagement_state: str | None = None
     evidence_count: int = 1
+    engagement_count: int = 1
+    positive_signal_count: int = 1
+    exposure_count: int = 1
+    non_reengagement_count: int = 0
+    deflection_count: int = 0
     explicit: bool = False
     source_event_ids: tuple[str, ...] = ()
     updated_at: str | None = None
@@ -324,10 +438,61 @@ class WorldInterestSignal:
         object.__setattr__(self, "confidence", _normalize_float(self.confidence, field_name="confidence", default=0.5))
         object.__setattr__(
             self,
+            "engagement_score",
+            _normalize_float(self.engagement_score, field_name="engagement_score", default=0.5),
+        )
+        object.__setattr__(
+            self,
             "evidence_count",
             _normalize_int(self.evidence_count, field_name="evidence_count", default=1, minimum=1),
         )
+        object.__setattr__(
+            self,
+            "engagement_count",
+            _normalize_int(self.engagement_count, field_name="engagement_count", default=1, minimum=0),
+        )
+        object.__setattr__(
+            self,
+            "positive_signal_count",
+            _normalize_int(self.positive_signal_count, field_name="positive_signal_count", default=1, minimum=0),
+        )
+        object.__setattr__(
+            self,
+            "exposure_count",
+            _normalize_int(self.exposure_count, field_name="exposure_count", default=1, minimum=0),
+        )
+        object.__setattr__(
+            self,
+            "non_reengagement_count",
+            _normalize_int(
+                self.non_reengagement_count,
+                field_name="non_reengagement_count",
+                default=0,
+                minimum=0,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "deflection_count",
+            _normalize_int(self.deflection_count, field_name="deflection_count", default=0, minimum=0),
+        )
         object.__setattr__(self, "explicit", bool(self.explicit))
+        normalized_state = _optional_text(self.engagement_state)
+        if normalized_state is not None:
+            normalized_state = normalized_state.casefold()
+            if normalized_state not in _ALLOWED_ENGAGEMENT_STATES:
+                raise ValueError(f"engagement_state must be one of {sorted(_ALLOWED_ENGAGEMENT_STATES)}.")
+        else:
+            normalized_state = _derive_engagement_state(
+                engagement_score=self.engagement_score,
+                engagement_count=self.engagement_count,
+                positive_signal_count=self.positive_signal_count,
+                exposure_count=self.exposure_count,
+                non_reengagement_count=self.non_reengagement_count,
+                deflection_count=self.deflection_count,
+                explicit=self.explicit,
+            )
+        object.__setattr__(self, "engagement_state", normalized_state)
         object.__setattr__(
             self,
             "source_event_ids",
@@ -345,7 +510,14 @@ class WorldInterestSignal:
             "scope": self.scope,
             "salience": self.salience,
             "confidence": self.confidence,
+            "engagement_score": self.engagement_score,
+            "engagement_state": self.engagement_state,
             "evidence_count": self.evidence_count,
+            "engagement_count": self.engagement_count,
+            "positive_signal_count": self.positive_signal_count,
+            "exposure_count": self.exposure_count,
+            "non_reengagement_count": self.non_reengagement_count,
+            "deflection_count": self.deflection_count,
             "explicit": self.explicit,
             "source_event_ids": list(self.source_event_ids),
         }
@@ -359,6 +531,35 @@ class WorldInterestSignal:
     def from_payload(cls, payload: Mapping[str, object]) -> "WorldInterestSignal":
         """Build one calibration signal from stored payload data."""
 
+        legacy_engagement_count = (
+            payload.get("engagement_count")
+            if "engagement_count" in payload
+            else payload.get("evidence_count")
+        )
+        positive_signal_count = (
+            payload.get("positive_signal_count")
+            if "positive_signal_count" in payload
+            else legacy_engagement_count
+        )
+        engagement_score = (
+            payload.get("engagement_score")
+            if "engagement_score" in payload
+            else _legacy_default_engagement_score(payload)
+        )
+        engagement_count = (
+            payload.get("engagement_count")
+            if "engagement_count" in payload
+            else legacy_engagement_count
+        )
+        exposure_count = payload.get("exposure_count")
+        if exposure_count is None:
+            fallback_positive_count = _normalize_int(
+                positive_signal_count,
+                field_name="positive_signal_count",
+                default=1,
+                minimum=0,
+            )
+            exposure_count = max(1, fallback_positive_count)
         return cls(
             signal_id=_required_mapping_text(payload, field_name="signal_id", aliases=("id",)),
             topic=_required_mapping_text(payload, field_name="topic"),
@@ -367,7 +568,14 @@ class WorldInterestSignal:
             scope=payload.get("scope", "topic"),
             salience=payload.get("salience"),
             confidence=payload.get("confidence"),
+            engagement_score=engagement_score,
+            engagement_state=payload.get("engagement_state"),
             evidence_count=payload.get("evidence_count"),
+            engagement_count=engagement_count,
+            positive_signal_count=positive_signal_count,
+            exposure_count=exposure_count,
+            non_reengagement_count=payload.get("non_reengagement_count", 0),
+            deflection_count=payload.get("deflection_count", 0),
             explicit=payload.get("explicit", False),
             source_event_ids=payload.get("source_event_ids"),
             updated_at=payload.get("updated_at"),

@@ -194,6 +194,20 @@ def _parse_csv_mapping(
     return tuple(parsed) or default
 
 
+def _default_display_poll_interval_s(display_driver: str | None) -> float:
+    """Return one backend-aware default display poll interval.
+
+    HDMI surfaces need a much faster cue/render cadence than e-paper backends,
+    otherwise face-follow and emoji acknowledgements feel delayed even when the
+    upstream sensor path is already fast.
+    """
+
+    normalized = (display_driver or "").strip().lower()
+    if normalized in {"hdmi_fbdev", "hdmi_wayland"}:
+        return 0.12
+    return 0.5
+
+
 def _default_bundled_openwakeword_models(project_root: Path) -> tuple[str, ...]:
     """Return the bundled Twinr wakeword model when the leading repo ships it."""
 
@@ -458,13 +472,13 @@ class TwinrConfig:
     proactive_local_camera_mediapipe_gesture_model_path: str = "state/mediapipe/models/gesture_recognizer.task"
     proactive_local_camera_mediapipe_custom_gesture_model_path: str | None = None
     proactive_local_camera_mediapipe_num_hands: int = 2
-    proactive_local_camera_sequence_window_s: float = 1.6
-    proactive_local_camera_sequence_min_frames: int = 4
+    proactive_local_camera_sequence_window_s: float = 0.75
+    proactive_local_camera_sequence_min_frames: int = 3
     proactive_local_camera_source_device: str = "imx500"
-    proactive_local_camera_frame_rate: int = 10
+    proactive_local_camera_frame_rate: int = 15
     proactive_local_camera_lock_timeout_s: float = 5.0
     proactive_local_camera_startup_warmup_s: float = 0.8
-    proactive_local_camera_metadata_wait_s: float = 3.0
+    proactive_local_camera_metadata_wait_s: float = 0.75
     proactive_local_camera_person_confidence_threshold: float = 0.40
     proactive_local_camera_object_confidence_threshold: float = 0.55
     proactive_local_camera_person_near_area_threshold: float = 0.20
@@ -473,7 +487,17 @@ class TwinrConfig:
     proactive_local_camera_attention_score_threshold: float = 0.62
     proactive_local_camera_engaged_score_threshold: float = 0.45
     proactive_local_camera_pose_confidence_threshold: float = 0.30
-    proactive_local_camera_pose_refresh_s: float = 12.0
+    proactive_local_camera_pose_refresh_s: float = 0.75
+    proactive_local_camera_builtin_gesture_min_score: float = 0.35
+    proactive_local_camera_custom_gesture_min_score: float = 0.45
+    proactive_local_camera_min_hand_detection_confidence: float = 0.35
+    proactive_local_camera_min_hand_presence_confidence: float = 0.35
+    proactive_local_camera_min_hand_tracking_confidence: float = 0.35
+    proactive_local_camera_max_roi_candidates: int = 4
+    proactive_local_camera_primary_person_roi_padding: float = 0.18
+    proactive_local_camera_primary_person_upper_body_ratio: float = 0.78
+    proactive_local_camera_wrist_roi_scale: float = 0.34
+    proactive_local_camera_fine_hand_explicit_hold_s: float = 0.45
     proactive_poll_interval_s: float = 4.0
     proactive_capture_interval_s: float = 6.0
     proactive_motion_window_s: float = 20.0
@@ -670,7 +694,7 @@ class TwinrConfig:
     display_face_cue_ttl_s: float = 4.0
     display_emoji_cue_path: str = "artifacts/stores/ops/display_emoji.json"
     display_emoji_cue_ttl_s: float = 6.0
-    display_attention_refresh_interval_s: float = 0.6
+    display_attention_refresh_interval_s: float = 0.2
     display_attention_session_focus_hold_s: float = 4.5
     display_presentation_path: str = "artifacts/stores/ops/display_presentation.json"
     display_presentation_ttl_s: float = 20.0
@@ -1520,16 +1544,16 @@ class TwinrConfig:
             ),
             proactive_local_camera_sequence_window_s=_parse_float(
                 get_value("TWINR_PROACTIVE_LOCAL_CAMERA_SEQUENCE_WINDOW_S"),
-                1.6,
+                0.75,
             ),
             proactive_local_camera_sequence_min_frames=int(
-                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_SEQUENCE_MIN_FRAMES", "4") or "4"
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_SEQUENCE_MIN_FRAMES", "3") or "3"
             ),
             proactive_local_camera_source_device=(
                 get_value("TWINR_PROACTIVE_LOCAL_CAMERA_SOURCE_DEVICE", "imx500") or "imx500"
             ),
             proactive_local_camera_frame_rate=int(
-                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_FRAME_RATE", "10") or "10"
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_FRAME_RATE", "15") or "15"
             ),
             proactive_local_camera_lock_timeout_s=_parse_float(
                 get_value("TWINR_PROACTIVE_LOCAL_CAMERA_LOCK_TIMEOUT_S"),
@@ -1541,7 +1565,7 @@ class TwinrConfig:
             ),
             proactive_local_camera_metadata_wait_s=_parse_float(
                 get_value("TWINR_PROACTIVE_LOCAL_CAMERA_METADATA_WAIT_S"),
-                3.0,
+                0.75,
             ),
             proactive_local_camera_person_confidence_threshold=_parse_float(
                 get_value("TWINR_PROACTIVE_LOCAL_CAMERA_PERSON_CONFIDENCE_THRESHOLD"),
@@ -1577,7 +1601,46 @@ class TwinrConfig:
             ),
             proactive_local_camera_pose_refresh_s=_parse_float(
                 get_value("TWINR_PROACTIVE_LOCAL_CAMERA_POSE_REFRESH_S"),
-                12.0,
+                0.75,
+            ),
+            proactive_local_camera_builtin_gesture_min_score=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_BUILTIN_GESTURE_MIN_SCORE"),
+                0.35,
+            ),
+            proactive_local_camera_custom_gesture_min_score=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_CUSTOM_GESTURE_MIN_SCORE"),
+                0.45,
+            ),
+            proactive_local_camera_min_hand_detection_confidence=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_MIN_HAND_DETECTION_CONFIDENCE"),
+                0.35,
+            ),
+            proactive_local_camera_min_hand_presence_confidence=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_MIN_HAND_PRESENCE_CONFIDENCE"),
+                0.35,
+            ),
+            proactive_local_camera_min_hand_tracking_confidence=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_MIN_HAND_TRACKING_CONFIDENCE"),
+                0.35,
+            ),
+            proactive_local_camera_max_roi_candidates=int(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_MAX_ROI_CANDIDATES", "4") or "4"
+            ),
+            proactive_local_camera_primary_person_roi_padding=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_PRIMARY_PERSON_ROI_PADDING"),
+                0.18,
+            ),
+            proactive_local_camera_primary_person_upper_body_ratio=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_PRIMARY_PERSON_UPPER_BODY_RATIO"),
+                0.78,
+            ),
+            proactive_local_camera_wrist_roi_scale=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_WRIST_ROI_SCALE"),
+                0.34,
+            ),
+            proactive_local_camera_fine_hand_explicit_hold_s=_parse_float(
+                get_value("TWINR_PROACTIVE_LOCAL_CAMERA_FINE_HAND_EXPLICIT_HOLD_S"),
+                0.45,
             ),
             proactive_poll_interval_s=_parse_float(get_value("TWINR_PROACTIVE_POLL_INTERVAL_S"), 4.0),
             proactive_capture_interval_s=_parse_float(get_value("TWINR_PROACTIVE_CAPTURE_INTERVAL_S"), 6.0),
@@ -2189,7 +2252,7 @@ class TwinrConfig:
             display_emoji_cue_ttl_s=_parse_float(get_value("TWINR_DISPLAY_EMOJI_CUE_TTL_S"), 6.0, minimum=0.1),
             display_attention_refresh_interval_s=_parse_float(
                 get_value("TWINR_DISPLAY_ATTENTION_REFRESH_INTERVAL_S"),
-                0.6,
+                0.2,
                 minimum=0.0,
             ),
             display_attention_session_focus_hold_s=_parse_float(
@@ -2221,7 +2284,10 @@ class TwinrConfig:
             display_full_refresh_interval=int(get_value("TWINR_DISPLAY_FULL_REFRESH_INTERVAL", "0") or "0"),
             display_busy_timeout_s=_parse_float(get_value("TWINR_DISPLAY_BUSY_TIMEOUT_S"), 20.0, minimum=0.1),
             display_runtime_trace_enabled=_parse_bool(get_value("TWINR_DISPLAY_RUNTIME_TRACE_ENABLED"), False),
-            display_poll_interval_s=_parse_float(get_value("TWINR_DISPLAY_POLL_INTERVAL_S"), 0.5),
+            display_poll_interval_s=_parse_float(
+                get_value("TWINR_DISPLAY_POLL_INTERVAL_S"),
+                _default_display_poll_interval_s(get_value("TWINR_DISPLAY_DRIVER", "hdmi_fbdev") or "hdmi_fbdev"),
+            ),
             display_layout=get_value("TWINR_DISPLAY_LAYOUT", "default") or "default",
             display_news_ticker_enabled=_parse_bool(get_value("TWINR_DISPLAY_NEWS_TICKER_ENABLED"), False),
             display_news_ticker_feed_urls=_parse_csv_strings(

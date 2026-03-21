@@ -42,13 +42,13 @@ class HandLandmarkWorkerConfig:
 
     model_path: str
     num_hands: int = 2
-    max_roi_candidates: int = 3
-    primary_person_roi_padding: float = 0.12
-    primary_person_upper_body_ratio: float = 0.68
-    wrist_roi_scale: float = 0.28
-    min_hand_detection_confidence: float = 0.50
-    min_hand_presence_confidence: float = 0.50
-    min_hand_tracking_confidence: float = 0.50
+    max_roi_candidates: int = 4
+    primary_person_roi_padding: float = 0.18
+    primary_person_upper_body_ratio: float = 0.78
+    wrist_roi_scale: float = 0.34
+    min_hand_detection_confidence: float = 0.35
+    min_hand_presence_confidence: float = 0.35
+    min_hand_tracking_confidence: float = 0.35
 
     @classmethod
     def from_config(cls, config: object) -> "HandLandmarkWorkerConfig":
@@ -57,30 +57,30 @@ class HandLandmarkWorkerConfig:
         return cls(
             model_path=str(getattr(config, "hand_landmarker_model_path", "") or "").strip(),
             num_hands=max(1, int(getattr(config, "num_hands", 2) or 2)),
-            max_roi_candidates=max(1, int(getattr(config, "max_roi_candidates", 3) or 3)),
+            max_roi_candidates=max(1, int(getattr(config, "max_roi_candidates", 4) or 4)),
             primary_person_roi_padding=_clamp_ratio(
-                getattr(config, "primary_person_roi_padding", 0.12),
-                default=0.12,
+                getattr(config, "primary_person_roi_padding", 0.18),
+                default=0.18,
             ),
             primary_person_upper_body_ratio=_clamp_ratio(
-                getattr(config, "primary_person_upper_body_ratio", 0.68),
-                default=0.68,
+                getattr(config, "primary_person_upper_body_ratio", 0.78),
+                default=0.78,
             ),
             wrist_roi_scale=_clamp_ratio(
-                getattr(config, "wrist_roi_scale", 0.28),
-                default=0.28,
+                getattr(config, "wrist_roi_scale", 0.34),
+                default=0.34,
             ),
             min_hand_detection_confidence=_clamp_ratio(
-                getattr(config, "min_hand_detection_confidence", 0.50),
-                default=0.50,
+                getattr(config, "min_hand_detection_confidence", 0.35),
+                default=0.35,
             ),
             min_hand_presence_confidence=_clamp_ratio(
-                getattr(config, "min_hand_presence_confidence", 0.50),
-                default=0.50,
+                getattr(config, "min_hand_presence_confidence", 0.35),
+                default=0.35,
             ),
             min_hand_tracking_confidence=_clamp_ratio(
-                getattr(config, "min_hand_tracking_confidence", 0.50),
-                default=0.50,
+                getattr(config, "min_hand_tracking_confidence", 0.35),
+                default=0.35,
             ),
         )
 

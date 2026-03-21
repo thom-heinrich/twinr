@@ -15,6 +15,10 @@ blocks that combine portrait, voice, and explicit feedback on device.
 - persist multi-user local household voice identities and assess current-turn audio against enrolled household members
 - coordinate one bounded local household identity manager across portrait matching, multi-user voice matching, explicit confirm or deny feedback, and short session history
 - run bounded hybrid IMX500 + MediaPipe camera inference for proactive sensing, with IMX500 always-on gating, MediaPipe pose enrichment, dedicated hand-landmark ROI work, ROI-guided gesture recognition, coarse motion, coarse-arm gestures, and bounded fine-hand gesture output
+- surface IMX500 detection/runtime failures explicitly instead of collapsing them into healthy-looking empty no-person frames, so downstream gaze and gesture consumers can distinguish camera faults from real absence
+- expose bounded Pi-side tuning for live hand-gesture responsiveness, including camera FPS, hand-detection/tracking thresholds, gesture score floors, and hand ROI sizing
+- keep local AI-camera metadata waits and pose-refresh reuse windows short enough for interactive face-follow and gesture acknowledgement; multi-second waits or stale 10s+ pose reuse are not acceptable for the Pi HCI path
+- auto-enable the staged local custom gesture model at `state/mediapipe/models/custom_gesture.task` when it exists, so fine-hand symbols such as `OK_SIGN` do not require a separate env override on deployed Pi images
 - normalize MediaPipe-bound image buffers centrally so full frames and ROI crops reach the Pi runtime with supported dtype and contiguous layout
 - keep multi-ROI MediaPipe tasks monotonic by advancing and reserving timestamps across candidate inference within a frame
 - format and submit bounded receipt print jobs

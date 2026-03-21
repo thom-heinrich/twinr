@@ -14,6 +14,12 @@ scored proactive trigger candidates and optional visual second opinions.
 - Wrap ambient-audio, ReSpeaker XVF3800, legacy OpenAI vision, and local-first AI-camera observations into bounded conservative snapshots
 - Preserve conservative ReSpeaker facts such as `assistant_output_active`, `direction_confidence`, `speech_overlap_likely`, and `barge_in_detected`
 - Stabilize automation-facing camera snapshots, including person-count/zone anchors, coarse motion, and coarse/fine gesture event surfaces
+- Treat local camera health faults as `unknown` camera semantics instead of authoritative "no person" ticks, so short IMX500/runtime problems do not instantly erase the last stable person anchor
+- Smooth small primary-person center jitter before it reaches the HDMI gaze path, so box wobble does not read as nervous eye movement when the user is standing still
+- Keep that center smoothing short enough for live HDMI HCI, so person-following stays calm without adding second-scale lag
+- Keep the gesture acknowledgement surface fast enough for HDMI HCI, so changed user symbols like `🖐️` then `👍` are not blocked for several seconds by the slower proactive inspect cadence
+- Preserve short explicit fine-hand symbols such as `👍`, `👎`, `👉`, or `👌` across brief motion/dropout jitter so users do not need to freeze unnaturally for the camera path
+- Expose a low-latency ReSpeaker signal-only audio snapshot path for HDMI attention refresh, so local gesture/gaze HCI does not inherit the longer ambient PCM sampling window
 - Route safety prompts and render bounded evidence facts for proactive prompting
 - Buffer recent camera frames and request conservative visual second opinions
 

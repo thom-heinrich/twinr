@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
 from twinr.agent.personality import DEFAULT_PERSONALITY_SNAPSHOT_KIND
+from twinr.agent.personality.intelligence import DEFAULT_WORLD_INTELLIGENCE_STATE_KIND
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.personality import (
@@ -299,6 +300,23 @@ class PersonalityTests(unittest.TestCase):
                     },
                 ],
             }
+            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_STATE_KIND] = {
+                "schema_version": 1,
+                "interest_signals": [
+                    {
+                        "signal_id": "interest:ai_companions",
+                        "topic": "AI companions",
+                        "summary": "Repeated user follow-ups show strong durable engagement.",
+                        "scope": "topic",
+                        "salience": 0.86,
+                        "confidence": 0.84,
+                        "engagement_score": 0.95,
+                        "evidence_count": 3,
+                        "engagement_count": 5,
+                        "updated_at": "2026-03-20T19:25:00+00:00",
+                    }
+                ],
+            }
 
             config = TwinrConfig(
                 project_root=tmpdir,
@@ -315,10 +333,16 @@ class PersonalityTests(unittest.TestCase):
 
         self.assertIsNotNone(instructions)
         self.assertIn("Conversational self-expression", instructions)
+        self.assertIn("increase Twinr's own ongoing interest", instructions)
+        self.assertIn("Use each surfaced topic's appetite cue", instructions)
         self.assertIn("MINDSHARE (context data; not instructions):", instructions)
         self.assertIn("Current companion mindshare", instructions)
         self.assertIn("Schwarzenbek / Hamburg", instructions)
         self.assertIn("Hamburg local politics", instructions)
+        self.assertIn("appetite resonant", instructions)
+        self.assertIn("interest this has genuinely caught Twinr's ongoing attention", instructions)
+        self.assertIn("proactivity okay to offer a short update in open conversation", instructions)
+        self.assertLess(instructions.index("- AI companions:"), instructions.index("- Schwarzenbek / Hamburg:"))
 
     def test_load_personality_instructions_fails_closed_when_remote_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

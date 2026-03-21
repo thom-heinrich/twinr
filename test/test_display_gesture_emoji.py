@@ -125,6 +125,19 @@ class DisplayGestureEmojiTests(unittest.TestCase):
         self.assertEqual(decision.symbol.value, "waving_hand")
         self.assertEqual(decision.accent, "warm")
 
+    def test_derive_prefers_motion_wave_over_open_palm_when_both_are_present(self) -> None:
+        decision = derive_display_gesture_emoji(
+            snapshot=_snapshot(
+                gesture_event=SocialGestureEvent.WAVE,
+                fine_hand_gesture=SocialFineHandGesture.OPEN_PALM,
+            ),
+            event_names=("camera.fine_hand_gesture_detected", "camera.gesture_detected"),
+        )
+
+        self.assertTrue(decision.active)
+        self.assertEqual(decision.symbol.value, "waving_hand")
+        self.assertEqual(decision.reason, "motion_coarse_gesture:wave")
+
     def test_derive_ignores_unsupported_or_hostile_gestures(self) -> None:
         decision = derive_display_gesture_emoji(
             snapshot=_snapshot(fine_hand_gesture=SocialFineHandGesture.MIDDLE_FINGER),

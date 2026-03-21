@@ -1,0 +1,39 @@
+{
+  "archive_root": "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20",
+  "bundle_id": "zh_en_3m_phone_int8",
+  "keyword_names": [
+    "twinna",
+    "twina",
+    "twinner",
+    "twinr"
+  ],
+  "lexicon_entries": {
+    "TWINA": [
+      "T W IY1 N AH0"
+    ],
+    "TWINNA": [
+      "T W IY1 N AH0"
+    ],
+    "TWINNER": [
+      "T W IY1 N ER0"
+    ],
+    "TWINR": [
+      "T W IY1 N ER0"
+    ]
+  },
+  "source_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
+  "spec": {
+    "archive_root": "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20",
+    "bundle_id": "zh_en_3m_phone_int8",
+    "decoder_filename": "decoder-epoch-13-avg-2-chunk-16-left-64.onnx",
+    "encoder_filename": "encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
+    "joiner_filename": "joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
+    "lexicon_filename": "en.phone",
+    "readme_filename": null,
+    "source_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
+    "tokenizer_filename": null,
+    "tokens_filename": "tokens.txt",
+    "tokens_type": "phone+ppinyin"
+  },
+  "tokens_type": "phone+ppinyin"
+}

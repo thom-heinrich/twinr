@@ -12,10 +12,14 @@ from twinr.display.face_expressions import DisplayFaceGazeDirection
 from twinr.proactive.runtime.display_attention import (
     DisplayAttentionCuePublisher,
     derive_display_attention_cue,
+    resolve_display_attention_refresh_interval,
 )
 
 
 class DisplayAttentionCueTests(unittest.TestCase):
+    def test_refresh_interval_uses_faster_default(self) -> None:
+        self.assertEqual(resolve_display_attention_refresh_interval(TwinrConfig()), 0.2)
+
     def test_derives_user_facing_rightward_gaze_from_left_camera_anchor(self) -> None:
         decision = derive_display_attention_cue(
             config=TwinrConfig(proactive_capture_interval_s=6.0, display_attention_refresh_interval_s=0.6),
@@ -56,6 +60,25 @@ class DisplayAttentionCueTests(unittest.TestCase):
         self.assertTrue(decision.active)
         self.assertEqual(decision.gaze, DisplayFaceGazeDirection.CENTER)
         self.assertEqual(decision.head_dx, 1)
+
+    def test_committed_side_gaze_keeps_strong_stable_head_turn(self) -> None:
+        decision = derive_display_attention_cue(
+            config=TwinrConfig(proactive_capture_interval_s=6.0, display_attention_refresh_interval_s=0.6),
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "primary_person_center_x": 0.40,
+                    "primary_person_center_y": 0.5,
+                },
+                "vad": {
+                    "speech_detected": False,
+                },
+            },
+        )
+
+        self.assertTrue(decision.active)
+        self.assertEqual(decision.gaze, DisplayFaceGazeDirection.RIGHT)
+        self.assertEqual(decision.head_dx, 2)
 
     def test_derives_speaking_mouth_when_visible_person_is_current_speaker(self) -> None:
         decision = derive_display_attention_cue(
@@ -325,6 +348,46 @@ class DisplayAttentionCueTests(unittest.TestCase):
         self.assertIsNotNone(held)
         assert held is not None
         self.assertEqual(held.gaze_x, 2)
+
+    def test_publisher_keeps_same_side_gaze_unchanged_when_anchor_moves_within_side(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_capture_interval_s=6.0,
+                display_attention_refresh_interval_s=0.6,
+                display_face_cue_ttl_s=4.0,
+            )
+            publisher = DisplayAttentionCuePublisher.from_config(config)
+            first_result = publisher.publish_from_facts(
+                config=config,
+                live_facts={
+                    "camera": {
+                        "person_visible": True,
+                        "primary_person_center_x": 0.12,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                    },
+                },
+                now=datetime(2026, 3, 20, 8, 4, tzinfo=timezone.utc),
+            )
+
+            same_side_result = publisher.publish_from_facts(
+                config=config,
+                live_facts={
+                    "camera": {
+                        "person_visible": True,
+                        "primary_person_center_x": 0.40,
+                    },
+                    "vad": {
+                        "speech_detected": False,
+                    },
+                },
+                now=datetime(2026, 3, 20, 8, 4, 0, 500000, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(first_result.action, "updated")
+        self.assertEqual(same_side_result.action, "unchanged")
 
     def test_publisher_holds_recent_cue_across_brief_visual_dropout(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

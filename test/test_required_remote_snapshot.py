@@ -309,6 +309,28 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
         self.assertTrue(assessment.snapshot_stale)
         self.assertIn("stale", assessment.detail.lower())
 
+    def test_assess_accepts_pi_second_resolution_steady_state_boundary(self) -> None:
+        now = datetime(2026, 3, 20, 19, 47, 37, 217594, tzinfo=timezone.utc)
+        snapshot = _build_snapshot(
+            now=now,
+            pid=os.getpid(),
+            age_s=21.217594,
+            latency_ms=1864.0,
+            heartbeat_age_s=8.217594,
+            probe_inflight=False,
+            previous_sample_ages_s=(78.217594, 59.217594, 40.217594),
+        )
+        config = TwinrConfig()
+
+        assessment = assess_required_remote_watchdog_snapshot(
+            config,
+            now_wall=now,
+            store=_FakeStore(snapshot),
+        )
+
+        self.assertTrue(assessment.ready)
+        self.assertFalse(assessment.snapshot_stale)
+
     def test_assess_accepts_live_inflight_probe_with_fresh_heartbeat(self) -> None:
         now = datetime.now(timezone.utc)
         snapshot = _build_snapshot(
@@ -381,6 +403,31 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
         self.assertGreater(assessment.sample_age_s or 0.0, assessment.max_sample_age_s)
         self.assertGreater(assessment.heartbeat_age_s or 0.0, 5.0)
 
+    def test_assess_accepts_live_pi_inflight_probe_with_bounded_heartbeat_bridge(self) -> None:
+        now = datetime(2026, 3, 20, 19, 36, 49, 2982, tzinfo=timezone.utc)
+        snapshot = _build_snapshot(
+            now=now,
+            pid=os.getpid(),
+            age_s=27.002982,
+            latency_ms=4933.1,
+            heartbeat_age_s=7.002982,
+            probe_inflight=True,
+            probe_age_s=0.0,
+            previous_sample_ages_s=(83.002982, 64.002982, 44.002982),
+        )
+        config = TwinrConfig()
+
+        assessment = assess_required_remote_watchdog_snapshot(
+            config,
+            now_wall=now,
+            store=_FakeStore(snapshot),
+        )
+
+        self.assertTrue(assessment.ready)
+        self.assertFalse(assessment.snapshot_stale)
+        self.assertTrue(assessment.probe_inflight)
+        self.assertGreater(assessment.sample_age_s or 0.0, assessment.max_sample_age_s)
+
     def test_assess_rejects_inflight_probe_when_heartbeat_is_too_old(self) -> None:
         now = datetime.now(timezone.utc)
         snapshot = _build_snapshot(
@@ -388,9 +435,9 @@ class RequiredRemoteWatchdogSnapshotTests(unittest.TestCase):
             pid=os.getpid(),
             age_s=9.0,
             latency_ms=1015.4,
-            heartbeat_age_s=8.2,
+            heartbeat_age_s=13.2,
             probe_inflight=True,
-            probe_age_s=8.2,
+            probe_age_s=13.2,
         )
         config = TwinrConfig()
 
