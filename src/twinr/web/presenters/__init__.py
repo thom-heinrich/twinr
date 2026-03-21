@@ -20,9 +20,11 @@ from twinr.web.presenters.debug import build_ops_debug_page_context, coerce_ops_
 from twinr.web.presenters.integrations import (
     _build_calendar_integration_record,
     _build_email_integration_record,
+    _build_smart_home_integration_record,
     _calendar_integration_sections,
     _email_integration_sections,
     _integration_overview_rows,
+    _smart_home_integration_sections,
     _whatsapp_integration_context,
 )
 from twinr.web.presenters.memory import _memory_sections
@@ -41,6 +43,7 @@ __all__ = [
     "_adaptive_timing_view",
     "_build_calendar_integration_record",
     "_build_email_integration_record",
+    "_build_smart_home_integration_record",
     "_calendar_integration_sections",
     "_capture_voice_profile_sample",
     "_connect_sections",
@@ -50,6 +53,7 @@ __all__ = [
     "_format_usage_rows",
     "_health_card_detail",
     "_integration_overview_rows",
+    "_smart_home_integration_sections",
     "_memory_sections",
     "_nav_items",
     "_provider_status",

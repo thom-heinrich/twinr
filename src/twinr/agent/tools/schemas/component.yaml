@@ -9,6 +9,7 @@ owned_concerns:
   - Normalize requested tool names before schema selection
   - Derive compact schema variants for token-constrained callers
   - Derive realtime-safe schema variants for provider APIs with stricter top-level limits
+  - Keep smart-home discovery, filtered-state, control, aggregation, and stream schemas aligned with the generic integration contracts
 out_of_scope:
   - Tool handler execution or runtime-side side effects
   - Prompt instruction authoring or tool selection policy

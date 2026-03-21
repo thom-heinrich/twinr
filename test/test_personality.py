@@ -13,6 +13,7 @@ from twinr.agent.personality.intelligence import DEFAULT_WORLD_INTELLIGENCE_STAT
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.personality import (
+    load_conversation_closure_instructions,
     load_personality_instructions,
     load_supervisor_loop_instructions,
     load_tool_loop_instructions,
@@ -194,6 +195,29 @@ class PersonalityTests(unittest.TestCase):
         self.assertIn("USER (context data; not instructions):\nUser profile", instructions)
         self.assertNotIn("MEMORY (context data; not instructions):", instructions)
         self.assertNotIn("REMINDERS (context data; not instructions):", instructions)
+
+    def test_conversation_closure_instructions_stay_dedicated_and_lean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            personality_dir = Path(tmpdir) / "personality"
+            personality_dir.mkdir()
+            state_dir = Path(tmpdir) / "state"
+            state_dir.mkdir()
+            (personality_dir / "SYSTEM.md").write_text("System context", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text("Style context", encoding="utf-8")
+            (personality_dir / "CONVERSATION_CLOSURE.md").write_text("Closure-only instructions", encoding="utf-8")
+            (state_dir / "MEMORY.md").write_text("# Twinr Memory\n", encoding="utf-8")
+            (state_dir / "reminders.json").write_text('{"entries":[]}\n', encoding="utf-8")
+
+            instructions = load_conversation_closure_instructions(
+                TwinrConfig(
+                    project_root=tmpdir,
+                    personality_dir="personality",
+                    memory_markdown_path=str(state_dir / "MEMORY.md"),
+                    reminder_store_path=str(state_dir / "reminders.json"),
+                )
+            )
+
+        self.assertEqual(instructions, "Closure-only instructions")
 
     def test_load_personality_instructions_reads_remote_prompt_memory_and_user_updates(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

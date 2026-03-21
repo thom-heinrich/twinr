@@ -3,18 +3,22 @@ name: integrations.smarthome
 path: src/twinr/integrations/smarthome
 kind: python-package
 visibility: internal
-summary: Provide vendor-neutral smart-home contracts plus a shared adapter for read, control, and sensor-stream use cases.
+summary: Provide vendor-neutral smart-home contracts, shared adapters, and stream-to-observation helpers for read, control, and sensor use cases.
 owned_concerns:
   - Define generic smart-home entities, commands, and stream events
   - Expose one shared smart-home adapter surface for LLM reads, explicit control, and bounded event-stream reads
+  - Parse generic smart-home selectors, scalar state filters, pagination, and aggregations without adding provider-specific summary operations
+  - Aggregate multiple routed smart-home providers behind one route-qualified read/control/stream surface
+  - Translate provider stream batches into compact Twinr smart-home observations
+  - Run one bounded smart-home sensor worker that polls providers and emits normalized observations
   - Keep provider-specific transport and normalization out of the generic package
 out_of_scope:
   - Hue-specific bridge transport and stream parsing in src/twinr/integrations/smarthome/hue
   - Automation-engine trigger registration outside src/twinr/integrations
-  - Runtime-loop orchestration above the integration adapter boundary
+  - Global runtime-loop orchestration above the smart-home worker boundary
 files:
   - path: __init__.py
-    role: Stable export surface for generic smart-home contracts
+    role: Stable export surface for generic smart-home contracts and observation helpers
   - path: models.py
     role: Vendor-neutral entity, command, and event models
     exports:
@@ -32,8 +36,26 @@ files:
       - SmartHomeEntityProvider
       - SmartHomeIntegrationAdapter
       - SmartHomeSensorStream
+  - path: query.py
+    role: Generic smart-home selector, scalar filter, pagination, and aggregation helpers
+  - path: aggregate.py
+    role: Route-aware aggregation for multi-bridge or multi-hub smart-home providers
+    exports:
+      - AggregatedSmartHomeProvider
+      - RoutedSmartHomeProvider
+      - build_routed_entity_id
+      - build_routed_event_id
+      - parse_routed_entity_id
+  - path: runtime.py
+    role: Smart-home stream-to-observation mapping and bounded sensor worker
+    exports:
+      - SmartHomeObservation
+      - SmartHomeObservationBuilder
+      - SmartHomeSensorWorker
   - path: hue
     role: First smart-home provider package for Philips Hue bridges
 tests:
   - path: test/test_integrations.py
   - path: test/test_integrations_smarthome.py
+  - path: test/test_integrations_smarthome_runtime.py
+  - path: test/test_integrations_smarthome_hue.py

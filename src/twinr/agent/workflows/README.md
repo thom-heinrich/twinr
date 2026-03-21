@@ -11,6 +11,8 @@ bounded.
 `workflows` owns:
 - orchestrate button, wakeword, and proactive entry points for live loops
 - coordinate conversation turns, print delivery, and streamed speech output
+- cache and replay one normalized wakeword-ack payload so the Pi wakeword `Ja?` stays audible without changing broader speech orchestration
+- start one bounded managed smart-home sensor worker so external motion, button, alarm, and device-health events become normal Twinr sensor observations
 - keep the yellow print button latency-safe by queuing prints from local short-term context only instead of synchronously rebuilding remote provider context before the print lane starts
 - route beep, feedback, and spoken playback through one priority-aware playback coordinator instead of scattered per-call locks
 - keep fatal Pi loop/bootstrap failures on one stable error screen by holding the runtime in `error` and refreshing its snapshot instead of crashing back to the desktop and letting the supervisor ping-pong
@@ -53,7 +55,7 @@ bounded.
 | File | Purpose |
 |---|---|
 | [runner.py](./runner.py) | Compatibility shim to the legacy classic loop in `src/twinr/agent/legacy/classic_hardware_loop.py` |
-| [realtime_runner.py](./realtime_runner.py) | Realtime session loop that delegates guidance and transcript-verifier policy to focused runtime helpers |
+| [realtime_runner.py](./realtime_runner.py) | Realtime session loop that delegates guidance and transcript-verifier policy while also running the smart-home sensor worker |
 | [streaming_runner.py](./streaming_runner.py) | Streaming loop entrypoint and orchestration shell |
 | [follow_up_steering.py](./follow_up_steering.py) | Runtime bridge from personality steering cues into follow-up reopening decisions |
 | [runtime_error_hold.py](./runtime_error_hold.py) | Stable runtime-error hold that keeps the display companion alive and the snapshot fresh after fatal loop failures |
@@ -70,7 +72,7 @@ bounded.
 | [realtime_runtime/support.py](./realtime_runtime/support.py) | Active emit/media/config helpers used by the realtime loop |
 | [realtime_runner_background.py](./realtime_runner_background.py) | Compatibility shim for background helpers |
 | [realtime_runner_support.py](./realtime_runner_support.py) | Compatibility shim for support helpers |
-| [realtime_runner_tools.py](./realtime_runner_tools.py) | Tool delegate mixin, including RSS/world-intelligence configuration wiring |
+| [realtime_runner_tools.py](./realtime_runner_tools.py) | Tool delegate mixin, including smart-home and RSS/world-intelligence wiring |
 | [button_dispatch.py](./button_dispatch.py) | Non-blocking button dispatch and busy-turn interruption |
 | [required_remote_watch.py](./required_remote_watch.py) | Background required-remote readiness watch for fail-closed runtimes |
 | [required_remote_snapshot.py](./required_remote_snapshot.py) | Cheap external-watchdog snapshot evaluation for live runtime gating, including bounded heartbeat bridging keyed to healthy recent steady-state probe cadence and Pi-safe heartbeat quiet windows |

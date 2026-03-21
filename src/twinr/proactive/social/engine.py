@@ -191,6 +191,7 @@ class SocialFineHandGesture(StrEnum):
     THUMBS_UP = "thumbs_up"
     THUMBS_DOWN = "thumbs_down"
     POINTING = "pointing"
+    PEACE_SIGN = "peace_sign"
     OPEN_PALM = "open_palm"
     OK_SIGN = "ok_sign"
     MIDDLE_FINGER = "middle_finger"

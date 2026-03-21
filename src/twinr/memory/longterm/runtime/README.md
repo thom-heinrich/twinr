@@ -12,9 +12,11 @@ bounded background writers into the APIs used by agent runtime loops.
 - Build runtime provider context and tool-safe context while preserving both original-language and canonical query recall paths
 - Expose confirmed durable-memory state explicitly in provider/tool context so meta-memory questions can distinguish stored current facts from generic neighbors
 - Rebuild and persist provenance-rich restart-recall packets after durable-memory mutations so fresh runtime roots retain immediate continuity
+- Persist one deterministic immediate turn-continuity midterm packet before slower extraction/reflection drains so fresh follow-up recall does not block on the full background writer
 - Persist conversation turns and multimodal evidence through bounded workers
 - Coalesce high-frequency sensor observations onto a latest-only idle-loop handoff before they hit multimodal long-term persistence, so proactive sensor churn cannot build an unbounded remote write backlog
 - Route consolidated conversation turns and post-turn tool history into the structured personality-learning service without mixing that policy into the core memory algorithms
+- Pass reflection-enriched turn batches into personality learning so downstream continuity/context formation can see newly created thread summaries from the same committed turn
 - Route explicit RSS/world-intelligence configuration plus reflection-phase feed refresh/recalibration into the structured personality-learning service without mixing that source logic into the core memory algorithms
 - Split one service-level flush timeout into explicit per-writer budgets so wall-clock runtime deadlines stay real
 - Keep low-signal multimodal writes on the deterministic reflection path while skipping optional midterm compilation that would otherwise duplicate per-turn remote latency

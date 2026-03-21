@@ -19,6 +19,7 @@ from twinr.memory.longterm import (
     LongTermConsolidationResultV1,
     LongTermMemoryConflictV1,
     LongTermMemoryObjectV1,
+    LongTermReflectionResultV1,
     LongTermMidtermStore,
     LongTermProactiveCandidateV1,
     LongTermProactiveStateStore,
@@ -182,6 +183,86 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertIn("contact:person:corinna_maier:phone", context.conflict_context or "")
         self.assertNotIn("This local-only memory should not be used", context.episodic_context or "")
 
+    def test_build_context_surfaces_environment_reflection_in_durable_and_midterm_context(self) -> None:
+        environment_summary = LongTermMemoryObjectV1(
+            memory_id="environment_reflection:home_main:2026-03-16",
+            kind="summary",
+            summary="Recent home activity on 2026-03-16 differs from the usual pattern: less activity than usual.",
+            details=(
+                "Room-agnostic smart-home environment reflection compiled from motion and device-health history. "
+                "Recent deviations: Observed less activity than usual compared with the rolling baseline. "
+                "Quality flags: device_offline_present. Caution: sensor_quality_limited."
+            ),
+            source=_source("turn:env"),
+            status="active",
+            confidence=0.8,
+            slot_key="environment_reflection:home:main",
+            value_key="2026-03-16",
+            valid_from="2026-03-16",
+            valid_to="2026-03-16",
+            attributes={
+                "memory_domain": "smart_home_environment",
+                "summary_type": "environment_reflection",
+                "environment_id": "home:main",
+                "profile_day": "2026-03-16",
+                "deviation_types": ("daily_activity_drop",),
+                "deviation_labels": ("less activity than usual",),
+                "quality_flags": ("device_offline_present",),
+                "blocked_by": ("sensor_quality_limited",),
+                "active_node_count": 1,
+                "active_epoch_count": 2,
+                "baseline_weekday_class": "all_days",
+                "query_hints": ("home activity", "movement pattern", "daily routine", "less activity than usual"),
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            retriever, object_store, _prompt_context_store, _graph_store, midterm_store = self._make_retriever(temp_dir)
+            object_store.apply_reflection(
+                LongTermReflectionResultV1(
+                    reflected_objects=(),
+                    created_summaries=(environment_summary,),
+                    midterm_packets=(),
+                )
+            )
+            midterm_store.save_packets(
+                packets=(
+                    midterm_store.packet_type(
+                        packet_id="midterm:environment:home_main:2026-03-16",
+                        kind="recent_environment_pattern",
+                        summary=environment_summary.summary,
+                        details=environment_summary.details,
+                        source_memory_ids=(environment_summary.memory_id,),
+                        query_hints=("home activity", "movement pattern", "daily routine", "less activity than usual"),
+                        sensitivity="low",
+                        valid_from="2026-03-16",
+                        valid_to="2026-03-16",
+                        attributes={
+                            "memory_domain": "smart_home_environment",
+                            "packet_scope": "recent_environment_reflection",
+                            "environment_id": "home:main",
+                            "profile_day": "2026-03-16",
+                        },
+                    ),
+                )
+            )
+
+            context = retriever.build_context(
+                query=LongTermQueryProfile.from_text(
+                    "Wie war die Aktivität im Haus heute?",
+                    canonical_english_text="How has home activity been today?",
+                ),
+                original_query_text="Wie war die Aktivität im Haus heute?",
+            )
+
+        self.assertIsNotNone(context.durable_context)
+        self.assertIsNotNone(context.midterm_context)
+        self.assertIn("smart_home_environment", context.durable_context or "")
+        self.assertIn("environment_reflection", context.durable_context or "")
+        self.assertIn("less activity than usual", context.durable_context or "")
+        self.assertIn("recent_environment_pattern", context.midterm_context or "")
+        self.assertIn("sensor_quality_limited", context.midterm_context or "")
+
     def test_build_context_ignores_local_markdown_when_no_structured_episode_exists(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             retriever, _object_store, prompt_context_store, _graph_store, _midterm_store = self._make_retriever(temp_dir)
@@ -251,7 +332,7 @@ class LongTermRetrieverTests(unittest.TestCase):
         self.assertEqual(context.episodic_context, "episodic-context")
         self.assertEqual(context.subtext_context, "subtext:1")
 
-    def test_build_context_skips_subtext_when_no_episodic_matches_exist(self) -> None:
+    def test_build_context_still_attempts_subtext_when_no_episodic_matches_exist(self) -> None:
         subtext_calls: list[tuple[str | None, str, int]] = []
 
         def _select_context_object_sections(self, query_texts):
@@ -286,8 +367,8 @@ class LongTermRetrieverTests(unittest.TestCase):
                     original_query_text="Hallo",
                 )
 
-        self.assertEqual(subtext_calls, [])
-        self.assertIsNone(context.subtext_context)
+        self.assertEqual(subtext_calls, [("Hallo", "Hallo", 0)])
+        self.assertEqual(context.subtext_context, "unexpected")
 
     def test_build_context_overlaps_local_sections_without_parallel_remote_searches(self) -> None:
         midterm_started = threading.Event()

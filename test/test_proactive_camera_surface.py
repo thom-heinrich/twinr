@@ -20,6 +20,7 @@ from twinr.proactive.social.engine import (
     SocialTriggerEngine,
     SocialVisionObservation,
 )
+from twinr.proactive.social.gesture_calibration import FineHandGesturePolicy, GestureCalibrationProfile
 from twinr.runtime import TwinrRuntime
 
 from test.test_proactive_monitor import FakeAudioObserver, FakePirMonitor, FakeVisionObserver, MutableClock
@@ -219,6 +220,7 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
                 gesture_event_cooldown_s=0.0,
                 fine_hand_explicit_confirm_samples=2,
                 fine_hand_explicit_min_confidence=0.72,
+                gesture_calibration=GestureCalibrationProfile(fine_hand={}),
             )
         )
 
@@ -273,6 +275,118 @@ class ProactiveCameraSurfaceTest(unittest.TestCase):
 
         self.assertEqual(update.snapshot.fine_hand_gesture, SocialFineHandGesture.NONE)
         self.assertNotIn("camera.fine_hand_gesture_detected", update.event_names)
+
+    def test_surface_uses_calibrated_policy_for_ok_sign(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                gesture_event_cooldown_s=0.0,
+                fine_hand_explicit_confirm_samples=1,
+                fine_hand_explicit_min_confidence=0.65,
+                gesture_calibration=GestureCalibrationProfile(
+                    fine_hand={
+                        SocialFineHandGesture.OK_SIGN: FineHandGesturePolicy(
+                            min_confidence=0.82,
+                            confirm_samples=2,
+                            hold_s=0.48,
+                        )
+                    }
+                ),
+            )
+        )
+
+        first = surface.observe(
+            inspected=True,
+            observed_at=1.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.OK_SIGN,
+                fine_hand_gesture_confidence=0.84,
+            ),
+        )
+        second = surface.observe(
+            inspected=True,
+            observed_at=1.2,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.OK_SIGN,
+                fine_hand_gesture_confidence=0.86,
+            ),
+        )
+
+        self.assertEqual(first.snapshot.fine_hand_gesture, SocialFineHandGesture.NONE)
+        self.assertNotIn("camera.fine_hand_gesture_detected", first.event_names)
+        self.assertEqual(second.snapshot.fine_hand_gesture, SocialFineHandGesture.OK_SIGN)
+        self.assertIn("camera.fine_hand_gesture_detected", second.event_names)
+
+    def test_surface_uses_calibrated_hold_for_middle_finger(self) -> None:
+        surface = ProactiveCameraSurface(
+            config=ProactiveCameraSurfaceConfig(
+                gesture_event_cooldown_s=0.0,
+                gesture_calibration=GestureCalibrationProfile(
+                    fine_hand={
+                        SocialFineHandGesture.MIDDLE_FINGER: FineHandGesturePolicy(
+                            min_confidence=0.86,
+                            confirm_samples=2,
+                            hold_s=0.28,
+                        )
+                    }
+                ),
+            )
+        )
+
+        first = surface.observe(
+            inspected=True,
+            observed_at=1.0,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.MIDDLE_FINGER,
+                fine_hand_gesture_confidence=0.87,
+            ),
+        )
+        confirmed = surface.observe(
+            inspected=True,
+            observed_at=1.15,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.MIDDLE_FINGER,
+                fine_hand_gesture_confidence=0.89,
+            ),
+        )
+        held = surface.observe(
+            inspected=True,
+            observed_at=1.35,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.NONE,
+                fine_hand_gesture_confidence=None,
+            ),
+        )
+        expired = surface.observe(
+            inspected=True,
+            observed_at=1.48,
+            observation=SocialVisionObservation(
+                person_visible=True,
+                person_count=1,
+                body_pose=SocialBodyPose.UPRIGHT,
+                fine_hand_gesture=SocialFineHandGesture.NONE,
+                fine_hand_gesture_confidence=None,
+            ),
+        )
+
+        self.assertEqual(first.snapshot.fine_hand_gesture, SocialFineHandGesture.NONE)
+        self.assertEqual(confirmed.snapshot.fine_hand_gesture, SocialFineHandGesture.MIDDLE_FINGER)
+        self.assertEqual(held.snapshot.fine_hand_gesture, SocialFineHandGesture.MIDDLE_FINGER)
+        self.assertEqual(expired.snapshot.fine_hand_gesture, SocialFineHandGesture.NONE)
 
     def test_surface_treats_local_camera_health_failure_as_unknown_not_no_person(self) -> None:
         surface = ProactiveCameraSurface(

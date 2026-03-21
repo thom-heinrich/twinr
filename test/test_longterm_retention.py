@@ -57,6 +57,36 @@ class LongTermRetentionPolicyTests(unittest.TestCase):
         self.assertEqual(result.pruned_memory_ids, ("observation:1",))
         self.assertEqual({item.memory_id for item in result.expired_objects}, {"event:1"})
 
+    def test_retention_keeps_active_patterns_when_valid_to_is_only_last_observed_day(self) -> None:
+        now = datetime(2026, 3, 21, 12, 0, tzinfo=timezone.utc)
+        pattern = LongTermMemoryObjectV1(
+            memory_id="pattern:button:green:start_listening:morning",
+            kind="pattern",
+            summary="The green button was used to start a conversation in the morning.",
+            details="Low-confidence interaction pattern derived from repeated button use.",
+            source=self._source(),
+            status="active",
+            valid_from="2026-03-14",
+            valid_to="2026-03-14",
+            updated_at=now - timedelta(minutes=2),
+            created_at=now - timedelta(minutes=2),
+            attributes={
+                "pattern_type": "interaction",
+                "memory_domain": "interaction",
+                "daypart": "morning",
+            },
+        )
+
+        result = LongTermRetentionPolicy(timezone_name="UTC", archive_enabled=True).apply(
+            objects=(pattern,),
+            now=now,
+        )
+
+        self.assertEqual(result.expired_objects, ())
+        self.assertEqual(result.archived_objects, ())
+        self.assertEqual(result.pruned_memory_ids, ())
+        self.assertEqual(result.kept_objects[0].status, "active")
+
     def test_store_retention_writes_archive_snapshot(self) -> None:
         now = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as temp_dir:

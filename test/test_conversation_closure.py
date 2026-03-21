@@ -9,9 +9,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.conversation.closure import (
     ConversationClosureDecision,
+    StructuredConversationClosureEvaluator,
     ToolCallingConversationClosureEvaluator,
 )
-from twinr.agent.base_agent.contracts import AgentToolCall, ToolCallingTurnResponse
+from twinr.agent.base_agent.contracts import (
+    AgentToolCall,
+    ConversationClosureProviderDecision,
+    ToolCallingTurnResponse,
+)
 from twinr.agent.personality.steering import ConversationTurnSteeringCue
 from twinr.config import TwinrConfig
 
@@ -90,6 +95,43 @@ class BlockingClosureToolAgentProvider:
         self.started.set()
         self.release.wait(timeout=5.0)
         return ToolCallingTurnResponse(text="", tool_calls=())
+
+
+class FakeStructuredClosureProvider:
+    def __init__(
+        self,
+        config: TwinrConfig,
+        *,
+        close_now: bool = False,
+        matched_topics: tuple[str, ...] = (),
+    ) -> None:
+        self.config = config
+        self.close_now = close_now
+        self.matched_topics = matched_topics
+        self.calls: list[dict[str, object]] = []
+
+    def decide(
+        self,
+        prompt: str,
+        *,
+        conversation=None,
+        instructions=None,
+        timeout_seconds=None,
+    ) -> ConversationClosureProviderDecision:
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "conversation": conversation,
+                "instructions": instructions,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return ConversationClosureProviderDecision(
+            close_now=self.close_now,
+            confidence=0.87 if self.close_now else 0.34,
+            reason="explicit_goodbye" if self.close_now else "still_engaged",
+            matched_topics=self.matched_topics,
+        )
 
 
 class ConversationClosureEvaluatorTests(unittest.TestCase):
@@ -242,6 +284,42 @@ class ConversationClosureEvaluatorTests(unittest.TestCase):
 
         self.assertTrue(provider.started.is_set())
         self.assertLess(elapsed, 1.0)
+
+    def test_structured_evaluator_uses_fast_provider_contract(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            personality_dir="personality",
+            conversation_closure_provider_timeout_seconds=7.5,
+        )
+        provider = FakeStructuredClosureProvider(
+            config,
+            close_now=False,
+            matched_topics=("AI companions",),
+        )
+        evaluator = StructuredConversationClosureEvaluator(config=config, provider=provider)
+
+        decision = evaluator.evaluate(
+            user_transcript="Und bei KI-Begleitern gerade?",
+            assistant_response="Kurz gesagt geht gerade viel in Richtung alltagstauglicher Begleiter.",
+            request_source="button",
+            turn_steering_cues=(
+                ConversationTurnSteeringCue(
+                    title="AI companions",
+                    salience=0.92,
+                    attention_state="shared_thread",
+                    open_offer="brief_update_if_open",
+                    user_pull="one_calm_follow_up",
+                    positive_engagement_action="invite_follow_up",
+                ),
+            ),
+        )
+
+        self.assertEqual(decision.close_now, False)
+        self.assertEqual(decision.reason, "still_engaged")
+        self.assertEqual(decision.matched_topics, ("AI companions",))
+        self.assertEqual(provider.calls[0]["timeout_seconds"], 7.5)
+        self.assertIn("AI companions", provider.calls[0]["prompt"])
 
 
 if __name__ == "__main__":

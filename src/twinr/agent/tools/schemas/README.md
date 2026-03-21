@@ -11,6 +11,7 @@ realtime-safe schema variants.
 - derive compact schema variants for token-constrained callers
 - derive realtime-safe schema variants and attach compatibility notes
 - describe the self-coding learned-skill control tools alongside the learning/compile tools
+- describe the smart-home discovery, filtered-state, aggregation, control, and sensor-stream tools alongside the rest of the canonical tool surface
 
 `schemas` does **not** own:
 - tool handler execution or runtime-side validation effects

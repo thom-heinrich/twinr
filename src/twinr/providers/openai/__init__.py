@@ -9,6 +9,7 @@ Implementation stays split across the focused ``api``, ``core``, and
 from twinr.providers.openai.api import (
     OpenAIAgentTextProvider,
     OpenAIBackend,
+    OpenAIConversationClosureDecisionProvider,
     OpenAIFirstWordProvider,
     OpenAIProviderBundle,
     OpenAISpeechToTextProvider,
@@ -22,6 +23,7 @@ from twinr.providers.openai.realtime import OpenAIRealtimeSession, OpenAIRealtim
 __all__ = [
     "OpenAIAgentTextProvider",
     "OpenAIBackend",
+    "OpenAIConversationClosureDecisionProvider",
     "OpenAIFirstWordProvider",
     "OpenAIImageInput",
     "OpenAIProviderBundle",

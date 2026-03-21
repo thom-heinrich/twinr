@@ -22,6 +22,8 @@ from twinr.agent.base_agent.contracts import (
     AgentToolResult,
     AgentTextProvider,
     CompositeSpeechAgentProvider,
+    ConversationClosureProvider,
+    ConversationClosureProviderDecision,
     ConversationLike,
     FirstWordProvider,
     FirstWordReply,
@@ -613,6 +615,151 @@ class OpenAIToolCallingAgentProvider:
         return tuple(function_calls)
 
 
+_CONVERSATION_CLOSURE_DECISION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "close_now": {
+            "type": "boolean",
+            "description": "Whether Twinr should suppress automatic follow-up listening after the just-finished exchange.",
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Confidence score for the closure decision.",
+        },
+        "reason": {
+            "type": "string",
+            "description": "Short canonical English reason code or phrase.",
+        },
+        "matched_topics": {
+            "type": "array",
+            "description": "Up to two matched topic titles echoed from the provided steering context.",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["close_now", "confidence", "reason", "matched_topics"],
+    "additionalProperties": False,
+}
+
+
+@dataclass
+class OpenAIConversationClosureDecisionProvider:
+    """Produce one fast structured closure decision through the backend.
+
+    This adapter intentionally avoids the slower tool-streaming path used by
+    the normal tool loop. Conversation closure is a tiny post-response
+    micro-decision, so it uses one bounded non-streaming JSON-schema request.
+
+    Attributes:
+        backend: Shared backend instance that owns the OpenAI client.
+        model_override: Optional dedicated closure model override.
+        reasoning_effort_override: Optional dedicated closure reasoning
+            override.
+        base_instructions_override: Optional closure-specific base
+            instructions merged ahead of per-call instructions.
+        replace_base_instructions: Included for interface parity. Closure does
+            not inherit the broader tool-loop base instructions by default.
+    """
+
+    backend: OpenAIBackend
+    model_override: str | None = None
+    reasoning_effort_override: str | None = None
+    base_instructions_override: str | None = None
+    replace_base_instructions: bool = False
+
+    @property
+    def config(self) -> TwinrConfig:
+        return self.backend.config
+
+    @config.setter
+    def config(self, value: TwinrConfig) -> None:
+        self.backend.config = value
+
+    def _resolved_model(self) -> str:
+        """Resolve the model used for closure decisions."""
+
+        override = (self.model_override or "").strip()
+        if override:
+            return override
+        resolved = (self.config.conversation_closure_model or "").strip()
+        return resolved or self.config.default_model
+
+    def _resolved_reasoning_effort(self) -> str | None:
+        """Resolve the reasoning-effort value for closure decisions."""
+
+        override = (self.reasoning_effort_override or "").strip()
+        if override:
+            return override
+        resolved = (self.config.conversation_closure_reasoning_effort or "").strip()
+        return resolved or None
+
+    def _merged_base_instructions(self, instructions: str | None) -> str | None:
+        """Merge closure instructions without inheriting the tool-loop bundle."""
+
+        if self.replace_base_instructions:
+            return merge_instructions(self.base_instructions_override, instructions)
+        return merge_instructions(self.base_instructions_override, instructions)
+
+    def decide(
+        self,
+        prompt: str,
+        *,
+        conversation: ConversationLike | None = None,
+        instructions: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ConversationClosureProviderDecision:
+        """Return one validated structured closure decision."""
+
+        model = self._resolved_model()
+        reasoning_effort = self._resolved_reasoning_effort()
+        request = self.backend._build_response_request(
+            prompt,
+            conversation=conversation,
+            instructions=self._merged_base_instructions(instructions),
+            allow_web_search=False,
+            model=model,
+            reasoning_effort=reasoning_effort or "",
+            max_output_tokens=max(16, int(self.config.conversation_closure_max_output_tokens)),
+            prompt_cache_scope="conversation_closure",
+        )
+        _apply_reasoning_effort_request(
+            self.backend,
+            request,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        if timeout_seconds is not None:
+            request["timeout"] = timeout_seconds
+        request["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": "twinr_conversation_closure_decision",
+                "schema": _CONVERSATION_CLOSURE_DECISION_SCHEMA,
+                "strict": True,
+            }
+        }
+        response = _create_response_with_reasoning_fallback(
+            self.backend,
+            request,
+            context="conversation closure decision",
+        )
+        payload = _load_json_object(
+            _coerce_text(self.backend._extract_output_text(response)),
+            context="conversation closure decision",
+        )
+        return ConversationClosureProviderDecision(
+            close_now=bool(payload.get("close_now", False)),
+            confidence=float(payload.get("confidence", 0.0) or 0.0),
+            reason=_coerce_text(payload.get("reason")),
+            matched_topics=_coerce_topic_titles(payload.get("matched_topics")),
+            response_id=getattr(response, "id", None),
+            request_id=getattr(response, "_request_id", None),
+            model=extract_model_name(response, model),
+            token_usage=extract_token_usage(response),
+        )
+
+
 _SUPERVISOR_DECISION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -1005,6 +1152,27 @@ def _optional_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _coerce_topic_titles(value: Any) -> tuple[str, ...]:
+    """Normalize matched topic titles into a bounded duplicate-free tuple."""
+
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ()
+    normalized_topics: list[str] = []
+    seen: set[str] = set()
+    for raw_topic in value:
+        topic = _optional_text(raw_topic)
+        if not topic:
+            continue
+        key = topic.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_topics.append(topic)
+        if len(normalized_topics) >= 2:
+            break
+    return tuple(normalized_topics)
 
 
 def _optional_bool(value: Any) -> bool | None:

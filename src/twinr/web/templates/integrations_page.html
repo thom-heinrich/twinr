@@ -60,6 +60,7 @@
       <li><strong>WhatsApp</strong> One guided self-chat wizard with QR pairing, one allowed number, and groups blocked</li>
       <li><strong>Email</strong> IMAP/SMTP setup, Gmail-friendly, approval-first</li>
       <li><strong>Calendar</strong> Read-only ICS feed setup for agenda views</li>
+      <li><strong>Smart Home</strong> Local Hue bridge setup for low-risk device control and bounded sensor streams</li>
     </ul>
   </div>
 </section>
@@ -105,6 +106,28 @@
   {% endfor %}
   <div class="actions">
     <button type="submit">Save calendar integration</button>
+  </div>
+</form>
+
+<form method="post" action="/integrations" class="stack top-gap">
+  <input type="hidden" name="_integration_id" value="smart_home_hub">
+  {% for section in smart_home_sections %}
+  <section class="panel">
+    <div class="section-header">
+      <div>
+        <h2>{{ section.title }}</h2>
+        <p class="section-description">{{ section.description }}</p>
+      </div>
+    </div>
+    <div class="form-grid">
+      {% for field in section.fields %}
+      {{ render_setting_field(field) }}
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+  <div class="actions">
+    <button type="submit">Save smart-home integration</button>
   </div>
 </form>
 {% endblock %}

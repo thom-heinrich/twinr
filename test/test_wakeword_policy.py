@@ -69,6 +69,9 @@ class WakewordDecisionPolicyTests(unittest.TestCase):
     def test_normalize_wakeword_backend_accepts_kws(self) -> None:
         self.assertEqual(normalize_wakeword_backend("kws", default="openwakeword"), "kws")
 
+    def test_normalize_wakeword_backend_accepts_wekws(self) -> None:
+        self.assertEqual(normalize_wakeword_backend("wekws", default="openwakeword"), "wekws")
+
     def test_verifier_accepts_calibrated_twin_alias_for_twinr(self) -> None:
         verifier = SttWakewordVerifier(
             backend=FakeBackend("Hallo Twin wie gehts"),

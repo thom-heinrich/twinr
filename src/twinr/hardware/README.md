@@ -8,6 +8,7 @@ blocks that combine portrait, voice, and explicit feedback on device.
 
 `hardware` owns:
 - capture and play bounded audio for conversation and ambient sensing
+- lift under-driven PCM16 wakeword-ack playback to an audible level before it reaches the Pi speaker path when provider TTS arrives too quiet
 - monitor GPIO buttons and PIR motion across supported Pi backends
 - capture still photos from V4L2 cameras, with a bounded `rpicam-still` fallback for Pi `unicam-image` devices when the V4L2 node is busy
 - persist local portrait identities with multiple reference images per user
@@ -25,7 +26,10 @@ blocks that combine portrait, voice, and explicit feedback on device.
 - treat negative custom labels such as `none` as authoritative suppression, so a weak `ok_sign`/other symbol does not win when the classifier itself prefers "no gesture"
 - normalize MediaPipe-bound image buffers centrally so full frames and ROI crops reach the Pi runtime with supported dtype and contiguous layout
 - keep multi-ROI MediaPipe tasks monotonic by advancing and reserving timestamps across candidate inference within a frame
-- keep MediaPipe gesture recognition on a stable full-frame video stream; ROI crops may support hand context, but alternating crop/full-frame inputs must not break the recognizer's tracking assumptions
+- keep MediaPipe gesture recognition latency bounded by preferring ROI gesture recognition when concrete wrist-localized hand crops already exist, and only falling back to the stable full-frame recognizer when ROI crops did not yield a real symbol
+- run the dedicated ROI hand-landmark worker in MediaPipe IMAGE mode, because upper-body and wrist crops are independent images rather than one temporally stable video stream; broad upper-body ROI search is a fallback for missing wrist cues, not a mandatory hot-path crop on every frame
+- expose a cheap attention-only AI-camera observation that reuses IMX500 person detection plus optional face-anchor supplementation but skips the heavy MediaPipe gesture stack, so HDMI eye-follow can stay reactive while explicit gesture acknowledgement uses the slower full path separately
+- expose a dedicated live-stream gesture observation that reuses the RGB camera session but feeds a thin MediaPipe `LIVE_STREAM` gesture lane plus bounded wave tracking, so user-facing HDMI symbol acknowledgement does not depend on the broader pose/social observation stack
 - format and submit bounded receipt print jobs
 - probe ReSpeaker XVF3800 runtime state and expose typed host-control signals
 - derive conservative XVF3800 runtime facts such as direction confidence and busy-state interruption hints
@@ -51,6 +55,7 @@ blocks that combine portrait, voice, and explicit feedback on device.
 | [audio.py](./audio.py) | Bounded audio capture, readable-frame probing, and playback |
 | [audio_env.py](./audio_env.py) | Sanitize child-process env for ALSA helpers when the Pi runtime borrows a different user's Wayland session |
 | [camera_ai/](./camera_ai/) | Internal SoC package for camera contracts, IMX500 runtime, MediaPipe runtime, pose, motion, and gesture modules |
+| [camera_ai/live_gesture_pipeline.py](./camera_ai/live_gesture_pipeline.py) | Dedicated low-latency MediaPipe live-stream gesture lane for HDMI symbol acknowledgement |
 | [ai_camera.py](./ai_camera.py) | Stable compatibility facade for the public local AI-camera adapter surface |
 | [ai_camera_diagnostics.py](./ai_camera_diagnostics.py) | Bounded Pi-facing diagnostics for pose candidate selection and keypoint support |
 | [hand_landmarks.py](./hand_landmarks.py) | Bounded MediaPipe hand-landmark ROI worker for full-frame-to-hand crop resolution |

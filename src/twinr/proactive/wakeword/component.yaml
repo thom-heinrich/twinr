@@ -6,11 +6,14 @@ visibility: internal
 summary: Provide wakeword matching, local KWS/openWakeWord spotting, optional local verifier support, sequence-aware cascade verification, verification policy, calibration profiles, streaming detection, runtime-faithful promotion replay, and offline evaluation/training helpers for proactive runtime.
 owned_concerns:
   - Normalize wakeword transcripts, configured phrases, and detector labels
-  - Run local openWakeWord or sherpa-onnx KWS clip and frame spotting plus optional local verifier, sequence-aware cascade verification, and STT verification
+  - Run local openWakeWord, sherpa-onnx KWS, or WeKws clip and frame spotting plus optional local verifier, sequence-aware cascade verification, and STT verification
   - Provision official sherpa-onnx KWS bundle assets and generate Twinr keyword files reproducibly from the leading repo
   - Persist and apply per-device wakeword calibration overrides
   - Replay labeled captures for evaluation, operator labeling, verifier training, autotune recommendations, post-training acceptance checks, and runtime-faithful promotion guards
   - Train reproducible Twinr base models from generated wakeword datasets and export local ONNX assets
+  - Export labeled Twinr manifests into WeKws/Kaldi-style split directories for custom conventional KWS training
+  - Prepare reproducible WeKws experiment workspaces, configs, and runner scripts from exported Twinr datasets
+  - Plan deterministic large synthetic Qwen3TTS wakeword corpora with speaker/style/degradation diversity for custom conventional KWS retrains
   - Render the canonical Stage-1 family, hard-negative mining, and Pi acceptance plan for future retrains
   - Stream bounded PCM frames into wakeword detections for proactive runtime
 out_of_scope:
@@ -47,10 +50,14 @@ files:
       - WakewordSequenceVerifier
       - WakewordSequenceVerifierTrainingReport
       - WakewordStreamDetection
+      - PreparedWekwsExperiment
+      - PreparedWekwsSplit
+      - WekwsRecipeSpec
       - WakewordVerification
       - append_wakeword_capture_label
       - apply_wakeword_calibration
       - autotune_wakeword_profile
+      - available_wekws_recipe_specs
       - load_eval_manifest
       - load_labeled_ops_captures
       - match_wakeword_transcript
@@ -62,6 +69,7 @@ files:
       - train_wakeword_base_model_from_dataset_root
       - train_wakeword_custom_verifier_from_manifest
       - train_wakeword_sequence_verifier_from_manifest
+      - prepare_wekws_experiment
       - wakeword_primary_prompt
   - path: cascade.py
     role: Train and run Twinr's second-stage sequence verifier assets with temporal alignment over localized captures
@@ -70,6 +78,10 @@ files:
       - WakewordSequenceVerifier
       - WakewordSequenceVerifierTrainingReport
       - train_wakeword_sequence_verifier_from_manifest
+  - path: local_verifier.py
+    role: Attach Twinr's sequence verifier to any local stage-1 detector family from config
+    exports:
+      - build_configured_sequence_capture_verifier
   - path: matching.py
     role: Transcript normalization and phrase matching
     exports:
@@ -148,6 +160,30 @@ files:
     exports:
       - WakewordBaseModelTrainingReport
       - train_wakeword_base_model_from_dataset_root
+  - path: wekws_export.py
+    role: Export labeled Twinr manifests into WeKws/Kaldi-style split directories for custom conventional KWS training
+    exports:
+      - WekwsExportReport
+      - WekwsExportSplitReport
+      - export_wakeword_manifests_to_wekws
+  - path: wekws_experiment.py
+    role: Prepare reproducible WeKws experiment workspaces, configs, runner scripts, and MDTC-safe ONNX export helpers
+    exports:
+      - PreparedWekwsExperiment
+      - PreparedWekwsSplit
+      - WekwsRecipeSpec
+      - available_wekws_recipe_specs
+      - prepare_wekws_experiment
+  - path: synthetic_corpus.py
+    role: Plan deterministic large synthetic Qwen3TTS wakeword corpora and lightweight degradations for Twinr-specific WeKws retrains
+    exports:
+      - SyntheticAugmentationProfile
+      - SyntheticGenerationProfile
+      - SyntheticStyleProfile
+      - SyntheticWakewordRequest
+      - build_qwen3tts_synthetic_corpus_plan
+      - apply_augmentation
+      - manifest_row_for_request
   - path: training_plan.py
     role: Canonical Stage-1 family, hard-negative mining, and Pi acceptance plan rendering
     exports:
@@ -200,11 +236,17 @@ public_api:
     - WakewordStreamDetection
     - WakewordTrainingCommand
     - WakewordTrainingPlan
+    - WekwsExportReport
+    - WekwsExportSplitReport
+    - PreparedWekwsExperiment
+    - PreparedWekwsSplit
+    - WekwsRecipeSpec
     - WakewordVerification
     - WakewordAcceptanceMetricPlan
     - append_wakeword_capture_label
     - apply_wakeword_calibration
     - autotune_wakeword_profile
+    - available_wekws_recipe_specs
     - available_builtin_kws_bundle_specs
     - build_default_wakeword_training_plan
     - derive_kws_keyword_names
@@ -225,6 +267,8 @@ public_api:
     - train_wakeword_base_model_from_dataset_root
     - train_wakeword_custom_verifier_from_manifest
     - train_wakeword_sequence_verifier_from_manifest
+    - export_wakeword_manifests_to_wekws
+    - prepare_wekws_experiment
     - wakeword_primary_prompt
 compatibility_reexports:
   - path: src/twinr/proactive/__init__.py
@@ -263,11 +307,15 @@ compatibility_reexports:
       - WakewordStreamDetection
       - WakewordTrainingCommand
       - WakewordTrainingPlan
+      - PreparedWekwsExperiment
+      - PreparedWekwsSplit
+      - WekwsRecipeSpec
       - WakewordVerification
       - WakewordAcceptanceMetricPlan
       - append_wakeword_capture_label
       - apply_wakeword_calibration
       - autotune_wakeword_profile
+      - available_wekws_recipe_specs
       - build_default_wakeword_training_plan
       - evaluate_wakeword_stream_entries
       - load_eval_manifest
@@ -282,6 +330,7 @@ compatibility_reexports:
       - run_wakeword_promotion_eval
       - run_wakeword_eval
       - run_wakeword_stream_eval
+      - prepare_wekws_experiment
       - train_wakeword_base_model_from_dataset_root
       - train_wakeword_custom_verifier_from_manifest
       - train_wakeword_sequence_verifier_from_manifest
@@ -298,6 +347,8 @@ tests:
   - path: test/test_wakeword_training.py
   - path: test/test_wakeword_promotion.py
   - path: test/test_wakeword_cascade.py
+  - path: test/test_wakeword_wekws_export.py
+  - path: test/test_wakeword_wekws_experiment.py
   - path: test/test_wakeword_training_plan.py
   - path: test/test_proactive_monitor.py
   - path: test/test_main.py

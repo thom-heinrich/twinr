@@ -10,6 +10,7 @@ owned_concerns:
   - Normalize structured ReSpeaker audio-policy facts and per-claim metadata into bounded audio routine seeds and observed preference candidates
   - Replay persisted ops history into multimodal evidence for bounded backfill and recovery
   - Compile sensor-derived routines and deviations from previously consolidated pattern objects
+  - Compile room-agnostic smart-home day profiles, rolling baselines, and typed deviations from smart-home motion and health pattern history
 out_of_scope:
   - Persist or archive long-term memory objects and remote state
   - Resolve conflicts, truth state, retention, or reflection policy
@@ -37,6 +38,10 @@ files:
     role: Multimodal evidence extraction into candidate memories
     exports:
       - LongTermMultimodalExtractor
+  - path: environment_profile.py
+    role: Room-agnostic smart-home environment-profile compilation
+    exports:
+      - LongTermEnvironmentProfileCompiler
   - path: respeaker_audio.py
     role: Structured ReSpeaker audio routine-seed extraction from automation facts
   - path: respeaker_contract.py
@@ -54,6 +59,7 @@ files:
 public_api:
   module: twinr.memory.longterm
   exports:
+    - LongTermEnvironmentProfileCompiler
     - LongTermMultimodalExtractor
     - LongTermSensorMemoryCompiler
     - LongTermTurnExtractor

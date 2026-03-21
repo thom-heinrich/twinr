@@ -1565,6 +1565,98 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(calls, [root])
         self.assertEqual(rendered, "# fake wakeword training plan\n")
 
+    def test_wakeword_export_wekws_dispatches_to_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
+            output_dir = root / "wekws"
+            train_manifest = root / "train.json"
+            dev_manifest = root / "dev.json"
+            test_manifest = root / "test.json"
+            calls: list[tuple[Path, Path, Path | None, Path | None, str, str]] = []
+            fake_proactive_module = ModuleType("twinr.proactive")
+            fake_wakeword_module = ModuleType("twinr.proactive.wakeword")
+
+            def _export_wekws(*, output_dir, train_manifest, dev_manifest, test_manifest, positive_token, filler_token):
+                calls.append(
+                    (
+                        Path(output_dir),
+                        Path(train_manifest),
+                        None if dev_manifest is None else Path(dev_manifest),
+                        None if test_manifest is None else Path(test_manifest),
+                        positive_token,
+                        filler_token,
+                    )
+                )
+                return SimpleNamespace(
+                    output_dir=Path(output_dir),
+                    dict_path=Path(output_dir) / "dict" / "dict.txt",
+                    words_path=Path(output_dir) / "dict" / "words.txt",
+                    metadata_path=Path(output_dir) / "wekws_export_metadata.json",
+                    split_reports=(
+                        SimpleNamespace(
+                            split_name="train",
+                            manifest_path=Path(train_manifest),
+                            output_dir=Path(output_dir) / "train",
+                            entry_count=12,
+                            positive_count=5,
+                            negative_count=7,
+                            ignored_count=0,
+                        ),
+                    ),
+                )
+
+            fake_proactive_module.wakeword = fake_wakeword_module
+            fake_wakeword_module.export_wakeword_manifests_to_wekws = _export_wekws
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.proactive": fake_proactive_module,
+                        "twinr.proactive.wakeword": fake_wakeword_module,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    sys.argv = [
+                        "twinr",
+                        "--env-file",
+                        str(env_path),
+                        "--wakeword-export-wekws",
+                        "--wakeword-wekws-output-dir",
+                        str(output_dir),
+                        "--wakeword-wekws-train-manifest",
+                        str(train_manifest),
+                        "--wakeword-wekws-dev-manifest",
+                        str(dev_manifest),
+                        "--wakeword-wekws-test-manifest",
+                        str(test_manifest),
+                        "--wakeword-wekws-positive-token",
+                        "TWINR_FAMILY",
+                        "--wakeword-wekws-filler-token",
+                        "FILLER",
+                    ]
+                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [(
+                output_dir,
+                train_manifest,
+                dev_manifest,
+                test_manifest,
+                "TWINR_FAMILY",
+                "FILLER",
+            )],
+        )
+
     def test_wakeword_kws_provision_dispatches_to_wakeword_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1649,6 +1741,123 @@ class MainCliTests(unittest.TestCase):
                         "Twinr": ("T W IY1 N ER0",),
                     },
                     True,
+                )
+            ],
+        )
+
+    def test_wakeword_prepare_wekws_experiment_dispatches_to_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            env_path = root / ".env"
+            env_path.write_text("TWINR_WAKEWORD_VERIFIER_MODE=disabled\n", encoding="utf-8")
+            dataset_dir = root / "dataset"
+            experiment_dir = root / "experiment"
+            base_checkpoint = root / "base.pt"
+            calls: list[tuple[Path, Path, str, int, str, int, int, int, Path | None]] = []
+            fake_proactive_module = ModuleType("twinr.proactive")
+            fake_wakeword_module = ModuleType("twinr.proactive.wakeword")
+
+            def _prepare_experiment(
+                *,
+                output_dir,
+                exported_dataset_dir,
+                recipe_id,
+                seed,
+                gpus,
+                num_workers,
+                cmvn_num_workers,
+                min_duration_frames,
+                base_checkpoint,
+            ):
+                calls.append(
+                    (
+                        Path(output_dir),
+                        Path(exported_dataset_dir),
+                        recipe_id,
+                        seed,
+                        gpus,
+                        num_workers,
+                        cmvn_num_workers,
+                        min_duration_frames,
+                        None if base_checkpoint is None else Path(base_checkpoint),
+                    )
+                )
+                return SimpleNamespace(
+                    output_dir=Path(output_dir),
+                    recipe=SimpleNamespace(recipe_id=recipe_id),
+                    config_path=Path(output_dir) / "conf" / f"{recipe_id}.yaml",
+                    dict_dir=Path(output_dir) / "dict",
+                    model_dir=Path(output_dir) / "exp" / recipe_id,
+                    script_path=Path(output_dir) / "run_wekws.sh",
+                    metadata_path=Path(output_dir) / "wekws_experiment_metadata.json",
+                    split_reports=(
+                        SimpleNamespace(
+                            split_name="train",
+                            source_dir=Path(exported_dataset_dir) / "train",
+                            output_dir=Path(output_dir) / "data" / "train",
+                            utterance_count=42,
+                            data_list_path=Path(output_dir) / "data" / "train" / "data.list",
+                        ),
+                    ),
+                )
+
+            fake_proactive_module.wakeword = fake_wakeword_module
+            fake_wakeword_module.prepare_wekws_experiment = _prepare_experiment
+            original_argv = list(sys.argv)
+
+            try:
+                sys.modules.pop("twinr.__main__", None)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        "twinr.proactive": fake_proactive_module,
+                        "twinr.proactive.wakeword": fake_wakeword_module,
+                    },
+                ):
+                    main_mod = importlib.import_module("twinr.__main__")
+                    sys.argv = [
+                        "twinr",
+                        "--env-file",
+                        str(env_path),
+                        "--wakeword-prepare-wekws-experiment",
+                        "--wakeword-wekws-dataset-dir",
+                        str(dataset_dir),
+                        "--wakeword-wekws-experiment-dir",
+                        str(experiment_dir),
+                        "--wakeword-wekws-recipe",
+                        "ds_tcn_fbank",
+                        "--wakeword-wekws-gpus",
+                        "0,1",
+                        "--wakeword-wekws-num-workers",
+                        "12",
+                        "--wakeword-wekws-cmvn-num-workers",
+                        "20",
+                        "--wakeword-wekws-min-duration-frames",
+                        "60",
+                        "--wakeword-wekws-seed",
+                        "777",
+                        "--wakeword-wekws-base-checkpoint",
+                        str(base_checkpoint),
+                    ]
+                    exit_code = main_mod.main()
+            finally:
+                sys.argv = original_argv
+                sys.modules.pop("twinr.__main__", None)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    experiment_dir,
+                    dataset_dir,
+                    "ds_tcn_fbank",
+                    777,
+                    "0,1",
+                    12,
+                    20,
+                    60,
+                    base_checkpoint,
                 )
             ],
         )

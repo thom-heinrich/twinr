@@ -22,6 +22,8 @@ from twinr.integrations.email import (
     SMTPMailSenderConfig,
 )
 from twinr.integrations.smarthome import (
+    AggregatedSmartHomeProvider,
+    RoutedSmartHomeProvider,
     SmartHomeAdapterSettings,
     SmartHomeCommand,
     SmartHomeController,
@@ -33,6 +35,9 @@ from twinr.integrations.smarthome import (
     SmartHomeEventKind,
     SmartHomeIntegrationAdapter,
     SmartHomeSensorStream,
+    build_routed_entity_id,
+    build_routed_event_id,
+    parse_routed_entity_id,
 )
 from twinr.integrations.smarthome.hue import (
     HueBridgeClient,
@@ -67,11 +72,16 @@ from twinr.integrations.runtime import (
     CALENDAR_AGENDA_INTEGRATION_ID,
     EMAIL_APP_PASSWORD_ENV_KEY,
     EMAIL_MAILBOX_INTEGRATION_ID,
+    HUE_APPLICATION_KEY_ENV_KEY,
+    HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY,
     IntegrationReadiness,
     ManagedIntegrationsRuntime,
     build_calendar_agenda_adapter,
     build_email_mailbox_adapter,
     build_managed_integrations,
+    build_smart_home_hub_adapter,
+    SMART_HOME_HUB_INTEGRATION_ID,
+    hue_application_key_env_key_for_host,
     validate_calendar_source,
 )
 from twinr.integrations.store import ManagedIntegrationConfig, TwinrIntegrationStore, integration_store_path
@@ -83,6 +93,7 @@ from twinr.integrations.web_automation_families import (
 
 __all__ = [
     "BUILTIN_MANIFESTS",
+    "AggregatedSmartHomeProvider",
     "ApprovedEmailContacts",
     "CALENDAR_AGENDA_INTEGRATION_ID",
     "CalendarAdapterSettings",
@@ -93,6 +104,8 @@ __all__ = [
     "DataSensitivity",
     "EMAIL_APP_PASSWORD_ENV_KEY",
     "EMAIL_MAILBOX_INTEGRATION_ID",
+    "HUE_APPLICATION_KEY_ENV_KEY",
+    "HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY",
     "EmailAdapterSettings",
     "EmailContact",
     "EmailDraft",
@@ -121,9 +134,11 @@ __all__ = [
     "ReadOnlyCalendarAdapter",
     "RequestOrigin",
     "RiskLevel",
+    "RoutedSmartHomeProvider",
     "SMTPMailSender",
     "SMTPMailSenderConfig",
     "SafeIntegrationPolicy",
+    "SMART_HOME_HUB_INTEGRATION_ID",
     "SafetyProfile",
     "SecretReference",
     "SecretStorage",
@@ -149,10 +164,15 @@ __all__ = [
     "build_email_mailbox_adapter",
     "build_hue_smart_home_provider",
     "build_managed_integrations",
+    "build_routed_entity_id",
+    "build_routed_event_id",
+    "build_smart_home_hub_adapter",
+    "hue_application_key_env_key_for_host",
     "integration_automation_family_providers",
     "integration_store_path",
     "manifest_for_id",
     "manifests_for_domain",
+    "parse_routed_entity_id",
     "stricter_confirmation",
     "validate_calendar_source",
 ]

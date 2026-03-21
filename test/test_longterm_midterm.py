@@ -13,12 +13,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
 from twinr.memory.longterm import (
+    LongTermConversationTurn,
     LongTermMemoryObjectV1,
     LongTermMemoryReflector,
     LongTermMidtermStore,
     LongTermSourceRefV1,
 )
-from twinr.memory.longterm.reasoning.midterm import _midterm_reflection_schema
+from twinr.memory.longterm.reasoning.midterm import (
+    _memory_object_to_prompt_payload,
+    _midterm_reflection_schema,
+    _normalize_reflection_result,
+)
+from twinr.memory.longterm.reasoning.turn_continuity import LongTermTurnContinuityCompiler
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
 from twinr.memory.context_store import PromptContextStore
@@ -91,6 +97,36 @@ class StubReflectionProgram:
                 ]
             }
         return {"midterm_packets": []}
+
+
+class _EnglishPacketFromGermanSourceProgram:
+    def compile_reflection(
+        self,
+        *,
+        objects,
+        timezone_name: str,
+        packet_limit: int,
+    ):
+        del timezone_name
+        del packet_limit
+        object_ids = {item.memory_id for item in objects}
+        if "event:lea_soup_dropoff" not in object_ids:
+            return {"midterm_packets": []}
+        return {
+            "midterm_packets": [
+                {
+                    "packet_id": "midterm:lea_soup_dropoff",
+                    "kind": "upcoming_event",
+                    "summary": "Lea will bring a thermos of lentil soup this evening.",
+                    "details": "At 7 PM Lea will drop off homemade lentil soup in a thermos.",
+                    "source_memory_ids": ["event:lea_soup_dropoff"],
+                    "query_hints": ["lea", "thermos", "lentil soup", "7 pm"],
+                    "sensitivity": "normal",
+                    "valid_from": None,
+                    "valid_to": None,
+                }
+            ]
+        }
 
 
 class _FakeRemoteState:
@@ -168,6 +204,76 @@ class LongTermMidtermTests(unittest.TestCase):
         self.assertIn("Janina", packet.summary)
         self.assertIn("eye doctor", packet.summary)
         self.assertEqual(packet.source_memory_ids, ("fact:janina_wife", "event:janina_eye_doctor_today"))
+
+    def test_reflector_preserves_source_language_hints_for_canonical_midterm_packets(self) -> None:
+        dropoff = LongTermMemoryObjectV1(
+            memory_id="event:lea_soup_dropoff",
+            kind="event",
+            summary="Lea bringt heute Abend um 19 Uhr eine Thermoskanne mit Linsensuppe vorbei.",
+            details="Heute Abend kommt Lea vorbei und bringt dir eine Thermoskanne mit selbstgemachter Linsensuppe.",
+            source=_source("turn:lea"),
+            status="active",
+            confidence=0.95,
+            slot_key="event:lea:soup_dropoff:2026-03-21T19:00:00+01:00",
+            value_key="event:lea:soup_dropoff",
+            sensitivity="normal",
+            valid_from="2026-03-21T19:00:00+01:00",
+            valid_to="2026-03-21T20:00:00+01:00",
+            attributes={
+                "person_name": "Lea",
+                "item": "Thermoskanne mit Linsensuppe",
+                "memory_domain": "delivery",
+            },
+        )
+
+        prompt_payload = _memory_object_to_prompt_payload(dropoff)
+        normalized = _normalize_reflection_result(
+            _EnglishPacketFromGermanSourceProgram().compile_reflection(
+                objects=(dropoff,),
+                timezone_name="Europe/Berlin",
+                packet_limit=3,
+            ),
+            valid_memory_ids={"event:lea_soup_dropoff"},
+            packet_limit=3,
+            source_payload_by_memory_id={"event:lea_soup_dropoff": prompt_payload},
+        )
+
+        self.assertEqual(len(normalized["midterm_packets"]), 1)
+        packet = LongTermMidtermStore.packet_type.from_payload(normalized["midterm_packets"][0])
+        self.assertIn("thermos", packet.query_hints)
+        self.assertTrue(
+            any("Thermoskanne" in hint or "Linsensuppe" in hint for hint in packet.query_hints),
+            packet.query_hints,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LongTermMidtermStore.from_config(_config(temp_dir))
+            store.save_packets(packets=(packet,))
+            matches = store.select_relevant_packets("Was bringt Lea heute Abend vorbei?", limit=2)
+
+        self.assertEqual([item.packet_id for item in matches], ["midterm:lea_soup_dropoff"])
+
+    def test_turn_continuity_compiler_preserves_source_language_turn_recall(self) -> None:
+        packet = LongTermTurnContinuityCompiler().compile_packet(
+            turn=LongTermConversationTurn(
+                transcript="Meine Tochter Lea bringt mir heute Abend eine Thermoskanne mit Linsensuppe vorbei.",
+                response="Ich merke mir, dass Lea dir heute Abend die Thermoskanne mit Linsensuppe bringt.",
+                source="conversation",
+            )
+        )
+
+        self.assertIsNotNone(packet)
+        assert packet is not None
+        self.assertEqual(packet.kind, "recent_turn_continuity")
+        self.assertIn("latest user-assistant turn", packet.summary)
+        self.assertIn("Thermoskanne", packet.details or "")
+        self.assertIn("Linsensuppe", packet.details or "")
+        self.assertIn("lea", packet.query_hints)
+        self.assertTrue(
+            any("thermoskanne" in hint.lower() or "linsensuppe" in hint.lower() for hint in packet.query_hints),
+            packet.query_hints,
+        )
+        self.assertEqual(packet.attributes["persistence_scope"], "turn_continuity")
 
     def test_midterm_store_selects_query_relevant_packets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -24,10 +24,12 @@ Out of scope:
 - `service.py` stays orchestration-focused. New extraction, reasoning, storage, or policy logic belongs in the package that already owns that concern.
 - All runtime mutations that touch prompt, object, graph, or midterm stores must stay serialized under the shared `_store_lock`.
 - Personality learning stays a downstream sidecar owned by `src/twinr/agent/personality/`; `service.py` may route consolidated turns and tool history into it, but must not reimplement signal taxonomy or evolution policy here.
+- When runtime reflection creates summaries or promotes objects inline, the downstream personality-learning handoff must see that enriched batch instead of only the pre-reflection consolidator result.
 - Required remote-primary readiness failures must surface as `LongTermRemoteUnavailableError`; do not degrade them into empty context or silent fallback.
 - Background writers must stay bounded, reject new items after shutdown starts, and preserve exact pending/drop/error state.
 - Service-level flush deadlines must be real wall-clock totals; do not reapply the full timeout independently to multiple writers.
 - Runtime restart-recall persistence stays orchestration-only here: `service.py` may trigger packet refreshes, but packet compilation logic belongs in retrieval and packet storage semantics belong in storage.
+- Runtime may persist a deterministic immediate turn-continuity packet before slower durable enrichment drains, but the packet-compilation logic belongs in reasoning and must not grow ad-hoc inside `service.py`.
 - Multimodal evidence and episodic fallback payloads must remain bounded and sanitized before persistence.
 
 ## Verification

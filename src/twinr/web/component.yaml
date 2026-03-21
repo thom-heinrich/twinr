@@ -15,7 +15,7 @@ owned_concerns:
   - Expose the `/connect/whatsapp` wizard for one-number WhatsApp self-chat setup, including allowlist, runtime, a bounded pairing window, live worker status, and the final self-chat test
   - Persist and read generic per-channel onboarding snapshots so pairing, reconnect, and repair-needed state survive page reloads
   - Centralize request-time config loading, store construction, and safe template rendering through `context.py`
-  - Validate and persist web-driven automation, reminder, integration, provider, personality, and user-context edits through the appropriate helpers
+  - Validate and persist web-driven automation, reminder, integration, provider, personality, and user-context edits through the appropriate helpers, including Hue-backed smart-home configuration on `/integrations`
   - Ship the package-local Jinja templates and static CSS used by the local control surface
 out_of_scope:
   - Core runtime, provider, hardware, memory, or ops business logic outside route orchestration and operator-facing page composition
@@ -28,7 +28,7 @@ files:
     exports:
       - create_app
   - path: app.py
-    role: FastAPI app factory, proxy-aware security middleware, and route handlers, including the WhatsApp setup wizard routes
+    role: FastAPI app factory, proxy-aware security middleware, and route handlers, including the WhatsApp setup wizard routes plus managed smart-home integration persistence
     exports:
       - create_app
   - path: conversation_lab.py

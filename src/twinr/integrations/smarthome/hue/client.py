@@ -82,7 +82,11 @@ class HueBridgeClient:
         timeout = self.config.timeout_s if timeout_s is None else float(timeout_s)
         if max_events < 1:
             raise ValueError("max_events must be >= 1")
-        return self._event_reader("/eventstream/clip/v2", timeout, max_events)
+        try:
+            return self._event_reader("/eventstream/clip/v2", timeout, max_events)
+        except TimeoutError:
+            # Treat an idle SSE timeout as a bounded no-event read, not as a transport failure.
+            return []
 
     def _ssl_context(self) -> ssl.SSLContext:
         """Build the TLS context for local bridge requests."""

@@ -51,6 +51,7 @@ from ..social.vision_review import (
 )
 from ..wakeword.calibration import WakewordCalibrationStore, apply_wakeword_calibration
 from ..wakeword.kws import WakewordSherpaOnnxFrameSpotter, WakewordSherpaOnnxSpotter
+from ..wakeword.local_verifier import build_configured_sequence_capture_verifier
 from ..wakeword.matching import WakewordMatch, WakewordPhraseSpotter
 from ..wakeword.policy import SttWakewordVerifier, WakewordDecision, WakewordDecisionPolicy, normalize_wakeword_backend
 from ..wakeword.spotter import WakewordOpenWakeWordSpotter
@@ -64,12 +65,21 @@ from .attention_targeting import (
     MultimodalAttentionTargetSnapshot,
     MultimodalAttentionTargetTracker,
 )
+from .attention_debug_stream import AttentionDebugStream
 from .display_attention import DisplayAttentionCuePublishResult, DisplayAttentionCuePublisher
 from .display_attention import (
     display_attention_refresh_supported,
     resolve_display_attention_refresh_interval,
 )
-from .display_gesture_emoji import DisplayGestureEmojiPublisher
+from .display_gesture_emoji import (
+    DisplayGestureEmojiDecision,
+    DisplayGestureEmojiPublishResult,
+    DisplayGestureEmojiPublisher,
+    display_gesture_refresh_supported,
+    resolve_display_gesture_refresh_interval,
+)
+from .gesture_ack_lane import GestureAckLane
+from .gesture_debug_stream import GestureDebugStream
 from .identity_fusion import (
     MultimodalIdentityFusionSnapshot,
     TemporalIdentityFusionTracker,
@@ -81,6 +91,8 @@ from .multimodal_initiative import (
     derive_respeaker_multimodal_initiative,
 )
 from .presence import PresenceSessionController, PresenceSessionSnapshot
+from .pir_open_gate import open_pir_monitor_with_busy_retry
+from .respeaker_capture_gate import require_stable_respeaker_capture
 from .portrait_match import PortraitMatchSnapshot, derive_portrait_match
 from .runtime_contract import (
     ReSpeakerRuntimeContractError,
@@ -243,6 +255,34 @@ def _display_attention_refresh_allowed_runtime_status(runtime_status_value: obje
     # still allowing purely local HDMI face-follow cues to run from on-device
     # camera/audio signals.
     return normalized in _DISPLAY_ATTENTION_CUE_ONLY_RUNTIME_STATES
+
+
+def _preserve_local_attention_on_audio_block(
+    *,
+    runtime: TwinrRuntime,
+    emit: Callable[[str], None] | None,
+    detail: str,
+) -> None:
+    """Keep local HDMI camera follow alive while marking the runtime as blocked.
+
+    A broken ReSpeaker startup path must still surface as a hard runtime error,
+    but it should not prevent Twinr from running purely local camera-driven
+    HDMI cues such as eye-follow and gesture acknowledgements.
+    """
+
+    _record_component_warning(
+        runtime=runtime,
+        emit=emit,
+        reason="respeaker_camera_follow_only",
+        detail=(
+            "ReSpeaker startup is blocked, so Twinr preserved only the local "
+            f"HDMI camera-follow path: {detail}"
+        ),
+    )
+    try:
+        runtime.fail(detail)
+    except Exception:
+        _safe_emit(emit, f"runtime_fail_failed={_exception_text(detail)}")
 
 
 def _respeaker_dead_capture_payload(
@@ -471,6 +511,8 @@ class ProactiveCoordinator:
         observation_handler: Callable[[dict[str, Any], tuple[str, ...]], None] | None = None,
         display_attention_publisher: DisplayAttentionCuePublisher | None = None,
         display_gesture_emoji_publisher: DisplayGestureEmojiPublisher | None = None,
+        display_attention_debug_stream: AttentionDebugStream | None = None,
+        display_gesture_debug_stream: GestureDebugStream | None = None,
         emit: Callable[[str], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         audio_observer_fallback_factory: Callable[[], Any] | None = None,
@@ -501,6 +543,12 @@ class ProactiveCoordinator:
         self.display_gesture_emoji_publisher = display_gesture_emoji_publisher or DisplayGestureEmojiPublisher.from_config(
             config
         )
+        self.display_attention_debug_stream = display_attention_debug_stream or AttentionDebugStream.from_config(
+            config
+        )
+        self.display_gesture_debug_stream = display_gesture_debug_stream or GestureDebugStream.from_config(
+            config
+        )
         self.emit = emit or (lambda _line: None)
         self.clock = clock
         self._normalized_wakeword_backend = normalize_wakeword_backend(
@@ -510,11 +558,17 @@ class ProactiveCoordinator:
         self._last_motion_at: float | None = None
         self._last_capture_at: float | None = None
         self._last_display_attention_refresh_at: float | None = None
+        self._last_display_gesture_refresh_at: float | None = None
         self._last_audio_snapshot: ProactiveAudioSnapshot | None = None
         self._last_audio_snapshot_at: float | None = None
         self._last_display_attention_follow_key: tuple[object, ...] | None = None
         self._last_observation_key: tuple[object, ...] | None = None
+        self._last_attention_vision_refresh_mode: str | None = None
+        self._last_attention_audio_refresh_mode: str | None = None
+        self._last_gesture_vision_refresh_mode: str | None = None
         self._camera_surface = ProactiveCameraSurface.from_config(config)
+        self._display_attention_camera_surface = ProactiveCameraSurface.from_config(config)
+        self._gesture_ack_lane = GestureAckLane.from_config(config)
         self._last_sensor_flags: dict[str, bool] = {}
         self._speech_detected_since: float | None = None
         self._quiet_since: float | None = None
@@ -645,17 +699,21 @@ class ProactiveCoordinator:
             try:
                 snapshot = fast_observe()
             except Exception as exc:
+                self._last_attention_audio_refresh_mode = "signal_only_failed_fallback"
                 self._record_fault(
                     event="proactive_attention_audio_fast_observe_failed",
                     message="Fast audio observation failed during HDMI attention refresh; using cached/null audio instead.",
                     error=exc,
                 )
                 return self._attention_refresh_audio_fallback(now=now)
+            self._last_attention_audio_refresh_mode = "signal_only"
             return self._store_audio_snapshot(snapshot=snapshot, observed_at=now)
 
         if isinstance(self.audio_observer, AmbientAudioObservationProvider):
+            self._last_attention_audio_refresh_mode = "cache_or_null"
             return self._attention_refresh_audio_fallback(now=now)
 
+        self._last_attention_audio_refresh_mode = "default_observe"
         return self._observe_audio_safe()
 
     def _attention_refresh_audio_fallback(
@@ -670,11 +728,47 @@ class ProactiveCoordinator:
             and self._last_audio_snapshot_at is not None
             and (now - self._last_audio_snapshot_at) <= _ATTENTION_REFRESH_AUDIO_CACHE_MAX_AGE_S
         ):
+            self._last_attention_audio_refresh_mode = "cache"
             return self._last_audio_snapshot
+        self._last_attention_audio_refresh_mode = "null"
         return self._store_audio_snapshot(
             snapshot=self._null_audio_observer.observe(),
             observed_at=now,
         )
+
+    def _observe_vision_for_attention_refresh(self):
+        """Collect one low-cost vision snapshot for the HDMI eye-follow path."""
+
+        if self.vision_observer is None:
+            self._last_attention_vision_refresh_mode = "missing"
+            return None
+        fast_observe = getattr(self.vision_observer, "observe_attention", None)
+        if callable(fast_observe):
+            try:
+                self._last_attention_vision_refresh_mode = "attention_fast"
+                return fast_observe()
+            except Exception as exc:
+                self._last_attention_vision_refresh_mode = "attention_fast_failed_default"
+                self._record_fault(
+                    event="proactive_attention_vision_fast_observe_failed",
+                    message="Fast attention vision observation failed; falling back to the default vision observer.",
+                    error=exc,
+                )
+        self._last_attention_vision_refresh_mode = "default_observe"
+        return self._observe_vision_safe()
+
+    def _observe_vision_with_method(self, observe_fn: Callable[[], Any]):
+        """Call one vision-observer method while preserving the non-throwing contract."""
+
+        try:
+            return observe_fn()
+        except Exception as exc:
+            self._record_fault(
+                event="proactive_vision_specialized_observe_failed",
+                message="Specialized vision observation failed; continuing without a refresh snapshot.",
+                error=exc,
+            )
+            return None
 
     # AUDIT-FIX(#6): Vision observation faults should fall back to an uninspected tick so wakeword/presence logic can continue.
     def _observe_vision_safe(self):
@@ -1211,6 +1305,28 @@ class ProactiveCoordinator:
 
         if self.wakeword_handler is None:
             return False
+        paused_stream = None
+        if source == "streaming_spotter" and self.wakeword_stream is not None:
+            paused_stream = self.wakeword_stream
+            try:
+                # AUDIT-FIX(#11): The streaming wakeword monitor owns an exclusive
+                # arecord handle on the same ALSA capture path that the
+                # hands-free conversation capture opens next. Pause it before
+                # running the handler so a successful wakeword does not
+                # immediately fail with "Device or resource busy".
+                paused_stream.close()
+            except Exception as exc:
+                self._record_fault(
+                    event="wakeword_stream_pause_failed",
+                    message="Wakeword handler could not pause the active streaming capture path.",
+                    error=exc,
+                    data={
+                        "source": source,
+                        "matched_phrase": match.matched_phrase,
+                        "detector_label": match.detector_label,
+                    },
+                )
+                return False
         try:
             handled = bool(self.wakeword_handler(match))
         except Exception as exc:
@@ -1225,6 +1341,12 @@ class ProactiveCoordinator:
                 },
             )
             return False
+        finally:
+            if paused_stream is not None and self.wakeword_stream is paused_stream:
+                try:
+                    paused_stream.open()
+                except Exception as exc:
+                    self._handle_wakeword_stream_failure(exc)
         if handled:
             self._emit("wakeword_detected=true")
         return handled
@@ -1421,7 +1543,7 @@ class ProactiveCoordinator:
             return False
         if getattr(audio_snapshot, "channels", None) is None:
             return False
-        if self._normalized_wakeword_backend in {"openwakeword", "kws"}:  # AUDIT-FIX(#9): normalized comparison avoids config case/whitespace mismatches.
+        if self._normalized_wakeword_backend in {"openwakeword", "kws", "wekws"}:  # AUDIT-FIX(#9): normalized comparison avoids config case/whitespace mismatches.
             if sample.active_chunk_count >= max(1, self.config.wakeword_min_active_chunks):
                 return True
             if audio_snapshot.observation.speech_detected is True:
@@ -1624,16 +1746,37 @@ class ProactiveCoordinator:
         return True
 
     def refresh_display_attention(self) -> bool:
-        """Refresh HDMI attention-follow from the local camera outside PIR-gated ticks."""
+        """Refresh HDMI attention-follow from the cheap local camera path.
+
+        Eye-follow must remain responsive even when explicit hand-gesture
+        recognition is heavier. This refresh therefore prefers a dedicated
+        attention-only camera observation and a dedicated stabilized surface so
+        gesture-path tuning cannot regress the face-follow loop.
+        """
+
+        refresh_started_ns = time.monotonic_ns()
+        stage_ms: dict[str, float] = {}
 
         if not display_attention_refresh_supported(
             config=self.config,
             vision_observer=self.vision_observer,
         ):
+            self._record_attention_debug_tick(
+                observed_at=self.clock(),
+                outcome="unsupported",
+                runtime_status_value=None,
+                stage_ms=stage_ms,
+            )
             return False
         now = self.clock()
         interval_s = resolve_display_attention_refresh_interval(self.config)
         if interval_s is None:
+            self._record_attention_debug_tick(
+                observed_at=now,
+                outcome="no_refresh_interval",
+                runtime_status_value=None,
+                stage_ms=stage_ms,
+            )
             return False
         if (
             self._last_display_attention_refresh_at is not None
@@ -1648,15 +1791,37 @@ class ProactiveCoordinator:
                 message="Failed to read runtime status for HDMI attention refresh.",
                 error=exc,
             )
+            self._record_attention_debug_tick(
+                observed_at=now,
+                outcome="runtime_status_failed",
+                runtime_status_value=None,
+                stage_ms=stage_ms,
+            )
             return False
         if not _display_attention_refresh_allowed_runtime_status(runtime_status_value):
+            self._record_attention_debug_tick(
+                observed_at=now,
+                outcome="runtime_status_blocked",
+                runtime_status_value=runtime_status_value,
+                stage_ms=stage_ms,
+            )
             return False
-        snapshot = self._observe_vision_safe()
+        stage_started_ns = time.monotonic_ns()
+        snapshot = self._observe_vision_for_attention_refresh()
+        stage_ms["vision_observe"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
         if snapshot is None:
+            stage_ms["total"] = round((time.monotonic_ns() - refresh_started_ns) / 1_000_000.0, 3)
+            self._record_attention_debug_tick(
+                observed_at=now,
+                outcome="vision_snapshot_missing",
+                runtime_status_value=runtime_status_value,
+                stage_ms=stage_ms,
+            )
             return False
         self._last_display_attention_refresh_at = now
         self._record_vision_snapshot_safe(snapshot)
-        camera_update = self._observe_camera_surface(
+        stage_started_ns = time.monotonic_ns()
+        camera_update = self._observe_display_attention_camera_surface(
             SocialObservation(
                 observed_at=now,
                 inspected=True,
@@ -1667,12 +1832,16 @@ class ProactiveCoordinator:
             ),
             inspected=True,
         )
-        self._update_display_gesture_emoji_ack(camera_update)
+        stage_ms["camera_surface"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+        stage_started_ns = time.monotonic_ns()
         audio_snapshot = self._observe_audio_for_attention_refresh(now=now)
+        stage_ms["audio_observe"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+        stage_started_ns = time.monotonic_ns()
         audio_policy_snapshot = self._observe_audio_policy(
             now=now,
             audio_observation=audio_snapshot.observation,
         )
+        stage_ms["audio_policy"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
         observation = SocialObservation(
             observed_at=now,
             inspected=True,
@@ -1681,17 +1850,120 @@ class ProactiveCoordinator:
             vision=snapshot.observation,
             audio=audio_snapshot.observation,
         )
+        stage_started_ns = time.monotonic_ns()
         publish_result = self._update_display_attention_follow(
             observed_at=now,
             camera_snapshot=camera_update.snapshot,
             audio_observation=audio_snapshot.observation,
             audio_policy_snapshot=audio_policy_snapshot,
         )
+        stage_ms["publish"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+        stage_ms["total"] = round((time.monotonic_ns() - refresh_started_ns) / 1_000_000.0, 3)
         self._record_display_attention_follow_if_changed(
             observed_at=now,
             runtime_status_value=runtime_status_value,
             camera_snapshot=camera_update.snapshot,
             publish_result=publish_result,
+        )
+        self._record_attention_debug_tick(
+            observed_at=now,
+            outcome="published" if publish_result is not None else "no_publish_result",
+            runtime_status_value=runtime_status_value,
+            camera_snapshot=camera_update.snapshot,
+            audio_observation=audio_snapshot.observation,
+            publish_result=publish_result,
+            stage_ms=stage_ms,
+        )
+        return True
+
+    def refresh_display_gesture_emoji(self) -> bool:
+        """Refresh HDMI gesture acknowledgements from the dedicated gesture path."""
+
+        refresh_started_ns = time.monotonic_ns()
+        stage_ms: dict[str, float] = {}
+        if self.display_gesture_emoji_publisher is None:
+            return False
+        if not display_gesture_refresh_supported(
+            config=self.config,
+            vision_observer=self.vision_observer,
+        ):
+            self._record_gesture_debug_tick(
+                observed_at=self.clock(),
+                outcome="unsupported",
+                runtime_status_value=None,
+                stage_ms=stage_ms,
+            )
+            return False
+        now = self.clock()
+        interval_s = resolve_display_gesture_refresh_interval(self.config)
+        if interval_s is None:
+            self._record_gesture_debug_tick(
+                observed_at=now,
+                outcome="no_refresh_interval",
+                runtime_status_value=None,
+                stage_ms=stage_ms,
+            )
+            return False
+        if (
+            self._last_display_gesture_refresh_at is not None
+            and (now - self._last_display_gesture_refresh_at) < interval_s
+        ):
+            return False
+        try:
+            runtime_status_value = self.runtime.status.value
+        except Exception as exc:
+            self._record_fault(
+                event="proactive_display_gesture_runtime_status_failed",
+                message="Failed to read runtime status for HDMI gesture refresh.",
+                error=exc,
+            )
+            self._record_gesture_debug_tick(
+                observed_at=now,
+                outcome="runtime_status_failed",
+                runtime_status_value=None,
+                stage_ms=stage_ms,
+            )
+            return False
+        if not _display_attention_refresh_allowed_runtime_status(runtime_status_value):
+            self._record_gesture_debug_tick(
+                observed_at=now,
+                outcome="runtime_status_blocked",
+                runtime_status_value=runtime_status_value,
+                stage_ms=stage_ms,
+            )
+            return False
+        stage_started_ns = time.monotonic_ns()
+        snapshot = self._observe_vision_for_gesture_refresh()
+        stage_ms["vision_observe"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+        if snapshot is None:
+            stage_ms["total"] = round((time.monotonic_ns() - refresh_started_ns) / 1_000_000.0, 3)
+            self._record_gesture_debug_tick(
+                observed_at=now,
+                outcome="vision_snapshot_missing",
+                runtime_status_value=runtime_status_value,
+                stage_ms=stage_ms,
+            )
+            return False
+        self._last_display_gesture_refresh_at = now
+        self._record_vision_snapshot_safe(snapshot)
+        stage_started_ns = time.monotonic_ns()
+        decision = self._gesture_ack_lane.observe(
+            observed_at=now,
+            observation=snapshot.observation,
+        )
+        stage_ms["ack_lane"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+        stage_started_ns = time.monotonic_ns()
+        publish_result = self._publish_display_gesture_decision(decision)
+        stage_ms["publish"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+        stage_ms["total"] = round((time.monotonic_ns() - refresh_started_ns) / 1_000_000.0, 3)
+        self._record_gesture_debug_tick(
+            observed_at=now,
+            outcome=("publish_failed" if publish_result is None else publish_result.action),
+            runtime_status_value=runtime_status_value,
+            observation=snapshot.observation,
+            decision=decision,
+            publish_result=publish_result,
+            stage_ms=stage_ms,
         )
         return True
 
@@ -2475,7 +2747,11 @@ class ProactiveCoordinator:
 
         try:
             camera_update = self._observe_camera_surface(observation, inspected=inspected)
-            self._update_display_gesture_emoji_ack(camera_update)
+            if not display_gesture_refresh_supported(
+                config=self.config,
+                vision_observer=self.vision_observer,
+            ):
+                self._update_display_gesture_emoji_ack(camera_update)
             publish_result = self._update_display_attention_follow(
                 observed_at=observation.observed_at,
                 camera_snapshot=camera_update.snapshot,
@@ -2586,6 +2862,26 @@ class ProactiveCoordinator:
                 data={"event_names": list(camera_update.event_names)},
             )
 
+    def _publish_display_gesture_decision(
+        self,
+        decision: DisplayGestureEmojiDecision,
+    ) -> DisplayGestureEmojiPublishResult | None:
+        """Persist one direct gesture-ack decision through the emoji publisher."""
+
+        publisher = self.display_gesture_emoji_publisher
+        if publisher is None:
+            return None
+        try:
+            return publisher.publish(decision)
+        except Exception as exc:
+            self._record_fault(
+                event="proactive_display_gesture_emoji_failed",
+                message="Failed to update the HDMI gesture-emoji acknowledgement cue.",
+                error=exc,
+                data={"reason": decision.reason},
+            )
+            return None
+
     def _record_display_attention_follow_if_changed(
         self,
         *,
@@ -2684,6 +2980,180 @@ class ProactiveCoordinator:
             },
         )
 
+    def _record_attention_debug_tick(
+        self,
+        *,
+        observed_at: float,
+        outcome: str,
+        runtime_status_value: object,
+        stage_ms: dict[str, float],
+        camera_snapshot: ProactiveCameraSnapshot | None = None,
+        audio_observation: SocialAudioObservation | None = None,
+        publish_result: DisplayAttentionCuePublishResult | None = None,
+    ) -> None:
+        """Append one continuous bounded attention-debug tick."""
+
+        stream = self.display_attention_debug_stream
+        if stream is None:
+            return
+        decision = None if publish_result is None else publish_result.decision
+        payload: dict[str, Any] = {
+            "runtime_status": str(runtime_status_value or "").strip().lower() or None,
+            "vision_mode": self._last_attention_vision_refresh_mode,
+            "audio_mode": self._last_attention_audio_refresh_mode,
+            "stage_ms": dict(stage_ms),
+        }
+        if camera_snapshot is not None:
+            payload.update(
+                {
+                    "camera_online": camera_snapshot.camera_online,
+                    "camera_ready": camera_snapshot.camera_ready,
+                    "camera_ai_ready": camera_snapshot.camera_ai_ready,
+                    "camera_error": camera_snapshot.camera_error,
+                    "person_visible": camera_snapshot.person_visible,
+                    "person_visible_unknown": camera_snapshot.person_visible_unknown,
+                    "camera_person_count": camera_snapshot.person_count,
+                    "camera_visible_person_count": len(camera_snapshot.visible_persons),
+                    "camera_primary_person_zone": camera_snapshot.primary_person_zone.value,
+                    "camera_primary_person_center_x": _round_optional_ratio(camera_snapshot.primary_person_center_x),
+                    "camera_primary_person_center_y": _round_optional_ratio(camera_snapshot.primary_person_center_y),
+                    "camera_frame_age_s": _round_optional_seconds(
+                        None
+                        if camera_snapshot.last_camera_frame_at is None
+                        else max(0.0, observed_at - float(camera_snapshot.last_camera_frame_at))
+                    ),
+                }
+            )
+        if self.latest_attention_target_snapshot is not None:
+            payload.update(
+                {
+                    "attention_target_state": self.latest_attention_target_snapshot.state,
+                    "attention_target_active": self.latest_attention_target_snapshot.active,
+                    "attention_target_horizontal": self.latest_attention_target_snapshot.target_horizontal,
+                    "attention_target_vertical": self.latest_attention_target_snapshot.target_vertical,
+                    "attention_target_track_id": self.latest_attention_target_snapshot.target_track_id,
+                    "attention_target_center_x": _round_optional_ratio(
+                        self.latest_attention_target_snapshot.target_center_x
+                    ),
+                    "attention_target_center_y": _round_optional_ratio(
+                        self.latest_attention_target_snapshot.target_center_y
+                    ),
+                    "attention_target_focus_source": self.latest_attention_target_snapshot.focus_source,
+                    "attention_target_speaker_locked": self.latest_attention_target_snapshot.speaker_locked,
+                }
+            )
+        if audio_observation is not None:
+            payload.update(
+                {
+                    "audio_speech_detected": audio_observation.speech_detected,
+                    "audio_azimuth_deg": audio_observation.azimuth_deg,
+                    "audio_direction_confidence": _round_optional_ratio(audio_observation.direction_confidence),
+                    "audio_signal_source": audio_observation.signal_source,
+                }
+            )
+        if publish_result is not None:
+            payload.update(
+                {
+                    "publish_action": publish_result.action,
+                    "publish_owner": publish_result.owner,
+                }
+            )
+        if decision is not None:
+            payload.update(
+                {
+                    "decision_reason": decision.reason,
+                    "decision_gaze": decision.gaze.value,
+                    "decision_cue_gaze_x": decision.cue_gaze_x,
+                    "decision_cue_gaze_y": decision.cue_gaze_y,
+                    "decision_head_dx": decision.head_dx,
+                    "decision_head_dy": decision.head_dy,
+                    "decision_speaker_locked": decision.speaker_locked,
+                }
+            )
+        try:
+            stream.append_tick(
+                outcome=outcome,
+                observed_at=observed_at,
+                data=payload,
+            )
+        except Exception as exc:
+            self._record_fault(
+                event="proactive_attention_debug_stream_failed",
+                message="Failed to append the bounded attention debug tick.",
+                error=exc,
+                data={"outcome": outcome},
+            )
+
+    def _record_gesture_debug_tick(
+        self,
+        *,
+        observed_at: float,
+        outcome: str,
+        runtime_status_value: object,
+        stage_ms: dict[str, float],
+        observation: SocialVisionObservation | None = None,
+        decision: DisplayGestureEmojiDecision | None = None,
+        publish_result: DisplayGestureEmojiPublishResult | None = None,
+    ) -> None:
+        """Append one continuous bounded gesture-debug tick."""
+
+        stream = self.display_gesture_debug_stream
+        if stream is None:
+            return
+        payload: dict[str, Any] = {
+            "runtime_status": str(runtime_status_value or "").strip().lower() or None,
+            "vision_mode": self._last_gesture_vision_refresh_mode,
+            "stage_ms": dict(stage_ms),
+        }
+        if observation is not None:
+            payload.update(
+                {
+                    "camera_online": observation.camera_online,
+                    "camera_ready": observation.camera_ready,
+                    "camera_ai_ready": observation.camera_ai_ready,
+                    "camera_error": observation.camera_error,
+                    "camera_person_count": observation.person_count,
+                    "camera_fine_hand_gesture": observation.fine_hand_gesture.value,
+                    "camera_fine_hand_gesture_confidence": _round_optional_ratio(
+                        observation.fine_hand_gesture_confidence
+                    ),
+                    "camera_gesture_event": observation.gesture_event.value,
+                    "camera_gesture_confidence": _round_optional_ratio(observation.gesture_confidence),
+                    "camera_hand_or_object_near": observation.hand_or_object_near_camera,
+                    "camera_showing_intent_likely": observation.showing_intent_likely,
+                }
+            )
+        if decision is not None:
+            payload.update(
+                {
+                    "decision_active": decision.active,
+                    "decision_reason": decision.reason,
+                    "decision_symbol": decision.symbol.value,
+                    "decision_accent": decision.accent,
+                    "decision_hold_seconds": round(decision.hold_seconds, 3),
+                }
+            )
+        if publish_result is not None:
+            payload.update(
+                {
+                    "publish_action": publish_result.action,
+                    "publish_owner": publish_result.owner,
+                }
+            )
+        try:
+            stream.append_tick(
+                outcome=outcome,
+                observed_at=observed_at,
+                data=payload,
+            )
+        except Exception as exc:
+            self._record_fault(
+                event="proactive_gesture_debug_stream_failed",
+                message="Failed to append the bounded gesture debug tick.",
+                error=exc,
+                data={"outcome": outcome},
+            )
+
     def _observe_camera_surface(
         self,
         observation: SocialObservation,
@@ -2697,6 +3167,33 @@ class ProactiveCoordinator:
             observed_at=observation.observed_at,
             observation=observation.vision,
         )
+
+    def _observe_display_attention_camera_surface(
+        self,
+        observation: SocialObservation,
+        *,
+        inspected: bool,
+    ) -> ProactiveCameraSurfaceUpdate:
+        """Project one raw eye-follow observation onto the attention-only surface."""
+
+        return self._display_attention_camera_surface.observe(
+            inspected=inspected,
+            observed_at=observation.observed_at,
+            observation=observation.vision,
+        )
+
+    def _observe_vision_for_gesture_refresh(self):
+        """Capture one gesture-only vision snapshot for HDMI emoji acknowledgement."""
+
+        if self.vision_observer is None:
+            self._last_gesture_vision_refresh_mode = "missing"
+            return None
+        observe_gesture = getattr(self.vision_observer, "observe_gesture", None)
+        if callable(observe_gesture):
+            self._last_gesture_vision_refresh_mode = "gesture_fast"
+            return self._observe_vision_with_method(observe_gesture)
+        self._last_gesture_vision_refresh_mode = "full_fallback"
+        return self._observe_vision_safe()
 
     def _build_automation_facts(
         self,
@@ -3025,7 +3522,16 @@ class ProactiveMonitorService:
         opened_stream = False
         try:
             if self.coordinator.pir_monitor is not None:
-                self.coordinator.pir_monitor.open()
+                pir_open_result = open_pir_monitor_with_busy_retry(self.coordinator.pir_monitor)
+                if pir_open_result.busy_retry_count > 0:
+                    self._append_ops_event(
+                        event="proactive_pir_open_retried",
+                        message="PIR startup waited for a transient busy GPIO line to clear.",
+                        data={
+                            "attempt_count": pir_open_result.attempt_count,
+                            "busy_retry_count": pir_open_result.busy_retry_count,
+                        },
+                    )
                 opened_pir = True
             if self.wakeword_stream is not None:
                 self.wakeword_stream.open()
@@ -3136,6 +3642,7 @@ class ProactiveMonitorService:
 
         next_tick_at = 0.0
         next_attention_refresh_at = 0.0
+        next_gesture_refresh_at = 0.0
         try:
             while not self._stop_event.is_set():
                 did_work = False
@@ -3173,6 +3680,27 @@ class ProactiveMonitorService:
                         if interval_s is not None
                         else time.monotonic() + self.poll_interval_s
                     )
+                now = time.monotonic()
+                if now >= next_gesture_refresh_at:
+                    try:
+                        if self.coordinator.refresh_display_gesture_emoji():
+                            did_work = True
+                    except Exception as exc:
+                        error_text = _exception_text(exc)
+                        self._emit(f"proactive_error={error_text}")
+                        self._append_ops_event(
+                            event="proactive_error",
+                            level="error",
+                            message="Display gesture refresh failed.",
+                            data={"error": error_text},
+                        )
+                    interval_s = resolve_display_gesture_refresh_interval(self.coordinator.config)
+                    next_gesture_refresh_at = (
+                        time.monotonic() + interval_s
+                        if interval_s is not None
+                        else time.monotonic() + self.poll_interval_s
+                    )
+                now = time.monotonic()
                 if now >= next_tick_at:
                     try:
                         self.coordinator.tick()
@@ -3255,7 +3783,7 @@ def build_default_proactive_monitor(
         getattr(config, "wakeword_fallback_backend", "stt"),
         default="stt",
     )
-    use_streaming_wakeword = config.wakeword_enabled and primary_backend in {"openwakeword", "kws"}
+    use_streaming_wakeword = config.wakeword_enabled and primary_backend in {"openwakeword", "kws", "wekws"}
 
     pir_monitor = None
     if config.pir_enabled:
@@ -3296,6 +3824,12 @@ def build_default_proactive_monitor(
         if use_streaming_wakeword:
             if primary_backend == "kws":
                 wakeword_stream = _build_kws_stream(
+                    config=config,
+                    runtime=runtime,
+                    emit=emit,
+                )
+            elif primary_backend == "wekws":
+                wakeword_stream = _build_wekws_stream(
                     config=config,
                     runtime=runtime,
                     emit=emit,
@@ -3418,7 +3952,8 @@ def build_default_proactive_monitor(
                     detail=detail,
                 )
             try:
-                AmbientAudioSampler.from_config(config).require_readable_frames(
+                require_stable_respeaker_capture(
+                    sampler=AmbientAudioSampler.from_config(config),
                     duration_ms=_respeaker_capture_probe_duration_ms(config),
                 )
             except AudioCaptureReadinessError as exc:
@@ -3447,13 +3982,26 @@ def build_default_proactive_monitor(
                 audio_observer_fallback_factory = _fallback_respeaker_audio_observer_factory
         except Exception as exc:
             if isinstance(exc, ReSpeakerRuntimeContractError):
-                raise
-            _record_component_warning(
-                runtime=runtime,
-                emit=emit,
-                reason="respeaker_signal_provider_init_failed",
-                detail=f"ReSpeaker signal-provider initialization failed: {_exception_text(exc)}",
-            )
+                if not display_attention_enabled:
+                    raise
+                detail = _exception_text(exc)
+                _preserve_local_attention_on_audio_block(
+                    runtime=runtime,
+                    emit=emit,
+                    detail=detail,
+                )
+                audio_observer = NullAudioObservationProvider()
+                audio_observer_fallback_factory = None
+                wakeword_stream = None
+                wakeword_spotter = None
+                wakeword_policy = None
+            else:
+                _record_component_warning(
+                    runtime=runtime,
+                    emit=emit,
+                    reason="respeaker_signal_provider_init_failed",
+                    detail=f"ReSpeaker signal-provider initialization failed: {_exception_text(exc)}",
+                )
 
     vision_observer = None
     if config.proactive_enabled or display_attention_enabled:
@@ -3592,14 +4140,7 @@ def _build_wakeword_policy(
         getattr(config, "wakeword_primary_backend", config.wakeword_backend),
         default="openwakeword",
     )
-    local_verifier = None
-    if primary_backend == "openwakeword" and config.wakeword_openwakeword_sequence_verifier_models:
-        from twinr.proactive.wakeword.cascade import WakewordSequenceCaptureVerifier
-
-        local_verifier = WakewordSequenceCaptureVerifier(
-            verifier_models=dict(config.wakeword_openwakeword_sequence_verifier_models),
-            threshold=config.wakeword_openwakeword_sequence_verifier_threshold,
-        )
+    local_verifier = build_configured_sequence_capture_verifier(config)
 
     verifier = None
     if config.wakeword_verifier_mode != "disabled":
@@ -3616,6 +4157,8 @@ def _build_wakeword_policy(
         primary_threshold=(
             config.wakeword_kws_keywords_threshold
             if primary_backend == "kws"
+            else config.wakeword_wekws_threshold
+            if primary_backend == "wekws"
             else config.wakeword_openwakeword_threshold
         ),
         verifier=verifier,
@@ -3632,6 +4175,22 @@ def _missing_kws_asset_fields(config: TwinrConfig) -> tuple[str, ...]:
         "TWINR_WAKEWORD_KWS_DECODER_PATH": config.wakeword_kws_decoder_path,
         "TWINR_WAKEWORD_KWS_JOINER_PATH": config.wakeword_kws_joiner_path,
         "TWINR_WAKEWORD_KWS_KEYWORDS_FILE_PATH": config.wakeword_kws_keywords_file_path,
+    }
+    missing: list[str] = []
+    for env_name, value in required_assets.items():
+        if str(value or "").strip():
+            continue
+        missing.append(env_name)
+    return tuple(missing)
+
+
+def _missing_wekws_asset_fields(config: TwinrConfig) -> tuple[str, ...]:
+    """Return the missing required WeKws asset fields."""
+
+    required_assets = {
+        "TWINR_WAKEWORD_WEKWS_MODEL_PATH": config.wakeword_wekws_model_path,
+        "TWINR_WAKEWORD_WEKWS_CONFIG_PATH": config.wakeword_wekws_config_path,
+        "TWINR_WAKEWORD_WEKWS_WORDS_PATH": config.wakeword_wekws_words_path,
     }
     missing: list[str] = []
     for env_name, value in required_assets.items():
@@ -3798,6 +4357,86 @@ def _build_kws_stream(
         return None
 
 
+def _build_wekws_stream(
+    *,
+    config: TwinrConfig,
+    runtime: TwinrRuntime,
+    emit: Callable[[str], None] | None,
+) -> OpenWakeWordStreamingMonitor | None:
+    """Build the WeKws conventional-KWS streaming monitor when configured."""
+
+    if config.audio_channels != 1:
+        _record_wakeword_backend_warning(
+            runtime=runtime,
+            emit=emit,
+            reason="wekws_requires_mono_audio",
+            detail="WeKws currently requires TWINR_AUDIO_CHANNELS=1.",
+            fallback_backend=config.wakeword_fallback_backend,
+        )
+        return None
+    missing_assets = _missing_wekws_asset_fields(config)
+    if missing_assets:
+        _record_wakeword_backend_warning(
+            runtime=runtime,
+            emit=emit,
+            reason="wekws_assets_missing",
+            detail=(
+                "WeKws backend selected, but required ONNX assets are missing: "
+                + ", ".join(missing_assets)
+            ),
+            fallback_backend=config.wakeword_fallback_backend,
+        )
+        return None
+    try:
+        from ..wakeword.wekws import WakewordWekwsFrameSpotter
+
+        spotter = WakewordWekwsFrameSpotter(
+            model_path=config.wakeword_wekws_model_path or "",
+            config_path=config.wakeword_wekws_config_path or "",
+            words_path=config.wakeword_wekws_words_path or "",
+            cmvn_path=config.wakeword_wekws_cmvn_path,
+            phrases=config.wakeword_phrases,
+            project_root=config.project_root,
+            threshold=config.wakeword_wekws_threshold,
+            chunk_ms=config.wakeword_wekws_chunk_ms,
+            num_threads=config.wakeword_wekws_num_threads,
+            provider=config.wakeword_wekws_provider,
+        )
+        if int(config.audio_sample_rate) != int(spotter.model_config.sample_rate):
+            _record_wakeword_backend_warning(
+                runtime=runtime,
+                emit=emit,
+                reason="wekws_sample_rate_mismatch",
+                detail=(
+                    "WeKws requires TWINR_AUDIO_SAMPLE_RATE to match the model "
+                    f"sample rate ({spotter.model_config.sample_rate})."
+                ),
+                fallback_backend=config.wakeword_fallback_backend,
+            )
+            return None
+        return OpenWakeWordStreamingMonitor(
+            device=_normalize_optional_text(
+                config.proactive_audio_input_device,
+                config.audio_input_device,
+            ),
+            sample_rate=config.audio_sample_rate,
+            channels=config.audio_channels,
+            spotter=spotter,
+            attempt_cooldown_s=config.wakeword_attempt_cooldown_s,
+            speech_threshold=config.audio_speech_threshold,
+            emit=emit,
+        )
+    except Exception as exc:
+        _record_wakeword_backend_warning(
+            runtime=runtime,
+            emit=emit,
+            reason="wekws_init_failed",
+            detail=f"WeKws streaming initialization failed: {_exception_text(exc)}",
+            fallback_backend=config.wakeword_fallback_backend,
+        )
+        return None
+
+
 def _build_wakeword_spotter(
     *,
     config: TwinrConfig,
@@ -3900,6 +4539,45 @@ def _build_wakeword_spotter(
                     emit=emit,
                     reason="kws_init_failed",
                     detail=f"KWS initialization failed: {_exception_text(exc)}",
+                    fallback_backend=fallback_backend,
+                )
+        if fallback_backend != "stt":
+            return None
+    if selected_backend == "wekws":
+        missing_assets = _missing_wekws_asset_fields(config)
+        if missing_assets:
+            _record_wakeword_backend_warning(
+                runtime=runtime,
+                emit=emit,
+                reason="wekws_assets_missing",
+                detail=(
+                    "WeKws backend selected, but required ONNX assets are missing: "
+                    + ", ".join(missing_assets)
+                ),
+                fallback_backend=fallback_backend,
+            )
+        else:
+            try:
+                from ..wakeword.wekws import WakewordWekwsSpotter
+
+                return WakewordWekwsSpotter(
+                    model_path=config.wakeword_wekws_model_path or "",
+                    config_path=config.wakeword_wekws_config_path or "",
+                    words_path=config.wakeword_wekws_words_path or "",
+                    cmvn_path=config.wakeword_wekws_cmvn_path,
+                    phrases=config.wakeword_phrases,
+                    project_root=config.project_root,
+                    threshold=config.wakeword_wekws_threshold,
+                    chunk_ms=config.wakeword_wekws_chunk_ms,
+                    num_threads=config.wakeword_wekws_num_threads,
+                    provider=config.wakeword_wekws_provider,
+                )
+            except Exception as exc:
+                _record_wakeword_backend_warning(
+                    runtime=runtime,
+                    emit=emit,
+                    reason="wekws_init_failed",
+                    detail=f"WeKws initialization failed: {_exception_text(exc)}",
                     fallback_backend=fallback_backend,
                 )
         if fallback_backend != "stt":

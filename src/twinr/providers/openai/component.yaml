@@ -19,6 +19,7 @@ files:
     exports:
       - OpenAIAgentTextProvider
       - OpenAIBackend
+      - OpenAIConversationClosureDecisionProvider
       - OpenAIFirstWordProvider
       - OpenAIImageInput
       - OpenAIProviderBundle
@@ -43,6 +44,7 @@ public_api:
   exports:
     - OpenAIAgentTextProvider
     - OpenAIBackend
+    - OpenAIConversationClosureDecisionProvider
     - OpenAIFirstWordProvider
     - OpenAIImageInput
     - OpenAIProviderBundle

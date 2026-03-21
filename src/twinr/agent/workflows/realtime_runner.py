@@ -30,7 +30,7 @@ from twinr.agent.base_agent.conversation.turn_controller import (
 from twinr.agent.base_agent.conversation.closure import (
     ConversationClosureEvaluation,
     ConversationClosureDecision,
-    ToolCallingConversationClosureEvaluator,
+    ConversationClosureEvaluator,
 )
 from twinr.agent.workflows.follow_up_steering import FollowUpSteeringRuntime
 from twinr.agent.base_agent.runtime import TwinrRuntime
@@ -40,12 +40,15 @@ from twinr.hardware.audio import (
     SilenceDetectedRecorder,
     SpeechCaptureResult,
     WaveAudioPlayer,
+    normalize_wav_playback_level,
     pcm16_to_wav_bytes,
 )
 from twinr.hardware.buttons import ButtonAction, configured_button_monitor
 from twinr.hardware.camera import V4L2StillCamera
 from twinr.hardware.printer import RawReceiptPrinter
 from twinr.hardware.voice_profile import VoiceProfileMonitor
+from twinr.integrations import build_smart_home_hub_adapter
+from twinr.integrations.smarthome import SmartHomeObservation, SmartHomeSensorWorker
 from twinr.ops.usage import TwinrUsageStore
 from twinr.proactive import SocialTriggerDecision, WakewordMatch, build_default_proactive_monitor
 from twinr.providers.openai import OpenAIProviderBundle
@@ -91,7 +94,7 @@ class TwinrRealtimeHardwareLoop(
         turn_stt_provider: StreamingSpeechToTextProvider | None = None,
         turn_tool_agent_provider: ToolCallingAgentProvider | None = None,
         verification_stt_provider: SpeechToTextProvider | None = None,
-        conversation_closure_evaluator: ToolCallingConversationClosureEvaluator | None = None,
+        conversation_closure_evaluator: ConversationClosureEvaluator | None = None,
         button_monitor=None,
         recorder: SilenceDetectedRecorder | None = None,
         player: WaveAudioPlayer | None = None,
@@ -182,14 +185,7 @@ class TwinrRealtimeHardwareLoop(
         )
         self.conversation_closure_evaluator = (
             conversation_closure_evaluator
-            or (
-                ToolCallingConversationClosureEvaluator(
-                    config=config,
-                    provider=self.turn_tool_agent_provider,
-                )
-                if self.turn_tool_agent_provider is not None and self.config.conversation_closure_guard_enabled
-                else None
-            )
+            or self._build_conversation_closure_evaluator(config)
         )
         self.realtime_session = realtime_session or OpenAIRealtimeSession(
             config=config,
@@ -341,6 +337,7 @@ class TwinrRealtimeHardwareLoop(
             housekeeping_stop, housekeeping_thread = self._start_idle_housekeeping_worker(
                 poll_timeout=safe_poll_timeout
             )
+            smart_home_sensor_worker = self._start_smart_home_sensor_worker()
             try:
                 while True:
                     try:  # AUDIT-FIX(#4): Keep the hardware loop alive when button polling or button handling raises.
@@ -386,6 +383,8 @@ class TwinrRealtimeHardwareLoop(
                     except Exception as exc:
                         self._handle_error(exc)
             finally:
+                if smart_home_sensor_worker is not None:
+                    smart_home_sensor_worker.stop(timeout_s=max(0.5, safe_poll_timeout + 0.25))
                 housekeeping_stop.set()
                 housekeeping_thread.join(timeout=max(0.5, safe_poll_timeout + 0.25))
                 button_dispatcher.close(timeout_s=max(0.5, safe_poll_timeout + 0.25))
@@ -428,6 +427,31 @@ class TwinrRealtimeHardwareLoop(
         thread = Thread(target=worker, daemon=True, name="twinr-realtime-housekeeping")
         thread.start()
         return stop_event, thread
+
+    def _build_managed_smart_home_adapter(self):
+        return build_smart_home_hub_adapter(Path(self.config.project_root))
+
+    def _handle_smart_home_observation(self, observation: SmartHomeObservation) -> None:
+        self.handle_sensor_observation(observation.facts, observation.event_names)
+
+    def _start_smart_home_sensor_worker(self) -> SmartHomeSensorWorker | None:
+        if not bool(getattr(self.config, "smart_home_background_worker_enabled", True)):
+            return None
+        worker = SmartHomeSensorWorker(
+            adapter_loader=self._build_managed_smart_home_adapter,
+            observation_callback=self._handle_smart_home_observation,
+            idle_sleep_s=float(getattr(self.config, "smart_home_background_idle_sleep_s", 1.0)),
+            retry_delay_s=float(getattr(self.config, "smart_home_background_retry_delay_s", 2.0)),
+            batch_limit=int(getattr(self.config, "smart_home_background_batch_limit", 8)),
+            emit=self.emit,
+            record_event=lambda event_name, detail: self._record_event(
+                event_name,
+                detail,
+                source="smart_home_sensor_worker",
+            ),
+        )
+        worker.start()
+        return worker
 
     def wait_for_print_lane_idle(self, timeout_s: float = 1.0) -> bool:
         return self.print_lane.wait_for_idle(timeout_s=timeout_s)
@@ -1752,19 +1776,16 @@ class TwinrRealtimeHardwareLoop(
         tts_started = time.monotonic()
         try:
             self._play_listen_beep()
-            if cached_audio is not None:
-                self.playback_coordinator.play_wav_bytes(
-                    owner="wakeword_ack",
-                    priority=PlaybackPriority.SPEECH,
-                    wav_bytes=cached_audio,
-                )
-            else:
-                self._ensure_wakeword_ack_prefetch_started()
-                self.playback_coordinator.play_wav_chunks(
-                    owner="wakeword_ack",
-                    priority=PlaybackPriority.SPEECH,
-                    chunks=self.tts_provider.synthesize_stream(prompt),
-                )
+            if cached_audio is None:
+                cached_audio = self._build_wakeword_ack_wav_bytes(prompt)
+                with self._wakeword_ack_cache_lock:
+                    if self._wakeword_ack_wav_bytes is None:
+                        self._wakeword_ack_wav_bytes = cached_audio
+            self.playback_coordinator.play_wav_bytes(
+                owner="wakeword_ack",
+                priority=PlaybackPriority.SPEECH,
+                wav_bytes=cached_audio,
+            )
         finally:
             self.runtime.finish_speaking()  # AUDIT-FIX(#6): Ensure wakeword acknowledgment failures do not strand runtime state in "speaking".
             self._emit_status(force=True)
@@ -1799,7 +1820,7 @@ class TwinrRealtimeHardwareLoop(
 
     def _prime_wakeword_ack_cache(self) -> None:
         try:
-            audio_bytes = self.tts_provider.synthesize("Ja?")
+            audio_bytes = self._build_wakeword_ack_wav_bytes("Ja?")
         except Exception as exc:
             with self._wakeword_ack_cache_lock:
                 self._wakeword_ack_prefetch_started = False  # AUDIT-FIX(#9): Allow retry after transient TTS/network failures instead of disabling the cache for the process lifetime.
@@ -1809,6 +1830,11 @@ class TwinrRealtimeHardwareLoop(
         with self._wakeword_ack_cache_lock:
             self._wakeword_ack_wav_bytes = audio_bytes
             self._wakeword_ack_prefetch_thread = None
+
+    def _build_wakeword_ack_wav_bytes(self, prompt: str) -> bytes:
+        """Return one locally normalized wakeword-ack payload for Pi playback."""
+
+        return normalize_wav_playback_level(self.tts_provider.synthesize(prompt))
 
     def _listening_window_speech_start_chunks(self, *, initial_source: str, follow_up: bool) -> int | None:
         if initial_source == "button" and not follow_up:

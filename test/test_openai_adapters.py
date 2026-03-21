@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.config import TwinrConfig
 from twinr.agent.base_agent.contracts import AgentToolResult
 from twinr.providers.openai import (
+    OpenAIConversationClosureDecisionProvider,
     OpenAIFirstWordProvider,
     OpenAIProviderBundle,
     OpenAISupervisorDecisionProvider,
@@ -534,3 +535,52 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
         self.assertIn("location_hint", request["text"]["format"]["schema"]["properties"])
         self.assertIn("date_context", request["text"]["format"]["schema"]["properties"])
         self.assertIn("context_scope", request["text"]["format"]["schema"]["properties"])
+
+
+class OpenAIConversationClosureDecisionProviderTests(unittest.TestCase):
+    def test_decide_uses_structured_json_schema_and_closure_config(self) -> None:
+        backend = FakeToolBackend(
+            TwinrConfig(
+                openai_api_key="test-key",
+                default_model="gpt-5.2",
+                conversation_closure_model="gpt-4o-mini",
+                conversation_closure_max_output_tokens=48,
+            )
+        )
+        backend._client.responses.create_results.append(
+            SimpleNamespace(
+                id="resp_closure_1",
+                _request_id="req_closure_1",
+                model="gpt-4o-mini",
+                output_text='{"close_now":false,"confidence":0.84,"reason":"still_engaged","matched_topics":["AI companions"]}',
+                output=[],
+                usage=None,
+            )
+        )
+        provider = OpenAIConversationClosureDecisionProvider(
+            backend,
+            model_override="gpt-4o-mini",
+            base_instructions_override="Closure controller instructions",
+            replace_base_instructions=True,
+        )
+
+        decision = provider.decide(
+            "closure prompt",
+            conversation=(("assistant", "Voriger Turn"),),
+            instructions="Runtime closure extra",
+            timeout_seconds=7.5,
+        )
+
+        request = backend._client.responses.create_requests[0]
+        self.assertFalse(decision.close_now)
+        self.assertAlmostEqual(decision.confidence, 0.84)
+        self.assertEqual(decision.reason, "still_engaged")
+        self.assertEqual(decision.matched_topics, ("AI companions",))
+        self.assertEqual(request["model"], "gpt-4o-mini")
+        self.assertEqual(request["max_output_tokens"], 48)
+        self.assertEqual(request["timeout"], 7.5)
+        self.assertIn("Closure controller instructions", request["instructions"])
+        self.assertIn("Runtime closure extra", request["instructions"])
+        self.assertEqual(request["prompt_cache_key"], "twinr:conversation_closure:gpt-4o-mini:de")
+        self.assertEqual(request["text"]["format"]["type"], "json_schema")
+        self.assertEqual(request["text"]["format"]["name"], "twinr_conversation_closure_decision")

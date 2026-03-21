@@ -51,6 +51,11 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("Repeated enroll_portrait_identity calls", instructions)
         self.assertIn("configure_world_intelligence tool", instructions)
         self.assertIn("occasional recalibration", instructions)
+        self.assertIn("list_smart_home_entities", instructions)
+        self.assertIn("control_smart_home_entities", instructions)
+        self.assertIn("broad smart-home or house-status question", instructions)
+        self.assertIn("state_filters", instructions)
+        self.assertIn("aggregate_by", instructions)
 
     def test_compact_tool_instructions_cover_portrait_identity_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -61,6 +66,8 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("Use enroll_portrait_identity", instructions)
         self.assertIn("Prefer manage_household_identity", instructions)
         self.assertIn("guidance_hints and recommended_next_step", instructions)
+        self.assertIn("read_smart_home_sensor_stream", instructions)
+        self.assertIn("grouped smart-home counts", instructions)
 
     def test_supervisor_instructions_do_not_embed_full_business_tool_rules(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

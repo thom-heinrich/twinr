@@ -1,6 +1,7 @@
 from array import array
 from dataclasses import replace
 from datetime import datetime, timedelta
+import io
 import json
 from pathlib import Path
 from threading import Event
@@ -12,6 +13,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+import wave
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -37,6 +39,7 @@ from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, Lon
 from twinr.memory.reminders import now_in_timezone
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority, WakewordMatch
 from twinr.proactive.runtime.audio_policy import ReSpeakerAudioPolicySnapshot
+from twinr.proactive.runtime.runtime_contract import ReSpeakerRuntimeContractError
 from twinr.providers.openai import OpenAITextResponse
 from twinr.providers.openai.realtime import OpenAIRealtimeTurn
 from twinr.realtime_runner import TwinrRealtimeHardwareLoop
@@ -63,6 +66,7 @@ from twinr.hardware.audio import (
     ListenTimeoutCaptureDiagnostics,
     SpeechCaptureResult,
     SpeechStartTimeoutError,
+    normalize_wav_playback_level,
 )
 from twinr.agent.workflows.button_dispatch import ButtonPressDispatcher
 
@@ -81,6 +85,16 @@ def _voice_sample_pcm_bytes(*, frequency_hz: float = 175.0, amplitude: float = 0
         )
         frames.append(max(-32767, min(32767, int(sample * 32767))))
     return frames.tobytes()
+
+
+def _pcm_to_test_wav_bytes(pcm_bytes: bytes, *, sample_rate: int = 24000, channels: int = 1) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(channels)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(pcm_bytes)
+    return buffer.getvalue()
 
 
 def _longterm_source(event_id: str) -> LongTermSourceRefV1:
@@ -177,6 +191,7 @@ class FakePrintBackend:
         self.search_sleep_s = 0.0
         self.synthesize_sleep_s = 0.0
         self.synthesize_calls: list[str] = []
+        self.synthesize_result = b"WAVPCM"
         self.reminder_calls: list[object] = []
         self.generic_reminder_calls: list[tuple[str, str | None, bool | None]] = []
         self.automation_calls: list[tuple[str, bool, str]] = []
@@ -244,7 +259,7 @@ class FakePrintBackend:
         self.synthesize_calls.append(text)
         if self.synthesize_sleep_s > 0:
             time.sleep(self.synthesize_sleep_s)
-        return b"WAVPCM"
+        return self.synthesize_result
 
     def phrase_due_reminder_with_metadata(self, reminder):
         self.reminder_calls.append(reminder)
@@ -1588,7 +1603,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(recorder.ignore_initial_ms, [loop.config.audio_follow_up_ignore_ms])
         self.assertEqual(recorder.pause_grace_values, [loop.config.adaptive_timing_pause_grace_ms])
         self.assertGreaterEqual(len(player.tones), 1)
-        self.assertEqual(player.played, [b"PCM", b"PCM"])
+        self.assertEqual(player.played, [b"WAVPCM", b"PCM"])
         self.assertIn("wakeword_mode=listen", lines)
         self.assertIn("wakeword_ack=Ja?", lines)
 
@@ -1604,6 +1619,17 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(player.played, [b"WAVPCM"])
         self.assertIn("wakeword_ack=Ja?", lines)
         self.assertIn("wakeword_ack_cached=true", lines)
+
+    def test_wakeword_ack_normalizes_quiet_valid_wav(self) -> None:
+        loop, _lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
+            config=TwinrConfig(wakeword_enabled=True)
+        )
+        quiet_wav = _pcm_to_test_wav_bytes((b"\x10\x00" + b"\xf0\xff") * 800)
+        print_backend.synthesize_result = quiet_wav
+
+        loop._acknowledge_wakeword()
+
+        self.assertEqual(player.played, [normalize_wav_playback_level(quiet_wav)])
 
     def test_yellow_button_uses_print_backend(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop()
@@ -4387,7 +4413,6 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("required_remote_correlation_id=ltw-test123", lines)
 
     def test_run_recovers_after_required_remote_dependency_returns(self) -> None:
-        button_monitor = FakeIdleButtonMonitor()
         loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
             config=TwinrConfig(
                 long_term_memory_enabled=True,
@@ -4395,7 +4420,6 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 long_term_memory_remote_required=True,
                 long_term_memory_remote_keepalive_interval_s=0.01,
             ),
-            button_monitor=button_monitor,
         )
 
         ready_after = time.monotonic() + 0.02
@@ -4418,10 +4442,15 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
                 return LongTermRemoteStatus(mode="remote_primary", ready=True)
 
         loop.runtime.long_term_memory = _RecoveringRequiredRemote()
+        loop.runtime.reset_error()
+        loop._enter_required_remote_error(LongTermRemoteUnavailableError("remote unavailable"))
 
-        result = loop.run(duration_s=0.25, poll_timeout=0.001)
+        while time.monotonic() < ready_after:
+            self.assertFalse(loop._refresh_required_remote_dependency(force=True, force_sync=True))
+            time.sleep(0.005)
+        refreshed = loop._refresh_required_remote_dependency(force=True, force_sync=True)
 
-        self.assertEqual(result, 0)
+        self.assertTrue(refreshed)
         self.assertIn("status=error", lines)
         self.assertIn("status=waiting", lines)
         self.assertIn("required_remote_dependency_restored=true", lines)
@@ -4461,6 +4490,76 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(loop.runtime.status.value, "error")
         self.assertIn("status=error", lines)
         self.assertNotIn("required_remote_dependency_restored=true", lines)
+
+    def test_handle_error_keeps_runtime_in_error_for_respeaker_runtime_contract_blockers(self) -> None:
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=TwinrConfig(
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_keepalive_interval_s=0.01,
+            ),
+        )
+        loop.error_reset_seconds = 0.01
+        loop._required_remote_dependency_error_active = True
+
+        class _ReadyRequiredRemote:
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                return None
+
+            def remote_status(self):
+                return LongTermRemoteStatus(mode="remote_primary", ready=True)
+
+        loop.runtime.long_term_memory = _ReadyRequiredRemote()
+
+        loop._handle_error(
+            ReSpeakerRuntimeContractError(
+                "ReSpeaker XVF3800 is not visible to the Pi, so Twinr refuses to start proactive audio."
+            )
+        )
+        refreshed = loop._refresh_required_remote_dependency(force=True, force_sync=True)
+
+        self.assertTrue(refreshed)
+        self.assertEqual(loop.runtime.status.value, "error")
+        self.assertIn("status=error", lines)
+        self.assertNotIn("status=waiting", lines)
+        self.assertNotIn("required_remote_dependency_restored=true", lines)
+        self.assertTrue(any(line.startswith("error=") for line in lines))
+
+    def test_required_remote_restore_does_not_clear_foreign_runtime_error(self) -> None:
+        loop, lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            config=TwinrConfig(
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=True,
+                long_term_memory_remote_keepalive_interval_s=0.01,
+            ),
+        )
+
+        class _ReadyRequiredRemote:
+            def remote_required(self):
+                return True
+
+            def ensure_remote_ready(self):
+                return None
+
+            def remote_status(self):
+                return LongTermRemoteStatus(mode="remote_primary", ready=True)
+
+        loop.runtime.long_term_memory = _ReadyRequiredRemote()
+        loop.runtime.fail("ReSpeaker XVF3800 is not visible to the Pi.")
+        loop._required_remote_dependency_error_active = True
+        loop._required_remote_dependency_error_message = "Required remote long-term memory is unavailable."
+
+        refreshed = loop._refresh_required_remote_dependency(force=True, force_sync=True)
+
+        self.assertTrue(refreshed)
+        self.assertEqual(loop.runtime.status.value, "error")
+        self.assertNotIn("required_remote_dependency_restored=true", lines)
+        self.assertNotIn("status=waiting", lines)
 
     def test_run_polls_buttons_while_required_remote_watch_blocks(self) -> None:
         button_monitor = FakeScheduledButtonMonitor(event_after_s=0.02, name="yellow")

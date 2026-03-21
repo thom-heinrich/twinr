@@ -110,6 +110,17 @@ class SmartHomeCommand(StrEnum):
     ACTIVATE = "activate"
 
 
+class SmartHomeEntityAggregateField(StrEnum):
+    """Describe one entity field that generic queries may aggregate by."""
+
+    ENTITY_CLASS = "entity_class"
+    AREA = "area"
+    PROVIDER = "provider"
+    ONLINE = "online"
+    CONTROLLABLE = "controllable"
+    READABLE = "readable"
+
+
 class SmartHomeEventKind(StrEnum):
     """Describe one normalized smart-home stream event kind."""
 
@@ -121,6 +132,15 @@ class SmartHomeEventKind(StrEnum):
     ALARM_TRIGGERED = "alarm_triggered"
     ALARM_CLEARED = "alarm_cleared"
     STATE_CHANGED = "state_changed"
+
+
+class SmartHomeEventAggregateField(StrEnum):
+    """Describe one event field that generic queries may aggregate by."""
+
+    EVENT_KIND = "event_kind"
+    AREA = "area"
+    PROVIDER = "provider"
+    ENTITY_ID = "entity_id"
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,8 +271,10 @@ class SmartHomeEventBatch:
 __all__ = [
     "SmartHomeCommand",
     "SmartHomeEntity",
+    "SmartHomeEntityAggregateField",
     "SmartHomeEntityClass",
     "SmartHomeEvent",
     "SmartHomeEventBatch",
+    "SmartHomeEventAggregateField",
     "SmartHomeEventKind",
 ]

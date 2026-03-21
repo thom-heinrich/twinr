@@ -18,6 +18,7 @@ from .config import MediaPipeVisionConfig
 from .fine_hand_gestures import (
     BUILTIN_FINE_GESTURE_MAP,
     CUSTOM_FINE_GESTURE_MAP,
+    combine_builtin_and_custom_gesture_choice,
     prefer_gesture_choice,
     resolve_fine_hand_gesture,
 )
@@ -82,6 +83,14 @@ def _sanitize_gesture_choice(
     if not isinstance(gesture, AICameraFineHandGesture):
         gesture = AICameraFineHandGesture.NONE  # AUDIT-FIX(#7): Guard against malformed resolver output.
     return gesture, _coerce_confidence(confidence)
+
+
+def _is_concrete_fine_gesture_choice(
+    choice: tuple[AICameraFineHandGesture, float | None],
+) -> bool:
+    """Return whether one gesture choice carries a real user-facing symbol."""
+
+    return choice[0] not in {AICameraFineHandGesture.NONE, AICameraFineHandGesture.UNKNOWN}
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,15 +286,15 @@ class MediaPipeVisionPipeline:
         timestamp_ms: int,
         hand_landmark_result: HandLandmarkResult | None,
     ) -> tuple[AICameraFineHandGesture, float | None]:
-        """Recognize one fine hand gesture from a stable full-frame video stream.
+        """Recognize one fine hand gesture with ROI-first plus full-frame fallback.
 
-        MediaPipe's video-mode gesture tracking expects a temporally stable image
-        stream. Feeding alternating wrist crops and full frames into the same
-        recognizer breaks that assumption, increases latency, and makes live
-        tracking jittery because the internal hand tracker keeps seeing a new
-        coordinate system. Twinr already has a separate bounded hand-landmark
-        worker for ROI-derived context, so the gesture recognizer itself stays
-        on the full frame and uses its own tracker.
+        On the Pi, hand landmarks already localize bounded wrist crops for the
+        common interaction case where a user presents a hand near the device.
+        Running full-frame gesture recognition before those ROI crops forces the
+        hot path to pay for both detectors on every frame, which visibly raises
+        live gesture latency. Prefer ROI recognizers first when concrete hand
+        detections exist, then fall back to the stable full-frame tracker only
+        when the ROI path did not yield a real symbol.
         """
 
         best_builtin = (AICameraFineHandGesture.NONE, None)
@@ -294,6 +303,20 @@ class MediaPipeVisionPipeline:
             start_timestamp_ms=timestamp_ms,
             slots=1,
         )  # AUDIT-FIX(#2): Reserve exactly one timestamp slot for the stable full-frame gesture pass.
+
+        if hand_landmark_result is not None and hand_landmark_result.detections:
+            try:
+                roi_builtin, roi_custom = self._recognize_fine_gesture_from_hand_rois(
+                    runtime=runtime,
+                    hand_landmark_result=hand_landmark_result,
+                )
+                roi_choice = combine_builtin_and_custom_gesture_choice(roi_builtin, roi_custom)
+                if _is_concrete_fine_gesture_choice(roi_choice):
+                    return roi_choice
+                best_builtin = prefer_gesture_choice(best_builtin, roi_builtin)
+                best_custom = prefer_gesture_choice(best_custom, roi_custom)
+            except Exception:
+                logger.exception("ROI fine gesture fallback failed")
 
         gesture_recognizer: Any | None = None
         try:
@@ -346,9 +369,55 @@ class MediaPipeVisionPipeline:
             except Exception:
                 logger.exception("Custom fine gesture inference failed for full-frame candidate")
 
-        if best_custom[0] != AICameraFineHandGesture.NONE:
-            return best_custom
-        return best_builtin
+        return combine_builtin_and_custom_gesture_choice(best_builtin, best_custom)
+
+    def _recognize_fine_gesture_from_hand_rois(
+        self,
+        *,
+        runtime: dict[str, Any],
+        hand_landmark_result: HandLandmarkResult,
+    ) -> tuple[
+        tuple[AICameraFineHandGesture, float | None],
+        tuple[AICameraFineHandGesture, float | None],
+    ]:
+        """Run bounded image-mode gesture recognition on ROI crops from hand landmarks."""
+
+        if not hand_landmark_result.detections:
+            return (AICameraFineHandGesture.NONE, None), (AICameraFineHandGesture.NONE, None)
+
+        builtin_choice = (AICameraFineHandGesture.NONE, None)
+        custom_choice = (AICameraFineHandGesture.NONE, None)
+        builtin_recognizer = self._ensure_roi_gesture_recognizer(runtime)
+        custom_recognizer: Any | None = None
+        if self.config.custom_gesture_model_path:
+            custom_recognizer = self._ensure_custom_roi_gesture_recognizer(runtime)
+
+        for detection in hand_landmark_result.detections:
+            roi_frame = getattr(detection, "roi_frame_rgb", None)
+            if roi_frame is None:
+                continue
+            roi_image = self._build_image(runtime, frame_rgb=roi_frame)
+            roi_builtin = resolve_fine_hand_gesture(
+                result=builtin_recognizer.recognize(roi_image),
+                category_map=BUILTIN_FINE_GESTURE_MAP,
+                min_score=self.config.builtin_gesture_min_score,
+            )
+            builtin_choice = prefer_gesture_choice(
+                builtin_choice,
+                _sanitize_gesture_choice(roi_builtin),
+            )
+            if custom_recognizer is None:
+                continue
+            roi_custom = resolve_fine_hand_gesture(
+                result=custom_recognizer.recognize(roi_image),
+                category_map=CUSTOM_FINE_GESTURE_MAP,
+                min_score=self.config.custom_gesture_min_score,
+            )
+            custom_choice = prefer_gesture_choice(
+                custom_choice,
+                _sanitize_gesture_choice(roi_custom),
+            )
+        return builtin_choice, custom_choice
 
     def _analyze_hand_landmarks(
         self,
@@ -457,6 +526,16 @@ class MediaPipeVisionPipeline:
                 runtime,
             )  # AUDIT-FIX(#4): Cache the created task instance for stable lifecycle ownership.
         return self._custom_gesture_recognizer
+
+    def _ensure_roi_gesture_recognizer(self, runtime: dict[str, Any]) -> Any:
+        """Preserve the historic ROI gesture-recognizer override point for tests."""
+
+        return self._runtime.ensure_roi_gesture_recognizer(runtime)
+
+    def _ensure_custom_roi_gesture_recognizer(self, runtime: dict[str, Any]) -> Any:
+        """Preserve the historic ROI custom-gesture override point for tests."""
+
+        return self._runtime.ensure_custom_roi_gesture_recognizer(runtime)
 
 
 def extract_sparse_keypoints(result: Any) -> tuple[dict[int, tuple[float, float, float]], float | None]:

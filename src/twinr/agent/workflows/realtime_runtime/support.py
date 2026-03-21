@@ -15,7 +15,11 @@ from threading import Event, RLock, Thread, current_thread
 from typing import Callable
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.conversation.closure import ToolCallingConversationClosureEvaluator
+from twinr.agent.base_agent.conversation.closure import (
+    ConversationClosureEvaluator,
+    StructuredConversationClosureEvaluator,
+    ToolCallingConversationClosureEvaluator,
+)
 from twinr.agent.base_agent.conversation.turn_controller import ToolCallingTurnDecisionEvaluator
 from twinr.hardware.household_identity import HouseholdIdentityManager
 from twinr.memory.longterm.storage.remote_read_diagnostics import extract_remote_write_context
@@ -27,7 +31,12 @@ from twinr.agent.workflows.required_remote_snapshot import (
     ensure_required_remote_watchdog_snapshot_ready,
 )
 from twinr.agent.workflows.working_feedback import WorkingFeedbackKind, start_working_feedback_loop
-from twinr.providers.openai import OpenAIImageInput
+from twinr.proactive.runtime.runtime_contract import ReSpeakerRuntimeContractError
+from twinr.providers.openai import (
+    OpenAIConversationClosureDecisionProvider,
+    OpenAIImageInput,
+    OpenAIToolCallingAgentProvider,
+)
 
 _SEARCH_FEEDBACK_TONE_PATTERN: tuple[tuple[int, int], ...] = (
     (784, 90),
@@ -322,6 +331,7 @@ class TwinrRealtimeSupportMixin:
             time.monotonic() + self._required_remote_dependency_interval_seconds()
         )
         self._required_remote_dependency_error_active = True
+        self._required_remote_dependency_error_message = message
         if active and getattr(getattr(self.runtime, "status", None), "value", None) == "error":
             return True
         request_interrupt = getattr(self, "_request_active_turn_interrupt", None)
@@ -373,6 +383,7 @@ class TwinrRealtimeSupportMixin:
         with self._get_lock("_required_remote_dependency_lock"):
             if not self._remote_dependency_is_required():
                 self._required_remote_dependency_error_active = False
+                self._required_remote_dependency_error_message = None
                 self._required_remote_dependency_cached_ready = True
                 self._required_remote_dependency_recovery_started_at = None
                 self._required_remote_dependency_next_check_at = 0.0
@@ -466,11 +477,16 @@ class TwinrRealtimeSupportMixin:
                 self._enter_required_remote_error(exc)
                 return False
 
+            runtime_status_value = getattr(getattr(self.runtime, "status", None), "value", None)
+            remote_error_owns_runtime = (
+                getattr(self, "_required_remote_dependency_error_active", False)
+                and runtime_status_value == "error"
+                and self._current_runtime_error_matches_required_remote()
+            )
             recovery_hold_s = self._required_remote_dependency_recovery_hold_seconds()
             if (
                 recovery_hold_s > 0.0
-                and getattr(self, "_required_remote_dependency_error_active", False)
-                and getattr(getattr(self.runtime, "status", None), "value", None) == "error"
+                and remote_error_owns_runtime
             ):
                 recovery_started_at = getattr(self, "_required_remote_dependency_recovery_started_at", None)
                 if recovery_started_at is None:
@@ -497,6 +513,18 @@ class TwinrRealtimeSupportMixin:
             self._required_remote_dependency_cached_ready = True
             self._required_remote_dependency_recovery_started_at = None
             self._required_remote_dependency_next_check_at = now + self._required_remote_dependency_interval_seconds()
+            if (
+                getattr(self, "_required_remote_dependency_error_active", False)
+                and runtime_status_value == "error"
+                and not remote_error_owns_runtime
+            ):
+                self._required_remote_dependency_error_active = False
+                self._required_remote_dependency_error_message = None
+                self._trace_event(
+                    "required_remote_restore_skipped_for_foreign_error",
+                    kind="invariant",
+                    details={"runtime_status": runtime_status_value},
+                )
             self._trace_event(
                 "required_remote_refresh_succeeded",
                 kind="invariant",
@@ -504,8 +532,7 @@ class TwinrRealtimeSupportMixin:
                 kpi={"duration_ms": round((time.monotonic() - started) * 1000.0, 3)},
             )
             if (
-                getattr(self, "_required_remote_dependency_error_active", False)
-                and getattr(getattr(self.runtime, "status", None), "value", None) == "error"
+                remote_error_owns_runtime
             ):
                 self.runtime.reset_error()
                 self._emit_status(force=True)
@@ -516,6 +543,7 @@ class TwinrRealtimeSupportMixin:
                     details={"runtime_status": getattr(getattr(self.runtime, "status", None), "value", "unknown")},
                 )
             self._required_remote_dependency_error_active = False
+            self._required_remote_dependency_error_message = None
             return True
 
     # AUDIT-FIX(#4): Error reporting must not throw while handling another failure.
@@ -646,10 +674,19 @@ class TwinrRealtimeSupportMixin:
             provider=turn_tool_agent_provider,
         )
 
-    def _build_conversation_closure_evaluator(self, config: TwinrConfig) -> ToolCallingConversationClosureEvaluator | None:
+    def _build_conversation_closure_evaluator(self, config: TwinrConfig) -> ConversationClosureEvaluator | None:
         turn_tool_agent_provider = getattr(self, "turn_tool_agent_provider", None)
         if turn_tool_agent_provider is None or not config.conversation_closure_guard_enabled:
             return None
+        if isinstance(turn_tool_agent_provider, OpenAIToolCallingAgentProvider):
+            return StructuredConversationClosureEvaluator(
+                config=config,
+                provider=OpenAIConversationClosureDecisionProvider(
+                    turn_tool_agent_provider.backend,
+                    model_override=config.conversation_closure_model,
+                    reasoning_effort_override=config.conversation_closure_reasoning_effort,
+                ),
+            )
         return ToolCallingConversationClosureEvaluator(
             config=config,
             provider=turn_tool_agent_provider,
@@ -659,6 +696,18 @@ class TwinrRealtimeSupportMixin:
         if isinstance(exc, LongTermRemoteUnavailableError) and self._enter_required_remote_error(exc):
             return
         safe_error = self._safe_error_text(exc)  # AUDIT-FIX(#4): Never emit unsanitized exception text.
+        if getattr(self, "_required_remote_dependency_error_active", False):
+            # A new non-remote blocker must not inherit stale remote-recovery state,
+            # otherwise the next healthy remote probe can incorrectly reset an
+            # unrelated runtime error back to waiting.
+            self._required_remote_dependency_error_active = False
+            self._required_remote_dependency_error_message = None
+            self._required_remote_dependency_recovery_started_at = None
+            self._trace_event(
+                "required_remote_error_cleared_for_non_remote_failure",
+                kind="invariant",
+                details={"error_type": type(exc).__name__},
+            )
         self._trace_event(
             "workflow_error_handler_entered",
             kind="exception",
@@ -671,6 +720,17 @@ class TwinrRealtimeSupportMixin:
             _default_emit(f"runtime_fail_error={self._safe_error_text(runtime_exc)}")
         self._emit_status(force=True)
         self._try_emit(f"error={safe_error}")  # AUDIT-FIX(#4): Emission is best-effort only.
+        if isinstance(exc, ReSpeakerRuntimeContractError):
+            self._trace_event(
+                "workflow_error_handler_hold",
+                kind="exception",
+                details={
+                    "error": safe_error,
+                    "error_type": type(exc).__name__,
+                    "reason": "sticky_runtime_contract_blocker",
+                },
+            )
+            return
         sleep_seconds = max(0.0, float(getattr(self, "error_reset_seconds", 0.0) or 0.0))
         if sleep_seconds > 0:
             try:
@@ -687,6 +747,29 @@ class TwinrRealtimeSupportMixin:
             kind="exception",
             details={"error": safe_error},
         )
+
+    def _current_runtime_error_matches_required_remote(self) -> bool:
+        expected = str(getattr(self, "_required_remote_dependency_error_message", "") or "").strip()
+        if not expected:
+            return False
+        snapshot_store = getattr(getattr(self, "runtime", None), "snapshot_store", None)
+        load = getattr(snapshot_store, "load", None)
+        if not callable(load):
+            return False
+        try:
+            snapshot = load()
+        except Exception as exc:
+            self._trace_event(
+                "required_remote_error_match_read_failed",
+                kind="error",
+                level="ERROR",
+                details={"error_type": type(exc).__name__, "error": self._safe_error_text(exc)},
+            )
+            return False
+        if snapshot is None:
+            return False
+        current_error = " ".join(str(getattr(snapshot, "error_message", "") or "").split()).strip()
+        return current_error == expected
 
     def _emit_status(self, *, force: bool = False) -> None:
         status = getattr(getattr(self.runtime, "status", None), "value", "unknown")  # AUDIT-FIX(#9): Guard the first emit when _last_status is unset or runtime is partially initialised.

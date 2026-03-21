@@ -61,6 +61,7 @@ from twinr.memory.longterm.retrieval.adaptive_policy import LongTermAdaptivePoli
 from twinr.memory.longterm.retrieval.restart_recall_policy import LongTermRestartRecallPolicyCompiler
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
 from twinr.memory.longterm.reasoning.retention import LongTermRetentionPolicy
+from twinr.memory.longterm.reasoning.turn_continuity import LongTermTurnContinuityCompiler
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, LongTermRemoteUnavailableError
 from twinr.memory.longterm.ingestion.sensor_memory import LongTermSensorMemoryCompiler
 from twinr.memory.longterm.storage.store import LongTermStructuredStore
@@ -370,6 +371,7 @@ class LongTermMemoryService:
     planner: LongTermProactivePlanner
     proactive_policy: LongTermProactivePolicy
     retention_policy: LongTermRetentionPolicy
+    turn_continuity_compiler: LongTermTurnContinuityCompiler = field(default_factory=LongTermTurnContinuityCompiler)
     restart_recall_policy_compiler: LongTermRestartRecallPolicyCompiler | None = None
     personality_learning: PersonalityLearningService | None = None
     writer: AsyncLongTermMemoryWriter | None = None
@@ -408,6 +410,7 @@ class LongTermMemoryService:
         consolidator = LongTermMemoryConsolidator(truth_maintainer=truth_maintainer)
         conflict_resolver = LongTermConflictResolver()
         reflector = LongTermMemoryReflector.from_config(config)
+        turn_continuity_compiler = LongTermTurnContinuityCompiler()
         sensor_memory = LongTermSensorMemoryCompiler.from_config(config)
         ops_backfiller = LongTermOpsEventBackfiller()
         planner = LongTermProactivePlanner(timezone_name=config.local_timezone_name)
@@ -465,6 +468,7 @@ class LongTermMemoryService:
                     extractor=extractor,
                     consolidator=consolidator,
                     reflector=reflector,
+                    turn_continuity_compiler=turn_continuity_compiler,
                     sensor_memory=sensor_memory,
                     retention_policy=retention_policy,
                     personality_learning=personality_learning,
@@ -503,6 +507,7 @@ class LongTermMemoryService:
             consolidator=consolidator,
             conflict_resolver=conflict_resolver,
             reflector=reflector,
+            turn_continuity_compiler=turn_continuity_compiler,
             sensor_memory=sensor_memory,
             ops_backfiller=ops_backfiller,
             planner=planner,
@@ -924,6 +929,7 @@ class LongTermMemoryService:
                 extractor=self.extractor,
                 consolidator=self.consolidator,
                 reflector=self.reflector,
+                turn_continuity_compiler=self.turn_continuity_compiler,
                 sensor_memory=self.sensor_memory,
                 retention_policy=self.retention_policy,
                 personality_learning=self.personality_learning,
@@ -1696,6 +1702,7 @@ class LongTermMemoryService:
         extractor: LongTermTurnExtractor,
         consolidator: LongTermMemoryConsolidator,
         reflector: LongTermMemoryReflector,
+        turn_continuity_compiler: LongTermTurnContinuityCompiler | None = None,
         sensor_memory: LongTermSensorMemoryCompiler,
         retention_policy: LongTermRetentionPolicy,
         personality_learning: PersonalityLearningService | None = None,
@@ -1717,12 +1724,20 @@ class LongTermMemoryService:
 
         effective_store_lock = store_lock or threading.RLock()
         effective_timezone_name = timezone_name or config.local_timezone_name
+        effective_turn_continuity_compiler = turn_continuity_compiler or LongTermTurnContinuityCompiler()
         occurred_at = _normalize_datetime(item.created_at, timezone_name=effective_timezone_name) or item.created_at
         reflection = LongTermMemoryService._empty_reflection_result()
         sensor_reflection = LongTermMemoryService._empty_reflection_result()
 
         try:
             with effective_store_lock:
+                continuity_packet = effective_turn_continuity_compiler.compile_packet(turn=item)
+                if continuity_packet is not None:
+                    midterm_store.save_packets_preserving_attribute(
+                        packets=(continuity_packet,),
+                        attribute_key="persistence_scope",
+                        attribute_value="restart_recall",
+                    )
                 existing_objects = tuple(object_store.load_objects())
                 existing_conflicts = tuple(object_store.load_conflicts())
                 existing_archived = tuple(object_store.load_archived_objects())
@@ -1779,16 +1794,20 @@ class LongTermMemoryService:
                 except Exception:
                     logger.exception("Graph-store update failed after conversation-turn snapshot commit.")
                 try:
-                    if LongTermMemoryService._has_reflection_payload(reflection):
+                    if reflection.midterm_packets:
                         midterm_store.apply_reflection(reflection)
-                    if LongTermMemoryService._has_reflection_payload(sensor_reflection):
+                    if sensor_reflection.midterm_packets:
                         midterm_store.apply_reflection(sensor_reflection)
                 except Exception:
                     logger.exception("Midterm-store update failed after conversation-turn snapshot commit.")
                 if personality_learning is not None:
+                    learning_consolidation = LongTermMemoryService._merge_reflection_into_consolidation(
+                        result=result,
+                        reflection_batches=(reflection, sensor_reflection),
+                    )
                     personality_learning.record_conversation_consolidation(
                         turn=item,
-                        consolidation=result,
+                        consolidation=learning_consolidation,
                     )
                 if config.long_term_memory_mode == "remote_primary":
                     return None
@@ -1979,6 +1998,35 @@ class LongTermMemoryService:
         """Report whether a reflection payload contains any state updates."""
 
         return bool(result.reflected_objects or result.created_summaries or result.midterm_packets)
+
+    @staticmethod
+    def _merge_reflection_into_consolidation(
+        *,
+        result: LongTermConsolidationResultV1,
+        reflection_batches: Iterable[LongTermReflectionResultV1],
+    ) -> LongTermConsolidationResultV1:
+        """Return one consolidation view enriched with reflection-side object updates."""
+
+        durable_by_id = {item.memory_id: item for item in result.durable_objects}
+        deferred_by_id = {item.memory_id: item for item in result.deferred_objects}
+        for reflection in reflection_batches:
+            for item in reflection.reflected_objects:
+                if item.memory_id in deferred_by_id:
+                    deferred_by_id[item.memory_id] = item
+                else:
+                    durable_by_id[item.memory_id] = item
+            for item in reflection.created_summaries:
+                deferred_by_id.pop(item.memory_id, None)
+                durable_by_id[item.memory_id] = item
+        return LongTermConsolidationResultV1(
+            turn_id=result.turn_id,
+            occurred_at=result.occurred_at,
+            episodic_objects=result.episodic_objects,
+            durable_objects=_sort_objects_by_memory_id(durable_by_id.values()),
+            deferred_objects=_sort_objects_by_memory_id(deferred_by_id.values()),
+            conflicts=result.conflicts,
+            graph_edges=result.graph_edges,
+        )
 
     @staticmethod
     def _should_include_midterm_in_multimodal_reflection(result: LongTermConsolidationResultV1) -> bool:

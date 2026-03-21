@@ -24,6 +24,9 @@ BUILTIN_FINE_GESTURE_MAP: Final[dict[str, AICameraFineHandGesture]] = {
     "thumbs_down": AICameraFineHandGesture.THUMBS_DOWN,
     "pointing_up": AICameraFineHandGesture.POINTING,
     "pointing": AICameraFineHandGesture.POINTING,
+    "victory": AICameraFineHandGesture.PEACE_SIGN,
+    "peace": AICameraFineHandGesture.PEACE_SIGN,
+    "peace_sign": AICameraFineHandGesture.PEACE_SIGN,
     "open_palm": AICameraFineHandGesture.OPEN_PALM,
 }
 
@@ -34,6 +37,21 @@ CUSTOM_FINE_GESTURE_MAP: Final[dict[str, AICameraFineHandGesture]] = {
     "middle_finger": AICameraFineHandGesture.MIDDLE_FINGER,
     "flip_off": AICameraFineHandGesture.MIDDLE_FINGER,
 }
+
+_CUSTOM_ONLY_FINE_GESTURES: Final[frozenset[AICameraFineHandGesture]] = frozenset(
+    {
+        AICameraFineHandGesture.OK_SIGN,
+        AICameraFineHandGesture.MIDDLE_FINGER,
+    }
+)
+_BUILTIN_PRIORITY_FINE_GESTURES: Final[frozenset[AICameraFineHandGesture]] = frozenset(
+    {
+        AICameraFineHandGesture.THUMBS_UP,
+        AICameraFineHandGesture.THUMBS_DOWN,
+        AICameraFineHandGesture.POINTING,
+        AICameraFineHandGesture.PEACE_SIGN,
+    }
+)
 
 _NEGATIVE_FINE_GESTURE_LABELS: Final[frozenset[str]] = frozenset(
     {
@@ -135,6 +153,45 @@ def prefer_gesture_choice(
     return first
 
 
+def combine_builtin_and_custom_gesture_choice(
+    builtin: tuple[AICameraFineHandGesture, float | None],
+    custom: tuple[AICameraFineHandGesture, float | None],
+) -> tuple[AICameraFineHandGesture, float | None]:
+    """Merge built-in and custom gesture choices without letting custom-only labels overrun built-ins.
+
+    Twinr's staged custom model currently only covers labels like ``ok_sign`` and
+    ``middle_finger``. Those should supplement the MediaPipe built-in recognizer,
+    not globally outrank strong built-in labels such as ``victory`` or
+    ``pointing_up``. Prefer built-in labels when both recognizers disagree on a
+    concrete non-generic symbol, but still allow custom-only labels to win over
+    generic ``none`` / ``open_palm`` outputs so OK-sign remains usable.
+    """
+
+    builtin_gesture, builtin_confidence = builtin
+    custom_gesture, custom_confidence = custom
+    builtin_score = _safe_ratio(builtin_confidence, default=0.0)
+    custom_score = _safe_ratio(custom_confidence, default=0.0)
+
+    if custom_gesture == AICameraFineHandGesture.NONE:
+        return builtin
+    if builtin_gesture in {AICameraFineHandGesture.NONE, AICameraFineHandGesture.UNKNOWN}:
+        return custom
+    if custom_gesture == builtin_gesture:
+        if custom_score >= builtin_score:
+            return custom
+        return builtin
+
+    if custom_gesture in _CUSTOM_ONLY_FINE_GESTURES:
+        if builtin_gesture in _BUILTIN_PRIORITY_FINE_GESTURES:
+            return builtin
+        if builtin_gesture == AICameraFineHandGesture.OPEN_PALM:
+            if custom_score >= max(0.72, builtin_score + 0.08):
+                return custom
+            return builtin
+        return custom
+    return builtin
+
+
 def normalize_category_name(value: object) -> str:
     """Normalize one classifier category label to a stable token."""
 
@@ -159,6 +216,7 @@ def normalize_category_name(value: object) -> str:
 __all__ = [
     "BUILTIN_FINE_GESTURE_MAP",
     "CUSTOM_FINE_GESTURE_MAP",
+    "combine_builtin_and_custom_gesture_choice",
     "normalize_category_name",
     "prefer_gesture_choice",
     "resolve_fine_hand_gesture",

@@ -11,6 +11,7 @@ short-window event fusion, delivery governance, and wakeword behavior.
 - expose the `twinr.proactive` compatibility import surface across proactive child packages
 - define the package boundary between `runtime`, `social`, `event_fusion`, `governance`, and `wakeword`
 - direct new work into the correct child package instead of growing the package root
+- keep optional wakeword backend/tooling dependencies from breaking the root import surface when those paths are not selected at runtime
 
 `proactive` does **not** own:
 - proactive monitor orchestration details, ReSpeaker policy-hook derivation, conservative speaker-association/multimodal-initiative fusion, runtime alerts, or structured observation export in [`runtime`](./runtime/README.md)

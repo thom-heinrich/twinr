@@ -102,6 +102,95 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional Markdown output path for --wakeword-training-plan.",
     )
     parser.add_argument(
+        "--wakeword-export-wekws",
+        action="store_true",
+        help="Export labeled Twinr wakeword manifests into WeKws/Kaldi-style split directories.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-output-dir",
+        type=Path,
+        help="Output directory for --wakeword-export-wekws.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-train-manifest",
+        type=Path,
+        help="Required train manifest for --wakeword-export-wekws.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-dev-manifest",
+        type=Path,
+        help="Optional dev manifest for --wakeword-export-wekws.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-test-manifest",
+        type=Path,
+        help="Optional test manifest for --wakeword-export-wekws.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-positive-token",
+        default="TWINR_FAMILY",
+        help="Positive class token for --wakeword-export-wekws; angle brackets are added automatically.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-filler-token",
+        default="FILLER",
+        help="Negative filler token for --wakeword-export-wekws; angle brackets are added automatically.",
+    )
+    parser.add_argument(
+        "--wakeword-prepare-wekws-experiment",
+        action="store_true",
+        help="Prepare a reproducible WeKws training workspace from an exported Twinr WeKws dataset.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-dataset-dir",
+        type=Path,
+        help="Input dataset directory produced by --wakeword-export-wekws.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-experiment-dir",
+        type=Path,
+        help="Output directory for --wakeword-prepare-wekws-experiment.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-recipe",
+        default="mdtc_fbank_stream",
+        help="Built-in WeKws experiment recipe id for --wakeword-prepare-wekws-experiment.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-gpus",
+        default="0",
+        help="Comma-separated GPU ids to embed into the generated WeKws runner script.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-num-workers",
+        type=int,
+        default=8,
+        help="Data-loader worker count to embed into the generated WeKws runner script.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-cmvn-num-workers",
+        type=int,
+        default=16,
+        help="CMVN worker count to embed into the generated WeKws runner script.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-min-duration-frames",
+        type=int,
+        default=50,
+        help="Minimum keyword duration in frames for the generated WeKws training command.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-seed",
+        type=int,
+        default=666,
+        help="Random seed to embed into the generated WeKws training command.",
+    )
+    parser.add_argument(
+        "--wakeword-wekws-base-checkpoint",
+        type=Path,
+        help="Optional upstream WeKws checkpoint to resume or fine-tune from.",
+    )
+    parser.add_argument(
         "--wakeword-kws-provision",
         action="store_true",
         help="Download and prepare one official sherpa-onnx KWS bundle plus Twinr keyword files.",
@@ -751,8 +840,72 @@ def main() -> int:
             print(f"wakeword_training_plan_output={output_path}")
             print(f"wakeword_training_plan_model_name={plan.stage1_model_name}")
             print(f"wakeword_training_plan_phrase_profile={plan.stage1_phrase_profile}")
-        else:
-            print(markdown.rstrip())
+            return 0
+        print(markdown.rstrip())
+        return 0
+
+    if args.wakeword_export_wekws:
+        if args.wakeword_wekws_output_dir is None:
+            raise RuntimeError("--wakeword-wekws-output-dir is required with --wakeword-export-wekws")
+        if args.wakeword_wekws_train_manifest is None:
+            raise RuntimeError("--wakeword-wekws-train-manifest is required with --wakeword-export-wekws")
+        from twinr.proactive.wakeword import export_wakeword_manifests_to_wekws
+
+        report = export_wakeword_manifests_to_wekws(
+            output_dir=args.wakeword_wekws_output_dir,
+            train_manifest=args.wakeword_wekws_train_manifest,
+            dev_manifest=args.wakeword_wekws_dev_manifest,
+            test_manifest=args.wakeword_wekws_test_manifest,
+            positive_token=args.wakeword_wekws_positive_token,
+            filler_token=args.wakeword_wekws_filler_token,
+        )
+        print(f"wakeword_wekws_output_dir={report.output_dir}")
+        print(f"wakeword_wekws_dict={report.dict_path}")
+        print(f"wakeword_wekws_words={report.words_path}")
+        print(f"wakeword_wekws_metadata={report.metadata_path}")
+        for split_report in report.split_reports:
+            prefix = f"wakeword_wekws_{split_report.split_name}"
+            print(f"{prefix}_manifest={split_report.manifest_path}")
+            print(f"{prefix}_output_dir={split_report.output_dir}")
+            print(f"{prefix}_entries={split_report.entry_count}")
+            print(f"{prefix}_positive={split_report.positive_count}")
+            print(f"{prefix}_negative={split_report.negative_count}")
+            print(f"{prefix}_ignored={split_report.ignored_count}")
+        return 0
+
+    if args.wakeword_prepare_wekws_experiment:
+        if args.wakeword_wekws_dataset_dir is None:
+            raise RuntimeError("--wakeword-wekws-dataset-dir is required with --wakeword-prepare-wekws-experiment")
+        if args.wakeword_wekws_experiment_dir is None:
+            raise RuntimeError(
+                "--wakeword-wekws-experiment-dir is required with --wakeword-prepare-wekws-experiment"
+            )
+        from twinr.proactive.wakeword import prepare_wekws_experiment
+
+        report = prepare_wekws_experiment(
+            output_dir=args.wakeword_wekws_experiment_dir,
+            exported_dataset_dir=args.wakeword_wekws_dataset_dir,
+            recipe_id=str(args.wakeword_wekws_recipe or "").strip() or "mdtc_fbank_stream",
+            seed=int(args.wakeword_wekws_seed),
+            gpus=str(args.wakeword_wekws_gpus or "0"),
+            num_workers=int(args.wakeword_wekws_num_workers),
+            cmvn_num_workers=int(args.wakeword_wekws_cmvn_num_workers),
+            min_duration_frames=int(args.wakeword_wekws_min_duration_frames),
+            base_checkpoint=args.wakeword_wekws_base_checkpoint,
+        )
+        print(f"wakeword_wekws_experiment_dir={report.output_dir}")
+        print(f"wakeword_wekws_recipe={report.recipe.recipe_id}")
+        print(f"wakeword_wekws_config={report.config_path}")
+        print(f"wakeword_wekws_dict={report.dict_dir}")
+        print(f"wakeword_wekws_model_dir={report.model_dir}")
+        print(f"wakeword_wekws_script={report.script_path}")
+        print(f"wakeword_wekws_metadata={report.metadata_path}")
+        for split_report in report.split_reports:
+            prefix = f"wakeword_wekws_{split_report.split_name}"
+            print(f"{prefix}_source_dir={split_report.source_dir}")
+            print(f"{prefix}_output_dir={split_report.output_dir}")
+            print(f"{prefix}_entries={split_report.utterance_count}")
+            print(f"{prefix}_data_list={split_report.data_list_path}")
         return 0
 
     if args.wakeword_kws_provision:

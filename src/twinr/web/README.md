@@ -21,7 +21,7 @@ templates and CSS that power the operator dashboard.
 - render the `/connect/whatsapp` wizard that guides one internal WhatsApp self-chat setup through allowlist, runtime, a bounded pairing window, and the final self-chat test
 - persist per-channel onboarding snapshots so web-driven channel setup can show live QR-needed, paired, reconnect, and repair-needed status without moving runtime state into templates
 - compose presenters, support helpers, templates, and static assets into operator pages
-- persist safe web-driven changes for settings, reminders, automations, integrations, personality, and user context
+- persist safe web-driven changes for settings, reminders, automations, integrations, personality, and user context, including Hue-backed smart-home settings on `/integrations`
 
 `web` does **not** own:
 - Twinr runtime, provider, memory, or hardware business logic outside page orchestration

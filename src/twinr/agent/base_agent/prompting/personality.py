@@ -327,14 +327,11 @@ def load_conversation_closure_instructions(config: TwinrConfig) -> str | None:
             instruction sources.
 
     Returns:
-        The merged tool-loop instructions and optional closure override, or
-        ``None`` when both sources are empty.
+        The dedicated closure-controller instruction bundle, or ``None`` when
+        the configured closure instruction file is empty or unavailable.
     """
 
-    return merge_instructions(
-        load_tool_loop_instructions(config),
-        load_named_instruction_file(config, config.conversation_closure_instructions_file),
-    )
+    return load_named_instruction_file(config, config.conversation_closure_instructions_file)
 
 
 def merge_instructions(*parts: str | None) -> str | None:

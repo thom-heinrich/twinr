@@ -12,6 +12,7 @@ from test.longterm_test_program import make_test_extractor
 from twinr.config import TwinrConfig
 from twinr.memory.longterm import (
     LongTermConsolidationResultV1,
+    LongTermEnvironmentProfileCompiler,
     LongTermMemoryObjectV1,
     LongTermMemoryService,
     LongTermSensorMemoryCompiler,
@@ -86,6 +87,98 @@ def _audio_pattern(
             "source_sensor": "respeaker_xvf3800",
             "source_type": "observed",
             "requires_confirmation": True,
+        },
+    )
+
+
+def _smart_home_event_id(occurred_at: datetime, *, node_token: str, suffix: str) -> str:
+    return f"smart_home_env:{occurred_at.strftime('%Y%m%dT%H%M%S%f%z')}:{node_token}:{suffix}"
+
+
+def _smart_home_motion_pattern(
+    *,
+    day: date,
+    node_id: str,
+    event_hours: tuple[int, ...],
+) -> LongTermMemoryObjectV1:
+    node_token = node_id.replace(":", "_").replace("-", "_")
+    event_datetimes = tuple(
+        datetime(day.year, day.month, day.day, hour, 0, tzinfo=timezone.utc)
+        for hour in event_hours
+    )
+    return LongTermMemoryObjectV1(
+        memory_id=f"pattern:smart_home_node_activity:{node_token}:{day.isoformat()}",
+        kind="pattern",
+        summary="Synthetic smart-home motion node activity pattern.",
+        details="Synthetic room-agnostic smart-home motion seed for tests.",
+        source=LongTermSourceRefV1(
+            source_type="smart_home_sensor",
+            event_ids=tuple(
+                _smart_home_event_id(occurred_at, node_token=node_token, suffix=f"{index:02d}")
+                for index, occurred_at in enumerate(event_datetimes)
+            ),
+            modality="sensor",
+        ),
+        status="active",
+        confidence=0.66,
+        sensitivity="low",
+        slot_key=f"pattern:smart_home_node_activity:{node_id}:{day.isoformat()}",
+        value_key="smart_home_motion_node_activity",
+        valid_from=day.isoformat(),
+        valid_to=day.isoformat(),
+        attributes={
+            "memory_domain": "smart_home_environment",
+            "environment_id": "home:main",
+            "environment_signal_type": "motion_node_activity",
+            "node_id": node_id,
+            "provider": "hue",
+            "route_id": "192.168.178.22",
+            "source_entity_id": node_id,
+            "provider_label": node_id,
+            "provider_area_label": "Erdgeschoss",
+        },
+    )
+
+
+def _smart_home_health_pattern(
+    *,
+    day: date,
+    node_id: str,
+    state: str,
+    hour: int,
+) -> LongTermMemoryObjectV1:
+    node_token = node_id.replace(":", "_").replace("-", "_")
+    occurred_at = datetime(day.year, day.month, day.day, hour, 30, tzinfo=timezone.utc)
+    return LongTermMemoryObjectV1(
+        memory_id=f"pattern:smart_home_node_health:{node_token}:{state}:{day.isoformat()}",
+        kind="pattern",
+        summary="Synthetic smart-home node health pattern.",
+        details="Synthetic room-agnostic smart-home health seed for tests.",
+        source=LongTermSourceRefV1(
+            source_type="smart_home_sensor",
+            event_ids=(
+                _smart_home_event_id(occurred_at, node_token=node_token, suffix=state),
+            ),
+            modality="sensor",
+        ),
+        status="active",
+        confidence=0.68,
+        sensitivity="low",
+        slot_key=f"pattern:smart_home_node_health:{node_id}:{day.isoformat()}",
+        value_key="smart_home_node_health",
+        valid_from=day.isoformat(),
+        valid_to=day.isoformat(),
+        attributes={
+            "memory_domain": "smart_home_environment",
+            "environment_id": "home:main",
+            "environment_signal_type": "node_health",
+            "health_state": state,
+            "node_id": node_id,
+            "provider": "hue",
+            "route_id": "192.168.178.22",
+            "source_entity_id": node_id,
+            "provider_label": node_id,
+            "provider_area_label": "Erdgeschoss",
         },
     )
 
@@ -293,6 +386,71 @@ class LongTermSensorMemoryCompilerTests(unittest.TestCase):
         self.assertEqual(attrs["interaction_type"], "resume_follow_up")
         self.assertEqual(attrs["days_with_interaction"], 7)
 
+    def test_environment_profile_compiler_builds_day_profile_baseline_and_activity_drop_deviation(self) -> None:
+        compiler = LongTermEnvironmentProfileCompiler(
+            enabled=True,
+            baseline_days=7,
+            history_days=21,
+            min_baseline_days=4,
+        )
+        reference = datetime(2026, 3, 18, 18, 0, tzinfo=timezone.utc)
+        history = (
+            _smart_home_motion_pattern(day=date(2026, 3, 11), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+            _smart_home_motion_pattern(day=date(2026, 3, 11), node_id="route:192.168.178.22:node-b", event_hours=(7, 12, 18)),
+            _smart_home_motion_pattern(day=date(2026, 3, 12), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+            _smart_home_motion_pattern(day=date(2026, 3, 12), node_id="route:192.168.178.22:node-b", event_hours=(7, 12, 18)),
+            _smart_home_motion_pattern(day=date(2026, 3, 13), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+            _smart_home_motion_pattern(day=date(2026, 3, 13), node_id="route:192.168.178.22:node-b", event_hours=(7, 12, 18)),
+            _smart_home_motion_pattern(day=date(2026, 3, 17), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+            _smart_home_motion_pattern(day=date(2026, 3, 17), node_id="route:192.168.178.22:node-b", event_hours=(7, 12, 18)),
+            _smart_home_motion_pattern(day=date(2026, 3, 18), node_id="route:192.168.178.22:node-a", event_hours=(7,)),
+            _smart_home_health_pattern(day=date(2026, 3, 18), node_id="route:192.168.178.22:node-b", state="offline", hour=9),
+        )
+
+        result = compiler.compile(objects=history, now=reference)
+        items = {item.memory_id: item for item in result.created_summaries}
+
+        profile = items["environment_profile:home_main:day:2026-03-18"]
+        baseline = items["environment_baseline:home_main:weekday:rolling_7d"]
+        deviation = items["environment_deviation:home_main:daily_activity_drop:2026-03-18"]
+
+        profile_attrs = dict(profile.attributes or {})
+        baseline_attrs = dict(baseline.attributes or {})
+        deviation_attrs = dict(deviation.attributes or {})
+
+        self.assertEqual(profile_attrs["summary_type"], "environment_day_profile")
+        self.assertEqual(profile_attrs["markers"]["active_epoch_count_day"], 1)
+        self.assertEqual(profile_attrs["markers"]["unique_active_node_count_day"], 1)
+        self.assertIn("device_offline_present", profile_attrs["quality_flags"])
+        self.assertEqual(baseline_attrs["pattern_type"], "environment_baseline")
+        self.assertEqual(baseline_attrs["sample_count"], 4)
+        self.assertIn("active_epoch_count_day", baseline_attrs["marker_stats"])
+        self.assertEqual(deviation_attrs["deviation_type"], "daily_activity_drop")
+        self.assertEqual(deviation_attrs["markers"][0]["name"], "active_epoch_count_day")
+
+    def test_sensor_memory_compiler_merges_environment_profile_outputs(self) -> None:
+        compiler = LongTermSensorMemoryCompiler(
+            enabled=True,
+            baseline_days=7,
+            min_days_observed=4,
+            min_routine_ratio=0.6,
+            deviation_min_delta=0.5,
+        )
+        reference = datetime(2026, 3, 18, 18, 0, tzinfo=timezone.utc)
+        history = (
+            _smart_home_motion_pattern(day=date(2026, 3, 11), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+            _smart_home_motion_pattern(day=date(2026, 3, 12), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+            _smart_home_motion_pattern(day=date(2026, 3, 13), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+            _smart_home_motion_pattern(day=date(2026, 3, 17), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+            _smart_home_motion_pattern(day=date(2026, 3, 18), node_id="route:192.168.178.22:node-a", event_hours=(7,)),
+        )
+
+        result = compiler.compile(objects=history, now=reference)
+        items = {item.memory_id: item for item in result.created_summaries}
+
+        self.assertIn("environment_profile:home_main:day:2026-03-18", items)
+        self.assertIn("environment_baseline:home_main:weekday:rolling_7d", items)
+
 
 class LongTermSensorMemoryServiceTests(unittest.TestCase):
     def test_service_run_sensor_memory_persists_routine_objects(self) -> None:
@@ -327,6 +485,36 @@ class LongTermSensorMemoryServiceTests(unittest.TestCase):
 
         self.assertTrue(result.created_summaries)
         self.assertIn("routine:presence:weekday:morning", objects)
+
+    def test_service_run_sensor_memory_persists_environment_profile_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = LongTermMemoryService.from_config(_config(temp_dir), extractor=make_test_extractor())
+            raw_objects = (
+                _smart_home_motion_pattern(day=date(2026, 3, 11), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+                _smart_home_motion_pattern(day=date(2026, 3, 12), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+                _smart_home_motion_pattern(day=date(2026, 3, 13), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+                _smart_home_motion_pattern(day=date(2026, 3, 17), node_id="route:192.168.178.22:node-a", event_hours=(7, 8, 12, 13, 18, 19)),
+                _smart_home_motion_pattern(day=date(2026, 3, 18), node_id="route:192.168.178.22:node-a", event_hours=(7,)),
+            )
+            service.object_store.apply_consolidation(
+                LongTermConsolidationResultV1(
+                    turn_id="turn:smart-home-environment",
+                    occurred_at=datetime(2026, 3, 18, 18, 0, tzinfo=timezone.utc),
+                    episodic_objects=(),
+                    durable_objects=raw_objects,
+                    deferred_objects=(),
+                    conflicts=(),
+                    graph_edges=(),
+                )
+            )
+
+            result = service.run_sensor_memory(now=datetime(2026, 3, 18, 18, 0, tzinfo=timezone.utc))
+            objects = {item.memory_id: item for item in service.object_store.load_objects()}
+            service.shutdown()
+
+        self.assertTrue(result.created_summaries)
+        self.assertIn("environment_profile:home_main:day:2026-03-18", objects)
+        self.assertIn("environment_baseline:home_main:weekday:rolling_7d", objects)
 
 
 if __name__ == "__main__":

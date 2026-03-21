@@ -5,7 +5,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.integrations import SmartHomeCommand, SmartHomeEntityClass
-from twinr.integrations.smarthome.hue import HueSmartHomeProvider
+from twinr.integrations.smarthome.hue import HueBridgeClient, HueBridgeConfig, HueSmartHomeProvider
 
 
 class _FakeHueClient:
@@ -32,6 +32,21 @@ class _FakeHueClient:
 
 
 class HueSmartHomeProviderTests(unittest.TestCase):
+    def test_hue_client_treats_idle_event_timeout_as_empty_batch(self) -> None:
+        client = HueBridgeClient(
+            HueBridgeConfig(
+                bridge_host="192.168.1.20",
+                application_key="local-key",
+                verify_tls=False,
+                timeout_s=2.0,
+            ),
+            event_reader=lambda path, timeout_s, max_events: (_ for _ in ()).throw(TimeoutError("idle")),
+        )
+
+        events = client.read_event_stream(timeout_s=1.0, max_events=4)
+
+        self.assertEqual(events, [])
+
     def test_list_entities_normalizes_hue_resources(self) -> None:
         client = _FakeHueClient(
             resources=(

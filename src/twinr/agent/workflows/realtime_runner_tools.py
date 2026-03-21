@@ -33,6 +33,18 @@ class TwinrRealtimeToolDelegatesMixin:
     def _handle_delete_automation_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_delete_automation(arguments)
 
+    def _handle_list_smart_home_entities_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_list_smart_home_entities(arguments)
+
+    def _handle_read_smart_home_state_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_read_smart_home_state(arguments)
+
+    def _handle_control_smart_home_entities_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_control_smart_home_entities(arguments)
+
+    def _handle_read_smart_home_sensor_stream_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_read_smart_home_sensor_stream(arguments)
+
     def _handle_propose_skill_learning_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_propose_skill_learning(arguments)
 

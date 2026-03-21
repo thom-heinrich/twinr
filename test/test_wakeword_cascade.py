@@ -279,6 +279,30 @@ class WakewordCascadeTests(unittest.TestCase):
         self.assertEqual(result.status, "skipped")
         self.assertEqual(result.reason, "detector_label_unconfigured")
 
+    def test_sequence_capture_verifier_accepts_normalized_detector_label_alias(self) -> None:
+        class _FakeVerifier:
+            def score_capture(self, capture):
+                del capture
+                return 0.9
+
+        verifier = WakewordSequenceCaptureVerifier(verifier_models={}, threshold=0.5)
+        verifier._verifiers["twinr"] = _FakeVerifier()
+
+        result = verifier.verify(
+            _capture(1800),
+            detector_match=WakewordMatch(
+                detected=True,
+                transcript="",
+                backend="wekws",
+                detector_label="<TWINR_FAMILY>",
+                matched_phrase="twinr",
+                score=0.8,
+            ),
+        )
+
+        self.assertEqual(result.status, "accepted")
+        self.assertEqual(result.backend, "local_sequence")
+
 
 if __name__ == "__main__":
     unittest.main()

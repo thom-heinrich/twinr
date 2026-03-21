@@ -8,7 +8,10 @@ through structured multimodal facts under `ingestion/`; no raw PCM belongs in
 this subsystem. ReSpeaker-derived observed preferences remain distinct from
 explicitly confirmed preferences and must not auto-promote just because their
 confidence is high. Confirmed response-channel preferences can then flow back
-out through `retrieval/` as explicit adaptive policy packets.
+out through `retrieval/` as explicit adaptive policy packets. Room-agnostic
+smart-home environment profiling also compiles under `ingestion/`, using
+motion-node, transition, fragmentation, and timing markers instead of hard
+room labels.
 
 ## Responsibility
 

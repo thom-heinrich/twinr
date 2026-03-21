@@ -11,6 +11,7 @@ import io
 import math
 import os
 import sys
+import audioop
 from array import array
 from collections import deque
 from collections.abc import Iterable
@@ -35,6 +36,10 @@ _STREAM_IO_STALL_TIMEOUT_S = 5.0
 _PLAYBACK_FINALIZE_TIMEOUT_S = 10.0
 _PLAYBACK_FILE_TIMEOUT_S = 120.0
 _PROCESS_STOP_TIMEOUT_S = 1.0
+_PCM16_MAX_ABS = 32767
+_DEFAULT_WAV_TARGET_PEAK = 28000
+_DEFAULT_WAV_MAX_GAIN = 4.0
+_TONE_HEADROOM_SCALE = 0.92
 
 
 def _normalize_audio_device(device: str | None) -> str:
@@ -63,6 +68,50 @@ def _ensure_float(name: str, value: object, *, minimum: float) -> float:
     if normalized < minimum:
         raise ValueError(f"{name} must be >= {minimum}")
     return normalized
+
+
+def normalize_wav_playback_level(
+    audio_bytes: bytes,
+    *,
+    target_peak: int = _DEFAULT_WAV_TARGET_PEAK,
+    max_gain: float = _DEFAULT_WAV_MAX_GAIN,
+) -> bytes:
+    """Boost a quiet PCM16 WAV payload to an audible playback level.
+
+    The Pi ReSpeaker path can already be at full mixer volume while provider TTS
+    returns under-driven audio. In that case the only reliable place to recover
+    audible output is the WAV payload itself. Invalid or already-loud audio
+    stays untouched.
+    """
+
+    if not audio_bytes:
+        return audio_bytes
+    normalized_target_peak = max(1, min(int(target_peak), _PCM16_MAX_ABS))
+    normalized_max_gain = max(1.0, float(max_gain))
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wave_reader:
+            channels = wave_reader.getnchannels()
+            sample_width = wave_reader.getsampwidth()
+            sample_rate = wave_reader.getframerate()
+            frames = wave_reader.readframes(wave_reader.getnframes())
+    except (wave.Error, EOFError):
+        return audio_bytes
+    if sample_width != _SAMPLE_WIDTH_BYTES or not frames:
+        return audio_bytes
+    peak = audioop.max(frames, sample_width)
+    if peak <= 0 or peak >= normalized_target_peak:
+        return audio_bytes
+    gain = min(normalized_max_gain, normalized_target_peak / float(peak))
+    if gain <= 1.0:
+        return audio_bytes
+    boosted_frames = audioop.mul(frames, sample_width, gain)
+    output_buffer = io.BytesIO()
+    with wave.open(output_buffer, "wb") as wave_writer:
+        wave_writer.setnchannels(channels)
+        wave_writer.setsampwidth(sample_width)
+        wave_writer.setframerate(sample_rate)
+        wave_writer.writeframes(boosted_frames)
+    return output_buffer.getvalue()
 
 
 def _bytes_per_frame(channels: int) -> int:
@@ -1284,7 +1333,9 @@ class WaveAudioPlayer:
         normalized_frequency_hz = _ensure_int("frequency_hz", frequency_hz, minimum=0)
         normalized_duration_ms = _ensure_int("duration_ms", duration_ms, minimum=0)
         normalized_sample_rate = _ensure_int("sample_rate", sample_rate, minimum=1)
-        amplitude = max(0.0, min(float(volume), 1.0)) * 32767.0 * 0.6
+        # Keep some headroom, but do not throw away most of the available
+        # speaker range on the Pi confirmation-beep path.
+        amplitude = max(0.0, min(float(volume), 1.0)) * 32767.0 * _TONE_HEADROOM_SCALE
         if normalized_duration_ms == 0 or amplitude == 0.0:
             return b""
         frame_count = int(normalized_sample_rate * (normalized_duration_ms / 1000.0))

@@ -21,6 +21,13 @@ from twinr.agent.base_agent.settings.simple_settings import (
     supported_spoken_voices,
 )
 from twinr.automations import supported_sensor_trigger_kinds
+from twinr.integrations.smarthome.models import (
+    SmartHomeCommand,
+    SmartHomeEntityAggregateField,
+    SmartHomeEntityClass,
+    SmartHomeEventAggregateField,
+    SmartHomeEventKind,
+)
 
 _CANONICAL_ENGLISH_MEMORY_NOTE = (
     "All semantic text fields must be canonical English, even if the user spoke another language. "
@@ -312,6 +319,11 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
     setting_names = _unique_strings(supported_setting_names())
     spoken_voices = _unique_strings(supported_spoken_voices())
     spoken_voice_catalog = str(spoken_voice_options_context()).strip()
+    smart_home_entity_classes = _unique_strings(item.value for item in SmartHomeEntityClass)
+    smart_home_commands = _unique_strings(item.value for item in SmartHomeCommand)
+    smart_home_entity_aggregate_fields = _unique_strings(item.value for item in SmartHomeEntityAggregateField)
+    smart_home_event_aggregate_fields = _unique_strings(item.value for item in SmartHomeEventAggregateField)
+    smart_home_event_kinds = _unique_strings(item.value for item in SmartHomeEventKind)
 
     tools: list[dict[str, Any]] = []
     if "print_receipt" in available:
@@ -717,6 +729,250 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                         ),
                     },
                     "required": ["automation_ref"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "list_smart_home_entities" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "list_smart_home_entities",
+                "description": (
+                    "List bounded smart-home entities such as lights, scenes, motion sensors, and device-health endpoints. "
+                    "This tool supports generic selectors, exact scalar state filters, pagination, and simple aggregations, so it can answer both exact device discovery questions and broader house-status queries without a special-case summary tool."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "entity_ids": _array_property(
+                            "Optional exact entity IDs to limit the listing to a known subset.",
+                            _string_property("Exact smart-home entity ID.", min_length=1),
+                            min_items=1,
+                            max_items=8,
+                            unique_items=True,
+                        ),
+                        "entity_class": _string_property(
+                            "Optional legacy single entity-class filter such as light, scene, motion_sensor, or device_health.",
+                            enum=smart_home_entity_classes,
+                        ),
+                        "entity_classes": _array_property(
+                            "Optional entity-class filter set. Prefer this over entity_class when more than one class is relevant.",
+                            _string_property(
+                                "Smart-home entity class.",
+                                enum=smart_home_entity_classes,
+                            ),
+                            min_items=1,
+                            max_items=8,
+                            unique_items=True,
+                        ),
+                        "areas": _array_property(
+                            "Optional exact area labels to keep, such as Wohnzimmer or Flur.",
+                            _string_property("Exact smart-home area label.", min_length=1),
+                            min_items=1,
+                            max_items=8,
+                            unique_items=True,
+                        ),
+                        "providers": _array_property(
+                            "Optional provider IDs to keep, such as hue.",
+                            _string_property("Exact smart-home provider ID.", min_length=1),
+                            min_items=1,
+                            max_items=8,
+                            unique_items=True,
+                        ),
+                        "online": _boolean_property(
+                            "Optional online-status filter. Set false to focus on offline or unavailable entities."
+                        ),
+                        "controllable": _boolean_property(
+                            "Optional controllability filter."
+                        ),
+                        "readable": _boolean_property(
+                            "Optional readability filter."
+                        ),
+                        "include_unavailable": _boolean_property(
+                            "Set true to include currently unavailable or offline entities."
+                        ),
+                        "state_filters": _array_property(
+                            "Optional exact scalar state filters. Use keys such as on, brightness, motion, or nested dotted paths when the provider exposes nested state.",
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "key": _string_property(
+                                        "Exact state key or dotted state path to inspect.",
+                                        min_length=1,
+                                    ),
+                                    "value": {
+                                        "anyOf": [
+                                            {"type": "string", "minLength": 1},
+                                            {"type": "number"},
+                                            {"type": "boolean"},
+                                        ],
+                                        "description": "Exact scalar value that the selected state key must equal.",
+                                    },
+                                },
+                                "required": ["key", "value"],
+                                "additionalProperties": False,
+                            },
+                            min_items=1,
+                            max_items=8,
+                        ),
+                        "aggregate_by": _array_property(
+                            "Optional entity fields to aggregate counts by.",
+                            _string_property(
+                                "Aggregate field.",
+                                enum=smart_home_entity_aggregate_fields,
+                            ),
+                            min_items=1,
+                            max_items=6,
+                            unique_items=True,
+                        ),
+                        "limit": _number_property(
+                            "Maximum number of matching entities to return after filtering.",
+                            minimum=1,
+                            maximum=32,
+                            integer=True,
+                        ),
+                        "cursor": _string_property(
+                            "Optional opaque offset cursor from the previous entity list response.",
+                            min_length=1,
+                        ),
+                    },
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "read_smart_home_state" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "read_smart_home_state",
+                "description": (
+                    "Read the current state for one or more exact smart-home entities after they are already known. "
+                    "Use this for precise questions like whether a light is on, how bright it is, or whether a motion sensor recently fired."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "entity_ids": _array_property(
+                            "One or more exact smart-home entity IDs to inspect.",
+                            _string_property("Exact smart-home entity ID.", min_length=1),
+                            min_items=1,
+                            max_items=8,
+                            unique_items=True,
+                        ),
+                        "include_unavailable": _boolean_property(
+                            "Set true to include entities even if they are currently unavailable."
+                        ),
+                    },
+                    "required": ["entity_ids"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "control_smart_home_entities" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "control_smart_home_entities",
+                "description": (
+                    "Control allowed low-risk smart-home targets such as lights, grouped lights, switches, and scenes. "
+                    "Use this only for explicit user requests to change device state."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "entity_ids": _array_property(
+                            "One or more exact smart-home entity IDs to control.",
+                            _string_property("Exact smart-home entity ID.", min_length=1),
+                            min_items=1,
+                            max_items=8,
+                            unique_items=True,
+                        ),
+                        "command": _string_property(
+                            "Generic control command to execute.",
+                            enum=smart_home_commands,
+                        ),
+                        "brightness": _number_property(
+                            "Brightness percentage from 0 to 100. Required only for set_brightness.",
+                            minimum=0,
+                            maximum=100,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed this control action when explicit confirmation is needed."
+                        ),
+                    },
+                    "required": ["entity_ids", "command"],
+                    "additionalProperties": False,
+                },
+            }
+        )
+    if "read_smart_home_sensor_stream" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "read_smart_home_sensor_stream",
+                "description": (
+                    "Read a bounded batch of recent normalized smart-home events such as motion detections, button presses, connectivity changes, or alarm state changes. "
+                    "Use this for explicit inspection or debugging of the current stream. "
+                    "It supports generic event selectors and simple aggregations instead of a hardcoded status-summary path."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "entity_ids": _array_property(
+                            "Optional exact smart-home entity IDs to keep in the event stream.",
+                            _string_property("Exact smart-home entity ID.", min_length=1),
+                            min_items=1,
+                            max_items=8,
+                            unique_items=True,
+                        ),
+                        "event_kinds": _array_property(
+                            "Optional event-kind filters such as motion_detected, device_offline, or alarm_triggered.",
+                            _string_property(
+                                "Normalized smart-home event kind.",
+                                enum=smart_home_event_kinds,
+                            ),
+                            min_items=1,
+                            max_items=8,
+                            unique_items=True,
+                        ),
+                        "areas": _array_property(
+                            "Optional exact area labels to keep in the event stream.",
+                            _string_property("Exact smart-home area label.", min_length=1),
+                            min_items=1,
+                            max_items=8,
+                            unique_items=True,
+                        ),
+                        "providers": _array_property(
+                            "Optional provider IDs to keep in the event stream.",
+                            _string_property("Exact smart-home provider ID.", min_length=1),
+                            min_items=1,
+                            max_items=8,
+                            unique_items=True,
+                        ),
+                        "aggregate_by": _array_property(
+                            "Optional event fields to aggregate counts by.",
+                            _string_property(
+                                "Aggregate field.",
+                                enum=smart_home_event_aggregate_fields,
+                            ),
+                            min_items=1,
+                            max_items=4,
+                            unique_items=True,
+                        ),
+                        "cursor": _string_property(
+                            "Optional provider cursor from the previous stream read when available.",
+                            min_length=1,
+                        ),
+                        "limit": _number_property(
+                            "Maximum number of stream events to return.",
+                            minimum=1,
+                            maximum=20,
+                            integer=True,
+                        ),
+                    },
+                    "required": [],
                     "additionalProperties": False,
                 },
             }

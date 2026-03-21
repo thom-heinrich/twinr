@@ -21,6 +21,11 @@ _SUPPORTED_SENSOR_TRIGGER_KINDS = (
     "vad_quiet",
     "camera_person_visible",
     "camera_hand_or_object_near_camera",
+    "smart_home_motion_detected",
+    "smart_home_motion_cleared",
+    "smart_home_button_pressed",
+    "smart_home_device_offline",
+    "smart_home_alarm_triggered",
 )
 
 _IMMEDIATE_SENSOR_EVENTS = {
@@ -28,6 +33,11 @@ _IMMEDIATE_SENSOR_EVENTS = {
     "vad_speech_detected": "vad.speech_detected",
     "camera_person_visible": "camera.person_visible",
     "camera_hand_or_object_near_camera": "camera.hand_or_object_near_camera",
+    "smart_home_motion_detected": "smart_home.motion_detected",
+    "smart_home_motion_cleared": "smart_home.motion_cleared",
+    "smart_home_button_pressed": "smart_home.button_pressed",
+    "smart_home_device_offline": "smart_home.device_offline",
+    "smart_home_alarm_triggered": "smart_home.alarm_triggered",
 }
 
 # AUDIT-FIX(#6): use clearer user-facing wording and avoid unnecessary sensor jargon in generated descriptions.
@@ -38,6 +48,11 @@ _SENSOR_LABELS = {
     "vad_quiet": "the room microphone has been quiet",
     "camera_person_visible": "a person is visible in the camera view",
     "camera_hand_or_object_near_camera": "a hand or object is near the camera",
+    "smart_home_motion_detected": "motion is detected by a smart-home sensor",
+    "smart_home_motion_cleared": "motion has cleared on a smart-home sensor",
+    "smart_home_button_pressed": "a smart-home button was pressed",
+    "smart_home_device_offline": "a smart-home device went offline",
+    "smart_home_alarm_triggered": "a smart-home alarm was triggered",
 }
 
 # AUDIT-FIX(#5): centralize trigger metadata so unknown kinds fail closed instead of silently falling through to the wrong fact key.
@@ -280,6 +295,16 @@ def _base_conditions(trigger_kind: str) -> tuple[AutomationCondition, ...]:
         return (_make_condition("camera.person_visible", "truthy"),)
     if trigger_kind == "camera_hand_or_object_near_camera":
         return (_make_condition("camera.hand_or_object_near_camera", "truthy"),)
+    if trigger_kind == "smart_home_motion_detected":
+        return (_make_condition("smart_home.motion_detected", "truthy"),)
+    if trigger_kind == "smart_home_motion_cleared":
+        return (_make_condition("smart_home.motion_detected", "falsy"),)
+    if trigger_kind == "smart_home_button_pressed":
+        return (_make_condition("smart_home.button_pressed", "truthy"),)
+    if trigger_kind == "smart_home_device_offline":
+        return (_make_condition("smart_home.device_offline", "truthy"),)
+    if trigger_kind == "smart_home_alarm_triggered":
+        return (_make_condition("smart_home.alarm_triggered", "truthy"),)
     raise ValueError(f"Unsupported sensor trigger kind: {trigger_kind}")  # AUDIT-FIX(#5)
 
 

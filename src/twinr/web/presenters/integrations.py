@@ -16,7 +16,12 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.agent.base_agent import TwinrConfig
-from twinr.integrations import ManagedIntegrationConfig, validate_calendar_source
+from twinr.integrations import (
+    HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY,
+    ManagedIntegrationConfig,
+    hue_application_key_env_key_for_host,
+    validate_calendar_source,
+)
 from twinr.web.support.channel_onboarding import ChannelPairingSnapshot
 from twinr.web.support.contracts import IntegrationOverviewRow, SettingsSection, WizardCheckRow
 from twinr.web.support.forms import _select_field, _text_field, _textarea_field
@@ -27,6 +32,8 @@ from twinr.web.presenters.common import (
     _CALENDAR_SOURCE_OPTIONS,
     _EMAIL_PROFILE_OPTIONS,
     _EMAIL_SECRET_KEY,
+    _HUE_SECRET_KEY,
+    _SMART_HOME_PROVIDER_OPTIONS,
     _credential_state_label,
 )
 
@@ -36,6 +43,9 @@ _EMAIL_LOCAL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$")
 _HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9-]+$")
 _MAX_KNOWN_CONTACTS_TEXT_LENGTH = 8192
 _MAX_MAILBOX_LENGTH = 255
+_MAX_HUE_APPLICATION_KEY_LENGTH = 512
+_MAX_HUE_BRIDGE_HOSTS_TEXT_LENGTH = 2048
+_MAX_ADDITIONAL_HUE_BRIDGES = 7
 
 
 def _coerce_text(value: object, default: str = "") -> str:
@@ -214,6 +224,62 @@ def _normalize_persisted_secret(raw: object) -> str:
         return ""
 
 
+def _normalize_hue_application_key(raw: object, *, field_label: str) -> str:
+    """Normalize one Hue application key before env persistence."""
+
+    application_key = _coerce_text(raw).strip()
+    if application_key:
+        _reject_control_characters(application_key, field_label)
+        if len(application_key) > _MAX_HUE_APPLICATION_KEY_LENGTH:
+            raise ValueError(f"{field_label} is too long.")
+    return application_key
+
+
+def _normalize_hue_bridge_hosts(
+    primary_host_raw: object,
+    additional_hosts_raw: object,
+) -> tuple[str, tuple[str, ...], str]:
+    """Validate and normalize the ordered Hue bridge-host list."""
+
+    primary_host = _coerce_text(primary_host_raw, "").strip()
+    if primary_host:
+        primary_host = _validate_host(primary_host, "Bridge host")
+    additional_hosts_text = _normalize_multiline_text(
+        _coerce_text(additional_hosts_raw, ""),
+        "Additional Hue bridge hosts",
+        max_length=_MAX_HUE_BRIDGE_HOSTS_TEXT_LENGTH,
+    )
+    seen_hosts = {primary_host} if primary_host else set()
+    additional_hosts: list[str] = []
+    for index, raw_line in enumerate(additional_hosts_text.replace(",", "\n").splitlines(), start=1):
+        candidate = raw_line.strip()
+        if not candidate:
+            continue
+        normalized_host = _validate_host(candidate, f"Additional Hue bridge host {index}")
+        if normalized_host in seen_hosts:
+            continue
+        seen_hosts.add(normalized_host)
+        additional_hosts.append(normalized_host)
+    if len(additional_hosts) > _MAX_ADDITIONAL_HUE_BRIDGES:
+        raise ValueError(f"Additional Hue bridge hosts must contain at most {_MAX_ADDITIONAL_HUE_BRIDGES} entries.")
+    return primary_host, tuple(additional_hosts), "\n".join(additional_hosts)
+
+
+def _stored_hue_application_key(
+    env_values: Mapping[str, object],
+    bridge_host: str,
+    *,
+    allow_legacy_fallback: bool,
+) -> str:
+    """Return the persisted Hue application key available for one bridge."""
+
+    if bridge_host:
+        host_secret = _normalize_persisted_secret(env_values.get(hue_application_key_env_key_for_host(bridge_host)))
+        if host_secret:
+            return host_secret
+    return _normalize_persisted_secret(env_values.get(_HUE_SECRET_KEY)) if allow_legacy_fallback else ""
+
+
 def _validate_host(value: str, field_label: str) -> str:
     """Validate a hostname or IP address without scheme, path, or port."""
 
@@ -277,6 +343,20 @@ def _validate_bounded_int(value: str, field_label: str, *, minimum: int, maximum
     if number < minimum or number > maximum:
         raise ValueError(f"{field_label} must be a whole number between {minimum} and {maximum}.")
     return str(number)
+
+
+def _validate_positive_float_text(value: str, field_label: str, *, minimum: float, maximum: float) -> str:
+    """Validate a bounded positive float setting and return a compact string form."""
+
+    number_text = value.strip()
+    _reject_control_characters(number_text, field_label)
+    try:
+        number = float(number_text)
+    except ValueError as exc:
+        raise ValueError(f"{field_label} must be a number between {minimum:g} and {maximum:g}.") from exc
+    if number < minimum or number > maximum:
+        raise ValueError(f"{field_label} must be a number between {minimum:g} and {maximum:g}.")
+    return f"{number:g}"
 
 
 def _validate_email_address(value: str, field_label: str) -> str:
@@ -754,6 +834,136 @@ def _calendar_integration_sections(record: ManagedIntegrationConfig) -> tuple[Se
     )
 
 
+def _smart_home_integration_sections(
+    record: ManagedIntegrationConfig,
+    env_values: Mapping[str, object],
+) -> tuple[SettingsSection, ...]:
+    """Build the smart-home integration form sections for the dashboard."""
+
+    values = _string_settings(getattr(record, "settings", {}))
+    provider = _safe_normalize_choice(
+        values.get("provider", "hue"),
+        default="hue",
+        options=_SMART_HOME_PROVIDER_OPTIONS,
+        fallback=("hue",),
+    )
+    values["provider"] = provider
+    try:
+        primary_bridge_host, additional_bridge_hosts, additional_bridge_hosts_text = _normalize_hue_bridge_hosts(
+            values.get("bridge_host", ""),
+            values.get(HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY, ""),
+        )
+    except ValueError:
+        primary_bridge_host, additional_bridge_hosts, additional_bridge_hosts_text = "", (), ""
+    values["bridge_host"] = primary_bridge_host
+    values[HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY] = additional_bridge_hosts_text
+    values["verify_tls"] = _safe_bool_string(values.get("verify_tls", "false"), default=False)
+    values["request_timeout_s"] = values.get("request_timeout_s", "10").strip() or "10"
+    values["event_timeout_s"] = values.get("event_timeout_s", "2").strip() or "2"
+    bridge_secret_fields: list[FileBackedSetting] = [
+        FileBackedSetting(
+            key=_HUE_SECRET_KEY,
+            label=f"Hue application key for {primary_bridge_host}" if primary_bridge_host else "Hue application key",
+            value="",
+            help_text=(
+                f"Credential state: {_credential_state_label(_stored_hue_application_key(env_values, primary_bridge_host, allow_legacy_fallback=True))}. "
+                "Leave blank to keep it unchanged."
+            ),
+            tooltip_text="Stored only in .env. Each Hue bridge needs its own local application key.",
+            input_type="password",
+            placeholder="Hue application key",
+            secret=True,
+        )
+    ]
+    for bridge_host in additional_bridge_hosts:
+        env_key = hue_application_key_env_key_for_host(bridge_host)
+        bridge_secret_fields.append(
+            FileBackedSetting(
+                key=env_key,
+                label=f"Hue application key for {bridge_host}",
+                value="",
+                help_text=(
+                    f"Credential state: {_credential_state_label(_stored_hue_application_key(env_values, bridge_host, allow_legacy_fallback=False))}. "
+                    "Leave blank to keep it unchanged."
+                ),
+                tooltip_text="Stored only in .env for this specific additional Hue bridge.",
+                input_type="password",
+                placeholder="Hue application key",
+                secret=True,
+            )
+        )
+    return (
+        SettingsSection(
+            title="Smart Home",
+            description="Set up a local low-risk smart-home bridge for device reads, explicit light control, and bounded sensor streams.",
+            fields=(
+                _select_field(
+                    "enabled",
+                    "Smart-home enabled",
+                    values,
+                    _BOOL_OPTIONS,
+                    "true" if record.enabled else "false",
+                    tooltip_text="Enable only after the local bridge host and application key are configured.",
+                ),
+                _select_field(
+                    "provider",
+                    "Provider",
+                    values,
+                    _SMART_HOME_PROVIDER_OPTIONS,
+                    provider,
+                    tooltip_text="Phase 1 uses the local Philips Hue bridge only.",
+                ),
+                _text_field(
+                    "bridge_host",
+                    "Bridge host",
+                    values,
+                    values["bridge_host"],
+                    placeholder="192.168.1.20",
+                    tooltip_text="Local Hue bridge hostname or IP address without scheme or port.",
+                ),
+                _textarea_field(
+                    HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY,
+                    "Additional bridge hosts",
+                    values,
+                    additional_bridge_hosts_text,
+                    tooltip_text="Optional extra Hue bridge hosts, one per line. Each additional bridge needs its own Hue application key below.",
+                    placeholder="192.168.1.21",
+                    rows=3,
+                ),
+                *tuple(bridge_secret_fields),
+            ),
+        ),
+        SettingsSection(
+            title="Hue runtime",
+            description="Bound the local bridge request and event-stream behavior so runtime control and sensor streaming stay responsive on the Pi.",
+            fields=(
+                _select_field(
+                    "verify_tls",
+                    "Verify TLS",
+                    values,
+                    _BOOL_OPTIONS,
+                    values["verify_tls"],
+                    tooltip_text="Local Hue bridges often use self-signed certificates. Leave this off unless certificate verification is set up locally.",
+                ),
+                _text_field(
+                    "request_timeout_s",
+                    "Request timeout seconds",
+                    values,
+                    values["request_timeout_s"],
+                    tooltip_text="Upper bound for normal bridge reads and writes.",
+                ),
+                _text_field(
+                    "event_timeout_s",
+                    "Event timeout seconds",
+                    values,
+                    values["event_timeout_s"],
+                    tooltip_text="Upper bound for one bounded event-stream read before the worker reconnects.",
+                ),
+            ),
+        ),
+    )
+
+
 def _build_email_integration_record(
     form: Mapping[str, object],
     env_values: Mapping[str, object],
@@ -918,3 +1128,88 @@ def _build_calendar_integration_record(form: Mapping[str, object]) -> tuple[Mana
         },
     )
     return record, {}
+
+
+def _build_smart_home_integration_record(
+    form: Mapping[str, object],
+    env_values: Mapping[str, object],
+) -> tuple[ManagedIntegrationConfig, dict[str, str]]:
+    """Validate posted smart-home form data into a managed integration record."""
+
+    enabled = _parse_bool_choice(form.get("enabled", "false"), "Smart-home enabled", default=False)
+    provider = _normalize_choice(
+        form.get("provider", "hue"),
+        "Provider",
+        default="hue",
+        options=_SMART_HOME_PROVIDER_OPTIONS,
+        fallback=("hue",),
+    )
+    bridge_host, additional_bridge_hosts, additional_bridge_hosts_text = _normalize_hue_bridge_hosts(
+        form.get("bridge_host", ""),
+        form.get(HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY, ""),
+    )
+    if enabled and not bridge_host:
+        raise ValueError("Bridge host is required when smart-home integration is enabled.")
+
+    existing_primary_secret = _stored_hue_application_key(
+        env_values,
+        bridge_host,
+        allow_legacy_fallback=True,
+    )
+    application_key = _normalize_hue_application_key(
+        form.get(_HUE_SECRET_KEY, ""),
+        field_label="Hue application key",
+    )
+    if enabled and not (application_key or existing_primary_secret):
+        raise ValueError("Hue application key is required when smart-home integration is enabled.")
+
+    env_updates: dict[str, str] = {}
+    if application_key:
+        env_updates[_HUE_SECRET_KEY] = application_key
+        if bridge_host:
+            env_updates[hue_application_key_env_key_for_host(bridge_host)] = application_key
+
+    for bridge_host_entry in additional_bridge_hosts:
+        env_key = hue_application_key_env_key_for_host(bridge_host_entry)
+        existing_secret = _stored_hue_application_key(
+            env_values,
+            bridge_host_entry,
+            allow_legacy_fallback=False,
+        )
+        submitted_secret = _normalize_hue_application_key(
+            form.get(env_key, ""),
+            field_label=f"Hue application key for {bridge_host_entry}",
+        )
+        if submitted_secret:
+            env_updates[env_key] = submitted_secret
+            continue
+        if enabled and not existing_secret:
+            raise ValueError(f"Hue application key is required for additional bridge {bridge_host_entry}.")
+
+    record = ManagedIntegrationConfig(
+        integration_id="smart_home_hub",
+        enabled=enabled,
+        settings={
+            "provider": provider,
+            "bridge_host": bridge_host,
+            HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY: additional_bridge_hosts_text,
+            "verify_tls": (
+                "true"
+                if _parse_bool_choice(form.get("verify_tls", "false"), "Verify TLS", default=False)
+                else "false"
+            ),
+            "request_timeout_s": _validate_positive_float_text(
+                _coerce_text(form.get("request_timeout_s", "")).strip() or "10",
+                "Request timeout seconds",
+                minimum=0.1,
+                maximum=30.0,
+            ),
+            "event_timeout_s": _validate_positive_float_text(
+                _coerce_text(form.get("event_timeout_s", "")).strip() or "2",
+                "Event timeout seconds",
+                minimum=0.1,
+                maximum=10.0,
+            ),
+        },
+    )
+    return record, env_updates

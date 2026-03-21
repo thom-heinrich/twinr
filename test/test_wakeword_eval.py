@@ -20,6 +20,7 @@ from twinr.proactive.wakeword.evaluation import (
     run_wakeword_eval,
     train_wakeword_custom_verifier_from_manifest,
 )
+from twinr.proactive.wakeword.local_verifier import build_configured_sequence_capture_verifier
 
 
 def _write_wav(path: Path, *, amplitude: int, sample_count: int = 1600) -> None:
@@ -50,6 +51,27 @@ def _model_factory(**kwargs):
 
 
 class WakewordEvalTests(unittest.TestCase):
+    def test_build_configured_sequence_capture_verifier_supports_wekws_backend(self) -> None:
+        config = TwinrConfig(
+            wakeword_enabled=True,
+            wakeword_primary_backend="wekws",
+            wakeword_openwakeword_sequence_verifier_models=(
+                ("twinr_family", "/tmp/twinr_family.sequence_verifier.pkl"),
+            ),
+            wakeword_openwakeword_sequence_verifier_threshold=0.23,
+        )
+
+        with patch("twinr.proactive.wakeword.local_verifier.WakewordSequenceCaptureVerifier") as factory:
+            sentinel = object()
+            factory.return_value = sentinel
+            verifier = build_configured_sequence_capture_verifier(config)
+
+        self.assertIs(verifier, sentinel)
+        factory.assert_called_once_with(
+            verifier_models={"twinr_family": "/tmp/twinr_family.sequence_verifier.pkl"},
+            threshold=0.23,
+        )
+
     def test_load_eval_manifest_accepts_json_array_and_prefers_captured_audio_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

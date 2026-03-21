@@ -10,7 +10,7 @@ other subsystems use to create and inspect supported automations.
 - define automation triggers, conditions, actions, and stored entries
 - evaluate scheduled and fact-based triggers
 - persist automations safely to the JSON store and backup file
-- map supported sensor triggers to canonical if/then trigger shapes
+- map supported sensor triggers, including smart-home motion, button, alarm, and device-health events, to canonical if/then trigger shapes
 
 `automations` does **not** own:
 - web form parsing or automation page layout
@@ -45,6 +45,12 @@ entry = store.create_time_automation(
 from twinr.automations import build_sensor_trigger
 
 trigger = build_sensor_trigger("pir_no_motion", hold_seconds=300, cooldown_seconds=60)
+```
+
+```python
+from twinr.automations import build_sensor_trigger
+
+trigger = build_sensor_trigger("smart_home_motion_detected", cooldown_seconds=30)
 ```
 
 ## See also

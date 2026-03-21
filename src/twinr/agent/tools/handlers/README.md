@@ -2,7 +2,7 @@
 
 `handlers` owns the concrete realtime tool handlers used during live turns. It
 translates tool payloads into bounded runtime reads or mutations for automations,
-memory, reminders, output, self-coding, settings, voice-profile, portrait-
+smart-home, memory, reminders, output, self-coding, settings, voice-profile, portrait-
 identity, shared household-identity flows, and RSS/world-intelligence source
 configuration, and keeps shared voice/argument guards close to that boundary.
 
@@ -11,6 +11,7 @@ configuration, and keeps shared voice/argument guards close to that boundary.
 `handlers` owns:
 - implement per-tool handler functions called by `RealtimeToolExecutor`
 - validate and normalize tool arguments before they reach runtime methods
+- expose one smart-home tool surface for discovery, filtered state queries, low-risk control, and bounded stream inspection
 - keep handler-local telemetry and audit side effects best-effort
 - share sensitive-action confirmation and live-audio guard helpers
 - translate local camera-driven portrait-enrollment results into structured guidance for the model
@@ -29,6 +30,7 @@ configuration, and keeps shared voice/argument guards close to that boundary.
 | File | Purpose |
 |---|---|
 | [automations.py](./automations.py) | Automation CRUD handlers |
+| [smarthome.py](./smarthome.py) | Smart-home discovery, filtered state-read, control, and stream handlers |
 | [intelligence.py](./intelligence.py) | RSS/world-intelligence subscription and refresh-config handler |
 | [memory.py](./memory.py) | Durable-memory tool handlers |
 | [output.py](./output.py) | Print, search, and camera handlers |

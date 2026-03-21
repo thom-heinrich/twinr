@@ -304,6 +304,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "update_time_automation": lambda _arguments: {"status": "updated"},
                 "update_sensor_automation": lambda _arguments: {"status": "updated"},
                 "delete_automation": lambda _arguments: {"status": "deleted"},
+                "list_smart_home_entities": lambda _arguments: {"status": "ok", "entities": []},
+                "read_smart_home_state": lambda _arguments: {"status": "ok", "entities": []},
+                "control_smart_home_entities": lambda _arguments: {"status": "ok"},
+                "read_smart_home_sensor_stream": lambda _arguments: {"status": "ok", "events": []},
                 "remember_memory": lambda _arguments: {"status": "saved"},
                 "remember_contact": lambda _arguments: {"status": "created"},
                 "lookup_contact": lambda _arguments: {"status": "found"},
@@ -343,6 +347,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "update_time_automation",
                 "update_sensor_automation",
                 "delete_automation",
+                "list_smart_home_entities",
+                "read_smart_home_state",
+                "control_smart_home_entities",
+                "read_smart_home_sensor_stream",
                 "remember_memory",
                 "remember_contact",
                 "lookup_contact",
@@ -380,6 +388,15 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("trigger_kind", tools_by_name["create_sensor_automation"]["parameters"]["properties"])
         self.assertIn("automation_ref", tools_by_name["update_time_automation"]["parameters"]["properties"])
         self.assertIn("automation_ref", tools_by_name["update_sensor_automation"]["parameters"]["properties"])
+        self.assertIn("entity_class", tools_by_name["list_smart_home_entities"]["parameters"]["properties"])
+        self.assertIn("entity_classes", tools_by_name["list_smart_home_entities"]["parameters"]["properties"])
+        self.assertIn("state_filters", tools_by_name["list_smart_home_entities"]["parameters"]["properties"])
+        self.assertIn("aggregate_by", tools_by_name["list_smart_home_entities"]["parameters"]["properties"])
+        self.assertIn("entity_ids", tools_by_name["read_smart_home_state"]["parameters"]["properties"])
+        self.assertIn("command", tools_by_name["control_smart_home_entities"]["parameters"]["properties"])
+        self.assertIn("limit", tools_by_name["read_smart_home_sensor_stream"]["parameters"]["properties"])
+        self.assertIn("event_kinds", tools_by_name["read_smart_home_sensor_stream"]["parameters"]["properties"])
+        self.assertIn("aggregate_by", tools_by_name["read_smart_home_sensor_stream"]["parameters"]["properties"])
         self.assertIn("summary", tools_by_name["remember_memory"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["remember_memory"]["parameters"]["properties"])
         self.assertIn("phone", tools_by_name["remember_contact"]["parameters"]["properties"])
@@ -433,6 +450,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("enroll_portrait_identity tool", connection.session.calls[0]["instructions"])
         self.assertIn("guidance_hints", connection.session.calls[0]["instructions"])
         self.assertIn("manage_household_identity", connection.session.calls[0]["instructions"])
+        self.assertIn("list_smart_home_entities", connection.session.calls[0]["instructions"])
         self.assertIn("configure_world_intelligence tool", connection.session.calls[0]["instructions"])
 
     def test_open_uses_realtime_safe_top_level_tool_schemas(self) -> None:

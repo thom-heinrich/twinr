@@ -333,6 +333,7 @@ class TwinrConfigTests(unittest.TestCase):
 
         self.assertEqual(config.proactive_local_camera_metadata_wait_s, 0.75)
         self.assertEqual(config.proactive_local_camera_pose_refresh_s, 0.75)
+        self.assertEqual(config.proactive_local_camera_sequence_window_s, 0.55)
         self.assertEqual(config.proactive_local_camera_fine_hand_explicit_confirm_samples, 1)
         self.assertEqual(config.proactive_local_camera_fine_hand_explicit_min_confidence, 0.72)
 
@@ -434,8 +435,11 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_CONVERSATION_FOLLOW_UP_ENABLED=true",
                         "TWINR_CONVERSATION_FOLLOW_UP_AFTER_PROACTIVE_ENABLED=true",
                         "TWINR_CONVERSATION_CLOSURE_GUARD_ENABLED=false",
+                        "TWINR_CONVERSATION_CLOSURE_MODEL=gpt-4.1-nano",
+                        "TWINR_CONVERSATION_CLOSURE_REASONING_EFFORT=low",
                         "TWINR_CONVERSATION_CLOSURE_CONTEXT_TURNS=3",
                         "TWINR_CONVERSATION_CLOSURE_INSTRUCTIONS_FILE=ALT_CONVERSATION_CLOSURE.md",
+                        "TWINR_CONVERSATION_CLOSURE_MAX_OUTPUT_TOKENS=40",
                         "TWINR_CONVERSATION_CLOSURE_PROVIDER_TIMEOUT_SECONDS=1.25",
                         "TWINR_CONVERSATION_CLOSURE_MAX_TRANSCRIPT_CHARS=333",
                         "TWINR_CONVERSATION_CLOSURE_MAX_RESPONSE_CHARS=444",
@@ -762,8 +766,11 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertTrue(config.conversation_follow_up_enabled)
         self.assertTrue(config.conversation_follow_up_after_proactive_enabled)
         self.assertFalse(config.conversation_closure_guard_enabled)
+        self.assertEqual(config.conversation_closure_model, "gpt-4.1-nano")
+        self.assertEqual(config.conversation_closure_reasoning_effort, "low")
         self.assertEqual(config.conversation_closure_context_turns, 3)
         self.assertEqual(config.conversation_closure_instructions_file, "ALT_CONVERSATION_CLOSURE.md")
+        self.assertEqual(config.conversation_closure_max_output_tokens, 40)
         self.assertEqual(config.conversation_closure_provider_timeout_seconds, 1.25)
         self.assertEqual(config.conversation_closure_max_transcript_chars, 333)
         self.assertEqual(config.conversation_closure_max_response_chars, 444)
@@ -1100,8 +1107,11 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_transcript_verifier_max_capture_ms, 6500)
         self.assertEqual(config.streaming_first_word_prefetch_min_words, 2)
         self.assertTrue(config.conversation_closure_guard_enabled)
+        self.assertEqual(config.conversation_closure_model, "gpt-4o-mini")
+        self.assertEqual(config.conversation_closure_reasoning_effort, "")
         self.assertEqual(config.conversation_closure_context_turns, 4)
         self.assertEqual(config.conversation_closure_instructions_file, "CONVERSATION_CLOSURE.md")
+        self.assertEqual(config.conversation_closure_max_output_tokens, 32)
         self.assertEqual(config.conversation_closure_provider_timeout_seconds, 2.0)
         self.assertEqual(config.conversation_closure_max_transcript_chars, 512)
         self.assertEqual(config.conversation_closure_max_response_chars, 512)

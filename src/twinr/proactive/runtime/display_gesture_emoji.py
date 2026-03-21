@@ -9,8 +9,9 @@ without touching the face channel.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+import math
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.emoji_cues import DisplayEmojiController, DisplayEmojiCueStore, DisplayEmojiSymbol
@@ -30,13 +31,23 @@ _MOTION_COARSE_GESTURES = frozenset(
         SocialGestureEvent.TWO_HAND_DISMISS,
     }
 )
+_MOTION_GESTURE_DOMINANCE_WINDOW_S = 1.0
+_MIN_REFRESH_INTERVAL_S = 0.1
+_CUSTOM_ONLY_FINE_GESTURES = frozenset(
+    {
+        SocialFineHandGesture.OK_SIGN,
+        SocialFineHandGesture.MIDDLE_FINGER,
+    }
+)
 
 _FINE_HAND_GESTURE_MAP: dict[SocialFineHandGesture, tuple[DisplayEmojiSymbol, str]] = {
     SocialFineHandGesture.THUMBS_UP: (DisplayEmojiSymbol.THUMBS_UP, "success"),
     SocialFineHandGesture.THUMBS_DOWN: (DisplayEmojiSymbol.THUMBS_DOWN, "warm"),
     SocialFineHandGesture.POINTING: (DisplayEmojiSymbol.POINTING_HAND, "info"),
+    SocialFineHandGesture.PEACE_SIGN: (DisplayEmojiSymbol.VICTORY_HAND, "warm"),
     SocialFineHandGesture.OPEN_PALM: (DisplayEmojiSymbol.RAISED_HAND, "info"),
     SocialFineHandGesture.OK_SIGN: (DisplayEmojiSymbol.OK_HAND, "success"),
+    SocialFineHandGesture.MIDDLE_FINGER: (DisplayEmojiSymbol.WARNING, "alert"),
 }
 
 _COARSE_GESTURE_MAP: dict[SocialGestureEvent, tuple[DisplayEmojiSymbol, str]] = {
@@ -46,6 +57,80 @@ _COARSE_GESTURE_MAP: dict[SocialGestureEvent, tuple[DisplayEmojiSymbol, str]] = 
     SocialGestureEvent.TWO_HAND_DISMISS: (DisplayEmojiSymbol.WAVING_HAND, "neutral"),
     SocialGestureEvent.CONFIRM: (DisplayEmojiSymbol.CHECK, "success"),
 }
+
+
+def resolve_display_gesture_refresh_interval(config: TwinrConfig) -> float | None:
+    """Return the bounded local refresh cadence for HDMI gesture acknowledgement."""
+
+    raw_interval = getattr(
+        config,
+        "display_gesture_refresh_interval_s",
+        getattr(config, "display_attention_refresh_interval_s", 0.2),
+    )
+    try:
+        interval_s = float(raw_interval or 0.0)
+    except (TypeError, ValueError):
+        return 0.2
+    if not math.isfinite(interval_s) or interval_s <= 0.0:
+        return None
+    return max(_MIN_REFRESH_INTERVAL_S, interval_s)
+
+
+def display_gesture_refresh_supported(
+    *,
+    config: TwinrConfig,
+    vision_observer: object | None,
+) -> bool:
+    """Return whether a dedicated HDMI gesture-refresh path is safe to run."""
+
+    if resolve_display_gesture_refresh_interval(config) is None:
+        return False
+    display_driver = str(getattr(config, "display_driver", "") or "").strip().lower()
+    if not display_driver.startswith("hdmi"):
+        return False
+    supports_gesture_refresh = getattr(vision_observer, "supports_gesture_refresh", None)
+    if supports_gesture_refresh is True:
+        return True
+    if supports_gesture_refresh is False:
+        return False
+    return callable(getattr(vision_observer, "observe_gesture", None))
+
+
+def decision_for_fine_hand_gesture(
+    gesture: SocialFineHandGesture,
+) -> DisplayGestureEmojiDecision:
+    """Return the user-facing emoji decision for one fine-hand gesture."""
+
+    mapped = _FINE_HAND_GESTURE_MAP.get(gesture)
+    if mapped is None:
+        return DisplayGestureEmojiDecision(reason="unsupported_fine_hand_gesture")
+    symbol, accent = mapped
+    return DisplayGestureEmojiDecision(
+        active=True,
+        reason=f"fine_hand_gesture:{gesture.value}",
+        symbol=symbol,
+        accent=accent,
+    )
+
+
+def decision_for_coarse_gesture(
+    gesture: SocialGestureEvent,
+    *,
+    motion_priority: bool = False,
+) -> DisplayGestureEmojiDecision:
+    """Return the user-facing emoji decision for one coarse-arm gesture."""
+
+    mapped = _COARSE_GESTURE_MAP.get(gesture)
+    if mapped is None:
+        return DisplayGestureEmojiDecision(reason="unsupported_coarse_gesture")
+    symbol, accent = mapped
+    reason_prefix = "motion_coarse_gesture" if motion_priority else "coarse_gesture"
+    return DisplayGestureEmojiDecision(
+        active=True,
+        reason=f"{reason_prefix}:{gesture.value}",
+        symbol=symbol,
+        accent=accent,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,38 +174,25 @@ def derive_display_gesture_emoji(
             )
         )
     ):
-        mapped = _COARSE_GESTURE_MAP.get(snapshot.gesture_event)
-        if mapped is not None:
-            symbol, accent = mapped
-            return DisplayGestureEmojiDecision(
-                active=True,
-                reason=f"motion_coarse_gesture:{snapshot.gesture_event.value}",
-                symbol=symbol,
-                accent=accent,
-            )
+        decision = decision_for_coarse_gesture(
+            snapshot.gesture_event,
+            motion_priority=True,
+        )
+        if decision.active:
+            return decision
 
     if _FINE_GESTURE_EVENT_NAME in names:
-        mapped = _FINE_HAND_GESTURE_MAP.get(snapshot.fine_hand_gesture)
-        if mapped is not None and not snapshot.fine_hand_gesture_unknown:
-            symbol, accent = mapped
-            return DisplayGestureEmojiDecision(
-                active=True,
-                reason=f"fine_hand_gesture:{snapshot.fine_hand_gesture.value}",
-                symbol=symbol,
-                accent=accent,
-            )
+        if not snapshot.fine_hand_gesture_unknown:
+            decision = decision_for_fine_hand_gesture(snapshot.fine_hand_gesture)
+            if decision.active:
+                return decision
         return DisplayGestureEmojiDecision(reason="unsupported_fine_hand_gesture")
 
     if _COARSE_GESTURE_EVENT_NAMES.intersection(names):
-        mapped = _COARSE_GESTURE_MAP.get(snapshot.gesture_event)
-        if mapped is not None and not snapshot.gesture_event_unknown:
-            symbol, accent = mapped
-            return DisplayGestureEmojiDecision(
-                active=True,
-                reason=f"coarse_gesture:{snapshot.gesture_event.value}",
-                symbol=symbol,
-                accent=accent,
-            )
+        if not snapshot.gesture_event_unknown:
+            decision = decision_for_coarse_gesture(snapshot.gesture_event)
+            if decision.active:
+                return decision
         return DisplayGestureEmojiDecision(reason="unsupported_coarse_gesture")
 
     return DisplayGestureEmojiDecision(reason="no_gesture_event")
@@ -132,6 +204,7 @@ class DisplayGestureEmojiPublisher:
 
     controller: DisplayEmojiController
     source: str = _SOURCE
+    _recent_motion_priority_until: datetime | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "DisplayGestureEmojiPublisher":
@@ -158,11 +231,17 @@ class DisplayGestureEmojiPublisher:
     ) -> DisplayGestureEmojiPublishResult:
         """Derive and publish one emoji acknowledgement from a camera update."""
 
+        effective_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         decision = derive_display_gesture_emoji(
             snapshot=update.snapshot,
             event_names=update.event_names,
         )
-        return self.publish(decision, now=now)
+        decision = self._apply_recent_motion_priority(
+            update=update,
+            decision=decision,
+            now=effective_now,
+        )
+        return self.publish(decision, now=effective_now)
 
     def publish(
         self,
@@ -196,10 +275,45 @@ class DisplayGestureEmojiPublisher:
             owner=active_owner,
         )
 
+    def _apply_recent_motion_priority(
+        self,
+        *,
+        update: ProactiveCameraSurfaceUpdate,
+        decision: DisplayGestureEmojiDecision,
+        now: datetime,
+    ) -> DisplayGestureEmojiDecision:
+        """Prefer recent motion gestures briefly over conflicting custom-only fine-hand blips."""
+
+        if (
+            decision.active
+            and decision.reason.startswith("motion_coarse_gesture:")
+            and update.snapshot.gesture_event in _MOTION_COARSE_GESTURES
+        ):
+            self._recent_motion_priority_until = now + timedelta(
+                seconds=min(decision.hold_seconds, _MOTION_GESTURE_DOMINANCE_WINDOW_S)
+            )
+            return decision
+
+        if not decision.active or not decision.reason.startswith("fine_hand_gesture:"):
+            return decision
+
+        if update.snapshot.fine_hand_gesture not in _CUSTOM_ONLY_FINE_GESTURES:
+            return decision
+
+        recent_motion_until = self._recent_motion_priority_until
+        if recent_motion_until is None or now >= recent_motion_until:
+            return decision
+
+        return DisplayGestureEmojiDecision(reason="suppressed_by_recent_motion_gesture")
+
 
 __all__ = [
     "DisplayGestureEmojiDecision",
     "DisplayGestureEmojiPublishResult",
     "DisplayGestureEmojiPublisher",
+    "decision_for_coarse_gesture",
+    "decision_for_fine_hand_gesture",
+    "display_gesture_refresh_supported",
     "derive_display_gesture_emoji",
+    "resolve_display_gesture_refresh_interval",
 ]

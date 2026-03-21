@@ -102,6 +102,7 @@ class AutomationToolBrokerPolicy:
     """Decide which realtime tool handlers background automations may call."""
 
     allowed_tool_names: tuple[str, ...] = (
+        "control_smart_home_entities",
         "inspect_camera",
         "print_receipt",
         "run_self_coding_skill_scheduled",

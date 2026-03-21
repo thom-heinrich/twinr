@@ -24,7 +24,6 @@ from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSample
 from twinr.ops import resolve_ops_paths_for_config
 
-from .cascade import WakewordSequenceCaptureVerifier
 from .evaluation import (
     WakewordEvalEntry,
     WakewordEvalMetrics,
@@ -33,9 +32,11 @@ from .evaluation import (
     load_eval_manifest,
 )
 from .kws import WakewordSherpaOnnxFrameSpotter
+from .local_verifier import build_configured_sequence_capture_verifier
 from .policy import SttWakewordVerifier, WakewordDecisionPolicy, normalize_wakeword_backend
 from .stream import WakewordFrameSpotter
 from .spotter import WakewordOpenWakeWordFrameSpotter
+from .wekws import WakewordWekwsFrameSpotter
 
 _STREAM_CAPTURE_WINDOW_MS = 2500
 _REPORT_DIRNAME = "wakeword_eval"
@@ -236,17 +237,12 @@ def _build_stream_policy(
         getattr(config, "wakeword_primary_backend", config.wakeword_backend),
         default="openwakeword",
     )
-    local_verifier = (
-        None
-        if primary_backend != "openwakeword" or not config.wakeword_openwakeword_sequence_verifier_models
-        else WakewordSequenceCaptureVerifier(
-            verifier_models=dict(config.wakeword_openwakeword_sequence_verifier_models),
-            threshold=config.wakeword_openwakeword_sequence_verifier_threshold,
-        )
-    )
+    local_verifier = build_configured_sequence_capture_verifier(config)
     primary_threshold = (
         float(config.wakeword_kws_keywords_threshold)
         if primary_backend == "kws"
+        else float(config.wakeword_wekws_threshold)
+        if primary_backend == "wekws"
         else float(config.wakeword_openwakeword_threshold)
     )
     return WakewordDecisionPolicy(
@@ -271,9 +267,9 @@ def _build_stream_spotter(
         getattr(config, "wakeword_primary_backend", config.wakeword_backend),
         default="openwakeword",
     )
-    if primary_backend not in {"openwakeword", "kws"}:
+    if primary_backend not in {"openwakeword", "kws", "wekws"}:
         raise ValueError(
-            "Wakeword stream replay currently supports only local detector backends: openwakeword or kws."
+            "Wakeword stream replay currently supports only local detector backends: openwakeword, kws, or wekws."
         )
     if int(config.audio_channels) != 1:
         raise ValueError(
@@ -301,6 +297,20 @@ def _build_stream_spotter(
             num_threads=config.wakeword_kws_num_threads,
             provider=config.wakeword_kws_provider,
             keyword_spotter_factory=model_factory,
+        )
+    if primary_backend == "wekws":
+        return WakewordWekwsFrameSpotter(
+            model_path=config.wakeword_wekws_model_path or "",
+            config_path=config.wakeword_wekws_config_path or "",
+            words_path=config.wakeword_wekws_words_path or "",
+            cmvn_path=config.wakeword_wekws_cmvn_path,
+            phrases=config.wakeword_phrases,
+            project_root=config.project_root,
+            threshold=config.wakeword_wekws_threshold,
+            chunk_ms=config.wakeword_wekws_chunk_ms,
+            num_threads=config.wakeword_wekws_num_threads,
+            provider=config.wakeword_wekws_provider,
+            session_factory=model_factory,
         )
     if int(config.audio_sample_rate) != 16000:
         raise ValueError(

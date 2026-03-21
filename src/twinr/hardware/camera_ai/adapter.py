@@ -15,6 +15,7 @@ from .config import AICameraAdapterConfig, MediaPipeVisionConfig
 from .detection import DetectionResult, capture_detection
 from .face_anchors import OpenCVFaceAnchorDetector, merge_detection_with_face_anchors
 from .imx500_runtime import IMX500RuntimeSessionManager
+from .live_gesture_pipeline import LiveGesturePipeline
 from .mediapipe_pipeline import MediaPipeVisionPipeline
 from .models import (
     AICameraBodyPose,
@@ -78,6 +79,7 @@ class LocalAICameraAdapter:
         self._last_pose_result: PoseResult | None = None
         self._last_pose_box_metrics: dict[str, float] | None = None  # AUDIT-FIX(#3): Reuse cached pose only for the same tracked person.
         self._mediapipe_pipeline: MediaPipeVisionPipeline | None = None
+        self._live_gesture_pipeline: LiveGesturePipeline | None = None
         self._last_motion_box = None
         self._last_motion_person_count = 0
         self._last_motion_at: float | None = None
@@ -195,6 +197,190 @@ class LocalAICameraAdapter:
                 ready=False,
                 ai_ready=False,
                 error=code,
+            )
+        finally:
+            self._lock.release()
+
+    def observe_attention(self) -> AICameraObservation:
+        """Capture one cheap person/anchor-only observation for HDMI eye-follow.
+
+        The local HDMI attention loop must not pay for the full MediaPipe
+        gesture stack on every refresh. This path keeps the same IMX500 person
+        detection and optional face-anchor supplementation, but deliberately
+        skips expensive pose/gesture inference so eye-follow stays reactive even
+        while explicit hand-symbol tuning changes elsewhere.
+        """
+
+        lock_timeout_s = self._lock_timeout_s()
+        if not self._lock.acquire(timeout=lock_timeout_s):
+            return self._health_only_observation(
+                observed_at=self._now(),
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error="camera_lock_timeout",
+            )
+        observed_at = self._now()
+        observed_monotonic = self._monotonic_now()
+        try:
+            try:
+                runtime = self._load_detection_runtime()
+            except Exception as exc:  # pragma: no cover - depends on local environment.
+                code = self._classify_error(exc)
+                logger.warning("Local AI camera attention runtime load failed with %s.", code)
+                logger.debug("Local AI camera attention runtime load exception details.", exc_info=True)
+                self._reset_runtime_state_locked(close_pipeline=False, clear_pose=False, clear_motion=False)
+                return self._health_only_observation(
+                    observed_at=observed_at,
+                    online=False,
+                    ready=False,
+                    ai_ready=False,
+                    error=code,
+                )
+            online_error = self._probe_online(runtime)
+            if online_error is not None:
+                logger.warning("Local AI camera attention online probe failed with %s.", online_error)
+                return self._health_only_observation(
+                    observed_at=observed_at,
+                    online=False,
+                    ready=False,
+                    ai_ready=False,
+                    error=online_error,
+                )
+
+            detection = self._coerce_detection_result(
+                self._capture_detection(runtime, observed_at=observed_at)
+            )
+            frame_rgb = None
+            if self._needs_rgb_frame_for_attention(detection=detection):
+                frame_rgb, _frame_error = self._capture_optional_rgb_frame(
+                    runtime,
+                    observed_at=observed_at,
+                )
+                detection = self._supplement_visible_persons(
+                    detection=detection,
+                    frame_rgb=frame_rgb,
+                )
+            observation = self._compose_observation(
+                observed_at=observed_at,
+                observed_monotonic=observed_monotonic,
+                detection=detection,
+                pose=None,
+                pose_error=None,
+            )
+            return self._with_health(
+                observation,
+                online=True,
+                ready=True,
+                ai_ready=True,
+                error=None,
+                frame_at=observed_at,
+            )
+        except Exception as exc:  # pragma: no cover - hardware and library behavior are environment-dependent.
+            code = self._classify_error(exc)
+            logger.warning("Local AI camera attention observation failed with %s.", code)
+            logger.debug("Local AI camera attention observation exception details.", exc_info=True)
+            return self._health_only_observation(
+                observed_at=observed_at,
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error=code,
+            )
+        finally:
+            self._lock.release()
+
+    def observe_gesture(self) -> AICameraObservation:
+        """Capture one dedicated live-stream gesture observation for HDMI emoji ack.
+
+        This path intentionally bypasses the general pose/social observation
+        pipeline. It reuses the existing RGB preview session, but only feeds the
+        frame into the thin live-stream gesture recognizers so user-facing
+        symbol acknowledgement stays responsive and cannot regress eye-follow.
+        """
+
+        lock_timeout_s = self._lock_timeout_s()
+        if not self._lock.acquire(timeout=lock_timeout_s):
+            return self._health_only_observation(
+                observed_at=self._now(),
+                online=True,
+                ready=False,
+                ai_ready=False,
+                error="camera_lock_timeout",
+            )
+        observed_at = self._now()
+        try:
+            try:
+                runtime = self._load_detection_runtime()
+            except Exception as exc:  # pragma: no cover - depends on local environment.
+                code = self._classify_error(exc)
+                logger.warning("Local AI camera gesture runtime load failed with %s.", code)
+                logger.debug("Local AI camera gesture runtime load exception details.", exc_info=True)
+                self._safe_close_live_gesture_pipeline_locked()
+                self._safe_close_runtime_locked()
+                return self._health_only_observation(
+                    observed_at=observed_at,
+                    online=False,
+                    ready=False,
+                    ai_ready=False,
+                    error=code,
+                )
+            online_error = self._probe_online(runtime)
+            if online_error is not None:
+                logger.warning("Local AI camera gesture online probe failed with %s.", online_error)
+                return self._health_only_observation(
+                    observed_at=observed_at,
+                    online=False,
+                    ready=False,
+                    ai_ready=False,
+                    error=online_error,
+                )
+            try:
+                frame_rgb = self._capture_rgb_frame(runtime, observed_at=observed_at)
+                gesture_observation = self._ensure_live_gesture_pipeline().observe(
+                    frame_rgb=frame_rgb,
+                    observed_at=observed_at,
+                )
+            except Exception as exc:  # pragma: no cover - hardware-dependent path.
+                code = self._classify_error(exc)
+                logger.warning("Local AI camera live gesture observation failed with %s.", code)
+                logger.debug("Local AI camera live gesture exception details.", exc_info=True)
+                self._safe_close_live_gesture_pipeline_locked()
+                self._safe_close_runtime_locked()
+                return self._health_only_observation(
+                    observed_at=observed_at,
+                    online=True,
+                    ready=False,
+                    ai_ready=False,
+                    error=code,
+                )
+
+            observation = AICameraObservation(
+                observed_at=observed_at,
+                camera_online=True,
+                camera_ready=True,
+                camera_ai_ready=True,
+                hand_or_object_near_camera=gesture_observation.hand_count > 0,
+                showing_intent_likely=(
+                    True
+                    if gesture_observation.hand_count > 0
+                    or gesture_observation.fine_hand_gesture != AICameraFineHandGesture.NONE
+                    or gesture_observation.gesture_event != AICameraGestureEvent.NONE
+                    else None
+                ),
+                gesture_event=gesture_observation.gesture_event,
+                gesture_confidence=gesture_observation.gesture_confidence,
+                fine_hand_gesture=gesture_observation.fine_hand_gesture,
+                fine_hand_gesture_confidence=gesture_observation.fine_hand_gesture_confidence,
+                model="local-imx500+mediapipe-live-gesture",
+            )
+            return self._with_health(
+                observation,
+                online=True,
+                ready=True,
+                ai_ready=True,
+                error=None,
+                frame_at=observed_at,
             )
         finally:
             self._lock.release()
@@ -411,6 +597,16 @@ class LocalAICameraAdapter:
         )
         return self._mediapipe_pipeline
 
+    def _ensure_live_gesture_pipeline(self) -> LiveGesturePipeline:
+        """Reuse or create the dedicated live-stream gesture pipeline lazily."""
+
+        if self._live_gesture_pipeline is not None:
+            return self._live_gesture_pipeline
+        self._live_gesture_pipeline = LiveGesturePipeline(
+            config=MediaPipeVisionConfig.from_ai_camera_config(self.config),
+        )
+        return self._live_gesture_pipeline
+
     def _load_detection_runtime(self) -> dict[str, Any]:
         """Preserve the historic detection-runtime override point for tests."""
 
@@ -574,6 +770,16 @@ class LocalAICameraAdapter:
             return True
         return self._face_anchor_detector is not None and detection.person_count < 2
 
+    def _needs_rgb_frame_for_attention(self, *, detection: DetectionResult) -> bool:
+        """Return whether the cheap attention path needs one preview frame.
+
+        Attention-only refresh uses RGB solely for optional face-anchor
+        supplementation when SSD does not already see two people. It never
+        promotes RGB capture to mandatory pose/gesture inference.
+        """
+
+        return self._face_anchor_detector is not None and detection.person_count < 2
+
     def _capture_optional_rgb_frame(
         self,
         runtime: dict[str, Any],
@@ -720,6 +926,7 @@ class LocalAICameraAdapter:
         self._safe_close_runtime_locked()  # AUDIT-FIX(#2): Cleanup must never raise over the primary capture failure.
         if close_pipeline:
             self._safe_close_mediapipe_pipeline_locked()  # AUDIT-FIX(#2): Drop potentially corrupted MediaPipe state before the next attempt.
+            self._safe_close_live_gesture_pipeline_locked()
         if clear_pose:
             self._clear_pose_cache()  # AUDIT-FIX(#3): Reset stale pose cache across runtime failures and close().
         if clear_motion:
@@ -744,6 +951,18 @@ class LocalAICameraAdapter:
             pipeline.close()
         except Exception:  # pragma: no cover - depends on MediaPipe runtime state.
             logger.debug("Ignoring MediaPipe close failure during AI camera cleanup.", exc_info=True)
+
+    def _safe_close_live_gesture_pipeline_locked(self) -> None:
+        """Close the live-stream gesture pipeline without raising."""
+
+        pipeline = self._live_gesture_pipeline
+        self._live_gesture_pipeline = None
+        if pipeline is None:
+            return
+        try:
+            pipeline.close()
+        except Exception:  # pragma: no cover - depends on MediaPipe runtime state.
+            logger.debug("Ignoring live gesture pipeline close failure during AI camera cleanup.", exc_info=True)
 
     def _safe_reset_mediapipe_temporal_state_locked(self) -> None:
         """Reset MediaPipe temporal state without failing observation capture."""

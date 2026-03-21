@@ -16,7 +16,7 @@ from urllib.parse import quote  # AUDIT-FIX(#5): Encode filenames safely when co
 from fastapi import HTTPException
 
 from twinr.agent.base_agent import TwinrConfig
-from twinr.integrations import EMAIL_APP_PASSWORD_ENV_KEY
+from twinr.integrations import EMAIL_APP_PASSWORD_ENV_KEY, HUE_APPLICATION_KEY_ENV_KEY
 from twinr.memory.reminders import format_due_label, now_in_timezone
 from twinr.web.support.store import mask_secret
 
@@ -43,7 +43,9 @@ _WAKEWORD_VERIFIER_MODE_OPTIONS = (
 )
 _EMAIL_PROFILE_OPTIONS = (("gmail", "Gmail"), ("generic_imap_smtp", "Generic IMAP/SMTP"))
 _CALENDAR_SOURCE_OPTIONS = (("ics_file", "ICS file"), ("ics_url", "ICS URL"))
+_SMART_HOME_PROVIDER_OPTIONS = (("hue", "Philips Hue"),)
 _EMAIL_SECRET_KEY = EMAIL_APP_PASSWORD_ENV_KEY
+_HUE_SECRET_KEY = HUE_APPLICATION_KEY_ENV_KEY
 
 _FILE_NOT_FOUND_DETAIL = "File not found"  # AUDIT-FIX(#1,#3): Standardize fail-closed file rejection behavior.
 _UNAVAILABLE_LABEL = "Unavailable"  # AUDIT-FIX(#2): Degrade visibly instead of crashing on malformed reminder state.

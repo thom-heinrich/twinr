@@ -54,6 +54,7 @@ class LocalAICameraObservationProvider:
     """Return bounded local-first camera observations without cloud dependency."""
 
     supports_attention_refresh = True
+    supports_gesture_refresh = True
 
     def __init__(
         self,
@@ -88,6 +89,67 @@ class LocalAICameraObservationProvider:
                 camera_ready=False,
                 camera_ai_ready=False,
                 camera_error="local_ai_camera_provider_failed",
+            )
+
+        social = self._to_social_observation(observation)
+        return ProactiveVisionSnapshot(
+            observation=social,
+            response_text=self._response_text(observation),
+            captured_at=observation.last_camera_frame_at or observation.observed_at,
+            image=None,
+            source_device=self.config.source_device,
+            input_format=self.config.input_format,
+            response_id=None,
+            request_id=None,
+            model=observation.model,
+        )
+
+    def observe_attention(self) -> ProactiveVisionSnapshot:
+        """Capture one low-latency person/anchor snapshot for HDMI eye-follow.
+
+        This path intentionally skips the expensive full gesture/pose stack in
+        the adapter so the display-follow loop stays responsive even when the
+        explicit gesture path is heavier.
+        """
+
+        try:
+            observation = self.adapter.observe_attention()
+        except Exception:  # pragma: no cover - adapter already degrades conservatively.
+            logger.exception("Local AI camera attention provider failed unexpectedly; returning a conservative health snapshot.")
+            observation = AICameraObservation(
+                observed_at=0.0,
+                camera_online=False,
+                camera_ready=False,
+                camera_ai_ready=False,
+                camera_error="local_ai_camera_attention_provider_failed",
+            )
+
+        social = self._to_social_observation(observation)
+        return ProactiveVisionSnapshot(
+            observation=social,
+            response_text=self._response_text(observation),
+            captured_at=observation.last_camera_frame_at or observation.observed_at,
+            image=None,
+            source_device=self.config.source_device,
+            input_format=self.config.input_format,
+            response_id=None,
+            request_id=None,
+            model=observation.model,
+        )
+
+    def observe_gesture(self) -> ProactiveVisionSnapshot:
+        """Capture one low-latency gesture-only snapshot for HDMI emoji ack."""
+
+        try:
+            observation = self.adapter.observe_gesture()
+        except Exception:  # pragma: no cover - adapter already degrades conservatively.
+            logger.exception("Local AI camera gesture provider failed unexpectedly; returning a conservative health snapshot.")
+            observation = AICameraObservation(
+                observed_at=0.0,
+                camera_online=False,
+                camera_ready=False,
+                camera_ai_ready=False,
+                camera_error="local_ai_camera_gesture_provider_failed",
             )
 
         social = self._to_social_observation(observation)
@@ -262,6 +324,7 @@ def _map_fine_hand_gesture(value: AICameraFineHandGesture) -> SocialFineHandGest
         AICameraFineHandGesture.THUMBS_UP: SocialFineHandGesture.THUMBS_UP,
         AICameraFineHandGesture.THUMBS_DOWN: SocialFineHandGesture.THUMBS_DOWN,
         AICameraFineHandGesture.POINTING: SocialFineHandGesture.POINTING,
+        AICameraFineHandGesture.PEACE_SIGN: SocialFineHandGesture.PEACE_SIGN,
         AICameraFineHandGesture.OPEN_PALM: SocialFineHandGesture.OPEN_PALM,
         AICameraFineHandGesture.OK_SIGN: SocialFineHandGesture.OK_SIGN,
         AICameraFineHandGesture.MIDDLE_FINGER: SocialFineHandGesture.MIDDLE_FINGER,

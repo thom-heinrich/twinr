@@ -11,6 +11,7 @@ default, compact, supervisor, first-word, and specialist instruction bundles.
 - encode when the fast supervisor must carry structured `location_hint` / `date_context` fields and when it must escalate memory-dependent turns to fuller context
 - merge time and simple-setting context into tool-lane instruction bundles
 - encode the learned-skill tool policy for self-coding activation, rollback, pause, and reactivation
+- encode when the model should discover, filter, aggregate, control, or inspect smart-home state through the dedicated tool surface
 - expose public builders for default, compact, supervisor, first-word, and specialist lanes
 
 `prompting` does **not** own:

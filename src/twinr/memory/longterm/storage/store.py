@@ -1729,7 +1729,11 @@ class LongTermStructuredStore:
                 # empty provider-context durable section.
                 if direct_payloads and not partitioned[0] and not partitioned[1]:
                     continue
-                return partitioned
+                return self._rescue_underfilled_context_sections(
+                    query_text=clean_query,
+                    partitioned=partitioned,
+                    durable_limit=resolved_durable_limit,
+                )
             try:
                 if not remote_catalog.catalog_available(snapshot_kind="objects"):
                     return (), ()
@@ -1746,10 +1750,14 @@ class LongTermStructuredStore:
                 entries=entries,
                 snapshot_kind="objects",
             )
-            return self._partition_context_objects(
+            return self._rescue_underfilled_context_sections(
                 query_text=clean_query,
-                objects=shared_objects,
-                episodic_limit=resolved_episodic_limit,
+                partitioned=self._partition_context_objects(
+                    query_text=clean_query,
+                    objects=shared_objects,
+                    episodic_limit=resolved_episodic_limit,
+                    durable_limit=resolved_durable_limit,
+                ),
                 durable_limit=resolved_durable_limit,
             )
 
@@ -1775,10 +1783,14 @@ class LongTermStructuredStore:
             selected_ids = selector.search(clean_query, limit=shared_limit)
             by_id = {item.memory_id: item for item in objects}
             selected = tuple(by_id[memory_id] for memory_id in selected_ids if memory_id in by_id)
-            return self._partition_context_objects(
+            return self._rescue_underfilled_context_sections(
                 query_text=clean_query,
-                objects=selected,
-                episodic_limit=resolved_episodic_limit,
+                partitioned=self._partition_context_objects(
+                    query_text=clean_query,
+                    objects=selected,
+                    episodic_limit=resolved_episodic_limit,
+                    durable_limit=resolved_durable_limit,
+                ),
                 durable_limit=resolved_durable_limit,
             )
 
@@ -2033,16 +2045,55 @@ class LongTermStructuredStore:
         )
         return episodic_ranked, durable_ranked
 
+    def _rescue_underfilled_context_sections(
+        self,
+        *,
+        query_text: str,
+        partitioned: tuple[tuple[LongTermMemoryObjectV1, ...], tuple[LongTermMemoryObjectV1, ...]],
+        durable_limit: int,
+    ) -> tuple[tuple[LongTermMemoryObjectV1, ...], tuple[LongTermMemoryObjectV1, ...]]:
+        """Top up durable context when a mixed shared pool starves durable hits.
+
+        Shared episodic/durable search keeps the hot path to one query window,
+        but highly active episodic matches can crowd durable multimodal facts
+        out of that window. When the durable side comes back underfilled, run
+        one bounded durable-only rescue and rerank the merged durable set.
+        """
+
+        episodic_ranked, durable_ranked = partitioned
+        if durable_limit <= 0 or len(durable_ranked) >= durable_limit:
+            return partitioned
+        rescue_candidates = self.select_relevant_objects(
+            query_text=query_text,
+            limit=durable_limit,
+        )
+        if not rescue_candidates:
+            return partitioned
+        merged: list[LongTermMemoryObjectV1] = list(durable_ranked)
+        seen_memory_ids = {item.memory_id for item in durable_ranked}
+        for item in rescue_candidates:
+            if item.memory_id in seen_memory_ids:
+                continue
+            seen_memory_ids.add(item.memory_id)
+            merged.append(item)
+        rescued_durable = self.rank_selected_objects(
+            query_texts=(query_text,),
+            objects=merged,
+            limit=durable_limit,
+        )
+        return episodic_ranked, rescued_durable
+
     def _object_search_text(self, item: LongTermMemoryObjectV1) -> str:
         parts = [
             item.kind,
             item.summary,
             item.details or "",
-            item.slot_key or "",
-            item.value_key or "",
             f"status {item.status}",
             self._object_state_search_text(item),
         ]
+        # Raw storage identifiers leak dates and internal keys like `2026-03-14`
+        # into retrieval. Keep the search text semantic so math/date questions
+        # do not match unrelated memories just because a slot key contains `14`.
         for key, value in (item.attributes or {}).items():
             if key in _NON_SEMANTIC_ATTRIBUTE_KEYS:
                 continue

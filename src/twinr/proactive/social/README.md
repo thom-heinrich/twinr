@@ -19,7 +19,10 @@ scored proactive trigger candidates and optional visual second opinions.
 - Smooth small primary-person center jitter before it reaches the HDMI gaze path, so box wobble does not read as nervous eye movement when the user is standing still
 - Keep that center smoothing short enough for live HDMI HCI, so person-following stays calm without adding second-scale lag
 - Keep the gesture acknowledgement surface fast enough for HDMI HCI, so changed user symbols like `🖐️` then `👍` are not blocked for several seconds by the slower proactive inspect cadence
-- Preserve short explicit fine-hand symbols such as `👍`, `👎`, `👉`, or `👌` across brief motion/dropout jitter so users do not need to freeze unnaturally for the camera path
+- Preserve short explicit fine-hand symbols such as `👍`, `👎`, `👉`, `✌️`, `👌`, or `🖕` across brief motion/dropout jitter so users do not need to freeze unnaturally for the camera path
+- Keep per-symbol fine-hand acceptance configurable and bounded, because `👌` and `🖕` are materially easier to confuse than built-in `👍`, `👎`, `✌️`, or `👉`
+- Keep default confirmation counts tight enough for sub-second HDMI acknowledgement on the Pi; prefer stricter confidence floors over extra confirmation frames whenever a target gesture still needs to feel realtime
+- Let the staged custom gesture model supplement built-in MediaPipe hand symbols instead of globally overriding them, so custom-only `👌` / `🖕` support does not steal `✌️` or `👉` from the built-in recognizer
 - Expose a low-latency ReSpeaker signal-only audio snapshot path for HDMI attention refresh, so local gesture/gaze HCI does not inherit the longer ambient PCM sampling window
 - Route safety prompts and render bounded evidence facts for proactive prompting
 - Buffer recent camera frames and request conservative visual second opinions
@@ -27,7 +30,7 @@ scored proactive trigger candidates and optional visual second opinions.
 `social` does **not** own:
 - Proactive monitor orchestration or worker lifecycle
 - Delivery-governance cooldown policy after a candidate is emitted
-- Conservative fine-hand stabilization for explicit symbols (`thumbs_up`, `thumbs_down`, `pointing`, `ok_sign`): require short confirmation and a minimum confidence before raising user-facing events, then hold only across brief dropouts
+- Fine-hand model training or dataset capture scripts under `hardware/piaicam/`
 - Raw hardware driver implementations outside runtime-facing wrappers
 - Speech delivery, printing, or long-term proactive planning
 
@@ -37,6 +40,7 @@ scored proactive trigger candidates and optional visual second opinions.
 |---|---|
 | `__init__.py` | Package export surface |
 | `camera_surface.py` | Debounced camera snapshot, bounded multi-person anchor surface, coarse motion, and rising-edge coarse/fine gesture event surface |
+| `gesture_calibration.py` | Bounded per-symbol fine-hand calibration profile loaded from `state/mediapipe/gesture_calibration.json` |
 | `engine.py` | Stateful social-trigger scoring engine and normalized vision contract, including visible-person anchor payloads |
 | `local_camera_provider.py` | Maps the local IMX500 + MediaPipe adapter onto the social vision contract, including visible-person anchors, motion, and coarse/fine gesture output |
 | `observers.py` | Audio, ReSpeaker overlay, and vision observation providers |

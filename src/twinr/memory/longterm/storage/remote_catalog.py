@@ -53,10 +53,12 @@ _DEFAULT_RETRIEVE_BATCH_SIZE = 500
 _DEFAULT_REMOTE_READ_MAX_WORKERS = 4
 _DEFAULT_REMOTE_READ_TIMEOUT_S = 8.0
 _DEFAULT_REMOTE_WRITE_TIMEOUT_S = 15.0
+_DEFAULT_REMOTE_FLUSH_TIMEOUT_S = 60.0
 _DEFAULT_REMOTE_RETRY_ATTEMPTS = 3
 _DEFAULT_REMOTE_RETRY_BACKOFF_S = 1.0
 _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_S = 20.0
-_DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S = 45.0
+_DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_S = 20.0
+_DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S = 180.0
 _DEFAULT_ASYNC_ATTESTATION_POLL_S = 0.05
 _ALLOWED_DOC_IDS_RETRIEVE_QUERY = "__allowed_doc_ids__"
 _CATALOG_ENTRY_TEXT_FIELDS = (
@@ -1691,10 +1693,11 @@ class LongTermRemoteCatalogStore:
         total_batches = len(batches)
         for index, batch in enumerate(batches):
             request_correlation_id = self._new_remote_write_correlation_id()
+            async_job_timeout_s = self._remote_async_job_timeout_s()
             request = ChonkyDBBulkRecordRequest(
                 items=tuple(batch),
                 execution_mode="async",
-                timeout_seconds=self._remote_write_timeout_s(),
+                timeout_seconds=async_job_timeout_s,
                 client_request_id=request_correlation_id,
                 finalize_vector_segments=index + 1 >= len(batches),
             )
@@ -1771,12 +1774,45 @@ class LongTermRemoteCatalogStore:
         return len(json.dumps(request.to_payload(), ensure_ascii=False).encode("utf-8"))
 
     def _remote_write_timeout_s(self) -> float | None:
+        """Return the HTTP transport timeout for write-bound ChonkyDB calls."""
+
         config = getattr(getattr(self, "remote_state", None), "config", None)
         try:
             timeout_s = float(getattr(config, "long_term_memory_remote_write_timeout_s", None))
         except (TypeError, ValueError):
             return None
         return timeout_s if timeout_s > 0.0 else None
+
+    def _remote_flush_timeout_s(self) -> float:
+        """Return the end-to-end remote flush budget for one memory persist."""
+
+        config = getattr(getattr(self, "remote_state", None), "config", None)
+        try:
+            timeout_s = float(
+                getattr(
+                    config,
+                    "long_term_memory_remote_flush_timeout_s",
+                    _DEFAULT_REMOTE_FLUSH_TIMEOUT_S,
+                )
+            )
+        except (TypeError, ValueError):
+            timeout_s = _DEFAULT_REMOTE_FLUSH_TIMEOUT_S
+        return max(0.05, float(timeout_s))
+
+    def _remote_async_job_timeout_s(self) -> float | None:
+        """Return the server-side async job budget for accepted bulk writes.
+
+        The write client timeout bounds only the HTTP submission and job-status
+        polling calls. The accepted async ChonkyDB ingest job itself must use
+        the broader remote flush budget; reusing the transport timeout here
+        causes accepted jobs to fail server-side with `payload_sync_bulk_timeout`
+        before Twinr can attest readback.
+        """
+
+        transport_timeout_s = self._remote_write_timeout_s()
+        flush_timeout_s = self._remote_flush_timeout_s()
+        candidate = max(flush_timeout_s, transport_timeout_s or 0.0)
+        return candidate if candidate > 0.0 else None
 
     def _remote_retry_attempts(self) -> int:
         config = getattr(getattr(self, "remote_state", None), "config", None)
@@ -1795,19 +1831,40 @@ class LongTermRemoteCatalogStore:
         return min(30.0, max(0.0, resolved))
 
     def _async_attestation_visibility_timeout_s(self) -> float:
+        """Return the bounded same-URI readback window for accepted async writes."""
+
         config = getattr(getattr(self, "remote_state", None), "config", None)
         try:
             read_timeout_s = float(getattr(config, "long_term_memory_remote_read_timeout_s", _DEFAULT_REMOTE_READ_TIMEOUT_S))
         except (TypeError, ValueError):
             read_timeout_s = _DEFAULT_REMOTE_READ_TIMEOUT_S
-        try:
-            write_timeout_s = float(getattr(config, "long_term_memory_remote_write_timeout_s", _DEFAULT_REMOTE_WRITE_TIMEOUT_S))
-        except (TypeError, ValueError):
-            write_timeout_s = _DEFAULT_REMOTE_WRITE_TIMEOUT_S
+        write_timeout_s = self._remote_write_timeout_s() or _DEFAULT_REMOTE_WRITE_TIMEOUT_S
         candidate = max(
             _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_S,
             read_timeout_s,
+            write_timeout_s,
             min(write_timeout_s * 2.0, _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S),
+        )
+        return min(
+            _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S,
+            max(_DEFAULT_ASYNC_ATTESTATION_POLL_S, candidate),
+        )
+
+    def _async_job_visibility_timeout_s(self) -> float:
+        """Return the bounded window for async job completion plus document-id readback."""
+
+        config = getattr(getattr(self, "remote_state", None), "config", None)
+        try:
+            read_timeout_s = float(getattr(config, "long_term_memory_remote_read_timeout_s", _DEFAULT_REMOTE_READ_TIMEOUT_S))
+        except (TypeError, ValueError):
+            read_timeout_s = _DEFAULT_REMOTE_READ_TIMEOUT_S
+        flush_timeout_s = self._remote_flush_timeout_s()
+        async_job_timeout_s = self._remote_async_job_timeout_s() or flush_timeout_s
+        candidate = max(
+            _DEFAULT_ASYNC_JOB_VISIBILITY_TIMEOUT_S,
+            read_timeout_s,
+            flush_timeout_s,
+            async_job_timeout_s + read_timeout_s,
         )
         return min(
             _DEFAULT_ASYNC_ATTESTATION_VISIBILITY_TIMEOUT_CAP_S,
@@ -1853,7 +1910,7 @@ class LongTermRemoteCatalogStore:
         if not job_id or not callable(job_status):
             return None
         poll_interval_s = max(self._remote_retry_backoff_s(), _DEFAULT_ASYNC_ATTESTATION_POLL_S)
-        total_timeout_s = self._async_attestation_visibility_timeout_s()
+        total_timeout_s = self._async_job_visibility_timeout_s()
         attempts = max(1, int(math.ceil(total_timeout_s / poll_interval_s)))
         last_failure_detail = "async job did not expose document ids"
         for attempt in range(attempts):

@@ -6,6 +6,7 @@ visibility: internal
 summary: Provide bounded audio, GPIO, camera, printer, voice-profile, and local household-identity adapters for Twinr runtime paths.
 owned_concerns:
   - Capture and play bounded audio for conversation, ambient sensing, and wakeword flows
+  - Lift under-driven PCM16 wakeword-ack playback before it reaches the Pi speaker path so mixer-maxed devices still answer audibly
   - Prove bounded readable-frame microphone capture before runtime layers trust a targeted input path as voice-ready
   - Keep ALSA child-process env independent from borrowed Wayland/user-session sockets when the Pi runtime runs under a different UID than the visible desktop session
   - Monitor GPIO buttons and PIR motion across supported Pi backends

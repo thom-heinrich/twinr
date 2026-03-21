@@ -1,8 +1,9 @@
 """Evaluate whether a finished exchange should keep follow-up listening open.
 
-The closure evaluator asks a tool-calling provider for a structured decision
-after Twinr has already responded. It keeps the prompt bounded and coerces
-model output into a safe ``ConversationClosureDecision`` shape.
+The closure layer keeps the post-response prompt bounded and can route the
+decision through either the legacy tool-calling path or a faster structured
+decision provider. Both paths are coerced into the same safe
+``ConversationClosureDecision`` shape for workflow consumers.
 """
 
 from __future__ import annotations
@@ -12,10 +13,15 @@ from dataclasses import dataclass
 from threading import Event, Thread
 import inspect
 import json
-import time
+from typing import Protocol, runtime_checkable
 
 from twinr.agent.base_agent.config import TwinrConfig
-from twinr.agent.base_agent.contracts import ConversationLike, ToolCallingAgentProvider
+from twinr.agent.base_agent.contracts import (
+    ConversationClosureProvider,
+    ConversationClosureProviderDecision,
+    ConversationLike,
+    ToolCallingAgentProvider,
+)
 from twinr.agent.base_agent.prompting.personality import load_conversation_closure_instructions
 from twinr.agent.personality.steering import ConversationTurnSteeringCue, serialize_turn_steering_cues
 from twinr.agent.base_agent.conversation.turn_controller import (
@@ -91,23 +97,9 @@ class ConversationClosureEvaluation:
     turn_steering_cues: tuple[ConversationTurnSteeringCue, ...] = ()
 
 
-class ToolCallingConversationClosureEvaluator:
-    """Ask a tool-calling provider for a structured closure decision.
-
-    The evaluator summarizes the just-finished exchange, loads dedicated
-    closure instructions, and accepts either tool arguments or JSON text as the
-    provider response format.
-    """
-
-    def __init__(
-        self,
-        *,
-        config: TwinrConfig,
-        provider: ToolCallingAgentProvider,
-    ) -> None:
-        self.config = config
-        self.provider = provider
-        self._provider_timeout_kwarg_name = self._detect_provider_timeout_kwarg()
+@runtime_checkable
+class ConversationClosureEvaluator(Protocol):
+    """Protocol for runtime evaluators that return closure decisions."""
 
     def evaluate(
         self,
@@ -119,24 +111,22 @@ class ToolCallingConversationClosureEvaluator:
         conversation: ConversationLike | None = None,
         turn_steering_cues: Sequence[ConversationTurnSteeringCue] = (),
     ) -> ConversationClosureDecision:
-        """Evaluate whether Twinr should close follow-up listening now.
+        ...
 
-        Args:
-            user_transcript: Final user transcript for the just-finished turn.
-            assistant_response: Assistant response that was spoken or prepared.
-            request_source: Origin of the exchange, such as ``button``.
-            proactive_trigger: Optional proactive trigger name that opened the
-                exchange.
-            conversation: Optional recent conversation history for context.
-            turn_steering_cues: Current machine-readable steering cues that may
-                map the exchange onto a shared thread or a cooling topic.
 
-        Returns:
-            A bounded structured decision describing whether follow-up listening
-            should stop after this response.
-        """
+class _ConversationClosureEvaluatorBase:
+    """Shared prompt assembly and coercion helpers for closure evaluators."""
 
-        compact_conversation = _compact_conversation(
+    def __init__(self, *, config: TwinrConfig) -> None:
+        self.config = config
+
+    def _compact_conversation(
+        self,
+        conversation: ConversationLike | None,
+    ) -> tuple[tuple[str, str], ...]:
+        """Build the bounded recent-turn context for one closure decision."""
+
+        return _compact_conversation(
             conversation,
             max_turns=_config_int(
                 self.config,
@@ -154,42 +144,6 @@ class ToolCallingConversationClosureEvaluator:
             ),
             max_total_chars=8192,
         )
-        prompt = self._build_prompt(
-            user_transcript=user_transcript,
-            assistant_response=assistant_response,
-            request_source=request_source,
-            proactive_trigger=proactive_trigger,
-            conversation=compact_conversation,
-            turn_steering_cues=turn_steering_cues,
-        )
-        timeout_seconds = _config_float(
-            self.config,
-            "conversation_closure_provider_timeout_seconds",
-            _DEFAULT_PROVIDER_TIMEOUT_SECONDS,
-            minimum=0.25,
-            maximum=15.0,
-        )
-        provider_kwargs: dict[str, object] = {}
-        if self._provider_timeout_kwarg_name is not None:
-            provider_kwargs[self._provider_timeout_kwarg_name] = timeout_seconds
-        response = self._start_turn_streaming_with_watchdog(
-            prompt=prompt,
-            compact_conversation=compact_conversation,
-            timeout_seconds=timeout_seconds,
-            provider_kwargs=provider_kwargs,
-        )
-        tool_calls = getattr(response, "tool_calls", ()) or ()
-        for tool_call in tool_calls:
-            if _coerce_text(getattr(tool_call, "name", ""), max_chars=64) != "submit_closure_decision":
-                continue
-            raw_arguments = getattr(tool_call, "arguments", {})
-            if isinstance(raw_arguments, dict):
-                payload = raw_arguments
-            else:
-                payload = _extract_json_object(raw_arguments) or {}
-            return self._coerce_decision(payload)
-        payload = _extract_json_object(getattr(response, "text", "")) or {}
-        return self._coerce_decision(payload)
 
     def _build_prompt(
         self,
@@ -258,6 +212,30 @@ class ToolCallingConversationClosureEvaluator:
             matched_topics=self._coerce_matched_topics(payload.get("matched_topics")),
         )
 
+    def _coerce_provider_decision(
+        self,
+        decision: ConversationClosureProviderDecision,
+    ) -> ConversationClosureDecision:
+        """Normalize one provider-native decision into the runtime contract."""
+
+        return ConversationClosureDecision(
+            close_now=bool(decision.close_now),
+            confidence=_coerce_probability(decision.confidence, default=0.0),
+            reason=_coerce_text(
+                decision.reason,
+                default="closure_controller_fallback",
+                max_chars=_config_int(
+                    self.config,
+                    "conversation_closure_max_reason_chars",
+                    _DEFAULT_MAX_REASON_CHARS,
+                    minimum=32,
+                    maximum=1024,
+                ),
+            )
+            or "closure_controller_fallback",
+            matched_topics=self._coerce_matched_topics(decision.matched_topics),
+        )
+
     def _coerce_matched_topics(self, value: object) -> tuple[str, ...]:
         """Coerce matched topic titles into a bounded normalized tuple."""
 
@@ -280,6 +258,138 @@ class ToolCallingConversationClosureEvaluator:
                 break
         return tuple(topics)
 
+    def _provider_timeout_seconds(self) -> float:
+        """Return the bounded provider budget for one closure request."""
+
+        return _config_float(
+            self.config,
+            "conversation_closure_provider_timeout_seconds",
+            _DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+            minimum=0.25,
+            maximum=15.0,
+        )
+
+    def _call_with_watchdog(
+        self,
+        *,
+        timeout_seconds: float,
+        target_name: str,
+        call,
+    ):
+        """Bound closure-model latency even when an adapter blocks too long."""
+
+        done = Event()
+        response_holder: list[object] = []
+        error_holder: list[BaseException] = []
+
+        def _worker() -> None:
+            try:
+                response_holder.append(call())
+            except BaseException as exc:
+                error_holder.append(exc)
+            finally:
+                done.set()
+
+        worker = Thread(
+            target=_worker,
+            daemon=True,
+            name=f"twinr-{target_name}",
+        )
+        worker.start()
+        if not done.wait(timeout_seconds):
+            raise TimeoutError(
+                f"Conversation closure evaluation exceeded {timeout_seconds:.2f}s"
+            )
+        if error_holder:
+            raise error_holder[0]
+        if not response_holder:
+            raise RuntimeError("Conversation closure evaluation returned no response")
+        return response_holder[0]
+
+
+class ToolCallingConversationClosureEvaluator(_ConversationClosureEvaluatorBase):
+    """Ask a tool-calling provider for a structured closure decision.
+
+    The evaluator summarizes the just-finished exchange, loads dedicated
+    closure instructions, and accepts either tool arguments or JSON text as the
+    provider response format.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: TwinrConfig,
+        provider: ToolCallingAgentProvider,
+    ) -> None:
+        super().__init__(config=config)
+        self.provider = provider
+        self._provider_timeout_kwarg_name = self._detect_provider_timeout_kwarg()
+
+    def evaluate(
+        self,
+        *,
+        user_transcript: str,
+        assistant_response: str,
+        request_source: str,
+        proactive_trigger: str | None = None,
+        conversation: ConversationLike | None = None,
+        turn_steering_cues: Sequence[ConversationTurnSteeringCue] = (),
+    ) -> ConversationClosureDecision:
+        """Evaluate whether Twinr should close follow-up listening now.
+
+        Args:
+            user_transcript: Final user transcript for the just-finished turn.
+            assistant_response: Assistant response that was spoken or prepared.
+            request_source: Origin of the exchange, such as ``button``.
+            proactive_trigger: Optional proactive trigger name that opened the
+                exchange.
+            conversation: Optional recent conversation history for context.
+            turn_steering_cues: Current machine-readable steering cues that may
+                map the exchange onto a shared thread or a cooling topic.
+
+        Returns:
+            A bounded structured decision describing whether follow-up listening
+            should stop after this response.
+        """
+
+        compact_conversation = self._compact_conversation(conversation)
+        prompt = self._build_prompt(
+            user_transcript=user_transcript,
+            assistant_response=assistant_response,
+            request_source=request_source,
+            proactive_trigger=proactive_trigger,
+            conversation=compact_conversation,
+            turn_steering_cues=turn_steering_cues,
+        )
+        timeout_seconds = self._provider_timeout_seconds()
+        provider_kwargs: dict[str, object] = {}
+        if self._provider_timeout_kwarg_name is not None:
+            provider_kwargs[self._provider_timeout_kwarg_name] = timeout_seconds
+        response = self._call_with_watchdog(
+            timeout_seconds=timeout_seconds,
+            target_name="closure-evaluator",
+            call=lambda: self.provider.start_turn_streaming(
+                prompt,
+                conversation=compact_conversation,
+                instructions=load_conversation_closure_instructions(self.config),
+                tool_schemas=(_CLOSURE_DECISION_TOOL_SCHEMA,),
+                allow_web_search=False,
+                **provider_kwargs,
+            ),
+        )
+        tool_calls = getattr(response, "tool_calls", ()) or ()
+        for tool_call in tool_calls:
+            if _coerce_text(getattr(tool_call, "name", ""), max_chars=64) != "submit_closure_decision":
+                continue
+            raw_arguments = getattr(tool_call, "arguments", {})
+            if isinstance(raw_arguments, dict):
+                payload = raw_arguments
+            else:
+                payload = _extract_json_object(raw_arguments) or {}
+            return self._coerce_decision(payload)
+        payload = _extract_json_object(getattr(response, "text", "")) or {}
+        return self._coerce_decision(payload)
+
     def _detect_provider_timeout_kwarg(self) -> str | None:
         try:
             signature = inspect.signature(self.provider.start_turn_streaming)
@@ -294,49 +404,49 @@ class ToolCallingConversationClosureEvaluator:
             return "timeout_seconds"
         return None
 
-    def _start_turn_streaming_with_watchdog(
+
+class StructuredConversationClosureEvaluator(_ConversationClosureEvaluatorBase):
+    """Ask a structured decision provider for one fast closure decision."""
+
+    def __init__(
         self,
         *,
-        prompt: str,
-        compact_conversation: tuple[tuple[str, str], ...],
-        timeout_seconds: float,
-        provider_kwargs: dict[str, object],
-    ):
-        """Bound closure-model latency even when adapters ignore timeout kwargs."""
+        config: TwinrConfig,
+        provider: ConversationClosureProvider,
+    ) -> None:
+        super().__init__(config=config)
+        self.provider = provider
 
-        done = Event()
-        response_holder: list[object] = []
-        error_holder: list[BaseException] = []
-
-        def _worker() -> None:
-            try:
-                response_holder.append(
-                    self.provider.start_turn_streaming(
-                        prompt,
-                        conversation=compact_conversation,
-                        instructions=load_conversation_closure_instructions(self.config),
-                        tool_schemas=(_CLOSURE_DECISION_TOOL_SCHEMA,),
-                        allow_web_search=False,
-                        **provider_kwargs,
-                    )
-                )
-            except BaseException as exc:
-                error_holder.append(exc)
-            finally:
-                done.set()
-
-        worker = Thread(
-            target=_worker,
-            daemon=True,
-            name="twinr-closure-evaluator",
+    def evaluate(
+        self,
+        *,
+        user_transcript: str,
+        assistant_response: str,
+        request_source: str,
+        proactive_trigger: str | None = None,
+        conversation: ConversationLike | None = None,
+        turn_steering_cues: Sequence[ConversationTurnSteeringCue] = (),
+    ) -> ConversationClosureDecision:
+        compact_conversation = self._compact_conversation(conversation)
+        prompt = self._build_prompt(
+            user_transcript=user_transcript,
+            assistant_response=assistant_response,
+            request_source=request_source,
+            proactive_trigger=proactive_trigger,
+            conversation=compact_conversation,
+            turn_steering_cues=turn_steering_cues,
         )
-        worker.start()
-        if not done.wait(timeout_seconds):
-            raise TimeoutError(
-                f"Conversation closure evaluation exceeded {timeout_seconds:.2f}s"
-            )
-        if error_holder:
-            raise error_holder[0]
-        if not response_holder:
-            raise RuntimeError("Conversation closure evaluation returned no response")
-        return response_holder[0]
+        timeout_seconds = self._provider_timeout_seconds()
+        decision = self._call_with_watchdog(
+            timeout_seconds=timeout_seconds,
+            target_name="closure-decision",
+            call=lambda: self.provider.decide(
+                prompt,
+                conversation=compact_conversation,
+                instructions=load_conversation_closure_instructions(self.config),
+                timeout_seconds=timeout_seconds,
+            ),
+        )
+        if not isinstance(decision, ConversationClosureProviderDecision):
+            raise RuntimeError("Conversation closure decision provider returned an invalid result")
+        return self._coerce_provider_decision(decision)

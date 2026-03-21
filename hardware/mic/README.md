@@ -35,6 +35,14 @@ sudo ./hardware/mic/setup_respeaker_access.sh
 `setup_audio.sh` now also resets the selected playback sink plus the target
 card's playback mixer controls to audible defaults so a newly selected
 ReSpeaker output does not stay effectively muted by inherited low volume.
+After normalizing those ALSA playback controls it also stores the card state,
+so a later re-enumeration or service restart does not restore the old muted
+profile.
+When it can resolve the target capture card by name, it also persists
+`TWINR_AUDIO_INPUT_DEVICE` as an explicit `plughw:CARD=...,DEV=...` path so
+the normal conversation recorder does not drift back onto a stale generic
+`default` alias while wakeword/proactive capture already uses the real
+ReSpeaker device.
 Pass `--skip-playback-volume` only when you intentionally want to keep the
 current sink/card loudness unchanged.
 

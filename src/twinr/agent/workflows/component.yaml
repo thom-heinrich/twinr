@@ -7,6 +7,8 @@ summary: Orchestrate the active realtime and streaming Twinr hardware loops plus
 owned_concerns:
   - Orchestrate button, wakeword, and proactive entry points for Twinr hardware loops
   - Coordinate live conversation sessions, print delivery, and bounded speech output
+  - Cache and replay one normalized wakeword-ack payload so the Pi confirmation voice stays audible without widening broader speech policy
+  - Start one bounded managed smart-home sensor worker and feed its normalized observations into the realtime sensor path
   - Hold fatal loop/bootstrap failures in a stable runtime error state so the Pi display companion and supervisor do not flap back to the desktop
   - Forward completed tool-call history into runtime-side personality learning after turn finalization
   - Keep turn-guidance context shaping and transcript-verifier gate policy outside the active loop classes
@@ -36,7 +38,7 @@ files:
     exports:
       - TwinrHardwareLoop
   - path: realtime_runner.py
-    role: Realtime session loop with wakeword and print-lane orchestration that delegates guidance and transcript verification
+    role: Realtime session loop with wakeword, print-lane, and smart-home sensor-worker orchestration that delegates guidance and transcript verification
     exports:
       - TwinrRealtimeHardwareLoop
   - path: streaming_runner.py
@@ -115,7 +117,7 @@ files:
     exports:
       - TwinrRealtimeSupportMixin
   - path: realtime_runner_tools.py
-    role: Thin realtime tool-callback delegate mixin, including RSS/world-intelligence configuration wiring
+    role: Thin realtime tool-callback delegate mixin, including smart-home and RSS/world-intelligence wiring
     exports:
       - TwinrRealtimeToolDelegatesMixin
   - path: button_dispatch.py

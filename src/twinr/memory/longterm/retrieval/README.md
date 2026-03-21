@@ -8,11 +8,14 @@ personalization cues for a single user turn.
 `retrieval` owns:
 - assemble durable, episodic, mid-term, graph, and conflict context
 - merge original-language and canonical-English query variants during store-backed recall so optional rewrites improve recall without suppressing same-language memories
+- keep that cross-variant merge bounded but wide enough that a noisy first-language hit set does not starve better canonical-query episodic or durable matches before reranking
 - rerank durable recall across merged query variants so confirmed/current facts surface ahead of generic siblings for meta-memory questions
+- rerank episodic recall across merged query variants as well, so recent distractors from the first query wording do not crowd out the actually relevant episode carried by a later canonical rewrite
 - compile adaptive mid-term policy hints from confirmed memory, recurring routines, and proactive success/skip history
 - compile explicit confirmed response-channel policy packets so confirmed ReSpeaker-derived channel preferences can guide later delivery behavior without promoting mere observations
 - compile persistent restart-recall policy packets from stable durable memories so fresh runtime roots retain a small provenance-rich continuity layer
-- compile and render silent personalization cues from graph and episodic memory
+- surface room-agnostic smart-home environment reflections and recent environment packets as ambient behavior context while preserving their uncertainty markers
+- compile and render silent personalization cues from graph and episodic memory, including graph-only turns where no episodic match is available
 - opportunistically reuse or background-build expensive silent subtext packets so live foreground turns do not stall on cold personalization compilation
 - sanitize recalled memory payloads before prompt serialization or optional LLM use
 - reject compiled personalization payloads that leak schema/JSON/markup structure and fall back to the static subtext path instead of injecting corrupted hidden guidance
@@ -23,12 +26,17 @@ personalization cues for a single user turn.
 - extract, consolidate, or resolve memory objects
 - runtime/service orchestration outside retrieval-specific helpers
 
+Smart-home environment entries are ambient behavior signals, not diagnoses.
+Retrieval must preserve quality flags and blockers from
+`smart_home_environment` memories and must not expand them into raw sensor
+dumps.
+
 ## Key files
 
 | File | Purpose |
 |---|---|
 | `__init__.py` | Package marker |
-| `retriever.py` | Context assembly |
+| `retriever.py` | Context assembly, including environment-aware durable and midterm rendering |
 | `adaptive_policy.py` | Adaptive prompt-policy compiler from stored long-term signals, including confirmed response-channel preference packets |
 | `restart_recall_policy.py` | Persistent restart-recall packet compiler from stable durable memory |
 | `operator_search.py` | Read-only operator search over the real long-term retrieval stack |

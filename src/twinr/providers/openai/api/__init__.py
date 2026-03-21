@@ -8,6 +8,7 @@ only when working inside the OpenAI provider package itself.
 
 from .adapters import (
     OpenAIAgentTextProvider,
+    OpenAIConversationClosureDecisionProvider,
     OpenAIFirstWordProvider,
     OpenAIProviderBundle,
     OpenAISpeechToTextProvider,
@@ -20,6 +21,7 @@ from .backend import OpenAIBackend
 __all__ = [
     "OpenAIAgentTextProvider",
     "OpenAIBackend",
+    "OpenAIConversationClosureDecisionProvider",
     "OpenAIFirstWordProvider",
     "OpenAIProviderBundle",
     "OpenAISpeechToTextProvider",

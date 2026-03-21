@@ -128,12 +128,17 @@ class OpenAIStructuredReflectionProgram:
             return _empty_reflection_result()
 
         object_payload = [_memory_object_to_prompt_payload(item) for item in objects]
+        source_payload_by_memory_id = {
+            memory_id: dict(payload)
+            for payload in object_payload
+            for memory_id in (
+                _normalize_single_line_string(payload.get("memory_id"), max_length=_MAX_IDENTIFIER_LENGTH),
+            )
+            if memory_id is not None
+        }
         valid_memory_ids = {
             memory_id
-            for memory_id in (
-                _normalize_single_line_string(payload.get("memory_id"), max_length=_MAX_IDENTIFIER_LENGTH)
-                for payload in object_payload
-            )
+            for memory_id in source_payload_by_memory_id
             if memory_id is not None
         }
         resolved_model = self.model or _normalize_single_line_string(
@@ -204,6 +209,7 @@ class OpenAIStructuredReflectionProgram:
             raw_result,
             valid_memory_ids=valid_memory_ids,
             packet_limit=effective_packet_limit,
+            source_payload_by_memory_id=source_payload_by_memory_id,
         )
 
 
@@ -391,6 +397,7 @@ def _normalize_reflection_result(
     *,
     valid_memory_ids: set[str],
     packet_limit: int,
+    source_payload_by_memory_id: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object]:
     if packet_limit <= 0:
         return _empty_reflection_result()
@@ -460,6 +467,11 @@ def _normalize_reflection_result(
             raw_packet.get("query_hints"),
             max_items=_MAX_QUERY_HINTS,
             max_item_length=_MAX_QUERY_HINT_LENGTH,
+        )
+        query_hints = _augment_query_hints_from_source_payloads(
+            query_hints=query_hints,
+            source_memory_ids=source_memory_ids,
+            source_payload_by_memory_id=source_payload_by_memory_id,
         )
         valid_from = _normalize_optional_datetime_string(raw_packet.get("valid_from"))
         valid_to = _normalize_optional_datetime_string(raw_packet.get("valid_to"))
@@ -662,6 +674,74 @@ def _normalize_string_list(
         if len(normalized) >= max_items:
             break
     return normalized
+
+
+def _augment_query_hints_from_source_payloads(
+    *,
+    query_hints: list[str],
+    source_memory_ids: list[str],
+    source_payload_by_memory_id: Mapping[str, Mapping[str, object]],
+) -> list[str]:
+    """Preserve source-language retrieval cues alongside canonical packet text.
+
+    Midterm packets intentionally keep summary/details in canonical English, but
+    first-turn retrieval may still arrive in the user's original language before
+    the optional background query rewrite completes. Grounding query hints in
+    the cited source memories keeps those packets retrievable immediately
+    without depending on rewrite timing.
+    """
+
+    if len(query_hints) >= _MAX_QUERY_HINTS or not source_memory_ids:
+        return query_hints
+    normalized = list(query_hints)
+    seen = {item.casefold() for item in normalized}
+    for source_memory_id in source_memory_ids:
+        payload = source_payload_by_memory_id.get(source_memory_id)
+        if not isinstance(payload, ABCMapping):
+            continue
+        for candidate in _source_payload_query_hints(payload):
+            key = candidate.casefold()
+            if key in seen:
+                continue
+            normalized.append(candidate)
+            seen.add(key)
+            if len(normalized) >= _MAX_QUERY_HINTS:
+                return normalized
+    return normalized
+
+
+def _source_payload_query_hints(payload: Mapping[str, object]) -> tuple[str, ...]:
+    """Extract bounded source-language hint strings from one grounded object."""
+
+    candidates: list[str] = []
+    for field in ("summary", "details"):
+        candidate = _normalize_single_line_string(
+            payload.get(field),
+            max_length=_MAX_QUERY_HINT_LENGTH,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    raw_attributes = payload.get("attributes")
+    if isinstance(raw_attributes, ABCMapping):
+        for value in raw_attributes.values():
+            if isinstance(value, str):
+                candidate = _normalize_single_line_string(
+                    value,
+                    max_length=_MAX_QUERY_HINT_LENGTH,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if not isinstance(item, str):
+                        continue
+                    candidate = _normalize_single_line_string(
+                        item,
+                        max_length=_MAX_QUERY_HINT_LENGTH,
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
+    return tuple(candidates)
 
 
 def _parse_aware_datetime(value: str) -> datetime | None:

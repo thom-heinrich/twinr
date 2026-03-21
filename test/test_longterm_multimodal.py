@@ -98,6 +98,52 @@ def _sensor_facts() -> dict[str, object]:
     }
 
 
+def _smart_home_sensor_facts() -> dict[str, object]:
+    return {
+        "pir": {
+            "motion_detected": False,
+            "low_motion": True,
+            "no_motion_for_s": 30.0,
+        },
+        "camera": {
+            "person_visible": False,
+            "person_visible_for_s": 0.0,
+            "looking_toward_device": False,
+            "body_pose": "unknown",
+            "smiling": False,
+            "hand_or_object_near_camera": False,
+            "hand_or_object_near_camera_for_s": 0.0,
+        },
+        "smart_home": {
+            "motion_detected": True,
+            "motion_entity_ids": ["route:192.168.178.22:motion-node-1"],
+            "offline_entity_ids": ["route:192.168.178.22:motion-node-2"],
+            "recent_events": [
+                {
+                    "event_id": "route-event:192.168.178.22:evt-1",
+                    "provider": "hue",
+                    "entity_id": "route:192.168.178.22:motion-node-1",
+                    "event_kind": "motion_detected",
+                    "observed_at": "2026-03-19T08:00:00Z",
+                    "label": "Esszimmer 1",
+                    "area": "Erdgeschoss",
+                    "details": {"route_id": "192.168.178.22"},
+                },
+                {
+                    "event_id": "route-event:192.168.178.22:evt-2",
+                    "provider": "hue",
+                    "entity_id": "route:192.168.178.22:motion-node-2",
+                    "event_kind": "device_offline",
+                    "observed_at": "2026-03-19T08:01:00Z",
+                    "label": "Flur Sensor",
+                    "area": "Erdgeschoss",
+                    "details": {"route_id": "192.168.178.22"},
+                },
+            ],
+        },
+    }
+
+
 def _respeaker_sensor_facts(
     *,
     observed_at: float = 8.0,
@@ -380,6 +426,43 @@ class LongTermMultimodalTests(unittest.TestCase):
         self.assertEqual(attrs["captured_at"], 8.0)
         self.assertNotIn("pcm_bytes", episode.details or "")
         self.assertNotIn("raw_audio", episode.details or "")
+
+    def test_multimodal_extractor_emits_room_agnostic_smart_home_motion_and_health_seeds(self) -> None:
+        extractor = LongTermMultimodalExtractor()
+        evidence = LongTermMultimodalEvidence(
+            event_name="sensor_observation",
+            modality="sensor",
+            source="proactive_monitor",
+            message="Changed multimodal sensor observation recorded.",
+            data={
+                "facts": _smart_home_sensor_facts(),
+                "event_names": ["smart_home.motion_detected", "smart_home.device_offline"],
+            },
+            created_at=datetime(2026, 3, 19, 8, 2, tzinfo=timezone.utc),
+        )
+
+        extraction = extractor.extract_evidence(evidence)
+        motion = next(
+            item
+            for item in extraction.candidate_objects
+            if (item.attributes or {}).get("environment_signal_type") == "motion_node_activity"
+        )
+        health = next(
+            item
+            for item in extraction.candidate_objects
+            if (item.attributes or {}).get("environment_signal_type") == "node_health"
+        )
+
+        self.assertIn("pattern:smart_home_node_activity:", motion.memory_id)
+        self.assertEqual((motion.attributes or {}).get("node_id"), "route:192.168.178.22:motion-node-1")
+        self.assertEqual((motion.attributes or {}).get("provider_label"), "Esszimmer 1")
+        self.assertEqual((motion.attributes or {}).get("route_id"), "192.168.178.22")
+        self.assertEqual(motion.source.source_type, "smart_home_sensor")
+        self.assertTrue(motion.source.event_ids[0].startswith("smart_home_env:20260319T090000"))
+
+        self.assertIn("pattern:smart_home_node_health:", health.memory_id)
+        self.assertEqual((health.attributes or {}).get("health_state"), "offline")
+        self.assertEqual((health.attributes or {}).get("provider_area_label"), "Erdgeschoss")
 
     def test_low_signal_multimodal_batches_skip_optional_midterm_compilation(self) -> None:
         source_ref = LongTermSourceRefV1(

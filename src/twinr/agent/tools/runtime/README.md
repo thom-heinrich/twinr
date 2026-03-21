@@ -10,6 +10,7 @@ streaming APIs.
 `runtime` owns:
 - adapt workflow owners into `handle_*` methods for realtime tools
 - validate the canonical tool-name to handler binding registry
+- route smart-home discovery, state-read, control, and sensor-stream tools through the same thin executor surface as the other realtime tools
 - route the shared local household-identity tool through the same thin executor surface as the legacy portrait and voice tools
 - route the RSS/world-intelligence configuration tool through the same thin executor surface as the other persistent tool handlers
 - dispatch learned-skill control tools and hidden self-coding runtime triggers through the same thin executor surface
@@ -17,7 +18,7 @@ streaming APIs.
 - generate LLM-only recovery replies for streaming timeout/error paths
 - emit speech-lane deltas and serialize tool results safely
 - emit redacted semantic-answer branch forensics for supervisor decisions, handoffs, and recovery-path selection
-- enforce the focused broker policy for background automation `tool_call` execution
+- enforce the focused broker policy for background automation `tool_call` execution, including low-risk smart-home control
 
 The dual-lane handoff loop preserves optional explicit search hints such as a
 spoken target location or resolved date context when they are provided at the

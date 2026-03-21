@@ -1,9 +1,11 @@
 from pathlib import Path
 from tempfile import TemporaryFile
 from unittest import mock
+import io
 import os
 import sys
 import unittest
+import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -14,6 +16,7 @@ from twinr.hardware.audio import (
     SilenceDetectedRecorder,
     SpeechStartTimeoutError,
     WaveAudioPlayer,
+    normalize_wav_playback_level,
     resolve_dynamic_pause_thresholds,
     resolve_pause_resume_confirmation,
 )
@@ -213,6 +216,25 @@ class _FakeCaptureProcess:
 
 
 class WaveAudioPlayerTests(unittest.TestCase):
+    def test_normalize_wav_playback_level_boosts_quiet_pcm16_wav(self) -> None:
+        frames = (b"\x10\x00" + b"\xf0\xff") * 800
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as writer:
+            writer.setnchannels(1)
+            writer.setsampwidth(2)
+            writer.setframerate(24000)
+            writer.writeframes(frames)
+
+        normalized = normalize_wav_playback_level(buffer.getvalue(), target_peak=20000, max_gain=4.0)
+
+        with wave.open(io.BytesIO(normalized), "rb") as reader:
+            boosted_frames = reader.readframes(reader.getnframes())
+        self.assertGreater(len(boosted_frames), 0)
+        self.assertGreater(abs(int.from_bytes(boosted_frames[:2], "little", signed=True)), 0x10)
+
+    def test_normalize_wav_playback_level_keeps_invalid_payload_unchanged(self) -> None:
+        self.assertEqual(normalize_wav_playback_level(b"WAVPCM"), b"WAVPCM")
+
     def test_preempted_stream_terminates_aplay_without_waiting_for_drain(self) -> None:
         player = WaveAudioPlayer(device="default")
         process = _FakePlaybackProcess()

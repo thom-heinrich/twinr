@@ -10,6 +10,7 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 - shape route data into `SettingsSection`, `AdaptiveTimingView`, and template dictionaries
 - normalize malformed persisted values into stable operator-safe display values
 - validate managed integration form submissions before route handlers persist them
+- validate managed smart-home Hue integration form submissions, including multi-bridge host lists and per-bridge secrets, before route handlers persist them
 - build self-coding operator telemetry rows from persisted compile, activation, health, live-e2e, and lifecycle-control state
 - build the tabbed `/ops/debug` operator page context from runtime, watchdog, memory-attestation, usage, hardware, and raw artifact state
 - shape the `/ops/debug` memory-search tab, including grouped durable/midterm/episodic/conflict hits from the real long-term retrieval path
@@ -31,7 +32,7 @@ for [`app.py`](../app.py) and [`context.py`](../context.py).
 | [`__init__.py`](./__init__.py) | Curated presenter export surface |
 | [`common.py`](./common.py) | Shared nav and reminder helpers |
 | [`settings.py`](./settings.py) | Global settings page builders |
-| [`integrations.py`](./integrations.py) | Email/calendar sections plus the compact WhatsApp setup summary for `/integrations` |
+| [`integrations.py`](./integrations.py) | Email/calendar/smart-home sections, including Hue multi-bridge host/secret validation, plus the compact WhatsApp setup summary for `/integrations` |
 | [`voice.py`](./voice.py) | Voice profile page helpers |
 | [`ops.py`](./ops.py) | Ops row formatters and redaction |
 | [`debug.py`](./debug.py) | Tabbed operator debug page context builder |

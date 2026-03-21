@@ -8,7 +8,7 @@ the provider bundle consumed by runtime loops and factories.
 
 `api` owns:
 - compose the canonical `OpenAIBackend` from shared mixins
-- bridge Twinr speech, text, tool-calling, supervisor, and first-word contracts onto the backend
+- bridge Twinr speech, text, tool-calling, supervisor, closure-decision, and first-word contracts onto the backend
 - validate structured supervisor decisions that now carry explicit `location_hint`, `date_context`, and `context_scope` fields for safer fast-lane routing
 - assemble the OpenAI provider bundle used by runtime callers
 
@@ -41,6 +41,14 @@ from twinr.providers.openai import OpenAIProviderBundle
 
 bundle = OpenAIProviderBundle.from_config(config)
 turn = bundle.tool_agent.start_turn_streaming("Bitte drucke das", tool_schemas=schemas)
+```
+
+```python
+from twinr.providers.openai import OpenAIBackend, OpenAIConversationClosureDecisionProvider
+
+backend = OpenAIBackend(config=config)
+closure = OpenAIConversationClosureDecisionProvider(backend)
+decision = closure.decide("closure prompt", instructions="Return one structured closure decision.")
 ```
 
 ## See also

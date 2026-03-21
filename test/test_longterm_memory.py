@@ -1,3 +1,5 @@
+"""Regression and integration tests for the long-term memory runtime service."""
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -24,6 +26,7 @@ from twinr.memory.longterm import (
     LongTermMemoryContext,
     LongTermMemoryObjectV1,
     LongTermMemoryReflector,
+    LongTermReflectionResultV1,
     LongTermMemoryService,
     LongTermMidtermStore,
     LongTermSourceRefV1,
@@ -205,6 +208,33 @@ class _RecordingPersonalityLearningService:
         self.tool_history_calls.append((tool_calls, tool_results))
 
 
+class _StubThreadSummaryReflector:
+    def __init__(self, result: LongTermReflectionResultV1) -> None:
+        self._result = result
+
+    def reflect(
+        self,
+        *,
+        objects: tuple[LongTermMemoryObjectV1, ...],
+        include_midterm: bool = True,
+    ) -> LongTermReflectionResultV1:
+        del objects
+        del include_midterm
+        return self._result
+
+
+class _BlockingExtractor:
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def extract_conversation_turn(self, **kwargs):
+        self.started.set()
+        self.release.wait(timeout=5.0)
+        return self._delegate.extract_conversation_turn(**kwargs)
+
+
 class LongTermMemoryServiceTests(unittest.TestCase):
     def _source(self, event_id: str = "turn:test") -> LongTermSourceRefV1:
         return LongTermSourceRefV1(
@@ -253,6 +283,47 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertIn('Conversation about "Wie wird das Wetter heute?"', entries[0].summary)
         self.assertIn('Twinr answered: "Heute ist es sonnig und mild."', entries[0].details or "")
         self.assertTrue(any(item.kind == "episode" for item in stored_objects))
+
+    def test_background_worker_persists_immediate_midterm_packet_before_slow_extraction_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_midterm_enabled=True,
+                long_term_memory_reflection_compiler_enabled=False,
+                long_term_memory_write_queue_size=4,
+            )
+            extractor = _BlockingExtractor(make_test_extractor())
+            service = LongTermMemoryService.from_config(config, extractor=extractor)
+            try:
+                result = service.enqueue_conversation_turn(
+                    transcript="Lea bringt mir heute Abend eine Thermoskanne mit Linsensuppe vorbei.",
+                    response="Ich merke mir, dass Lea dir heute Abend die Thermoskanne mit Linsensuppe bringt.",
+                )
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertTrue(result.accepted)
+                self.assertTrue(extractor.started.wait(timeout=1.0))
+
+                deadline = time.monotonic() + 2.0
+                packets = ()
+                while time.monotonic() < deadline:
+                    packets = service.midterm_store.load_packets()
+                    if packets:
+                        break
+                    time.sleep(0.02)
+
+                self.assertFalse(service.flush(timeout_s=0.05))
+                self.assertTrue(packets)
+                self.assertEqual(packets[0].kind, "recent_turn_continuity")
+                self.assertEqual(packets[0].attributes["persistence_scope"], "turn_continuity")
+                self.assertIn("Thermoskanne", packets[0].details or "")
+            finally:
+                extractor.release.set()
+                service.flush(timeout_s=2.0)
+                service.shutdown()
 
     def test_build_provider_context_uses_remote_probe_cache_within_one_turn(self) -> None:
         remote_state = _CountingRemoteState()
@@ -581,6 +652,80 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertEqual(recorded_turn.transcript, turn.transcript)
         self.assertEqual(recorded_result.turn_id[:5], "turn:")
 
+    def test_persist_longterm_turn_passes_reflection_thread_summaries_to_personality_learning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                personality_dir="personality",
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_path=str(Path(temp_dir) / "state" / "chonkydb"),
+            )
+            prompt_context_store = PromptContextStore.from_config(config)
+            graph_store = TwinrPersonalGraphStore(
+                Path(temp_dir) / "state" / "chonkydb" / "twinr_graph_v1.json",
+                user_label="Erika",
+            )
+            object_store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb")
+            midterm_store = LongTermMidtermStore(base_path=Path(temp_dir) / "state" / "chonkydb")
+            helper = LongTermMemoryService.from_config(config, extractor=make_test_extractor())
+            personality_learning = _RecordingPersonalityLearningService()
+            turn = LongTermConversationTurn(
+                transcript="Janina is my wife and she has an eye doctor appointment.",
+                response="I will keep that Janina thread in mind.",
+            )
+            reflection_summary = LongTermMemoryObjectV1(
+                memory_id="thread:person_janina",
+                kind="summary",
+                summary="Ongoing thread about Janina: Janina is the user's wife; eye doctor appointment.",
+                source=self._source("turn:janina"),
+                status="active",
+                confidence=0.78,
+                slot_key="thread:person:janina",
+                value_key="person:janina",
+                attributes={
+                    "person_ref": "person:janina",
+                    "person_name": "Janina",
+                    "support_count": 2,
+                    "summary_type": "thread",
+                    "memory_domain": "thread",
+                },
+            )
+            reflector = _StubThreadSummaryReflector(
+                LongTermReflectionResultV1(
+                    reflected_objects=(),
+                    created_summaries=(reflection_summary,),
+                )
+            )
+            try:
+                LongTermMemoryService._persist_longterm_turn(
+                    config=config,
+                    store=prompt_context_store,
+                    graph_store=graph_store,
+                    object_store=object_store,
+                    midterm_store=midterm_store,
+                    extractor=make_test_extractor(),
+                    consolidator=helper.consolidator,
+                    reflector=reflector,
+                    sensor_memory=helper.sensor_memory,
+                    retention_policy=helper.retention_policy,
+                    personality_learning=personality_learning,
+                    item=turn,
+                )
+            finally:
+                helper.shutdown(timeout_s=1.0)
+
+        self.assertEqual(len(personality_learning.conversation_calls), 1)
+        _recorded_turn, recorded_result = personality_learning.conversation_calls[0]
+        summary_objects = [
+            item
+            for item in (*recorded_result.durable_objects, *recorded_result.deferred_objects)
+            if (item.attributes or {}).get("summary_type") == "thread"
+        ]
+        self.assertEqual(len(summary_objects), 1)
+        self.assertEqual(summary_objects[0].memory_id, reflection_summary.memory_id)
+
     def test_record_personality_tool_history_routes_tool_calls_to_learning_service(self) -> None:
         service = object.__new__(LongTermMemoryService)
         service.personality_learning = _RecordingPersonalityLearningService()
@@ -639,13 +784,15 @@ class LongTermMemoryServiceTests(unittest.TestCase):
             service.shutdown()
 
         messages = context.system_messages()
-        self.assertEqual(len(messages), 3)
+        self.assertEqual(len(messages), 4)
         self.assertIn("Silent personalization background for this turn.", messages[0])
         self.assertIn("twinr_silent_personalization_context_v1", messages[0])
-        self.assertIn("Structured long-term episodic memory for this turn.", messages[1])
+        self.assertIn("twinr_long_term_midterm_context_v1", messages[1])
         self.assertIn("Heute wollte ich spazieren gehen", messages[1])
-        self.assertIn("twinr_graph_memory_context_v1", messages[2])
-        self.assertIn("Melitta", messages[2])
+        self.assertIn("Structured long-term episodic memory for this turn.", messages[2])
+        self.assertIn("Heute wollte ich spazieren gehen", messages[2])
+        self.assertIn("twinr_graph_memory_context_v1", messages[3])
+        self.assertIn("Melitta", messages[3])
 
     def test_provider_context_does_not_fallback_to_irrelevant_episodes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

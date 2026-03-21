@@ -13,6 +13,7 @@ owned_concerns:
   - Map the local-first IMX500 adapter onto the normalized social vision contract
   - Stabilize automation-facing camera snapshots, bounded visible-person anchors, coarse motion, and rising-edge coarse/fine gesture events
   - Confirm explicit fine-hand symbols conservatively before the UI or policy layers see them, so random single-frame positives do not become user-facing acknowledgements
+  - Load bounded per-symbol fine-hand calibration so ambiguous symbols such as `ok_sign` or `middle_finger` can be stricter than `thumbs_up` or `pointing`
   - Route prompt mode and render bounded evidence facts for proactive prompting
   - Buffer recent frames and request conservative visual second opinions
 out_of_scope:
@@ -81,6 +82,11 @@ files:
       - ProactiveCameraSurface
       - ProactiveCameraSurfaceConfig
       - ProactiveCameraSurfaceUpdate
+  - path: gesture_calibration.py
+    role: Load bounded per-symbol fine-hand calibration for the live social camera surface
+    exports:
+      - FineHandGesturePolicy
+      - GestureCalibrationProfile
   - path: local_camera_provider.py
     role: Local-first IMX500 + MediaPipe provider mapped onto the social vision contract, including bounded multi-person visibility plus motion and coarse/fine gesture output
     exports:
@@ -198,6 +204,7 @@ primary_callers:
   - path: src/twinr/proactive/__init__.py
 tests:
   - path: test/test_local_ai_camera_provider.py
+  - path: test/test_gesture_calibration.py
   - path: test/test_proactive_camera_surface.py
   - path: test/test_social_triggers.py
   - path: test/test_proactive_vision_review.py

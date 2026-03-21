@@ -10,7 +10,8 @@ dashboard metadata that provider packages plug into.
 - define canonical manifests, requests, results, and safety metadata
 - publish builtin manifest lookups for supported integration domains
 - evaluate policy and dispatch requests to registered adapters
-- assemble managed email/calendar adapters from store and environment state
+- assemble managed email/calendar/smart-home adapters from store and environment state
+- resolve single-bridge and multi-bridge Hue runtime wiring from store and `.env` state
 - expose vendor-neutral smart-home contracts plus provider packages such as Hue
 - persist integration settings and expose integration-family blocks to `src/twinr/web`
 
@@ -29,7 +30,7 @@ dashboard metadata that provider packages plug into.
 | [catalog.py](./catalog.py) | Builtin manifest registry |
 | [policy.py](./policy.py) | Safety gate decisions |
 | [registry.py](./registry.py) | Adapter registration and dispatch |
-| [runtime.py](./runtime.py) | Managed email/calendar wiring |
+| [runtime.py](./runtime.py) | Managed email/calendar/smart-home wiring |
 | [store.py](./store.py) | File-backed integration config store |
 | [web_automation_families.py](./web_automation_families.py) | Dashboard family blocks |
 | [calendar/](./calendar) | Calendar provider package |
@@ -53,7 +54,7 @@ result = registry.dispatch(
 from twinr.integrations import build_managed_integrations
 
 runtime = build_managed_integrations(project_root=".")
-readiness = runtime.readiness_for("email_mailbox")
+readiness = runtime.readiness_for("smart_home_hub")
 ```
 
 ## See also

@@ -11,6 +11,7 @@ from twinr.hardware.hand_landmarks import HandLandmarkDetection, HandLandmarkRes
 from twinr.hardware.camera_ai.config import MediaPipeVisionConfig
 from twinr.hardware.camera_ai.mediapipe_runtime import MediaPipeTaskRuntime
 from twinr.hardware.camera_ai.fine_hand_gestures import (
+    combine_builtin_and_custom_gesture_choice as _combine_builtin_and_custom_gesture_choice,
     prefer_gesture_choice as _prefer_gesture_choice,
     resolve_fine_hand_gesture as _resolve_fine_hand_gesture,
 )
@@ -113,6 +114,16 @@ class MediaPipeVisionTests(unittest.TestCase):
 
         self.assertEqual(gesture, AICameraFineHandGesture.OK_SIGN)
         self.assertAlmostEqual(confidence or 0.0, 0.91, places=3)
+
+    def test_fine_gesture_mapping_picks_builtin_victory_as_peace_sign(self) -> None:
+        gesture, confidence = _resolve_fine_hand_gesture(
+            result=_GestureResult([[_Category("Victory", 0.89)]]),
+            category_map={"victory": AICameraFineHandGesture.PEACE_SIGN},
+            min_score=0.50,
+        )
+
+        self.assertEqual(gesture, AICameraFineHandGesture.PEACE_SIGN)
+        self.assertAlmostEqual(confidence or 0.0, 0.89, places=3)
 
     def test_fine_gesture_mapping_suppresses_custom_positive_when_none_wins(self) -> None:
         gesture, confidence = _resolve_fine_hand_gesture(
@@ -217,7 +228,7 @@ class MediaPipeVisionTests(unittest.TestCase):
 
         self.assertIn("mediapipe_custom_gesture_model_missing", str(context.exception))
 
-    def test_pipeline_uses_stable_full_frame_gesture_track_even_when_roi_detections_exist(self) -> None:
+    def test_pipeline_prefers_roi_gesture_when_hand_rois_exist(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             pipeline = MediaPipeVisionPipeline(
                 config=MediaPipeVisionConfig(
@@ -232,13 +243,16 @@ class MediaPipeVisionTests(unittest.TestCase):
                 (),
                 {
                     "recognize_for_video": staticmethod(
-                        lambda image, timestamp_ms: (
-                            _GestureResult([[_Category("Pointing_Up", 0.93)]])
-                            if image == "full-frame"
-                            else _GestureResult([])
+                        lambda image, timestamp_ms: (_ for _ in ()).throw(
+                            AssertionError("full-frame recognizer should not run when ROI already produced a symbol")
                         )
                     )
                 },
+            )()
+            pipeline._ensure_roi_gesture_recognizer = lambda runtime: type(
+                "_StubRoiGestureRecognizer",
+                (),
+                {"recognize": staticmethod(lambda image: _GestureResult([[_Category("Pointing_Up", 0.91)]]))},
             )()
 
             gesture, confidence = pipeline._recognize_fine_gesture(
@@ -260,7 +274,162 @@ class MediaPipeVisionTests(unittest.TestCase):
             )
 
         self.assertEqual(gesture, AICameraFineHandGesture.POINTING)
-        self.assertAlmostEqual(confidence or 0.0, 0.93, places=3)
+        self.assertAlmostEqual(confidence or 0.0, 0.91, places=3)
+
+    def test_pipeline_falls_back_to_full_frame_when_roi_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pipeline = MediaPipeVisionPipeline(
+                config=MediaPipeVisionConfig(
+                    pose_model_path="pose.task",
+                    hand_landmarker_model_path=str(Path(temp_dir) / "hand.task"),
+                    gesture_model_path=str(Path(temp_dir) / "gesture.task"),
+                )
+            )
+            pipeline._build_image = lambda runtime, frame_rgb: frame_rgb
+            pipeline._gesture_recognizer = type(
+                "_StubGestureRecognizer",
+                (),
+                {
+                    "recognize_for_video": staticmethod(
+                        lambda image, timestamp_ms: _GestureResult([[_Category("Pointing_Up", 0.89)]])
+                    )
+                },
+            )()
+            pipeline._ensure_roi_gesture_recognizer = lambda runtime: type(
+                "_StubRoiGestureRecognizer",
+                (),
+                {"recognize": staticmethod(lambda image: _GestureResult([[_Category("none", 0.95)]]))},
+            )()
+
+            gesture, confidence = pipeline._recognize_fine_gesture(
+                runtime={},
+                image="full-frame",
+                timestamp_ms=1,
+                hand_landmark_result=HandLandmarkResult(
+                    detections=(
+                        HandLandmarkDetection(
+                            roi_source=HandRoiSource.RIGHT_WRIST,
+                            roi_frame_rgb="roi-crop",
+                            roi=AICameraBox(top=0.20, left=0.40, bottom=0.52, right=0.66),
+                            handedness="right",
+                            handedness_score=0.91,
+                            landmarks=(HandLandmarkPoint(x=0.5, y=0.5, z=0.0),),
+                        ),
+                    )
+                ),
+            )
+
+        self.assertEqual(gesture, AICameraFineHandGesture.POINTING)
+        self.assertAlmostEqual(confidence or 0.0, 0.89, places=3)
+
+    def test_pipeline_falls_back_to_roi_gesture_when_full_frame_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pipeline = MediaPipeVisionPipeline(
+                config=MediaPipeVisionConfig(
+                    pose_model_path="pose.task",
+                    hand_landmarker_model_path=str(Path(temp_dir) / "hand.task"),
+                    gesture_model_path=str(Path(temp_dir) / "gesture.task"),
+                )
+            )
+            pipeline._build_image = lambda runtime, frame_rgb: frame_rgb
+            pipeline._gesture_recognizer = type(
+                "_StubGestureRecognizer",
+                (),
+                {
+                    "recognize_for_video": staticmethod(
+                        lambda image, timestamp_ms: _GestureResult([[_Category("none", 0.91)]])
+                    )
+                },
+            )()
+            pipeline._ensure_roi_gesture_recognizer = lambda runtime: type(
+                "_StubRoiGestureRecognizer",
+                (),
+                {"recognize": staticmethod(lambda image: _GestureResult([[_Category("Pointing_Up", 0.87)]]))},
+            )()
+
+            gesture, confidence = pipeline._recognize_fine_gesture(
+                runtime={},
+                image="full-frame",
+                timestamp_ms=1,
+                hand_landmark_result=HandLandmarkResult(
+                    detections=(
+                        HandLandmarkDetection(
+                            roi_source=HandRoiSource.RIGHT_WRIST,
+                            roi_frame_rgb="roi-crop",
+                            roi=AICameraBox(top=0.20, left=0.40, bottom=0.52, right=0.66),
+                            handedness="right",
+                            handedness_score=0.91,
+                            landmarks=(HandLandmarkPoint(x=0.5, y=0.5, z=0.0),),
+                        ),
+                    )
+                ),
+            )
+
+        self.assertEqual(gesture, AICameraFineHandGesture.POINTING)
+        self.assertAlmostEqual(confidence or 0.0, 0.87, places=3)
+
+    def test_pipeline_falls_back_to_custom_roi_gesture_when_full_frame_is_generic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            custom_model = Path(temp_dir) / "custom.task"
+            custom_model.write_bytes(b"custom")
+            pipeline = MediaPipeVisionPipeline(
+                config=MediaPipeVisionConfig(
+                    pose_model_path="pose.task",
+                    hand_landmarker_model_path=str(Path(temp_dir) / "hand.task"),
+                    gesture_model_path=str(Path(temp_dir) / "gesture.task"),
+                    custom_gesture_model_path=str(custom_model),
+                )
+            )
+            pipeline._build_image = lambda runtime, frame_rgb: frame_rgb
+            pipeline._gesture_recognizer = type(
+                "_StubGestureRecognizer",
+                (),
+                {
+                    "recognize_for_video": staticmethod(
+                        lambda image, timestamp_ms: _GestureResult([[_Category("Open_Palm", 0.78)]])
+                    )
+                },
+            )()
+            pipeline._custom_gesture_recognizer = type(
+                "_StubCustomGestureRecognizer",
+                (),
+                {
+                    "recognize_for_video": staticmethod(
+                        lambda image, timestamp_ms: _GestureResult([[_Category("none", 0.88)]])
+                    )
+                },
+            )()
+            pipeline._ensure_roi_gesture_recognizer = lambda runtime: type(
+                "_StubRoiGestureRecognizer",
+                (),
+                {"recognize": staticmethod(lambda image: _GestureResult([[_Category("Open_Palm", 0.76)]]))},
+            )()
+            pipeline._ensure_custom_roi_gesture_recognizer = lambda runtime: type(
+                "_StubCustomRoiGestureRecognizer",
+                (),
+                {"recognize": staticmethod(lambda image: _GestureResult([[_Category("ok_sign", 0.91)]]))},
+            )()
+
+            gesture, confidence = pipeline._recognize_fine_gesture(
+                runtime={},
+                image="full-frame",
+                timestamp_ms=1,
+                hand_landmark_result=HandLandmarkResult(
+                    detections=(
+                        HandLandmarkDetection(
+                            roi_source=HandRoiSource.LEFT_WRIST,
+                            roi_frame_rgb="roi-crop",
+                            roi=AICameraBox(top=0.18, left=0.32, bottom=0.54, right=0.60),
+                            handedness="left",
+                            handedness_score=0.89,
+                            landmarks=(HandLandmarkPoint(x=0.5, y=0.5, z=0.0),),
+                        ),
+                    )
+                ),
+            )
+
+        self.assertEqual(gesture, AICameraFineHandGesture.OK_SIGN)
+        self.assertAlmostEqual(confidence or 0.0, 0.91, places=3)
 
     def test_prefer_gesture_choice_keeps_higher_confidence(self) -> None:
         choice = _prefer_gesture_choice(
@@ -269,6 +438,64 @@ class MediaPipeVisionTests(unittest.TestCase):
         )
 
         self.assertEqual(choice, (AICameraFineHandGesture.POINTING, 0.87))
+
+    def test_combine_builtin_and_custom_keeps_builtin_priority_gesture(self) -> None:
+        choice = _combine_builtin_and_custom_gesture_choice(
+            (AICameraFineHandGesture.PEACE_SIGN, 0.88),
+            (AICameraFineHandGesture.OK_SIGN, 0.93),
+        )
+
+        self.assertEqual(choice, (AICameraFineHandGesture.PEACE_SIGN, 0.88))
+
+    def test_combine_builtin_and_custom_allows_custom_over_generic_open_palm(self) -> None:
+        choice = _combine_builtin_and_custom_gesture_choice(
+            (AICameraFineHandGesture.OPEN_PALM, 0.71),
+            (AICameraFineHandGesture.OK_SIGN, 0.91),
+        )
+
+        self.assertEqual(choice, (AICameraFineHandGesture.OK_SIGN, 0.91))
+
+    def test_pipeline_keeps_builtin_peace_sign_when_custom_ok_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            custom_model = Path(temp_dir) / "custom.task"
+            custom_model.write_bytes(b"custom")
+            pipeline = MediaPipeVisionPipeline(
+                config=MediaPipeVisionConfig(
+                    pose_model_path="pose.task",
+                    hand_landmarker_model_path=str(Path(temp_dir) / "hand.task"),
+                    gesture_model_path=str(Path(temp_dir) / "gesture.task"),
+                    custom_gesture_model_path=str(custom_model),
+                )
+            )
+            pipeline._build_image = lambda runtime, frame_rgb: frame_rgb
+            pipeline._gesture_recognizer = type(
+                "_StubGestureRecognizer",
+                (),
+                {
+                    "recognize_for_video": staticmethod(
+                        lambda image, timestamp_ms: _GestureResult([[_Category("Victory", 0.88)]])
+                    )
+                },
+            )()
+            pipeline._custom_gesture_recognizer = type(
+                "_StubCustomGestureRecognizer",
+                (),
+                {
+                    "recognize_for_video": staticmethod(
+                        lambda image, timestamp_ms: _GestureResult([[_Category("ok_sign", 0.94)]])
+                    )
+                },
+            )()
+
+            gesture, confidence = pipeline._recognize_fine_gesture(
+                runtime={},
+                image="full-frame",
+                timestamp_ms=11,
+                hand_landmark_result=HandLandmarkResult(),
+            )
+
+        self.assertEqual(gesture, AICameraFineHandGesture.PEACE_SIGN)
+        self.assertAlmostEqual(confidence or 0.0, 0.88, places=3)
 
     def test_pipeline_uses_single_full_frame_timestamp_for_stable_gesture_tracking(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

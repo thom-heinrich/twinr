@@ -50,6 +50,7 @@ from twinr.memory.longterm.proactive.state import (
     LongTermProactiveReservationV1,
     LongTermProactiveStateStore,
 )
+from twinr.memory.longterm.ingestion.environment_profile import LongTermEnvironmentProfileCompiler
 from twinr.memory.longterm.reasoning.reflect import LongTermMemoryReflector
 from twinr.memory.longterm.retrieval.retriever import LongTermRetriever
 from twinr.memory.longterm.reasoning.retention import LongTermRetentionPolicy
@@ -102,6 +103,7 @@ __all__ = [
     "LongTermTurnPropositionCompiler",
     "LongTermMemoryReflector",
     "LongTermRetriever",
+    "LongTermEnvironmentProfileCompiler",
     "LongTermRetentionPolicy",
     "LongTermSensorMemoryCompiler",
     "LongTermRetentionResultV1",

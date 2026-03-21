@@ -76,6 +76,7 @@ class DisplayEmojiSymbol(str, Enum):
     WAVING_HAND = "waving_hand"
     RAISED_HAND = "raised_hand"
     POINTING_HAND = "pointing_hand"
+    VICTORY_HAND = "victory_hand"
     OK_HAND = "ok_hand"
     HEART = "heart"
     CHECK = "check"
@@ -96,6 +97,7 @@ _EMOJI_GLYPHS: dict[DisplayEmojiSymbol, str] = {
     DisplayEmojiSymbol.WAVING_HAND: "👋",
     DisplayEmojiSymbol.RAISED_HAND: "🖐️",
     DisplayEmojiSymbol.POINTING_HAND: "👉",
+    DisplayEmojiSymbol.VICTORY_HAND: "✌️",
     DisplayEmojiSymbol.OK_HAND: "👌",
     DisplayEmojiSymbol.HEART: "❤️",
     DisplayEmojiSymbol.CHECK: "✅",

@@ -15,6 +15,7 @@ import stat
 from dataclasses import dataclass
 from email.utils import parseaddr
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -34,11 +35,22 @@ from twinr.integrations.email import (
     SMTPMailSenderConfig,
     normalize_email,
 )
+from twinr.integrations.smarthome import (
+    AggregatedSmartHomeProvider,
+    RoutedSmartHomeProvider,
+    SmartHomeAdapterSettings,
+    SmartHomeIntegrationAdapter,
+)
+from twinr.integrations.smarthome.hue import HueBridgeClient, HueBridgeConfig, HueSmartHomeProvider, build_hue_smart_home_provider
 from twinr.integrations.store import ManagedIntegrationConfig, TwinrIntegrationStore
 
 EMAIL_MAILBOX_INTEGRATION_ID = "email_mailbox"
 CALENDAR_AGENDA_INTEGRATION_ID = "calendar_agenda"
+SMART_HOME_HUB_INTEGRATION_ID = "smart_home_hub"
+SMART_HOME_HUE_PROVIDER = "hue"
 EMAIL_APP_PASSWORD_ENV_KEY = "TWINR_INTEGRATION_EMAIL_APP_PASSWORD"
+HUE_APPLICATION_KEY_ENV_KEY = "TWINR_INTEGRATION_HUE_APPLICATION_KEY"
+HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY = "additional_bridge_hosts"
 CALENDAR_ALLOWED_ROOT_ENV_KEY = "TWINR_INTEGRATION_CALENDAR_ALLOWED_ROOT"  # AUDIT-FIX(#1): Optional allowlist root for local ICS files; defaults to the project root.
 _MAX_ICS_DOWNLOAD_BYTES = 2 * 1024 * 1024
 _MAX_ENV_FILE_BYTES = 64 * 1024  # AUDIT-FIX(#7): Bound .env reads so a damaged or wrong file cannot consume unbounded memory on RPi.
@@ -71,6 +83,7 @@ class ManagedIntegrationsRuntime:
 
     email_mailbox: EmailMailboxAdapter | None = None
     calendar_agenda: ReadOnlyCalendarAdapter | None = None
+    smart_home_hub: SmartHomeIntegrationAdapter | None = None
     readiness: tuple[IntegrationReadiness, ...] = ()
 
     def readiness_for(self, integration_id: str) -> IntegrationReadiness | None:
@@ -98,7 +111,7 @@ def build_managed_integrations(
     env_path: str | Path | None = None,
     url_text_loader: Callable[[str], str] | None = None,
 ) -> ManagedIntegrationsRuntime:
-    """Build the managed email and calendar adapters for one project root."""
+    """Build the managed email, calendar, and smart-home adapters for one project root."""
 
     project_path = Path(project_root).resolve()
     env_values = _read_env_values(_resolve_env_path(project_path, env_path))
@@ -108,6 +121,7 @@ def build_managed_integrations(
         store = TwinrIntegrationStore.from_project_root(project_path)
         email_record = store.get(EMAIL_MAILBOX_INTEGRATION_ID)
         calendar_record = store.get(CALENDAR_AGENDA_INTEGRATION_ID)
+        smart_home_record = store.get(SMART_HOME_HUB_INTEGRATION_ID)
     except Exception:
         detail = (
             "Integration settings could not be loaded from disk. "
@@ -129,6 +143,13 @@ def build_managed_integrations(
                     summary="Unavailable",
                     detail=detail,
                 ),
+                IntegrationReadiness(
+                    integration_id=SMART_HOME_HUB_INTEGRATION_ID,
+                    label="Smart Home",
+                    status="warn",
+                    summary="Unavailable",
+                    detail=detail,
+                ),
             ),
         )
 
@@ -142,10 +163,15 @@ def build_managed_integrations(
         env_values=env_values,
         url_text_loader=url_text_loader or _fetch_ics_url,
     )
+    smart_home_adapter, smart_home_readiness = _safe_build_smart_home_hub_runtime(
+        smart_home_record,
+        env_values=env_values,
+    )
     return ManagedIntegrationsRuntime(
         email_mailbox=email_adapter,
         calendar_agenda=calendar_adapter,
-        readiness=(email_readiness, calendar_readiness),
+        smart_home_hub=smart_home_adapter,
+        readiness=(email_readiness, calendar_readiness, smart_home_readiness),
     )
 
 
@@ -172,6 +198,29 @@ def build_calendar_agenda_adapter(
         env_path=env_path,
         url_text_loader=url_text_loader,
     ).calendar_agenda
+
+
+def build_smart_home_hub_adapter(
+    project_root: str | Path,
+    *,
+    env_path: str | Path | None = None,
+) -> SmartHomeIntegrationAdapter | None:
+    """Build only the managed smart-home adapter for one project root."""
+
+    return build_managed_integrations(project_root, env_path=env_path).smart_home_hub
+
+
+def hue_application_key_env_key_for_host(host: str) -> str:
+    """Return the per-bridge Hue application-key env key for one host."""
+
+    normalized_host = _validate_network_host(host, label="Hue bridge host")
+    host_suffix = "".join(
+        character.upper() if character.isalnum() else "_"
+        for character in normalized_host
+    ).strip("_")
+    if not host_suffix:
+        host_suffix = "HOST"
+    return f"TWINR_INTEGRATION_HUE_BRIDGE_{host_suffix}_APPLICATION_KEY"
 
 
 def validate_calendar_source(*, source_kind: str, source_value: str) -> None:
@@ -231,6 +280,25 @@ def _safe_build_calendar_agenda_runtime(
             status="warn",
             summary="Unavailable",
             detail="Calendar integration could not be started. Check the source path or URL and restore packaged files if needed.",
+        )
+
+
+def _safe_build_smart_home_hub_runtime(
+    record: ManagedIntegrationConfig,
+    *,
+    env_values: dict[str, str],
+) -> tuple[SmartHomeIntegrationAdapter | None, IntegrationReadiness]:
+    """Build the smart-home runtime and degrade cleanly on unexpected failure."""
+
+    try:
+        return _build_smart_home_hub_runtime(record, env_values=env_values)
+    except Exception:
+        return None, IntegrationReadiness(
+            integration_id=SMART_HOME_HUB_INTEGRATION_ID,
+            label="Smart Home",
+            status="warn",
+            summary="Unavailable",
+            detail="Smart-home integration could not be started. Check the bridge settings and restore packaged files if needed.",
         )
 
 
@@ -511,6 +579,207 @@ def _build_calendar_reader(
     )
 
 
+def _build_smart_home_hub_runtime(
+    record: ManagedIntegrationConfig,
+    *,
+    env_values: dict[str, str],
+) -> tuple[SmartHomeIntegrationAdapter | None, IntegrationReadiness]:
+    """Build the smart-home adapter and readiness summary from one config record."""
+
+    if not record.enabled:
+        return None, IntegrationReadiness(
+            integration_id=SMART_HOME_HUB_INTEGRATION_ID,
+            label="Smart Home",
+            status="muted",
+            summary="Disabled",
+            detail="No smart-home bridge is active. Configure a local bridge connection when ready.",
+        )
+
+    provider_name = _coerce_text(record.value("provider", SMART_HOME_HUE_PROVIDER)).strip().lower() or SMART_HOME_HUE_PROVIDER
+    if provider_name != SMART_HOME_HUE_PROVIDER:
+        return None, IntegrationReadiness(
+            integration_id=SMART_HOME_HUB_INTEGRATION_ID,
+            label="Smart Home",
+            status="warn",
+            summary="Invalid config",
+            detail=f"Unsupported smart-home provider: {provider_name}",
+        )
+
+    try:
+        configured_hosts = _configured_hue_bridge_hosts(record)
+        if not configured_hosts:
+            raise ValueError("Missing Hue bridge host.")
+        verify_tls = _parse_bool(
+            record.value("verify_tls", "false"),
+            default=False,
+            label="Hue bridge TLS verification",
+        )
+        request_timeout_s = min(
+            _parse_positive_float(
+                record.value("request_timeout_s", "10.0"),
+                label="Hue bridge timeout",
+            ),
+            30.0,
+        )
+        event_timeout_s = min(
+            _parse_positive_float(
+                record.value("event_timeout_s", "2.0"),
+                label="Hue event timeout",
+            ),
+            10.0,
+        )
+    except ValueError as exc:
+        return None, IntegrationReadiness(
+            integration_id=SMART_HOME_HUB_INTEGRATION_ID,
+            label="Smart Home",
+            status="warn",
+            summary="Invalid config",
+            detail=str(exc),
+        )
+
+    manifest = manifest_for_id(SMART_HOME_HUB_INTEGRATION_ID)
+    if manifest is None:
+        return None, IntegrationReadiness(
+            integration_id=SMART_HOME_HUB_INTEGRATION_ID,
+            label="Smart Home",
+            status="warn",
+            summary="Unavailable",
+            detail="Smart-home integration files are incomplete. Restore the Twinr package before enabling bridge access.",
+        )
+
+    try:
+        providers: list[RoutedSmartHomeProvider] = []
+        ready_hosts: list[str] = []
+        warnings: list[str] = []
+        for index, bridge_host in enumerate(configured_hosts):
+            resolved_application_key, secret_env_key = _resolve_hue_application_key(
+                env_values,
+                bridge_host,
+                allow_legacy_fallback=index == 0,
+            )
+            if not resolved_application_key:
+                warnings.append(f"Missing Hue application key in .env for bridge {bridge_host} ({secret_env_key}).")
+                continue
+            client = HueBridgeClient(
+                HueBridgeConfig(
+                    bridge_host=bridge_host,
+                    application_key=resolved_application_key,
+                    verify_tls=verify_tls,
+                    timeout_s=request_timeout_s,
+                )
+            )
+            provider = build_hue_smart_home_provider(client)
+            provider.event_timeout_s = event_timeout_s
+            providers.append(
+                RoutedSmartHomeProvider(
+                    route_id=bridge_host,
+                    entity_provider=provider,
+                )
+            )
+            ready_hosts.append(bridge_host)
+    except (TypeError, ValueError) as exc:
+        return None, IntegrationReadiness(
+            integration_id=SMART_HOME_HUB_INTEGRATION_ID,
+            label="Smart Home",
+            status="warn",
+            summary="Invalid config",
+            detail=str(exc),
+        )
+
+    if not providers:
+        summary = "Needs secret" if configured_hosts else "Needs setup"
+        detail = warnings[0] if warnings else "No Hue bridge is ready."
+        return None, IntegrationReadiness(
+            integration_id=SMART_HOME_HUB_INTEGRATION_ID,
+            label="Smart Home",
+            status="warn",
+            summary=summary,
+            detail=detail,
+            warnings=tuple(warnings),
+        )
+
+    routed_provider: AggregatedSmartHomeProvider | HueSmartHomeProvider
+    if len(configured_hosts) > 1:
+        routed_provider = AggregatedSmartHomeProvider(tuple(providers))
+    else:
+        routed_provider = providers[0].entity_provider
+        if not isinstance(routed_provider, HueSmartHomeProvider):  # pragma: no cover - defensive for future refactors.
+            raise TypeError("Single Hue bridge provider must be a HueSmartHomeProvider.")
+
+    adapter = SmartHomeIntegrationAdapter(
+        manifest=manifest,
+        entity_provider=routed_provider,
+        controller=routed_provider,
+        sensor_stream=routed_provider,
+        settings=SmartHomeAdapterSettings(),
+    )
+    tls_label = "TLS verify on" if verify_tls else "TLS verify off"
+    ready_hosts_label = ", ".join(ready_hosts)
+    bridges_label = "bridges" if len(ready_hosts) != 1 else "bridge"
+    detail = f"Hue {bridges_label} {ready_hosts_label} · local app key stored separately in .env · {tls_label}"
+    if len(configured_hosts) > 1:
+        detail = f"{detail} · {len(ready_hosts)}/{len(configured_hosts)} bridges ready"
+    if warnings:
+        detail = f"{detail} · {warnings[0]}"
+    return adapter, IntegrationReadiness(
+        integration_id=SMART_HOME_HUB_INTEGRATION_ID,
+        label="Smart Home",
+        status="warn" if warnings else "ok",
+        summary="Ready with warnings" if warnings else "Ready",
+        detail=detail,
+        warnings=tuple(warnings),
+    )
+
+
+def _configured_hue_bridge_hosts(record: ManagedIntegrationConfig) -> tuple[str, ...]:
+    """Return the normalized ordered list of configured Hue bridge hosts."""
+
+    primary_host = _coerce_text(record.value("bridge_host", "")).strip()
+    additional_hosts_text = _coerce_text(record.value(HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY, "")).strip()
+    collected: list[str] = []
+    seen: set[str] = set()
+    for raw_host in (primary_host, *_split_hue_bridge_hosts_text(additional_hosts_text)):
+        if not raw_host:
+            continue
+        normalized_host = _validate_network_host(raw_host, label="Hue bridge host")
+        if normalized_host in seen:
+            continue
+        seen.add(normalized_host)
+        collected.append(normalized_host)
+    return tuple(collected)
+
+
+def _split_hue_bridge_hosts_text(value: str) -> tuple[str, ...]:
+    """Split newline- or comma-delimited bridge host text into raw items."""
+
+    if not value:
+        return ()
+    return tuple(
+        line.strip()
+        for line in value.replace(",", "\n").splitlines()
+        if line.strip()
+    )
+
+
+def _resolve_hue_application_key(
+    env_values: Mapping[str, str],
+    bridge_host: str,
+    *,
+    allow_legacy_fallback: bool,
+) -> tuple[str, str]:
+    """Resolve the best available Hue application key for one bridge."""
+
+    host_env_key = hue_application_key_env_key_for_host(bridge_host)
+    host_key = _coerce_text(env_values.get(host_env_key, "")).strip()
+    if host_key:
+        return host_key, host_env_key
+    if allow_legacy_fallback:
+        legacy_key = _coerce_text(env_values.get(HUE_APPLICATION_KEY_ENV_KEY, "")).strip()
+        if legacy_key:
+            return legacy_key, HUE_APPLICATION_KEY_ENV_KEY
+    return "", host_env_key
+
+
 def _parse_known_contacts(text: str) -> tuple[ApprovedEmailContacts, tuple[str, ...]]:
     """Parse approved contacts from operator-supplied multiline text."""
 
@@ -565,6 +834,21 @@ def _parse_positive_int(value: object, *, label: str, max_value: int | None = No
     return parsed
 
 
+def _parse_positive_float(value: object, *, label: str) -> float:
+    """Parse one positive float setting."""
+
+    text = _coerce_text(value).strip()
+    if not text:
+        raise ValueError(f"{label} must be a number.")
+    try:
+        parsed = float(text)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be a number.") from None
+    if parsed <= 0.0:
+        raise ValueError(f"{label} must be greater than zero.")
+    return parsed
+
+
 def _parse_bool(value: object, *, default: bool, label: str = "Boolean value") -> bool:
     """Parse one boolean setting from tolerant text input."""
 
@@ -576,6 +860,44 @@ def _parse_bool(value: object, *, default: bool, label: str = "Boolean value") -
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{label} is invalid: {value}")
+
+
+def _validate_network_host(value: object, *, label: str) -> str:
+    """Validate one hostname or IP address without scheme, path, or port."""
+
+    host = _coerce_text(value).strip()
+    if not host:
+        raise ValueError(f"{label} is required.")
+    if "://" in host or "/" in host or "?" in host or "#" in host or "@" in host:
+        raise ValueError(f"{label} must be a hostname or IP address without a scheme or path.")
+    if host.startswith("["):
+        if not host.endswith("]"):
+            raise ValueError(f"{label} must be a valid hostname or IP address.")
+        literal = host[1:-1]
+        try:
+            ipaddress.ip_address(literal)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a valid hostname or IP address.") from exc
+        return host
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    if ":" in host:
+        raise ValueError(f"{label} must not include a port.")
+    if len(host) > 253:
+        raise ValueError(f"{label} is too long.")
+    labels = host.split(".")
+    for label_text in labels:
+        if not label_text or len(label_text) > 63:
+            raise ValueError(f"{label} must be a valid hostname or IP address.")
+        if label_text.startswith("-") or label_text.endswith("-"):
+            raise ValueError(f"{label} must be a valid hostname or IP address.")
+        for character in label_text:
+            if not (character.isalnum() or character == "-"):
+                raise ValueError(f"{label} must be a valid hostname or IP address.")
+    return host.lower()
 
 
 def _resolve_timezone(value: object) -> ZoneInfo:

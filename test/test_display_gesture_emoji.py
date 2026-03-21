@@ -144,8 +144,19 @@ class DisplayGestureEmojiTests(unittest.TestCase):
             event_names=("camera.fine_hand_gesture_detected",),
         )
 
-        self.assertFalse(decision.active)
-        self.assertEqual(decision.reason, "unsupported_fine_hand_gesture")
+        self.assertTrue(decision.active)
+        self.assertEqual(decision.symbol.value, "warning")
+        self.assertEqual(decision.accent, "alert")
+
+    def test_derive_maps_peace_sign_to_victory_hand(self) -> None:
+        decision = derive_display_gesture_emoji(
+            snapshot=_snapshot(fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN),
+            event_names=("camera.fine_hand_gesture_detected",),
+        )
+
+        self.assertTrue(decision.active)
+        self.assertEqual(decision.symbol.value, "victory_hand")
+        self.assertEqual(decision.accent, "warm")
 
     def test_publisher_does_not_overwrite_foreign_emoji_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -171,6 +182,34 @@ class DisplayGestureEmojiTests(unittest.TestCase):
         assert active is not None
         self.assertEqual(active.source, "presentation")
         self.assertEqual(active.symbol, "sparkles")
+
+    def test_publisher_suppresses_custom_only_fine_gesture_immediately_after_wave(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            publisher = DisplayGestureEmojiPublisher.from_config(config)
+
+            wave_result = publisher.publish_update(
+                ProactiveCameraSurfaceUpdate(
+                    snapshot=_snapshot(gesture_event=SocialGestureEvent.WAVE),
+                    event_names=("camera.gesture_detected",),
+                ),
+                now=datetime(2026, 3, 21, 12, 0, 0, tzinfo=timezone.utc),
+            )
+            ok_result = publisher.publish_update(
+                ProactiveCameraSurfaceUpdate(
+                    snapshot=_snapshot(fine_hand_gesture=SocialFineHandGesture.OK_SIGN),
+                    event_names=("camera.fine_hand_gesture_detected",),
+                ),
+                now=datetime(2026, 3, 21, 12, 0, 0, 400000, tzinfo=timezone.utc),
+            )
+            active = publisher.store.load_active(now=datetime(2026, 3, 21, 12, 0, 0, 500000, tzinfo=timezone.utc))
+
+        self.assertEqual(wave_result.action, "created")
+        self.assertEqual(ok_result.action, "inactive")
+        self.assertEqual(ok_result.decision.reason, "suppressed_by_recent_motion_gesture")
+        self.assertIsNotNone(active)
+        assert active is not None
+        self.assertEqual(active.symbol, "waving_hand")
 
 
 if __name__ == "__main__":

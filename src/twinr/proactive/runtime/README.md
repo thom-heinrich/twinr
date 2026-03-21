@@ -18,7 +18,7 @@ and presence-session state used to arm wakeword listening and proactive checks.
 - Use one local PCM speech-likeness discriminator to veto strong XVF3800 speech false positives from captured room audio itself, so loudspeaker playback does not rely only on host-control flags
 - Let strong PCM non-speech evidence reopen ambient activity even when the old chunk/RMS gate misses a bounded playback window, so media/noise does not disappear behind a false early `audio_activity_detected=False`
 - Let already-classified non-speech/background-media outrank low-confidence overlap hints in the operator-facing room-context guard, so ambiguous speaker-playback probes do not get mislabeled as human room speech
-- Enforce the hard XVF3800 startup/runtime contract so DFU/safe mode and unreadable enumerated capture block proactive voice monitoring clearly instead of degrading silently
+- Enforce the hard XVF3800 startup/runtime contract so DFU/safe mode, a fully disconnected board, and unreadable enumerated capture block proactive voice monitoring clearly instead of degrading silently
 - Package current ReSpeaker presence/audio facts into explicit governor-input context for downstream proactive delivery paths
 - Fuse the single primary camera anchor with ReSpeaker direction confidence into a conservative speaker-association fact
 - Derive a bounded multimodal initiative state that can force display-first or skip later proactive work when room context is ambiguous
@@ -33,12 +33,19 @@ and presence-session state used to arm wakeword listening and proactive checks.
 - Fail the HDMI attention-target and cue path closed when camera health is explicitly bad and no visible person exists, so stale speaker/session focus does not keep steering the face away from the user
 - Keep the HDMI attention-follow cadence genuinely sub-second in production defaults, so the local face-follow path is not visually delayed by legacy status-loop timings
 - Keep the fast HDMI attention-refresh path non-blocking by preferring local signal-only audio snapshots over full ambient PCM windows, so gaze and gesture acknowledgement are not serialized behind one-second audio sampling
-- Mirror clear stabilized user camera gestures such as thumbs-up or waving into short-lived HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues; motion-bearing coarse gestures like waving must outrank a simultaneous generic open-palm hand shape so `👋` does not collapse into a stop-hand acknowledgement
+- Keep HDMI eye-follow and HDMI gesture acknowledgements on separate local refresh paths: eye-follow should prefer a cheap attention-only camera observation and its own stabilized surface, while gesture acknowledgements may use the heavier full gesture path without clearing or delaying face-follow state
+- Keep HDMI gesture acknowledgement on its own dedicated low-latency live-gesture lane plus self-contained ack stabilizer, so user-facing symbols do not depend on the broader social camera-surface cadence or regress eye-follow when gesture policy changes
+- Preserve the local HDMI camera-follow/gesture path even when ReSpeaker startup capture is unreadable, marking the runtime blocked while still building the bounded on-device attention monitor instead of letting the audio contract failure erase local visual HCI entirely
+- Mirror clear stabilized user camera gestures such as thumbs-up or waving into short-lived HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues; motion-bearing coarse gestures like waving must outrank a simultaneous generic open-palm hand shape and briefly suppress conflicting custom-only fine-hand symbols like `👌` so `👋` does not flap into a custom false positive while the user is still waving
 - Keep HDMI attention-follow available on wakeword/runtime-monitor builds even when `proactive_enabled` remains off for camera-triggered proactive prompts
 - Run a bounded local HDMI attention-refresh cadence that keeps gaze-follow responsive even when full proactive inspection is still PIR-gated, and keep that local cue-only path alive while the main runtime is in `error`
 - Bootstrap one bounded local vision inspection from live speech when wakeword mode is enabled, so a quiet or missing PIR does not leave presence-gated wakeword permanently idle
+- Retry exact transient `Device or resource busy` PIR startup overlaps for a short bounded window, so runtime restarts do not flap into error while a previous Twinr process is still releasing GPIO17
+- Pause the active streaming wakeword `arecord` handle while an accepted wakeword opens the exclusive hands-free conversation capture, then resume streaming after the handler returns so successful wakewords do not immediately fail with ALSA `Device or resource busy`
 - Export normalized observation facts and ops telemetry from proactive monitoring, including raw local-camera readiness/count/gesture fields for Pi-side presence debugging
 - Export a dedicated changed-only HDMI attention-follow ops trace so Pi-side debugging can correlate camera health, stabilized person anchors, attention-target state, and cue-publish decisions without blind tuning
+- Persist a bounded continuous HDMI attention debug stream with per-refresh outcome codes and stage timings so short-lived eye-follow dropouts can be diagnosed after the fact
+- Persist a bounded continuous HDMI gesture debug stream with per-refresh outcome codes, raw gesture observations, ack-lane decisions, publish results, and stage timings so Pi-side symbol latency and dropouts can be diagnosed after the fact
 - Export structured ReSpeaker audio-policy facts, per-claim confidence/source metadata, and presence-session IDs for bounded automation and long-term memory ingestion
 - Inject ReSpeaker XVF3800 signal facts into runtime audio observations when that device is targeted
 - Keep bounded ReSpeaker audio observation alive while Twinr is already speaking so interruption facts do not go blind in `answering`
@@ -59,6 +66,8 @@ and presence-session state used to arm wakeword listening and proactive checks.
 |---|---|
 | `__init__.py` | Package export surface |
 | `audio_perception.py` | Runtime-faithful one-shot ReSpeaker perception diagnostics and conservative room/device-directedness guard summaries |
+| `pir_open_gate.py` | Bounded PIR startup gate that retries only exact transient GPIO busy overlaps |
+| `respeaker_capture_gate.py` | Bounded startup gate that requires sustained readable ReSpeaker capture before the runtime leaves startup error state |
 | `audio_policy.py` | Conservative ReSpeaker policy-hook, speech-defer, and runtime-alert derivation |
 | `ambiguous_room_guard.py` | Fail-closed room-ambiguity guard for person-targeted runtime inferences |
 | `identity_fusion.py` | Bounded temporal/session identity fusion over voice, portrait, enrolled household-voice candidates, and visual-anchor history |
@@ -66,17 +75,20 @@ and presence-session state used to arm wakeword listening and proactive checks.
 | `known_user_hint.py` | Conservative known-user hint from voice-profile state plus optional temporal identity-fusion evidence |
 | `affect_proxy.py` | Prompt-only affect proxy surface from coarse posture, attention, and quiet cues |
 | `attention_targeting.py` | Bounded multimodal attention-target prioritization over camera anchor, speaker association, showing intent, and session focus memory; speaker and last-motion targets keep priority in multi-person scenes |
+| `attention_debug_stream.py` | Bounded JSONL tick stream for every HDMI attention refresh, including outcome codes, stage timings, and current camera/target/cue state for Pi-side dropout forensics |
 | `continuous_attention.py` | Short-lived visible-person track matching, stale-track bridging across brief detector misses, last-motion fallback, adaptive audio mirror calibration, and continuous target-center prediction for HDMI gaze follow |
 | `display_attention.py` | Conservative proactive producer and local refresh policy for HDMI gaze-follow face cues, mirroring camera-space anchors into user-facing gaze, deriving bounded up/down follow from live person height, and renewing or briefly holding cues before they expire or disappear on short camera dropouts |
-| `display_gesture_emoji.py` | Conservative runtime producer that mirrors stabilized rising-edge user gestures into short-lived HDMI emoji acknowledgements without overwriting foreign emoji cues |
+| `display_gesture_emoji.py` | Conservative runtime producer that mirrors stabilized rising-edge user gestures into short-lived HDMI emoji acknowledgements without overwriting foreign emoji cues and briefly keeps motion gestures authoritative over conflicting custom-only fine-hand false positives |
+| `gesture_ack_lane.py` | Dedicated low-latency gesture acknowledgement stabilizer for the explicit user-facing symbol set, separate from general camera-surface state |
+| `gesture_debug_stream.py` | Bounded JSONL tick stream for HDMI gesture-refresh diagnostics, including latency stages, raw observations, ack-lane decisions, and publish outcomes |
 | `claim_metadata.py` | Shared `confidence` / `source` / `requires_confirmation` helpers for multimodal runtime claims |
 | `multimodal_initiative.py` | Conservative multimodal initiative readiness and display-first recommendation from camera + ReSpeaker facts |
-| `runtime_contract.py` | Hard startup-blocker contract for XVF3800 DFU/safe-mode states |
+| `runtime_contract.py` | Hard startup-blocker contract for XVF3800 DFU/safe-mode and disconnected states |
 | `speaker_association.py` | Conservative association of current speech to the single primary visible person anchor |
 | `sensitive_behavior_gate.py` | Conservative gate that blocks sensitive proactive behavior on ambiguous multi-person or low-confidence audio context |
 | `governor_inputs.py` | Focused governor-facing packaging of current ReSpeaker presence/audio facts |
 | `presence.py` | Presence-session state machine |
-| `service.py` | Monitor orchestration, unreadable-capture blocking, and lifecycle |
+| `service.py` | Monitor orchestration, unreadable-capture blocking, lifecycle, and streaming-wakeword capture pause/resume around accepted hands-free turns |
 | `component.yaml` | Structured package metadata |
 | `AGENTS.md` | Local editing rules |
 

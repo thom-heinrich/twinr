@@ -25,6 +25,7 @@ Bounded smoke-test scripts for the Raspberry Pi AI Camera path used by Twinr.
 | [capture_custom_gesture_dataset.py](./capture_custom_gesture_dataset.py) | Capture bounded JPEG datasets for labels such as `none`, `ok_sign`, and `middle_finger` on the Pi |
 | [custom_gesture_workflow.py](./custom_gesture_workflow.py) | Shared dataset-validation, capture-planning, and model-copy helpers for the custom gesture workflow |
 | [fetch_mediapipe_models.py](./fetch_mediapipe_models.py) | Download the official MediaPipe pose, hand-landmarker, and gesture task bundles used on the Pi |
+| [probe_live_gestures.py](./probe_live_gestures.py) | Capture bounded JSONL samples of raw MediaPipe pose/fine-hand outputs plus the final Twinr gesture observation for live calibration |
 | [smoke_piaicam.py](./smoke_piaicam.py) | Run bounded Pi AI camera smoke phases |
 | [train_custom_gesture_model.py](./train_custom_gesture_model.py) | Train and export a custom MediaPipe Gesture Recognizer `.task` from a folder-per-label dataset |
 | [AGENTS.md](./AGENTS.md) | Local editing and verification rules |
@@ -33,6 +34,7 @@ Bounded smoke-test scripts for the Raspberry Pi AI Camera path used by Twinr.
 
 ```bash
 python3 hardware/piaicam/fetch_mediapipe_models.py
+PYTHONPATH=src python3 hardware/piaicam/probe_live_gestures.py --env-file /twinr/.env --duration-s 8 --output /tmp/twinr_gesture_probe.jsonl
 python3 hardware/piaicam/capture_custom_gesture_dataset.py --label none --count 24
 python3 hardware/piaicam/smoke_piaicam.py
 python3 hardware/piaicam/smoke_piaicam.py --profile quick
@@ -47,6 +49,12 @@ For custom training, use a dedicated local venv on the leading repo. The
 current reliable combination is `mediapipe-model-maker` plus `setuptools<81`,
 because newer `setuptools` drops `pkg_resources`, which `tensorflow_hub` still
 imports in this workflow.
+
+The built-in MediaPipe recognizer already covers gesture families such as
+`thumbs_up`, `thumbs_down`, `pointing_up`, `open_palm`, and `victory`. The
+custom Twinr gesture model is therefore best reserved for symbols that the
+built-in bundle does not cover well enough, currently `ok_sign` and
+`middle_finger`.
 
 ## See also
 

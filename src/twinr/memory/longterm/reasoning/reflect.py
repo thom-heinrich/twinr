@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable  # AUDIT-FIX(#5): Robustly coerce list-like payload fields without exploding strings into character-tuples.
 from dataclasses import dataclass
-from datetime import datetime, timezone  # AUDIT-FIX(#4): Normalize naive/aware datetimes before sorting and min/max operations.
+from datetime import date, datetime, timezone  # AUDIT-FIX(#4): Normalize naive/aware datetimes before sorting and min/max operations.
 import json
 import logging  # AUDIT-FIX(#2): Log degraded optional-reflection paths instead of crashing silently.
 import math  # AUDIT-FIX(#6): Safely reject non-finite numeric config values.
@@ -34,6 +34,25 @@ logger = logging.getLogger(__name__)  # AUDIT-FIX(#2): Preserve operational visi
 _DEFAULT_TIMEZONE_NAME = "Europe/Berlin"  # AUDIT-FIX(#6): Keep a known-good fallback timezone for invalid/missing config.
 _ALLOWED_ACTIVE_STATUSES = frozenset({"active", "candidate", "uncertain"})
 _THREAD_SUMMARY_EVIDENCE_KINDS = frozenset({"event", "plan"})  # AUDIT-FIX(#1): Only evidence-bearing kinds may support thread summaries.
+_SMART_HOME_ENVIRONMENT_DOMAIN = "smart_home_environment"
+_ENVIRONMENT_DAY_PROFILE_SUMMARY = "environment_day_profile"
+_ENVIRONMENT_DEVIATION_SUMMARY = "environment_deviation"
+_ENVIRONMENT_NODE_SUMMARY = "environment_node"
+_ENVIRONMENT_REFLECTION_SUMMARY = "environment_reflection"
+_ENVIRONMENT_BASELINE_PATTERN = "environment_baseline"
+_ENVIRONMENT_REFLECTION_PACKET_KIND = "recent_environment_pattern"
+_ENVIRONMENT_MARKER_KEYS = (
+    "active_epoch_count_day",
+    "first_activity_minute_local",
+    "last_activity_minute_local",
+    "longest_daytime_inactivity_min",
+    "night_activity_epoch_count",
+    "unique_active_node_count_day",
+    "transition_count_day",
+    "fragmentation_index_day",
+    "circadian_similarity_14d",
+    "sensor_coverage_ratio_day",
+)
 _SENSITIVITY_RANK = {
     "low": 0,
     "normal": 1,
@@ -160,6 +179,78 @@ def _normalize_midterm_attributes(value: object) -> dict[str, str] | None:
         if clean_value:
             normalized[clean_key] = clean_value
     return normalized or None
+
+
+def _coerce_mapping(value: object) -> Mapping[str, object]:
+    """Return a mapping payload or an empty mapping."""
+
+    if isinstance(value, Mapping):
+        return value
+    return {}
+
+
+def _parse_iso_date(value: object) -> date | None:
+    """Parse one date-like value into a calendar date."""
+
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    text = _normalize_object_text(value)
+    if not text:
+        return None
+    candidate = text[:10]
+    try:
+        return date.fromisoformat(candidate)
+    except ValueError:
+        return None
+
+
+def _coerce_float(value: object) -> float | None:
+    """Coerce one numeric value into a finite float."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _unique_texts(*values: object, limit: int = 12) -> tuple[str, ...]:
+    """Return bounded unique normalized text values."""
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if isinstance(value, (list, tuple, set, frozenset)):
+            entries = value
+        else:
+            entries = (value,)
+        for entry in entries:
+            text = _normalize_object_text(entry)
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            deduped.append(text)
+            if len(deduped) >= limit:
+                return tuple(deduped)
+    return tuple(deduped)
+
+
+def _minute_label(value: object) -> str:
+    """Render one minute-of-day integer as ``HH:MM`` text."""
+
+    minute = _coerce_bounded_int(value, default=-1, minimum=-1)
+    if minute < 0:
+        return ""
+    hours, minutes = divmod(minute, 60)
+    if hours < 0 or hours > 23 or minutes < 0 or minutes > 59:
+        return ""
+    return f"{hours:02d}:{minutes:02d}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,7 +388,7 @@ class LongTermMemoryReflector:
 
         by_person: dict[str, list[LongTermMemoryObjectV1]] = {}
         for item in normalized_objects:
-            person_ref = _normalize_object_text(self._attributes_mapping(item).get("person_ref"))
+            person_ref = self._person_ref(item)
             if not person_ref:
                 continue
             by_person.setdefault(person_ref, []).append(item)
@@ -314,13 +405,24 @@ class LongTermMemoryReflector:
             if summary is not None:
                 created_summaries.append(summary)
 
+        try:
+            environment_summary, environment_packets = self._build_environment_reflection(objects=normalized_objects)
+        except Exception:
+            logger.exception("Failed to build smart-home environment reflection; continuing without that summary.")
+            environment_summary = None
+            environment_packets = ()
+        if environment_summary is not None:
+            created_summaries.append(environment_summary)
+        if include_midterm and self.midterm_packet_limit > 0 and environment_packets:
+            midterm_packets.extend(environment_packets[: self.midterm_packet_limit])
+
         if include_midterm and self.program is not None and self.midterm_packet_limit > 0:
             try:
                 # AUDIT-FIX(#5): Optional midterm enrichment must degrade gracefully instead of crashing the caller on external/program errors.
                 payload = self.program.compile_reflection(
                     objects=self._reflection_window(normalized_objects),
                     timezone_name=self.timezone_name,
-                    packet_limit=self.midterm_packet_limit,
+                    packet_limit=max(0, self.midterm_packet_limit - len(midterm_packets)),
                 )
             except Exception:
                 logger.exception("Midterm reflection compilation failed; continuing without midterm packets.")
@@ -384,14 +486,374 @@ class LongTermMemoryReflector:
         raw = self._attributes_mapping(item).get("support_count")
         return _coerce_support_count(raw)
 
+    def _environment_domain(self, item: LongTermMemoryObjectV1) -> str:
+        """Return the normalized environment memory domain for one object."""
+
+        return _normalize_object_text(self._attributes_mapping(item).get("memory_domain")).lower()
+
+    def _environment_summary_type(self, item: LongTermMemoryObjectV1) -> str:
+        """Return the normalized environment summary type for one object."""
+
+        return _normalize_object_text(self._attributes_mapping(item).get("summary_type")).lower()
+
+    def _environment_pattern_type(self, item: LongTermMemoryObjectV1) -> str:
+        """Return the normalized environment pattern type for one object."""
+
+        return _normalize_object_text(self._attributes_mapping(item).get("pattern_type")).lower()
+
+    def _environment_id(self, item: LongTermMemoryObjectV1) -> str:
+        """Return the stable environment identifier for one object."""
+
+        return _normalize_object_text(self._attributes_mapping(item).get("environment_id")) or "home:main"
+
+    def _environment_profile_day(self, item: LongTermMemoryObjectV1) -> date | None:
+        """Return the profile day for one environment day-profile-like object."""
+
+        attributes = self._attributes_mapping(item)
+        return (
+            _parse_iso_date(attributes.get("date"))
+            or _parse_iso_date(attributes.get("profile_day"))
+            or _parse_iso_date(getattr(item, "valid_from", None))
+            or _parse_iso_date(getattr(item, "valid_to", None))
+        )
+
+    def _environment_deviation_day(self, item: LongTermMemoryObjectV1) -> date | None:
+        """Return the observed day for one environment deviation object."""
+
+        attributes = self._attributes_mapping(item)
+        return (
+            _parse_iso_date(attributes.get("observed_at"))
+            or _parse_iso_date(getattr(item, "valid_from", None))
+            or _parse_iso_date(getattr(item, "valid_to", None))
+        )
+
+    def _environment_marker_value(
+        self,
+        markers: Mapping[str, object],
+        key: str,
+    ) -> float | None:
+        """Return one numeric marker value from a marker mapping."""
+
+        return _coerce_float(markers.get(key))
+
+    def _environment_baseline(self, *, profile: LongTermMemoryObjectV1, items: tuple[LongTermMemoryObjectV1, ...]) -> LongTermMemoryObjectV1 | None:
+        """Select the best-matching baseline for one latest environment profile."""
+
+        profile_environment_id = self._environment_id(profile)
+        profile_weekday_class = _normalize_object_text(self._attributes_mapping(profile).get("weekday_class"))
+        baselines = [
+            item
+            for item in items
+            if self._environment_domain(item) == _SMART_HOME_ENVIRONMENT_DOMAIN
+            and self._environment_pattern_type(item) == _ENVIRONMENT_BASELINE_PATTERN
+            and self._environment_id(item) == profile_environment_id
+        ]
+        if not baselines:
+            return None
+        preferred = [
+            item
+            for item in baselines
+            if _normalize_object_text(self._attributes_mapping(item).get("weekday_class")) == profile_weekday_class
+        ]
+        if not preferred:
+            preferred = [
+                item
+                for item in baselines
+                if _normalize_object_text(self._attributes_mapping(item).get("weekday_class")) == "all_days"
+            ]
+        pool = preferred or baselines
+        return max(pool, key=lambda item: (self._item_updated_at(item), item.memory_id))
+
+    def _build_environment_reflection(
+        self,
+        *,
+        objects: tuple[LongTermMemoryObjectV1, ...],
+    ) -> tuple[LongTermMemoryObjectV1 | None, tuple[LongTermMidtermPacketV1, ...]]:
+        """Build one explainable smart-home environment reflection summary and packet."""
+
+        environment_items = tuple(
+            item
+            for item in objects
+            if self._environment_domain(item) == _SMART_HOME_ENVIRONMENT_DOMAIN
+        )
+        if not environment_items:
+            return None, ()
+
+        profile_items = tuple(
+            item
+            for item in environment_items
+            if self._environment_summary_type(item) == _ENVIRONMENT_DAY_PROFILE_SUMMARY
+        )
+        if not profile_items:
+            return None, ()
+
+        latest_profile = max(
+            profile_items,
+            key=lambda item: (
+                self._environment_profile_day(item) or date.min,
+                self._item_updated_at(item),
+                item.memory_id,
+            ),
+        )
+        profile_day = self._environment_profile_day(latest_profile)
+        if profile_day is None:
+            return None, ()
+
+        environment_id = self._environment_id(latest_profile)
+        profile_attributes = self._attributes_mapping(latest_profile)
+        profile_markers = _coerce_mapping(profile_attributes.get("markers"))
+        baseline = self._environment_baseline(profile=latest_profile, items=environment_items)
+        baseline_attributes = self._attributes_mapping(baseline) if baseline is not None else {}
+        baseline_marker_stats = _coerce_mapping(baseline_attributes.get("marker_stats"))
+        day_deviations = tuple(
+            sorted(
+                (
+                    item
+                    for item in environment_items
+                    if self._environment_summary_type(item) == _ENVIRONMENT_DEVIATION_SUMMARY
+                    and self._environment_id(item) == environment_id
+                    and self._environment_deviation_day(item) == profile_day
+                ),
+                key=lambda item: (
+                    _normalize_object_text(self._attributes_mapping(item).get("severity")) == "high",
+                    self._item_updated_at(item),
+                    item.memory_id,
+                ),
+                reverse=True,
+            )
+        )
+        node_count = len(
+            {
+                item.memory_id
+                for item in environment_items
+                if self._environment_summary_type(item) == _ENVIRONMENT_NODE_SUMMARY
+                and self._environment_id(item) == environment_id
+            }
+        )
+
+        deviation_labels = _unique_texts(
+            *(
+                _coerce_mapping(self._attributes_mapping(item).get("explanation")).get("short_label")
+                for item in day_deviations
+            ),
+            limit=3,
+        )
+        deviation_types = _unique_texts(
+            *(self._attributes_mapping(item).get("deviation_type") for item in day_deviations),
+            limit=4,
+        )
+        quality_flags = _unique_texts(
+            profile_attributes.get("quality_flags"),
+            *(self._attributes_mapping(item).get("quality_flags") for item in day_deviations),
+            limit=6,
+        )
+        blocked_by = _unique_texts(
+            *(self._attributes_mapping(item).get("blocked_by") for item in day_deviations),
+            limit=4,
+        )
+
+        active_epochs = self._environment_marker_value(profile_markers, "active_epoch_count_day")
+        active_nodes = self._environment_marker_value(profile_markers, "unique_active_node_count_day")
+        first_activity = _minute_label(profile_markers.get("first_activity_minute_local"))
+        last_activity = _minute_label(profile_markers.get("last_activity_minute_local"))
+        coverage_ratio = self._environment_marker_value(profile_markers, "sensor_coverage_ratio_day")
+
+        summary_parts: list[str] = []
+        if deviation_labels:
+            summary_parts.append(
+                f"Recent home activity on {profile_day.isoformat()} differs from the usual pattern"
+            )
+            if blocked_by:
+                summary_parts.append("and should be treated cautiously because sensor quality was limited")
+            summary_text = " ".join(summary_parts).strip() + f": {'; '.join(deviation_labels)}."
+        else:
+            if first_activity and last_activity:
+                summary_parts.append(f"activity ran from about {first_activity} to {last_activity}")
+            elif first_activity:
+                summary_parts.append(f"first activity was around {first_activity}")
+            elif last_activity:
+                summary_parts.append(f"last activity was around {last_activity}")
+            if active_nodes is not None:
+                summary_parts.append(f"{int(active_nodes)} motion nodes were active")
+            if active_epochs is not None:
+                summary_parts.append(f"{int(active_epochs)} activity epochs were observed")
+            summary_text = (
+                f"Recent home activity on {profile_day.isoformat()} is available for recall: "
+                + "; ".join(summary_parts[:3])
+                + "."
+            )
+
+        detail_parts = ["Room-agnostic smart-home environment reflection compiled from motion and device-health history."]
+        if deviation_labels:
+            deviation_explanations = _unique_texts(
+                *(
+                    _coerce_mapping(self._attributes_mapping(item).get("explanation")).get("human_readable")
+                    or getattr(item, "details", None)
+                    for item in day_deviations
+                ),
+                limit=2,
+            )
+            if deviation_explanations:
+                detail_parts.append("Recent deviations: " + " ".join(explanation.rstrip(".") + "." for explanation in deviation_explanations))
+        profile_bits: list[str] = []
+        if active_epochs is not None:
+            profile_bits.append(f"active epochs {int(active_epochs)}")
+        if active_nodes is not None:
+            profile_bits.append(f"active nodes {int(active_nodes)}")
+        if first_activity:
+            profile_bits.append(f"first activity {first_activity}")
+        if last_activity:
+            profile_bits.append(f"last activity {last_activity}")
+        if coverage_ratio is not None:
+            profile_bits.append(f"sensor coverage {coverage_ratio:.2f}")
+        if profile_bits:
+            detail_parts.append("Latest daily profile: " + "; ".join(profile_bits) + ".")
+
+        baseline_bits: list[str] = []
+        baseline_weekday_class = _normalize_object_text(baseline_attributes.get("weekday_class"))
+        if baseline_weekday_class:
+            baseline_bits.append(f"baseline bucket {baseline_weekday_class}")
+        baseline_active_epochs = self._environment_marker_value(
+            _coerce_mapping(baseline_marker_stats.get("active_epoch_count_day")),
+            "median",
+        )
+        baseline_active_nodes = self._environment_marker_value(
+            _coerce_mapping(baseline_marker_stats.get("unique_active_node_count_day")),
+            "median",
+        )
+        if baseline_active_epochs is not None:
+            baseline_bits.append(f"typical active epochs {baseline_active_epochs:.1f}")
+        if baseline_active_nodes is not None:
+            baseline_bits.append(f"typical active nodes {baseline_active_nodes:.1f}")
+        if baseline_bits:
+            detail_parts.append("Rolling baseline: " + "; ".join(baseline_bits) + ".")
+
+        if node_count > 0:
+            detail_parts.append(f"The current environment model includes {node_count} observed motion nodes.")
+        if quality_flags:
+            detail_parts.append("Quality flags: " + ", ".join(quality_flags) + ".")
+        if blocked_by:
+            detail_parts.append("Caution: " + ", ".join(blocked_by) + ".")
+        details_text = " ".join(part for part in detail_parts if part)
+
+        query_hints = _unique_texts(
+            "home activity",
+            "movement pattern",
+            "daily routine",
+            "recent activity change",
+            "motion sensors",
+            deviation_labels,
+            deviation_types,
+            summary_text,
+            limit=10,
+        )
+        source_memory_ids = tuple(
+            dict.fromkeys(
+                item.memory_id
+                for item in (
+                    latest_profile,
+                    baseline,
+                    *day_deviations,
+                )
+                if isinstance(item, LongTermMemoryObjectV1)
+            )
+        )
+        source_object = day_deviations[0] if day_deviations else latest_profile
+        summary_object = LongTermMemoryObjectV1(
+            memory_id=f"environment_reflection:{_slugify(environment_id, fallback='environment')}:{profile_day.isoformat()}",
+            kind="summary",
+            summary=summary_text,
+            details=details_text,
+            source=source_object.source,
+            status="active",
+            confidence=min(0.95, 0.62 + (0.06 * len(day_deviations))),
+            sensitivity="low",
+            slot_key=f"environment_reflection:{environment_id}",
+            value_key=profile_day.isoformat(),
+            valid_from=profile_day.isoformat(),
+            valid_to=profile_day.isoformat(),
+            attributes={
+                "memory_domain": _SMART_HOME_ENVIRONMENT_DOMAIN,
+                "summary_type": _ENVIRONMENT_REFLECTION_SUMMARY,
+                "environment_id": environment_id,
+                "profile_day": profile_day.isoformat(),
+                "deviation_types": deviation_types,
+                "deviation_labels": deviation_labels,
+                "quality_flags": quality_flags,
+                "blocked_by": blocked_by,
+                "active_node_count": int(active_nodes) if active_nodes is not None else None,
+                "active_epoch_count": int(active_epochs) if active_epochs is not None else None,
+                "baseline_weekday_class": baseline_weekday_class or None,
+                "query_hints": query_hints,
+                "source_memory_ids": source_memory_ids,
+            },
+        )
+
+        packet = LongTermMidtermPacketV1(
+            packet_id=f"midterm:environment:{_slugify(environment_id, fallback='environment')}:{profile_day.isoformat()}",
+            kind=_ENVIRONMENT_REFLECTION_PACKET_KIND,
+            summary=summary_text,
+            details=details_text,
+            source_memory_ids=source_memory_ids,
+            query_hints=query_hints,
+            sensitivity="low",
+            valid_from=profile_day.isoformat(),
+            valid_to=profile_day.isoformat(),
+            attributes={
+                "memory_domain": _SMART_HOME_ENVIRONMENT_DOMAIN,
+                "packet_scope": "recent_environment_reflection",
+                "environment_id": environment_id,
+                "profile_day": profile_day.isoformat(),
+            },
+        )
+        return summary_object, (packet,)
+
+    def _person_ref(self, item: LongTermMemoryObjectV1) -> str:
+        """Resolve the person reference for one candidate thread item."""
+
+        attributes = self._attributes_mapping(item)
+        person_ref = _normalize_object_text(attributes.get("person_ref"))
+        if person_ref:
+            return person_ref
+        subject_ref = _normalize_object_text(attributes.get("subject_ref"))
+        if subject_ref.startswith("person:"):
+            return subject_ref
+        return ""
+
+    def _reference_label(self, reference: str, *, title_case: bool = False) -> str:
+        """Render one canonical graph reference into compact display text."""
+
+        normalized = _normalize_text(reference.rsplit(":", 1)[-1].replace("_", " "))
+        if not normalized:
+            return ""
+        if title_case:
+            return normalized.title()
+        return normalized
+
+    def _is_relationship_fact(self, item: LongTermMemoryObjectV1) -> bool:
+        """Return whether one fact describes the user's relationship to a person."""
+
+        attributes = self._attributes_mapping(item)
+        if kind_matches(item.kind, "fact", attributes, attr_key="fact_type", attr_value="relationship"):
+            return True
+        if item.kind != "fact" or not self._person_ref(item):
+            return False
+        object_ref = _normalize_object_text(attributes.get("object_ref"))
+        return object_ref.startswith("user:")
+
     def _has_thread_summary_support(self, item: LongTermMemoryObjectV1) -> bool:
         if item.status == "active":
             return True
         return item.status in {"candidate", "uncertain"} and self._support_count(item) >= self.min_support_count_for_promotion
 
     def _is_thread_evidence(self, item: LongTermMemoryObjectV1) -> bool:
-        attributes = self._attributes_mapping(item)
-        return kind_matches(item.kind, "fact", attributes, attr_key="fact_type", attr_value="relationship") or item.kind in _THREAD_SUMMARY_EVIDENCE_KINDS
+        if not self._person_ref(item):
+            return False
+        if self._is_relationship_fact(item):
+            return True
+        if item.kind == "fact":
+            return True
+        return item.kind in _THREAD_SUMMARY_EVIDENCE_KINDS
 
     def _resolve_person_name(
         self,
@@ -404,7 +866,7 @@ class LongTermMemoryReflector:
             person_name = _normalize_object_text(self._attributes_mapping(item).get("person_name"))
             if person_name:
                 return person_name
-        return person_ref.rsplit(":", 1)[-1].replace("_", " ").title()
+        return self._reference_label(person_ref, title_case=True)
 
     def _build_thread_summary(
         self,
@@ -424,17 +886,45 @@ class LongTermMemoryReflector:
         topic_bits: list[str] = []
         for item in supported_items:
             attributes = self._attributes_mapping(item)
-            if kind_matches(item.kind, "fact", attributes, attr_key="fact_type", attr_value="relationship"):
+            if self._is_relationship_fact(item):
                 relation = _normalize_object_text(attributes.get("relation"))
                 if relation:
                     topic_bits.append(f"{person_name} is the user's {relation}")
+                    continue
+                summary = _normalize_object_text(getattr(item, "summary", None))
+                if summary:
+                    topic_bits.append(summary.rstrip("."))
+                    continue
+                predicate = _normalize_object_text(attributes.get("predicate"))
+                if predicate:
+                    topic_bits.append(predicate)
+            elif item.kind == "fact":
+                summary = _normalize_object_text(getattr(item, "summary", None))
+                if summary:
+                    topic_bits.append(summary.rstrip("."))
+                    continue
+                predicate = _normalize_object_text(attributes.get("predicate"))
+                value_text = _normalize_object_text(attributes.get("value_text"))
+                object_ref = _normalize_object_text(attributes.get("object_ref"))
+                if predicate and value_text:
+                    topic_bits.append(f"{predicate} {value_text}")
+                elif predicate and object_ref:
+                    topic_bits.append(f"{predicate} {self._reference_label(object_ref)}")
+                elif predicate:
+                    topic_bits.append(predicate)
             elif item.kind in _THREAD_SUMMARY_EVIDENCE_KINDS:
                 action = _normalize_object_text(attributes.get("action"))
                 if not action:
                     action = _normalize_object_text(attributes.get("treatment"))
                 if not action:
                     action = _normalize_object_text(attributes.get("purpose"))
+                if not action:
+                    action = _normalize_object_text(attributes.get("predicate"))
                 place = _normalize_object_text(attributes.get("place"))
+                if not place:
+                    object_ref = _normalize_object_text(attributes.get("object_ref"))
+                    if object_ref.startswith("place:"):
+                        place = self._reference_label(object_ref)
                 summary = _normalize_object_text(getattr(item, "summary", None))
                 if action and place:
                     topic_bits.append(f"{action} at {place}")

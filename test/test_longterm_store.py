@@ -50,6 +50,9 @@ class _FakeRemoteState:
         self.config = SimpleNamespace(
             long_term_memory_migration_enabled=False,
             long_term_memory_migration_batch_size=64,
+            long_term_memory_remote_read_timeout_s=8.0,
+            long_term_memory_remote_write_timeout_s=15.0,
+            long_term_memory_remote_flush_timeout_s=60.0,
             long_term_memory_remote_bulk_request_max_bytes=512 * 1024,
             long_term_memory_remote_shard_max_content_chars=1000,
             long_term_memory_remote_max_content_chars=2_000_000,
@@ -338,10 +341,13 @@ class _AsyncBulkJobStatusClient(_AsyncBulkEventuallyVisibleClient):
         self.job_status_calls: list[str] = []
         self._job_records_by_id: dict[str, list[dict[str, object]]] = {}
         self._next_job_id = 1
+        self.bulk_timeout_seconds: list[float | None] = []
 
     def store_records_bulk(self, request):
         items = tuple(getattr(request, "items", ()))
         self.bulk_execution_modes.append(str(getattr(request, "execution_mode", "")))
+        timeout_seconds = getattr(request, "timeout_seconds", None)
+        self.bulk_timeout_seconds.append(None if timeout_seconds is None else float(timeout_seconds))
         job_id = f"job-bulk-{self._next_job_id}"
         self._next_job_id += 1
         job_records: list[dict[str, object]] = []
@@ -1811,6 +1817,26 @@ class LongTermStructuredStoreTests(unittest.TestCase):
         )
         self.assertEqual(len(catalog_entries), 1)
         self.assertEqual(catalog_entries[0].document_id, "doc-1")
+        self.assertTrue(all(value == 60.0 for value in remote_state.client.bulk_timeout_seconds))
+
+    def test_remote_catalog_async_job_timeout_uses_flush_budget_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            remote_state = _FakeRemoteState()
+            remote_state.required = True
+            remote_state.config.long_term_memory_remote_write_timeout_s = 15.0
+            remote_state.config.long_term_memory_remote_flush_timeout_s = 60.0
+            store = LongTermStructuredStore(base_path=Path(temp_dir) / "state" / "chonkydb", remote_state=remote_state)
+            remote_catalog = store._remote_catalog
+            assert remote_catalog is not None
+
+            self.assertEqual(remote_catalog._remote_async_job_timeout_s(), 60.0)
+            self.assertEqual(remote_catalog._async_job_visibility_timeout_s(), 68.0)
+            self.assertEqual(remote_catalog._async_attestation_visibility_timeout_s(), 30.0)
+
+            remote_state.config.long_term_memory_remote_flush_timeout_s = 5.0
+            self.assertEqual(remote_catalog._remote_async_job_timeout_s(), 15.0)
+            self.assertEqual(remote_catalog._async_job_visibility_timeout_s(), 23.0)
+            self.assertEqual(remote_catalog._async_attestation_visibility_timeout_s(), 30.0)
 
     def test_remote_catalog_bulk_write_raises_when_async_readback_never_matches(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

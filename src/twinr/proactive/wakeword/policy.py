@@ -44,7 +44,7 @@ def normalize_wakeword_backend(value: object | None, *, default: str) -> str:
     """Normalize one wakeword backend name with a safe default."""
 
     normalized = str(value or default).strip().lower()
-    if normalized not in {"openwakeword", "kws", "stt", "disabled"}:
+    if normalized not in {"openwakeword", "kws", "wekws", "stt", "disabled"}:
         return default
     return normalized
 

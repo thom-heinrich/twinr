@@ -24,6 +24,7 @@ from sklearn.preprocessing import StandardScaler
 
 from twinr.hardware.audio import AmbientAudioCaptureWindow
 
+from .matching import normalize_detector_label
 from .policy import WakewordVerification
 
 _POSITIVE_LABELS = {"correct", "false_negative", "positive"}
@@ -1186,7 +1187,11 @@ class WakewordSequenceCaptureVerifier:
             normalized_path = str(asset_path or "").strip()
             if not normalized_label or not normalized_path:
                 continue
-            self._verifiers[normalized_label] = WakewordSequenceVerifier.from_path(normalized_path)
+            verifier = WakewordSequenceVerifier.from_path(normalized_path)
+            self._verifiers[normalized_label] = verifier
+            canonical_label = normalize_detector_label(normalized_label)
+            if canonical_label and canonical_label not in self._verifiers:
+                self._verifiers[canonical_label] = verifier
 
     def verify(
         self,
@@ -1198,6 +1203,8 @@ class WakewordSequenceCaptureVerifier:
 
         detector_label = str(getattr(detector_match, "detector_label", "") or "").strip()
         verifier = self._verifiers.get(detector_label)
+        if verifier is None:
+            verifier = self._verifiers.get(normalize_detector_label(detector_label))
         if verifier is None:
             return WakewordVerification(
                 status="skipped",

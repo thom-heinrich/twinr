@@ -45,7 +45,12 @@ from twinr.memory.longterm.core.models import (
 from twinr.memory.query_normalization import LongTermQueryProfile
 from twinr.memory.reminders import ReminderStore
 from twinr.memory import ConversationTurn, MemoryLedgerItem, MemoryState, SearchMemoryEntry
-from twinr.integrations import ManagedIntegrationConfig, TwinrIntegrationStore
+from twinr.integrations import (
+    HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY,
+    ManagedIntegrationConfig,
+    TwinrIntegrationStore,
+    hue_application_key_env_key_for_host,
+)
 from twinr.ops import DeviceFact, DeviceOverview, DeviceStatus, TwinrOpsEventStore, resolve_ops_paths
 from twinr.ops.remote_memory_watchdog import (
     RemoteMemoryWatchdogSample,
@@ -935,8 +940,10 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("/connect/whatsapp", response.text)
         self.assertIn("Save email integration", response.text)
         self.assertIn("Save calendar integration", response.text)
+        self.assertIn("Save smart-home integration", response.text)
         self.assertIn("Gmail", response.text)
         self.assertIn("ICS file", response.text)
+        self.assertIn("Philips Hue", response.text)
 
     def test_integrations_post_saves_email_config_and_secret(self) -> None:
         client, env_path = self.make_client()
@@ -1007,6 +1014,81 @@ class WebAppTests(unittest.TestCase):
         response = client.get("/integrations")
         self.assertIn("Ready", response.text)
         self.assertIn("state/calendar.ics", response.text)
+
+    def test_integrations_post_saves_smart_home_hue_config_and_secret(self) -> None:
+        client, env_path = self.make_client()
+
+        response = client.post(
+            "/integrations",
+            data={
+                "_integration_id": "smart_home_hub",
+                "enabled": "true",
+                "provider": "hue",
+                "bridge_host": "192.168.1.20",
+                "TWINR_INTEGRATION_HUE_APPLICATION_KEY": "local-hue-key",
+                "verify_tls": "false",
+                "request_timeout_s": "10",
+                "event_timeout_s": "2",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        env_text = env_path.read_text(encoding="utf-8")
+        self.assertIn("TWINR_INTEGRATION_HUE_APPLICATION_KEY=local-hue-key", env_text)
+        record = TwinrIntegrationStore.from_project_root(env_path.parent).get("smart_home_hub")
+        self.assertTrue(record.enabled)
+        self.assertEqual(record.value("provider"), "hue")
+        self.assertEqual(record.value("bridge_host"), "192.168.1.20")
+        self.assertEqual(record.value("event_timeout_s"), "2")
+        store_text = TwinrIntegrationStore.from_project_root(env_path.parent).path.read_text(encoding="utf-8")
+        self.assertNotIn("local-hue-key", store_text)
+
+        response = client.get("/integrations")
+        self.assertIn("Smart Home", response.text)
+        self.assertIn("192.168.1.20", response.text)
+        self.assertIn("Hue application key", response.text)
+
+    def test_integrations_post_saves_multi_bridge_hue_config_and_host_specific_secrets(self) -> None:
+        client, env_path = self.make_client()
+        secondary_env_key = hue_application_key_env_key_for_host("192.168.1.21")
+        primary_host_env_key = hue_application_key_env_key_for_host("192.168.1.20")
+
+        response = client.post(
+            "/integrations",
+            data={
+                "_integration_id": "smart_home_hub",
+                "enabled": "true",
+                "provider": "hue",
+                "bridge_host": "192.168.1.20",
+                HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY: "192.168.1.21",
+                "TWINR_INTEGRATION_HUE_APPLICATION_KEY": "primary-hue-key",
+                secondary_env_key: "secondary-hue-key",
+                "verify_tls": "false",
+                "request_timeout_s": "10",
+                "event_timeout_s": "2",
+            },
+            follow_redirects=False,
+        )
+
+        self.assertEqual(response.status_code, 303)
+        env_text = env_path.read_text(encoding="utf-8")
+        self.assertIn("TWINR_INTEGRATION_HUE_APPLICATION_KEY=primary-hue-key", env_text)
+        self.assertIn(f"{primary_host_env_key}=primary-hue-key", env_text)
+        self.assertIn(f"{secondary_env_key}=secondary-hue-key", env_text)
+        record = TwinrIntegrationStore.from_project_root(env_path.parent).get("smart_home_hub")
+        self.assertTrue(record.enabled)
+        self.assertEqual(record.value("provider"), "hue")
+        self.assertEqual(record.value("bridge_host"), "192.168.1.20")
+        self.assertEqual(record.value(HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY), "192.168.1.21")
+        store_text = TwinrIntegrationStore.from_project_root(env_path.parent).path.read_text(encoding="utf-8")
+        self.assertNotIn("primary-hue-key", store_text)
+        self.assertNotIn("secondary-hue-key", store_text)
+
+        response = client.get("/integrations")
+        self.assertIn("Additional bridge hosts", response.text)
+        self.assertIn("192.168.1.21", response.text)
+        self.assertIn("Hue application key for 192.168.1.21", response.text)
 
     def test_integrations_post_rejects_calendar_url_with_query_token(self) -> None:
         client, env_path = self.make_client()

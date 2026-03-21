@@ -190,6 +190,41 @@ class FirstWordReply:
 
 
 @dataclass(frozen=True, slots=True)
+class ConversationClosureProviderDecision:
+    """Store one structured closure-decision response from a provider.
+
+    Attributes:
+        close_now: Whether Twinr should stop automatic follow-up listening
+            after the just-finished exchange.
+        confidence: Normalized confidence score in the range ``0.0`` to
+            ``1.0``.
+        reason: Short provider-supplied reason string.
+        matched_topics: Up to two matched steering-topic titles echoed from the
+            current turn context.
+        response_id: Provider response identifier when available.
+        request_id: Transport request identifier when available.
+        model: Provider model identifier when available.
+        token_usage: Provider token-usage metadata when available.
+    """
+
+    close_now: bool
+    confidence: float
+    reason: str
+    matched_topics: tuple[str, ...] = ()
+    response_id: str | None = None
+    request_id: str | None = None
+    model: str | None = None
+    token_usage: object | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "matched_topics",
+            tuple(str(topic).strip() for topic in self.matched_topics if str(topic).strip()),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class StreamingTranscriptionResult:
     """Store the current streaming transcription snapshot for a session."""
 
@@ -418,6 +453,21 @@ class FirstWordProvider(ConfigurableProvider, Protocol):
         conversation: ConversationLike | None = None,
         instructions: str | None = None,
     ) -> FirstWordReply:
+        ...
+
+
+@runtime_checkable
+class ConversationClosureProvider(ConfigurableProvider, Protocol):
+    """Protocol for providers that return one closure-decision object."""
+
+    def decide(
+        self,
+        prompt: str,
+        *,
+        conversation: ConversationLike | None = None,
+        instructions: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> ConversationClosureProviderDecision:
         ...
 
 

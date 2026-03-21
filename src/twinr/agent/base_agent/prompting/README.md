@@ -11,6 +11,7 @@ workflow, and conversation callers use when they need ordered instruction string
 - merge those legacy sections with structured layers from [`../../personality`](../../personality/README.md) when a typed personality snapshot is available, including contextual `MINDSHARE` when Twinr has ongoing themes it may naturally speak from
 - merge memory, reminder, and automation context into loop-specific section sets
 - turn ordered sections into model-facing instruction strings
+- keep the conversation-closure loader lean by reading only the dedicated closure-controller instruction file instead of the full tool-loop bundle
 - provide small instruction-composition helpers shared across callers
 
 `prompting` does **not** own:

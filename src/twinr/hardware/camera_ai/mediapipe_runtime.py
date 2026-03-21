@@ -62,7 +62,11 @@ class MediaPipeTaskRuntime:
         self.config = config
         self._pose_landmarker: Any | None = None
         self._gesture_recognizer: Any | None = None
+        self._roi_gesture_recognizer: Any | None = None
         self._custom_gesture_recognizer: Any | None = None
+        self._custom_roi_gesture_recognizer: Any | None = None
+        self._live_gesture_recognizer: Any | None = None
+        self._live_custom_gesture_recognizer: Any | None = None
         self._last_timestamp_ms = 0
         self._lock = threading.RLock()  # AUDIT-FIX(#6): Serialize shared mutable state for init/close/timestamp paths.
 
@@ -75,7 +79,11 @@ class MediaPipeTaskRuntime:
                 for instance in (
                     self._pose_landmarker,
                     self._gesture_recognizer,
+                    self._roi_gesture_recognizer,
                     self._custom_gesture_recognizer,
+                    self._custom_roi_gesture_recognizer,
+                    self._live_gesture_recognizer,
+                    self._live_custom_gesture_recognizer,
                 ):
                     if instance is None:
                         continue
@@ -89,7 +97,11 @@ class MediaPipeTaskRuntime:
             finally:
                 self._pose_landmarker = None  # AUDIT-FIX(#3): Always clear stale instances, even when close() raises.
                 self._gesture_recognizer = None
+                self._roi_gesture_recognizer = None
                 self._custom_gesture_recognizer = None
+                self._custom_roi_gesture_recognizer = None
+                self._live_gesture_recognizer = None
+                self._live_custom_gesture_recognizer = None
                 self._last_timestamp_ms = 0
 
         if first_error is not None:
@@ -204,47 +216,27 @@ class MediaPipeTaskRuntime:
         with self._lock:
             if self._gesture_recognizer is not None:
                 return self._gesture_recognizer
-
-            model_path, model_bytes = self._load_model_asset(
-                self.config.gesture_model_path,
+            self._gesture_recognizer = self._create_gesture_recognizer(
+                runtime=runtime,
+                model_path=self.config.gesture_model_path,
                 missing_code="mediapipe_gesture_model_missing",
+                running_mode_name="VIDEO",
             )
-            vision = self._require_runtime_entry(runtime, "vision")
-            running_mode = self._require_attribute(vision, "RunningMode", error_code="mediapipe_runtime_incomplete")
-            gesture_recognizer_options = self._require_attribute(
-                vision,
-                "GestureRecognizerOptions",
-                error_code="mediapipe_runtime_incomplete",
-            )
-            gesture_recognizer = self._require_attribute(
-                vision,
-                "GestureRecognizer",
-                error_code="mediapipe_runtime_incomplete",
-            )
-
-            options = gesture_recognizer_options(
-                base_options=self._build_base_options(
-                    runtime,
-                    model_path=model_path,
-                    model_bytes=model_bytes,
-                ),
-                running_mode=running_mode.VIDEO,
-                num_hands=self._validate_num_hands(self.config.num_hands),
-                min_hand_detection_confidence=self._validate_probability(
-                    self.config.min_hand_detection_confidence,
-                    name="min_hand_detection_confidence",
-                ),
-                min_hand_presence_confidence=self._validate_probability(
-                    self.config.min_hand_presence_confidence,
-                    name="min_hand_presence_confidence",
-                ),
-                min_tracking_confidence=self._validate_probability(
-                    self.config.min_hand_tracking_confidence,
-                    name="min_hand_tracking_confidence",
-                ),
-            )
-            self._gesture_recognizer = gesture_recognizer.create_from_options(options)
             return self._gesture_recognizer
+
+    def ensure_roi_gesture_recognizer(self, runtime: dict[str, Any]) -> Any:
+        """Reuse or create the built-in image-mode recognizer for ROI fallback."""
+
+        with self._lock:
+            if self._roi_gesture_recognizer is not None:
+                return self._roi_gesture_recognizer
+            self._roi_gesture_recognizer = self._create_gesture_recognizer(
+                runtime=runtime,
+                model_path=self.config.gesture_model_path,
+                missing_code="mediapipe_gesture_model_missing",
+                running_mode_name="IMAGE",
+            )
+            return self._roi_gesture_recognizer
 
     def ensure_custom_gesture_recognizer(self, runtime: dict[str, Any]) -> Any:
         """Reuse or create the configured custom gesture recognizer."""
@@ -252,47 +244,123 @@ class MediaPipeTaskRuntime:
         with self._lock:
             if self._custom_gesture_recognizer is not None:
                 return self._custom_gesture_recognizer
-
-            model_path, model_bytes = self._load_model_asset(
-                self.config.custom_gesture_model_path,
+            self._custom_gesture_recognizer = self._create_gesture_recognizer(
+                runtime=runtime,
+                model_path=self.config.custom_gesture_model_path,
                 missing_code="mediapipe_custom_gesture_model_missing",
+                running_mode_name="VIDEO",
             )
-            vision = self._require_runtime_entry(runtime, "vision")
-            running_mode = self._require_attribute(vision, "RunningMode", error_code="mediapipe_runtime_incomplete")
-            gesture_recognizer_options = self._require_attribute(
-                vision,
-                "GestureRecognizerOptions",
-                error_code="mediapipe_runtime_incomplete",
-            )
-            gesture_recognizer = self._require_attribute(
-                vision,
-                "GestureRecognizer",
-                error_code="mediapipe_runtime_incomplete",
-            )
-
-            options = gesture_recognizer_options(
-                base_options=self._build_base_options(
-                    runtime,
-                    model_path=model_path,
-                    model_bytes=model_bytes,
-                ),
-                running_mode=running_mode.VIDEO,
-                num_hands=self._validate_num_hands(self.config.num_hands),
-                min_hand_detection_confidence=self._validate_probability(
-                    self.config.min_hand_detection_confidence,
-                    name="min_hand_detection_confidence",
-                ),
-                min_hand_presence_confidence=self._validate_probability(
-                    self.config.min_hand_presence_confidence,
-                    name="min_hand_presence_confidence",
-                ),
-                min_tracking_confidence=self._validate_probability(
-                    self.config.min_hand_tracking_confidence,
-                    name="min_hand_tracking_confidence",
-                ),
-            )
-            self._custom_gesture_recognizer = gesture_recognizer.create_from_options(options)
             return self._custom_gesture_recognizer
+
+    def ensure_custom_roi_gesture_recognizer(self, runtime: dict[str, Any]) -> Any:
+        """Reuse or create the custom image-mode recognizer for ROI fallback."""
+
+        with self._lock:
+            if self._custom_roi_gesture_recognizer is not None:
+                return self._custom_roi_gesture_recognizer
+            self._custom_roi_gesture_recognizer = self._create_gesture_recognizer(
+                runtime=runtime,
+                model_path=self.config.custom_gesture_model_path,
+                missing_code="mediapipe_custom_gesture_model_missing",
+                running_mode_name="IMAGE",
+            )
+            return self._custom_roi_gesture_recognizer
+
+    def ensure_live_gesture_recognizer(
+        self,
+        runtime: dict[str, Any],
+        *,
+        result_callback: Any,
+    ) -> Any:
+        """Reuse or create the built-in live-stream recognizer for fast gesture ack."""
+
+        with self._lock:
+            if self._live_gesture_recognizer is not None:
+                return self._live_gesture_recognizer
+            self._live_gesture_recognizer = self._create_gesture_recognizer(
+                runtime=runtime,
+                model_path=self.config.gesture_model_path,
+                missing_code="mediapipe_gesture_model_missing",
+                running_mode_name="LIVE_STREAM",
+                result_callback=result_callback,
+            )
+            return self._live_gesture_recognizer
+
+    def ensure_live_custom_gesture_recognizer(
+        self,
+        runtime: dict[str, Any],
+        *,
+        result_callback: Any,
+    ) -> Any:
+        """Reuse or create the custom live-stream recognizer for fast gesture ack."""
+
+        with self._lock:
+            if self._live_custom_gesture_recognizer is not None:
+                return self._live_custom_gesture_recognizer
+            self._live_custom_gesture_recognizer = self._create_gesture_recognizer(
+                runtime=runtime,
+                model_path=self.config.custom_gesture_model_path,
+                missing_code="mediapipe_custom_gesture_model_missing",
+                running_mode_name="LIVE_STREAM",
+                result_callback=result_callback,
+            )
+            return self._live_custom_gesture_recognizer
+
+    def _create_gesture_recognizer(
+        self,
+        *,
+        runtime: dict[str, Any],
+        model_path: str | None,
+        missing_code: str,
+        running_mode_name: str,
+        result_callback: Any | None = None,
+    ) -> Any:
+        """Create one gesture recognizer with the requested MediaPipe running mode."""
+
+        resolved_model_path, model_bytes = self._load_model_asset(
+            model_path,
+            missing_code=missing_code,
+        )
+        vision = self._require_runtime_entry(runtime, "vision")
+        running_mode = self._require_attribute(vision, "RunningMode", error_code="mediapipe_runtime_incomplete")
+        gesture_recognizer_options = self._require_attribute(
+            vision,
+            "GestureRecognizerOptions",
+            error_code="mediapipe_runtime_incomplete",
+        )
+        gesture_recognizer = self._require_attribute(
+            vision,
+            "GestureRecognizer",
+            error_code="mediapipe_runtime_incomplete",
+        )
+        selected_running_mode = self._require_attribute(
+            running_mode,
+            running_mode_name,
+            error_code="mediapipe_runtime_incomplete",
+        )
+        options = gesture_recognizer_options(
+            base_options=self._build_base_options(
+                runtime,
+                model_path=resolved_model_path,
+                model_bytes=model_bytes,
+            ),
+            running_mode=selected_running_mode,
+            num_hands=self._validate_num_hands(self.config.num_hands),
+            min_hand_detection_confidence=self._validate_probability(
+                self.config.min_hand_detection_confidence,
+                name="min_hand_detection_confidence",
+            ),
+            min_hand_presence_confidence=self._validate_probability(
+                self.config.min_hand_presence_confidence,
+                name="min_hand_presence_confidence",
+            ),
+            min_tracking_confidence=self._validate_probability(
+                self.config.min_hand_tracking_confidence,
+                name="min_hand_tracking_confidence",
+            ),
+            result_callback=result_callback,
+        )
+        return gesture_recognizer.create_from_options(options)
 
     def _require_runtime_entry(self, runtime: dict[str, Any], key: str) -> Any:
         """Return one required runtime entry or raise a stable runtime error."""

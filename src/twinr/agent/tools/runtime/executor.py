@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..handlers import automations, household_identity, intelligence, memory, output, portrait_identity, reminders, self_coding, settings, voice_profile
+from ..handlers import automations, household_identity, intelligence, memory, output, portrait_identity, reminders, self_coding, settings, smarthome, voice_profile
 
 
 class RealtimeToolExecutor:
@@ -56,6 +56,18 @@ class RealtimeToolExecutor:
 
     def handle_delete_automation(self, arguments: dict[str, object]) -> dict[str, object]:
         return automations.handle_delete_automation(self.owner, arguments)
+
+    def handle_list_smart_home_entities(self, arguments: dict[str, object]) -> dict[str, object]:
+        return smarthome.handle_list_smart_home_entities(self.owner, arguments)
+
+    def handle_read_smart_home_state(self, arguments: dict[str, object]) -> dict[str, object]:
+        return smarthome.handle_read_smart_home_state(self.owner, arguments)
+
+    def handle_control_smart_home_entities(self, arguments: dict[str, object]) -> dict[str, object]:
+        return smarthome.handle_control_smart_home_entities(self.owner, arguments)
+
+    def handle_read_smart_home_sensor_stream(self, arguments: dict[str, object]) -> dict[str, object]:
+        return smarthome.handle_read_smart_home_sensor_stream(self.owner, arguments)
 
     def handle_propose_skill_learning(self, arguments: dict[str, object]) -> dict[str, object]:
         return self_coding.handle_propose_skill_learning(self.owner, arguments)

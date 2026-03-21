@@ -310,6 +310,13 @@ class LongTermRetentionPolicy:
             if age > timedelta(days=self.ephemeral_observation_days):
                 return "prune"
             return "keep"
+        if kind_matches(item.kind, "pattern", item.attributes):
+            # Raw multimodal pattern seeds use `valid_to` as the last observed
+            # day, not as a hard truth-expiry boundary. Expiring them on the
+            # next day erases the only durable multimodal semantics and leaves
+            # retrieval with generic observations instead of the learned
+            # presence/button/camera routines.
+            return "keep"
         if item.status in _TERMINAL_STATUSES:
             age = self._age(item.updated_at, now=now, zone=zone)
             if self.archive_enabled and age > timedelta(days=self.stale_status_archive_days):

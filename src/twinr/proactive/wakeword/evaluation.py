@@ -20,10 +20,11 @@ from twinr.hardware.audio import AmbientAudioCaptureWindow, AmbientAudioLevelSam
 from twinr.ops import TwinrOpsEventStore, resolve_ops_paths_for_config
 
 from .calibration import WakewordCalibrationProfile, WakewordCalibrationStore, apply_wakeword_calibration
-from .cascade import WakewordSequenceCaptureVerifier
 from .kws import WakewordSherpaOnnxSpotter
+from .local_verifier import build_configured_sequence_capture_verifier
 from .policy import SttWakewordVerifier, WakewordDecisionPolicy, normalize_wakeword_backend
 from .spotter import WakewordOpenWakeWordSpotter
+from .wekws import WakewordWekwsSpotter
 
 _POSITIVE_LABELS = {"correct", "false_negative", "positive"}
 _NEGATIVE_LABELS = {
@@ -217,20 +218,15 @@ def _primary_threshold_for_config(config: TwinrConfig) -> float | None:
     primary_backend = _primary_backend_for_config(config)
     if primary_backend == "kws":
         return float(config.wakeword_kws_keywords_threshold)
+    if primary_backend == "wekws":
+        return float(config.wakeword_wekws_threshold)
     if primary_backend == "openwakeword":
         return float(config.wakeword_openwakeword_threshold)
     return None
 
 
 def _build_local_verifier(config: TwinrConfig):
-    if _primary_backend_for_config(config) != "openwakeword":
-        return None
-    if not config.wakeword_openwakeword_sequence_verifier_models:
-        return None
-    return WakewordSequenceCaptureVerifier(
-        verifier_models=dict(config.wakeword_openwakeword_sequence_verifier_models),
-        threshold=config.wakeword_openwakeword_sequence_verifier_threshold,
-    )
+    return build_configured_sequence_capture_verifier(config)
 
 
 def _build_eval_spotter(
@@ -239,9 +235,9 @@ def _build_eval_spotter(
     model_factory=None,
 ):
     primary_backend = _primary_backend_for_config(config)
-    if primary_backend not in {"openwakeword", "kws"}:
+    if primary_backend not in {"openwakeword", "kws", "wekws"}:
         raise ValueError(
-            "Wakeword eval currently supports only local detector backends: openwakeword or kws."
+            "Wakeword eval currently supports only local detector backends: openwakeword, kws, or wekws."
         )
     if primary_backend == "kws":
         return WakewordSherpaOnnxSpotter(
@@ -261,6 +257,20 @@ def _build_eval_spotter(
             num_threads=config.wakeword_kws_num_threads,
             provider=config.wakeword_kws_provider,
             keyword_spotter_factory=model_factory,
+        )
+    if primary_backend == "wekws":
+        return WakewordWekwsSpotter(
+            model_path=config.wakeword_wekws_model_path or "",
+            config_path=config.wakeword_wekws_config_path or "",
+            words_path=config.wakeword_wekws_words_path or "",
+            cmvn_path=config.wakeword_wekws_cmvn_path,
+            phrases=config.wakeword_phrases,
+            project_root=config.project_root,
+            threshold=config.wakeword_wekws_threshold,
+            chunk_ms=config.wakeword_wekws_chunk_ms,
+            num_threads=config.wakeword_wekws_num_threads,
+            provider=config.wakeword_wekws_provider,
+            session_factory=model_factory,
         )
     return WakewordOpenWakeWordSpotter(
         wakeword_models=config.wakeword_openwakeword_models,

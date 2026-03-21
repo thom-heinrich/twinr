@@ -164,6 +164,7 @@ The local detector should propose. The review step should veto unclear cases. Th
 Twinr already has the beginning of `sensor memory`.
 
 The concrete V1 implementation sketch for this path lives in [`SENSOR_MEMORY_V1.md`](SENSOR_MEMORY_V1.md).
+The room-agnostic smart-home profiling layer for motion sensors lives in [`SMART_HOME_ENVIRONMENT_PROFILE_V1.md`](SMART_HOME_ENVIRONMENT_PROFILE_V1.md).
 
 Today, the long-term layer already stores low-confidence multimodal evidence such as:
 

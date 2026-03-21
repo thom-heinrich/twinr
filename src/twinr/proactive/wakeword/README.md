@@ -7,13 +7,22 @@ and offline plus runtime-faithful evaluation helpers for Twinr.
 This package is the wakeword-specific boundary below proactive runtime
 orchestration and above raw audio/hardware adapters.
 
+## Import contract
+
+- Runtime startup must not fail just because optional WeKws and offline
+  training helpers are unavailable on the Pi.
+- The package surface therefore keeps normal runtime helpers importable even
+  when optional WeKws-specific dependencies are missing.
+- When Twinr actually uses WeKws tooling or the WeKws backend, `PyYAML`
+  remains a declared dependency and must exist in the active environment.
+
 ## Responsibility
 
 `wakeword` owns:
 - Normalize wakeword phrases, transcripts, and detector labels
 - Separate canonical wakeword phrases from STT-specific recognition phrases
 - Run local clip/frame wakeword spotting via openWakeWord or sherpa-onnx KWS plus optional verifier and STT confirmation
-- Run a Twinr-specific sequence-aware verifier as a second local stage on localized wakeword captures
+- Run a Twinr-specific sequence-aware verifier as a second local stage on localized wakeword captures, regardless of whether stage 1 is `openwakeword`, `kws`, or `wekws`
 - Resolve bundled local openWakeWord model assets when the repo ships them
 - Auto-load sibling `.verifier.pkl` assets for bundled local models when available
 - Auto-load sibling `.sequence_verifier.pkl` assets for bundled local models when available
@@ -23,7 +32,10 @@ orchestration and above raw audio/hardware adapters.
 - Replay labeled captures for evaluation, labeling, verifier training, and autotune workflows
 - Replay labeled captures through the streaming runtime path for promotion suites and ambient false-accepts/hour guards
 - Train reproducible Twinr base models from generated multivoice datasets and select deployment thresholds against labeled acceptance captures
+- Export Twinr labeled manifests into WeKws/Kaldi-style split directories so a real custom conventional KWS detector can be trained outside the generic bundle path
+- Prepare reproducible WeKws experiment workspaces, configs, and runner scripts from exported Twinr datasets
 - Stream bounded PCM frames into wakeword detections for proactive runtime
+- Keep optional evaluation/training/WeKws dependencies from breaking the normal runtime import path when those helpers are not selected
 
 `wakeword` does **not** own:
 - Presence-session arming or monitor orchestration
@@ -43,6 +55,7 @@ orchestration and above raw audio/hardware adapters.
 |---|---|
 | `__init__.py` | Package export surface |
 | `cascade.py` | Twinr-specific second-stage DTW-aligned sequence verifier assets and runtime gate |
+| `local_verifier.py` | Backend-agnostic config bridge for attaching the sequence verifier to local stage-1 detectors |
 | `matching.py` | Transcript and label matching |
 | `kws.py` | sherpa-onnx KWS clip and frame spotting |
 | `kws_assets.py` | Official sherpa-onnx bundle provisioning, optional phone-lexicon overlays, and Twinr keyword-file generation |
@@ -53,6 +66,9 @@ orchestration and above raw audio/hardware adapters.
 | `evaluation.py` | Labeling, manifest replay, verifier training, eval, and autotune |
 | `training.py` | Offline base-model training, ONNX export, and threshold selection |
 | `training_plan.py` | Canonical Stage-1 family, hard-negative mining, and Pi acceptance plan rendering |
+| `wekws_export.py` | Export Twinr manifests into WeKws/Kaldi-style training splits for custom conventional KWS training |
+| `wekws_experiment.py` | Build a reproducible WeKws experiment workspace, config, runner script, and MDTC-safe ONNX export helper from exported Twinr data |
+| `synthetic_corpus.py` | Plan deterministic Qwen3TTS wakeword corpora with many speakers, style conditions, and lightweight channel degradations |
 | `stream.py` | Bounded live audio monitor |
 | `component.yaml` | Structured package metadata |
 | `AGENTS.md` | Local editing rules |
@@ -126,6 +142,33 @@ PYTHONPATH=src python3 -m twinr \
 ```bash
 PYTHONPATH=src python3 -m twinr \
   --env-file .env \
+  --wakeword-export-wekws \
+  --wakeword-wekws-output-dir /tmp/twinr_wekws \
+  --wakeword-wekws-train-manifest /tmp/twinr_train_manifest.json \
+  --wakeword-wekws-dev-manifest /tmp/twinr_dev_manifest.json \
+  --wakeword-wekws-test-manifest /tmp/twinr_test_manifest.json
+```
+
+```bash
+PYTHONPATH=src python3 -m twinr \
+  --env-file .env \
+  --wakeword-prepare-wekws-experiment \
+  --wakeword-wekws-dataset-dir /tmp/twinr_wekws \
+  --wakeword-wekws-experiment-dir /tmp/twinr_wekws_exp \
+  --wakeword-wekws-recipe mdtc_fbank_stream
+```
+
+```bash
+PYTHONPATH=src python3 scripts/generate_qwen3tts_wakeword_corpus.py \
+  --output-root /tmp/twinr_qwen3tts_corpus_v1 \
+  --device cuda:0 \
+  --speaker-shard-index 0 \
+  --speaker-shard-count 2
+```
+
+```bash
+PYTHONPATH=src python3 -m twinr \
+  --env-file .env \
   --wakeword-training-plan \
   --wakeword-training-plan-output /tmp/twinr_wakeword_training_plan.md
 ```
@@ -181,6 +224,9 @@ PYTHONPATH=src python3 scripts/generate_multivoice_dataset.py \
 - Promotion is blocked unless the candidate passes the held-out suites plus the long-form Pi ambient false-accepts/hour guard on the real Twinr runtime evaluation path, driven by `promotion.py` and `twinr --wakeword-promotion-eval`.
 - The new `kws` backend is a professional runtime path built around `sherpa-onnx` streaming keyword spotting. It requires an explicit asset bundle (`tokens.txt`, `encoder.onnx`, `decoder.onnx`, `joiner.onnx`, `keywords.txt`) and stays fail-closed when the bundle is missing or incomplete.
 - `kws_assets.py` provisions the official upstream bundle plus Twinr-specific `keywords_raw.txt`, `keywords.txt`, optional `bpe.model`, optional phone lexicon files such as `en.phone`, and `bundle_metadata.json` so `/twinr` can be switched without ad-hoc shell work or silently dropped custom wakewords.
+- For a true custom conventional detector, `wekws_export.py` now bridges Twinr's labeled Pi captures into WeKws/Kaldi-style `wav.scp`, `text`, `utt2spk`, `wav.dur`, and `dict/` files so the next retrain can leave the generic open-vocabulary bundle path entirely.
+- `wekws_experiment.py` now turns those exported splits into a full WeKws workspace with `data.list`, a built-in Twinr recipe, `conf/*.yaml`, `exp/<recipe>/`, and a reproducible `run_wekws.sh` so the GPU training path stops depending on ad-hoc shell history.
+- `synthetic_corpus.py` plus `scripts/generate_qwen3tts_wakeword_corpus.py` now provide the large synthetic data engine for Twinr-specific WeKws retrains: many Qwen3TTS speakers, style instructions, deterministic seeds, and lightweight far-field/noise/channel degradations before the WeKws export step.
 
 ## See also
 

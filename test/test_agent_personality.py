@@ -1797,7 +1797,8 @@ class AgentPersonalityTests(unittest.TestCase):
                             "style.verbosity",
                             "relationship.topic_affinity:",
                         ),
-                    )
+                    ),
+                    now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
                 ),
             ),
         )

@@ -3,7 +3,8 @@
 This module keeps XVF3800 startup-blocker policy out of the runtime assembly
 path. It translates one initial signal snapshot into a small contract decision
 so the monitor can fail clearly on unsupported startup states such as DFU mode
-without growing more inline conditionals in the orchestration layer.
+or a fully missing capture device without growing more inline conditionals in
+the orchestration layer.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from dataclasses import dataclass
 from twinr.hardware.respeaker.models import ReSpeakerSignalSnapshot
 
 
-_HARD_BLOCK_ALERT_CODES = frozenset({"dfu_mode"})
+_HARD_BLOCK_ALERT_CODES = frozenset({"dfu_mode", "disconnected"})
 
 
 class ReSpeakerRuntimeContractError(RuntimeError):
@@ -35,10 +36,11 @@ def assess_respeaker_monitor_startup_contract(
 ) -> ReSpeakerStartupContractAssessment:
     """Return whether the initial XVF3800 state blocks monitor startup.
 
-    Twinr currently hard-blocks only the clear DFU/safe-mode state where the
-    board enumerates on USB but exposes no ALSA capture device. Other degraded
-    transport states remain operator-visible warnings so the runtime can still
-    use the fallback observation path when available.
+    Twinr hard-blocks startup whenever the configured XVF3800 has no usable
+    capture path at all. That includes DFU/safe-mode enumeration and the fully
+    disconnected/not-detected state. Other degraded transport states remain
+    operator-visible warnings so the runtime can still use the fallback
+    observation path when available.
     """
 
     mode = _normalize_text(signal.device_runtime_mode)
@@ -51,6 +53,17 @@ def assess_respeaker_monitor_startup_contract(
                 "ReSpeaker XVF3800 is visible on USB but has no ALSA capture device. "
                 "Twinr refuses to start proactive or wakeword audio against DFU/safe mode. "
                 "Reboot or reflash the board into its normal USB-audio runtime first."
+            ),
+        )
+    if mode == "not_detected":
+        return ReSpeakerStartupContractAssessment(
+            blocking=True,
+            blocker_code="disconnected",
+            ops_reason="respeaker_not_detected_blocked",
+            detail=(
+                "ReSpeaker XVF3800 is not visible to the Pi, so Twinr refuses to start "
+                "proactive or wakeword audio against the configured Array capture path. "
+                "Reconnect the board or fix the USB/audio path before restarting Twinr."
             ),
         )
     return ReSpeakerStartupContractAssessment(blocking=False)

@@ -22,9 +22,14 @@ Out of scope:
 - `affect_proxy.py` — prompt-only affect proxy surface from coarse posture, attention, and quiet cues
 - `continuous_attention.py` — bounded short-lived visible-person track matching, motion recency, audio-to-vision speaker targeting, and short-horizon target prediction for HDMI follow
 - `attention_targeting.py` — bounded multimodal attention-target prioritization over camera anchor, speaker association, showing intent, and short-lived session focus memory
+- `attention_debug_stream.py` — bounded continuous JSONL debug stream for HDMI attention refresh ticks, including outcome codes, stage timings, and current camera/target/cue state
 - `display_attention.py` — conservative proactive producer that steers HDMI eye gaze toward the currently relevant visible person without overwriting foreign face cues, while keeping normal follow behavior horizontal-only, mirroring camera-space left/right into user-facing gaze, adding small near-center head turns before full side gaze commits, and renewing or briefly holding matching cues before they expire or disappear on short camera dropouts
 - `display_gesture_emoji.py` — conservative producer that mirrors stabilized rising-edge user gestures into bounded HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues
+- `gesture_ack_lane.py` — dedicated low-latency acknowledgement stabilizer for the explicit user-facing gesture symbol set, separate from general camera-surface state
+- `gesture_debug_stream.py` — bounded continuous JSONL debug stream for HDMI gesture refresh ticks, including raw observations, ack decisions, publish outcomes, and stage timings
 - `audio_perception.py` — runtime-faithful one-shot ReSpeaker perception diagnostics and conservative room/device-directedness guard summaries for operator checks and recovery smokes
+- `pir_open_gate.py` — bounded startup gate that retries only exact transient PIR GPIO busy overlaps during runtime handover
+- `respeaker_capture_gate.py` — bounded startup gate that requires consecutive readable-frame probes before ReSpeaker capture is considered stable
 - `claim_metadata.py` — shared `confidence` / `source` / `requires_confirmation` helpers for runtime claims
 - `speaker_association.py` — conservative speaker-to-camera-anchor association for the single-primary-person case
 - `multimodal_initiative.py` — confidence-bearing display-first/skip gate for later proactive behavior
@@ -39,6 +44,9 @@ Out of scope:
 - Wakeword arming must fail closed on malformed sensor flags or unavailable dependencies.
 - `service.py` stays orchestration-focused; trigger scoring and wakeword matching belong in sibling packages.
 - `audio_perception.py` must stay a bounded diagnostic/guard surface that reuses existing normalized observation and policy helpers; it must not grow its own parallel monitor orchestration.
+- `service.py` must pause the active streaming wakeword capture before handing an accepted streaming wakeword to an exclusive conversation-recording path on the same ALSA device, and reopen it after the handler returns; otherwise wakeword success degenerates into immediate `Device or resource busy` capture failures.
+- `service.py` must not clear a targeted ReSpeaker startup blocker after a single transient readable-frame probe; startup needs sustained bounded capture success so unstable USB enumeration does not flap the runtime between `ok` and `error`.
+- `service.py` must tolerate only short exact `EBUSY` handover races when opening the PIR monitor; permanent GPIO contention or non-busy faults stay fail-closed and must not be downgraded.
 - `audio_policy.py` must treat classified non-speech/background-media room activity as incompatible with calm `presence_audio_active`; do not let uncorroborated XVF3800 speech flags alone re-elevate media/noise into device-directed presence speech.
 - ReSpeaker ambient classification must not depend solely on the speech-threshold chunk gate for non-speech detection; bounded low-dynamic RMS activity may still be media/noise even when `active_ratio` stays at zero.
 - ReSpeaker ambient classification may use local PCM-content evidence to veto strong XVF3800 speech false positives, but ambiguous PCM windows must stay fail-closed and allow upstream host-control to remain decisive.
@@ -56,7 +64,11 @@ Out of scope:
 - Matching `display_attention.py` cues must refresh their TTL before expiry so a stable visible-person target does not fall back to center between local attention-refresh ticks, and brief center jitter or short no-person/no-anchor blips must not immediately erase a recent local cue. Near-center responsiveness should come from bounded spatial head/gaze tuning, not from reintroducing jittery up/down or random idle eye motion.
 - The fast HDMI attention-refresh path must not block on full ambient PCM sampling windows. When ReSpeaker host-control already provides speech/direction hints, use a signal-only snapshot or recent cached audio instead of serializing gaze/gesture refresh behind slow audio reads.
 - The fast HDMI attention-refresh path must keep its default cadence genuinely sub-second on Pi HDMI builds; a half-second-plus default render loop is too slow for gaze-follow or gesture acknowledgement.
+- HDMI eye-follow and HDMI gesture acknowledgement must stay decoupled. Eye-follow should prefer a cheap attention-only local camera observation and its own stabilized camera-surface state, while gesture acknowledgement may use the heavier full gesture path without clearing, delaying, or otherwise regressing face-follow behavior.
+- HDMI gesture acknowledgement should prefer its own dedicated live-gesture observation path and ack-lane state. Do not route user-facing symbol latency through the heavier social camera-surface path when the dedicated gesture refresh is available.
 - `service.py` should keep a bounded changed-only ops trace for HDMI attention-follow decisions so Pi debugging can prove whether failures come from camera health, stabilized camera semantics, target selection, or cue publishing.
+- `service.py` should also keep a bounded continuous attention debug stream for each HDMI refresh tick so transient 1-3 minute eye-follow dropouts still leave first-run evidence after the fact.
+- `service.py` should also keep a bounded continuous gesture debug stream for each HDMI gesture refresh tick so Pi-side symbol latency and missed acknowledgements can be diagnosed from first-run evidence instead of blind retuning.
 - The fast HDMI attention-refresh path must stay local-camera-only, bounded, and separate from full proactive trigger evaluation; do not turn it into an always-on generic vision loop.
 - The fast HDMI attention-refresh path may stay active while the main runtime is in `error`, but only for local face-cue following; it must not be used to re-enable agent turns, remote-memory work, or other degraded runtime behavior.
 - Speaker association and multimodal initiative must fail closed on multi-person or low-confidence room context; do not let weak audio hints force spoken proactivity.

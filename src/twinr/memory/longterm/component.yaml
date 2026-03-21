@@ -9,6 +9,7 @@ owned_concerns:
   - Define the top-level boundaries between the core, ingestion, reasoning, retrieval, storage, runtime, proactive, and evaluation subpackages
   - Hold the target-state architecture document for the long-term memory subsystem
   - Provide lazy access to evaluation entry points without making normal runtime imports depend on the evaluation harnesses
+  - Expose the room-agnostic smart-home environment-profile compiler used by the sensor-memory ingestion layer
 out_of_scope:
   - Short-term or on-device memory outside this subsystem
   - Low-level ChonkyDB client or graph-schema code outside long-term storage integration
@@ -63,6 +64,7 @@ public_api:
     - LongTermMemoryService
     - LongTermMidtermPacketV1
     - LongTermMidtermStore
+    - LongTermEnvironmentProfileCompiler
     - LongTermMultimodalEvidence
     - LongTermMultimodalExtractor
     - LongTermProactiveCandidateV1

@@ -67,6 +67,37 @@ def build_default_wakeword_training_plan(*, project_root: str | Path | None = No
     baseline_model = root / "src" / "twinr" / "proactive" / "wakeword" / "models" / "twinr_v1.onnx"
     commands = (
         WakewordTrainingCommand(
+            name="Export Conventional KWS Splits",
+            purpose=(
+                "Export held-out-safe Twinr room captures into WeKws/Kaldi-style "
+                "split directories so the next conventional keyword detector can be "
+                "trained from the real phonetic family instead of a generic bundle."
+            ),
+            command=(
+                f"PYTHONPATH=src python3 -m twinr --env-file {root / '.env'} \\\n"
+                "  --wakeword-export-wekws \\\n"
+                "  --wakeword-wekws-output-dir <wekws_dataset_dir> \\\n"
+                "  --wakeword-wekws-train-manifest <wekws_train_manifest.json> \\\n"
+                "  --wakeword-wekws-dev-manifest <wekws_dev_manifest.json> \\\n"
+                "  --wakeword-wekws-test-manifest <wekws_test_manifest.json>"
+            ),
+        ),
+        WakewordTrainingCommand(
+            name="Prepare WeKws Experiment",
+            purpose=(
+                "Turn the exported WeKws splits into a reproducible experiment "
+                "workspace with Twinr's built-in streaming recipe, `data.list`, "
+                "and a runner script that trains, scores, and exports ONNX."
+            ),
+            command=(
+                f"PYTHONPATH=src python3 -m twinr --env-file {root / '.env'} \\\n"
+                "  --wakeword-prepare-wekws-experiment \\\n"
+                "  --wakeword-wekws-dataset-dir <wekws_dataset_dir> \\\n"
+                "  --wakeword-wekws-experiment-dir <wekws_experiment_dir> \\\n"
+                "  --wakeword-wekws-recipe mdtc_fbank_stream"
+            ),
+        ),
+        WakewordTrainingCommand(
             name="Build Stage-1 Dataset",
             purpose=(
                 "Generate one family detector dataset that keeps Twinna/Twina/Twinner "
@@ -158,11 +189,13 @@ def build_default_wakeword_training_plan(*, project_root: str | Path | None = No
         "Exclude every held-out acceptance manifest from dataset generation to keep promotion honest.",
         "Do not promote a candidate that improves full-set false positives by introducing even one new family false negative.",
         "Treat candidate-family confusion words as first-class negatives: Twin, Winner, Winter, Tina, Timer, Twitter.",
+        "Treat generic open-vocabulary bundles only as bootstrap baselines; the production target is a custom conventional KWS detector plus verification.",
     )
     references = (
         "Google 2017 cascade KWS on mobile devices",
         "Amazon word-level wakeword verification",
         "Amazon wakeword-independent verification",
+        "WeKws open-source production-oriented keyword spotting toolkit",
         "microWakeWord false-accepts/hour deployment guidance",
         "openWakeWord custom verifier guidance",
         "Recent phoneme-aware and confusable-negative user-defined KWS papers",

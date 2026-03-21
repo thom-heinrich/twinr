@@ -39,6 +39,9 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
   otherwise free right-hand reserve area with one real Unicode symbol such as
   `👍` or `👋` without pushing emoji-only semantics into the generic runtime
   snapshot schema
+- let the right-hand reserve mirror clear user camera gestures with the same
+  symbol when the proactive runtime publishes a bounded acknowledgement, while
+  keeping hostile-gesture reactions separate from face emotion
 - allow optional external HDMI presentation cues so other capabilities can
   expand the default right-hand panel into a bounded fullscreen image or rich
   card without teaching the generic runtime snapshot schema about
@@ -178,6 +181,9 @@ leave the right-hand reserve area free of status-card chrome so the live
 screen does not regress back toward the earlier cramped composition. When a
 capability does claim that reserve area, prefer one real emoji cue with a soft
 halo over dense text or extra chrome so the surface stays readable at a glance.
+Gesture acknowledgements should mirror clear symbols like `👍`, `👎`, `👋`,
+`✌️`, `👌`, or `👉` directly instead of inventing extra text, while still
+keeping face emotions in the face channel and not in emoji-only surrogates.
 
 That waiting surface may also show very rare ambient moments: tiny sparkles,
 hearts, crescent moons, wave marks, curious dot clusters, or even a tiny crown

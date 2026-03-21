@@ -7,11 +7,13 @@ import sys
 import tempfile
 import unittest
 import wave
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.proactive.wakeword.promotion import (
+    _build_stream_policy,
     load_wakeword_promotion_spec,
     run_wakeword_promotion_eval,
     run_wakeword_stream_eval,
@@ -95,7 +97,59 @@ class FakeKeywordSpotter:
         stream.pending_results.clear()
 
 
+class FakeWekwsFrameSpotter:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = dict(kwargs)
+
+    def frame_bytes_for_channels(self, channels: int) -> int:
+        return 1600 * max(1, int(channels)) * 2
+
+    def reset(self) -> None:
+        return None
+
+    def process_pcm_bytes(self, pcm_bytes: bytes, *, channels: int):
+        del channels
+        peak = 0
+        for offset in range(0, len(pcm_bytes) - (len(pcm_bytes) % 2), 2):
+            sample = int.from_bytes(pcm_bytes[offset:offset + 2], "little", signed=True)
+            peak = max(peak, abs(sample))
+        if peak < 900:
+            return None
+        from twinr.proactive.wakeword.matching import WakewordMatch
+
+        return WakewordMatch(
+            detected=True,
+            transcript="",
+            matched_phrase="twinr",
+            backend="wekws",
+            detector_label="<TWINR_FAMILY>",
+            score=0.72,
+        )
+
+
 class WakewordPromotionTests(unittest.TestCase):
+    def test_build_stream_policy_attaches_sequence_verifier_for_wekws(self) -> None:
+        config = TwinrConfig(
+            wakeword_enabled=True,
+            wakeword_primary_backend="wekws",
+            wakeword_fallback_backend="stt",
+            wakeword_verifier_mode="disabled",
+            wakeword_openwakeword_sequence_verifier_models=(
+                ("twinr_family", "/tmp/twinr_family.sequence_verifier.pkl"),
+            ),
+            wakeword_openwakeword_sequence_verifier_threshold=0.19,
+        )
+
+        with patch(
+            "twinr.proactive.wakeword.promotion.build_configured_sequence_capture_verifier"
+        ) as builder:
+            sentinel = object()
+            builder.return_value = sentinel
+            policy = _build_stream_policy(config=config, backend=None)
+
+        self.assertIs(policy.local_verifier, sentinel)
+        builder.assert_called_once_with(config)
+
     def test_run_wakeword_stream_eval_replays_runtime_stream_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -201,6 +255,61 @@ class WakewordPromotionTests(unittest.TestCase):
         self.assertEqual(report.metrics.false_positive, 0)
         self.assertEqual(report.metrics.false_negative, 0)
         self.assertEqual(report.accepted_detection_count, 1)
+
+    def test_run_wakeword_stream_eval_supports_wekws_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            positive = root / "wakeword_positive.wav"
+            negative = root / "wakeword_negative.wav"
+            manifest = root / "manifest.json"
+            _write_wav(positive, amplitude=16000)
+            _write_wav(negative, amplitude=100)
+            manifest.write_text(
+                json.dumps(
+                    [
+                        {"captured_audio_path": str(positive), "label": "correct"},
+                        {"captured_audio_path": str(negative), "label": "false_positive"},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = TwinrConfig(
+                project_root=temp_dir,
+                wakeword_enabled=True,
+                wakeword_primary_backend="wekws",
+                wakeword_fallback_backend="stt",
+                wakeword_verifier_mode="disabled",
+                wakeword_phrases=("twinna", "twinr"),
+                wakeword_wekws_model_path=str(root / "model.onnx"),
+                wakeword_wekws_config_path=str(root / "config.yaml"),
+                wakeword_wekws_words_path=str(root / "words.txt"),
+                wakeword_wekws_cmvn_path=str(root / "global_cmvn"),
+                wakeword_wekws_threshold=0.25,
+                audio_sample_rate=16000,
+                audio_channels=1,
+                audio_speech_threshold=400,
+                wakeword_attempt_cooldown_s=10.0,
+            )
+
+            with patch(
+                "twinr.proactive.wakeword.promotion.WakewordWekwsFrameSpotter",
+                return_value=FakeWekwsFrameSpotter(),
+            ) as factory:
+                report = run_wakeword_stream_eval(
+                    config=config,
+                    manifest_path=manifest,
+                    backend=None,
+                    model_factory=None,
+                )
+
+        self.assertEqual(report.evaluated_entries, 2)
+        self.assertEqual(report.metrics.true_positive, 1)
+        self.assertEqual(report.metrics.true_negative, 1)
+        self.assertEqual(report.metrics.false_positive, 0)
+        self.assertEqual(report.metrics.false_negative, 0)
+        self.assertEqual(report.accepted_detection_count, 1)
+        factory.assert_called_once()
 
     def test_load_wakeword_promotion_spec_resolves_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

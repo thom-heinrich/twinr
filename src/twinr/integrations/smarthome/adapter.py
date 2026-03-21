@@ -20,8 +20,21 @@ from twinr.integrations.models import IntegrationManifest, IntegrationRequest, I
 from twinr.integrations.smarthome.models import (
     SmartHomeCommand,
     SmartHomeEntity,
+    SmartHomeEntityAggregateField,
     SmartHomeEntityClass,
     SmartHomeEventBatch,
+    SmartHomeEventAggregateField,
+)
+from twinr.integrations.smarthome.query import (
+    aggregate_entities,
+    aggregate_events,
+    entity_query_filters_payload,
+    event_query_filters_payload,
+    filter_entities,
+    filter_events,
+    paginate_entities,
+    parse_entity_query_parameters,
+    parse_event_query_parameters,
 )
 
 logger = logging.getLogger(__name__)
@@ -219,32 +232,35 @@ class SmartHomeIntegrationAdapter(IntegrationAdapter):
             )
 
     def _list_entities(self, request: IntegrationRequest) -> IntegrationResult:
-        """Return bounded smart-home entities with their current state."""
+        """Return filtered smart-home entities with optional aggregations."""
 
         params = _parameters(request)
-        requested_ids = _parse_string_tuple(
-            params.get("entity_ids", params.get("entity_id")),
-            field_name="entity_ids",
+        query = parse_entity_query_parameters(
+            params,
+            default_limit=self.settings.max_entity_results,
+            maximum_limit=self.settings.max_entity_results,
         )
-        entity_class_text = _parse_optional_text(params.get("entity_class"), field_name="entity_class")
-        entity_class = SmartHomeEntityClass(entity_class_text) if entity_class_text is not None else None
-        include_unavailable = _parse_strict_bool(
-            params.get("include_unavailable", False),
-            field_name="include_unavailable",
+        provider_entity_class = query.entity_classes[0] if len(query.entity_classes) == 1 else None
+        provider_entities = self.entity_provider.list_entities(
+            entity_ids=query.entity_ids,
+            entity_class=provider_entity_class,
+            include_unavailable=query.include_unavailable or query.online is False,
         )
-
-        entities = self.entity_provider.list_entities(
-            entity_ids=requested_ids,
-            entity_class=entity_class,
-            include_unavailable=include_unavailable,
-        )
-        bounded_entities = entities[: self.settings.max_entity_results]
+        filtered_entities = filter_entities(provider_entities, query)
+        bounded_entities, next_cursor = paginate_entities(filtered_entities, query)
+        aggregates = aggregate_entities(filtered_entities, query.aggregate_by)
         return IntegrationResult(
             ok=True,
             summary=f"{len(bounded_entities)} smart-home entities ready.",
             details={
                 "count": len(bounded_entities),
+                "total_count": len(filtered_entities),
+                "returned_count": len(bounded_entities),
+                "next_cursor": next_cursor,
+                "truncated": next_cursor is not None,
+                "applied_filters": entity_query_filters_payload(query),
                 "entities": [entity.as_dict() for entity in bounded_entities],
+                "aggregates": aggregates,
             },
         )
 
@@ -327,22 +343,40 @@ class SmartHomeIntegrationAdapter(IntegrationAdapter):
         return self._control_entities(synthetic_request)
 
     def _read_sensor_stream(self, request: IntegrationRequest) -> IntegrationResult:
-        """Return a bounded normalized smart-home event batch."""
+        """Return a filtered normalized smart-home event batch with aggregates."""
 
         if self.sensor_stream is None:
             raise RuntimeError("I couldn't read the smart-home sensor stream because the stream service is unavailable.")
 
         params = _parameters(request)
-        limit = min(
-            self.settings.max_event_results,
-            _parse_positive_int(params.get("limit", self.settings.max_event_results), field_name="limit"),
+        query = parse_event_query_parameters(
+            params,
+            default_limit=self.settings.max_event_results,
+            maximum_limit=self.settings.max_event_results,
         )
-        cursor = _parse_optional_text(params.get("cursor"), field_name="cursor")
-        batch = self.sensor_stream.read_sensor_stream(cursor=cursor, limit=limit)
+        raw_limit = self.settings.max_event_results if (
+            query.aggregate_by
+            or query.entity_ids
+            or query.event_kinds
+            or query.providers
+            or query.areas
+        ) else query.limit
+        batch = self.sensor_stream.read_sensor_stream(cursor=query.cursor, limit=raw_limit)
+        filtered_events = filter_events(batch.events, query)
+        bounded_events = tuple(filtered_events[: query.limit])
+        aggregates = aggregate_events(filtered_events, query.aggregate_by)
         return IntegrationResult(
             ok=True,
-            summary=f"{len(batch.events)} smart-home event(s) ready.",
-            details=batch.as_dict(),
+            summary=f"{len(bounded_events)} smart-home event(s) ready.",
+            details={
+                "events": [event.as_dict() for event in bounded_events],
+                "next_cursor": batch.next_cursor,
+                "stream_live": batch.stream_live,
+                "count": len(bounded_events),
+                "matched_count": len(filtered_events),
+                "applied_filters": event_query_filters_payload(query),
+                "aggregates": aggregates,
+            },
         )
 
     @staticmethod

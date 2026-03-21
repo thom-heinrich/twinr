@@ -70,7 +70,7 @@ def _normalize_backend(value: object | None, *, allow_disabled: bool) -> str | N
     normalized = (_normalize_optional_text(value) or "").lower()
     if not normalized:
         return None
-    allowed = {"openwakeword", "kws", "stt"}
+    allowed = {"openwakeword", "kws", "wekws", "stt"}
     if allow_disabled:
         allowed.add("disabled")
     if normalized not in allowed:

@@ -146,7 +146,12 @@ class _HandRoiCandidate:
 
 
 class MediaPipeHandLandmarkWorker:
-    """Run MediaPipe Hand Landmarker on bounded candidate ROIs."""
+    """Run MediaPipe Hand Landmarker on bounded candidate ROIs.
+
+    The worker evaluates independent ROI crops derived from the primary person
+    box and wrist hints. These crops are not one stable video stream, so the
+    hand landmarker must run in image mode instead of video-tracking mode.
+    """
 
     def __init__(self, *, config: HandLandmarkWorkerConfig) -> None:
         """Initialize one lazy hand-landmark worker."""
@@ -173,7 +178,11 @@ class MediaPipeHandLandmarkWorker:
         primary_person_box: AICameraBox,
         sparse_keypoints: dict[int, tuple[float, float, float]] | None = None,
     ) -> HandLandmarkResult:
-        """Run hand-landmark inference on bounded ROIs for one frame."""
+        """Run hand-landmark inference on bounded ROIs for one frame.
+
+        Each ROI is an independent crop. Use one image-mode inference per crop
+        instead of feeding alternating ROI spaces into one video tracker.
+        """
 
         candidates = _build_hand_roi_candidates(
             primary_person_box=primary_person_box,
@@ -193,7 +202,7 @@ class MediaPipeHandLandmarkWorker:
             image_data = normalize_image_data(crop)
             image = runtime["mp"].Image(image_format=runtime["mp"].ImageFormat.SRGB, data=image_data)
             candidate_timestamp_ms = timestamp_ms + index
-            result = hand_landmarker.detect_for_video(image, candidate_timestamp_ms)
+            result = hand_landmarker.detect(image)
             final_timestamp_ms = candidate_timestamp_ms
             detections.extend(
                 _parse_hand_landmark_result(
@@ -213,7 +222,11 @@ class MediaPipeHandLandmarkWorker:
         )
 
     def _ensure_hand_landmarker(self, runtime: dict[str, Any]) -> Any:
-        """Reuse or create the configured hand landmarker."""
+        """Reuse or create the configured hand landmarker.
+
+        ROI crops are independent images, so IMAGE mode is the correct
+        MediaPipe running mode for this worker.
+        """
 
         if self._hand_landmarker is not None:
             return self._hand_landmarker
@@ -223,7 +236,7 @@ class MediaPipeHandLandmarkWorker:
         vision = runtime["vision"]
         options = vision.HandLandmarkerOptions(
             base_options=runtime["BaseOptions"](model_asset_path=str(model_path)),
-            running_mode=vision.RunningMode.VIDEO,
+            running_mode=vision.RunningMode.IMAGE,
             num_hands=self.config.num_hands,
             min_hand_detection_confidence=self.config.min_hand_detection_confidence,
             min_hand_presence_confidence=self.config.min_hand_presence_confidence,
@@ -241,16 +254,7 @@ def _build_hand_roi_candidates(
 ) -> tuple[_HandRoiCandidate, ...]:
     """Return bounded ROI candidates for one primary person."""
 
-    candidates: list[_HandRoiCandidate] = [
-        _HandRoiCandidate(
-            box=_build_primary_person_upper_body_roi(
-                primary_person_box=primary_person_box,
-                config=config,
-            ),
-            source=HandRoiSource.PRIMARY_PERSON_UPPER_BODY,
-            priority=2,
-        )
-    ]
+    candidates: list[_HandRoiCandidate] = []
     left_wrist_candidate = _build_wrist_roi_candidate(
         wrist_key=9,
         elbow_key=7,
@@ -273,6 +277,17 @@ def _build_hand_roi_candidates(
     )
     if right_wrist_candidate is not None:
         candidates.append(right_wrist_candidate)
+    if not candidates:
+        candidates.append(
+            _HandRoiCandidate(
+                box=_build_primary_person_upper_body_roi(
+                    primary_person_box=primary_person_box,
+                    config=config,
+                ),
+                source=HandRoiSource.PRIMARY_PERSON_UPPER_BODY,
+                priority=2,
+            )
+        )
     candidates.sort(key=lambda item: (item.priority, -item.box.area))
     deduped: list[_HandRoiCandidate] = []
     for candidate in candidates:

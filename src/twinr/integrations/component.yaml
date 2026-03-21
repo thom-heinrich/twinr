@@ -8,7 +8,8 @@ owned_concerns:
   - Define the canonical manifest, request, result, and safety models shared by all Twinr integrations
   - Publish Twinr's builtin integration catalog and manifest lookup helpers
   - Evaluate integration policy decisions and dispatch requests to registered adapters
-  - Build managed email and calendar adapters from store and environment state
+  - Build managed email, calendar, and smart-home adapters from store and environment state
+  - Resolve per-bridge Hue application keys and aggregate multiple configured bridges when smart-home routing needs them
   - Expose generic smart-home contracts and provider packages under src/twinr/integrations/smarthome
   - Persist integration configuration and expose integration automation family blocks to the web layer
 out_of_scope:
@@ -61,16 +62,21 @@ files:
       - IntegrationRegistry
       - IntegrationRegistryError
   - path: runtime.py
-    role: Managed email and calendar runtime assembly from config and environment
+    role: Managed email, calendar, and smart-home runtime assembly from config and environment
     exports:
       - CALENDAR_AGENDA_INTEGRATION_ID
       - EMAIL_APP_PASSWORD_ENV_KEY
+      - HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY
       - EMAIL_MAILBOX_INTEGRATION_ID
+      - HUE_APPLICATION_KEY_ENV_KEY
       - IntegrationReadiness
       - ManagedIntegrationsRuntime
+      - SMART_HOME_HUB_INTEGRATION_ID
       - build_calendar_agenda_adapter
       - build_email_mailbox_adapter
       - build_managed_integrations
+      - build_smart_home_hub_adapter
+      - hue_application_key_env_key_for_host
       - validate_calendar_source
   - path: store.py
     role: File-backed integration configuration store with bounded atomic writes
@@ -104,6 +110,8 @@ public_api:
     - DataSensitivity
     - EMAIL_APP_PASSWORD_ENV_KEY
     - EMAIL_MAILBOX_INTEGRATION_ID
+    - HUE_ADDITIONAL_BRIDGE_HOSTS_SETTING_KEY
+    - HUE_APPLICATION_KEY_ENV_KEY
     - EmailAdapterSettings
     - EmailContact
     - EmailDraft
@@ -136,11 +144,13 @@ public_api:
     - RiskLevel
     - SMTPMailSender
     - SMTPMailSenderConfig
+    - SMART_HOME_HUB_INTEGRATION_ID
     - SafeIntegrationPolicy
     - SafetyProfile
     - SecretReference
     - SecretStorage
     - SmartHomeAdapterSettings
+    - AggregatedSmartHomeProvider
     - SmartHomeCommand
     - SmartHomeController
     - SmartHomeEntity
@@ -151,6 +161,7 @@ public_api:
     - SmartHomeEventKind
     - SmartHomeIntegrationAdapter
     - SmartHomeSensorStream
+    - RoutedSmartHomeProvider
     - TwinrIntegrationStore
     - HueBridgeClient
     - HueBridgeConfig
@@ -160,10 +171,15 @@ public_api:
     - build_email_mailbox_adapter
     - build_hue_smart_home_provider
     - build_managed_integrations
+    - build_routed_entity_id
+    - build_routed_event_id
+    - build_smart_home_hub_adapter
+    - hue_application_key_env_key_for_host
     - integration_automation_family_providers
     - integration_store_path
     - manifest_for_id
     - manifests_for_domain
+    - parse_routed_entity_id
     - stricter_confirmation
     - validate_calendar_source
 primary_callers:
@@ -171,10 +187,13 @@ primary_callers:
   - path: src/twinr/web/context.py
   - path: src/twinr/web/viewmodels_integrations.py
   - path: src/twinr/agent/self_coding/capability_registry.py
+  - path: src/twinr/agent/tools/handlers/smarthome.py
+  - path: src/twinr/agent/workflows/realtime_runner.py
 tests:
   - path: test/test_integrations.py
   - path: test/test_integration_runtime.py
   - path: test/test_integration_store.py
   - path: test/test_integrations_smarthome.py
   - path: test/test_integrations_smarthome_hue.py
+  - path: test/test_integrations_smarthome_runtime.py
   - path: test/test_web_app.py

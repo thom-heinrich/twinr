@@ -370,8 +370,11 @@ class TwinrConfig:
     conversation_follow_up_enabled: bool = False
     conversation_follow_up_after_proactive_enabled: bool = False
     conversation_closure_guard_enabled: bool = True
+    conversation_closure_model: str = "gpt-4o-mini"
+    conversation_closure_reasoning_effort: str = ""
     conversation_closure_context_turns: int = 4
     conversation_closure_instructions_file: str = "CONVERSATION_CLOSURE.md"
+    conversation_closure_max_output_tokens: int = 32
     conversation_closure_provider_timeout_seconds: float = 2.0
     conversation_closure_max_transcript_chars: int = 512
     conversation_closure_max_response_chars: int = 512
@@ -472,7 +475,7 @@ class TwinrConfig:
     proactive_local_camera_mediapipe_gesture_model_path: str = "state/mediapipe/models/gesture_recognizer.task"
     proactive_local_camera_mediapipe_custom_gesture_model_path: str | None = None
     proactive_local_camera_mediapipe_num_hands: int = 2
-    proactive_local_camera_sequence_window_s: float = 0.75
+    proactive_local_camera_sequence_window_s: float = 0.55
     proactive_local_camera_sequence_min_frames: int = 3
     proactive_local_camera_source_device: str = "imx500"
     proactive_local_camera_frame_rate: int = 15
@@ -555,6 +558,14 @@ class TwinrConfig:
     wakeword_kws_keywords_score: float = 1.0
     wakeword_kws_keywords_threshold: float = 0.25
     wakeword_kws_num_trailing_blanks: int = 1
+    wakeword_wekws_model_path: str | None = None
+    wakeword_wekws_config_path: str | None = None
+    wakeword_wekws_words_path: str | None = None
+    wakeword_wekws_cmvn_path: str | None = None
+    wakeword_wekws_provider: str = "cpu"
+    wakeword_wekws_num_threads: int = 2
+    wakeword_wekws_threshold: float = 0.5
+    wakeword_wekws_chunk_ms: int = 100
     wakeword_calibration_profile_path: str = "state/wakeword_calibration.json"
     wakeword_calibration_recommended_path: str = "state/wakeword_calibration.recommended.json"
     proactive_person_returned_absence_s: float = 20.0 * 60.0
@@ -669,6 +680,10 @@ class TwinrConfig:
     reminder_max_entries: int = 48
     automation_poll_interval_s: float = 5.0
     automation_max_entries: int = 96
+    smart_home_background_worker_enabled: bool = True
+    smart_home_background_idle_sleep_s: float = 1.0
+    smart_home_background_retry_delay_s: float = 2.0
+    smart_home_background_batch_limit: int = 8
     voice_profile_min_sample_ms: int = 1200
     voice_profile_likely_threshold: float = 0.72
     voice_profile_uncertain_threshold: float = 0.55
@@ -1013,6 +1028,10 @@ class TwinrConfig:
         wakeword_kws_keywords_file_path = _parse_optional_text(
             get_value("TWINR_WAKEWORD_KWS_KEYWORDS_FILE_PATH")
         )
+        wakeword_wekws_model_path = _parse_optional_text(get_value("TWINR_WAKEWORD_WEKWS_MODEL_PATH"))
+        wakeword_wekws_config_path = _parse_optional_text(get_value("TWINR_WAKEWORD_WEKWS_CONFIG_PATH"))
+        wakeword_wekws_words_path = _parse_optional_text(get_value("TWINR_WAKEWORD_WEKWS_WORDS_PATH"))
+        wakeword_wekws_cmvn_path = _parse_optional_text(get_value("TWINR_WAKEWORD_WEKWS_CMVN_PATH"))
 
         return cls(
             openai_api_key=get_value("OPENAI_API_KEY"),
@@ -1255,12 +1274,22 @@ class TwinrConfig:
                 get_value("TWINR_CONVERSATION_CLOSURE_GUARD_ENABLED"),
                 True,
             ),
+            conversation_closure_model=(
+                get_value("TWINR_CONVERSATION_CLOSURE_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
+            ),
+            conversation_closure_reasoning_effort=(
+                get_value("TWINR_CONVERSATION_CLOSURE_REASONING_EFFORT", "") or ""
+            ),
             conversation_closure_context_turns=int(
                 get_value("TWINR_CONVERSATION_CLOSURE_CONTEXT_TURNS", "4") or "4"
             ),
             conversation_closure_instructions_file=(
                 get_value("TWINR_CONVERSATION_CLOSURE_INSTRUCTIONS_FILE", "CONVERSATION_CLOSURE.md")
                 or "CONVERSATION_CLOSURE.md"
+            ),
+            conversation_closure_max_output_tokens=max(
+                16,
+                int(get_value("TWINR_CONVERSATION_CLOSURE_MAX_OUTPUT_TOKENS", "32") or "32"),
             ),
             conversation_closure_provider_timeout_seconds=_parse_float(
                 get_value("TWINR_CONVERSATION_CLOSURE_PROVIDER_TIMEOUT_SECONDS"),
@@ -1546,7 +1575,7 @@ class TwinrConfig:
             ),
             proactive_local_camera_sequence_window_s=_parse_float(
                 get_value("TWINR_PROACTIVE_LOCAL_CAMERA_SEQUENCE_WINDOW_S"),
-                0.75,
+                0.55,
             ),
             proactive_local_camera_sequence_min_frames=int(
                 get_value("TWINR_PROACTIVE_LOCAL_CAMERA_SEQUENCE_MIN_FRAMES", "3") or "3"
@@ -1803,6 +1832,25 @@ class TwinrConfig:
             ),
             wakeword_kws_num_trailing_blanks=int(
                 get_value("TWINR_WAKEWORD_KWS_NUM_TRAILING_BLANKS", "1") or "1"
+            ),
+            wakeword_wekws_model_path=wakeword_wekws_model_path,
+            wakeword_wekws_config_path=wakeword_wekws_config_path,
+            wakeword_wekws_words_path=wakeword_wekws_words_path,
+            wakeword_wekws_cmvn_path=wakeword_wekws_cmvn_path,
+            wakeword_wekws_provider=(
+                get_value("TWINR_WAKEWORD_WEKWS_PROVIDER", "cpu") or "cpu"
+            ).strip().lower(),
+            wakeword_wekws_num_threads=int(
+                get_value("TWINR_WAKEWORD_WEKWS_NUM_THREADS", "2") or "2"
+            ),
+            wakeword_wekws_threshold=_parse_clamped_float(
+                get_value("TWINR_WAKEWORD_WEKWS_THRESHOLD"),
+                0.5,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            wakeword_wekws_chunk_ms=int(
+                get_value("TWINR_WAKEWORD_WEKWS_CHUNK_MS", "100") or "100"
             ),
             wakeword_calibration_profile_path=get_value(
                 "TWINR_WAKEWORD_CALIBRATION_PROFILE_PATH",
@@ -2213,6 +2261,24 @@ class TwinrConfig:
             reminder_max_entries=int(get_value("TWINR_REMINDER_MAX_ENTRIES", "48") or "48"),
             automation_poll_interval_s=_parse_float(get_value("TWINR_AUTOMATION_POLL_INTERVAL_S"), 5.0),
             automation_max_entries=int(get_value("TWINR_AUTOMATION_MAX_ENTRIES", "96") or "96"),
+            smart_home_background_worker_enabled=_parse_bool(
+                get_value("TWINR_SMART_HOME_BACKGROUND_WORKER_ENABLED"),
+                True,
+            ),
+            smart_home_background_idle_sleep_s=_parse_float(
+                get_value("TWINR_SMART_HOME_BACKGROUND_IDLE_SLEEP_S"),
+                1.0,
+                minimum=0.1,
+            ),
+            smart_home_background_retry_delay_s=_parse_float(
+                get_value("TWINR_SMART_HOME_BACKGROUND_RETRY_DELAY_S"),
+                2.0,
+                minimum=0.1,
+            ),
+            smart_home_background_batch_limit=max(
+                1,
+                int(get_value("TWINR_SMART_HOME_BACKGROUND_BATCH_LIMIT", "8") or "8"),
+            ),
             voice_profile_min_sample_ms=int(get_value("TWINR_VOICE_PROFILE_MIN_SAMPLE_MS", "1200") or "1200"),
             voice_profile_likely_threshold=_parse_float(
                 get_value("TWINR_VOICE_PROFILE_LIKELY_THRESHOLD"),

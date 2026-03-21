@@ -3,10 +3,11 @@ name: handlers
 path: src/twinr/agent/tools/handlers
 kind: python-package
 visibility: internal
-summary: Concrete realtime tool handlers and shared guard helpers for automation, memory, reminder, world-intelligence, output, self-coding, settings, voice-profile, portrait-identity, and shared household-identity tool calls.
+summary: Concrete realtime tool handlers and shared guard helpers for automation, smart-home, memory, reminder, world-intelligence, output, self-coding, settings, voice-profile, portrait-identity, and shared household-identity tool calls.
 owned_concerns:
   - Validate and normalize tool-call payloads at the handler boundary
   - Translate tool requests into bounded runtime reads and mutations
+  - Expose one smart-home tool surface for entity discovery, filtered state queries, low-risk control, and bounded stream inspection
   - Keep handler-local telemetry, audit events, and follow-up side effects best-effort
   - Share live-audio, sensitive-action confirmation, and primitive coercion helpers across handler families
   - Return structured portrait-enrollment guidance so the model can drive camera retries naturally
@@ -31,6 +32,13 @@ files:
       - handle_update_sensor_automation
       - handle_delete_automation
       - normalize_delivery
+  - path: smarthome.py
+    role: Smart-home entity discovery, filtered state read, control, and stream handlers
+    exports:
+      - handle_control_smart_home_entities
+      - handle_list_smart_home_entities
+      - handle_read_smart_home_sensor_stream
+      - handle_read_smart_home_state
   - path: memory.py
     role: Durable-memory, contact, preference, and plan handlers
     exports:
@@ -105,6 +113,7 @@ tests:
   - path: test/test_realtime_runner.py
   - path: test/test_self_coding_dialogue.py
   - path: test/test_openai_realtime.py
+  - path: test/test_tool_broker_policy.py
   - path: test/test_automations.py
   - path: test/test_reminders.py
   - path: test/test_simple_settings.py

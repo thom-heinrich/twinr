@@ -31,8 +31,10 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 - keep catalog-backed rescue alive when current-scope object payloads collapse away during status/kind partitioning, so newly confirmed facts are not hidden just because a stale scope hit now deserializes as `superseded`
 - fall back from a false-empty current-scope conflict `topk_records` hit set to the current remote catalog instead of double-filtering the same conflict away, so open conflicts remain visible when the remote one-shot search under-matches inflected wording
 - fall back from false-empty durable-object catalog top-k results to the already loaded local catalog selector, but keep empty episodic scope misses authoritative so off-topic episode queries do not rehydrate the whole episodic catalog into the hot path
+- top up underfilled durable sections with one bounded durable-only rescue when the shared episodic/durable query pool is dominated by episodes, so multimodal print/button facts are not starved by recent distractor turns
 - attest every required remote snapshot write and subsequent pointer update with immediate parseable readbacks before Twinr trusts the saved snapshot or updates its fresh-reader document-id hints
 - route exact-read remote snapshot and pointer writes through ChonkyDB's fast async content path, then prove visibility via readback attestation instead of waiting on the timeout-prone synchronous `records/bulk` content-processing path
+- treat `long_term_memory_remote_write_timeout_s` as the HTTP transport bound only, and use the broader remote flush budget for accepted async bulk jobs plus their readback window, so Twinr does not kill its own accepted writes with an artificial 15s server-side timeout
 - keep async snapshot and pointer attestation retries on the readback side when ChonkyDB does not return an exact `document_id`, so Twinr waits for the new same-URI head instead of blindly duplicating accepted writes under the same `origin_uri`
 - route fine-grained remote catalog/segment writes through async `records/bulk` plus bounded same-URI readback attestation, so live device writes stop timing out on ChonkyDB's synchronous bulk ingestion path while still failing closed if the accepted payload never becomes readable
 - skip `retrieve_search` entirely when the current remote catalog candidate set already fits inside the caller's requested limit, so small conflict/object lookups do not burn an extra timeout-prone backend roundtrip
@@ -47,6 +49,7 @@ Persist long-term object, conflict, archive, midterm, and remote catalog state.
 - project structured memory-state semantics such as `confirmed`, `aktuell`, `gespeichert`, and `superseded` into durable-object search text so meta-memory queries can retrieve the right fact instead of a generic sibling
 - rank selected durable objects by combined query overlap, confirmation state, and recency before returning them to retrieval/runtime callers
 - gate durable-object and conflict recall on content-bearing query terms so control questions do not pull in off-topic memory just because they share auxiliary words like `ist`
+- keep raw storage identifiers such as `slot_key` and `value_key` out of retrieval text so dates and internal IDs do not make unrelated math/control questions match durable memory
 - keep fine-grained remote bulk writes bounded by item count and request bytes before they hit ChonkyDB
 - bootstrap fresh required remote namespaces with empty structured snapshots instead of failing before the first live write
 - treat missing local/remote midterm baselines as empty bootstrap state, not as malformed payload warnings

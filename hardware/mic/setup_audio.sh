@@ -15,12 +15,14 @@ DEVICE_MATCH="${TWINR_AUDIO_DEVICE_MATCH:-reSpeaker}"
 CARD_INDEX=""
 DEVICE_INDEX=0
 CAPTURE_DEVICE_MATCH="${TWINR_AUDIO_CAPTURE_DEVICE_MATCH:-}"
+CAPTURE_MATCH="${TWINR_AUDIO_CAPTURE_DEVICE_MATCH:-${TWINR_AUDIO_DEVICE_MATCH:-reSpeaker}}"
 CAPTURE_CARD_INDEX=""
 CAPTURE_DEVICE_INDEX=""
 PROACTIVE_DEVICE="${TWINR_PROACTIVE_AUDIO_DEVICE:-}"
 PROACTIVE_DEVICE_MATCH="${TWINR_PROACTIVE_AUDIO_DEVICE_MATCH:-}"
 PROACTIVE_DEVICE_INDEX=0
 PROACTIVE_SAMPLE_MS=""
+CAPTURE_DEVICE=""
 SINK_VOLUME_PERCENT="${TWINR_AUDIO_OUTPUT_VOLUME_PERCENT:-100}"
 CARD_PLAYBACK_VOLUME_PERCENT="${TWINR_AUDIO_CARD_PLAYBACK_VOLUME_PERCENT:-100}"
 SKIP_ALSA=0
@@ -172,6 +174,16 @@ set_card_playback_controls_percent() {
         ;;
     esac
   done < <(amixer -c "$card_index" scontrols)
+}
+
+# Persist the selected ALSA card state after playback controls were normalized
+# so later device re-enumeration or service restarts do not restore a stale,
+# effectively muted mixer profile.
+store_card_playback_state() {
+  local card_index="$1"
+
+  command -v alsactl >/dev/null 2>&1 || return 0
+  alsactl store "$card_index" >/dev/null 2>&1 || true
 }
 
 detect_wpctl_id() {
@@ -361,13 +373,12 @@ fi
 [[ "$CARD_INDEX" =~ ^[0-9]+$ ]] || fail "Resolved card index is not numeric: $CARD_INDEX"
 
 if [[ -z "$CAPTURE_CARD_INDEX" ]]; then
-  CAPTURE_MATCH="${CAPTURE_DEVICE_MATCH:-$DEVICE_MATCH}"
   CAPTURE_CARD_INDEX="$(detect_card_index arecord "$CAPTURE_MATCH")"
 fi
 CAPTURE_CARD_INDEX="${CAPTURE_CARD_INDEX:-$CARD_INDEX}"
 [[ "$CAPTURE_CARD_INDEX" =~ ^[0-9]+$ ]] || fail "Resolved capture card index is not numeric: $CAPTURE_CARD_INDEX"
 
-detect_proactive_device() {
+detect_plughw_capture_device() {
   local match="$1"
   local device_index="$2"
   arecord -l | awk -v needle="$match" -v wanted_idx="$device_index" '
@@ -391,22 +402,30 @@ detect_proactive_device() {
 }
 
 if [[ -z "$PROACTIVE_DEVICE" && -n "$PROACTIVE_DEVICE_MATCH" ]]; then
-  PROACTIVE_DEVICE="$(detect_proactive_device "$PROACTIVE_DEVICE_MATCH" "$PROACTIVE_DEVICE_INDEX")"
+  PROACTIVE_DEVICE="$(detect_plughw_capture_device "$PROACTIVE_DEVICE_MATCH" "$PROACTIVE_DEVICE_INDEX")"
 fi
 
-if [[ -n "$PROACTIVE_DEVICE" ]]; then
+if [[ -n "$CAPTURE_MATCH" ]]; then
+  CAPTURE_DEVICE="$(detect_plughw_capture_device "$CAPTURE_MATCH" "$CAPTURE_DEVICE_INDEX")"
+fi
+
+if [[ -n "$CAPTURE_DEVICE" || -n "$PROACTIVE_DEVICE" ]]; then
   mkdir -p "$(dirname "$ENV_FILE")"
   touch "$ENV_FILE"
   "$PYTHON_BIN" - <<PY
 from pathlib import Path
 
 path = Path(r'''$ENV_FILE''')
-updates = {
-    "TWINR_PROACTIVE_AUDIO_ENABLED": "true",
-    "TWINR_PROACTIVE_AUDIO_DEVICE": r'''$PROACTIVE_DEVICE''',
-}
+updates = {}
+capture_device = r'''$CAPTURE_DEVICE'''.strip()
+if capture_device:
+    updates["TWINR_AUDIO_INPUT_DEVICE"] = capture_device
+proactive_device = r'''$PROACTIVE_DEVICE'''.strip()
+if proactive_device:
+    updates["TWINR_PROACTIVE_AUDIO_ENABLED"] = "true"
+    updates["TWINR_PROACTIVE_AUDIO_DEVICE"] = proactive_device
 sample_ms = r'''$PROACTIVE_SAMPLE_MS'''.strip()
-if sample_ms:
+if proactive_device and sample_ms:
     updates["TWINR_PROACTIVE_AUDIO_SAMPLE_MS"] = sample_ms
 
 lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
@@ -491,6 +510,7 @@ if [[ "$SKIP_PLAYBACK_VOLUME" -eq 0 ]]; then
     set_sink_volume_percent "$SINK_NAME" "$WPCTL_SINK_ID" "$SINK_VOLUME_PERCENT"
   fi
   set_card_playback_controls_percent "$CARD_INDEX" "$CARD_PLAYBACK_VOLUME_PERCENT"
+  store_card_playback_state "$CARD_INDEX"
 fi
 
 printf 'playback_card=%s\n' "$CARD_INDEX"

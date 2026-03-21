@@ -8,7 +8,7 @@ signals so runtime orchestrators can stay thin.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Any
 
@@ -23,6 +23,7 @@ from .engine import (
     SocialVisiblePerson,
     SocialVisionObservation,
 )
+from .gesture_calibration import GestureCalibrationProfile
 
 _PERSON_VISIBLE_EVENT = "camera.person_visible"
 _HAND_NEAR_EVENT = "camera.hand_or_object_near_camera"
@@ -39,7 +40,9 @@ _EXPLICIT_FINE_HAND_GESTURES = frozenset(
         SocialFineHandGesture.THUMBS_UP,
         SocialFineHandGesture.THUMBS_DOWN,
         SocialFineHandGesture.POINTING,
+        SocialFineHandGesture.PEACE_SIGN,
         SocialFineHandGesture.OK_SIGN,
+        SocialFineHandGesture.MIDDLE_FINGER,
     }
 )
 _MIN_CENTER_SMOOTHING_ALPHA = 0.1
@@ -82,6 +85,7 @@ class ProactiveCameraSurfaceConfig:
     fine_hand_explicit_hold_s: float = 0.45
     fine_hand_explicit_confirm_samples: int = 1
     fine_hand_explicit_min_confidence: float = 0.72
+    gesture_calibration: GestureCalibrationProfile = field(default_factory=GestureCalibrationProfile.defaults)
     primary_person_center_smoothing_alpha: float = 0.58
     primary_person_center_deadband: float = 0.028
     primary_person_center_smoothing_window_s: float = 1.4
@@ -227,6 +231,7 @@ class ProactiveCameraSurfaceConfig:
             fine_hand_explicit_min_confidence=(
                 0.72 if fine_hand_explicit_min_confidence is None else float(fine_hand_explicit_min_confidence)
             ),
+            gesture_calibration=GestureCalibrationProfile.from_runtime_config(config),
             primary_person_center_smoothing_alpha=0.76,
             primary_person_center_deadband=center_deadband,
             primary_person_center_smoothing_window_s=center_smoothing_window_s,
@@ -1608,9 +1613,15 @@ class ProactiveCameraSurface:
         ``open_palm`` so users do not need to freeze unnaturally.
         """
 
+        policy = self.config.gesture_calibration.fine_hand_policy(
+            event,
+            fallback_min_confidence=self.config.fine_hand_explicit_min_confidence,
+            fallback_confirm_samples=self.config.fine_hand_explicit_confirm_samples,
+            fallback_hold_s=self.config.fine_hand_explicit_hold_s,
+        )
         if event in _EXPLICIT_FINE_HAND_GESTURES:
             current_confidence = 0.0 if confidence is None else confidence
-            if current_confidence < self.config.fine_hand_explicit_min_confidence:
+            if current_confidence < policy.min_confidence:
                 self._clear_pending_explicit_fine_hand_gesture()
                 event = SocialFineHandGesture.NONE
                 confidence = None
@@ -1624,7 +1635,7 @@ class ProactiveCameraSurface:
                     self._pending_explicit_fine_hand_gesture = event
                     self._pending_explicit_fine_hand_gesture_count = 1
                     self._pending_explicit_fine_hand_gesture_confidence = current_confidence
-                if self._pending_explicit_fine_hand_gesture_count < self.config.fine_hand_explicit_confirm_samples:
+                if self._pending_explicit_fine_hand_gesture_count < policy.confirm_samples:
                     return SocialFineHandGesture.NONE, None
                 confidence = self._pending_explicit_fine_hand_gesture_confidence
                 self._clear_pending_explicit_fine_hand_gesture()
@@ -1641,7 +1652,13 @@ class ProactiveCameraSurface:
         held_at = self._last_explicit_fine_hand_gesture_at
         if held_event not in _EXPLICIT_FINE_HAND_GESTURES or held_at is None:
             return event, confidence
-        if (now - held_at) > self.config.fine_hand_explicit_hold_s:
+        held_policy = self.config.gesture_calibration.fine_hand_policy(
+            held_event,
+            fallback_min_confidence=self.config.fine_hand_explicit_min_confidence,
+            fallback_confirm_samples=self.config.fine_hand_explicit_confirm_samples,
+            fallback_hold_s=self.config.fine_hand_explicit_hold_s,
+        )
+        if (now - held_at) > held_policy.hold_s:
             return event, confidence
         held_confidence = self._last_explicit_fine_hand_gesture_confidence
         current_confidence = 0.0 if confidence is None else confidence

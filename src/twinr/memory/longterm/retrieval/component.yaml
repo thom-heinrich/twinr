@@ -10,6 +10,7 @@ owned_concerns:
   - Compile adaptive mid-term policy hints from confirmed memory, recurring routines, and proactive outcome history
   - Compile explicit confirmed response-channel policy packets from confirmed preferences so ReSpeaker-derived voice-channel learning stays confirm-first
   - Compile persistent restart-recall packets from stable durable memory so fresh runtime roots keep a small provenance-rich continuity layer
+  - Render room-agnostic smart-home environment reflections and recent environment packets as bounded ambient behavior context
   - Compile and render silent personalization subtext from graph and episodic cues
   - Sanitize retrieved memory payloads before JSON serialization or optional LLM compilation
   - Expose a read-only operator search view over the same durable, episodic, mid-term, graph, and conflict stores used for recall
@@ -21,7 +22,7 @@ files:
   - path: __init__.py
     role: Package marker and local summary
   - path: retriever.py
-    role: Context assembly across long-term memory stores
+    role: Context assembly across long-term memory stores, including bounded smart-home environment rendering
     exports:
       - LongTermRetriever
   - path: adaptive_policy.py

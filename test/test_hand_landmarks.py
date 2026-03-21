@@ -41,7 +41,7 @@ class _FakeFrame:
 
 
 class HandLandmarkWorkerTests(unittest.TestCase):
-    def test_build_hand_roi_candidates_adds_wrist_windows_before_upper_body(self) -> None:
+    def test_build_hand_roi_candidates_prefers_wrist_windows_without_upper_body_fallback(self) -> None:
         candidates = _build_hand_roi_candidates(
             primary_person_box=AICameraBox(top=0.14, left=0.20, bottom=0.96, right=0.78),
             sparse_keypoints={
@@ -56,9 +56,19 @@ class HandLandmarkWorkerTests(unittest.TestCase):
         )
 
         self.assertEqual({candidates[0].source, candidates[1].source}, {HandRoiSource.LEFT_WRIST, HandRoiSource.RIGHT_WRIST})
-        self.assertEqual(candidates[2].source, HandRoiSource.PRIMARY_PERSON_UPPER_BODY)
+        self.assertEqual(len(candidates), 2)
         wrist_centers = sorted(round(candidate.box.center_x, 2) for candidate in candidates[:2])
         self.assertEqual(wrist_centers, [0.18, 0.83])
+
+    def test_build_hand_roi_candidates_uses_upper_body_fallback_when_wrists_missing(self) -> None:
+        candidates = _build_hand_roi_candidates(
+            primary_person_box=AICameraBox(top=0.14, left=0.20, bottom=0.96, right=0.78),
+            sparse_keypoints={},
+            config=HandLandmarkWorkerConfig(model_path="state/mediapipe/models/hand_landmarker.task"),
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].source, HandRoiSource.PRIMARY_PERSON_UPPER_BODY)
 
     def test_project_landmark_to_full_frame_maps_roi_local_coords(self) -> None:
         point = _project_landmark_to_full_frame(
@@ -81,7 +91,7 @@ class HandLandmarkWorkerTests(unittest.TestCase):
                 )
             )
             worker._hand_landmarker = SimpleNamespace(
-                detect_for_video=lambda image, timestamp_ms: SimpleNamespace(
+                detect=lambda image: SimpleNamespace(
                     hand_landmarks=[
                         [SimpleNamespace(x=0.2, y=0.3, z=0.0)],
                         [SimpleNamespace(x=0.7, y=0.4, z=0.0)],
@@ -129,6 +139,36 @@ class HandLandmarkWorkerTests(unittest.TestCase):
 
         self.assertIn("mediapipe_hand_landmarker_model_missing", str(context.exception))
 
+    def test_ensure_hand_landmarker_uses_image_running_mode_for_roi_crops(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "hand_landmarker.task"
+            model_path.write_bytes(b"hand")
+            worker = MediaPipeHandLandmarkWorker(
+                config=HandLandmarkWorkerConfig(model_path=str(model_path))
+            )
+            created: dict[str, object] = {}
+
+            def _options(**kwargs):
+                created["running_mode"] = kwargs.get("running_mode")
+                return SimpleNamespace(**kwargs)
+
+            def _create_from_options(options):
+                created["options"] = options
+                return SimpleNamespace(detect=lambda image: SimpleNamespace(hand_landmarks=[], handedness=[]))
+
+            runtime = {
+                "vision": SimpleNamespace(
+                    RunningMode=SimpleNamespace(IMAGE="image", VIDEO="video"),
+                    HandLandmarkerOptions=_options,
+                    HandLandmarker=SimpleNamespace(create_from_options=_create_from_options),
+                ),
+                "BaseOptions": lambda **kwargs: SimpleNamespace(**kwargs),
+            }
+
+            worker._ensure_hand_landmarker(runtime)
+
+        self.assertEqual(created["running_mode"], "image")
+
     def test_analyze_normalizes_non_contiguous_roi_before_mediapipe_image(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "hand_landmarker.task"
@@ -141,7 +181,7 @@ class HandLandmarkWorkerTests(unittest.TestCase):
                 )
             )
             worker._hand_landmarker = SimpleNamespace(
-                detect_for_video=lambda image, timestamp_ms: SimpleNamespace(
+                detect=lambda image: SimpleNamespace(
                     hand_landmarks=[],
                     handedness=[],
                 )
@@ -170,7 +210,7 @@ class HandLandmarkWorkerTests(unittest.TestCase):
 
         self.assertEqual(observed, [(True, "uint8")])
 
-    def test_analyze_uses_monotonic_timestamps_across_roi_candidates(self) -> None:
+    def test_analyze_uses_image_mode_detection_across_roi_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "hand_landmarker.task"
             model_path.write_bytes(b"hand")
@@ -181,12 +221,15 @@ class HandLandmarkWorkerTests(unittest.TestCase):
                     max_roi_candidates=3,
                 )
             )
-            timestamps: list[int] = []
+            detect_calls: list[int] = []
             worker._hand_landmarker = SimpleNamespace(
-                detect_for_video=lambda image, timestamp_ms: (
-                    timestamps.append(timestamp_ms),
+                detect=lambda image: (
+                    detect_calls.append(1),
                     SimpleNamespace(hand_landmarks=[], handedness=[]),
-                )[1]
+                )[1],
+                detect_for_video=lambda image, timestamp_ms: (_ for _ in ()).throw(
+                    AssertionError("ROI hand worker must not use VIDEO-mode detection")
+                ),
             )
             runtime = {
                 "mp": SimpleNamespace(
@@ -212,8 +255,8 @@ class HandLandmarkWorkerTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(timestamps, [7, 8, 9])
-        self.assertEqual(result.final_timestamp_ms, 9)
+        self.assertEqual(len(detect_calls), 2)
+        self.assertEqual(result.final_timestamp_ms, 8)
 
 
 if __name__ == "__main__":

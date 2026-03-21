@@ -31,6 +31,7 @@ _DEFAULT_TIMEZONE_NAME = "Europe/Berlin"
 _MAX_DETAIL_STRING_LENGTH = 512
 _MAX_DETAIL_ITEMS = 32
 _MAX_KEY_COMPONENT_LENGTH = 64
+_SMART_HOME_ENVIRONMENT_ID = "home:main"
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]+")
 _TRUE_VALUES = frozenset({"1", "true", "t", "yes", "y", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "f", "no", "n", "off", ""})
@@ -350,6 +351,35 @@ def _localize_datetime(value: datetime, *, target_tz: tzinfo) -> datetime:
     return value.astimezone(target_tz)
 
 
+def _parse_datetime_text(value: object | None) -> datetime | None:
+    """Parse one ISO-like datetime string with bounded fallback behavior."""
+
+    text = _normalize_text(value, limit=96)
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _smart_home_environment_source_event_id(
+    *,
+    occurred_at: datetime,
+    node_token: str,
+    source_event_id: str,
+) -> str:
+    """Build one timestamp-carrying source event ID for environment profiling."""
+
+    digest = sha256(source_event_id.encode("utf-8")).hexdigest()[:12]
+    return (
+        f"smart_home_env:{occurred_at.strftime('%Y%m%dT%H%M%S%f%z')}:"
+        f"{node_token}:{digest}"
+    )
+
+
 # AUDIT-FIX(#2): Add a stable payload fingerprint so same-second events do not collide in file-backed stores.
 def _event_fingerprint(
     evidence: LongTermMultimodalEvidence,
@@ -613,6 +643,11 @@ class LongTermMultimodalExtractor:
                 )
             )
         objects.extend(
+            self._extract_smart_home_environment_patterns(
+                fact_map=fact_map,
+            )
+        )
+        objects.extend(
             extract_respeaker_audio_patterns(
                 fact_map=fact_map,
                 source_ref=source_ref,
@@ -622,6 +657,130 @@ class LongTermMultimodalExtractor:
             )
         )
         return objects
+
+    def _extract_smart_home_environment_patterns(
+        self,
+        *,
+        fact_map: Mapping[str, object],
+    ) -> list[LongTermMemoryObjectV1]:
+        """Derive room-agnostic smart-home node and health seeds from facts."""
+
+        smart_home = _mapping_or_empty(fact_map.get("smart_home"))
+        recent_events = smart_home.get("recent_events")
+        if isinstance(recent_events, (str, bytes, bytearray)) or not isinstance(recent_events, Sequence):
+            return []
+
+        target_tz = _resolve_timezone(self.timezone_name)
+        created: list[LongTermMemoryObjectV1] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for raw_event in recent_events:
+            event = _mapping_or_empty(raw_event)
+            event_kind = _normalize_text(event.get("event_kind"), limit=64).lower()
+            if event_kind not in {"motion_detected", "device_online", "device_offline"}:
+                continue
+            entity_id = _normalize_text(event.get("entity_id"), limit=256)
+            if not entity_id:
+                continue
+            observed_at = _parse_datetime_text(event.get("observed_at"))
+            if observed_at is None:
+                continue
+            local_observed_at = _localize_datetime(observed_at, target_tz=target_tz)
+            date_key = local_observed_at.date().isoformat()
+            daypart = self._daypart(local_observed_at)
+            details = _mapping_or_empty(event.get("details"))
+            provider = _normalize_text(event.get("provider"), limit=64) or "smart_home"
+            route_id = _normalize_text(details.get("route_id"), limit=128)
+            provider_label = _normalize_text(event.get("label"), limit=128)
+            provider_area_label = _normalize_text(event.get("area"), limit=128)
+            raw_source_event_id = _normalize_text(event.get("event_id"), limit=256) or f"{provider}:{entity_id}:{date_key}"
+            node_token = _safe_key_component(
+                f"{provider}_{route_id}_{entity_id}",
+                fallback="node",
+            )
+            synthetic_source_event_id = _smart_home_environment_source_event_id(
+                occurred_at=local_observed_at,
+                node_token=node_token,
+                source_event_id=raw_source_event_id,
+            )
+            source = LongTermSourceRefV1(
+                source_type="smart_home_sensor",
+                event_ids=(synthetic_source_event_id,),
+                modality="sensor",
+            )
+
+            if event_kind == "motion_detected":
+                memory_id = f"pattern:smart_home_node_activity:{node_token}:{date_key}"
+                if (memory_id, synthetic_source_event_id) in seen_keys:
+                    continue
+                seen_keys.add((memory_id, synthetic_source_event_id))
+                created.append(
+                    LongTermMemoryObjectV1(
+                        memory_id=memory_id,
+                        kind="pattern",
+                        summary="Smart-home motion was observed on one environment node.",
+                        details="Low-confidence room-agnostic smart-home motion seed for long-horizon environment profiling.",
+                        source=source,
+                        confidence=0.59,
+                        sensitivity="low",
+                        slot_key=f"pattern:smart_home_node_activity:{entity_id}:{date_key}",
+                        value_key="smart_home_motion_node_activity",
+                        valid_from=date_key,
+                        valid_to=date_key,
+                        attributes={
+                            "memory_domain": "smart_home_environment",
+                            "environment_id": _SMART_HOME_ENVIRONMENT_ID,
+                            "environment_signal_type": "motion_node_activity",
+                            "node_id": entity_id,
+                            "provider": provider,
+                            "route_id": route_id,
+                            "source_entity_id": entity_id,
+                            "provider_label": provider_label,
+                            "provider_area_label": provider_area_label,
+                            "daypart": daypart,
+                            "pattern_type": "environment_motion",
+                            "observed_at": local_observed_at.isoformat(),
+                            "source_event_id": raw_source_event_id,
+                        },
+                    )
+                )
+                continue
+
+            health_state = "online" if event_kind == "device_online" else "offline"
+            memory_id = f"pattern:smart_home_node_health:{node_token}:{health_state}:{date_key}"
+            if (memory_id, synthetic_source_event_id) in seen_keys:
+                continue
+            seen_keys.add((memory_id, synthetic_source_event_id))
+            created.append(
+                LongTermMemoryObjectV1(
+                    memory_id=memory_id,
+                    kind="pattern",
+                    summary=f"Smart-home node health changed to {health_state}.",
+                    details="Room-agnostic smart-home health seed for environment-profile quality gating.",
+                    source=source,
+                    confidence=0.63,
+                    sensitivity="low",
+                    slot_key=f"pattern:smart_home_node_health:{entity_id}:{date_key}",
+                    value_key="smart_home_node_health",
+                    valid_from=date_key,
+                    valid_to=date_key,
+                    attributes={
+                        "memory_domain": "smart_home_environment",
+                        "environment_id": _SMART_HOME_ENVIRONMENT_ID,
+                        "environment_signal_type": "node_health",
+                        "health_state": health_state,
+                        "node_id": entity_id,
+                        "provider": provider,
+                        "route_id": route_id,
+                        "source_entity_id": entity_id,
+                        "provider_label": provider_label,
+                        "provider_area_label": provider_area_label,
+                        "daypart": daypart,
+                        "observed_at": local_observed_at.isoformat(),
+                        "source_event_id": raw_source_event_id,
+                    },
+                )
+            )
+        return created
 
     def _extract_button_interaction(
         self,

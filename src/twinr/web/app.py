@@ -83,6 +83,7 @@ from twinr.web.presenters import (
     _adaptive_timing_view,
     _build_calendar_integration_record,
     _build_email_integration_record,
+    _build_smart_home_integration_record,
     _calendar_integration_sections,
     build_ops_debug_page_context,
     _capture_voice_profile_sample,
@@ -99,6 +100,7 @@ from twinr.web.presenters import (
     _recent_named_files,
     _reminder_rows,
     _resolve_named_file,
+    _smart_home_integration_sections,
     _settings_sections,
     _whatsapp_integration_context,
     build_self_coding_ops_page_context,
@@ -1570,6 +1572,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
         store = ctx.integration_store()
         email_record = await _call_sync(store.get, "email_mailbox")
         calendar_record = await _call_sync(store.get, "calendar_agenda")
+        smart_home_record = await _call_sync(store.get, "smart_home_hub")
         runtime = await _call_sync(build_managed_integrations, ctx.project_root, env_path=ctx.env_path)
         pairing_snapshot = await _call_sync(whatsapp_pairing.load_snapshot)
         return ctx.render(
@@ -1595,6 +1598,7 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
             ),
             email_sections=_email_integration_sections(email_record, env_values),
             calendar_sections=_calendar_integration_sections(calendar_record),
+            smart_home_sections=_smart_home_integration_sections(smart_home_record, env_values),
         )
 
     @app.post("/integrations")
@@ -1614,6 +1618,8 @@ def create_app(env_file: str | Path = ".env") -> FastAPI:
                 record, env_updates = await _call_sync(_build_email_integration_record, form, env_values)
             elif integration_id == "calendar_agenda":
                 record, env_updates = await _call_sync(_build_calendar_integration_record, form)
+            elif integration_id == "smart_home_hub":
+                record, env_updates = await _call_sync(_build_smart_home_integration_record, form, env_values)
             else:
                 raise ValueError("Please choose a valid integration form.")
 

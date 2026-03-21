@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import logging  # AUDIT-FIX(#5): Add logging so malformed records and unexpected failures degrade gracefully instead of failing silently.
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # AUDIT-FIX(#3): Handle invalid or missing IANA timezone data without crashing the compiler.
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.longterm.core.models import LongTermMemoryObjectV1, LongTermReflectionResultV1, LongTermSourceRefV1
+from twinr.memory.longterm.ingestion.environment_profile import LongTermEnvironmentProfileCompiler
 
 _LOGGER = logging.getLogger(__name__)  # AUDIT-FIX(#5): Keep the compiler best-effort and observable in production.
 _DAYPARTS = ("morning", "afternoon", "evening", "night")
@@ -350,6 +351,12 @@ class LongTermSensorMemoryCompiler:
                     current_daypart=current_daypart,
                 )
             )
+            environment_result = self._compile_environment_profiles(
+                objects=tuple(objects or ()),
+                now=reference,
+            )
+            if environment_result.created_summaries:
+                created.extend(environment_result.created_summaries)
             return LongTermReflectionResultV1(reflected_objects=(), created_summaries=tuple(created))
         except Exception:  # AUDIT-FIX(#5): This compiler runs in a long-lived process; unexpected data must not crash the surrounding service.
             _LOGGER.exception("Failed to compile sensor-derived long-term memory objects")
@@ -374,7 +381,7 @@ class LongTermSensorMemoryCompiler:
                         "Fallback timezone %r is also unavailable; using UTC instead",
                         _DEFAULT_TIMEZONE_NAME,
                     )  # AUDIT-FIX(#3): Preserve availability even when system tzdata is missing.
-            return datetime.UTC
+            return timezone.utc
 
     def _normalize_reference_datetime(self, *, now: datetime | None, timezone: tzinfo) -> datetime:
         """Normalize the optional reference time into the target timezone."""
@@ -854,6 +861,23 @@ class LongTermSensorMemoryCompiler:
                 event_ids.append(event_id)
                 seen_event_ids.add(event_id)
         return tuple(event_ids[-_MAX_EVENT_IDS:])
+
+    def _compile_environment_profiles(
+        self,
+        *,
+        objects: tuple[LongTermMemoryObjectV1, ...],
+        now: datetime,
+    ) -> LongTermReflectionResultV1:
+        """Compile room-agnostic smart-home environment profiles alongside routines."""
+
+        compiler = LongTermEnvironmentProfileCompiler(
+            timezone_name=self.timezone_name,
+            enabled=self.enabled,
+            baseline_days=max(7, self.baseline_days),
+            history_days=max(42, self.baseline_days * 3),
+            min_baseline_days=max(3, self.min_days_observed),
+        )
+        return compiler.compile(objects=objects, now=now)
 
 
 __all__ = ["LongTermSensorMemoryCompiler"]

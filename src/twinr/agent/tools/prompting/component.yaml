@@ -7,6 +7,7 @@ summary: Assemble tool-lane instruction strings and small dynamic context overla
 owned_concerns:
   - Define canonical instruction constants for default, compact, supervisor, first-word, and specialist tool lanes
   - Add local date/time and simple-setting context to instruction bundles at call time
+  - Teach tool-capable lanes when to use smart-home discovery, filtered state queries, control, and stream tools
   - Export the public prompt-builder surface used by workflow, orchestrator, and package-level callers
 out_of_scope:
   - Personality file loading or base-agent section ordering in src/twinr/agent/base_agent/prompting

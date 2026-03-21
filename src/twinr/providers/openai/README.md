@@ -1,8 +1,9 @@
 # openai
 
 `openai` is the stable package-root import surface for Twinr's OpenAI provider
-stack. It re-exports the backend, provider adapters, realtime session
-surface, and shared value objects while leaving implementation in focused
+stack. It re-exports the backend, provider adapters including the fast
+conversation-closure decision adapter, realtime session surface, and shared
+value objects while leaving implementation in focused
 subpackages.
 
 ## Responsibility

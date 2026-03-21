@@ -23,13 +23,19 @@ owned_concerns:
   - Derive a bounded continuous visible-person target from multi-person camera anchors, motion recency, short-horizon prediction, conservative audio-to-vision speaker handoff, and short stale-track bridging across brief detector misses
   - Derive a bounded multimodal attention-target surface from camera anchor, visible-person tracks, speaker association, showing-intent cues, and short-lived session focus memory, with speaker and last-motion priority preserved in multi-person scenes
   - Drive calm HDMI face attention-follow cues from the current relevant-person anchor without teaching the generic runtime snapshot schema about gaze-follow behavior, while mirroring camera-space anchors into user-facing gaze, adding small near-center head turns before full side gaze commits, reserving stronger up/down body-language poses for explicit semantic cues, and renewing or briefly holding matching cues before they expire or disappear on short camera dropouts
+  - Persist a bounded continuous HDMI attention debug stream with per-refresh outcome codes, stage timings, and camera/target/cue state so transient eye-follow dropouts leave first-run evidence
+  - Keep a dedicated live-gesture acknowledgement lane separate from the broader social camera-surface path so user-facing symbol latency does not regress eye-follow or depend on full proactive observation cadence
   - Mirror clear stabilized user camera gestures into short-lived HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues
+  - Persist a bounded continuous HDMI gesture debug stream with raw observations, ack-lane decisions, publish outcomes, and stage timings so Pi-side symbol latency and missed acknowledgements leave first-run evidence
   - Run a bounded local HDMI attention-refresh cadence so gaze-follow stays responsive even when full proactive inspection remains motion-gated
   - Block sensitive proactive behavior when current ReSpeaker plus camera context is ambiguous
   - Coordinate proactive monitor ticks across vision, PIR, ambient audio, and wakeword policy paths
+  - Retry exact transient GPIO busy overlaps for PIR startup over a short bounded handover window so runtime restarts do not flap into error while a previous Twinr process is still releasing GPIO17
+  - Pause and resume the streaming wakeword capture path around accepted hands-free turns so exclusive ALSA conversation capture can reuse the same microphone device safely
   - Export normalized observation facts and ops telemetry from runtime monitoring
   - Export structured ReSpeaker audio-policy facts plus presence-session metadata for bounded automation and long-term memory ingestion
   - Wrap targeted ReSpeaker XVF3800 audio paths with direct signal facts plus readable-frame startup/runtime blocking when capture dies
+  - Require sustained bounded readable-frame success before a targeted ReSpeaker startup path leaves error state, so unstable USB enumeration cannot flap Twinr between ok and error
   - Schedule heavy XVF3800 host-control polling more slowly than the cheap ambient-audio path when the room is idle
   - Keep bounded ReSpeaker audio observation active during `answering` so interruption facts remain observable
   - Emit explicit operator-readable ReSpeaker runtime alerts for DFU, disconnect, unreadable capture, and recovery transitions
@@ -68,6 +74,17 @@ files:
       - derive_respeaker_audio_perception_guard
       - observe_audio_perception_once
       - render_audio_perception_snapshot_lines
+  - path: pir_open_gate.py
+    role: Bounded startup gate that retries only exact transient PIR GPIO busy overlaps during runtime handover
+    exports:
+      - PirOpenGateResult
+      - PirOpenable
+      - open_pir_monitor_with_busy_retry
+  - path: respeaker_capture_gate.py
+    role: Bounded startup gate that requires consecutive readable ReSpeaker capture probes before runtime startup clears error state
+    exports:
+      - ReadableFrameProbeSampler
+      - require_stable_respeaker_capture
   - path: claim_metadata.py
     role: Shared `confidence` / `source` / `requires_confirmation` helpers for multimodal runtime claims
     exports:
@@ -110,6 +127,11 @@ files:
       - MultimodalAttentionTargetConfig
       - MultimodalAttentionTargetSnapshot
       - MultimodalAttentionTargetTracker
+  - path: attention_debug_stream.py
+    role: Bounded JSONL tick stream for HDMI attention-refresh diagnostics and dropout forensics
+    exports:
+      - AttentionDebugStream
+      - AttentionDebugStreamConfig
   - path: display_attention.py
     role: Conservative proactive producer and local refresh policy for HDMI gaze-follow face cues that mirror camera-space anchors into user-facing gaze, keep semantic up/down poses out of normal person-following, and renew or briefly hold matching cues before they expire or disappear on short camera dropouts
     exports:
@@ -126,6 +148,17 @@ files:
       - DisplayGestureEmojiPublishResult
       - DisplayGestureEmojiPublisher
       - derive_display_gesture_emoji
+      - display_gesture_refresh_supported
+      - resolve_display_gesture_refresh_interval
+  - path: gesture_ack_lane.py
+    role: Dedicated low-latency acknowledgement stabilizer for the explicit user-facing gesture symbol set
+    exports:
+      - GestureAckLane
+  - path: gesture_debug_stream.py
+    role: Bounded JSONL tick stream for HDMI gesture-refresh diagnostics and latency forensics
+    exports:
+      - GestureDebugStream
+      - GestureDebugStreamConfig
   - path: runtime_contract.py
     role: Hard startup-blocker contract for XVF3800 DFU/safe-mode states
     exports:
@@ -201,6 +234,7 @@ primary_callers:
 tests:
   - path: test/test_display_attention.py
   - path: test/test_attention_targeting.py
+  - path: test/test_pir_open_gate.py
   - path: test/test_proactive_monitor.py
   - path: test/test_display_gesture_emoji.py
   - path: test/test_governor_inputs.py
