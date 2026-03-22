@@ -15,6 +15,9 @@ templates and CSS that power the operator dashboard.
 - render the tabbed debug page that groups runtime, ChonkyDB, live memory attestation, LLM, events, hardware, and raw local artifacts
 - render a read-only long-term memory search tab in `/ops/debug` that queries the real retrieval stack and groups hits by durable, midterm, episodic, and conflict memory
 - run the interactive `/ops/debug` Conversation Lab tab that sends a real text turn through Twinr's provider/tool/memory path and persists human-readable routing, tool, retrieval, and memory-write traces
+- run Conversation Lab turns under a text-only runtime config so operator text probes do not touch shared microphone-adaptive timing state that belongs to audio capture
+- keep Conversation Lab operator turns out of background long-term turn writers and personality-learning queues so debug probes stay bounded and do not train live behavior
+- keep Conversation Lab flushes bounded and surface pending durable-memory state in the stored turn record instead of holding the operator request open indefinitely
 - support camera-backed Conversation Lab tool turns for portrait enrollment and `inspect_camera` without pushing camera orchestration into the route layer
 - keep the `/ops/debug` operator surface high-contrast and readable on external monitors, including dense log-like sections
 - render the self-coding operator page with compile telemetry, health, live-e2e state, stale compile/run watchdog visibility, and learned-skill lifecycle controls

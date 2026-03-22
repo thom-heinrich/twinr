@@ -131,6 +131,22 @@ class WakewordEvalReport:
 
 
 @dataclass(frozen=True, slots=True)
+class WakewordScoreSanityReport:
+    """Describe whether raw detector scores separate positives from negatives."""
+
+    backend: str
+    passed: bool
+    positive_examples: int
+    negative_examples: int
+    positive_score_floor: float | None
+    negative_score_ceiling: float | None
+    min_positive_score: float | None
+    max_negative_score: float | None
+    separation_margin: float | None
+    reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class WakewordAutotuneRecommendation:
     """Describe the best calibration profile found during autotune."""
 
@@ -150,6 +166,73 @@ class WakewordVerifierTrainingReport:
     positive_clips: int
     negative_clips: int
     negative_seconds: float
+
+
+def _score_quantile(values: list[float], quantile: float) -> float:
+    """Return one linear-interpolated quantile from sorted or unsorted scores."""
+
+    if not values:
+        raise ValueError("score quantile requires at least one value.")
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = max(0.0, min(1.0, float(quantile))) * float(len(ordered) - 1)
+    lower_index = int(math.floor(position))
+    upper_index = int(math.ceil(position))
+    if lower_index == upper_index:
+        return ordered[lower_index]
+    lower_value = ordered[lower_index]
+    upper_value = ordered[upper_index]
+    fraction = position - float(lower_index)
+    return lower_value + ((upper_value - lower_value) * fraction)
+
+
+def evaluate_wekws_score_sanity_entries(
+    *,
+    entries: list[WakewordEvalEntry],
+    spotter: WakewordWekwsSpotter,
+) -> WakewordScoreSanityReport:
+    """Check whether raw WeKws scores separate labeled positives from negatives."""
+
+    positive_scores: list[float] = []
+    negative_scores: list[float] = []
+    for entry in entries:
+        expected = _expected_detected(entry.label)
+        if expected is None:
+            continue
+        score, _detector_label = spotter.score_capture(_capture_from_wav(entry.audio_path))
+        if expected:
+            positive_scores.append(float(score))
+        else:
+            negative_scores.append(float(score))
+    if not positive_scores or not negative_scores:
+        return WakewordScoreSanityReport(
+            backend="wekws",
+            passed=False,
+            positive_examples=len(positive_scores),
+            negative_examples=len(negative_scores),
+            positive_score_floor=None,
+            negative_score_ceiling=None,
+            min_positive_score=min(positive_scores) if positive_scores else None,
+            max_negative_score=max(negative_scores) if negative_scores else None,
+            separation_margin=None,
+            reason="WeKws sanity guard requires both positive and negative labeled clips.",
+        )
+    positive_score_floor = _score_quantile(positive_scores, 0.10)
+    negative_score_ceiling = _score_quantile(negative_scores, 0.90)
+    separation_margin = positive_score_floor - negative_score_ceiling
+    return WakewordScoreSanityReport(
+        backend="wekws",
+        passed=separation_margin > 0.0,
+        positive_examples=len(positive_scores),
+        negative_examples=len(negative_scores),
+        positive_score_floor=positive_score_floor,
+        negative_score_ceiling=negative_score_ceiling,
+        min_positive_score=min(positive_scores),
+        max_negative_score=max(negative_scores),
+        separation_margin=separation_margin,
+        reason=None,
+    )
 
 
 def _load_manifest_payloads(manifest_path: str | Path) -> tuple[Path, list[dict[str, object]]]:
@@ -661,9 +744,11 @@ __all__ = [
     "WakewordEvalEntry",
     "WakewordEvalMetrics",
     "WakewordEvalReport",
+    "WakewordScoreSanityReport",
     "WakewordVerifierTrainingReport",
     "append_wakeword_capture_label",
     "autotune_wakeword_profile",
+    "evaluate_wekws_score_sanity_entries",
     "load_eval_manifest",
     "load_labeled_ops_captures",
     "run_wakeword_eval",

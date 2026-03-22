@@ -392,11 +392,13 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("entity_classes", tools_by_name["list_smart_home_entities"]["parameters"]["properties"])
         self.assertIn("state_filters", tools_by_name["list_smart_home_entities"]["parameters"]["properties"])
         self.assertIn("aggregate_by", tools_by_name["list_smart_home_entities"]["parameters"]["properties"])
+        self.assertIn("call this tool more than once", tools_by_name["list_smart_home_entities"]["description"])
         self.assertIn("entity_ids", tools_by_name["read_smart_home_state"]["parameters"]["properties"])
         self.assertIn("command", tools_by_name["control_smart_home_entities"]["parameters"]["properties"])
         self.assertIn("limit", tools_by_name["read_smart_home_sensor_stream"]["parameters"]["properties"])
         self.assertIn("event_kinds", tools_by_name["read_smart_home_sensor_stream"]["parameters"]["properties"])
         self.assertIn("aggregate_by", tools_by_name["read_smart_home_sensor_stream"]["parameters"]["properties"])
+        self.assertIn("pair this with list_smart_home_entities", tools_by_name["read_smart_home_sensor_stream"]["description"])
         self.assertIn("summary", tools_by_name["remember_memory"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["remember_memory"]["parameters"]["properties"])
         self.assertIn("phone", tools_by_name["remember_contact"]["parameters"]["properties"])
@@ -451,6 +453,8 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("guidance_hints", connection.session.calls[0]["instructions"])
         self.assertIn("manage_household_identity", connection.session.calls[0]["instructions"])
         self.assertIn("list_smart_home_entities", connection.session.calls[0]["instructions"])
+        self.assertIn("small live situation picture", connection.session.calls[0]["instructions"])
+        self.assertIn("two to four targeted smart-home queries", connection.session.calls[0]["instructions"])
         self.assertIn("configure_world_intelligence tool", connection.session.calls[0]["instructions"])
 
     def test_open_uses_realtime_safe_top_level_tool_schemas(self) -> None:

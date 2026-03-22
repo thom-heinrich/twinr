@@ -73,6 +73,19 @@ def _normalize_text(value: str | None) -> str:
     return " ".join(str(value or "").split()).strip()
 
 
+def remote_snapshot_document_hints_path(config: TwinrConfig) -> Path | None:
+    """Return the local durable document-id hint file used by remote snapshots.
+
+    The prompting layer uses this path as a cheap local invalidation signal for
+    cached instruction bundles that depend on remote-managed prompt context.
+    """
+
+    try:
+        return chonkydb_data_path(config) / _DOCUMENT_ID_HINTS_FILENAME
+    except Exception:
+        return None
+
+
 def _strip_text(value: str | None) -> str:
     """Return trimmed string content for optional text input."""
 

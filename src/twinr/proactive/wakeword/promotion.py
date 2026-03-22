@@ -14,7 +14,9 @@ from collections import deque
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
+import tempfile
 import wave
 
 import numpy as np
@@ -27,8 +29,10 @@ from twinr.ops import resolve_ops_paths_for_config
 from .evaluation import (
     WakewordEvalEntry,
     WakewordEvalMetrics,
+    WakewordScoreSanityReport,
     _expected_detected,
     _metrics_from_counts,
+    evaluate_wekws_score_sanity_entries,
     load_eval_manifest,
 )
 from .kws import WakewordSherpaOnnxFrameSpotter
@@ -36,10 +40,42 @@ from .local_verifier import build_configured_sequence_capture_verifier
 from .policy import SttWakewordVerifier, WakewordDecisionPolicy, normalize_wakeword_backend
 from .stream import WakewordFrameSpotter
 from .spotter import WakewordOpenWakeWordFrameSpotter
-from .wekws import WakewordWekwsFrameSpotter
+from .wekws import WakewordWekwsFrameSpotter, WakewordWekwsSpotter
 
 _STREAM_CAPTURE_WINDOW_MS = 2500
 _REPORT_DIRNAME = "wakeword_eval"
+
+
+def _atomic_write_json_report(path: Path, payload: dict[str, object] | list[object]) -> None:
+    """Persist one JSON report via atomic replace in the destination directory.
+
+    Replacing the file instead of opening it in-place keeps repeated operator
+    proofs writable even if an earlier run created the destination under a
+    different user account.
+    """
+
+    target = path.expanduser().resolve(strict=False)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_file.write(serialized)
+            temp_path = temp_file.name
+        os.replace(temp_path, target)
+    finally:
+        if temp_path:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +167,7 @@ class WakewordPromotionReport:
     spec_path: Path
     suite_results: tuple[WakewordPromotionSuiteResult, ...]
     ambient_results: tuple[WakewordAmbientGuardResult, ...]
+    backend_sanity: WakewordScoreSanityReport | None
     blockers: tuple[str, ...]
     passed: bool
     report_path: Path | None = None
@@ -474,7 +511,7 @@ def run_wakeword_stream_eval(
             "false_negative_rate": round(report.metrics.false_negative_rate, 6),
         },
     }
-    report_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _atomic_write_json_report(report_path, payload)
     return WakewordStreamEvalReport(
         metrics=report.metrics,
         evaluated_entries=report.evaluated_entries,
@@ -583,11 +620,57 @@ def run_wakeword_promotion_eval(
     suite_results: list[WakewordPromotionSuiteResult] = []
     ambient_results: list[WakewordAmbientGuardResult] = []
     blockers: list[str] = []
+    suite_entries_by_name = {
+        suite.name: load_eval_manifest(suite.manifest_path)
+        for suite in spec.suites
+    }
+    ambient_entries_by_name = {
+        guard.name: load_eval_manifest(guard.manifest_path)
+        for guard in spec.ambient_guards
+    }
+    backend_sanity: WakewordScoreSanityReport | None = None
+
+    primary_backend = normalize_wakeword_backend(
+        getattr(config, "wakeword_primary_backend", config.wakeword_backend),
+        default="openwakeword",
+    )
+    if primary_backend == "wekws":
+        sanity_entries: list[WakewordEvalEntry] = []
+        for entries in suite_entries_by_name.values():
+            sanity_entries.extend(entries)
+        for entries in ambient_entries_by_name.values():
+            sanity_entries.extend(entries)
+        clip_spotter = WakewordWekwsSpotter(
+            model_path=config.wakeword_wekws_model_path or "",
+            config_path=config.wakeword_wekws_config_path or "",
+            words_path=config.wakeword_wekws_words_path or "",
+            cmvn_path=config.wakeword_wekws_cmvn_path,
+            phrases=config.wakeword_phrases,
+            project_root=config.project_root,
+            threshold=config.wakeword_wekws_threshold,
+            chunk_ms=config.wakeword_wekws_chunk_ms,
+            num_threads=config.wakeword_wekws_num_threads,
+            provider=config.wakeword_wekws_provider,
+            session_factory=model_factory,
+        )
+        backend_sanity = evaluate_wekws_score_sanity_entries(
+            entries=sanity_entries,
+            spotter=clip_spotter,
+        )
+        if not backend_sanity.passed:
+            if backend_sanity.reason:
+                blockers.append(f"wekws_bundle_sanity: {backend_sanity.reason}")
+            else:
+                blockers.append(
+                    "wekws_bundle_sanity: "
+                    f"positive_p10={backend_sanity.positive_score_floor:.6f} "
+                    f"<= negative_p90={backend_sanity.negative_score_ceiling:.6f}"
+                )
 
     for suite in spec.suites:
         report = evaluate_wakeword_stream_entries(
             config=config,
-            entries=load_eval_manifest(suite.manifest_path),
+            entries=suite_entries_by_name[suite.name],
             backend=backend,
             model_factory=model_factory,
         )
@@ -610,7 +693,7 @@ def run_wakeword_promotion_eval(
             )
 
     for ambient_guard in spec.ambient_guards:
-        entries = load_eval_manifest(ambient_guard.manifest_path)
+        entries = ambient_entries_by_name[ambient_guard.name]
         if any(_expected_detected(entry.label) is not False for entry in entries):
             raise ValueError(
                 f"Ambient guard {ambient_guard.name} must contain only negative labels."
@@ -641,6 +724,42 @@ def run_wakeword_promotion_eval(
         "passed": not blockers,
         "blockers": blockers,
         "spec_path": str(spec_file),
+        "backend_sanity": (
+            None
+            if backend_sanity is None
+            else {
+                "backend": backend_sanity.backend,
+                "passed": backend_sanity.passed,
+                "positive_examples": backend_sanity.positive_examples,
+                "negative_examples": backend_sanity.negative_examples,
+                "positive_score_floor": (
+                    None
+                    if backend_sanity.positive_score_floor is None
+                    else round(backend_sanity.positive_score_floor, 6)
+                ),
+                "negative_score_ceiling": (
+                    None
+                    if backend_sanity.negative_score_ceiling is None
+                    else round(backend_sanity.negative_score_ceiling, 6)
+                ),
+                "min_positive_score": (
+                    None
+                    if backend_sanity.min_positive_score is None
+                    else round(backend_sanity.min_positive_score, 6)
+                ),
+                "max_negative_score": (
+                    None
+                    if backend_sanity.max_negative_score is None
+                    else round(backend_sanity.max_negative_score, 6)
+                ),
+                "separation_margin": (
+                    None
+                    if backend_sanity.separation_margin is None
+                    else round(backend_sanity.separation_margin, 6)
+                ),
+                "reason": backend_sanity.reason,
+            }
+        ),
         "suites": [
             {
                 "name": result.spec.name,
@@ -679,11 +798,12 @@ def run_wakeword_promotion_eval(
             for result in ambient_results
         ],
     }
-    report_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _atomic_write_json_report(report_path, payload)
     return WakewordPromotionReport(
         spec_path=spec_file,
         suite_results=tuple(suite_results),
         ambient_results=tuple(ambient_results),
+        backend_sanity=backend_sanity,
         blockers=tuple(blockers),
         passed=not blockers,
         report_path=report_path,

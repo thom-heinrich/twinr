@@ -20,12 +20,18 @@ Out of scope:
 - `portrait_match.py` — conservative runtime claim for local portrait-match observations and temporal identity evidence
 - `known_user_hint.py` — conservative known-user hint from voice-profile state plus optional temporal identity-fusion evidence and clear room context
 - `affect_proxy.py` — prompt-only affect proxy surface from coarse posture, attention, and quiet cues
+- `smart_home_context.py` — bounded layered runtime context tracker for `near_device_presence`, optional same-room `room_context`, and house-wide `home_context`
+- `person_state.py` — bounded aggregate schema that projects the existing runtime surfaces into stable axes such as presence, attention, conversation, safety, identity, and home context
 - `continuous_attention.py` — bounded short-lived visible-person track matching, motion recency, audio-to-vision speaker targeting, and short-horizon target prediction for HDMI follow
 - `attention_targeting.py` — bounded multimodal attention-target prioritization over camera anchor, speaker association, showing intent, and short-lived session focus memory
 - `attention_debug_stream.py` — bounded continuous JSONL debug stream for HDMI attention refresh ticks, including outcome codes, stage timings, and current camera/target/cue state
 - `display_attention.py` — conservative proactive producer that steers HDMI eye gaze toward the currently relevant visible person without overwriting foreign face cues, while keeping normal follow behavior horizontal-only, mirroring camera-space left/right into user-facing gaze, adding small near-center head turns before full side gaze commits, and renewing or briefly holding matching cues before they expire or disappear on short camera dropouts
 - `display_gesture_emoji.py` — conservative producer that mirrors stabilized rising-edge user gestures into bounded HDMI emoji acknowledgements without touching the face channel or overwriting foreign emoji cues
+- `display_reserve_day_plan.py` — persistent per-day planner that turns personality-driven reserve candidates into one calm sequence for the HDMI reserve area
+- `display_ambient_impulses.py` — conservative live publisher that shows the next planned positive personality-driven HDMI reserve impulse only when quiet hours, presence, runtime state, and surface ownership all allow it
 - `gesture_ack_lane.py` — dedicated low-latency acknowledgement stabilizer for the explicit user-facing gesture symbol set, separate from general camera-surface state
+- `gesture_wakeup_dispatcher.py` — single-flight background dispatcher that runs accepted visual wakeups off the proactive monitor worker
+- `gesture_wakeup_lane.py` — dedicated visual wakeup stabilizer for one configured fine-hand symbol, separate from emoji acknowledgement and workflow entry orchestration
 - `gesture_debug_stream.py` — bounded continuous JSONL debug stream for HDMI gesture refresh ticks, including raw observations, ack decisions, publish outcomes, and stage timings
 - `audio_perception.py` — runtime-faithful one-shot ReSpeaker perception diagnostics and conservative room/device-directedness guard summaries for operator checks and recovery smokes
 - `pir_open_gate.py` — bounded startup gate that retries only exact transient PIR GPIO busy overlaps during runtime handover
@@ -44,7 +50,7 @@ Out of scope:
 - Wakeword arming must fail closed on malformed sensor flags or unavailable dependencies.
 - `service.py` stays orchestration-focused; trigger scoring and wakeword matching belong in sibling packages.
 - `audio_perception.py` must stay a bounded diagnostic/guard surface that reuses existing normalized observation and policy helpers; it must not grow its own parallel monitor orchestration.
-- `service.py` must pause the active streaming wakeword capture before handing an accepted streaming wakeword to an exclusive conversation-recording path on the same ALSA device, and reopen it after the handler returns; otherwise wakeword success degenerates into immediate `Device or resource busy` capture failures.
+- `service.py` must pause the active streaming wakeword capture before handing an accepted streaming wakeword or visual gesture wakeup to an exclusive conversation-recording path on the same ALSA device, and reopen it after the handler returns; otherwise wakeups degenerate into immediate `Device or resource busy` capture failures.
 - `service.py` must not clear a targeted ReSpeaker startup blocker after a single transient readable-frame probe; startup needs sustained bounded capture success so unstable USB enumeration does not flap the runtime between `ok` and `error`.
 - `service.py` must tolerate only short exact `EBUSY` handover races when opening the PIR monitor; permanent GPIO contention or non-busy faults stay fail-closed and must not be downgraded.
 - `audio_policy.py` must treat classified non-speech/background-media room activity as incompatible with calm `presence_audio_active`; do not let uncorroborated XVF3800 speech flags alone re-elevate media/noise into device-directed presence speech.
@@ -53,6 +59,8 @@ Out of scope:
 - ReSpeaker ambient classification must not discard strong PCM non-speech evidence just because the legacy chunk/RMS activity gate returns false on a bounded playback window.
 - The operator-facing room-context guard should prefer already-classified non-speech/background-media over weak overlap hints; ambiguous low-confidence XVF3800 overlap alone must not relabel playback noise as human room speech.
 - `ambiguous_room_guard`, `identity_fusion`, `portrait_match`, `known_user_hint`, and `affect_proxy` must remain conservative claim surfaces, not direct product decisions.
+- `smart_home_context.py` must stay a bounded optional context layer: explicit same-room entity IDs only, stale streams fail closed, and smart-home facts must never manufacture local `person_visible` or wakeword arming.
+- `person_state.py` must stay aggregation-only: reuse the current bounded runtime surfaces, keep axis contracts explicit, and do not smuggle new hidden policy or diagnosis logic into the aggregate layer.
 - `known_user_hint` must stay weaker than identity even when temporal portrait evidence is strong, and may only clear calm personalization; sensitive behavior still needs confirmation or stronger gates.
 - `identity_fusion` may use presence-session memory, enrolled household-voice candidates, and visual-anchor history, but it must stay confirm-first and fail closed on ambiguity or modality conflict.
 - `affect_proxy` must never emit emotion, wellbeing, or diagnosis claims; it may only support prompt-only follow-up cues.
@@ -61,6 +69,11 @@ Out of scope:
 - `attention_targeting.py` and `display_attention.py` must fail closed when camera health is explicitly bad and no visible person exists; stale speaker/session focus may not keep steering the face after camera loss.
 - `display_attention.py` may only publish its own `proactive_attention_follow` face cues and must fail closed when another display producer currently owns the cue store.
 - `display_gesture_emoji.py` may only acknowledge stabilized rising-edge camera gesture events, must stay bounded and short-lived, must fail closed when another producer currently owns the emoji surface, and must prefer motion-bearing coarse gestures like `wave` over a simultaneous generic `open_palm` hand-shape cue.
+- `display_reserve_day_plan.py` must keep reserve scheduling persistent and local-day-scoped: plan generation belongs there, not inline in the proactive monitor tick, and plan repetition must stay generic rather than topic-hardcoded. If the first same-day plan is empty, it must retry after a short bounded backoff rather than leaving the reserve blank until midnight.
+- `display_ambient_impulses.py` may only publish planned positive reserve-card nudges while Twinr is waiting, the room appears calmly occupied, quiet hours are closed, and no stronger reserve owner already holds the surface.
+- `display_ambient_impulses.py` must stay topic-generic and policy-driven: planning may depend on personality state and co-attention, but not on hardcoded named-topic exceptions or one-off display-copy hacks.
+- `gesture_wakeup_lane.py` may only derive one bounded wake decision from the configured fine-hand trigger. It must not publish HDMI cues itself, must stay independent from emoji acknowledgement cooldowns, and must never open a conversation turn directly.
+- Accepted visual gesture wakeups must not run synchronously on the proactive monitor worker thread. Dispatch them through `gesture_wakeup_dispatcher.py` so HDMI attention refresh keeps running during `listening` and `processing`.
 - Matching `display_attention.py` cues must refresh their TTL before expiry so a stable visible-person target does not fall back to center between local attention-refresh ticks, and brief center jitter or short no-person/no-anchor blips must not immediately erase a recent local cue. Near-center responsiveness should come from bounded spatial head/gaze tuning, not from reintroducing jittery up/down or random idle eye motion.
 - The fast HDMI attention-refresh path must not block on full ambient PCM sampling windows. When ReSpeaker host-control already provides speech/direction hints, use a signal-only snapshot or recent cached audio instead of serializing gaze/gesture refresh behind slow audio reads.
 - The fast HDMI attention-refresh path must keep its default cadence genuinely sub-second on Pi HDMI builds; a half-second-plus default render loop is too slow for gaze-follow or gesture acknowledgement.
@@ -68,7 +81,7 @@ Out of scope:
 - HDMI gesture acknowledgement should prefer its own dedicated live-gesture observation path and ack-lane state. Do not route user-facing symbol latency through the heavier social camera-surface path when the dedicated gesture refresh is available.
 - `service.py` should keep a bounded changed-only ops trace for HDMI attention-follow decisions so Pi debugging can prove whether failures come from camera health, stabilized camera semantics, target selection, or cue publishing.
 - `service.py` should also keep a bounded continuous attention debug stream for each HDMI refresh tick so transient 1-3 minute eye-follow dropouts still leave first-run evidence after the fact.
-- `service.py` should also keep a bounded continuous gesture debug stream for each HDMI gesture refresh tick so Pi-side symbol latency and missed acknowledgements can be diagnosed from first-run evidence instead of blind retuning.
+- `service.py` should also keep a bounded continuous gesture debug stream for each HDMI gesture refresh tick so Pi-side symbol latency and missed acknowledgements can be diagnosed from first-run evidence instead of blind retuning. That stream should include bounded provenance from the dedicated gesture pipeline itself when available, so operators can tell whether a miss came from full-frame live recognition, a recent-person ROI fallback, a recent-hand ROI fallback, or publish/ack policy.
 - The fast HDMI attention-refresh path must stay local-camera-only, bounded, and separate from full proactive trigger evaluation; do not turn it into an always-on generic vision loop.
 - The fast HDMI attention-refresh path may stay active while the main runtime is in `error`, but only for local face-cue following; it must not be used to re-enable agent turns, remote-memory work, or other degraded runtime behavior.
 - Speaker association and multimodal initiative must fail closed on multi-person or low-confidence room context; do not let weak audio hints force spoken proactivity.
@@ -81,7 +94,9 @@ After any edit in this directory, run:
 
 ```bash
 python3 -m compileall src/twinr/proactive/runtime
+PYTHONPATH=src pytest test/test_person_state.py -q
 PYTHONPATH=src pytest test/test_proactive_monitor.py -q
+PYTHONPATH=src pytest test/test_display_reserve_day_plan.py test/test_display_ambient_impulses.py -q
 ```
 
 If workflow wiring or export surface changed, also run:
@@ -97,12 +112,13 @@ PYTHONPATH=src pytest test/test_runner.py test/test_realtime_runner.py -q
 - `src/twinr/proactive/wakeword/stream.py`
 - `test/test_proactive_monitor.py`
 
-`service.py` changes -> also check:
+`service.py`, `display_ambient_impulses.py`, or `display_reserve_day_plan.py` changes -> also check:
 - `src/twinr/proactive/social/`
 - `src/twinr/proactive/wakeword/`
 - `src/twinr/agent/workflows/runner.py`
 - `src/twinr/agent/workflows/realtime_runner.py`
 - `test/test_proactive_monitor.py`
+- `test/test_display_reserve_day_plan.py`
 
 `audio_perception.py` or `audio_policy.py` changes -> also check:
 - `src/twinr/__main__.py`

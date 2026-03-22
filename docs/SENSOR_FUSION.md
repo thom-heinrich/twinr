@@ -15,6 +15,9 @@ The goal is not to guess hidden inner states. The goal is to decide what Twinr c
 The detailed design for short rolling audio/video buffers and `2-8s`
 multimodal event fusion lives in
 [`MULTIMODAL_EVENT_FUSION_V1.md`](./MULTIMODAL_EVENT_FUSION_V1.md).
+The runtime-layer split between local `near_device_presence`, optional
+smart-home-backed `room_context`, and house-wide `home_context` lives in
+[`SMART_HOME_RUNTIME_CONTEXT_MODEL_V1.md`](./SMART_HOME_RUNTIME_CONTEXT_MODEL_V1.md).
 
 ## Quality Legend
 
@@ -140,6 +143,10 @@ This tier should drive:
 - showing-intent prompts
 - returned-after-absence prompts
 - coarse concern prompts
+
+This tier remains the authoritative source for `near_device_presence`. Optional
+smart-home context may support timing and confidence, but it must not replace
+local PIR, camera, or microphone truth for near-device interaction.
 
 ### Tier 2: Light local classification
 

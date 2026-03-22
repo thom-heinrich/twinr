@@ -32,6 +32,8 @@ from twinr.proactive.runtime.ambiguous_room_guard import (
 )
 from twinr.proactive.runtime.governor_inputs import ReSpeakerGovernorInputs, build_respeaker_governor_inputs
 from twinr.proactive.runtime.multimodal_initiative import ReSpeakerMultimodalInitiativeSnapshot
+from twinr.proactive.runtime.smart_home_context import SmartHomeContextTracker
+from twinr.proactive.runtime.person_state import derive_person_state
 from twinr.proactive.runtime.sensitive_behavior_gate import evaluate_respeaker_sensitive_behavior_gate
 from twinr.providers.openai.core.instructions import REMINDER_DELIVERY_INSTRUCTIONS
 
@@ -213,6 +215,16 @@ class TwinrRealtimeBackgroundMixin:
         except Exception as exc:
             self._remember_background_fault("mark_reminder_failed", exc)
 
+    def _smart_home_context_tracker(self) -> SmartHomeContextTracker:
+        """Return the cached smart-home context tracker instance."""
+
+        tracker = getattr(self, "_smart_home_context_tracker_instance", None)
+        if isinstance(tracker, SmartHomeContextTracker):
+            return tracker
+        tracker = SmartHomeContextTracker.from_config(self.config)
+        setattr(self, "_smart_home_context_tracker_instance", tracker)
+        return tracker
+
     def _automation_tool_broker_policy(self) -> AutomationToolBrokerPolicy:
         policy = getattr(self, "_automation_tool_broker_policy_instance", None)
         if isinstance(policy, AutomationToolBrokerPolicy):
@@ -343,6 +355,47 @@ class TwinrRealtimeBackgroundMixin:
         if isinstance(value, set):
             return {self._clone_background_value(item) for item in value}
         return value
+
+    def _merge_background_mapping_values(self, base: object, incoming: object) -> object:
+        """Merge nested observation mappings while replacing scalar/list values."""
+
+        if isinstance(base, dict) and isinstance(incoming, dict):
+            merged = {key: self._clone_background_value(item) for key, item in base.items()}
+            for key, value in incoming.items():
+                if key in merged:
+                    merged[key] = self._merge_background_mapping_values(merged[key], value)
+                else:
+                    merged[key] = self._clone_background_value(value)
+            return merged
+        return self._clone_background_value(incoming)
+
+    def _merge_sensor_observation_facts(
+        self,
+        *,
+        existing: dict[str, object] | None,
+        incoming: dict[str, object],
+    ) -> dict[str, object]:
+        """Merge one partial sensor observation into the latest live fact map."""
+
+        if not isinstance(existing, dict) or not existing:
+            cloned = self._clone_background_value(incoming)
+            return cloned if isinstance(cloned, dict) else dict(incoming)
+        merged = self._merge_background_mapping_values(existing, incoming)
+        return merged if isinstance(merged, dict) else dict(incoming)
+
+    def _sensor_observation_monotonic_now(
+        self,
+        *,
+        facts: dict[str, object],
+    ) -> float:
+        """Return the best monotonic timestamp available for one observation."""
+
+        sensor = facts.get("sensor")
+        if isinstance(sensor, dict):
+            observed_at = sensor.get("observed_at")
+            if isinstance(observed_at, (int, float)) and not isinstance(observed_at, bool):
+                return max(0.0, float(observed_at))
+        return time.monotonic()
 
     # AUDIT-FIX(#11): Event names can come from persisted or external state and must be normalized before joins/comparisons.
     def _normalize_event_names(self, event_names: object) -> tuple[str, ...]:
@@ -669,18 +722,33 @@ class TwinrRealtimeBackgroundMixin:
         cloned_facts = self._clone_background_value(facts)
         copied_facts = cloned_facts if isinstance(cloned_facts, dict) else dict(facts)
         normalized_event_names = self._normalize_event_names(event_names)
-        self._latest_sensor_observation_facts = copied_facts
+        merged_facts = self._merge_sensor_observation_facts(
+            existing=getattr(self, "_latest_sensor_observation_facts", None),
+            incoming=copied_facts,
+        )
+        context_update = self._smart_home_context_tracker().observe(
+            observed_at=self._sensor_observation_monotonic_now(facts=merged_facts),
+            live_facts=merged_facts,
+            incoming_facts=copied_facts,
+        )
+        merged_facts = context_update.snapshot.apply_to_facts(merged_facts)
+        merged_facts["person_state"] = derive_person_state(
+            observed_at=self._sensor_observation_monotonic_now(facts=merged_facts),
+            live_facts=merged_facts,
+        ).to_automation_facts()
+        normalized_event_names = self._normalize_event_names((*normalized_event_names, *context_update.event_names))
+        self._latest_sensor_observation_facts = merged_facts
 
         # AUDIT-FIX(#4): Never block on a full observation queue; drop the oldest entry and keep the newest live state.
         try:
-            self._sensor_observation_queue.put_nowait((copied_facts, normalized_event_names))
+            self._sensor_observation_queue.put_nowait((merged_facts, normalized_event_names))
         except Full:
             try:
                 self._sensor_observation_queue.get_nowait()
             except Empty:
                 pass
             try:
-                self._sensor_observation_queue.put_nowait((copied_facts, normalized_event_names))
+                self._sensor_observation_queue.put_nowait((merged_facts, normalized_event_names))
             except Full as exc:
                 self._remember_background_fault("sensor_observation_queue", exc)
                 self._safe_emit("sensor_observation_queue_overflow=true")

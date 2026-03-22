@@ -8,6 +8,10 @@ from twinr.proactive.runtime.multimodal_initiative import (
     ReSpeakerMultimodalInitiativeSnapshot,
     derive_respeaker_multimodal_initiative,
 )
+from twinr.proactive.runtime.display_ambient_impulses import (
+    DisplayAmbientImpulsePublishResult,
+    DisplayAmbientImpulsePublisher,
+)
 from twinr.proactive.runtime.presence import PresenceSessionController, PresenceSessionSnapshot
 from twinr.proactive.runtime.sensitive_behavior_gate import (
     ReSpeakerSensitiveBehaviorGateDecision,
@@ -24,6 +28,8 @@ from twinr.proactive.runtime.service import (
 )
 
 __all__ = [
+    "DisplayAmbientImpulsePublishResult",
+    "DisplayAmbientImpulsePublisher",
     "PresenceSessionController",
     "PresenceSessionSnapshot",
     "ProactiveCoordinator",

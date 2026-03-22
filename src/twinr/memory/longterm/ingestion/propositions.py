@@ -241,6 +241,47 @@ def _normalize_optional_text(value: object) -> str | None:
     return clean_value or None
 
 
+def _semantic_tokens(*values: object | None) -> set[str]:
+    """Return lowercase alphanumeric tokens from structured semantic fields."""
+
+    tokens: set[str] = set()
+    for value in values:
+        normalized = _normalize_text(None if value is None else str(value), limit=220).casefold()
+        if not normalized:
+            continue
+        for separator in ("_", "-", "/", ":", ".", ",", "(", ")", ";"):
+            normalized = normalized.replace(separator, " ")
+        for raw_token in normalized.split():
+            clean_token = "".join(character for character in raw_token if character.isalnum())
+            if clean_token:
+                tokens.add(clean_token)
+    return tokens
+
+
+def _normalize_predicate_token(value: str | None) -> str:
+    """Canonicalize one predicate-like label into underscore token form."""
+
+    normalized = _normalize_text(value, limit=120).casefold()
+    for separator in (" ", "-", "/", ":"):
+        normalized = normalized.replace(separator, "_")
+    while "__" in normalized:
+        normalized = normalized.replace("__", "_")
+    return normalized.strip("_")
+
+
+def _set_classifier_if_generic(
+    attributes: dict[str, object],
+    *,
+    key: str,
+    value: str,
+) -> None:
+    """Overwrite one classifier only when it is unset or still generic."""
+
+    existing = _normalize_text(None if key not in attributes else str(attributes.get(key)), limit=64).casefold()
+    if not existing or existing == "general":
+        attributes[key] = value
+
+
 def _resolve_timezone(timezone_name: str) -> tuple[str, tzinfo]:
     """Resolve the requested timezone or fall back to UTC."""
     # AUDIT-FIX(#2): Invalid zone keys or missing zoneinfo data must not abort extraction; fall back to UTC deterministically.
@@ -356,6 +397,9 @@ class OpenAIStructuredTurnProgram:
                         "Use subject_ref for the main entity being described.",
                         "Use object_ref for stable entity targets and value_text for literal values such as warm or Sunday.",
                         "Encode attributes as arrays of {key, value} pairs.",
+                        "When the user explicitly states an answer-style preference, encode it in attributes such as preference_type=verbosity with preference_value like concise or detailed.",
+                        "When the user explicitly states how proactive follow-up should be, encode it in attributes such as preference_type=initiative with preference_value like gently_proactive, more_proactive, or less_proactive.",
+                        "When the user explicitly reacts to humor, encode it in attributes such as feedback_target=humor with feedback_polarity like positive or negative.",
                         "If a person relation is explicit, include both a proposition and a graph edge.",
                         "If an event is tied to a specific day, include valid_from, valid_to, and a temporal_occurs_on graph edge.",
                     )
@@ -548,6 +592,11 @@ class LongTermTurnPropositionCompiler:
             if proposition.value_text:
                 attributes.setdefault("value_text", proposition.value_text)
             attributes.setdefault("predicate", proposition.predicate)
+            self._enrich_preference_and_feedback_attributes(
+                kind=normalized_kind,
+                proposition=proposition,
+                attributes=attributes,
+            )
             slot_key = self._build_slot_key(
                 kind=normalized_kind,
                 proposition=proposition,
@@ -595,6 +644,77 @@ class LongTermTurnPropositionCompiler:
             )
         )
         return tuple(objects), graph_edges
+
+    def _enrich_preference_and_feedback_attributes(
+        self,
+        *,
+        kind: str,
+        proposition: LongTermTurnPropositionV1,
+        attributes: dict[str, object],
+    ) -> None:
+        """Promote canonical style and humor predicates into structured attrs.
+
+        The live turn extractor already emits stable predicates for explicit
+        conversation-style and humor feedback, but without richer preference
+        tags those objects remain invisible to downstream personality learning.
+        This compiler-level normalization keeps the extraction prompt broad
+        while ensuring canonical preference/feedback semantics survive into the
+        consolidated memory objects.
+        """
+
+        predicate = _normalize_predicate_token(proposition.predicate)
+        if not predicate:
+            return
+
+        if predicate == "user_prefers_answer_style":
+            _set_classifier_if_generic(attributes, key="memory_domain", value="preference")
+            if kind == "fact":
+                _set_classifier_if_generic(attributes, key="fact_type", value="preference")
+            attributes.setdefault("preference_type", "verbosity")
+            if "preference_value" not in attributes and "preferred_level" not in attributes:
+                value_tokens = _semantic_tokens(
+                    proposition.value_text,
+                    proposition.summary,
+                    proposition.details,
+                )
+                if value_tokens & {"detailed", "detail", "expansive", "expanded", "long", "longer", "full"}:
+                    attributes["preference_value"] = "detailed"
+                elif value_tokens & {"short", "shorter", "brief", "concise", "compact", "calmer"}:
+                    attributes["preference_value"] = "concise"
+            return
+
+        if predicate == "user_prefers_small_follow_up_when_helpful":
+            _set_classifier_if_generic(attributes, key="memory_domain", value="preference")
+            if kind == "fact":
+                _set_classifier_if_generic(attributes, key="fact_type", value="preference")
+            attributes.setdefault("preference_type", "initiative")
+            attributes.setdefault("preference_value", "gently_proactive")
+            return
+
+        predicate_tokens = _semantic_tokens(proposition.predicate)
+        object_tokens = _semantic_tokens(proposition.object_ref, proposition.value_text)
+        if "humor" not in predicate_tokens and "humor" not in object_tokens:
+            return
+
+        if predicate.startswith("responds_well_to_"):
+            _set_classifier_if_generic(attributes, key="memory_domain", value="preference")
+            if kind == "fact":
+                _set_classifier_if_generic(attributes, key="fact_type", value="feedback")
+            elif kind == "observation":
+                _set_classifier_if_generic(attributes, key="observation_type", value="feedback")
+            attributes.setdefault("feedback_target", "humor")
+            attributes.setdefault("feedback_polarity", "positive")
+            return
+
+        if predicate.startswith("responds_poorly_to_") or predicate.startswith("does_not_like_"):
+            _set_classifier_if_generic(attributes, key="memory_domain", value="preference")
+            if kind == "fact":
+                _set_classifier_if_generic(attributes, key="fact_type", value="feedback")
+            elif kind == "observation":
+                _set_classifier_if_generic(attributes, key="observation_type", value="feedback")
+            attributes.setdefault("feedback_target", "humor")
+            attributes.setdefault("feedback_polarity", "negative")
+            return
 
     def _build_slot_key(
         self,

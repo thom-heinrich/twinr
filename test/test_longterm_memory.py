@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
 from test.longterm_test_program import make_test_extractor
 from twinr.config import TwinrConfig
+from twinr.agent.base_agent.runtime.memory import TwinrRuntimeMemoryMixin
 from twinr.memory.chonkydb import TwinrPersonalGraphStore
 from twinr.memory.context_store import PromptContextStore
 from twinr.memory.longterm import (
@@ -189,6 +190,7 @@ class _FailOnEnterLock:
 class _RecordingPersonalityLearningService:
     def __init__(self) -> None:
         self.conversation_calls: list[tuple[LongTermConversationTurn, LongTermConsolidationResultV1]] = []
+        self.queued_tool_history_calls: list[tuple[tuple[AgentToolCall, ...], tuple[AgentToolResult, ...]]] = []
         self.tool_history_calls: list[tuple[tuple[AgentToolCall, ...], tuple[AgentToolResult, ...]]] = []
 
     def record_conversation_consolidation(
@@ -206,6 +208,30 @@ class _RecordingPersonalityLearningService:
         tool_results: tuple[AgentToolResult, ...],
     ) -> None:
         self.tool_history_calls.append((tool_calls, tool_results))
+
+    def enqueue_tool_history(
+        self,
+        *,
+        tool_calls: tuple[AgentToolCall, ...],
+        tool_results: tuple[AgentToolResult, ...],
+    ) -> None:
+        self.queued_tool_history_calls.append((tool_calls, tool_results))
+
+
+class _RecordingFlushService:
+    def __init__(self, *, flush_result: bool = True) -> None:
+        self.flush_result = flush_result
+        self.flush_timeouts: list[float] = []
+
+    def flush(self, *, timeout_s: float) -> bool:
+        self.flush_timeouts.append(timeout_s)
+        return self.flush_result
+
+
+class _RuntimeMemoryProbe(TwinrRuntimeMemoryMixin):
+    def __init__(self, *, config: TwinrConfig, long_term_memory: object) -> None:
+        self.config = config
+        self.long_term_memory = long_term_memory
 
 
 class _StubThreadSummaryReflector:
@@ -751,6 +777,30 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         recorded_calls, recorded_results = service.personality_learning.tool_history_calls[0]
         self.assertEqual(recorded_calls[0].name, "search_live_info")
         self.assertEqual(recorded_results[0].call_id, "call:search:1")
+
+    def test_enqueue_personality_tool_history_routes_tool_calls_to_queueing_path(self) -> None:
+        service = object.__new__(LongTermMemoryService)
+        service.personality_learning = _RecordingPersonalityLearningService()
+        service._store_lock = _FailOnEnterLock()
+        tool_call = AgentToolCall(
+            name="search_live_info",
+            call_id="call:search:1",
+            arguments={"question": "What changed today?"},
+        )
+        tool_result = AgentToolResult(
+            call_id="call:search:1",
+            name="search_live_info",
+            output={"status": "ok", "answer": "Fresh answer"},
+            serialized_output='{"status":"ok"}',
+        )
+
+        service.enqueue_personality_tool_history(
+            tool_calls=(tool_call,),
+            tool_results=(tool_result,),
+        )
+
+        self.assertEqual(len(service.personality_learning.queued_tool_history_calls), 1)
+        self.assertEqual(service.personality_learning.tool_history_calls, [])
 
     def test_provider_context_combines_recent_episodes_and_graph_context(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1872,6 +1922,38 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertEqual(objects[event.memory_id].attributes["invalidation_reason"], "This appointment was canceled.")
         self.assertEqual(deletion.action, "delete")
         self.assertNotIn(relationship.memory_id, objects)
+
+
+class RuntimeMemoryFlushTimeoutTests(unittest.TestCase):
+    def test_best_effort_flush_respects_caller_timeout_in_remote_primary_mode(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            long_term_memory_mode="remote_primary",
+            long_term_memory_remote_flush_timeout_s=60.0,
+        )
+        long_term_memory = _RecordingFlushService(flush_result=True)
+        runtime = _RuntimeMemoryProbe(config=config, long_term_memory=long_term_memory)
+
+        flushed = runtime.flush_long_term_memory(timeout_s=5.0)
+
+        self.assertTrue(flushed)
+        self.assertEqual(long_term_memory.flush_timeouts, [5.0])
+
+    def test_strict_flush_keeps_remote_primary_minimum_timeout(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            long_term_memory_mode="remote_primary",
+            long_term_memory_remote_flush_timeout_s=60.0,
+        )
+        long_term_memory = _RecordingFlushService(flush_result=False)
+        runtime = _RuntimeMemoryProbe(config=config, long_term_memory=long_term_memory)
+
+        with self.assertRaises(TimeoutError):
+            runtime._flush_long_term_memory_strict(operation="test", timeout_s=5.0)
+
+        self.assertEqual(long_term_memory.flush_timeouts, [60.0])
 
 
 if __name__ == "__main__":

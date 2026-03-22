@@ -100,6 +100,12 @@ class TwinrRuntimeMemoryMixin:
             raise ValueError("timeout_s must be a positive finite float") from exc
         if not math.isfinite(timeout) or timeout <= 0.0:
             raise ValueError("timeout_s must be a positive finite float")
+        return timeout
+
+    def _normalize_strict_long_term_flush_timeout(self, timeout_s: float) -> float:
+        """Return a validated timeout for durability-critical long-term flushes."""
+
+        timeout = self._normalize_timeout(timeout_s)
         if self.config.long_term_memory_mode == "remote_primary":
             timeout = max(timeout, float(self.config.long_term_memory_remote_flush_timeout_s))
         return timeout
@@ -171,7 +177,7 @@ class TwinrRuntimeMemoryMixin:
 
     # AUDIT-FIX(#2): Long-term-memory writes are not durable until flush() confirms persistence.
     def _flush_long_term_memory_strict(self, *, operation: str, timeout_s: float = 2.0) -> None:
-        timeout = self._normalize_timeout(timeout_s)
+        timeout = self._normalize_strict_long_term_flush_timeout(timeout_s)
         try:
             flushed = self.long_term_memory.flush(timeout_s=timeout)
         except Exception as exc:
@@ -277,7 +283,7 @@ class TwinrRuntimeMemoryMixin:
             return
         try:
             with self._memory_runtime_lock():
-                self.long_term_memory.record_personality_tool_history(
+                self.long_term_memory.enqueue_personality_tool_history(
                     tool_calls=normalized_tool_calls,
                     tool_results=normalized_tool_results,
                 )
@@ -359,7 +365,12 @@ class TwinrRuntimeMemoryMixin:
             )
 
     def flush_long_term_memory(self, *, timeout_s: float = 2.0) -> bool:
-        """Flush queued long-term memory work within the given timeout."""
+        """Flush queued long-term memory work within the caller-provided timeout.
+
+        This path is intentionally best-effort: unlike durability-critical runtime
+        mutations, it must not silently widen a UI/operator timeout to the
+        remote-primary default floor.
+        """
 
         timeout = self._normalize_timeout(timeout_s)  # AUDIT-FIX(#8)
         with self._memory_runtime_lock():  # AUDIT-FIX(#9)

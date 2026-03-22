@@ -167,6 +167,15 @@ PYTHONPATH=src python3 scripts/generate_qwen3tts_wakeword_corpus.py \
 ```
 
 ```bash
+PYTHONPATH=src python3 scripts/generate_qwen3tts_wakeword_corpus.py \
+  --output-root /tmp/twinr_qwen3tts_negatives_v2 \
+  --device cuda:1 \
+  --label-filter negative \
+  --style-profile plain,warm,soft \
+  --generation-profile stable,diverse
+```
+
+```bash
 PYTHONPATH=src python3 -m twinr \
   --env-file .env \
   --wakeword-training-plan \
@@ -226,7 +235,9 @@ PYTHONPATH=src python3 scripts/generate_multivoice_dataset.py \
 - `kws_assets.py` provisions the official upstream bundle plus Twinr-specific `keywords_raw.txt`, `keywords.txt`, optional `bpe.model`, optional phone lexicon files such as `en.phone`, and `bundle_metadata.json` so `/twinr` can be switched without ad-hoc shell work or silently dropped custom wakewords.
 - For a true custom conventional detector, `wekws_export.py` now bridges Twinr's labeled Pi captures into WeKws/Kaldi-style `wav.scp`, `text`, `utt2spk`, `wav.dur`, and `dict/` files so the next retrain can leave the generic open-vocabulary bundle path entirely.
 - `wekws_experiment.py` now turns those exported splits into a full WeKws workspace with `data.list`, a built-in Twinr recipe, `conf/*.yaml`, `exp/<recipe>/`, and a reproducible `run_wekws.sh` so the GPU training path stops depending on ad-hoc shell history.
-- `synthetic_corpus.py` plus `scripts/generate_qwen3tts_wakeword_corpus.py` now provide the large synthetic data engine for Twinr-specific WeKws retrains: many Qwen3TTS speakers, style instructions, deterministic seeds, and lightweight far-field/noise/channel degradations before the WeKws export step.
+- `wekws.py` now treats Twinr WeKws bundles as embedded-CMVN models by default when a CMVN sidecar exists but the ONNX metadata is still legacy-empty. This prevents the earlier double-CMVN runtime collapse where PyTorch and ONNX matched on the same features, but Twinr flattened both classes into one score band by normalizing twice.
+- `promotion.py` now runs a hard raw-score separation guard for `wekws` before the runtime-faithful stream replay. Bundles whose positive P10 score is not above the negative P90 score are blocked before they can look good on clip counts for the wrong reason.
+- `synthetic_corpus.py` plus `scripts/generate_qwen3tts_wakeword_corpus.py` now provide the large synthetic data engine for Twinr-specific WeKws retrains: many Qwen3TTS speakers, style instructions, deterministic seeds, lightweight far-field/noise/channel degradations, and asymmetric positive-vs-negative corpus runs before the WeKws export step.
 
 ## See also
 

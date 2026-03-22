@@ -43,6 +43,8 @@ Notes
 The script is resume-friendly by default: existing WAVs are skipped and missing
 manifest entries are reconstructed from the deterministic plan when needed.
 Use ``--overwrite`` to rebuild the selected shard from scratch.
+The Qwen3TTS generation path is also bounded by ``--max-new-tokens`` so short
+wakeword prompts cannot drift into runaway long-form synthesis.
 """
 
 from __future__ import annotations
@@ -72,6 +74,7 @@ try:
         apply_augmentation,
         build_qwen3tts_synthetic_corpus_plan,
         manifest_row_for_request,
+        normalize_synthetic_labels,
         write_pcm16_wav,
     )
 except Exception:
@@ -102,6 +105,7 @@ except Exception:
     apply_augmentation = _MODULE.apply_augmentation
     build_qwen3tts_synthetic_corpus_plan = _MODULE.build_qwen3tts_synthetic_corpus_plan
     manifest_row_for_request = _MODULE.manifest_row_for_request
+    normalize_synthetic_labels = _MODULE.normalize_synthetic_labels
     write_pcm16_wav = _MODULE.write_pcm16_wav
 
 
@@ -148,6 +152,16 @@ def _select_augmentation_profiles(keys: tuple[str, ...]) -> tuple[SyntheticAugme
     if not selected:
         raise ValueError(f"No augmentation profiles matched: {sorted(allowed)}")
     return selected
+
+
+def _parse_label_filters(raw_values: list[str]) -> tuple[str, ...]:
+    values: list[str] = []
+    for raw in raw_values:
+        for item in str(raw).split(","):
+            normalized_item = item.strip()
+            if normalized_item:
+                values.append(normalized_item)
+    return normalize_synthetic_labels(values)
 
 
 def _load_existing_manifest_rows(path: Path) -> dict[str, dict[str, Any]]:
@@ -238,7 +252,7 @@ def _load_qwen3tts_model(*, device: str, dtype: str):
     )
 
 
-def _synthesize_one(model, *, request) -> tuple[np.ndarray, int]:
+def _synthesize_one(model, *, request, max_new_tokens: int) -> tuple[np.ndarray, int]:
     import torch
 
     torch.manual_seed(int(request.seed))
@@ -253,6 +267,7 @@ def _synthesize_one(model, *, request) -> tuple[np.ndarray, int]:
         temperature=request.temperature,
         top_k=request.top_k,
         repetition_penalty=request.repetition_penalty,
+        max_new_tokens=int(max_new_tokens),
     )
     samples = np.asarray(wavs[0], dtype=np.float32)
     peak = float(np.max(np.abs(samples))) if samples.size else 0.0
@@ -299,6 +314,18 @@ def main() -> int:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=768,
+        help="Hard upper bound for Qwen3TTS codec-token generation per utterance.",
+    )
+    parser.add_argument(
+        "--label-filter",
+        action="append",
+        default=[],
+        help="Optional label selection: positive, negative, or all. Allows asymmetric corpus runs.",
+    )
+    parser.add_argument(
         "--prefix",
         action="append",
         default=[],
@@ -332,6 +359,7 @@ def main() -> int:
     style_profiles = _select_style_profiles(_parse_csv_strings(args.style_profile, default=()))
     generation_profiles = _select_generation_profiles(_parse_csv_strings(args.generation_profile, default=()))
     augmentation_profiles = _select_augmentation_profiles(_parse_csv_strings(args.augmentation_profile, default=()))
+    labels = _parse_label_filters(args.label_filter)
     prefixes = _parse_csv_strings(args.prefix, default=DEFAULT_PREFIXES)
     follow_ups = _parse_csv_strings(args.follow_up, default=DEFAULT_FOLLOW_UPS)
 
@@ -341,6 +369,7 @@ def main() -> int:
         style_profiles=style_profiles,
         generation_profiles=generation_profiles,
         augmentation_profiles=augmentation_profiles,
+        labels=labels,
         prefixes=prefixes,
         follow_ups=follow_ups,
         shard_index=int(args.speaker_shard_index),
@@ -375,7 +404,11 @@ def main() -> int:
             pending_requests.append(request)
         if not pending_requests:
             continue
-        samples, sample_rate = _synthesize_one(model, request=pending_requests[0])
+        samples, sample_rate = _synthesize_one(
+            model,
+            request=pending_requests[0],
+            max_new_tokens=int(args.max_new_tokens),
+        )
         for request in pending_requests:
             output_path = output_root / request.output_rel_path
             augmentation_profile = next(
@@ -416,6 +449,7 @@ def main() -> int:
         "output_root": str(output_root),
         "device": str(args.device),
         "dtype": str(args.dtype),
+        "max_new_tokens": int(args.max_new_tokens),
         "speaker_shard_index": int(args.speaker_shard_index),
         "speaker_shard_count": int(args.speaker_shard_count),
         "speakers": list(speakers),
@@ -423,6 +457,7 @@ def main() -> int:
         "style_profiles": [profile.key for profile in style_profiles],
         "generation_profiles": [profile.key for profile in generation_profiles],
         "augmentation_profiles": [profile.key for profile in augmentation_profiles],
+        "labels": list(labels),
         "prefixes": list(prefixes),
         "follow_ups": list(follow_ups),
         "planned_count": len(requests),

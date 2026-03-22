@@ -189,6 +189,88 @@ class LongTermTurnPropositionTests(unittest.TestCase):
         self.assertEqual(objects, ())
         self.assertEqual(edges, ())
 
+    def test_compiler_enriches_style_and_humor_semantics_from_canonical_predicates(self) -> None:
+        bundle = LongTermTurnPropositionBundleV1.from_payload(
+            {
+                "propositions": [
+                    {
+                        "proposition_id": "pref_verbosity",
+                        "kind": "fact",
+                        "summary": "The user says shorter and calmer answers usually help more.",
+                        "details": None,
+                        "predicate": "user_prefers_answer_style",
+                        "confidence": 0.88,
+                        "sensitivity": "normal",
+                        "source_channel": "user_transcript",
+                        "subject_ref": "user:main",
+                        "object_ref": None,
+                        "value_text": "Shorter and calmer answers",
+                        "valid_from": None,
+                        "valid_to": None,
+                        "attributes": [],
+                    },
+                    {
+                        "proposition_id": "pref_initiative",
+                        "kind": "fact",
+                        "summary": "The user says one small follow-up can help when it is really useful.",
+                        "details": None,
+                        "predicate": "user_prefers_small_follow_up_when_helpful",
+                        "confidence": 0.82,
+                        "sensitivity": "normal",
+                        "source_channel": "user_transcript",
+                        "subject_ref": "user:main",
+                        "object_ref": None,
+                        "value_text": "One small follow-up question when it really helps",
+                        "valid_from": None,
+                        "valid_to": None,
+                        "attributes": [],
+                    },
+                    {
+                        "proposition_id": "feedback_humor",
+                        "kind": "observation",
+                        "summary": "A small dry joke worked for the user.",
+                        "details": None,
+                        "predicate": "responds_well_to_dry_humor",
+                        "confidence": 0.79,
+                        "sensitivity": "normal",
+                        "source_channel": "user_transcript",
+                        "subject_ref": "user:main",
+                        "object_ref": "concept:dry_humor",
+                        "value_text": None,
+                        "valid_from": None,
+                        "valid_to": None,
+                        "attributes": [],
+                    },
+                ],
+                "graph_edges": [],
+            }
+        )
+
+        objects, _edges = LongTermTurnPropositionCompiler().compile(
+            bundle=bundle,
+            source_ref=LongTermSourceRefV1(source_type="conversation_turn"),
+        )
+        object_by_predicate = {
+            object_.attributes["predicate"]: object_
+            for object_ in objects
+            if object_.attributes is not None and "predicate" in object_.attributes
+        }
+
+        verbosity = object_by_predicate["user_prefers_answer_style"]
+        self.assertEqual(verbosity.attributes["memory_domain"], "preference")
+        self.assertEqual(verbosity.attributes["preference_type"], "verbosity")
+        self.assertEqual(verbosity.attributes["preference_value"], "concise")
+
+        initiative = object_by_predicate["user_prefers_small_follow_up_when_helpful"]
+        self.assertEqual(initiative.attributes["memory_domain"], "preference")
+        self.assertEqual(initiative.attributes["preference_type"], "initiative")
+        self.assertEqual(initiative.attributes["preference_value"], "gently_proactive")
+
+        humor = object_by_predicate["responds_well_to_dry_humor"]
+        self.assertEqual(humor.attributes["memory_domain"], "preference")
+        self.assertEqual(humor.attributes["feedback_target"], "humor")
+        self.assertEqual(humor.attributes["feedback_polarity"], "positive")
+
     def test_turn_program_forces_canonical_english_backend_language(self) -> None:
         config = TwinrConfig(
             openai_api_key="sk-test",

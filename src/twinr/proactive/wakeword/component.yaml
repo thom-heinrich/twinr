@@ -13,7 +13,7 @@ owned_concerns:
   - Train reproducible Twinr base models from generated wakeword datasets and export local ONNX assets
   - Export labeled Twinr manifests into WeKws/Kaldi-style split directories for custom conventional KWS training
   - Prepare reproducible WeKws experiment workspaces, configs, and runner scripts from exported Twinr datasets
-  - Plan deterministic large synthetic Qwen3TTS wakeword corpora with speaker/style/degradation diversity for custom conventional KWS retrains
+  - Plan deterministic large synthetic Qwen3TTS wakeword corpora with speaker/style/degradation diversity and asymmetric positive-vs-negative runs for custom conventional KWS retrains
   - Render the canonical Stage-1 family, hard-negative mining, and Pi acceptance plan for future retrains
   - Stream bounded PCM frames into wakeword detections for proactive runtime
 out_of_scope:
@@ -128,21 +128,23 @@ files:
       - WakewordCalibrationStore
       - apply_wakeword_calibration
   - path: evaluation.py
-    role: Manifest replay, labeling, verifier training, eval, and autotune helpers
+    role: Manifest replay, labeling, verifier training, eval, autotune, and raw-score sanity helpers
     exports:
       - WakewordAutotuneRecommendation
       - WakewordEvalEntry
       - WakewordEvalMetrics
       - WakewordEvalReport
+      - WakewordScoreSanityReport
       - WakewordVerifierTrainingReport
       - append_wakeword_capture_label
       - autotune_wakeword_profile
+      - evaluate_wekws_score_sanity_entries
       - load_eval_manifest
       - load_labeled_ops_captures
       - run_wakeword_eval
       - train_wakeword_custom_verifier_from_manifest
   - path: promotion.py
-    role: Runtime-faithful stream replay, promotion spec loading, suite gating, and ambient false-accepts/hour reports
+    role: Runtime-faithful stream replay, raw-score bundle sanity, promotion spec loading, suite gating, and ambient false-accepts/hour reports
     exports:
       - WakewordAmbientGuardResult
       - WakewordAmbientGuardSpec
@@ -215,6 +217,7 @@ public_api:
     - WakewordEvalEntry
     - WakewordEvalMetrics
     - WakewordEvalReport
+    - WakewordScoreSanityReport
     - WakewordKwsAssetBundle
     - ProvisionedWakewordKwsBundle
     - WakewordKwsProvisionSpec
@@ -250,6 +253,7 @@ public_api:
     - available_builtin_kws_bundle_specs
     - build_default_wakeword_training_plan
     - derive_kws_keyword_names
+    - evaluate_wekws_score_sanity_entries
     - evaluate_wakeword_stream_entries
     - load_eval_manifest
     - load_wakeword_promotion_spec
@@ -342,6 +346,7 @@ primary_callers:
 tests:
   - path: test/test_wakeword.py
   - path: test/test_wakeword_kws.py
+  - path: test/test_wakeword_wekws.py
   - path: test/test_wakeword_policy.py
   - path: test/test_wakeword_eval.py
   - path: test/test_wakeword_training.py

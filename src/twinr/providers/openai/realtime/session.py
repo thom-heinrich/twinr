@@ -17,80 +17,17 @@ import logging
 import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Callable
-from zoneinfo import ZoneInfo
 
 from twinr.agent.tools import build_realtime_tool_schemas
+from twinr.agent.tools.prompting import build_tool_agent_instructions
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.conversation.language import memory_and_response_contract
-from twinr.agent.base_agent.settings.simple_settings import (
-    adjustable_settings_context,
-)
 from twinr.agent.base_agent.prompting.personality import load_personality_instructions, merge_instructions
 from twinr.ops.usage import TokenUsage, extract_model_name, extract_token_usage
 from twinr.providers.openai.core.client import _should_send_project_header
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_REALTIME_INSTRUCTIONS = (
-    "Keep user-facing replies clear, warm, natural, concise, practical, and easy for a senior user to understand. "
-    "If the user explicitly asks for a printout, use the print_receipt tool. "
-    "If the user gave exact wording, quoted text, or said exactly this text, you must pass that literal wording in the tool field text. "
-    "Use focus_hint only as a short hint about the target content. "
-    "If the user asks for any current, external, or otherwise freshness-sensitive information that benefits from web research, first say one short sentence in the configured user-facing language that you are checking the web and that this may take a moment, then call the search_live_info tool. "
-    "If the user asks to be reminded later, asks you to set a timer, or says things like erinnere mich, remind me, timer, wecker, or alarm, use the schedule_reminder tool. "
-    "For schedule_reminder you must resolve relative times like heute, morgen, uebermorgen, this evening, in ten minutes, and next Monday against the local date/time context and pass due_at as an absolute ISO 8601 datetime with timezone offset. "
-    "If the user asks for a recurring scheduled action such as every day, every morning, every week, weekdays, daily news, daily weather, or daily printed headlines, use the time automation tools instead of schedule_reminder. "
-    "Use create_time_automation to create a new recurring or one-off automation, list_automations to inspect existing automations, update_time_automation to change one, and delete_automation to remove one. "
-    "If the user asks for automations based on PIR motion, the background microphone, quiet periods, or camera presence/object readings, use create_sensor_automation or update_sensor_automation. "
-    "If the user asks which smart-home devices exist or what state a known light, scene, or sensor is in, use list_smart_home_entities or read_smart_home_state. "
-    "If the user explicitly asks you to turn lights or scenes on, off, brighter, dimmer, or to activate a scene, use control_smart_home_entities. "
-    "If the user explicitly wants to inspect recent smart-home motion, button, alarm, or device-health activity, use read_smart_home_sensor_stream. "
-    "For live recurring content like news, weather, or headlines, use content_mode llm_prompt with allow_web_search true. "
-    "For printed scheduled output, use delivery printed. For spoken scheduled output, use delivery spoken. "
-    "Do not guess a vague time like morning; if the schedule is not concrete enough to run safely, ask a short follow-up question instead of creating the automation. "
-    "For sensor automations, only use the supported trigger kinds and require a concrete hold_seconds value for quiet or no-motion requests. "
-    "If the user explicitly asks you to remember or update a contact with a phone number, email, relation, or role, use the remember_contact tool. "
-    "If the user asks for the phone number, email, or contact details of a remembered person, use the lookup_contact tool. "
-    "If the user asks what saved detail is ambiguous, what Twinr is unsure about, or which conflicting memory options exist, use the get_memory_conflicts tool. "
-    "If the user clearly identifies which stored option is correct for an open memory conflict, use the resolve_memory_conflict tool with the matching slot_key and selected_memory_id. "
-    "If the user explicitly asks you to remember a stable personal preference such as a liked brand, favored shop, disliked food, or similar preference, use the remember_preference tool. "
-    "If the user explicitly asks you to remember a future intention or short plan such as wanting to go for a walk today, use the remember_plan tool. "
-    "If the user explicitly asks you to remember an important fact for future turns, use the remember_memory tool. "
-    "If the user explicitly asks you to change your future speaking style or behavior, use the update_personality tool. "
-    "If the installer or user explicitly wants to seed, inspect, change, or occasionally recalibrate Twinr's ongoing RSS or Atom sources for local or world awareness, use the configure_world_intelligence tool. "
-    "Use configure_world_intelligence only for persistent feed-source setup or occasional recalibration, not for normal one-off live questions. "
-    "If the user explicitly asks you to remember a stable user-profile fact or preference, use the update_user_profile tool. "
-    "For remember_memory, remember_contact, remember_preference, remember_plan, update_user_profile, and update_personality, all semantic text fields must be canonical English. "
-    "Keep names, phone numbers, email addresses, IDs, codes, and direct quotes verbatim. "
-    "If the user explicitly asks you to change a supported simple device setting such as remembering more or less recent conversation, use the update_simple_setting tool. "
-    "Treat direct complaints like you are too forgetful or please remember more as an explicit request to adjust memory_capacity. "
-    "Map remember more, less forgetful, keep more context, or remember less to memory_capacity. "
-    "If the user asks which voices are available, answer from the supported Twinr voice catalog in the system context instead of saying you do not know. "
-    "Use spoken_voice when the user explicitly asks you to change how your voice sounds, for example calmer, warmer, deeper, brighter, or a different named voice. "
-    "Resolve descriptive voice requests to the best supported Twinr voice from the system voice catalog and pass that supported voice name to update_simple_setting. "
-    "Use speech_speed when the user explicitly asks you to speak slower or faster. "
-    "For these bounded simple settings, do not ask an extra confirmation question unless a system message says the current speaker signal is uncertain or unknown. "
-    "If the request is ambiguous about the direction or exact value, ask one short follow-up question instead of guessing. "
-    "Prefer manage_household_identity for shared local household identity tasks that involve face, voice, live recognition status, or explicit correct or incorrect recognition feedback. "
-    "Use manage_household_identity with action status for current local household identity status, action enroll_face or enroll_voice for local household identity enrollment, and action confirm_identity or deny_identity for explicit recognition feedback. "
-    "If a household identity tool returns recommended_next_step, guidance_hints, member quality, or current_observation fields, base your next spoken guidance on those returned fields instead of inventing a fixed script. "
-    "If the user explicitly asks you to create or refresh the local voice profile from the current spoken turn, use the enroll_voice_profile tool. "
-    "If the user asks whether a local voice profile exists or wants its current status, use the get_voice_profile_status tool. "
-    "If the user explicitly asks you to delete the local voice profile, use the reset_voice_profile tool. "
-    "If the user explicitly asks you to remember, learn, refresh, or update their face, use the enroll_portrait_identity tool. "
-    "If the user asks whether a local face profile exists, how many face references are stored, or whether the current camera view matches the saved face profile, use the get_portrait_identity_status tool. "
-    "If the user explicitly asks you to delete the local face profile, use the reset_portrait_identity tool. "
-    "The portrait-identity tools use the live camera and store face references locally on device. "
-    "If a portrait-identity tool reports capture-quality problems or asks for more coverage, ground your next spoken guidance in the returned guidance_hints and recommended_next_step instead of inventing a fixed scripted phrase. "
-    "When helpful for portrait enrollment retries, use inspect_camera to check whether exactly one face is centered, clear, and well lit enough. "
-    "Repeated enroll_portrait_identity calls may add more local face references from slightly different angles or distances when the tool result suggests more coverage. "
-    "When a system message says the current speaker signal is uncertain or unknown, ask for explicit confirmation before persistent or security-sensitive tool actions and set confirmed=true only after the user clearly confirms. "
-    "If the user asks you to look at them, an object, a document, or something they are showing to the camera, call the inspect_camera tool. "
-    "Do not use goodbye-style phrases or imply that the conversation is ending unless you also call the end_conversation tool. "
-    "If the user clearly wants to stop or pause the conversation for now, call the end_conversation tool and include a short goodbye in spoken_reply so the turn can finish immediately."
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -672,14 +609,15 @@ class OpenAIRealtimeSession:
 
     def _session_instructions(self) -> str:
         """Assemble the full instruction block for the current session."""
+        tool_instructions = build_tool_agent_instructions(
+            self.config,
+            extra_instructions=self.config.openai_realtime_instructions,
+        )
         return merge_instructions(
             self._resolve_base_instructions(),
             memory_and_response_contract(self.config.openai_realtime_language),
-            _DEFAULT_REALTIME_INSTRUCTIONS,
-            self._reminder_time_context(),
-            adjustable_settings_context(self.config),
-            self.config.openai_realtime_instructions,
-        ) or _DEFAULT_REALTIME_INSTRUCTIONS
+            tool_instructions,
+        ) or tool_instructions
 
     def _resolve_base_instructions(self) -> str | None:
         """Resolve the base instructions before Twinr realtime additions."""
@@ -690,20 +628,6 @@ class OpenAIRealtimeSession:
     def _session_tools(self) -> list[dict[str, Any]]:
         """Build the realtime tool schema list for the active handlers."""
         return build_realtime_tool_schemas(self._tool_handlers.keys())
-
-    def _reminder_time_context(self) -> str:
-        """Render the local time context used for reminder resolution."""
-        try:
-            zone = ZoneInfo(self.config.local_timezone_name)
-            timezone_name = self.config.local_timezone_name
-        except Exception:
-            zone = ZoneInfo("UTC")
-            timezone_name = "UTC"
-        now = datetime.now(zone)
-        return (
-            "Local date/time context for resolving reminders, timers, and scheduled automations: "
-            f"{now.strftime('%A, %Y-%m-%d %H:%M:%S %z')} ({timezone_name})."
-        )
 
     def _format_error(self, event: Any) -> str:
         """Extract a readable error message from a realtime error event."""

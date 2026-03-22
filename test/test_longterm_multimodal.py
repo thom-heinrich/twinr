@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
@@ -45,6 +46,7 @@ class _FakeCamera:
 class _BackgroundHarness(TwinrRealtimeBackgroundMixin):
     def __init__(self, runtime: TwinrRuntime) -> None:
         self.runtime = runtime
+        self.config = runtime.config
         self._sensor_observation_queue: Queue[tuple[dict[str, object], tuple[str, ...]]] = Queue(maxsize=1)
         self._conversation_session_active = False
         self.emit = lambda _line: None
@@ -115,9 +117,16 @@ def _smart_home_sensor_facts() -> dict[str, object]:
             "hand_or_object_near_camera_for_s": 0.0,
         },
         "smart_home": {
+            "sensor_stream_live": True,
             "motion_detected": True,
             "motion_entity_ids": ["route:192.168.178.22:motion-node-1"],
+            "motion_active_by_entity": {
+                "route:192.168.178.22:motion-node-1": True,
+                "route:192.168.178.22:motion-node-2": False,
+            },
+            "device_offline": True,
             "offline_entity_ids": ["route:192.168.178.22:motion-node-2"],
+            "alarm_triggered": False,
             "recent_events": [
                 {
                     "event_id": "route-event:192.168.178.22:evt-1",
@@ -331,7 +340,8 @@ class LongTermMultimodalTests(unittest.TestCase):
             runtime.shutdown(timeout_s=2.0)
 
         self.assertIn("pir", queued_facts)
-        self.assertEqual(queued_events, ("pir.motion_detected", "camera.person_visible"))
+        self.assertIn("pir.motion_detected", queued_events)
+        self.assertIn("camera.person_visible", queued_events)
         self.assertTrue(
             any(
                 item.kind == "pattern" and (item.attributes or {}).get("pattern_type") == "presence"
@@ -354,6 +364,40 @@ class LongTermMultimodalTests(unittest.TestCase):
 
         self.assertEqual(queued_facts["camera"]["person_visible_for_s"], 42.0)
         self.assertEqual(queued_events, ("camera.person_visible", "pir.motion_detected"))
+
+    def test_background_sensor_handler_merges_smart_home_into_latest_live_facts_and_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = replace(
+                _config(temp_dir),
+                smart_home_same_room_entity_ids=("route:192.168.178.22:motion-node-1",),
+                smart_home_same_room_motion_window_s=60.0,
+                smart_home_stream_stale_after_s=120.0,
+            )
+            runtime = TwinrRuntime(
+                config=config
+            )
+            harness = _BackgroundHarness(runtime)
+            local_facts = _sensor_facts()
+            local_facts["sensor"] = {"observed_at": 8.0, "captured_at": 8.0}
+
+            harness.handle_sensor_observation(local_facts, ("camera.person_visible",))
+            harness.handle_sensor_observation(
+                {"smart_home": _smart_home_sensor_facts()["smart_home"]},
+                ("smart_home.motion_detected", "smart_home.device_offline"),
+            )
+            queued_facts, queued_events = harness._sensor_observation_queue.get_nowait()
+            runtime.shutdown(timeout_s=2.0)
+
+        self.assertIn("camera", queued_facts)
+        self.assertIn("smart_home", queued_facts)
+        self.assertTrue(queued_facts["near_device_presence"]["occupied_likely"])
+        self.assertTrue(queued_facts["room_context"]["same_room_motion_recent"])
+        self.assertTrue(queued_facts["home_context"]["device_offline"])
+        self.assertEqual(queued_facts["person_state"]["presence_state"]["state"], "occupied_visible")
+        self.assertEqual(queued_facts["person_state"]["home_context_state"]["state"], "device_offline")
+        self.assertIn("smart_home.motion_detected", queued_events)
+        self.assertIn("room_context.same_room_motion_recent", queued_events)
+        self.assertIn("home_context.device_offline", queued_events)
 
     def test_support_camera_capture_enqueues_multimodal_camera_usage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

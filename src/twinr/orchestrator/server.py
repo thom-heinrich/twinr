@@ -25,6 +25,13 @@ from twinr.orchestrator.contracts import (
     OrchestratorTurnRequest,
 )
 from twinr.orchestrator.session import EdgeOrchestratorSession, RemoteToolBridge
+from twinr.orchestrator.voice_contracts import (
+    OrchestratorVoiceAudioFrame,
+    OrchestratorVoiceErrorEvent,
+    OrchestratorVoiceHelloRequest,
+    OrchestratorVoiceRuntimeStateEvent,
+)
+from twinr.orchestrator.voice_session import EdgeOrchestratorVoiceSession
 
 
 logger = logging.getLogger(__name__)
@@ -68,9 +75,11 @@ class EdgeOrchestratorServer:
         config: TwinrConfig,
         *,
         session_factory: Callable[[TwinrConfig], EdgeOrchestratorSession] | None = None,
+        voice_session_factory: Callable[[TwinrConfig], EdgeOrchestratorVoiceSession] | None = None,
     ) -> None:
         self.config = config
         self._session_factory = session_factory or EdgeOrchestratorSession
+        self._voice_session_factory = voice_session_factory or EdgeOrchestratorVoiceSession
 
     def create_app(self) -> FastAPI:
         """Build the FastAPI application that exposes the orchestrator socket."""
@@ -201,6 +210,101 @@ class EdgeOrchestratorServer:
                 await _best_effort_close(tool_bridge, label="remote tool bridge")  # AUDIT-FIX(#5): Best-effort teardown to unblock pending tool waits.
                 await _best_effort_close(session, label="orchestrator session")  # AUDIT-FIX(#5): Release session resources on disconnect/restart.
                 await _cancel_task(sender)  # AUDIT-FIX(#5): Await sender cancellation to avoid orphaned task warnings.
+
+        @app.websocket("/ws/orchestrator/voice")
+        async def orchestrator_voice_socket(websocket: WebSocket) -> None:
+            if not server._authorize(websocket):
+                logger.warning("Rejected unauthorized voice orchestrator websocket from %s", _client_host(websocket))
+                await _close_websocket_quietly(websocket, code=1008, reason="unauthorized")
+                return
+
+            await websocket.accept()
+            loop = asyncio.get_running_loop()
+            closed_event = Event()
+            outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+                maxsize=_get_outgoing_queue_maxsize(server.config)
+            )
+
+            def emit_event(payload: dict[str, Any]) -> None:
+                _enqueue_payload(loop, outgoing, payload, closed_event, websocket)
+
+            sender: asyncio.Task[Any] | None = None
+            voice_session: EdgeOrchestratorVoiceSession | None = None
+
+            try:
+                try:
+                    voice_session = server._voice_session_factory(server.config)
+                except Exception:
+                    logger.exception("Failed to initialize voice orchestrator websocket session")
+                    with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+                        await websocket.send_json(
+                            OrchestratorVoiceErrorEvent(
+                                error="The voice orchestrator could not start. Please reconnect."
+                            ).to_payload()
+                        )
+                    await _close_websocket_quietly(websocket, code=1011, reason="startup_failed")
+                    return
+
+                sender = asyncio.create_task(_sender_loop(websocket, outgoing, closed_event))
+
+                while not closed_event.is_set():
+                    try:
+                        payload = await websocket.receive_json()
+                    except WebSocketDisconnect:
+                        break
+                    except Exception:
+                        logger.exception("Failed to receive JSON from voice orchestrator websocket")
+                        emit_event(OrchestratorVoiceErrorEvent(error="Invalid websocket message.").to_payload())
+                        continue
+
+                    if not isinstance(payload, dict):
+                        emit_event(OrchestratorVoiceErrorEvent(error="Invalid message payload.").to_payload())
+                        continue
+
+                    message_type = str(payload.get("type", "") or "")
+                    try:
+                        if message_type == "voice_hello":
+                            request = OrchestratorVoiceHelloRequest.from_payload(payload)
+                            for event_payload in await asyncio.to_thread(voice_session.handle_hello, request):
+                                emit_event(event_payload)
+                            continue
+                        if message_type == "voice_runtime_state":
+                            event = OrchestratorVoiceRuntimeStateEvent.from_payload(payload)
+                            for event_payload in await asyncio.to_thread(voice_session.handle_runtime_state, event):
+                                emit_event(event_payload)
+                            continue
+                        if message_type == "voice_audio_frame":
+                            frame = OrchestratorVoiceAudioFrame.from_payload(payload)
+                            for event_payload in await asyncio.to_thread(voice_session.handle_audio_frame, frame):
+                                emit_event(event_payload)
+                            continue
+                    except Exception:
+                        logger.exception("Voice orchestrator websocket message handling failed")
+                        emit_event(
+                            OrchestratorVoiceErrorEvent(
+                                error="The voice session could not process the message."
+                            ).to_payload()
+                        )
+                        continue
+
+                    emit_event(OrchestratorVoiceErrorEvent(error="Unsupported message type.").to_payload())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Unhandled voice orchestrator websocket failure")
+                closed_event.set()
+                await _cancel_task(sender)
+                sender = None
+                with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+                    await websocket.send_json(
+                        OrchestratorVoiceErrorEvent(
+                            error="The voice connection failed. Please reconnect."
+                        ).to_payload()
+                    )
+            finally:
+                closed_event.set()
+                await _best_effort_close(voice_session, label="voice orchestrator session")
+                await _cancel_task(sender)
 
         return app
 

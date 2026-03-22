@@ -56,6 +56,12 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("broad smart-home or house-status question", instructions)
         self.assertIn("state_filters", instructions)
         self.assertIn("aggregate_by", instructions)
+        self.assertIn("build a small live situation picture", instructions)
+        self.assertIn("two to four targeted smart-home queries", instructions)
+        self.assertIn("copy the exact routed entity_id values verbatim", instructions)
+        self.assertIn("catch-all entity dump", instructions)
+        self.assertIn("list is truncated", instructions)
+        self.assertIn("do not treat that alone as the whole house status", instructions)
 
     def test_compact_tool_instructions_cover_portrait_identity_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -68,6 +74,10 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("guidance_hints and recommended_next_step", instructions)
         self.assertIn("read_smart_home_sensor_stream", instructions)
         self.assertIn("grouped smart-home counts", instructions)
+        self.assertIn("multiple targeted smart-home queries", instructions)
+        self.assertIn("aggregate_by first", instructions)
+        self.assertIn("copied verbatim from prior smart-home tool results", instructions)
+        self.assertIn("catch-all entity list", instructions)
 
     def test_supervisor_instructions_do_not_embed_full_business_tool_rules(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -90,6 +100,7 @@ class ToolInstructionTests(unittest.TestCase):
         self.assertIn("settings actions directly", instructions)
         self.assertIn("handoff_specialist_worker.spoken_ack", instructions)
         self.assertIn("Do not wait for the specialist result", instructions)
+        self.assertIn("Open smart-home or house-status questions usually need handoff_specialist_worker", instructions)
 
     def test_supervisor_decision_instructions_use_structured_actions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -99,6 +110,7 @@ class ToolInstructionTests(unittest.TestCase):
 
         self.assertIn("three structured actions", instructions)
         self.assertIn("Choose handoff", instructions)
+        self.assertIn("Choose handoff for open smart-home or house-status questions", instructions)
         self.assertIn("set spoken_ack", instructions)
         self.assertIn("one or two short sentences", instructions)
         self.assertIn("without sounding canned", instructions)

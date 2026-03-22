@@ -53,6 +53,8 @@ _ENVIRONMENT_RENDERED_MARKERS = (
     "transition_count_day",
     "fragmentation_index_day",
     "circadian_similarity_14d",
+    "transition_graph_divergence_14d",
+    "node_usage_divergence_14d",
     "sensor_coverage_ratio_day",
 )
 
@@ -833,17 +835,57 @@ class LongTermRetriever:
             )
             return payload
 
+        if summary_type == "environment_deviation_event":
+            payload.update(
+                {
+                    "classification": self._serialize_json_value(attributes.get("classification")),
+                    "severity": self._serialize_json_value(attributes.get("severity")),
+                    "time_scale": self._serialize_json_value(attributes.get("time_scale")),
+                    "markers": self._serialize_json_value(self._coerce_iterable(attributes.get("markers"))),
+                    "quality_flags": self._serialize_json_value(self._coerce_iterable(attributes.get("quality_flags"))),
+                    "blocked_by": self._serialize_json_value(self._coerce_iterable(attributes.get("blocked_by"))),
+                    "explanation": self._serialize_json_value(attributes.get("explanation")),
+                }
+            )
+            return payload
+
+        if summary_type == "environment_quality_state":
+            payload.update(
+                {
+                    "classification": self._serialize_json_value(attributes.get("classification")),
+                    "quality_flags": self._serialize_json_value(self._coerce_iterable(attributes.get("quality_flags"))),
+                    "blocked_by": self._serialize_json_value(self._coerce_iterable(attributes.get("blocked_by"))),
+                    "evidence_markers": self._serialize_json_value(self._coerce_iterable(attributes.get("evidence_markers"))),
+                }
+            )
+            return payload
+
+        if summary_type == "environment_change_point":
+            payload.update(
+                {
+                    "change_started_on": self._serialize_json_value(attributes.get("change_started_on")),
+                    "severity": self._serialize_json_value(attributes.get("severity")),
+                    "markers": self._serialize_json_value(self._coerce_iterable(attributes.get("markers"))),
+                    "quality_flags": self._serialize_json_value(self._coerce_iterable(attributes.get("quality_flags"))),
+                    "blocked_by": self._serialize_json_value(self._coerce_iterable(attributes.get("blocked_by"))),
+                }
+            )
+            return payload
+
         if summary_type == "environment_reflection":
             payload.update(
                 {
                     "profile_day": self._serialize_json_value(attributes.get("profile_day")),
+                    "classification": self._serialize_json_value(attributes.get("classification")),
                     "deviation_types": self._serialize_json_value(self._coerce_iterable(attributes.get("deviation_types"))),
                     "deviation_labels": self._serialize_json_value(self._coerce_iterable(attributes.get("deviation_labels"))),
                     "quality_flags": self._serialize_json_value(self._coerce_iterable(attributes.get("quality_flags"))),
                     "blocked_by": self._serialize_json_value(self._coerce_iterable(attributes.get("blocked_by"))),
+                    "quality_classification": self._serialize_json_value(attributes.get("quality_classification")),
                     "active_node_count": self._serialize_json_value(attributes.get("active_node_count")),
                     "active_epoch_count": self._serialize_json_value(attributes.get("active_epoch_count")),
                     "baseline_weekday_class": self._serialize_json_value(attributes.get("baseline_weekday_class")),
+                    "baseline_kind": self._serialize_json_value(attributes.get("baseline_kind")),
                 }
             )
             return payload
@@ -851,10 +893,22 @@ class LongTermRetriever:
         if pattern_type == "environment_baseline":
             payload.update(
                 {
+                    "baseline_kind": self._serialize_json_value(attributes.get("baseline_kind")),
                     "weekday_class": self._serialize_json_value(attributes.get("weekday_class")),
                     "window_days": self._serialize_json_value(attributes.get("window_days")),
                     "sample_count": self._serialize_json_value(attributes.get("sample_count")),
                     "marker_stats": self._serialize_json_value(self._environment_baseline_subset(attributes.get("marker_stats"))),
+                }
+            )
+            return payload
+
+        if pattern_type == "environment_regime":
+            payload.update(
+                {
+                    "regime_started_on": self._serialize_json_value(attributes.get("regime_started_on")),
+                    "severity": self._serialize_json_value(attributes.get("severity")),
+                    "markers": self._serialize_json_value(self._coerce_iterable(attributes.get("markers"))),
+                    "quality_flags": self._serialize_json_value(self._coerce_iterable(attributes.get("quality_flags"))),
                 }
             )
             return payload
@@ -883,7 +937,7 @@ class LongTermRetriever:
                 continue
             filtered[key] = {
                 nested_key: marker_stats[key][nested_key]
-                for nested_key in ("median", "iqr", "ewma")
+                for nested_key in ("median", "iqr", "ewma", "mad", "lower_quantile", "upper_quantile")
                 if nested_key in marker_stats[key]
             }
         return filtered

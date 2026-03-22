@@ -267,7 +267,7 @@ class DualLaneToolLoop:
             decision = self.supervisor_decision_provider.decide(
                 prompt,
                 conversation=conversation,
-                instructions=merge_instructions(self.supervisor_instructions, instructions),
+                instructions=self.supervisor_instructions,
             )
             if not _supervisor_decision_has_required_user_reply(decision):
                 raise ValueError("Supervisor decision omitted the required user-facing reply field.")

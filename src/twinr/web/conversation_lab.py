@@ -9,7 +9,8 @@ previous runs without replaying provider calls.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, is_dataclass
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
 from inspect import signature
 from pathlib import Path
@@ -62,6 +63,10 @@ _CONVERSATION_LAB_TOOL_NAMES: tuple[str, ...] = (
     "update_personality",
     "configure_world_intelligence",
     "update_simple_setting",
+    "list_smart_home_entities",
+    "read_smart_home_state",
+    "control_smart_home_entities",
+    "read_smart_home_sensor_stream",
     "enroll_portrait_identity",
     "get_portrait_identity_status",
     "reset_portrait_identity",
@@ -75,6 +80,8 @@ _MAX_TURN_PREVIEW_CHARS = 220
 _MAX_DETAIL_VALUE_CHARS = 220
 _CONVERSATION_LAB_SOURCE = "web_conversation_lab"
 _CONVERSATION_LAB_REQUEST_KIND = "conversation_lab"
+_CONVERSATION_LAB_FLUSH_TIMEOUT_MAX_S = 5.0
+_CONVERSATION_LAB_SEARCH_TIMEOUT_S = 3.0
 _TRUNCATE_SUFFIX = "..."
 
 
@@ -249,6 +256,16 @@ def _writer_state_snapshot(runtime: TwinrRuntime) -> dict[str, object]:
     return dict(_json_safe(state)) if isinstance(_json_safe(state), dict) else {}
 
 
+def _has_background_long_term_writers(runtime: TwinrRuntime) -> bool:
+    service = getattr(runtime, "long_term_memory", None)
+    if service is None:
+        return False
+    return any(
+        getattr(service, attribute_name, None) is not None
+        for attribute_name in ("writer", "multimodal_writer")
+    )
+
+
 def _memory_rows(
     *,
     before_enqueue: dict[str, object],
@@ -381,12 +398,24 @@ def _collector_section_items(section_name: str, items: Sequence[dict[str, object
 
 
 def _search_snapshot(config: TwinrConfig, query_text: str) -> dict[str, object]:
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="conversation_lab_search")
+    future = executor.submit(run_long_term_operator_search, config, query_text)
     try:
-        result = run_long_term_operator_search(config, query_text)
+        result = future.result(timeout=_CONVERSATION_LAB_SEARCH_TIMEOUT_S)
         return build_memory_search_panel_context(
             query_text=query_text,
             result=result,
             error_message=None,
+        )
+    except FutureTimeoutError:
+        future.cancel()
+        return build_memory_search_panel_context(
+            query_text=query_text,
+            result=None,
+            error_message=(
+                f"TimeoutError: operator memory search exceeded "
+                f"{_CONVERSATION_LAB_SEARCH_TIMEOUT_S:.1f}s."
+            ),
         )
     except Exception as exc:
         return build_memory_search_panel_context(
@@ -394,6 +423,8 @@ def _search_snapshot(config: TwinrConfig, query_text: str) -> dict[str, object]:
             result=None,
             error_message=f"{type(exc).__name__}: {_truncate_text(exc, limit=120)}",
         )
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _close_if_possible(component: object | None) -> None:
@@ -913,6 +944,23 @@ def load_conversation_lab_state(
     }
 
 
+def _conversation_lab_runtime_config(config: TwinrConfig) -> TwinrConfig:
+    """Return the text-only runtime config used by the portal conversation lab.
+
+    Portal text turns do not open microphone captures, so adaptive listening
+    state is irrelevant there and should not touch the shared Pi audio timing
+    store. Conversation Lab turns also stay out of the background long-term
+    turn writer so operator debugging does not create bounded flush/shutdown
+    tail work.
+    """
+
+    return replace(
+        config,
+        adaptive_timing_enabled=False,
+        long_term_memory_background_store_turns=False,
+    )
+
+
 def run_conversation_lab_turn(
     config: TwinrConfig,
     env_path: Path,
@@ -943,14 +991,15 @@ def run_conversation_lab_turn(
     status = "ok"
 
     try:
-        runtime = TwinrRuntime(config)
+        runtime_config = _conversation_lab_runtime_config(config)
+        runtime = TwinrRuntime(runtime_config)
         runtime.user_voice_status = "portal_operator_authenticated"
         _seed_runtime_conversation(runtime, session)
         runtime.last_transcript = normalized_prompt
         before_enqueue = _writer_state_snapshot(runtime)
         usage_store = TwinrUsageStore.from_config(config)
         owner = _ConversationLabToolOwner(
-            config=config,
+            config=runtime_config,
             env_path=env_path,
             runtime=runtime,
             print_backend=None,
@@ -958,18 +1007,14 @@ def run_conversation_lab_turn(
             collector=collector,
             configurable_providers=(),
         )
-        loop, loop_resources = _build_tool_loop(config=config, owner=owner)
+        loop, loop_resources = _build_tool_loop(config=runtime_config, owner=owner)
         result = _run_text_turn(
-            config=config,
+            config=runtime_config,
             runtime=runtime,
             loop=loop,
             prompt=normalized_prompt,
         )
         response_text = runtime.finalize_agent_turn(_result_text(result))
-        runtime.record_personality_tool_history(
-            tool_calls=tuple(getattr(result, "tool_calls", ()) or ()),
-            tool_results=tuple(getattr(result, "tool_results", ()) or ()),
-        )
         usage_store.append(
             source=_CONVERSATION_LAB_SOURCE,
             request_kind=_CONVERSATION_LAB_REQUEST_KIND,
@@ -981,12 +1026,24 @@ def run_conversation_lab_turn(
             metadata={"turn_type": "portal_operator_lab"},
         )
         after_enqueue = _writer_state_snapshot(runtime)
-        flush_timeout_s = max(2.0, float(getattr(config, "long_term_memory_remote_flush_timeout_s", 2.0)))
-        flush_ok = runtime.flush_long_term_memory(timeout_s=flush_timeout_s)
-        after_flush = _writer_state_snapshot(runtime)
-        retrieval_after = _search_snapshot(config, normalized_prompt)
-        if flush_ok is False:
-            raise RuntimeError("Conversation memory flush did not complete successfully.")
+        if _has_background_long_term_writers(runtime):
+            flush_timeout_s = min(
+                _CONVERSATION_LAB_FLUSH_TIMEOUT_MAX_S,
+                max(2.0, float(getattr(config, "long_term_memory_remote_flush_timeout_s", 2.0))),
+            )
+            flush_ok = runtime.flush_long_term_memory(timeout_s=flush_timeout_s)
+            after_flush = _writer_state_snapshot(runtime)
+        else:
+            flush_ok = True
+            after_flush = dict(after_enqueue)
+        if flush_ok:
+            retrieval_after = _search_snapshot(config, normalized_prompt)
+        else:
+            status = "warn"
+            error_message = (
+                f"Long-term memory flush did not complete within {flush_timeout_s:.1f}s; "
+                "the turn finished, but durable memory updates may still be pending."
+            )
     except Exception as exc:
         status = "error"
         error_message = f"{type(exc).__name__}: {_truncate_text(exc, limit=160)}"

@@ -12,6 +12,7 @@ from twinr.hardware.hand_landmarks import (
     HandLandmarkWorkerConfig,
     HandRoiSource,
     MediaPipeHandLandmarkWorker,
+    _parse_hand_landmark_result,
     _build_hand_roi_candidates,
     _project_landmark_to_full_frame,
 )
@@ -257,6 +258,30 @@ class HandLandmarkWorkerTests(unittest.TestCase):
 
         self.assertEqual(len(detect_calls), 2)
         self.assertEqual(result.final_timestamp_ms, 8)
+
+    def test_parse_hand_landmark_result_tightens_roi_frame_to_local_hand_crop(self) -> None:
+        roi_frame = _FakeFrame(100, 120)
+
+        detections = _parse_hand_landmark_result(
+            result=SimpleNamespace(
+                hand_landmarks=[
+                    [
+                        SimpleNamespace(x=0.45, y=0.42, z=0.0),
+                        SimpleNamespace(x=0.58, y=0.54, z=0.0),
+                        SimpleNamespace(x=0.52, y=0.61, z=0.0),
+                    ]
+                ],
+                handedness=[[SimpleNamespace(category_name="Right", score=0.91)]],
+            ),
+            roi=AICameraBox(top=0.20, left=0.20, bottom=0.80, right=0.80),
+            roi_source=HandRoiSource.PRIMARY_PERSON_UPPER_BODY,
+            roi_frame_rgb=roi_frame,
+        )
+
+        self.assertEqual(len(detections), 1)
+        self.assertLess(detections[0].roi_frame_rgb.shape[0], roi_frame.shape[0])
+        self.assertLess(detections[0].roi_frame_rgb.shape[1], roi_frame.shape[1])
+        self.assertEqual(detections[0].handedness, "right")
 
 
 if __name__ == "__main__":

@@ -168,6 +168,43 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.display_emoji_cue_path, "state/custom/emoji.json")
         self.assertEqual(config.display_emoji_cue_ttl_s, 9.5)
 
+    def test_from_env_reads_display_reserve_bus_planning_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_DISPLAY_AMBIENT_IMPULSES_ENABLED=false",
+                        "TWINR_DISPLAY_AMBIENT_IMPULSE_PATH=state/custom/ambient.json",
+                        "TWINR_DISPLAY_AMBIENT_IMPULSE_TTL_S=22.0",
+                        "TWINR_DISPLAY_RESERVE_BUS_PLAN_PATH=state/custom/reserve_plan.json",
+                        "TWINR_DISPLAY_RESERVE_BUS_REFRESH_AFTER_LOCAL=06:15",
+                        "TWINR_DISPLAY_RESERVE_BUS_CANDIDATE_LIMIT=11",
+                        "TWINR_DISPLAY_RESERVE_BUS_ITEMS_PER_DAY=36",
+                        "TWINR_DISPLAY_RESERVE_BUS_TOPIC_GAP=3",
+                        "TWINR_DISPLAY_RESERVE_BUS_MIN_HOLD_S=900",
+                        "TWINR_DISPLAY_RESERVE_BUS_BASE_HOLD_S=1800",
+                        "TWINR_DISPLAY_RESERVE_BUS_MAX_HOLD_S=3000",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertFalse(config.display_ambient_impulses_enabled)
+        self.assertEqual(config.display_ambient_impulse_path, "state/custom/ambient.json")
+        self.assertEqual(config.display_ambient_impulse_ttl_s, 22.0)
+        self.assertEqual(config.display_reserve_bus_plan_path, "state/custom/reserve_plan.json")
+        self.assertEqual(config.display_reserve_bus_refresh_after_local, "06:15")
+        self.assertEqual(config.display_reserve_bus_candidate_limit, 11)
+        self.assertEqual(config.display_reserve_bus_items_per_day, 36)
+        self.assertEqual(config.display_reserve_bus_topic_gap, 3)
+        self.assertEqual(config.display_reserve_bus_min_hold_s, 900.0)
+        self.assertEqual(config.display_reserve_bus_base_hold_s, 1800.0)
+        self.assertEqual(config.display_reserve_bus_max_hold_s, 3000.0)
+
     def test_from_env_reads_display_presentation_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -323,6 +360,27 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_local_camera_fine_hand_explicit_hold_s, 0.52)
         self.assertEqual(config.proactive_local_camera_fine_hand_explicit_confirm_samples, 3)
         self.assertEqual(config.proactive_local_camera_fine_hand_explicit_min_confidence, 0.81)
+
+    def test_from_env_reads_gesture_wakeup_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "TWINR_GESTURE_WAKEUP_ENABLED=false",
+                        "TWINR_GESTURE_WAKEUP_TRIGGER=victory",
+                        "TWINR_GESTURE_WAKEUP_COOLDOWN_S=4.5",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertFalse(config.gesture_wakeup_enabled)
+        self.assertEqual(config.gesture_wakeup_trigger, "victory")
+        self.assertEqual(config.gesture_wakeup_cooldown_s, 4.5)
 
     def test_local_camera_defaults_favor_interactive_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

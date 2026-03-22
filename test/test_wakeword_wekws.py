@@ -41,7 +41,13 @@ def _capture(*, amplitude: int, sample_rate: int = 16000) -> AmbientAudioCapture
     )
 
 
-def _touch_wekws_bundle(root: Path, *, keyword_token: str = "twinna") -> dict[str, Path]:
+def _touch_wekws_bundle(
+    root: Path,
+    *,
+    keyword_token: str = "twinna",
+    cmvn_mean_value: float = 0.0,
+    cmvn_var_value: float = 1.0,
+) -> dict[str, Path]:
     model_path = root / "avg_30.onnx"
     config_path = root / "config.yaml"
     words_path = root / "words.txt"
@@ -71,8 +77,8 @@ def _touch_wekws_bundle(root: Path, *, keyword_token: str = "twinna") -> dict[st
     cmvn_path.write_text(
         json.dumps(
             {
-                "mean_stat": [0.0] * 80,
-                "var_stat": [1.0] * 80,
+                "mean_stat": [cmvn_mean_value] * 80,
+                "var_stat": [cmvn_var_value] * 80,
                 "frame_num": 1,
             }
         )
@@ -88,17 +94,25 @@ def _touch_wekws_bundle(root: Path, *, keyword_token: str = "twinna") -> dict[st
 
 
 class _FakeModelMeta:
-    def __init__(self, *, cache_dim: int = 4, cache_len: int = 3) -> None:
+    def __init__(
+        self,
+        *,
+        cache_dim: int = 4,
+        cache_len: int = 3,
+        cmvn_mode: str | None = None,
+    ) -> None:
         self.custom_metadata_map = {
             "cache_dim": str(cache_dim),
             "cache_len": str(cache_len),
         }
+        if cmvn_mode is not None:
+            self.custom_metadata_map["cmvn_mode"] = str(cmvn_mode)
 
 
 class _FakeSession:
-    def __init__(self, outputs: list[np.ndarray]) -> None:
+    def __init__(self, outputs: list[np.ndarray], *, meta: _FakeModelMeta | None = None) -> None:
         self._outputs = list(outputs)
-        self._meta = _FakeModelMeta()
+        self._meta = meta or _FakeModelMeta()
         self.feeds: list[dict[str, np.ndarray]] = []
 
     def get_modelmeta(self):
@@ -212,6 +226,62 @@ class WakewordWekwsTests(unittest.TestCase):
                     session_factory=lambda **_kwargs: _FakeSession([]),
                     feature_extractor=lambda samples, **kwargs: np.zeros((0, kwargs["feature_dim"]), dtype=np.float32),
                 )
+
+    def test_auto_cmvn_mode_skips_legacy_sidecar_stats_for_embedded_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bundle = _touch_wekws_bundle(
+                Path(temp_dir),
+                cmvn_mean_value=1.0,
+                cmvn_var_value=2.0,
+            )
+            fake_session = _FakeSession(
+                [np.array([[[0.81]]], dtype=np.float32)],
+                meta=_FakeModelMeta(),
+            )
+            spotter = WakewordWekwsSpotter(
+                model_path=str(bundle["model"]),
+                config_path=str(bundle["config"]),
+                words_path=str(bundle["words"]),
+                cmvn_path=str(bundle["cmvn"]),
+                phrases=("twinna",),
+                session_factory=lambda **_kwargs: fake_session,
+                feature_extractor=lambda samples, **kwargs: np.ones((2, kwargs["feature_dim"]), dtype=np.float32),
+            )
+
+            score, detector_label = spotter.score_capture(_capture(amplitude=16000))
+
+        self.assertEqual(detector_label, "twinna")
+        self.assertGreater(score, 0.8)
+        observed = fake_session.feeds[0]["input"][0]
+        self.assertTrue(np.allclose(observed, 1.0))
+        self.assertEqual(spotter.model_config.cmvn_mode, "embedded")
+
+    def test_explicit_external_cmvn_mode_applies_sidecar_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bundle = _touch_wekws_bundle(
+                Path(temp_dir),
+                cmvn_mean_value=1.0,
+                cmvn_var_value=2.0,
+            )
+            fake_session = _FakeSession([np.array([[[0.81]]], dtype=np.float32)])
+            spotter = WakewordWekwsSpotter(
+                model_path=str(bundle["model"]),
+                config_path=str(bundle["config"]),
+                words_path=str(bundle["words"]),
+                cmvn_path=str(bundle["cmvn"]),
+                cmvn_mode="external",
+                phrases=("twinna",),
+                session_factory=lambda **_kwargs: fake_session,
+                feature_extractor=lambda samples, **kwargs: np.ones((2, kwargs["feature_dim"]), dtype=np.float32),
+            )
+
+            score, detector_label = spotter.score_capture(_capture(amplitude=16000))
+
+        self.assertEqual(detector_label, "twinna")
+        self.assertGreater(score, 0.8)
+        observed = fake_session.feeds[0]["input"][0]
+        self.assertTrue(np.allclose(observed, 0.0))
+        self.assertEqual(spotter.model_config.cmvn_mode, "external")
 
 
 if __name__ == "__main__":

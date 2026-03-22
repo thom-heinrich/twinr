@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import tempfile
 import time
 import unittest
 
@@ -246,6 +247,33 @@ class TurnControllerTests(unittest.TestCase):
 
         self.assertEqual(decision.decision, "end_turn")
         self.assertEqual(decision.label, "backchannel")
+
+    def test_turn_controller_only_passes_lane_specific_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            personality_dir = Path(temp_dir) / "personality"
+            personality_dir.mkdir()
+            (personality_dir / "TURN_CONTROLLER.md").write_text(
+                "Turn-controller lane instructions",
+                encoding="utf-8",
+            )
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+            )
+            provider = FakeTurnToolAgentProvider(config)
+            evaluator = ToolCallingTurnDecisionEvaluator(config=config, provider=provider)
+
+            evaluator.evaluate(
+                candidate=TurnEvaluationCandidate(
+                    transcript="ich bin noch am programmieren",
+                    event_type="speech_final",
+                    speech_final=True,
+                ),
+                conversation=(("assistant", "Woran arbeitest du?"),),
+            )
+
+        self.assertEqual(provider.calls[0]["instructions"], "Turn-controller lane instructions")
 
 
 if __name__ == "__main__":

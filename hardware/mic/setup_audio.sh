@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ENV_FILE="${TWINR_ENV_FILE:-$REPO_ROOT/.env}"
 PYTHON_BIN=""
-DEVICE_MATCH="${TWINR_AUDIO_DEVICE_MATCH:-reSpeaker}"
+DEVICE_MATCH="${TWINR_AUDIO_OUTPUT_DEVICE_MATCH:-${TWINR_AUDIO_DEVICE_MATCH:-reSpeaker}}"
 CARD_INDEX=""
 DEVICE_INDEX=0
 CAPTURE_DEVICE_MATCH="${TWINR_AUDIO_CAPTURE_DEVICE_MATCH:-}"
@@ -25,6 +25,9 @@ PROACTIVE_SAMPLE_MS=""
 CAPTURE_DEVICE=""
 SINK_VOLUME_PERCENT="${TWINR_AUDIO_OUTPUT_VOLUME_PERCENT:-100}"
 CARD_PLAYBACK_VOLUME_PERCENT="${TWINR_AUDIO_CARD_PLAYBACK_VOLUME_PERCENT:-100}"
+SOFTVOL_MAX_DB="${TWINR_AUDIO_OUTPUT_SOFTVOL_MAX_DB:-0}"
+SOFTVOL_MAX_DB_RENDERED="0.0"
+SOFTVOL_CONTROL_NAME="Twinr Playback"
 SKIP_ALSA=0
 SKIP_PULSE=0
 SKIP_PLAYBACK_VOLUME=0
@@ -38,7 +41,7 @@ Configure Twinr audio defaults for the Raspberry Pi.
 
 Options:
   --env-file PATH      Path to .env file for proactive audio updates (default: /twinr/.env)
-  --device-match TEXT  Match substring for the playback device (default: reSpeaker)
+  --device-match TEXT  Match substring for the playback device (default: TWINR_AUDIO_OUTPUT_DEVICE_MATCH or TWINR_AUDIO_DEVICE_MATCH, else reSpeaker)
   --card-index N       Explicit ALSA playback card index to use
   --device-index N     ALSA playback device index (default: 0)
   --capture-device-match TEXT
@@ -58,6 +61,8 @@ Options:
                       Set the selected PipeWire/Pulse sink volume to N percent (default: 100)
   --card-playback-volume-percent N
                       Set playback mixer controls on the selected ALSA card to N percent (default: 100)
+  --softvol-max-db DB
+                      Add an ALSA softvol playback stage with up to +DB software gain (default: 0 = disabled)
   --skip-alsa          Do not write /etc/asound.conf
   --skip-pulse         Do not set PipeWire/Pulse default sink/source
   --skip-playback-volume
@@ -184,6 +189,21 @@ store_card_playback_state() {
 
   command -v alsactl >/dev/null 2>&1 || return 0
   alsactl store "$card_index" >/dev/null 2>&1 || true
+}
+
+set_softvol_control_percent() {
+  local card_index="$1"
+  local percent="$2"
+
+  command -v amixer >/dev/null 2>&1 || fail "amixer not found"
+  amixer -c "$card_index" sset "$SOFTVOL_CONTROL_NAME" "${percent}%" >/dev/null 2>&1 || true
+}
+
+prime_softvol_control() {
+  # ALSA only exposes the new softvol mixer control after the routed playback
+  # PCM is opened once. Feed one tiny block of silence through `default` so the
+  # control materializes without producing an audible setup tone.
+  head -c 3200 /dev/zero | aplay -q -D default -t raw -f S16_LE -c 1 -r 16000 - >/dev/null 2>&1 || true
 }
 
 detect_wpctl_id() {
@@ -322,6 +342,11 @@ while [[ $# -gt 0 ]]; do
       CARD_PLAYBACK_VOLUME_PERCENT="$2"
       shift 2
       ;;
+    --softvol-max-db)
+      [[ $# -ge 2 ]] || fail "Missing value for --softvol-max-db"
+      SOFTVOL_MAX_DB="$2"
+      shift 2
+      ;;
     --skip-alsa)
       SKIP_ALSA=1
       shift
@@ -362,6 +387,16 @@ if [[ -n "$PROACTIVE_SAMPLE_MS" ]]; then
 fi
 [[ "$SINK_VOLUME_PERCENT" =~ ^[0-9]+$ ]] || fail "--sink-volume-percent must be an integer"
 [[ "$CARD_PLAYBACK_VOLUME_PERCENT" =~ ^[0-9]+$ ]] || fail "--card-playback-volume-percent must be an integer"
+python3 - <<PY || fail "--softvol-max-db must be a finite float between 0 and 30"
+import math
+value = float(r'''$SOFTVOL_MAX_DB''')
+raise SystemExit(0 if math.isfinite(value) and 0.0 <= value <= 30.0 else 1)
+PY
+SOFTVOL_MAX_DB_RENDERED="$(python3 - <<PY
+value = float(r'''$SOFTVOL_MAX_DB''')
+print(f"{value:.1f}")
+PY
+)"
 (( SINK_VOLUME_PERCENT >= 0 && SINK_VOLUME_PERCENT <= 150 )) || fail "--sink-volume-percent must be between 0 and 150"
 (( CARD_PLAYBACK_VOLUME_PERCENT >= 0 && CARD_PLAYBACK_VOLUME_PERCENT <= 100 )) || fail "--card-playback-volume-percent must be between 0 and 100"
 
@@ -455,7 +490,46 @@ if [[ "$SKIP_ALSA" -eq 0 ]]; then
     backup_path="/etc/asound.conf.bak.$(date +%Y%m%d%H%M%S).$$"
     sudo cp /etc/asound.conf "$backup_path"
   fi
-  sudo tee /etc/asound.conf >/dev/null <<ASOUND
+  if python3 - <<PY
+import math
+value = float(r'''$SOFTVOL_MAX_DB''')
+raise SystemExit(0 if value > 0.0 else 1)
+PY
+  then
+    sudo tee /etc/asound.conf >/dev/null <<ASOUND
+pcm.twinr_playback_hw {
+  type plug
+  slave.pcm "hw:${CARD_INDEX},${DEVICE_INDEX}"
+}
+
+pcm.twinr_playback_softvol {
+  type softvol
+  slave.pcm "twinr_playback_hw"
+  control {
+    name "${SOFTVOL_CONTROL_NAME}"
+    card ${CARD_INDEX}
+  }
+  min_dB -20.0
+  max_dB ${SOFTVOL_MAX_DB_RENDERED}
+  resolution 256
+}
+
+pcm.!default {
+  type asym
+  playback.pcm "twinr_playback_softvol"
+  capture.pcm {
+    type plug
+    slave.pcm "hw:${CAPTURE_CARD_INDEX},${CAPTURE_DEVICE_INDEX}"
+  }
+}
+
+ctl.!default {
+  type hw
+  card ${CARD_INDEX}
+}
+ASOUND
+  else
+    sudo tee /etc/asound.conf >/dev/null <<ASOUND
 pcm.!default {
   type asym
   playback.pcm {
@@ -473,6 +547,7 @@ ctl.!default {
   card ${CARD_INDEX}
 }
 ASOUND
+  fi
 fi
 
 SINK_NAME=""
@@ -510,6 +585,15 @@ if [[ "$SKIP_PLAYBACK_VOLUME" -eq 0 ]]; then
     set_sink_volume_percent "$SINK_NAME" "$WPCTL_SINK_ID" "$SINK_VOLUME_PERCENT"
   fi
   set_card_playback_controls_percent "$CARD_INDEX" "$CARD_PLAYBACK_VOLUME_PERCENT"
+  if python3 - <<PY
+import math
+value = float(r'''$SOFTVOL_MAX_DB''')
+raise SystemExit(0 if value > 0.0 else 1)
+PY
+  then
+    prime_softvol_control
+    set_softvol_control_percent "$CARD_INDEX" 100
+  fi
   store_card_playback_state "$CARD_INDEX"
 fi
 
@@ -519,6 +603,7 @@ printf 'playback_device=%s\n' "$DEVICE_INDEX"
 printf 'capture_device=%s\n' "$CAPTURE_DEVICE_INDEX"
 printf 'sink_volume_percent=%s\n' "$SINK_VOLUME_PERCENT"
 printf 'card_playback_volume_percent=%s\n' "$CARD_PLAYBACK_VOLUME_PERCENT"
+printf 'softvol_max_db=%s\n' "$SOFTVOL_MAX_DB"
 if [[ -n "$SINK_NAME" ]]; then
   printf 'pulse_sink=%s\n' "$SINK_NAME"
 fi

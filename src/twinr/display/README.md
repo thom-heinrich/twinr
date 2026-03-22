@@ -39,6 +39,13 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
   otherwise free right-hand reserve area with one real Unicode symbol such as
   `👍` or `👋` without pushing emoji-only semantics into the generic runtime
   snapshot schema
+- allow optional external HDMI ambient-impulse cues so personality-driven
+  capabilities can claim that same reserve area with one tiny bounded
+  text-plus-emoji card that stays positive, glanceable, and clearly separate
+  from the generic runtime snapshot schema
+- arbitrate that right-hand HDMI reserve area through one explicit reserve-bus
+  helper so emoji acknowledgements, calm ambient cards, and future reserve-only
+  cue families do not compete through inline renderer conditionals
 - let the right-hand reserve mirror clear user camera gestures with the same
   symbol when the proactive runtime publishes a bounded acknowledgement, while
   keeping hostile-gesture reactions separate from face emotion
@@ -184,6 +191,9 @@ halo over dense text or extra chrome so the surface stays readable at a glance.
 Gesture acknowledgements should mirror clear symbols like `👍`, `👎`, `👋`,
 `✌️`, `👌`, or `👉` directly instead of inventing extra text, while still
 keeping face emotions in the face channel and not in emoji-only surrogates.
+Calm companion impulses may use a tiny bounded text card there too, but that
+card must stay short, positive, and subordinate to stronger reserve-surface
+owners such as gesture acknowledgements or fullscreen presentations.
 
 That waiting surface may also show very rare ambient moments: tiny sparkles,
 hearts, crescent moons, wave marks, curious dot clusters, or even a tiny crown
@@ -211,6 +221,11 @@ That senior-facing HDMI surface is now modeled as its own scene module instead
 of being inlined into the framebuffer adapter. `hdmi_default_scene.py` owns the
 default-scene layout, face animation, header model, and reserved right-hand
 capability area so future HDMI capabilities such as expanded cards, morph
+surfaces, and reserve-bus content owners can grow without bloating the display
+loop or the transport adapters. The reserve area itself is now resolved through
+`reserve_bus.py`: gesture emoji cues still outrank calmer ambient reserve
+cards, but that priority no longer lives as ad-hoc branching inside the scene
+renderer.
 transitions, or richer per-capability panels can be added without pushing
 presentation logic back into the transport backend.
 
@@ -261,6 +276,13 @@ emotion presets: low-level cues may use bounded multi-step eye offsets in the
 range `-3..3` so physical HCI paths like person-following can look smoother on
 the Pi instead of snapping between only a few coarse positions. `head_dx` /
 `head_dy` stay tighter and smaller.
+
+Ambient HDMI reserve impulses flow through `ambient_impulse_cues.py`. The
+display loop loads one optional cue artifact and renders it only on the
+default HDMI scene when neither an emoji acknowledgement nor a richer
+presentation already owns the reserve area. That keeps companion-like daily
+nudges, shared-thread prompts, and personality-toned small updates outside the
+generic runtime snapshot schema while preserving a calm face-first surface.
 
 Producer modules should use `face_expressions.py` instead of writing raw JSON.
 That helper keeps the low-level cue artifact stable while exposing a richer

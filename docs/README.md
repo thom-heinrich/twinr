@@ -115,6 +115,7 @@ Sensor-triggered automations currently support the following operator-facing tri
 
 The proactive monitor now feeds stable PIR, camera, and VAD facts into the automation engine while Twinr is idle. This lets voice-created if-then automations react to sensor facts without exposing raw camera frames or raw audio chunks as tool-level inputs.
 The target-state map for what Twinr should try to derive from PIR, audio, and camera lives in [`SENSOR_FUSION.md`](SENSOR_FUSION.md).
+The runtime-layer model for separating local `near_device_presence` from optional smart-home `room_context` and `home_context` lives in [`SMART_HOME_RUNTIME_CONTEXT_MODEL_V1.md`](SMART_HOME_RUNTIME_CONTEXT_MODEL_V1.md).
 The short-window rolling-buffer and multimodal event-fusion design for deriving stable `2-8s` event claims from audio plus camera history lives in [`MULTIMODAL_EVENT_FUSION_V1.md`](MULTIMODAL_EVENT_FUSION_V1.md).
 The room-agnostic long-horizon smart-home profiling design for motion sensors now lives in [`SMART_HOME_ENVIRONMENT_PROFILE_V1.md`](SMART_HOME_ENVIRONMENT_PROFILE_V1.md). That document defines how Twinr should learn behavior patterns from environment nodes, transitions, fragmentation, and timing without assuming that any sensor belongs to a known room.
 The ReSpeaker-specific requirements and build checklist for turning the XVF3800 into a first-class Twinr sensor live in [`RESPEAKER_REQUIREMENTS.md`](RESPEAKER_REQUIREMENTS.md).

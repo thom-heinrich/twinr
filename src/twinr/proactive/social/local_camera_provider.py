@@ -165,6 +165,17 @@ class LocalAICameraObservationProvider:
             model=observation.model,
         )
 
+    def gesture_debug_details(self) -> dict[str, object] | None:
+        """Return the newest bounded gesture-pipeline debug details."""
+
+        getter = getattr(self.adapter, "get_last_gesture_debug_details", None)
+        if not callable(getter):
+            return None
+        details = getter()
+        if details is None:
+            return None
+        return dict(details)
+
     def _to_social_observation(self, observation: AICameraObservation) -> SocialVisionObservation:
         """Map one adapter observation onto the stable social vision contract."""
 

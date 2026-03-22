@@ -39,6 +39,7 @@ from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, Lon
 from twinr.memory.reminders import now_in_timezone
 from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority, WakewordMatch
 from twinr.proactive.runtime.audio_policy import ReSpeakerAudioPolicySnapshot
+from twinr.proactive.runtime.gesture_wakeup_lane import GestureWakeupDecision
 from twinr.proactive.runtime.runtime_contract import ReSpeakerRuntimeContractError
 from twinr.providers.openai import OpenAITextResponse
 from twinr.providers.openai.realtime import OpenAIRealtimeTurn
@@ -1606,6 +1607,48 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(player.played, [b"WAVPCM", b"PCM"])
         self.assertIn("wakeword_mode=listen", lines)
         self.assertIn("wakeword_ack=Ja?", lines)
+
+    def test_gesture_wakeup_opens_listening_window_with_beep(self) -> None:
+        recorder = FakeRecorder(recordings=[RuntimeError("No speech detected before timeout")])
+        loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop(
+            recorder=recorder,
+        )
+
+        handled = loop.handle_gesture_wakeup(
+            GestureWakeupDecision(
+                active=True,
+                reason="gesture_wakeup:peace_sign",
+                confidence=0.92,
+            )
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(realtime_session.calls, [])
+        self.assertEqual(recorder.pause_values, [1200])
+        self.assertEqual(recorder.start_timeouts, [loop.config.conversation_follow_up_timeout_s])
+        self.assertEqual(recorder.speech_start_chunks, [loop.config.audio_follow_up_speech_start_chunks])
+        self.assertEqual(recorder.ignore_initial_ms, [loop.config.audio_follow_up_ignore_ms])
+        self.assertGreaterEqual(len(player.tones), 1)
+        self.assertEqual(player.played, [])
+        self.assertIn("gesture_wakeup_mode=listen", lines)
+        self.assertIn("gesture_wakeup_gesture=peace_sign", lines)
+        self.assertNotIn("wakeword_ack=Ja?", lines)
+
+    def test_gesture_wakeup_is_skipped_when_runtime_is_busy(self) -> None:
+        loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()
+        loop.runtime.press_green_button()
+
+        handled = loop.handle_gesture_wakeup(
+            GestureWakeupDecision(
+                active=True,
+                reason="gesture_wakeup:peace_sign",
+                confidence=0.92,
+            )
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual(player.played, [])
+        self.assertIn("gesture_wakeup_skipped=busy", lines)
 
     def test_wakeword_ack_uses_cached_audio_when_prefetched(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(

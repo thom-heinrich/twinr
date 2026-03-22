@@ -31,6 +31,7 @@ _DEFAULT_FRAME_LENGTH_MS = 25.0
 _DEFAULT_FRAME_SHIFT_MS = 10.0
 _DEFAULT_LOW_FREQ_HZ = 20.0
 _DEFAULT_HIGH_FREQ_OFFSET_HZ = -400.0
+_ALLOWED_WEKWS_CMVN_MODES = frozenset({"auto", "embedded", "external", "none"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +53,7 @@ class WakewordWekwsModelConfig:
     frame_length_ms: float
     frame_shift_ms: float
     keyword_labels: tuple[str, ...]
+    cmvn_mode: str = "none"
     cmvn_mean: tuple[float, ...] | None = None
     cmvn_istd: tuple[float, ...] | None = None
 
@@ -100,6 +102,15 @@ def _coerce_nonnegative_float(name: str, value: object, *, minimum: float = 0.0)
         raise ValueError(f"{name} must be a float >= {minimum}.") from exc
     if normalized < minimum:
         raise ValueError(f"{name} must be a float >= {minimum}.")
+    return normalized
+
+
+def _normalize_wekws_cmvn_mode(value: object | None, *, default: str = "auto") -> str:
+    raw_value = default if value is None or not str(value).strip() else value
+    normalized = str(raw_value).strip().lower()
+    if normalized not in _ALLOWED_WEKWS_CMVN_MODES:
+        allowed = ", ".join(sorted(_ALLOWED_WEKWS_CMVN_MODES))
+        raise ValueError(f"WeKws cmvn mode must be one of: {allowed}.")
     return normalized
 
 
@@ -206,15 +217,42 @@ def _resolve_cmvn_path(
     return str(resolved)
 
 
+def _resolve_wekws_cmvn_mode(
+    *,
+    metadata: object,
+    configured_mode: str,
+    config_path: Path,
+    explicit_cmvn_path: str | None,
+    config_payload: dict[str, Any],
+) -> str:
+    normalized_configured_mode = _normalize_wekws_cmvn_mode(configured_mode)
+    if normalized_configured_mode != "auto":
+        return normalized_configured_mode
+    metadata_mode = _optional_metadata_value(metadata, "cmvn_mode")
+    if metadata_mode is not None:
+        return _normalize_wekws_cmvn_mode(metadata_mode, default="embedded")
+    # Twinr's WeKws export path embeds GlobalCMVN into the ONNX graph. Older
+    # bundles may still lack explicit metadata, so treat any readable CMVN
+    # sidecar as an embedded-model signal unless the caller forces otherwise.
+    resolved_cmvn_path = _resolve_cmvn_path(
+        config_path=config_path,
+        explicit_cmvn_path=explicit_cmvn_path,
+        config_payload=config_payload,
+    )
+    return "embedded" if resolved_cmvn_path is not None else "none"
+
+
 def _load_wekws_model_config(
     *,
     config_path: Path,
     words_path: Path,
     cmvn_path: str | None,
+    cmvn_mode: str = "auto",
+    config_payload: dict[str, Any] | None = None,
 ) -> WakewordWekwsModelConfig:
     """Load one WeKws runtime config from exported training artifacts."""
 
-    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    payload = dict(config_payload) if config_payload is not None else yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     dataset_conf = dict(payload.get("dataset_conf", {}))
     if dataset_conf.get("feats_type", "fbank") != "fbank":
         raise ValueError("WeKws runtime currently supports only fbank features.")
@@ -224,15 +262,26 @@ def _load_wekws_model_config(
     frame_length_ms = float(fbank_conf.get("frame_length", _DEFAULT_FRAME_LENGTH_MS))
     frame_shift_ms = float(fbank_conf.get("frame_shift", _DEFAULT_FRAME_SHIFT_MS))
     keyword_labels = _load_keyword_labels(words_path)
-    if cmvn_path is None:
+    normalized_cmvn_mode = _normalize_wekws_cmvn_mode(cmvn_mode, default="none")
+    if normalized_cmvn_mode == "auto":
+        raise ValueError("WeKws cmvn mode must be resolved before loading model config.")
+    if normalized_cmvn_mode in {"embedded", "none"}:
         return WakewordWekwsModelConfig(
             sample_rate=sample_rate,
             feature_dim=feature_dim,
             frame_length_ms=frame_length_ms,
             frame_shift_ms=frame_shift_ms,
             keyword_labels=keyword_labels,
+            cmvn_mode=normalized_cmvn_mode,
         )
-    mean, inverse_stddevs = _load_cmvn(Path(cmvn_path))
+    resolved_cmvn_path = _resolve_cmvn_path(
+        config_path=config_path,
+        explicit_cmvn_path=cmvn_path,
+        config_payload=payload,
+    )
+    if resolved_cmvn_path is None:
+        raise ValueError("WeKws external CMVN mode requires a readable CMVN stats file.")
+    mean, inverse_stddevs = _load_cmvn(Path(resolved_cmvn_path))
     if len(mean) != feature_dim or len(inverse_stddevs) != feature_dim:
         raise ValueError(
             f"CMVN dimensions {len(mean)} do not match configured feature_dim {feature_dim}."
@@ -243,6 +292,7 @@ def _load_wekws_model_config(
         frame_length_ms=frame_length_ms,
         frame_shift_ms=frame_shift_ms,
         keyword_labels=keyword_labels,
+        cmvn_mode=normalized_cmvn_mode,
         cmvn_mean=mean,
         cmvn_istd=inverse_stddevs,
     )
@@ -409,6 +459,15 @@ def _metadata_value(metadata: object, key: str) -> str:
     raise KeyError(key)
 
 
+def _optional_metadata_value(metadata: object, key: str) -> str | None:
+    try:
+        value = _metadata_value(metadata, key)
+    except KeyError:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 class WakewordWekwsFrameSpotter:
     """Detect wakewords from live PCM bytes through a WeKws ONNX model."""
 
@@ -421,6 +480,7 @@ class WakewordWekwsFrameSpotter:
         phrases: tuple[str, ...] | list[str],
         project_root: str | Path | None = None,
         cmvn_path: str | None = None,
+        cmvn_mode: str = "auto",
         threshold: float = 0.5,
         chunk_ms: int = 100,
         num_threads: int = 2,
@@ -445,11 +505,6 @@ class WakewordWekwsFrameSpotter:
         self.chunk_ms = _coerce_positive_int("chunk_ms", chunk_ms)
         self.num_threads = _coerce_positive_int("num_threads", num_threads)
         self.provider = _normalize_nonempty_text("provider", provider).lower()
-        self.model_config = _load_wekws_model_config(
-            config_path=Path(self.assets.config_path),
-            words_path=Path(self.assets.words_path),
-            cmvn_path=self.assets.cmvn_path,
-        )
         self._feature_extractor = feature_extractor or _default_feature_extractor
         if feature_extractor is None:
             _ensure_default_feature_stack_available()
@@ -468,6 +523,22 @@ class WakewordWekwsFrameSpotter:
             self._cache_len = _coerce_positive_int("cache_len", _metadata_value(metadata, "cache_len"))
         except Exception as exc:  # pragma: no cover - depends on external runtime/model.
             raise RuntimeError("WeKws ONNX model metadata is missing cache_dim/cache_len.") from exc
+        config_path_obj = Path(self.assets.config_path)
+        config_payload = yaml.safe_load(config_path_obj.read_text(encoding="utf-8")) or {}
+        effective_cmvn_mode = _resolve_wekws_cmvn_mode(
+            metadata=metadata,
+            configured_mode=cmvn_mode,
+            config_path=config_path_obj,
+            explicit_cmvn_path=self.assets.cmvn_path,
+            config_payload=config_payload,
+        )
+        self.model_config = _load_wekws_model_config(
+            config_path=config_path_obj,
+            words_path=Path(self.assets.words_path),
+            cmvn_path=self.assets.cmvn_path,
+            cmvn_mode=effective_cmvn_mode,
+            config_payload=config_payload,
+        )
         self._frame_shift_samples = max(
             1,
             int(round(self.model_config.sample_rate * (self.model_config.frame_shift_ms / 1000.0))),
@@ -514,9 +585,29 @@ class WakewordWekwsFrameSpotter:
                 return None
 
     def detect(self, capture: AmbientAudioCaptureWindow) -> WakewordMatch:
+        try:
+            best_score, detector_label = self.score_capture(capture)
+        except Exception:  # pragma: no cover - depends on runtime env/model.
+            LOGGER.exception("WeKws clip spotting failed.")
+            return WakewordMatch(detected=False, transcript="", backend="wekws")
+        if detector_label is None or best_score < self.threshold:
+            return WakewordMatch(detected=False, transcript="", backend="wekws")
+        matched_phrase = phrase_from_detector_label(detector_label, phrases=self.phrases)
+        return WakewordMatch(
+            detected=True,
+            transcript="",
+            matched_phrase=matched_phrase,
+            remaining_text="",
+            normalized_transcript="",
+            backend="wekws",
+            detector_label=detector_label,
+            score=best_score,
+        )
+
+    def score_capture(self, capture: AmbientAudioCaptureWindow) -> tuple[float, str | None]:
         pcm_bytes = capture.pcm_bytes or b""
         if not pcm_bytes:
-            return WakewordMatch(detected=False, transcript="", backend="wekws")
+            return 0.0, None
         try:
             channels = _coerce_positive_int("channels", capture.channels)
             source_sample_rate = _coerce_positive_int("sample_rate", capture.sample_rate)
@@ -526,21 +617,16 @@ class WakewordWekwsFrameSpotter:
                 capture.sample_rate,
                 capture.channels,
             )
-            return WakewordMatch(detected=False, transcript="", backend="wekws")
+            return 0.0, None
         samples = _pcm16_to_int16_mono_samples(pcm_bytes, channels=channels)
         if samples.size == 0:
-            return WakewordMatch(detected=False, transcript="", backend="wekws")
-        try:
-            with self._lock:
-                features = self._extract_feature_matrix(samples, source_sample_rate=source_sample_rate)
-                if features.size == 0:
-                    return WakewordMatch(detected=False, transcript="", backend="wekws")
-                scores = self._run_model(features, cache=np.zeros_like(self._cache))
-            match = self._match_from_scores(scores)
-            return match or WakewordMatch(detected=False, transcript="", backend="wekws")
-        except Exception:  # pragma: no cover - depends on runtime env/model.
-            LOGGER.exception("WeKws clip spotting failed.")
-            return WakewordMatch(detected=False, transcript="", backend="wekws")
+            return 0.0, None
+        with self._lock:
+            features = self._extract_feature_matrix(samples, source_sample_rate=source_sample_rate)
+            if features.size == 0:
+                return 0.0, None
+            scores = self._run_model(features, cache=np.zeros_like(self._cache))
+        return self._best_score_from_frames(scores)
 
     def _extract_incremental_features(self, samples: np.ndarray) -> np.ndarray:
         waveform = np.concatenate((self._remained_samples, samples))
@@ -594,9 +680,9 @@ class WakewordWekwsFrameSpotter:
             self._cache = next_cache
         return score_frames[0]
 
-    def _match_from_scores(self, score_frames: np.ndarray) -> WakewordMatch | None:
+    def _best_score_from_frames(self, score_frames: np.ndarray) -> tuple[float, str | None]:
         if score_frames.size == 0:
-            return None
+            return 0.0, None
         if score_frames.ndim != 2:
             raise ValueError("WeKws score frames must have shape [frames, keywords].")
         keyword_count = score_frames.shape[1]
@@ -606,9 +692,15 @@ class WakewordWekwsFrameSpotter:
             )
         best_index = np.unravel_index(int(np.argmax(score_frames)), score_frames.shape)
         best_score = float(score_frames[best_index])
+        detector_label = self.model_config.keyword_labels[int(best_index[1])]
+        return best_score, detector_label
+
+    def _match_from_scores(self, score_frames: np.ndarray) -> WakewordMatch | None:
+        best_score, detector_label = self._best_score_from_frames(score_frames)
+        if detector_label is None:
+            return None
         if best_score < self.threshold:
             return None
-        detector_label = self.model_config.keyword_labels[int(best_index[1])]
         matched_phrase = phrase_from_detector_label(detector_label, phrases=self.phrases)
         return WakewordMatch(
             detected=True,

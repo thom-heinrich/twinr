@@ -431,12 +431,14 @@ class DualLaneLoopTests(unittest.TestCase):
             "Wie wird das Wetter morgen in Schwarzenbek?",
             supervisor_conversation=(("user", "kurzer kontext"),),
             specialist_conversation=(("user", "voller suchkontext"),),
+            instructions="General tool-agent instructions that must not leak into the decision lane.",
             on_text_delta=streamed.append,
         )
 
         self.assertEqual(streamed[0], "Einen Moment bitte.")
         self.assertEqual(len(supervisor.start_calls), 0)
         self.assertEqual(decision_provider.calls[0]["conversation"], (("user", "kurzer kontext"),))
+        self.assertEqual(decision_provider.calls[0]["instructions"], "Supervisor instructions")
         self.assertEqual(specialist.start_calls, [])
         self.assertEqual(
             search_calls,

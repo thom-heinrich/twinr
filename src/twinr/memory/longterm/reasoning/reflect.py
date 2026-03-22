@@ -553,13 +553,15 @@ class LongTermMemoryReflector:
         preferred = [
             item
             for item in baselines
-            if _normalize_object_text(self._attributes_mapping(item).get("weekday_class")) == profile_weekday_class
+            if _normalize_object_text(self._attributes_mapping(item).get("baseline_kind")) in {"", "short"}
+            and _normalize_object_text(self._attributes_mapping(item).get("weekday_class")) == profile_weekday_class
         ]
         if not preferred:
             preferred = [
                 item
                 for item in baselines
-                if _normalize_object_text(self._attributes_mapping(item).get("weekday_class")) == "all_days"
+                if _normalize_object_text(self._attributes_mapping(item).get("baseline_kind")) in {"", "short"}
+                and _normalize_object_text(self._attributes_mapping(item).get("weekday_class")) == "all_days"
             ]
         pool = preferred or baselines
         return max(pool, key=lambda item: (self._item_updated_at(item), item.memory_id))
@@ -610,7 +612,7 @@ class LongTermMemoryReflector:
                 (
                     item
                     for item in environment_items
-                    if self._environment_summary_type(item) == _ENVIRONMENT_DEVIATION_SUMMARY
+                    if self._environment_summary_type(item) in {_ENVIRONMENT_DEVIATION_SUMMARY, "environment_deviation_event"}
                     and self._environment_id(item) == environment_id
                     and self._environment_deviation_day(item) == profile_day
                 ),
@@ -621,6 +623,42 @@ class LongTermMemoryReflector:
                 ),
                 reverse=True,
             )
+        )
+        quality_state = max(
+            (
+                item
+                for item in environment_items
+                if self._environment_summary_type(item) == "environment_quality_state"
+                and self._environment_id(item) == environment_id
+                and self._environment_deviation_day(item) == profile_day
+            ),
+            key=lambda item: (self._item_updated_at(item), item.memory_id),
+            default=None,
+        )
+        change_point = max(
+            (
+                item
+                for item in environment_items
+                if self._environment_summary_type(item) == "environment_change_point"
+                and self._environment_id(item) == environment_id
+                and self._environment_deviation_day(item) == profile_day
+            ),
+            key=lambda item: (self._item_updated_at(item), item.memory_id),
+            default=None,
+        )
+        regime = max(
+            (
+                item
+                for item in environment_items
+                if self._environment_pattern_type(item) == "environment_regime"
+                and self._environment_id(item) == environment_id
+                and (
+                    _parse_iso_date(self._attributes_mapping(item).get("observed_at"))
+                    or _parse_iso_date(getattr(item, "valid_to", None))
+                ) == profile_day
+            ),
+            key=lambda item: (self._item_updated_at(item), item.memory_id),
+            default=None,
         )
         node_count = len(
             {
@@ -645,12 +683,18 @@ class LongTermMemoryReflector:
         quality_flags = _unique_texts(
             profile_attributes.get("quality_flags"),
             *(self._attributes_mapping(item).get("quality_flags") for item in day_deviations),
+            self._attributes_mapping(quality_state).get("quality_flags") if quality_state is not None else (),
+            self._attributes_mapping(change_point).get("quality_flags") if change_point is not None else (),
+            self._attributes_mapping(regime).get("quality_flags") if regime is not None else (),
             limit=6,
         )
         blocked_by = _unique_texts(
             *(self._attributes_mapping(item).get("blocked_by") for item in day_deviations),
+            self._attributes_mapping(quality_state).get("blocked_by") if quality_state is not None else (),
+            self._attributes_mapping(change_point).get("blocked_by") if change_point is not None else (),
             limit=4,
         )
+        quality_classification = _normalize_object_text(self._attributes_mapping(quality_state).get("classification"))
 
         active_epochs = self._environment_marker_value(profile_markers, "active_epoch_count_day")
         active_nodes = self._environment_marker_value(profile_markers, "unique_active_node_count_day")
@@ -658,14 +702,37 @@ class LongTermMemoryReflector:
         last_activity = _minute_label(profile_markers.get("last_activity_minute_local"))
         coverage_ratio = self._environment_marker_value(profile_markers, "sensor_coverage_ratio_day")
 
+        if regime is not None:
+            classification = "new_normal"
+        elif change_point is not None:
+            classification = "transition"
+        elif deviation_labels:
+            classification = "acute_deviation"
+        elif quality_classification == "blocked":
+            classification = "insufficient_quality"
+        else:
+            classification = "stable"
+
         summary_parts: list[str] = []
-        if deviation_labels:
+        if classification == "new_normal":
+            summary_text = (
+                f"Recent home activity on {profile_day.isoformat()} appears to have stabilized into a new normal pattern."
+            )
+        elif classification == "transition":
+            summary_text = (
+                f"Recent home activity on {profile_day.isoformat()} suggests an ongoing transition away from the older pattern."
+            )
+        elif classification == "acute_deviation":
             summary_parts.append(
                 f"Recent home activity on {profile_day.isoformat()} differs from the usual pattern"
             )
             if blocked_by:
                 summary_parts.append("and should be treated cautiously because sensor quality was limited")
             summary_text = " ".join(summary_parts).strip() + f": {'; '.join(deviation_labels)}."
+        elif classification == "insufficient_quality":
+            summary_text = (
+                f"Recent home activity on {profile_day.isoformat()} is available, but interpretation is limited because sensor quality was reduced."
+            )
         else:
             if first_activity and last_activity:
                 summary_parts.append(f"activity ran from about {first_activity} to {last_activity}")
@@ -695,6 +762,12 @@ class LongTermMemoryReflector:
             )
             if deviation_explanations:
                 detail_parts.append("Recent deviations: " + " ".join(explanation.rstrip(".") + "." for explanation in deviation_explanations))
+        if change_point is not None:
+            detail_parts.append((getattr(change_point, "details", None) or "An environment transition candidate was detected.").rstrip(".") + ".")
+        if regime is not None:
+            detail_parts.append((getattr(regime, "details", None) or "A new normal regime was accepted.").rstrip(".") + ".")
+        if quality_state is not None:
+            detail_parts.append((getattr(quality_state, "details", None) or "Environment quality state is available.").rstrip(".") + ".")
         profile_bits: list[str] = []
         if active_epochs is not None:
             profile_bits.append(f"active epochs {int(active_epochs)}")
@@ -711,6 +784,9 @@ class LongTermMemoryReflector:
 
         baseline_bits: list[str] = []
         baseline_weekday_class = _normalize_object_text(baseline_attributes.get("weekday_class"))
+        baseline_kind = _normalize_object_text(baseline_attributes.get("baseline_kind"))
+        if baseline_kind:
+            baseline_bits.append(f"{baseline_kind} baseline")
         if baseline_weekday_class:
             baseline_bits.append(f"baseline bucket {baseline_weekday_class}")
         baseline_active_epochs = self._environment_marker_value(
@@ -754,6 +830,9 @@ class LongTermMemoryReflector:
                     latest_profile,
                     baseline,
                     *day_deviations,
+                    quality_state,
+                    change_point,
+                    regime,
                 )
                 if isinstance(item, LongTermMemoryObjectV1)
             )
@@ -777,13 +856,16 @@ class LongTermMemoryReflector:
                 "summary_type": _ENVIRONMENT_REFLECTION_SUMMARY,
                 "environment_id": environment_id,
                 "profile_day": profile_day.isoformat(),
+                "classification": classification,
                 "deviation_types": deviation_types,
                 "deviation_labels": deviation_labels,
                 "quality_flags": quality_flags,
                 "blocked_by": blocked_by,
+                "quality_classification": quality_classification or None,
                 "active_node_count": int(active_nodes) if active_nodes is not None else None,
                 "active_epoch_count": int(active_epochs) if active_epochs is not None else None,
                 "baseline_weekday_class": baseline_weekday_class or None,
+                "baseline_kind": baseline_kind or None,
                 "query_hints": query_hints,
                 "source_memory_ids": source_memory_ids,
             },
@@ -804,6 +886,8 @@ class LongTermMemoryReflector:
                 "packet_scope": "recent_environment_reflection",
                 "environment_id": environment_id,
                 "profile_day": profile_day.isoformat(),
+                "classification": classification,
+                "quality_classification": quality_classification or None,
             },
         )
         return summary_object, (packet,)

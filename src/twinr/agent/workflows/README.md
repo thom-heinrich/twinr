@@ -9,7 +9,7 @@ bounded.
 ## Responsibility
 
 `workflows` owns:
-- orchestrate button, wakeword, and proactive entry points for live loops
+- orchestrate button, wakeword, configured visual gesture-wakeup, and proactive entry points for live loops
 - coordinate conversation turns, print delivery, and streamed speech output
 - cache and replay one normalized wakeword-ack payload so the Pi wakeword `Ja?` stays audible without changing broader speech orchestration
 - start one bounded managed smart-home sensor worker so external motion, button, alarm, and device-health events become normal Twinr sensor observations

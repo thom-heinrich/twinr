@@ -102,6 +102,8 @@ class PrepareWekwsExperimentTests(unittest.TestCase):
             self.assertIn('"$WEKWS_PYTHON" -m torch.distributed.run', script_text)
             self.assertIn("Compute JSON CMVN stats for one prepared WeKws workspace", cmvn_text)
             self.assertIn("backbone.num_layers", export_text)
+            self.assertIn("has_embedded_cmvn", export_text)
+            self.assertIn("meta.key, meta.value = 'cmvn_mode'", export_text)
             self.assertIn("providers=['CPUExecutionProvider']", export_text)
             self.assertIn("utils.sox_utils = SimpleNamespace", sitecustomize_text)
             self.assertIn("torchaudio.info = _compat_info", sitecustomize_text)

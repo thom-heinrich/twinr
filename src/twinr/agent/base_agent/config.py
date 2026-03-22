@@ -431,6 +431,20 @@ class TwinrConfig:
     orchestrator_port: int = 8797
     orchestrator_ws_url: str = "ws://127.0.0.1:8797/ws/orchestrator"
     orchestrator_shared_secret: str | None = None
+    voice_orchestrator_enabled: bool = False
+    voice_orchestrator_ws_url: str = "ws://127.0.0.1:8797/ws/orchestrator/voice"
+    voice_orchestrator_shared_secret: str | None = None
+    voice_orchestrator_audio_device: str | None = None
+    voice_orchestrator_history_ms: int = 4000
+    voice_orchestrator_wake_postroll_ms: int = 900
+    voice_orchestrator_follow_up_timeout_s: float = 6.0
+    voice_orchestrator_follow_up_window_ms: int = 900
+    voice_orchestrator_follow_up_min_active_ratio: float = 0.22
+    voice_orchestrator_follow_up_min_transcript_chars: int = 4
+    voice_orchestrator_barge_in_window_ms: int = 850
+    voice_orchestrator_barge_in_min_active_ratio: float = 0.28
+    voice_orchestrator_barge_in_min_transcript_chars: int = 4
+    voice_orchestrator_candidate_cooldown_s: float = 0.9
     whatsapp_node_binary: str = "node"
     whatsapp_allow_from: str | None = None
     whatsapp_auth_dir: str = "state/channels/whatsapp/auth"
@@ -503,6 +517,9 @@ class TwinrConfig:
     proactive_local_camera_fine_hand_explicit_hold_s: float = 0.45
     proactive_local_camera_fine_hand_explicit_confirm_samples: int = 1
     proactive_local_camera_fine_hand_explicit_min_confidence: float = 0.72
+    gesture_wakeup_enabled: bool = True
+    gesture_wakeup_trigger: str = "peace_sign"
+    gesture_wakeup_cooldown_s: float = 3.0
     proactive_poll_interval_s: float = 4.0
     proactive_capture_interval_s: float = 6.0
     proactive_motion_window_s: float = 20.0
@@ -661,6 +678,15 @@ class TwinrConfig:
     long_term_memory_sensor_min_days_observed: int = 6
     long_term_memory_sensor_min_routine_ratio: float = 0.55
     long_term_memory_sensor_deviation_min_delta: float = 0.45
+    long_term_memory_environment_short_baseline_days: int = 14
+    long_term_memory_environment_long_baseline_days: int = 56
+    long_term_memory_environment_min_baseline_days: int = 7
+    long_term_memory_environment_acute_z_threshold: float = 3.0
+    long_term_memory_environment_acute_empirical_q: float = 0.01
+    long_term_memory_environment_drift_min_sigma: float = 1.5
+    long_term_memory_environment_drift_min_days: int = 5
+    long_term_memory_environment_regime_accept_days: int = 10
+    long_term_memory_environment_min_coverage_ratio: float = 0.8
     long_term_memory_retention_enabled: bool = True
     long_term_memory_retention_mode: str = "conservative"
     long_term_memory_retention_run_interval_s: float = 300.0
@@ -684,6 +710,11 @@ class TwinrConfig:
     smart_home_background_idle_sleep_s: float = 1.0
     smart_home_background_retry_delay_s: float = 2.0
     smart_home_background_batch_limit: int = 8
+    smart_home_same_room_entity_ids: tuple[str, ...] = ()
+    smart_home_same_room_motion_window_s: float = 90.0
+    smart_home_same_room_button_window_s: float = 30.0
+    smart_home_home_occupancy_window_s: float = 300.0
+    smart_home_stream_stale_after_s: float = 120.0
     voice_profile_min_sample_ms: int = 1200
     voice_profile_likely_threshold: float = 0.72
     voice_profile_uncertain_threshold: float = 0.55
@@ -711,6 +742,17 @@ class TwinrConfig:
     display_face_cue_ttl_s: float = 4.0
     display_emoji_cue_path: str = "artifacts/stores/ops/display_emoji.json"
     display_emoji_cue_ttl_s: float = 6.0
+    display_ambient_impulse_path: str = "artifacts/stores/ops/display_ambient_impulse.json"
+    display_ambient_impulse_ttl_s: float = 18.0
+    display_ambient_impulses_enabled: bool = True
+    display_reserve_bus_plan_path: str = "artifacts/stores/ops/display_reserve_bus_plan.json"
+    display_reserve_bus_refresh_after_local: str = "05:30"
+    display_reserve_bus_candidate_limit: int = 8
+    display_reserve_bus_items_per_day: int = 30
+    display_reserve_bus_topic_gap: int = 2
+    display_reserve_bus_min_hold_s: float = 720.0
+    display_reserve_bus_base_hold_s: float = 1560.0
+    display_reserve_bus_max_hold_s: float = 2700.0
     display_attention_refresh_interval_s: float = 0.2
     display_attention_session_focus_hold_s: float = 4.5
     display_presentation_path: str = "artifacts/stores/ops/display_presentation.json"
@@ -777,6 +819,31 @@ class TwinrConfig:
         if not math.isfinite(normalized_display_emoji_cue_ttl_s):
             raise ValueError("display_emoji_cue_ttl_s must be finite")
         normalized_display_emoji_cue_ttl_s = max(0.1, normalized_display_emoji_cue_ttl_s)
+        normalized_display_ambient_impulse_ttl_s = float(self.display_ambient_impulse_ttl_s)
+        if not math.isfinite(normalized_display_ambient_impulse_ttl_s):
+            raise ValueError("display_ambient_impulse_ttl_s must be finite")
+        normalized_display_ambient_impulse_ttl_s = max(0.1, normalized_display_ambient_impulse_ttl_s)
+        normalized_display_reserve_bus_candidate_limit = max(1, int(self.display_reserve_bus_candidate_limit))
+        normalized_display_reserve_bus_items_per_day = max(1, int(self.display_reserve_bus_items_per_day))
+        normalized_display_reserve_bus_topic_gap = max(0, int(self.display_reserve_bus_topic_gap))
+        normalized_display_reserve_bus_min_hold_s = float(self.display_reserve_bus_min_hold_s)
+        if not math.isfinite(normalized_display_reserve_bus_min_hold_s):
+            raise ValueError("display_reserve_bus_min_hold_s must be finite")
+        normalized_display_reserve_bus_min_hold_s = max(60.0, normalized_display_reserve_bus_min_hold_s)
+        normalized_display_reserve_bus_base_hold_s = float(self.display_reserve_bus_base_hold_s)
+        if not math.isfinite(normalized_display_reserve_bus_base_hold_s):
+            raise ValueError("display_reserve_bus_base_hold_s must be finite")
+        normalized_display_reserve_bus_base_hold_s = max(
+            normalized_display_reserve_bus_min_hold_s,
+            normalized_display_reserve_bus_base_hold_s,
+        )
+        normalized_display_reserve_bus_max_hold_s = float(self.display_reserve_bus_max_hold_s)
+        if not math.isfinite(normalized_display_reserve_bus_max_hold_s):
+            raise ValueError("display_reserve_bus_max_hold_s must be finite")
+        normalized_display_reserve_bus_max_hold_s = max(
+            normalized_display_reserve_bus_base_hold_s,
+            normalized_display_reserve_bus_max_hold_s,
+        )
         normalized_display_attention_refresh_interval_s = float(self.display_attention_refresh_interval_s)
         if not math.isfinite(normalized_display_attention_refresh_interval_s):
             raise ValueError("display_attention_refresh_interval_s must be finite")
@@ -810,6 +877,17 @@ class TwinrConfig:
             str(self.display_emoji_cue_path or "artifacts/stores/ops/display_emoji.json").strip()
             or "artifacts/stores/ops/display_emoji.json"
         )
+        normalized_display_ambient_impulse_path = (
+            str(self.display_ambient_impulse_path or "artifacts/stores/ops/display_ambient_impulse.json").strip()
+            or "artifacts/stores/ops/display_ambient_impulse.json"
+        )
+        normalized_display_reserve_bus_plan_path = (
+            str(self.display_reserve_bus_plan_path or "artifacts/stores/ops/display_reserve_bus_plan.json").strip()
+            or "artifacts/stores/ops/display_reserve_bus_plan.json"
+        )
+        normalized_display_reserve_bus_refresh_after_local = (
+            str(self.display_reserve_bus_refresh_after_local or "05:30").strip() or "05:30"
+        )
         normalized_display_presentation_path = (
             str(self.display_presentation_path or "artifacts/stores/ops/display_presentation.json").strip()
             or "artifacts/stores/ops/display_presentation.json"
@@ -836,6 +914,44 @@ class TwinrConfig:
         object.__setattr__(self, "display_face_cue_ttl_s", normalized_display_face_cue_ttl_s)
         object.__setattr__(self, "display_emoji_cue_path", normalized_display_emoji_cue_path)
         object.__setattr__(self, "display_emoji_cue_ttl_s", normalized_display_emoji_cue_ttl_s)
+        object.__setattr__(self, "display_ambient_impulse_path", normalized_display_ambient_impulse_path)
+        object.__setattr__(self, "display_ambient_impulse_ttl_s", normalized_display_ambient_impulse_ttl_s)
+        object.__setattr__(self, "display_reserve_bus_plan_path", normalized_display_reserve_bus_plan_path)
+        object.__setattr__(
+            self,
+            "display_reserve_bus_refresh_after_local",
+            normalized_display_reserve_bus_refresh_after_local,
+        )
+        object.__setattr__(
+            self,
+            "display_reserve_bus_candidate_limit",
+            normalized_display_reserve_bus_candidate_limit,
+        )
+        object.__setattr__(
+            self,
+            "display_reserve_bus_items_per_day",
+            normalized_display_reserve_bus_items_per_day,
+        )
+        object.__setattr__(
+            self,
+            "display_reserve_bus_topic_gap",
+            normalized_display_reserve_bus_topic_gap,
+        )
+        object.__setattr__(
+            self,
+            "display_reserve_bus_min_hold_s",
+            normalized_display_reserve_bus_min_hold_s,
+        )
+        object.__setattr__(
+            self,
+            "display_reserve_bus_base_hold_s",
+            normalized_display_reserve_bus_base_hold_s,
+        )
+        object.__setattr__(
+            self,
+            "display_reserve_bus_max_hold_s",
+            normalized_display_reserve_bus_max_hold_s,
+        )
         object.__setattr__(
             self,
             "display_attention_refresh_interval_s",
@@ -1409,6 +1525,66 @@ class TwinrConfig:
                 or "ws://127.0.0.1:8797/ws/orchestrator"
             ),
             orchestrator_shared_secret=get_value("TWINR_ORCHESTRATOR_SHARED_SECRET") or None,
+            voice_orchestrator_enabled=_parse_bool(
+                get_value("TWINR_VOICE_ORCHESTRATOR_ENABLED"),
+                False,
+            ),
+            voice_orchestrator_ws_url=(
+                get_value("TWINR_VOICE_ORCHESTRATOR_WS_URL", "ws://127.0.0.1:8797/ws/orchestrator/voice")
+                or "ws://127.0.0.1:8797/ws/orchestrator/voice"
+            ),
+            voice_orchestrator_shared_secret=(
+                get_value("TWINR_VOICE_ORCHESTRATOR_SHARED_SECRET")
+                or get_value("TWINR_ORCHESTRATOR_SHARED_SECRET")
+                or None
+            ),
+            voice_orchestrator_audio_device=get_value("TWINR_VOICE_ORCHESTRATOR_AUDIO_DEVICE") or None,
+            voice_orchestrator_history_ms=int(
+                get_value("TWINR_VOICE_ORCHESTRATOR_HISTORY_MS", "4000") or "4000"
+            ),
+            voice_orchestrator_wake_postroll_ms=int(
+                get_value("TWINR_VOICE_ORCHESTRATOR_WAKE_POSTROLL_MS", "900") or "900"
+            ),
+            voice_orchestrator_follow_up_timeout_s=_parse_float(
+                get_value("TWINR_VOICE_ORCHESTRATOR_FOLLOW_UP_TIMEOUT_S"),
+                6.0,
+                minimum=1.0,
+            ),
+            voice_orchestrator_follow_up_window_ms=int(
+                get_value("TWINR_VOICE_ORCHESTRATOR_FOLLOW_UP_WINDOW_MS", "900") or "900"
+            ),
+            voice_orchestrator_follow_up_min_active_ratio=_parse_clamped_float(
+                get_value("TWINR_VOICE_ORCHESTRATOR_FOLLOW_UP_MIN_ACTIVE_RATIO"),
+                0.22,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            voice_orchestrator_follow_up_min_transcript_chars=max(
+                1,
+                int(
+                    get_value("TWINR_VOICE_ORCHESTRATOR_FOLLOW_UP_MIN_TRANSCRIPT_CHARS", "4") or "4"
+                ),
+            ),
+            voice_orchestrator_barge_in_window_ms=int(
+                get_value("TWINR_VOICE_ORCHESTRATOR_BARGE_IN_WINDOW_MS", "850") or "850"
+            ),
+            voice_orchestrator_barge_in_min_active_ratio=_parse_clamped_float(
+                get_value("TWINR_VOICE_ORCHESTRATOR_BARGE_IN_MIN_ACTIVE_RATIO"),
+                0.28,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            voice_orchestrator_barge_in_min_transcript_chars=max(
+                1,
+                int(
+                    get_value("TWINR_VOICE_ORCHESTRATOR_BARGE_IN_MIN_TRANSCRIPT_CHARS", "4") or "4"
+                ),
+            ),
+            voice_orchestrator_candidate_cooldown_s=_parse_float(
+                get_value("TWINR_VOICE_ORCHESTRATOR_CANDIDATE_COOLDOWN_S"),
+                0.9,
+                minimum=0.1,
+            ),
             whatsapp_node_binary=get_value("TWINR_WHATSAPP_NODE_BINARY", "node") or "node",
             whatsapp_allow_from=get_value("TWINR_WHATSAPP_ALLOW_FROM") or None,
             whatsapp_auth_dir=get_value(
@@ -1679,6 +1855,19 @@ class TwinrConfig:
             proactive_local_camera_fine_hand_explicit_min_confidence=_parse_float(
                 get_value("TWINR_PROACTIVE_LOCAL_CAMERA_FINE_HAND_EXPLICIT_MIN_CONFIDENCE"),
                 0.72,
+            ),
+            gesture_wakeup_enabled=_parse_bool(
+                get_value("TWINR_GESTURE_WAKEUP_ENABLED"),
+                True,
+            ),
+            gesture_wakeup_trigger=(
+                get_value("TWINR_GESTURE_WAKEUP_TRIGGER", "peace_sign")
+                or "peace_sign"
+            ).strip().lower(),
+            gesture_wakeup_cooldown_s=_parse_float(
+                get_value("TWINR_GESTURE_WAKEUP_COOLDOWN_S"),
+                3.0,
+                minimum=0.0,
             ),
             proactive_poll_interval_s=_parse_float(get_value("TWINR_PROACTIVE_POLL_INTERVAL_S"), 4.0),
             proactive_capture_interval_s=_parse_float(get_value("TWINR_PROACTIVE_CAPTURE_INTERVAL_S"), 6.0),
@@ -2212,6 +2401,37 @@ class TwinrConfig:
                 get_value("TWINR_LONG_TERM_MEMORY_SENSOR_DEVIATION_MIN_DELTA"),
                 0.45,
             ),
+            long_term_memory_environment_short_baseline_days=int(
+                get_value("TWINR_LONG_TERM_MEMORY_ENVIRONMENT_SHORT_BASELINE_DAYS", "14") or "14"
+            ),
+            long_term_memory_environment_long_baseline_days=int(
+                get_value("TWINR_LONG_TERM_MEMORY_ENVIRONMENT_LONG_BASELINE_DAYS", "56") or "56"
+            ),
+            long_term_memory_environment_min_baseline_days=int(
+                get_value("TWINR_LONG_TERM_MEMORY_ENVIRONMENT_MIN_BASELINE_DAYS", "7") or "7"
+            ),
+            long_term_memory_environment_acute_z_threshold=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_ENVIRONMENT_ACUTE_Z_THRESHOLD"),
+                3.0,
+            ),
+            long_term_memory_environment_acute_empirical_q=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_ENVIRONMENT_ACUTE_EMPIRICAL_Q"),
+                0.01,
+            ),
+            long_term_memory_environment_drift_min_sigma=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_ENVIRONMENT_DRIFT_MIN_SIGMA"),
+                1.5,
+            ),
+            long_term_memory_environment_drift_min_days=int(
+                get_value("TWINR_LONG_TERM_MEMORY_ENVIRONMENT_DRIFT_MIN_DAYS", "5") or "5"
+            ),
+            long_term_memory_environment_regime_accept_days=int(
+                get_value("TWINR_LONG_TERM_MEMORY_ENVIRONMENT_REGIME_ACCEPT_DAYS", "10") or "10"
+            ),
+            long_term_memory_environment_min_coverage_ratio=_parse_float(
+                get_value("TWINR_LONG_TERM_MEMORY_ENVIRONMENT_MIN_COVERAGE_RATIO"),
+                0.8,
+            ),
             long_term_memory_retention_enabled=_parse_bool(
                 get_value("TWINR_LONG_TERM_MEMORY_RETENTION_ENABLED"),
                 True,
@@ -2279,6 +2499,30 @@ class TwinrConfig:
                 1,
                 int(get_value("TWINR_SMART_HOME_BACKGROUND_BATCH_LIMIT", "8") or "8"),
             ),
+            smart_home_same_room_entity_ids=_parse_csv_strings(
+                get_value("TWINR_SMART_HOME_SAME_ROOM_ENTITY_IDS"),
+                (),
+            ),
+            smart_home_same_room_motion_window_s=_parse_float(
+                get_value("TWINR_SMART_HOME_SAME_ROOM_MOTION_WINDOW_S"),
+                90.0,
+                minimum=0.0,
+            ),
+            smart_home_same_room_button_window_s=_parse_float(
+                get_value("TWINR_SMART_HOME_SAME_ROOM_BUTTON_WINDOW_S"),
+                30.0,
+                minimum=0.0,
+            ),
+            smart_home_home_occupancy_window_s=_parse_float(
+                get_value("TWINR_SMART_HOME_HOME_OCCUPANCY_WINDOW_S"),
+                300.0,
+                minimum=0.0,
+            ),
+            smart_home_stream_stale_after_s=_parse_float(
+                get_value("TWINR_SMART_HOME_STREAM_STALE_AFTER_S"),
+                120.0,
+                minimum=0.0,
+            ),
             voice_profile_min_sample_ms=int(get_value("TWINR_VOICE_PROFILE_MIN_SAMPLE_MS", "1200") or "1200"),
             voice_profile_likely_threshold=_parse_float(
                 get_value("TWINR_VOICE_PROFILE_LIKELY_THRESHOLD"),
@@ -2325,6 +2569,54 @@ class TwinrConfig:
             )
             or "artifacts/stores/ops/display_emoji.json",
             display_emoji_cue_ttl_s=_parse_float(get_value("TWINR_DISPLAY_EMOJI_CUE_TTL_S"), 6.0, minimum=0.1),
+            display_ambient_impulse_path=get_value(
+                "TWINR_DISPLAY_AMBIENT_IMPULSE_PATH",
+                "artifacts/stores/ops/display_ambient_impulse.json",
+            )
+            or "artifacts/stores/ops/display_ambient_impulse.json",
+            display_ambient_impulse_ttl_s=_parse_float(
+                get_value("TWINR_DISPLAY_AMBIENT_IMPULSE_TTL_S"),
+                18.0,
+                minimum=0.1,
+            ),
+            display_ambient_impulses_enabled=_parse_bool(
+                get_value("TWINR_DISPLAY_AMBIENT_IMPULSES_ENABLED"),
+                True,
+            ),
+            display_reserve_bus_plan_path=get_value(
+                "TWINR_DISPLAY_RESERVE_BUS_PLAN_PATH",
+                "artifacts/stores/ops/display_reserve_bus_plan.json",
+            )
+            or "artifacts/stores/ops/display_reserve_bus_plan.json",
+            display_reserve_bus_refresh_after_local=get_value(
+                "TWINR_DISPLAY_RESERVE_BUS_REFRESH_AFTER_LOCAL",
+                "05:30",
+            )
+            or "05:30",
+            display_reserve_bus_candidate_limit=int(
+                get_value("TWINR_DISPLAY_RESERVE_BUS_CANDIDATE_LIMIT", "8") or "8"
+            ),
+            display_reserve_bus_items_per_day=int(
+                get_value("TWINR_DISPLAY_RESERVE_BUS_ITEMS_PER_DAY", "30") or "30"
+            ),
+            display_reserve_bus_topic_gap=int(
+                get_value("TWINR_DISPLAY_RESERVE_BUS_TOPIC_GAP", "2") or "2"
+            ),
+            display_reserve_bus_min_hold_s=_parse_float(
+                get_value("TWINR_DISPLAY_RESERVE_BUS_MIN_HOLD_S"),
+                720.0,
+                minimum=60.0,
+            ),
+            display_reserve_bus_base_hold_s=_parse_float(
+                get_value("TWINR_DISPLAY_RESERVE_BUS_BASE_HOLD_S"),
+                1560.0,
+                minimum=60.0,
+            ),
+            display_reserve_bus_max_hold_s=_parse_float(
+                get_value("TWINR_DISPLAY_RESERVE_BUS_MAX_HOLD_S"),
+                2700.0,
+                minimum=60.0,
+            ),
             display_attention_refresh_interval_s=_parse_float(
                 get_value("TWINR_DISPLAY_ATTENTION_REFRESH_INTERVAL_S"),
                 0.2,

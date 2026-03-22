@@ -15,6 +15,7 @@ streaming APIs.
 - route the RSS/world-intelligence configuration tool through the same thin executor surface as the other persistent tool handlers
 - dispatch learned-skill control tools and hidden self-coding runtime triggers through the same thin executor surface
 - run the generic streaming tool loop and the supervisor/specialist handoff loop
+- keep the structured supervisor-decision lane isolated from general tool-agent instructions so routing stays provider- and lane-specific
 - generate LLM-only recovery replies for streaming timeout/error paths
 - emit speech-lane deltas and serialize tool results safely
 - emit redacted semantic-answer branch forensics for supervisor decisions, handoffs, and recovery-path selection

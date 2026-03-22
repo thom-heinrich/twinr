@@ -60,6 +60,7 @@ DEFAULT_GENERIC_NEGATIVE_UTTERANCES: tuple[str, ...] = (
     "alles ist ruhig",
     "wann ist es so weit",
 )
+VALID_SYNTHETIC_LABELS: frozenset[str] = frozenset({"positive", "negative"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +248,26 @@ def shard_speakers(
     )
 
 
+def normalize_synthetic_labels(labels: Iterable[str] | None) -> tuple[str, ...]:
+    """Normalize one synthetic-corpus label selection."""
+
+    if labels is None:
+        return ("positive", "negative")
+    normalized: list[str] = []
+    for item in labels:
+        label = str(item).strip().lower()
+        if not label or label == "all":
+            return ("positive", "negative")
+        if label not in VALID_SYNTHETIC_LABELS:
+            raise ValueError(
+                f"Unsupported synthetic label filter '{label}'. "
+                f"Expected one of {sorted(VALID_SYNTHETIC_LABELS)} or 'all'."
+            )
+        if label not in normalized:
+            normalized.append(label)
+    return tuple(normalized) or ("positive", "negative")
+
+
 def build_qwen3tts_synthetic_corpus_plan(
     *,
     speakers: tuple[str, ...] = QWEN3TTS_SUPPORTED_SPEAKERS,
@@ -254,6 +275,7 @@ def build_qwen3tts_synthetic_corpus_plan(
     style_profiles: tuple[SyntheticStyleProfile, ...] = DEFAULT_STYLE_PROFILES,
     generation_profiles: tuple[SyntheticGenerationProfile, ...] = DEFAULT_GENERATION_PROFILES,
     augmentation_profiles: tuple[SyntheticAugmentationProfile, ...] = DEFAULT_AUGMENTATION_PROFILES,
+    labels: tuple[str, ...] = ("positive", "negative"),
     include_generic_negatives: bool = True,
     prefixes: tuple[str, ...] = DEFAULT_PREFIXES,
     follow_ups: tuple[str, ...] = DEFAULT_FOLLOW_UPS,
@@ -268,23 +290,26 @@ def build_qwen3tts_synthetic_corpus_plan(
         shard_index=shard_index,
         shard_count=shard_count,
     )
+    selected_labels = normalize_synthetic_labels(labels)
     if not selected_speakers:
         return ()
 
-    positive_rows = synthesize_phrase_inventory(
-        aliases=WAKEWORD_FAMILY,
-        prefixes=prefixes,
-        follow_ups=follow_ups,
-    )
-    confusion_rows = synthesize_phrase_inventory(
-        aliases=CONFUSION_FAMILY,
-        prefixes=prefixes,
-        follow_ups=follow_ups,
-    )
     rows: list[tuple[str, str, str]] = []
-    rows.extend(("positive", family_key, text) for family_key, text in positive_rows)
-    rows.extend(("negative", family_key, text) for family_key, text in confusion_rows)
-    if include_generic_negatives:
+    if "positive" in selected_labels:
+        positive_rows = synthesize_phrase_inventory(
+            aliases=WAKEWORD_FAMILY,
+            prefixes=prefixes,
+            follow_ups=follow_ups,
+        )
+        rows.extend(("positive", family_key, text) for family_key, text in positive_rows)
+    if "negative" in selected_labels:
+        confusion_rows = synthesize_phrase_inventory(
+            aliases=CONFUSION_FAMILY,
+            prefixes=prefixes,
+            follow_ups=follow_ups,
+        )
+        rows.extend(("negative", family_key, text) for family_key, text in confusion_rows)
+    if "negative" in selected_labels and include_generic_negatives:
         rows.extend(("negative", "generic", utterance) for utterance in generic_negative_utterances)
 
     requests: list[SyntheticWakewordRequest] = []
@@ -468,12 +493,14 @@ __all__ = [
     "SyntheticGenerationProfile",
     "SyntheticStyleProfile",
     "SyntheticWakewordRequest",
+    "VALID_SYNTHETIC_LABELS",
     "WAKEWORD_FAMILY",
     "apply_augmentation",
     "build_qwen3tts_synthetic_corpus_plan",
     "float_audio_to_pcm16",
     "hash_to_split",
     "manifest_row_for_request",
+    "normalize_synthetic_labels",
     "render_wakeword_phrase",
     "shard_speakers",
     "synthesize_phrase_inventory",

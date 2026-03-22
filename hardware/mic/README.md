@@ -29,12 +29,23 @@ Pi-side audio setup script for Twinr playback, capture, and proactive listening 
 sudo ./hardware/mic/setup_audio.sh --env-file .env --test
 sudo ./hardware/mic/setup_audio.sh --env-file .env --proactive-device-match reSpeaker
 sudo ./hardware/mic/setup_audio.sh --env-file .env --proactive-device-match PlayStation
+sudo ./hardware/mic/setup_audio.sh --env-file .env --device-match reSpeaker --capture-device-match reSpeaker --softvol-max-db 18
 sudo ./hardware/mic/setup_respeaker_access.sh
 ```
 
 `setup_audio.sh` now also resets the selected playback sink plus the target
 card's playback mixer controls to audible defaults so a newly selected
 ReSpeaker output does not stay effectively muted by inherited low volume.
+Playback matching can be forced independently from capture via
+`TWINR_AUDIO_OUTPUT_DEVICE_MATCH` or `--device-match`, so Twinr can use HDMI
+speakers while keeping the ReSpeaker as the capture path.
+If the selected playback hardware is already at `100%` mixer volume but still
+too quiet, `--softvol-max-db` (or `TWINR_AUDIO_OUTPUT_SOFTVOL_MAX_DB`) adds an
+ALSA `softvol` stage so Twinr can push louder software gain without depending
+on a desktop PipeWire session. The script now primes that virtual playback PCM
+with one silent block so ALSA materializes the `Twinr Playback` control
+immediately and then pins it to `100%`, instead of leaving the new gain stage
+at its quiet default.
 After normalizing those ALSA playback controls it also stores the card state,
 so a later re-enumeration or service restart does not restore the old muted
 profile.

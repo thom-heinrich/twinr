@@ -28,6 +28,7 @@ from twinr.agent.personality.intelligence import (
     WorldIntelligenceConfigRequest,
     WorldIntelligenceConfigResult,
     WorldIntelligenceRefreshResult,
+    WorldInterestSignal,
     WorldIntelligenceService,
 )
 from twinr.agent.personality.signals import PersonalitySignalBatch, PersonalitySignalExtractor
@@ -48,6 +49,11 @@ class PersonalityLearningService:
         default_factory=lambda: BackgroundPersonalityEvolutionLoop(config=TwinrConfig(project_root="."))
     )
     world_intelligence: WorldIntelligenceService | None = None
+    _pending_world_interest_signals: list[WorldInterestSignal] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
 
     @classmethod
     def from_config(
@@ -95,8 +101,9 @@ class PersonalityLearningService:
             occurred_at=consolidation.occurred_at,
             existing_interest_signals=existing_interest_signals,
         )
-        self._record_world_interest_signals(world_interest_batch.interest_signals)
-        return self._commit(batch)
+        self._enqueue_batch(batch)
+        self._enqueue_world_interest_signals(world_interest_batch.interest_signals)
+        return self._flush_pending()
 
     def record_tool_history(
         self,
@@ -114,8 +121,35 @@ class PersonalityLearningService:
             tool_calls=tuple(tool_calls),
             tool_results=tuple(tool_results),
         )
-        self._record_world_interest_signals(world_interest_batch.interest_signals)
-        return self._commit(batch)
+        self._enqueue_batch(batch)
+        self._enqueue_world_interest_signals(world_interest_batch.interest_signals)
+        return self._flush_pending()
+
+    def enqueue_tool_history(
+        self,
+        *,
+        tool_calls: Sequence[AgentToolCall],
+        tool_results: Sequence[AgentToolResult],
+    ) -> None:
+        """Queue tool-history learning for the next background commit."""
+
+        batch = self.extractor.extract_from_tool_history(
+            tool_calls=tuple(tool_calls),
+            tool_results=tuple(tool_results),
+        )
+        world_interest_batch = self.world_interest_extractor.extract_from_tool_history(
+            tool_calls=tuple(tool_calls),
+            tool_results=tuple(tool_results),
+        )
+        self._enqueue_batch(batch)
+        self._enqueue_world_interest_signals(world_interest_batch.interest_signals)
+
+    def flush_pending(self) -> PersonalityEvolutionResult | None:
+        """Commit queued tool-history/world-interest signals when present."""
+
+        if not self.background_loop.has_pending_items() and not self._pending_world_interest_signals:
+            return None
+        return self._flush_pending()
 
     def configure_world_intelligence(
         self,
@@ -158,11 +192,9 @@ class PersonalityLearningService:
             return
         self.world_intelligence.record_interest_signals(signals=tuple(signals))
 
-    def _commit(self, batch: PersonalitySignalBatch) -> PersonalityEvolutionResult:
-        """Enqueue one extracted batch and commit it through the evolution loop."""
+    def _enqueue_batch(self, batch: PersonalitySignalBatch) -> None:
+        """Append one extracted batch to the pending background queues."""
 
-        if not batch.has_any():
-            return self.background_loop.process_pending()
         for signal in batch.interaction_signals:
             self.background_loop.enqueue_interaction_signal(signal)
         for signal in batch.place_signals:
@@ -171,7 +203,25 @@ class PersonalityLearningService:
             self.background_loop.enqueue_world_signal(signal)
         for thread in batch.continuity_threads:
             self.background_loop.enqueue_continuity_thread(thread)
+
+    def _enqueue_world_interest_signals(self, signals: Sequence[WorldInterestSignal]) -> None:
+        """Queue world-interest calibration evidence for the next commit."""
+
+        self._pending_world_interest_signals.extend(tuple(signals))
+
+    def _flush_pending(self) -> PersonalityEvolutionResult:
+        """Persist queued intelligence signals and commit pending personality updates."""
+
+        if self._pending_world_interest_signals:
+            self._record_world_interest_signals(tuple(self._pending_world_interest_signals))
+            self._pending_world_interest_signals.clear()
         return self.background_loop.process_pending()
+
+    def _commit(self, batch: PersonalitySignalBatch) -> PersonalityEvolutionResult:
+        """Enqueue one extracted batch and commit it through the evolution loop."""
+
+        self._enqueue_batch(batch)
+        return self._flush_pending()
 
     def _commit_world_refresh(
         self,

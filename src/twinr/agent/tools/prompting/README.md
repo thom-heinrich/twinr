@@ -12,6 +12,7 @@ default, compact, supervisor, first-word, and specialist instruction bundles.
 - merge time and simple-setting context into tool-lane instruction bundles
 - encode the learned-skill tool policy for self-coding activation, rollback, pause, and reactivation
 - encode when the model should discover, filter, aggregate, control, or inspect smart-home state through the dedicated tool surface
+- encode the generic multi-query planning policy for broad smart-home and house-status questions so agents compose live status from multiple tool reads instead of a special-case summary path
 - expose public builders for default, compact, supervisor, first-word, and specialist lanes
 
 `prompting` does **not** own:

@@ -39,16 +39,25 @@ class PersonalityFormationEvalTests(unittest.TestCase):
 
         self.assertEqual(len(days), 2)
         self.assertTrue(any(day.raw_turns for day in days))
+        self.assertTrue(any(day.open_conversations for day in days))
         self.assertTrue(any(day.structured_learning for day in days))
         self.assertTrue(any(day.tool_history for day in days))
         appointment_turn = next(turn for turn in days[0].raw_turns if turn.name == "janina_appointment")
         expected_date = (days[0].raw_turns[0].occurred_at + timedelta(days=1)).date().isoformat()
         self.assertIn(expected_date, appointment_turn.transcript)
         self.assertGreater(appointment_turn.occurred_at.date(), now.date())
-        raw_turn_names = {turn.name for day in days for turn in day.raw_turns}
-        self.assertIn("style_verbosity_free_1", raw_turn_names)
-        self.assertIn("style_initiative_free_2", raw_turn_names)
-        self.assertIn("humor_feedback_free_2", raw_turn_names)
+        conversation_names = {conversation.name for day in days for conversation in day.open_conversations}
+        self.assertIn("open_ai_companions_session", conversation_names)
+        self.assertIn("open_world_politics_session", conversation_names)
+        conversation_turn_names = {
+            turn.name
+            for day in days
+            for conversation in day.open_conversations
+            for turn in conversation.turns
+        }
+        self.assertIn("open_ai_companions_shorter_calmer", conversation_turn_names)
+        self.assertIn("open_world_politics_one_next_question", conversation_turn_names)
+        self.assertIn("open_world_politics_humor_lands", conversation_turn_names)
 
     def test_snapshot_metrics_extract_personality_drift_fields(self) -> None:
         snapshot = PersonalitySnapshot(
@@ -183,6 +192,13 @@ class PersonalityFormationEvalTests(unittest.TestCase):
                 "initiative_preference": 2,
                 "humor_feedback": 2,
             },
+            open_conversation_count=2,
+            open_conversation_turn_count=8,
+            open_conversation_style_signal_counts={
+                "verbosity_preference": 2,
+                "initiative_preference": 2,
+                "humor_feedback": 2,
+            },
         )
 
         self.assertTrue(evaluation["reflection_activity_nonzero"])
@@ -195,6 +211,8 @@ class PersonalityFormationEvalTests(unittest.TestCase):
         self.assertTrue(evaluation["initiative_forming_proven"])
         self.assertTrue(evaluation["humor_forming_proven"])
         self.assertTrue(evaluation["style_axes_forming_proven"])
+        self.assertTrue(evaluation["open_conversation_style_learning_nonzero"])
+        self.assertTrue(evaluation["free_multiturn_style_forming_proven"])
         self.assertEqual(evaluation["behavior_change_topics"], ["AI companions"])
 
     def test_build_evaluation_summary_marks_thin_reflection_when_no_summaries_exist(self) -> None:
@@ -226,12 +244,16 @@ class PersonalityFormationEvalTests(unittest.TestCase):
             total_reflected_objects=3,
             total_created_summaries=0,
             raw_style_signal_counts={},
+            open_conversation_count=0,
+            open_conversation_turn_count=0,
+            open_conversation_style_signal_counts={},
         )
 
         self.assertTrue(evaluation["reflection_activity_nonzero"])
         self.assertFalse(evaluation["reflection_semantic_richness_nonzero"])
         self.assertFalse(evaluation["personality_forming_proven"])
         self.assertFalse(evaluation["style_axes_forming_proven"])
+        self.assertFalse(evaluation["free_multiturn_style_forming_proven"])
 
     def test_build_evaluation_summary_keeps_style_axes_red_without_raw_turn_style_learning(self) -> None:
         evaluation = _build_evaluation_summary(
@@ -262,6 +284,9 @@ class PersonalityFormationEvalTests(unittest.TestCase):
             total_reflected_objects=2,
             total_created_summaries=1,
             raw_style_signal_counts={"verbosity_preference": 0, "initiative_preference": 0, "humor_feedback": 0},
+            open_conversation_count=1,
+            open_conversation_turn_count=4,
+            open_conversation_style_signal_counts={},
         )
 
         self.assertTrue(evaluation["humor_evolution_nonzero"])
@@ -270,6 +295,59 @@ class PersonalityFormationEvalTests(unittest.TestCase):
         self.assertFalse(evaluation["initiative_forming_proven"])
         self.assertFalse(evaluation["humor_forming_proven"])
         self.assertFalse(evaluation["style_axes_forming_proven"])
+        self.assertFalse(evaluation["open_conversation_style_learning_nonzero"])
+        self.assertFalse(evaluation["free_multiturn_style_forming_proven"])
+
+    def test_build_evaluation_summary_counts_profile_emergence_from_defaults_as_drift(self) -> None:
+        evaluation = _build_evaluation_summary(
+            initial_snapshot_metrics={
+                "exists": False,
+                "humor_intensity": None,
+                "verbosity": None,
+                "initiative": None,
+                "relationship_topics": [],
+                "place_focuses": [],
+                "continuity_titles": [],
+            },
+            final_snapshot_metrics={
+                "exists": True,
+                "humor_intensity": 0.41,
+                "verbosity": 0.14,
+                "initiative": 0.77,
+                "relationship_topics": [],
+                "place_focuses": [],
+                "continuity_titles": ["Janina"],
+            },
+            initial_memory_state={"summary_count": 0},
+            final_memory_state={"summary_count": 1},
+            initial_world_state=WorldIntelligenceState(),
+            final_world_state=WorldIntelligenceState(),
+            initial_behavior={},
+            final_behavior={"Janina": {"in_mindshare": True}},
+            total_reflected_objects=0,
+            total_created_summaries=1,
+            raw_style_signal_counts={
+                "verbosity_preference": 2,
+                "initiative_preference": 2,
+                "humor_feedback": 2,
+            },
+            open_conversation_count=2,
+            open_conversation_turn_count=8,
+            open_conversation_style_signal_counts={
+                "verbosity_preference": 2,
+                "initiative_preference": 2,
+                "humor_feedback": 2,
+            },
+        )
+
+        self.assertLess(evaluation["verbosity_shift"], 0.0)
+        self.assertGreater(evaluation["initiative_shift"], 0.0)
+        self.assertGreater(evaluation["humor_shift"], 0.0)
+        self.assertTrue(evaluation["verbosity_forming_proven"])
+        self.assertTrue(evaluation["initiative_forming_proven"])
+        self.assertTrue(evaluation["humor_forming_proven"])
+        self.assertTrue(evaluation["style_axes_forming_proven"])
+        self.assertTrue(evaluation["free_multiturn_style_forming_proven"])
 
 
 if __name__ == "__main__":

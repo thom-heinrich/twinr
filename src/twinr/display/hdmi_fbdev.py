@@ -19,6 +19,7 @@ from threading import RLock
 from typing import Any
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCue
 from twinr.display.contracts import DisplayLogSections, DisplayStateFields
 from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.display.face_cues import DisplayFaceCue
@@ -181,6 +182,7 @@ class HdmiFramebufferDisplay:
         animation_frame: int = 0,
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
+        ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
     ) -> None:
         """Render and display one runtime status frame."""
@@ -195,6 +197,7 @@ class HdmiFramebufferDisplay:
             animation_frame=animation_frame,
             face_cue=face_cue,
             emoji_cue=emoji_cue,
+            ambient_impulse_cue=ambient_impulse_cue,
             presentation_cue=presentation_cue,
         )
         self.show_image(image)
@@ -266,6 +269,7 @@ class HdmiFramebufferDisplay:
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
+        ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         render_now: datetime | None = None,
     ):
@@ -312,6 +316,7 @@ class HdmiFramebufferDisplay:
             animation_frame=animation_frame,
             face_cue=face_cue,
             emoji_cue=emoji_cue,
+            ambient_impulse_cue=ambient_impulse_cue,
             presentation_cue=presentation_cue,
             render_now=render_now,
         )
@@ -351,6 +356,7 @@ class HdmiFramebufferDisplay:
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
+        ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         render_now: datetime | None = None,
     ) -> None:
@@ -367,6 +373,7 @@ class HdmiFramebufferDisplay:
             animation_frame=animation_frame,
             face_cue=face_cue,
             emoji_cue=emoji_cue,
+            ambient_impulse_cue=ambient_impulse_cue,
             presentation_cue=presentation_cue,
             ambient_now=render_now,
         )

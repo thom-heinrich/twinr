@@ -21,7 +21,7 @@ Pi-side setup, probe, and smoke-test scripts for Twinr peripherals.
 |---|---|
 | [buttons/](./buttons) | Button setup and GPIO probe |
 | [display/](./display) | Display backend setup and smoke tests |
-| [mic/](./mic) | Audio default-device setup, playback loudness normalization, and XVF3800 USB-access rule |
+| [mic/](./mic) | Audio default-device setup, playback loudness normalization/softvol, and XVF3800 USB-access rule |
 | [ops/](./ops) | Pi-side productive systemd units plus Pi bootstrap helpers |
 | [piaicam/](./piaicam) | Pi AI Camera smoke tests, custom gesture dataset capture, and MediaPipe model staging/training |
 | [pir/](./pir) | PIR setup and motion probe |

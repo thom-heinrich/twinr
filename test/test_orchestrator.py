@@ -1,7 +1,9 @@
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import sys
 import unittest
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -15,6 +17,13 @@ from twinr.orchestrator.contracts import OrchestratorToolResponse, OrchestratorT
 from twinr.orchestrator.contracts import OrchestratorTurnRequest
 from twinr.orchestrator.server import EdgeOrchestratorServer
 from twinr.orchestrator.session import EdgeOrchestratorSession, RemoteToolBridge
+from twinr.orchestrator.voice_client import OrchestratorVoiceWebSocketClient
+from twinr.orchestrator.voice_contracts import (
+    OrchestratorVoiceAudioFrame,
+    OrchestratorVoiceHelloRequest,
+    OrchestratorVoiceRuntimeStateEvent,
+)
+from twinr.orchestrator.voice_session import EdgeOrchestratorVoiceSession
 
 
 class _FakeDecisionProvider:
@@ -113,6 +122,70 @@ class _FakeServerSession:
         )
 
 
+class _FakeVoiceServerSession:
+    def handle_hello(self, request):
+        del request
+        return [{"type": "voice_ready", "session_id": "voice-1", "backend": "wekws"}]
+
+    def handle_runtime_state(self, event):
+        del event
+        return []
+
+    def handle_audio_frame(self, frame):
+        del frame
+        return [
+            {
+                "type": "wake_confirmed",
+                "matched_phrase": "twinna",
+                "remaining_text": "schau mal im web",
+                "backend": "wekws",
+                "detector_label": "twinna",
+                "score": 0.81,
+            }
+        ]
+
+
+class _FakeFrameSpotter:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def process_pcm_bytes(self, pcm_bytes: bytes, *, channels: int = 1):
+        del pcm_bytes, channels
+        self.calls += 1
+        if self.calls == 1:
+            from twinr.proactive.wakeword.matching import WakewordMatch
+
+            return WakewordMatch(
+                detected=True,
+                transcript="",
+                matched_phrase="twinna",
+                remaining_text="",
+                backend="wekws",
+                detector_label="twinna",
+                score=0.81,
+            )
+        return None
+
+    def reset(self) -> None:
+        return None
+
+
+class _FakeWakePhraseSpotter:
+    def detect(self, capture):
+        del capture
+        from twinr.proactive.wakeword.matching import WakewordMatch
+
+        return WakewordMatch(
+            detected=True,
+            transcript="Twinna schau mal im Web",
+            matched_phrase="twinna",
+            remaining_text="schau mal im web",
+            backend="stt",
+            detector_label="twinna",
+            score=0.92,
+        )
+
+
 class OrchestratorSessionTests(unittest.TestCase):
     def test_edge_orchestrator_session_emits_ack_and_remote_tool_request(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -164,10 +237,14 @@ class OrchestratorServerTests(unittest.TestCase):
                 openai_api_key="test-key",
                 project_root=temp_dir,
                 personality_dir="personality",
+                orchestrator_shared_secret="secret-token",
             )
             app = EdgeOrchestratorServer(config, session_factory=lambda _config: _FakeServerSession()).create_app()
             with TestClient(app) as client:
-                with client.websocket_connect("/ws/orchestrator") as websocket:
+                with client.websocket_connect(
+                    "/ws/orchestrator",
+                    headers={"x-twinr-secret": "secret-token"},
+                ) as websocket:
                     websocket.send_json(OrchestratorTurnRequest(prompt="Wie wird das Wetter morgen?").to_payload())
                     ack = websocket.receive_json()
                     tool_request = websocket.receive_json()
@@ -187,6 +264,44 @@ class OrchestratorServerTests(unittest.TestCase):
         self.assertEqual(completed["type"], "turn_complete")
         self.assertEqual(completed["text"], "Morgen wird es sonnig.")
 
+    def test_server_voice_websocket_emits_ready_and_wake_confirmed(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                orchestrator_shared_secret="secret-token",
+            )
+            app = EdgeOrchestratorServer(
+                config,
+                voice_session_factory=lambda _config: _FakeVoiceServerSession(),
+            ).create_app()
+            with TestClient(app) as client:
+                with client.websocket_connect(
+                    "/ws/orchestrator/voice",
+                    headers={"x-twinr-secret": "secret-token"},
+                ) as websocket:
+                    websocket.send_json(
+                        OrchestratorVoiceHelloRequest(
+                            session_id="voice-1",
+                            sample_rate=16000,
+                            channels=1,
+                            chunk_ms=100,
+                        ).to_payload()
+                    )
+                    ready = websocket.receive_json()
+                    websocket.send_json(
+                        OrchestratorVoiceAudioFrame(
+                            sequence=0,
+                            pcm_bytes=b"\x00\x00" * 1600,
+                        ).to_payload()
+                    )
+                    wake = websocket.receive_json()
+
+        self.assertEqual(ready["type"], "voice_ready")
+        self.assertEqual(wake["type"], "wake_confirmed")
+        self.assertEqual(wake["remaining_text"], "schau mal im web")
+
 
 class OrchestratorClientTests(unittest.TestCase):
     def test_client_handles_ack_tool_request_and_completion(self) -> None:
@@ -204,7 +319,8 @@ class OrchestratorClientTests(unittest.TestCase):
             def send(self, payload: str) -> None:
                 self.sent.append(payload)
 
-            def recv(self) -> str:
+            def recv(self, timeout=None) -> str:
+                del timeout
                 return next(self.messages)
 
             def __enter__(self):
@@ -215,7 +331,7 @@ class OrchestratorClientTests(unittest.TestCase):
 
         ack_events = []
         connector = lambda *args, **kwargs: _FakeSocket()
-        client = OrchestratorWebSocketClient("ws://test/ws", connector=connector)
+        client = OrchestratorWebSocketClient("ws://127.0.0.1/ws", connector=connector, require_tls=False)
 
         result = client.run_turn(
             OrchestratorTurnRequest(prompt="Wie wird das Wetter morgen?"),
@@ -227,16 +343,106 @@ class OrchestratorClientTests(unittest.TestCase):
         self.assertEqual(ack_events[0].ack_id, "checking_now")
         self.assertEqual(result.text, "Morgen wird es sonnig.")
 
+    def test_voice_client_decodes_ready_and_wake_events(self) -> None:
+        class _FakeSocket:
+            def __init__(self):
+                self.sent: list[str] = []
+                self.messages = iter(
+                    [
+                        '{"type":"voice_ready","session_id":"voice-1","backend":"wekws"}',
+                        '{"type":"wake_confirmed","matched_phrase":"twinna","remaining_text":"schau mal im web","backend":"wekws","detector_label":"twinna","score":0.9}',
+                    ]
+                )
+
+            def send(self, payload: str) -> None:
+                self.sent.append(payload)
+
+            def recv(self, timeout=None) -> str:
+                del timeout
+                return next(self.messages)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        events = []
+        client = OrchestratorVoiceWebSocketClient(
+            "ws://127.0.0.1/ws",
+            connector=lambda *args, **kwargs: _FakeSocket(),
+            on_event=events.append,
+            require_tls=False,
+        )
+
+        client.open()
+        client.send_hello(
+            OrchestratorVoiceHelloRequest(
+                session_id="voice-1",
+                sample_rate=16000,
+                channels=1,
+                chunk_ms=100,
+            )
+        )
+        client.send_runtime_state(
+            OrchestratorVoiceRuntimeStateEvent(
+                state="waiting",
+                follow_up_allowed=False,
+            )
+        )
+        client.close()
+
+        self.assertTrue(any(getattr(event, "backend", "") == "wekws" for event in events))
+        self.assertTrue(any(getattr(event, "remaining_text", "") == "schau mal im web" for event in events))
+
+
+class OrchestratorVoiceSessionTests(unittest.TestCase):
+    def test_voice_session_confirms_wakeword_after_postroll(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                audio_sample_rate=16000,
+                audio_channels=1,
+                audio_chunk_ms=100,
+                voice_orchestrator_wake_postroll_ms=100,
+            )
+            session = EdgeOrchestratorVoiceSession(
+                config,
+                backend=SimpleNamespace(transcribe=lambda *args, **kwargs: "Twinna schau mal im Web"),
+                frame_spotter=_FakeFrameSpotter(),
+                wake_phrase_spotter=_FakeWakePhraseSpotter(),
+            )
+
+            ready = session.handle_hello(
+                OrchestratorVoiceHelloRequest(
+                    session_id="voice-1",
+                    sample_rate=16000,
+                    channels=1,
+                    chunk_ms=100,
+                )
+            )
+            self.assertEqual(ready[0]["type"], "voice_ready")
+            first = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(sequence=0, pcm_bytes=b"\x01\x00" * 1600)
+            )
+            second = session.handle_audio_frame(
+                OrchestratorVoiceAudioFrame(sequence=1, pcm_bytes=b"\x01\x00" * 1600)
+            )
+
+        self.assertEqual(first, [])
+        self.assertEqual(second[0]["type"], "wake_confirmed")
+        self.assertEqual(second[0]["remaining_text"], "schau mal im web")
+
 
 class OrchestratorContractTests(unittest.TestCase):
     def test_turn_complete_payload_serializes_model_like_token_usage(self) -> None:
-        token_usage = type(
-            "TokenUsage",
-            (),
-            {
-                "__init__": lambda self: setattr(self, "total_tokens", 42),
-            },
-        )()
+        @dataclass
+        class TokenUsage:
+            total_tokens: int = 42
+
+        token_usage = TokenUsage()
         payload = OrchestratorTurnCompleteEvent(
             text="Hallo!",
             rounds=1,

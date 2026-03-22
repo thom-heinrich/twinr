@@ -260,7 +260,11 @@ class PersonalityEvolutionPolicy:
     relationship_decay_days: int = 30
     relationship_decay_step: float = 0.08
     min_relationship_salience: float = 0.08
-    supported_delta_targets: tuple[str, ...] = ("humor.intensity",)
+    supported_delta_targets: tuple[str, ...] = (
+        STYLE_VERBOSITY_DELTA_TARGET,
+        STYLE_INITIATIVE_DELTA_TARGET,
+        "humor.intensity",
+    )
 
     def __post_init__(self) -> None:
         """Normalize policy fields into safe bounded values."""
@@ -805,6 +809,16 @@ class BackgroundPersonalityEvolutionLoop:
         """Queue one continuity thread refresh for the next processing pass."""
 
         self._pending_continuity_threads.append(thread)
+
+    def has_pending_items(self) -> bool:
+        """Return whether any learning signals are waiting for commit."""
+
+        return bool(
+            self._pending_interaction_signals
+            or self._pending_place_signals
+            or self._pending_world_signals
+            or self._pending_continuity_threads
+        )
 
     def process_pending(self) -> PersonalityEvolutionResult:
         """Persist pending signals, evolve the snapshot, and clear the queue."""

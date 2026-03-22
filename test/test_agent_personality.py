@@ -43,6 +43,10 @@ from twinr.memory.longterm.core.models import (
     LongTermMemoryObjectV1,
     LongTermSourceRefV1,
 )
+from twinr.memory.longterm.ingestion.propositions import (
+    LongTermTurnPropositionBundleV1,
+    LongTermTurnPropositionCompiler,
+)
 
 
 class _InMemorySnapshotStore:
@@ -1113,6 +1117,85 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertEqual(result.snapshot.relationship_signals[0].topic, "celebrity gossip")
         self.assertEqual(result.snapshot.relationship_signals[0].stance, "aversion")
 
+    def test_evolution_loop_accepts_explicit_single_turn_style_and_humor_feedback(self) -> None:
+        loop = PersonalityEvolutionLoop(
+            policy=PersonalityEvolutionPolicy(
+                min_support_count=2,
+                supported_delta_targets=(
+                    "humor.intensity",
+                    "style.verbosity",
+                    "style.initiative",
+                ),
+            ),
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+        )
+
+        result = loop.evolve(
+            snapshot=PersonalitySnapshot(
+                style_profile=ConversationStyleProfile(
+                    verbosity=0.5,
+                    initiative=0.45,
+                ),
+                humor_profile=HumorProfile(
+                    style="gentle observational humor",
+                    summary="Use gentle wit sparingly.",
+                    intensity=0.25,
+                ),
+            ),
+            interaction_signals=(
+                InteractionSignal(
+                    signal_id="signal:verbosity:explicit",
+                    signal_kind="verbosity_preference",
+                    target="verbosity",
+                    summary="The user explicitly asked for shorter answers.",
+                    confidence=0.88,
+                    impact=0.44,
+                    evidence_count=1,
+                    source_event_ids=("turn:1",),
+                    explicit_user_requested=True,
+                    delta_target="style.verbosity",
+                    delta_value=-0.18,
+                    delta_summary="Keep answers a bit more concise by default.",
+                ),
+                InteractionSignal(
+                    signal_id="signal:initiative:explicit",
+                    signal_kind="initiative_preference",
+                    target="initiative",
+                    summary="The user explicitly welcomed one small helpful follow-up.",
+                    confidence=0.84,
+                    impact=0.34,
+                    evidence_count=1,
+                    source_event_ids=("turn:2",),
+                    explicit_user_requested=True,
+                    delta_target="style.initiative",
+                    delta_value=0.16,
+                    delta_summary="Take a slightly more proactive stance in relaxed turns.",
+                ),
+                InteractionSignal(
+                    signal_id="signal:humor:explicit",
+                    signal_kind="humor_feedback",
+                    target="humor",
+                    summary="The user explicitly said the dry joke worked.",
+                    confidence=0.82,
+                    impact=0.24,
+                    evidence_count=1,
+                    source_event_ids=("turn:3",),
+                    explicit_user_requested=True,
+                    delta_target="humor.intensity",
+                    delta_value=0.12,
+                    delta_summary="Increase humor slightly in relaxed turns.",
+                ),
+            ),
+            place_signals=(),
+            world_signals=(),
+            continuity_threads=(),
+        )
+
+        self.assertEqual(len(result.accepted_deltas), 3)
+        self.assertLess(result.snapshot.style_profile.verbosity, 0.5)
+        self.assertGreater(result.snapshot.style_profile.initiative, 0.45)
+        self.assertGreater(result.snapshot.humor_profile.intensity, 0.25)
+
     def test_evolution_loop_rejects_contradictory_topic_and_style_feedback(self) -> None:
         loop = PersonalityEvolutionLoop(
             policy=PersonalityEvolutionPolicy(
@@ -1622,6 +1705,102 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertGreaterEqual(engagement_signals["AI companions"].evidence_count, 2)
         self.assertEqual(batch.continuity_threads, ())
 
+    def test_signal_extractor_derives_style_signals_from_live_like_canonical_predicates(self) -> None:
+        extractor = PersonalitySignalExtractor(
+            now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+        )
+        bundle = LongTermTurnPropositionBundleV1.from_payload(
+            {
+                "propositions": [
+                    {
+                        "proposition_id": "pref_verbosity",
+                        "kind": "fact",
+                        "summary": "The user says shorter and calmer answers usually help more.",
+                        "details": None,
+                        "predicate": "user_prefers_answer_style",
+                        "confidence": 0.88,
+                        "sensitivity": "normal",
+                        "source_channel": "user_transcript",
+                        "subject_ref": "user:main",
+                        "object_ref": None,
+                        "value_text": "Shorter and calmer answers",
+                        "valid_from": None,
+                        "valid_to": None,
+                        "attributes": [],
+                    },
+                    {
+                        "proposition_id": "pref_initiative",
+                        "kind": "fact",
+                        "summary": "The user says one small follow-up can help when it is really useful.",
+                        "details": None,
+                        "predicate": "user_prefers_small_follow_up_when_helpful",
+                        "confidence": 0.82,
+                        "sensitivity": "normal",
+                        "source_channel": "user_transcript",
+                        "subject_ref": "user:main",
+                        "object_ref": None,
+                        "value_text": "One small follow-up question when it really helps",
+                        "valid_from": None,
+                        "valid_to": None,
+                        "attributes": [],
+                    },
+                    {
+                        "proposition_id": "feedback_humor",
+                        "kind": "observation",
+                        "summary": "A small dry joke worked for the user.",
+                        "details": None,
+                        "predicate": "responds_well_to_dry_humor",
+                        "confidence": 0.79,
+                        "sensitivity": "normal",
+                        "source_channel": "user_transcript",
+                        "subject_ref": "user:main",
+                        "object_ref": "concept:dry_humor",
+                        "value_text": None,
+                        "valid_from": None,
+                        "valid_to": None,
+                        "attributes": [],
+                    },
+                ],
+                "graph_edges": [],
+            }
+        )
+        durable_objects, _edges = LongTermTurnPropositionCompiler().compile(
+            bundle=bundle,
+            source_ref=self._source("turn:live_style_predicates"),
+        )
+        durable_style_objects = tuple(object_ for object_ in durable_objects if object_.kind != "observation")
+        episodic_style_objects = tuple(object_ for object_ in durable_objects if object_.kind == "observation")
+        turn = LongTermConversationTurn(
+            transcript="Bitte eher kurz, ein kleiner hilfreicher Nachsatz ist okay, und der trockene Witz eben war gut.",
+            response="Ich halte mich kuerzer, frage nur ruhig nach, und merke mir den trockenen Humor.",
+        )
+        consolidation = LongTermConsolidationResultV1(
+            turn_id="turn:live_style_predicates",
+            occurred_at=datetime(2026, 3, 20, 11, 55, tzinfo=timezone.utc),
+            episodic_objects=episodic_style_objects,
+            durable_objects=durable_style_objects,
+            deferred_objects=(),
+            conflicts=(),
+            graph_edges=(),
+        )
+
+        batch = extractor.extract_from_consolidation(
+            turn=turn,
+            consolidation=consolidation,
+        )
+
+        signals_by_kind = {signal.signal_kind: signal for signal in batch.interaction_signals}
+        self.assertEqual(
+            set(signals_by_kind),
+            {"verbosity_preference", "initiative_preference", "humor_feedback"},
+        )
+        self.assertLess(signals_by_kind["verbosity_preference"].delta_value, 0.0)
+        self.assertGreater(signals_by_kind["initiative_preference"].delta_value, 0.0)
+        self.assertGreater(signals_by_kind["humor_feedback"].delta_value, 0.0)
+        self.assertTrue(signals_by_kind["verbosity_preference"].explicit_user_requested)
+        self.assertTrue(signals_by_kind["initiative_preference"].explicit_user_requested)
+        self.assertTrue(signals_by_kind["humor_feedback"].explicit_user_requested)
+
     def test_signal_extractor_requires_repeated_exposure_for_topic_cooling(self) -> None:
         extractor = PersonalitySignalExtractor(
             now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
@@ -1894,6 +2073,95 @@ class AgentPersonalityTests(unittest.TestCase):
         self.assertLess(result.snapshot.style_profile.verbosity, 0.5)
         self.assertEqual(result.snapshot.continuity_threads[0].title, "hamburg budget updates")
         self.assertIn("agent_personality_world_signals_v1", remote_state.snapshots)
+
+    def test_learning_service_flushes_queued_tool_history_with_next_conversation_commit(self) -> None:
+        remote_state = _FakeRemoteState(None)
+        config = TwinrConfig(project_root=".")
+        learning = PersonalityLearningService(
+            extractor=PersonalitySignalExtractor(
+                now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
+            ),
+            background_loop=BackgroundPersonalityEvolutionLoop(
+                config=config,
+                remote_state=remote_state,
+                evolution_store=RemoteStatePersonalityEvolutionStore(),
+                snapshot_store=RemoteStatePersonalitySnapshotStore(),
+                evolution_loop=PersonalityEvolutionLoop(
+                    policy=PersonalityEvolutionPolicy(
+                        min_support_count=2,
+                        supported_delta_targets=(
+                            "humor.intensity",
+                            "style.verbosity",
+                            "relationship.topic_affinity:",
+                        ),
+                    ),
+                    now_provider=lambda: datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc),
+                ),
+            ),
+        )
+        learning.enqueue_tool_history(
+            tool_calls=(
+                AgentToolCall(
+                    name="search_live_info",
+                    call_id="call:search:queued",
+                    arguments={
+                        "question": "What changed in Hamburg local politics today?",
+                        "location_hint": "Hamburg",
+                    },
+                ),
+            ),
+            tool_results=(
+                AgentToolResult(
+                    call_id="call:search:queued",
+                    name="search_live_info",
+                    output={
+                        "status": "ok",
+                        "answer": "Hamburg approved a transit budget update at today's council meeting.",
+                        "sources": ("https://example.com/hamburg",),
+                        "used_web_search": True,
+                    },
+                    serialized_output='{"status":"ok"}',
+                ),
+            ),
+        )
+        self.assertNotIn("agent_personality_context_v1", remote_state.snapshots)
+
+        turn = LongTermConversationTurn(
+            transcript="Was ist gerade in der Hamburger Lokalpolitik los?",
+            response="Ich behalte die Haushaltsdebatte im Blick.",
+        )
+        consolidation = LongTermConsolidationResultV1(
+            turn_id="turn:learn:queued",
+            occurred_at=datetime(2026, 3, 20, 11, 0, tzinfo=timezone.utc),
+            episodic_objects=(),
+            durable_objects=(
+                LongTermMemoryObjectV1(
+                    memory_id="event:hamburg_budget_debate",
+                    kind="event",
+                    summary="The user asked about a budget debate in Hamburg city politics.",
+                    source=self._source("turn:learn:queued"),
+                    status="active",
+                    confidence=0.86,
+                    attributes={
+                        "topic": "local politics",
+                        "place": "Hamburg",
+                        "place_ref": "place:hamburg",
+                    },
+                ),
+            ),
+            deferred_objects=(),
+            conflicts=(),
+            graph_edges=(),
+        )
+
+        result = learning.record_conversation_consolidation(
+            turn=turn,
+            consolidation=consolidation,
+        )
+
+        self.assertEqual(result.snapshot.place_focuses[0].name, "Hamburg")
+        self.assertEqual(result.snapshot.world_signals[0].region, "Hamburg")
+        self.assertIn("agent_personality_context_v1", remote_state.snapshots)
 
     def test_background_loop_persists_snapshot_and_deltas(self) -> None:
         remote_state = _FakeRemoteState(None)

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -10,7 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from twinr.config import TwinrConfig
 from twinr.agent.personality import DEFAULT_PERSONALITY_SNAPSHOT_KIND
 from twinr.agent.personality.intelligence import DEFAULT_WORLD_INTELLIGENCE_STATE_KIND
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteUnavailableError,
+    remote_snapshot_document_hints_path,
+)
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
 from twinr.personality import (
     load_conversation_closure_instructions,
@@ -42,6 +46,16 @@ class _FailingRemoteState(_FakeRemoteState):
         raise LongTermRemoteUnavailableError(
             f"Failed to read remote long-term snapshot {snapshot_kind!r}: status=503"
         )
+
+
+class _CountingRemoteState(_FakeRemoteState):
+    def __init__(self) -> None:
+        super().__init__()
+        self.load_calls: list[str] = []
+
+    def load_snapshot(self, *, snapshot_kind: str, local_path=None):
+        self.load_calls.append(snapshot_kind)
+        return super().load_snapshot(snapshot_kind=snapshot_kind, local_path=local_path)
 
 
 class PersonalityTests(unittest.TestCase):
@@ -425,6 +439,126 @@ class PersonalityTests(unittest.TestCase):
         self.assertIsNotNone(instructions)
         self.assertIn("Base user profile", instructions)
         self.assertIn("Thom has two dogs.", instructions)
+
+    def test_tool_loop_instructions_cache_skips_repeated_remote_reads_when_sources_stay_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            personality_dir = Path(tmpdir) / "personality"
+            personality_dir.mkdir()
+            state_dir = Path(tmpdir) / "state"
+            state_dir.mkdir()
+            (personality_dir / "SYSTEM.md").write_text("System context", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text("Base personality", encoding="utf-8")
+            (personality_dir / "USER.md").write_text("Base user", encoding="utf-8")
+            (state_dir / "MEMORY.md").write_text("# Twinr Memory\n", encoding="utf-8")
+            (state_dir / "reminders.json").write_text('{"entries":[]}\n', encoding="utf-8")
+
+            remote_state = _CountingRemoteState()
+            ManagedContextFileStore(
+                personality_dir / "USER.md",
+                section_title="Twinr managed user updates",
+                remote_state=remote_state,
+                remote_snapshot_kind="user_context",
+            ).upsert(category="pets", instruction="Thom has two dogs.")
+            ManagedContextFileStore(
+                personality_dir / "PERSONALITY.md",
+                section_title="Twinr managed personality updates",
+                remote_state=remote_state,
+                remote_snapshot_kind="personality_context",
+            ).upsert(category="style", instruction="Keep answers calm.")
+
+            config = TwinrConfig(
+                project_root=tmpdir,
+                personality_dir="personality",
+                memory_markdown_path=str(state_dir / "MEMORY.md"),
+                reminder_store_path=str(state_dir / "reminders.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=False,
+            )
+            with patch(
+                "twinr.memory.longterm.storage.remote_state.LongTermRemoteStateStore.from_config",
+                return_value=remote_state,
+            ), patch(
+                "twinr.agent.base_agent.prompting.personality.LongTermRemoteStateStore.from_config",
+                return_value=remote_state,
+            ):
+                first = load_tool_loop_instructions(config)
+                first_remote_calls = len(remote_state.load_calls)
+                second = load_tool_loop_instructions(config)
+
+        self.assertIsNotNone(first)
+        self.assertEqual(first, second)
+        self.assertGreaterEqual(first_remote_calls, 2)
+        self.assertEqual(len(remote_state.load_calls), first_remote_calls)
+
+    def test_tool_loop_instructions_cache_invalidates_when_remote_hint_file_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            personality_dir = Path(tmpdir) / "personality"
+            personality_dir.mkdir()
+            state_dir = Path(tmpdir) / "state"
+            state_dir.mkdir()
+            remote_dir = state_dir / "chonkydb"
+            remote_dir.mkdir()
+            (personality_dir / "SYSTEM.md").write_text("System context", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text("Base personality", encoding="utf-8")
+            (personality_dir / "USER.md").write_text("Base user", encoding="utf-8")
+            (state_dir / "MEMORY.md").write_text("# Twinr Memory\n", encoding="utf-8")
+            (state_dir / "reminders.json").write_text('{"entries":[]}\n', encoding="utf-8")
+
+            remote_state = _CountingRemoteState()
+            ManagedContextFileStore(
+                personality_dir / "USER.md",
+                section_title="Twinr managed user updates",
+                remote_state=remote_state,
+                remote_snapshot_kind="user_context",
+            ).upsert(category="pets", instruction="Thom has two dogs.")
+
+            config = TwinrConfig(
+                project_root=tmpdir,
+                personality_dir="personality",
+                memory_markdown_path=str(state_dir / "MEMORY.md"),
+                reminder_store_path=str(state_dir / "reminders.json"),
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=False,
+                long_term_memory_path=str(remote_dir),
+            )
+            with patch(
+                "twinr.memory.longterm.storage.remote_state.LongTermRemoteStateStore.from_config",
+                return_value=remote_state,
+            ), patch(
+                "twinr.agent.base_agent.prompting.personality.LongTermRemoteStateStore.from_config",
+                return_value=remote_state,
+            ):
+                first = load_tool_loop_instructions(config)
+                first_remote_calls = len(remote_state.load_calls)
+                remote_state.snapshots["user_context"] = {
+                    "schema": "twinr_managed_context",
+                    "version": 1,
+                    "entries": [
+                        {
+                            "key": "pets",
+                            "instruction": "Thom now also helps his daughter with her cat.",
+                            "updated_at": "2026-03-21T20:15:00+00:00",
+                        }
+                    ],
+                }
+                hints_path = remote_snapshot_document_hints_path(config)
+                assert hints_path is not None
+                hints_path.parent.mkdir(parents=True, exist_ok=True)
+                hints_path.write_text('{"schema":"twinr_remote_snapshot_document_hints_v1"}', encoding="utf-8")
+                hint_stat = hints_path.stat()
+                os.utime(
+                    hints_path,
+                    ns=(hint_stat.st_atime_ns, hint_stat.st_mtime_ns + 1_000_000),
+                )
+                second = load_tool_loop_instructions(config)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first, second)
+        self.assertIn("Thom now also helps his daughter with her cat.", second)
+        self.assertGreater(len(remote_state.load_calls), first_remote_calls)
 
 
 if __name__ == "__main__":

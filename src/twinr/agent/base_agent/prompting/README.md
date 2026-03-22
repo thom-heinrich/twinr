@@ -10,7 +10,9 @@ workflow, and conversation callers use when they need ordered instruction string
 - load `SYSTEM`, `PERSONALITY`, and `USER` sections from the configured personality directory
 - merge those legacy sections with structured layers from [`../../personality`](../../personality/README.md) when a typed personality snapshot is available, including contextual `MINDSHARE` when Twinr has ongoing themes it may naturally speak from
 - merge memory, reminder, and automation context into loop-specific section sets
+- cache rendered instruction bundles against local source signatures so steady-state Pi turns do not re-fetch unchanged prompt context from remote storage on every turn
 - turn ordered sections into model-facing instruction strings
+- keep turn-controller lane instructions separate from provider-owned tool-loop base instructions so that lane-specific evaluators do not accidentally prepend the same base bundle twice
 - keep the conversation-closure loader lean by reading only the dedicated closure-controller instruction file instead of the full tool-loop bundle
 - provide small instruction-composition helpers shared across callers
 

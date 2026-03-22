@@ -16,6 +16,7 @@ bounded background writers into the APIs used by agent runtime loops.
 - Persist conversation turns and multimodal evidence through bounded workers
 - Coalesce high-frequency sensor observations onto a latest-only idle-loop handoff before they hit multimodal long-term persistence, so proactive sensor churn cannot build an unbounded remote write backlog
 - Route consolidated conversation turns and post-turn tool history into the structured personality-learning service without mixing that policy into the core memory algorithms
+- Keep foreground turn finalization bounded by queueing tool-history learning without taking the shared long-term store lock first, then letting the later conversation-persistence/flush path commit those signals under the existing long-term store lock
 - Pass reflection-enriched turn batches into personality learning so downstream continuity/context formation can see newly created thread summaries from the same committed turn
 - Route explicit RSS/world-intelligence configuration plus reflection-phase feed refresh/recalibration into the structured personality-learning service without mixing that source logic into the core memory algorithms
 - Split one service-level flush timeout into explicit per-writer budgets so wall-clock runtime deadlines stay real
@@ -63,7 +64,7 @@ service.enqueue_conversation_turn(
     transcript=user_text,
     response=assistant_text,
 )
-service.record_personality_tool_history(
+service.enqueue_personality_tool_history(
     tool_calls=tool_calls,
     tool_results=tool_results,
 )

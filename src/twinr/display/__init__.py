@@ -9,6 +9,9 @@ from __future__ import annotations
 from typing import Any
 
 __all__ = [
+    "DisplayAmbientImpulseController",
+    "DisplayAmbientImpulseCue",
+    "DisplayAmbientImpulseCueStore",
     "DisplayFaceBrowStyle",
     "DisplayFaceCue",
     "DisplayFaceCueStore",
@@ -36,6 +39,18 @@ __all__ = [
 def __getattr__(name: str) -> Any:
     """Resolve public display exports on demand."""
 
+    if name == "DisplayAmbientImpulseCue":
+        from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCue
+
+        return DisplayAmbientImpulseCue
+    if name == "DisplayAmbientImpulseCueStore":
+        from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCueStore
+
+        return DisplayAmbientImpulseCueStore
+    if name == "DisplayAmbientImpulseController":
+        from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseController
+
+        return DisplayAmbientImpulseController
     if name == "DisplayFaceCue":
         from twinr.display.face_cues import DisplayFaceCue
 

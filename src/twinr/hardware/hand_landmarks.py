@@ -26,6 +26,7 @@ DEFAULT_MEDIAPIPE_HAND_LANDMARKER_MODEL_URL = (
 _WRIST_SCORE_THRESHOLD = 0.35
 _ELBOW_SCORE_THRESHOLD = 0.30
 _SHOULDER_SCORE_THRESHOLD = 0.30
+_LOCAL_HAND_CROP_PADDING = 0.10
 
 
 class HandRoiSource(StrEnum):
@@ -374,6 +375,10 @@ def _parse_hand_landmark_result(
     detections: list[HandLandmarkDetection] = []
     for index, local_landmarks in enumerate(hand_landmarks):
         handedness_label, handedness_score = _resolve_handedness(handedness, index=index)
+        tight_roi_frame_rgb = _crop_local_hand_from_roi_frame(
+            roi_frame_rgb=roi_frame_rgb,
+            local_landmarks=local_landmarks,
+        )
         detections.append(
             HandLandmarkDetection(
                 roi=roi,
@@ -387,10 +392,66 @@ def _parse_hand_landmark_result(
                     )
                     for landmark in local_landmarks or ()
                 ),
-                roi_frame_rgb=roi_frame_rgb,
+                roi_frame_rgb=tight_roi_frame_rgb,
             )
         )
     return tuple(detections)
+
+
+def _crop_local_hand_from_roi_frame(
+    *,
+    roi_frame_rgb: Any,
+    local_landmarks: Any,
+) -> Any:
+    """Return a tight hand crop inside one ROI frame when shape data is available.
+
+    The hand-landmark worker already paid to localize the hand inside an upper
+    body ROI. Downstream gesture recognition should consume that tighter hand
+    crop instead of the full person ROI, otherwise unrelated torso/background
+    motion drowns out the actual hand symbol in busy multi-person scenes.
+    """
+
+    shape = getattr(roi_frame_rgb, "shape", None)
+    if not shape or len(shape) < 2:
+        return roi_frame_rgb
+    try:
+        points = list(local_landmarks or ())
+    except TypeError:
+        return roi_frame_rgb
+    xs: list[float] = []
+    ys: list[float] = []
+    for point in points:
+        x = _coerce_optional_ratio(getattr(point, "x", None), default=None)
+        y = _coerce_optional_ratio(getattr(point, "y", None), default=None)
+        if x is None or y is None:
+            continue
+        xs.append(x)
+        ys.append(y)
+    if not xs or not ys:
+        return roi_frame_rgb
+    left = max(0.0, min(xs) - _LOCAL_HAND_CROP_PADDING)
+    right = min(1.0, max(xs) + _LOCAL_HAND_CROP_PADDING)
+    top = max(0.0, min(ys) - _LOCAL_HAND_CROP_PADDING)
+    bottom = min(1.0, max(ys) + _LOCAL_HAND_CROP_PADDING)
+    if right <= left or bottom <= top:
+        return roi_frame_rgb
+    try:
+        frame_height = int(shape[0] or 0)
+        frame_width = int(shape[1] or 0)
+    except Exception:
+        return roi_frame_rgb
+    if frame_height <= 1 or frame_width <= 1:
+        return roi_frame_rgb
+    y0 = max(0, min(frame_height - 1, int(math.floor(top * frame_height))))
+    x0 = max(0, min(frame_width - 1, int(math.floor(left * frame_width))))
+    y1 = max(y0 + 1, min(frame_height, int(math.ceil(bottom * frame_height))))
+    x1 = max(x0 + 1, min(frame_width, int(math.ceil(right * frame_width))))
+    if y1 <= y0 or x1 <= x0:
+        return roi_frame_rgb
+    try:
+        return roi_frame_rgb[y0:y1, x0:x1]
+    except Exception:
+        return roi_frame_rgb
 
 
 def _project_landmark_to_full_frame(*, landmark: Any, roi: AICameraBox) -> HandLandmarkPoint:

@@ -19,7 +19,11 @@ from twinr.automations import AutomationStore
 from twinr.agent.personality import PersonalityContextService
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.context_store import ManagedContextFileStore, PersistentMemoryMarkdownStore
-from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError, LongTermRemoteStateStore
+from twinr.memory.longterm.storage.remote_state import (
+    LongTermRemoteUnavailableError,
+    LongTermRemoteStateStore,
+    remote_snapshot_document_hints_path,
+)
 from twinr.memory.reminders import ReminderStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -33,6 +37,18 @@ _SECTION_FILES = (
 _PERSONALITY_CONTEXT_SERVICE = PersonalityContextService()
 _REMOTE_CONTEXT_WARNING_LOCK = Lock()
 _REMOTE_CONTEXT_WARNINGS: set[str] = set()
+_INSTRUCTION_BUNDLE_CACHE_LOCK = Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class _InstructionBundleCacheEntry:
+    """Cache one rendered instruction bundle together with its source signature."""
+
+    signature: tuple[object, ...]
+    instructions: str | None
+
+
+_INSTRUCTION_BUNDLE_CACHE: dict[str, _InstructionBundleCacheEntry] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,8 +257,16 @@ def load_personality_instructions(config: TwinrConfig) -> str | None:
         The rendered instruction bundle for the main assistant loop, or ``None``
         when no sections can be loaded.
     """
-
-    return load_personality_context(config).to_instructions()
+    return _load_cached_instruction_bundle(
+        bundle_key="personality_loop",
+        signature=_instruction_bundle_signature(
+            config,
+            include_memory=True,
+            include_reminders=True,
+            include_automations=True,
+        ),
+        render=lambda: load_personality_context(config).to_instructions(),
+    )
 
 
 def load_tool_loop_instructions(config: TwinrConfig) -> str | None:
@@ -255,8 +279,15 @@ def load_tool_loop_instructions(config: TwinrConfig) -> str | None:
         The rendered instruction bundle for tool-capable turns, or ``None`` when
         no sections can be loaded.
     """
-
-    return load_tool_loop_personality_context(config).to_instructions()
+    return _load_cached_instruction_bundle(
+        bundle_key="tool_loop",
+        signature=_instruction_bundle_signature(
+            config,
+            include_memory=True,
+            include_reminders=True,
+        ),
+        render=lambda: load_tool_loop_personality_context(config).to_instructions(),
+    )
 
 
 def load_supervisor_loop_instructions(config: TwinrConfig) -> str | None:
@@ -269,8 +300,11 @@ def load_supervisor_loop_instructions(config: TwinrConfig) -> str | None:
         The rendered instruction bundle for the supervisor lane, or ``None`` when
         no sections can be loaded.
     """
-
-    return load_supervisor_loop_personality_context(config).to_instructions()
+    return _load_cached_instruction_bundle(
+        bundle_key="supervisor_loop",
+        signature=_instruction_bundle_signature(config),
+        render=lambda: load_supervisor_loop_personality_context(config).to_instructions(),
+    )
 
 
 def load_named_instruction_file(config: TwinrConfig, filename: str | None) -> str | None:
@@ -305,18 +339,14 @@ def load_turn_controller_instructions(config: TwinrConfig) -> str | None:
     """Load instructions for the turn controller.
 
     Args:
-        config: Runtime configuration that points to base and lane-specific
-            instruction sources.
+        config: Runtime configuration that points to the lane-specific
+            instruction source.
 
     Returns:
-        The merged tool-loop instructions and optional turn-controller override,
-        or ``None`` when both sources are empty.
+        The optional turn-controller lane instructions, or ``None`` when the
+        configured override file is empty or unavailable.
     """
-
-    return merge_instructions(
-        load_tool_loop_instructions(config),
-        load_named_instruction_file(config, config.turn_controller_instructions_file),
-    )
+    return load_named_instruction_file(config, config.turn_controller_instructions_file)
 
 
 def load_conversation_closure_instructions(config: TwinrConfig) -> str | None:
@@ -349,6 +379,143 @@ def merge_instructions(*parts: str | None) -> str | None:
     if not merged:
         return None
     return "\n\n".join(merged)
+
+
+def _load_cached_instruction_bundle(
+    *,
+    bundle_key: str,
+    signature: tuple[object, ...],
+    render: Callable[[], str | None],
+) -> str | None:
+    """Render one instruction bundle only when its prompt sources changed."""
+
+    with _INSTRUCTION_BUNDLE_CACHE_LOCK:
+        cached = _INSTRUCTION_BUNDLE_CACHE.get(bundle_key)
+        if cached is not None and cached.signature == signature:
+            return cached.instructions
+
+    instructions = render()
+
+    with _INSTRUCTION_BUNDLE_CACHE_LOCK:
+        _INSTRUCTION_BUNDLE_CACHE[bundle_key] = _InstructionBundleCacheEntry(
+            signature=signature,
+            instructions=instructions,
+        )
+    return instructions
+
+
+def _instruction_bundle_signature(
+    config: TwinrConfig,
+    *,
+    include_memory: bool = False,
+    include_reminders: bool = False,
+    include_automations: bool = False,
+) -> tuple[object, ...]:
+    """Return a local source signature for cached prompt bundles.
+
+    The signature stays cheap to compute on the Pi. It uses local file stamps
+    plus the durable remote snapshot document-id hint file, which changes when
+    this runtime persists new remote prompt-context snapshots.
+    """
+
+    personality_dir = _resolve_personality_directory(config)
+    signature: list[object] = [
+        "instruction_bundle_v1",
+        (
+            str(getattr(config, "project_root", "") or ""),
+            str(getattr(config, "personality_dir", "") or ""),
+            str(getattr(config, "local_timezone_name", "") or ""),
+            bool(getattr(config, "long_term_memory_enabled", False)),
+            str(getattr(config, "long_term_memory_mode", "") or ""),
+            bool(getattr(config, "long_term_memory_remote_required", False)),
+            str(getattr(config, "long_term_memory_path", "") or ""),
+            str(getattr(config, "long_term_memory_remote_namespace", "") or ""),
+            str(getattr(config, "chonkydb_base_url", "") or ""),
+        ),
+        ("system", _path_state(_personality_section_path(personality_dir, "SYSTEM.md"))),
+        ("personality", _path_state(_personality_section_path(personality_dir, "PERSONALITY.md"))),
+        ("user", _path_state(_personality_section_path(personality_dir, "USER.md"))),
+        ("remote_hints", _path_state(remote_snapshot_document_hints_path(config))),
+    ]
+    if include_memory:
+        signature.extend(
+            [
+                ("memory_path", str(getattr(config, "memory_markdown_path", "") or "")),
+                ("memory", _path_state(_resolve_runtime_path(config, getattr(config, "memory_markdown_path", "")))),
+            ]
+        )
+    if include_reminders:
+        signature.extend(
+            [
+                ("reminder_store_path", str(getattr(config, "reminder_store_path", "") or "")),
+                (
+                    "reminders",
+                    _path_state(_resolve_runtime_path(config, getattr(config, "reminder_store_path", ""))),
+                ),
+                ("reminder_retry_delay_s", float(getattr(config, "reminder_retry_delay_s", 0.0) or 0.0)),
+                ("reminder_max_entries", int(getattr(config, "reminder_max_entries", 0) or 0)),
+            ]
+        )
+    if include_automations:
+        signature.extend(
+            [
+                ("automation_store_path", str(getattr(config, "automation_store_path", "") or "")),
+                (
+                    "automations",
+                    _path_state(_resolve_runtime_path(config, getattr(config, "automation_store_path", ""))),
+                ),
+                ("automation_max_entries", int(getattr(config, "automation_max_entries", 0) or 0)),
+            ]
+        )
+    return tuple(signature)
+
+
+def _personality_section_path(directory: Path | None, filename: str) -> Path | None:
+    if directory is None:
+        return None
+    return directory / filename
+
+
+def _resolve_runtime_path(config: TwinrConfig, raw_path: object) -> Path | None:
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    try:
+        candidate = Path(text).expanduser()
+    except (OSError, ValueError):
+        return None
+    try:
+        if candidate.is_absolute():
+            return candidate.resolve(strict=False)
+        root = Path(config.project_root).expanduser().resolve(strict=False)
+        return (root / candidate).resolve(strict=False)
+    except OSError:
+        return None
+
+
+def _path_state(path: Path | None) -> tuple[object, ...]:
+    """Return a cheap cache stamp for one prompt source path."""
+
+    if path is None:
+        return ("missing",)
+    try:
+        stat_result = path.lstat()
+    except OSError:
+        return (str(path), "missing")
+    if stat.S_ISREG(stat_result.st_mode):
+        kind = "file"
+    elif stat.S_ISDIR(stat_result.st_mode):
+        kind = "dir"
+    elif stat.S_ISLNK(stat_result.st_mode):
+        kind = "symlink"
+    else:
+        kind = "other"
+    return (
+        str(path),
+        kind,
+        int(getattr(stat_result, "st_size", 0)),
+        int(getattr(stat_result, "st_mtime_ns", 0)),
+    )
 
 
 def _resolve_personality_directory(config: TwinrConfig) -> Path | None:

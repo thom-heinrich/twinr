@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.personality.context_builder import PersonalityContextBuilder
+from twinr.agent.personality.display_impulses import (
+    AmbientDisplayImpulseCandidate,
+    build_ambient_display_impulse_candidates,
+)
 from twinr.agent.personality.intelligence.models import WorldInterestSignal
 from twinr.agent.personality.intelligence.store import RemoteStateWorldIntelligenceStore
 from twinr.agent.personality.models import PersonalitySnapshot
@@ -124,6 +129,28 @@ class PersonalityContextService:
         return build_positive_engagement_policies(
             snapshot,
             engagement_signals=engagement_signals,
+            max_items=max_items,
+        )
+
+    def load_display_impulse_candidates(
+        self,
+        *,
+        config: TwinrConfig,
+        remote_state: LongTermRemoteStateStore | None = None,
+        local_now: datetime | None = None,
+        max_items: int = 4,
+    ) -> tuple[AmbientDisplayImpulseCandidate, ...]:
+        """Load the current bounded silent display-impulse candidates."""
+
+        snapshot = self.load_snapshot(config=config, remote_state=remote_state)
+        engagement_signals = self._load_engagement_signals(
+            config=config,
+            remote_state=remote_state,
+        )
+        return build_ambient_display_impulse_candidates(
+            snapshot,
+            engagement_signals=engagement_signals,
+            local_now=local_now,
             max_items=max_items,
         )
 

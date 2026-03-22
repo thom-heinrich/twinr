@@ -959,6 +959,25 @@ class LongTermMemoryService:
                 tool_results=normalized_tool_results,
             )
 
+    def enqueue_personality_tool_history(
+        self,
+        *,
+        tool_calls: Sequence[AgentToolCall],
+        tool_results: Sequence[AgentToolResult],
+    ) -> None:
+        """Queue structured tool-history signals for the next background commit."""
+
+        if self.personality_learning is None:
+            return
+        normalized_tool_calls = tuple(tool_calls)
+        normalized_tool_results = tuple(tool_results)
+        if not normalized_tool_calls and not normalized_tool_results:
+            return
+        self.personality_learning.enqueue_tool_history(
+            tool_calls=normalized_tool_calls,
+            tool_results=normalized_tool_results,
+        )
+
     def configure_world_intelligence(
         self,
         *,

@@ -9,7 +9,7 @@ small synchronous surface.
 
 `realtime` owns:
 - open and close the OpenAI realtime websocket session for Twinr
-- refresh realtime instructions, tool schemas, and local time context before each turn
+- refresh realtime instructions and tool schemas before each turn, reusing the canonical tool-agent instruction builder instead of a divergent realtime-only prompt copy
 - normalize streamed provider events into `OpenAIRealtimeTurn` results
 
 `realtime` does **not** own:

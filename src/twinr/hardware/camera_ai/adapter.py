@@ -87,6 +87,7 @@ class LocalAICameraAdapter:
         self._last_motion_state = AICameraMotionState.UNKNOWN
         self._last_motion_confidence: float | None = None
         self._face_anchor_detector = face_anchor_detector
+        self._last_gesture_debug_details: dict[str, Any] | None = None
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LocalAICameraAdapter":
@@ -328,6 +329,10 @@ class LocalAICameraAdapter:
             online_error = self._probe_online(runtime)
             if online_error is not None:
                 logger.warning("Local AI camera gesture online probe failed with %s.", online_error)
+                self._last_gesture_debug_details = {
+                    "resolved_source": "camera_offline",
+                    "pipeline_error": online_error,
+                }
                 return self._health_only_observation(
                     observed_at=observed_at,
                     online=False,
@@ -336,15 +341,38 @@ class LocalAICameraAdapter:
                     error=online_error,
                 )
             try:
+                detection = self._coerce_detection_result(
+                    self._capture_detection(runtime, observed_at=observed_at)
+                )
                 frame_rgb = self._capture_rgb_frame(runtime, observed_at=observed_at)
-                gesture_observation = self._ensure_live_gesture_pipeline().observe(
+                gesture_pipeline = self._ensure_live_gesture_pipeline()
+                gesture_observation = gesture_pipeline.observe(
                     frame_rgb=frame_rgb,
                     observed_at=observed_at,
+                    primary_person_box=detection.primary_person_box,
+                    visible_person_boxes=tuple(
+                        person.box
+                        for person in detection.visible_persons
+                        if getattr(person, "box", None) is not None
+                    ),
+                    person_count=detection.person_count,
                 )
+                gesture_debug = gesture_pipeline.debug_snapshot()
+                self._last_gesture_debug_details = {
+                    **gesture_debug,
+                    "detection_person_count": detection.person_count,
+                    "detection_primary_person_zone": detection.primary_person_zone.value,
+                    "detection_visible_person_count": len(detection.visible_persons),
+                    "detection_primary_person_box_available": detection.primary_person_box is not None,
+                }
             except Exception as exc:  # pragma: no cover - hardware-dependent path.
                 code = self._classify_error(exc)
                 logger.warning("Local AI camera live gesture observation failed with %s.", code)
                 logger.debug("Local AI camera live gesture exception details.", exc_info=True)
+                self._last_gesture_debug_details = {
+                    "resolved_source": "pipeline_error",
+                    "pipeline_error": code,
+                }
                 self._safe_close_live_gesture_pipeline_locked()
                 self._safe_close_runtime_locked()
                 return self._health_only_observation(
@@ -360,6 +388,10 @@ class LocalAICameraAdapter:
                 camera_online=True,
                 camera_ready=True,
                 camera_ai_ready=True,
+                person_count=detection.person_count,
+                primary_person_box=detection.primary_person_box,
+                primary_person_zone=detection.primary_person_zone,
+                visible_persons=detection.visible_persons,
                 hand_or_object_near_camera=gesture_observation.hand_count > 0,
                 showing_intent_likely=(
                     True
@@ -384,6 +416,13 @@ class LocalAICameraAdapter:
             )
         finally:
             self._lock.release()
+
+    def get_last_gesture_debug_details(self) -> dict[str, Any] | None:
+        """Return the newest bounded gesture debug snapshot for operators."""
+
+        if self._last_gesture_debug_details is None:
+            return None
+        return dict(self._last_gesture_debug_details)
 
     def _resolve_pose(
         self,

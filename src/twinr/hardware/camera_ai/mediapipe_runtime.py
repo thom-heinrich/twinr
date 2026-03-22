@@ -271,6 +271,7 @@ class MediaPipeTaskRuntime:
         runtime: dict[str, Any],
         *,
         result_callback: Any,
+        num_hands_override: int | None = None,
     ) -> Any:
         """Reuse or create the built-in live-stream recognizer for fast gesture ack."""
 
@@ -283,6 +284,7 @@ class MediaPipeTaskRuntime:
                 missing_code="mediapipe_gesture_model_missing",
                 running_mode_name="LIVE_STREAM",
                 result_callback=result_callback,
+                num_hands_override=num_hands_override,
             )
             return self._live_gesture_recognizer
 
@@ -314,6 +316,7 @@ class MediaPipeTaskRuntime:
         missing_code: str,
         running_mode_name: str,
         result_callback: Any | None = None,
+        num_hands_override: int | None = None,
     ) -> Any:
         """Create one gesture recognizer with the requested MediaPipe running mode."""
 
@@ -345,7 +348,9 @@ class MediaPipeTaskRuntime:
                 model_bytes=model_bytes,
             ),
             running_mode=selected_running_mode,
-            num_hands=self._validate_num_hands(self.config.num_hands),
+            num_hands=self._validate_num_hands(
+                self.config.num_hands if num_hands_override is None else num_hands_override
+            ),
             min_hand_detection_confidence=self._validate_probability(
                 self.config.min_hand_detection_confidence,
                 name="min_hand_detection_confidence",

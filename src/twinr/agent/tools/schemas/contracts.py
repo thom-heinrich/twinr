@@ -740,7 +740,10 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 "name": "list_smart_home_entities",
                 "description": (
                     "List bounded smart-home entities such as lights, scenes, motion sensors, and device-health endpoints. "
-                    "This tool supports generic selectors, exact scalar state filters, pagination, and simple aggregations, so it can answer both exact device discovery questions and broader house-status queries without a special-case summary tool."
+                    "This tool supports generic selectors, exact scalar state filters, pagination, and simple aggregations, so it can answer both exact device discovery questions and broader house-status queries without a special-case summary tool. "
+                    "Broad live status answers will often call this tool more than once with different selectors or aggregations, for example lights that are on, offline devices, grouped counts by area, or alarm/device-health entities. "
+                    "Avoid using one truncated catch-all listing as the whole house status when narrower filters or grouped counts are available. "
+                    "When a later exact state read is needed, use the returned entity_id values verbatim."
                 ),
                 "parameters": {
                     "type": "object",
@@ -817,7 +820,7 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                             max_items=8,
                         ),
                         "aggregate_by": _array_property(
-                            "Optional entity fields to aggregate counts by.",
+                            "Optional entity fields to aggregate counts by. Prefer this first for broader house-status scans in larger homes before narrowing to exact entity names.",
                             _string_property(
                                 "Aggregate field.",
                                 enum=smart_home_entity_aggregate_fields,
@@ -849,7 +852,8 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 "name": "read_smart_home_state",
                 "description": (
                     "Read the current state for one or more exact smart-home entities after they are already known. "
-                    "Use this for precise questions like whether a light is on, how bright it is, or whether a motion sensor recently fired."
+                    "Use this for precise questions like whether a light is on, how bright it is, or whether a motion sensor recently fired. "
+                    "entity_ids must be exact routed identifiers copied verbatim from smart-home tool results, not IDs invented from labels or classes."
                 ),
                 "parameters": {
                     "type": "object",
@@ -915,7 +919,8 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 "description": (
                     "Read a bounded batch of recent normalized smart-home events such as motion detections, button presses, connectivity changes, or alarm state changes. "
                     "Use this for explicit inspection or debugging of the current stream. "
-                    "It supports generic event selectors and simple aggregations instead of a hardcoded status-summary path."
+                    "It supports generic event selectors and simple aggregations instead of a hardcoded status-summary path. "
+                    "For broader live house-status answers, pair this with list_smart_home_entities instead of treating the recent event batch as the whole current state."
                 ),
                 "parameters": {
                     "type": "object",

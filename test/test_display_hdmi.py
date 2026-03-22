@@ -14,6 +14,7 @@ from PIL import Image, ImageChops
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCue
 from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.display.face_cues import DisplayFaceCue
 from twinr.display.face_expressions import (
@@ -738,6 +739,92 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
 
         self.assertIsNotNone(panel_diff.getbbox())
         self.assertGreater(sum(1 for pixel in panel_diff.getdata() if max(pixel) >= 24), 1200)
+
+    def test_default_scene_renders_ambient_impulse_card_into_reserved_area(self) -> None:
+        display = self.make_display()
+        base_scene = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+        )
+        scene = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+            ambient_impulse_cue=DisplayAmbientImpulseCue(
+                topic_key="ai companions",
+                headline="Ich habe zu AI companions heute etwas gelesen. Was meinst du?",
+                body="Dann weiss ich besser, ob ich dranbleiben soll.",
+                symbol="question",
+                accent="warm",
+                action="ask_one",
+            ),
+        )
+        base = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+        )
+        with_impulse = display.render_status_image(
+            status="waiting",
+            headline="Waiting",
+            details=("Internet ok", "AI ok"),
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            log_sections=(),
+            animation_frame=0,
+            ambient_impulse_cue=DisplayAmbientImpulseCue(
+                topic_key="ai companions",
+                headline="Ich habe zu AI companions heute etwas gelesen. Was meinst du?",
+                body="Dann weiss ich besser, ob ich dranbleiben soll.",
+                symbol="question",
+                accent="warm",
+                action="ask_one",
+            ),
+        )
+
+        panel_diff = ImageChops.difference(base.crop(scene.layout.panel_box), with_impulse.crop(scene.layout.panel_box))
+
+        self.assertIsNotNone(panel_diff.getbbox())
+        self.assertGreater(sum(1 for pixel in panel_diff.getdata() if max(pixel) >= 24), 2000)
+        self.assertGreater(
+            scene.layout.panel_box[2] - scene.layout.panel_box[0],
+            base_scene.layout.panel_box[2] - base_scene.layout.panel_box[0],
+        )
 
     def test_render_emoji_glyph_emits_once_when_font_is_missing(self) -> None:
         emitted: list[str] = []

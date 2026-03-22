@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
+from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCue
 from twinr.display.contracts import DisplayStateFields
 from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.display.face_cues import DisplayFaceCue
@@ -23,6 +24,7 @@ from twinr.display.hdmi_presentation_graph import (
     HdmiPresentationSceneGraphBuilder,
 )
 from twinr.display.presentation_cues import DisplayPresentationCue
+from twinr.display.reserve_bus import DisplayReserveBusState, resolve_display_reserve_bus
 
 
 _STATE_CARD_ORDER = ("Status", "Internet", "AI", "System", "Zeit", "Hinweis")
@@ -88,6 +90,9 @@ class HdmiStatusPanelModel:
     headline: str
     helper_text: str
     cards: tuple[HdmiSceneCard, ...]
+    symbol: str | None = None
+    accent: str = "neutral"
+    prompt_mode: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +127,7 @@ class HdmiDefaultScene:
     ticker: HdmiNewsTickerModel | None = None
     face_cue: DisplayFaceCue | None = None
     emoji_cue: DisplayEmojiCue | None = None
+    reserve_bus: DisplayReserveBusState | None = None
     ambient_moment: HdmiAmbientMoment | None = None
     presentation_graph: HdmiPresentationSceneGraph | None = None
 
@@ -297,6 +303,7 @@ class HdmiDefaultSceneRenderer:
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
+        ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         presentation_now: datetime | None = None,
         ambient_now: datetime | None = None,
@@ -314,6 +321,7 @@ class HdmiDefaultSceneRenderer:
             animation_frame=animation_frame,
             face_cue=face_cue,
             emoji_cue=emoji_cue,
+            ambient_impulse_cue=ambient_impulse_cue,
             presentation_cue=presentation_cue,
             presentation_now=presentation_now,
             ambient_now=ambient_now,
@@ -343,9 +351,11 @@ class HdmiDefaultSceneRenderer:
                 queued_count=len(graph.queued_cards),
             )
             return
-        self._draw_status_panel(draw, box=scene.layout.panel_box, panel=scene.panel, compact=scene.layout.compact_panel)
-        if scene.emoji_cue is not None:
-            self._draw_emoji_reserve(image, draw, box=scene.layout.panel_box, emoji_cue=scene.emoji_cue)
+        reserve_bus = scene.reserve_bus or DisplayReserveBusState.empty()
+        if reserve_bus.owner != "emoji":
+            self._draw_status_panel(draw, box=scene.layout.panel_box, panel=scene.panel, compact=scene.layout.compact_panel)
+        if reserve_bus.owner == "emoji" and reserve_bus.emoji_cue is not None:
+            self._draw_emoji_reserve(image, draw, box=scene.layout.panel_box, emoji_cue=reserve_bus.emoji_cue)
         if scene.ticker is not None:
             self._draw_news_ticker(draw, box=scene.layout.ticker_box, ticker=scene.ticker)
 
@@ -362,6 +372,7 @@ class HdmiDefaultSceneRenderer:
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
+        ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
         presentation_now: datetime | None = None,
         ambient_now: datetime | None = None,
@@ -369,7 +380,12 @@ class HdmiDefaultSceneRenderer:
         """Build the scene model so layout and content can evolve independently."""
 
         ticker = self._build_ticker_model(ticker_text)
-        layout = self._layout_for_size(width=width, height=height, reserve_ticker=ticker is not None)
+        layout = self._layout_for_size(
+            width=width,
+            height=height,
+            reserve_ticker=ticker is not None,
+            reserve_card_active=ambient_impulse_cue is not None and presentation_cue is None,
+        )
         presentation_graph = self._presentation_graph(
             cue=presentation_cue,
             layout=layout,
@@ -387,6 +403,12 @@ class HdmiDefaultSceneRenderer:
         if resolved_face_cue is None and ambient_moment is not None:
             resolved_face_cue = ambient_moment.face_cue
         resolved_face_cue = self._effective_face_cue(status=status, face_cue=resolved_face_cue)
+        reserve_bus = DisplayReserveBusState.empty(reason="presentation_surface_owned")
+        if presentation_graph is None:
+            reserve_bus = resolve_display_reserve_bus(
+                emoji_cue=emoji_cue,
+                ambient_impulse_cue=ambient_impulse_cue,
+            )
         return HdmiDefaultScene(
             status=status,
             animation_frame=animation_frame,
@@ -396,10 +418,11 @@ class HdmiDefaultSceneRenderer:
                 headline=headline,
                 state_fields=state_fields,
             ),
-            panel=self._build_panel_model(),
+            panel=self._build_panel_model(reserve_bus=reserve_bus),
             ticker=None if presentation_graph is not None else ticker,
             face_cue=resolved_face_cue,
-            emoji_cue=emoji_cue if presentation_graph is None else None,
+            emoji_cue=reserve_bus.emoji_cue,
+            reserve_bus=reserve_bus,
             ambient_moment=ambient_moment,
             presentation_graph=presentation_graph,
         )
@@ -427,7 +450,14 @@ class HdmiDefaultSceneRenderer:
             blink=face_cue.blink,
         )
 
-    def _layout_for_size(self, *, width: int, height: int, reserve_ticker: bool) -> HdmiDefaultSceneLayout:
+    def _layout_for_size(
+        self,
+        *,
+        width: int,
+        height: int,
+        reserve_ticker: bool,
+        reserve_card_active: bool = False,
+    ) -> HdmiDefaultSceneLayout:
         if width < 560 or height < 320:
             header_box = (12, 10, width - 12, 56)
             if reserve_ticker:
@@ -447,13 +477,24 @@ class HdmiDefaultSceneRenderer:
             header_bottom = 60 if widescreen else 58 if compact_hdmi else 66
             content_top = 78 if widescreen else 76 if compact_hdmi else 86
             panel_gap = 34 if widescreen else 30 if compact_hdmi else 24
-            panel_width = (
-                min(620, max(420, int(content_width * 0.40)))
-                if widescreen
-                else min(336, max(316, int(content_width * 0.43)))
-                if compact_hdmi
-                else min(392, max(348, int(content_width * 0.46)))
-            )
+            if widescreen:
+                panel_width = (
+                    min(700, max(468, int(content_width * 0.45)))
+                    if reserve_card_active
+                    else min(620, max(420, int(content_width * 0.40)))
+                )
+            elif compact_hdmi:
+                panel_width = (
+                    min(388, max(356, int(content_width * 0.48)))
+                    if reserve_card_active
+                    else min(336, max(316, int(content_width * 0.43)))
+                )
+            else:
+                panel_width = (
+                    min(428, max(376, int(content_width * 0.50)))
+                    if reserve_card_active
+                    else min(392, max(348, int(content_width * 0.46)))
+                )
             header_box = (content_left, 18, content_right, header_bottom)
             if reserve_ticker:
                 ticker_box = (content_left, height - 74, content_right, height - 24)
@@ -520,14 +561,30 @@ class HdmiDefaultSceneRenderer:
             system_accent=(116, 242, 170) if system_value == "OK" else (255, 134, 110),
         )
 
-    def _build_panel_model(self) -> HdmiStatusPanelModel:
-        """Keep the right-hand HDMI reserve area empty until a capability uses it."""
+    def _build_panel_model(
+        self,
+        *,
+        reserve_bus: DisplayReserveBusState,
+    ) -> HdmiStatusPanelModel:
+        """Build the optional right-hand reserve card from the active ambient cue."""
 
+        ambient_impulse_cue = reserve_bus.ambient_impulse_cue
+        if ambient_impulse_cue is None:
+            return HdmiStatusPanelModel(
+                eyebrow="",
+                headline="",
+                helper_text="",
+                cards=(),
+            )
+        eyebrow = self.tools._normalise_text(ambient_impulse_cue.eyebrow, fallback="").upper()
         return HdmiStatusPanelModel(
-            eyebrow="",
-            headline="",
-            helper_text="",
+            eyebrow=eyebrow,
+            headline=self.tools._normalise_text(ambient_impulse_cue.headline, fallback=""),
+            helper_text=self.tools._normalise_text(ambient_impulse_cue.body, fallback=""),
             cards=(),
+            symbol=ambient_impulse_cue.glyph(),
+            accent=ambient_impulse_cue.accent,
+            prompt_mode=not eyebrow,
         )
 
     def _build_ticker_model(self, ticker_text: str | None) -> HdmiNewsTickerModel | None:
@@ -694,10 +751,91 @@ class HdmiDefaultSceneRenderer:
         panel: HdmiStatusPanelModel,
         compact: bool,
     ) -> None:
-        """Leave the right-hand area intentionally free for future HDMI capabilities."""
+        """Draw one small calm reserve card for an active ambient impulse cue."""
 
-        _ = (draw, box, panel, compact)
-        return
+        if not panel.headline and not panel.helper_text and not panel.symbol:
+            return
+        left, top, right, bottom = box
+        width = max(0, right - left)
+        height = max(0, bottom - top)
+        if width <= 0 or height <= 0:
+            return
+        radius = 24 if not compact else 18
+        draw.rounded_rectangle(
+            box,
+            radius=radius,
+            fill=(0, 0, 0),
+            outline=(255, 255, 255),
+            width=2,
+        )
+        accent_fill = self._panel_accent_fill(panel.accent)
+        prompt_mode = panel.prompt_mode
+        if prompt_mode:
+            draw.rounded_rectangle(
+                (left + 12, top + 16, left + 18, bottom - 16),
+                radius=3,
+                fill=accent_fill,
+            )
+        else:
+            draw.rounded_rectangle(
+                (left + 12, top + 12, left + 20, top + 20),
+                radius=4,
+                fill=accent_fill,
+            )
+        eyebrow_font = self.tools._font(13 if compact else 15, bold=True)
+        headline_font = self.tools._font(25 if compact else 34, bold=True) if prompt_mode else self.tools._font(
+            22 if compact else 28,
+            bold=True,
+        )
+        body_font = self.tools._font(15 if compact else 18, bold=False)
+        padding_x = 20 if compact else 24
+        padding_y = 18 if compact else 22
+        text_left = left + padding_x
+        text_top = top + padding_y
+        inner_width = max(56, width - (padding_x * 2))
+        if panel.symbol and not prompt_mode:
+            symbol_font = self.tools._font(22 if compact else 26, bold=False)
+            draw.text((text_left, text_top - 2), panel.symbol, fill=accent_fill, font=symbol_font)
+            symbol_width = self.tools._text_width(draw, panel.symbol, font=symbol_font)
+            eyebrow_x = text_left + symbol_width + 10
+        else:
+            eyebrow_x = text_left
+        if panel.eyebrow:
+            draw.text((eyebrow_x, text_top), panel.eyebrow, fill=(182, 182, 182), font=eyebrow_font)
+            text_top += self.tools._text_height(draw, font=eyebrow_font) + (12 if compact else 14)
+        headline_lines = self.tools._wrapped_lines(
+            draw,
+            (panel.headline,),
+            max_width=inner_width,
+            font=headline_font,
+            max_lines=4 if prompt_mode and not panel.helper_text else 3 if prompt_mode else 2,
+        )
+        for line in headline_lines:
+            draw.text((text_left, text_top), line, fill=(255, 255, 255), font=headline_font)
+            text_top += self.tools._text_height(draw, font=headline_font) + (3 if prompt_mode else 2)
+        body_lines = self.tools._wrapped_lines(
+            draw,
+            (panel.helper_text,),
+            max_width=inner_width,
+            font=body_font,
+            max_lines=2 if prompt_mode else 3 if not compact else 2,
+        )
+        if body_lines:
+            text_top += 8 if prompt_mode else 6
+        for line in body_lines:
+            draw.text((text_left, text_top), line, fill=(214, 214, 214), font=body_font)
+            text_top += self.tools._text_height(draw, font=body_font) + 2
+
+    def _panel_accent_fill(self, accent: str) -> tuple[int, int, int]:
+        """Return a calm accent color for the ambient reserve card."""
+
+        mapping = {
+            "neutral": (224, 224, 224),
+            "info": (112, 168, 255),
+            "success": (116, 242, 170),
+            "warm": (255, 190, 98),
+        }
+        return mapping.get(accent, (224, 224, 224))
 
     def _rows_need_compact(self, box: tuple[int, int, int, int]) -> bool:
         """Return whether the remaining status-card area is too small for a two-by-two grid."""

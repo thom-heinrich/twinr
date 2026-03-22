@@ -20,6 +20,10 @@ import time
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshot, RuntimeSnapshotStore
+from twinr.display.ambient_impulse_cues import (
+    DisplayAmbientImpulseCue,
+    DisplayAmbientImpulseCueStore,
+)
 from twinr.display.contracts import TwinrDisplayAdapter
 from twinr.display.debug_log import LogSections, TwinrDisplayDebugLogBuilder
 from twinr.display.emoji_cues import DisplayEmojiCue, DisplayEmojiCueStore
@@ -28,6 +32,7 @@ from twinr.display.factory import create_display_adapter
 from twinr.display.heartbeat import DisplayHeartbeatStore, save_display_heartbeat
 from twinr.display.news_ticker import DisplayNewsTickerRuntime
 from twinr.display.presentation_cues import DisplayPresentationCue, DisplayPresentationStore
+from twinr.display.reserve_bus import resolve_display_reserve_bus
 from twinr.display.respeaker_hci import DisplayReSpeakerHciStore
 from twinr.ops.health import TwinrSystemHealth, collect_system_health
 
@@ -118,6 +123,7 @@ class TwinrStatusDisplayLoop:
     heartbeat_store: DisplayHeartbeatStore | None = None
     face_cue_store: DisplayFaceCueStore | None = None
     emoji_cue_store: DisplayEmojiCueStore | None = None
+    ambient_impulse_cue_store: DisplayAmbientImpulseCueStore | None = None
     presentation_cue_store: DisplayPresentationStore | None = None
     news_ticker_runtime: DisplayNewsTickerRuntime | None = None
     respeaker_hci_store: DisplayReSpeakerHciStore | None = None
@@ -167,6 +173,7 @@ class TwinrStatusDisplayLoop:
             heartbeat_store=DisplayHeartbeatStore.from_config(config),
             face_cue_store=DisplayFaceCueStore.from_config(config),
             emoji_cue_store=DisplayEmojiCueStore.from_config(config),
+            ambient_impulse_cue_store=DisplayAmbientImpulseCueStore.from_config(config),
             presentation_cue_store=DisplayPresentationStore.from_config(config),
             news_ticker_runtime=DisplayNewsTickerRuntime.from_config(config, emit=emit or _default_emit),
             respeaker_hci_store=DisplayReSpeakerHciStore.from_config(config),
@@ -201,6 +208,7 @@ class TwinrStatusDisplayLoop:
                 frame = self._display_animation_frame(status)
                 face_cue = self._active_face_cue()
                 emoji_cue = self._active_emoji_cue()
+                ambient_impulse_cue = self._active_ambient_impulse_cue()
                 presentation_cue = self._active_presentation_cue()
                 ticker_text = self._ticker_text()
                 signature = self._render_signature(
@@ -213,6 +221,7 @@ class TwinrStatusDisplayLoop:
                     animation_frame=frame,
                     face_cue=face_cue,
                     emoji_cue=emoji_cue,
+                    ambient_impulse_cue=ambient_impulse_cue,
                     presentation_cue=presentation_cue,
                 )
                 if self._should_render_signature(status=status, signature=signature, last_signature=last_signature):
@@ -228,6 +237,7 @@ class TwinrStatusDisplayLoop:
                         animation_frame=frame,
                         face_cue=face_cue,
                         emoji_cue=emoji_cue,
+                        ambient_impulse_cue=ambient_impulse_cue,
                         presentation_cue=presentation_cue,
                     ):
                         self._emit_display_status(status=status, presentation_cue=presentation_cue)
@@ -557,6 +567,7 @@ class TwinrStatusDisplayLoop:
         animation_frame: int,
         face_cue: DisplayFaceCue | None,
         emoji_cue: DisplayEmojiCue | None,
+        ambient_impulse_cue: DisplayAmbientImpulseCue | None,
         presentation_cue: DisplayPresentationCue | None,
     ) -> bool:
         try:
@@ -570,6 +581,7 @@ class TwinrStatusDisplayLoop:
                 animation_frame=animation_frame,
                 face_cue=face_cue,
                 emoji_cue=emoji_cue,
+                ambient_impulse_cue=ambient_impulse_cue,
                 presentation_cue=presentation_cue,
             )
             return True
@@ -589,6 +601,7 @@ class TwinrStatusDisplayLoop:
                     animation_frame=animation_frame,
                     face_cue=face_cue,
                     emoji_cue=emoji_cue,
+                    ambient_impulse_cue=ambient_impulse_cue,
                     presentation_cue=presentation_cue,
                 )
                 return True
@@ -759,13 +772,17 @@ class TwinrStatusDisplayLoop:
         animation_frame: int,
         face_cue: DisplayFaceCue | None,
         emoji_cue: DisplayEmojiCue | None,
+        ambient_impulse_cue: DisplayAmbientImpulseCue | None,
         presentation_cue: DisplayPresentationCue | None,
     ) -> tuple[object, ...]:
         layout_mode = self._display_layout()
         if layout_mode == "debug_log":
             return (layout_mode, status, headline, log_sections)
         cue_signature = face_cue.signature() if face_cue is not None else None
-        emoji_signature = emoji_cue.signature() if emoji_cue is not None else None
+        reserve_signature = resolve_display_reserve_bus(
+            emoji_cue=emoji_cue,
+            ambient_impulse_cue=ambient_impulse_cue,
+        ).signature()
         presentation_signature = presentation_cue.signature() if presentation_cue is not None else None
         presentation_bucket = presentation_cue.transition_bucket() if presentation_cue is not None else None
         return (
@@ -778,7 +795,7 @@ class TwinrStatusDisplayLoop:
             log_sections,
             animation_frame,
             cue_signature,
-            emoji_signature,
+            reserve_signature,
             presentation_signature,
             presentation_bucket,
         )
@@ -874,6 +891,18 @@ class TwinrStatusDisplayLoop:
             return store.load_active()
         except Exception as exc:
             self._emit_error("display_presentation_cue_load_failed", exc)
+            return None
+
+    def _active_ambient_impulse_cue(self) -> DisplayAmbientImpulseCue | None:
+        if self._display_layout() != "default":
+            return None
+        store = self.ambient_impulse_cue_store
+        if store is None:
+            return None
+        try:
+            return store.load_active()
+        except Exception as exc:
+            self._emit_error("display_ambient_impulse_cue_load_failed", exc)
             return None
 
     def _debug_log_builder(self) -> TwinrDisplayDebugLogBuilder:

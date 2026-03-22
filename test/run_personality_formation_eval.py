@@ -64,6 +64,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.base_agent.contracts import AgentToolCall, AgentToolResult
+from twinr.agent.personality.evolution import _default_humor_profile, _default_style_profile
 from twinr.agent.personality.intelligence import (
     RemoteStateWorldIntelligenceStore,
     WorldFeedSubscription,
@@ -154,8 +155,18 @@ class EvalDaySpec:
 
     name: str
     raw_turns: tuple[RawTurnSpec, ...]
+    open_conversations: tuple["OpenConversationSpec", ...]
     structured_learning: tuple[StructuredLearningSpec, ...]
     tool_history: tuple[ToolHistorySpec, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OpenConversationSpec:
+    """Describe one freer multi-turn conversation inside the bounded eval."""
+
+    name: str
+    topic: str
+    turns: tuple[RawTurnSpec, ...]
 
 
 def _source_ref(turn_id: str) -> LongTermSourceRefV1:
@@ -230,23 +241,37 @@ def _default_eval_days(*, now: datetime | None = None) -> tuple[EvalDaySpec, ...
                     response="I will remember that Janina has that appointment.",
                     occurred_at=day_1 + timedelta(minutes=5),
                 ),
-                RawTurnSpec(
-                    name="style_verbosity_free_1",
-                    transcript="When you answer me, shorter and calmer usually helps me more than a lot at once.",
-                    response="I will keep answers shorter and calmer by default.",
-                    occurred_at=day_1 + timedelta(minutes=10),
-                ),
-                RawTurnSpec(
-                    name="style_initiative_free_1",
-                    transcript="If you sometimes ask one small follow-up when it really helps, that usually works well for me.",
-                    response="I can occasionally bring one small helpful follow-up.",
-                    occurred_at=day_1 + timedelta(minutes=15),
-                ),
-                RawTurnSpec(
-                    name="humor_feedback_free_1",
-                    transcript="That small dry joke actually worked for me.",
-                    response="I will remember that this kind of quiet dry humor can land well here.",
-                    occurred_at=day_1 + timedelta(minutes=20),
+            ),
+            open_conversations=(
+                OpenConversationSpec(
+                    name="open_ai_companions_session",
+                    topic="AI companions",
+                    turns=(
+                        RawTurnSpec(
+                            name="open_ai_companions_opening",
+                            transcript="What has actually changed lately with AI companions when you ignore the hype and look at everyday life?",
+                            response="What keeps standing out is the shift from flashy demos toward quieter daily usefulness.",
+                            occurred_at=day_1 + timedelta(minutes=10),
+                        ),
+                        RawTurnSpec(
+                            name="open_ai_companions_shorter_calmer",
+                            transcript="That makes sense. The shorter, calmer version helps me more than a big download, and one practical angle is enough.",
+                            response="Then I will keep that topic brief and practical by default.",
+                            occurred_at=day_1 + timedelta(minutes=13),
+                        ),
+                        RawTurnSpec(
+                            name="open_ai_companions_humor_lands",
+                            transcript="Your little line about AI companions not needing a cape actually worked for me.",
+                            response="I will keep that dry kind of humor light and occasional.",
+                            occurred_at=day_1 + timedelta(minutes=16),
+                        ),
+                        RawTurnSpec(
+                            name="open_ai_companions_one_follow_up",
+                            transcript="If you want, one small follow-up question is fine when it genuinely helps the point land.",
+                            response="Then I can occasionally add one calm follow-up when it earns its place.",
+                            occurred_at=day_1 + timedelta(minutes=19),
+                        ),
+                    ),
                 ),
             ),
             structured_learning=(
@@ -295,24 +320,37 @@ def _default_eval_days(*, now: datetime | None = None) -> tuple[EvalDaySpec, ...
         ),
         EvalDaySpec(
             name="day_2_personality_forming_and_boundaries",
-            raw_turns=(
-                RawTurnSpec(
-                    name="style_verbosity_free_2",
-                    transcript="The short and clear way from earlier still fits me best.",
-                    response="I will keep that shorter style active.",
-                    occurred_at=day_2 + timedelta(minutes=9),
-                ),
-                RawTurnSpec(
-                    name="style_initiative_free_2",
-                    transcript="You can occasionally suggest one next step when it is genuinely useful.",
-                    response="I can stay gently proactive in relaxed moments.",
-                    occurred_at=day_2 + timedelta(minutes=12),
-                ),
-                RawTurnSpec(
-                    name="humor_feedback_free_2",
-                    transcript="That second understated dry joke also landed well with me.",
-                    response="I will keep that humor available sparingly.",
-                    occurred_at=day_2 + timedelta(minutes=15),
+            raw_turns=(),
+            open_conversations=(
+                OpenConversationSpec(
+                    name="open_world_politics_session",
+                    topic="world politics",
+                    turns=(
+                        RawTurnSpec(
+                            name="open_world_politics_opening",
+                            transcript="What have you been keeping an eye on in world politics lately, especially around diplomacy?",
+                            response="Mostly diplomacy, de-escalation attempts, and whether people still leave room to step back.",
+                            occurred_at=day_2 + timedelta(minutes=9),
+                        ),
+                        RawTurnSpec(
+                            name="open_world_politics_shorter_steady",
+                            transcript="That steady short version works for me there too. Keep it concise like that.",
+                            response="I will keep that world-politics framing concise and steady.",
+                            occurred_at=day_2 + timedelta(minutes=12),
+                        ),
+                        RawTurnSpec(
+                            name="open_world_politics_one_next_question",
+                            transcript="And one small next question can be useful when it opens the topic instead of pushing it.",
+                            response="I can bring one small follow-up when it helps the conversation breathe.",
+                            occurred_at=day_2 + timedelta(minutes=15),
+                        ),
+                        RawTurnSpec(
+                            name="open_world_politics_humor_lands",
+                            transcript="That dry line about diplomacy being the slow adult in the room also landed with me.",
+                            response="I will keep that understated humor available in calm moments.",
+                            occurred_at=day_2 + timedelta(minutes=18),
+                        ),
+                    ),
                 ),
             ),
             structured_learning=(
@@ -633,6 +671,41 @@ def _persist_raw_turn_with_preview(
         }
 
 
+def _persist_open_conversation_with_preview(
+    service: LongTermMemoryService,
+    conversation: OpenConversationSpec,
+) -> dict[str, object]:
+    """Persist one freer multi-turn conversation and aggregate its learning preview."""
+
+    reflected_objects = 0
+    created_summaries = 0
+    midterm_packets = 0
+    interaction_signal_counts: Counter[str] = Counter()
+    style_signal_counts: Counter[str] = Counter()
+    for turn in conversation.turns:
+        preview = _persist_raw_turn_with_preview(service, turn)
+        reflected_objects += int(preview["reflected_objects"])
+        created_summaries += int(preview["created_summaries"])
+        midterm_packets += int(preview["midterm_packets"])
+        interaction_signal_counts.update(preview["interaction_signal_counts"])
+        style_signal_counts.update(preview["style_signal_counts"])
+    return {
+        "turn_names": [turn.name for turn in conversation.turns],
+        "turn_count": len(conversation.turns),
+        "reflected_objects": reflected_objects,
+        "created_summaries": created_summaries,
+        "midterm_packets": midterm_packets,
+        "interaction_signal_counts": {
+            key: int(value)
+            for key, value in sorted(interaction_signal_counts.items())
+        },
+        "style_signal_counts": {
+            key: int(value)
+            for key, value in sorted(style_signal_counts.items())
+        },
+    }
+
+
 def _consolidation_result_from_structured_spec(spec: StructuredLearningSpec) -> LongTermConsolidationResultV1:
     """Build one typed consolidation result for a structured learning spec."""
 
@@ -824,6 +897,21 @@ def _behavior_changes(
     return changes
 
 
+def _metric_shift(
+    *,
+    initial_value: object | None,
+    final_value: object | None,
+    emergence_baseline: float,
+) -> float | None:
+    """Return a stable shift, treating profile emergence as baseline drift."""
+
+    if final_value is None:
+        return None
+    if initial_value is None:
+        return round(float(final_value) - emergence_baseline, 4)
+    return round(float(final_value) - float(initial_value), 4)
+
+
 def _reflection_metrics(service: LongTermMemoryService) -> dict[str, object]:
     """Summarize the current long-term reflection-bearing object state."""
 
@@ -862,6 +950,9 @@ def _build_evaluation_summary(
     total_reflected_objects: int,
     total_created_summaries: int,
     raw_style_signal_counts: Mapping[str, int],
+    open_conversation_count: int,
+    open_conversation_turn_count: int,
+    open_conversation_style_signal_counts: Mapping[str, int],
 ) -> dict[str, object]:
     """Derive one explicit eval verdict from the initial/final checkpoints.
 
@@ -874,32 +965,22 @@ def _build_evaluation_summary(
     - Did that drift become visible in downstream mindshare/engagement policy?
     """
 
-    humor_shift = (
-        None
-        if initial_snapshot_metrics["humor_intensity"] is None or final_snapshot_metrics["humor_intensity"] is None
-        else round(
-            float(final_snapshot_metrics["humor_intensity"])
-            - float(initial_snapshot_metrics["humor_intensity"]),
-            4,
-        )
+    default_style = _default_style_profile()
+    default_humor = _default_humor_profile()
+    humor_shift = _metric_shift(
+        initial_value=initial_snapshot_metrics["humor_intensity"],
+        final_value=final_snapshot_metrics["humor_intensity"],
+        emergence_baseline=default_humor.intensity,
     )
-    verbosity_shift = (
-        None
-        if initial_snapshot_metrics["verbosity"] is None or final_snapshot_metrics["verbosity"] is None
-        else round(
-            float(final_snapshot_metrics["verbosity"])
-            - float(initial_snapshot_metrics["verbosity"]),
-            4,
-        )
+    verbosity_shift = _metric_shift(
+        initial_value=initial_snapshot_metrics["verbosity"],
+        final_value=final_snapshot_metrics["verbosity"],
+        emergence_baseline=default_style.verbosity,
     )
-    initiative_shift = (
-        None
-        if initial_snapshot_metrics["initiative"] is None or final_snapshot_metrics["initiative"] is None
-        else round(
-            float(final_snapshot_metrics["initiative"])
-            - float(initial_snapshot_metrics["initiative"]),
-            4,
-        )
+    initiative_shift = _metric_shift(
+        initial_value=initial_snapshot_metrics["initiative"],
+        final_value=final_snapshot_metrics["initiative"],
+        emergence_baseline=default_style.initiative,
     )
     behavior_changes = _behavior_changes(initial=initial_behavior, final=final_behavior)
     relationship_topics_changed = (
@@ -935,11 +1016,35 @@ def _build_evaluation_summary(
     raw_verbosity_signal_count = int(raw_style_signal_counts.get("verbosity_preference", 0))
     raw_initiative_signal_count = int(raw_style_signal_counts.get("initiative_preference", 0))
     raw_humor_signal_count = int(raw_style_signal_counts.get("humor_feedback", 0))
+    open_conversation_verbosity_signal_count = int(
+        open_conversation_style_signal_counts.get("verbosity_preference", 0)
+    )
+    open_conversation_initiative_signal_count = int(
+        open_conversation_style_signal_counts.get("initiative_preference", 0)
+    )
+    open_conversation_humor_signal_count = int(
+        open_conversation_style_signal_counts.get("humor_feedback", 0)
+    )
     verbosity_forming_proven = bool(raw_verbosity_signal_count > 0 and (verbosity_shift or 0.0) < 0.0)
     initiative_forming_proven = bool(raw_initiative_signal_count > 0 and (initiative_shift or 0.0) > 0.0)
     humor_forming_proven = bool(raw_humor_signal_count > 0 and (humor_shift or 0.0) > 0.0)
     style_axes_forming_proven = bool(
         verbosity_forming_proven and initiative_forming_proven and humor_forming_proven
+    )
+    open_conversation_style_learning_nonzero = bool(
+        open_conversation_count > 0
+        and open_conversation_turn_count > 0
+        and (
+            open_conversation_verbosity_signal_count > 0
+            or open_conversation_initiative_signal_count > 0
+            or open_conversation_humor_signal_count > 0
+        )
+    )
+    free_multiturn_style_forming_proven = bool(
+        style_axes_forming_proven
+        and open_conversation_verbosity_signal_count > 0
+        and open_conversation_initiative_signal_count > 0
+        and open_conversation_humor_signal_count > 0
     )
     personality_forming_proven = bool(
         personality_drift_nonzero and downstream_behavior_changed
@@ -969,10 +1074,19 @@ def _build_evaluation_summary(
             "initiative_preference": raw_initiative_signal_count,
             "humor_feedback": raw_humor_signal_count,
         },
+        "open_conversation_count": int(open_conversation_count),
+        "open_conversation_turn_count": int(open_conversation_turn_count),
+        "open_conversation_style_signal_counts": {
+            "verbosity_preference": open_conversation_verbosity_signal_count,
+            "initiative_preference": open_conversation_initiative_signal_count,
+            "humor_feedback": open_conversation_humor_signal_count,
+        },
+        "open_conversation_style_learning_nonzero": open_conversation_style_learning_nonzero,
         "verbosity_forming_proven": verbosity_forming_proven,
         "initiative_forming_proven": initiative_forming_proven,
         "humor_forming_proven": humor_forming_proven,
         "style_axes_forming_proven": style_axes_forming_proven,
+        "free_multiturn_style_forming_proven": free_multiturn_style_forming_proven,
         "snapshot_exists_after_run": bool(final_snapshot_metrics["exists"]),
     }
 
@@ -1000,6 +1114,9 @@ def run_eval(
     total_reflected_objects = 0
     total_created_summaries = 0
     raw_style_signal_counts: Counter[str] = Counter()
+    open_conversation_style_signal_counts: Counter[str] = Counter()
+    open_conversation_count = 0
+    open_conversation_turn_count = 0
     started = time.monotonic()
 
     with tempfile.TemporaryDirectory(prefix="twinr_personality_eval_") as temp_dir:
@@ -1059,6 +1176,7 @@ def run_eval(
                 raw_turn_names: list[str] = []
                 structured_names: list[str] = []
                 tool_names: list[str] = []
+                open_conversation_reports: list[dict[str, object]] = []
                 day_reflected_objects = 0
                 day_created_summaries = 0
                 day_midterm_packets = 0
@@ -1076,6 +1194,30 @@ def run_eval(
                     day_interaction_signal_counts.update(preview["interaction_signal_counts"])
                     day_style_signal_counts.update(preview["style_signal_counts"])
                     raw_turn_names.append(turn.name)
+                for conversation in day.open_conversations:
+                    _emit_progress(
+                        enabled=emit_progress,
+                        message=f"{day.name}: open_conversation {conversation.name}",
+                    )
+                    preview = _persist_open_conversation_with_preview(service, conversation)
+                    open_conversation_count += 1
+                    open_conversation_turn_count += int(preview["turn_count"])
+                    day_reflected_objects += int(preview["reflected_objects"])
+                    day_created_summaries += int(preview["created_summaries"])
+                    day_midterm_packets += int(preview["midterm_packets"])
+                    day_interaction_signal_counts.update(preview["interaction_signal_counts"])
+                    day_style_signal_counts.update(preview["style_signal_counts"])
+                    open_conversation_style_signal_counts.update(preview["style_signal_counts"])
+                    open_conversation_reports.append(
+                        {
+                            "name": conversation.name,
+                            "topic": conversation.topic,
+                            "turn_names": preview["turn_names"],
+                            "turn_count": int(preview["turn_count"]),
+                            "interaction_signal_counts": preview["interaction_signal_counts"],
+                            "style_signal_counts": preview["style_signal_counts"],
+                        }
+                    )
                 for structured in day.structured_learning:
                     _emit_progress(
                         enabled=emit_progress,
@@ -1108,6 +1250,7 @@ def run_eval(
                     {
                         "day": day.name,
                         "raw_turns": raw_turn_names,
+                        "open_conversations": open_conversation_reports,
                         "structured_learning": structured_names,
                         "tool_history": tool_names,
                         "reflection": {
@@ -1180,6 +1323,12 @@ def run_eval(
             key: int(value)
             for key, value in sorted(raw_style_signal_counts.items())
         },
+        open_conversation_count=open_conversation_count,
+        open_conversation_turn_count=open_conversation_turn_count,
+        open_conversation_style_signal_counts={
+            key: int(value)
+            for key, value in sorted(open_conversation_style_signal_counts.items())
+        },
     )
     report = {
         "recorded_at": _utcnow_iso(),
@@ -1213,6 +1362,7 @@ def run_eval(
         evaluation["reflection_semantic_richness_nonzero"]
         and evaluation["personality_forming_proven"]
         and evaluation["style_axes_forming_proven"]
+        and evaluation["free_multiturn_style_forming_proven"]
     )
     return report
 

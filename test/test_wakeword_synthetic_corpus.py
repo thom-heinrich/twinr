@@ -20,6 +20,7 @@ from twinr.proactive.wakeword.synthetic_corpus import (
     float_audio_to_pcm16,
     hash_to_split,
     manifest_row_for_request,
+    normalize_synthetic_labels,
     render_wakeword_phrase,
     shard_speakers,
     synthesize_phrase_inventory,
@@ -88,6 +89,25 @@ class SyntheticCorpusTests(unittest.TestCase):
             shard_count=1,
         )
         self.assertEqual(len(requests), 26)
+
+    def test_normalize_synthetic_labels_accepts_all_and_deduplicates(self) -> None:
+        self.assertEqual(normalize_synthetic_labels(("positive", "negative")), ("positive", "negative"))
+        self.assertEqual(normalize_synthetic_labels(("negative", "negative")), ("negative",))
+        self.assertEqual(normalize_synthetic_labels(("all",)), ("positive", "negative"))
+
+    def test_build_plan_can_filter_negative_only(self) -> None:
+        requests = build_qwen3tts_synthetic_corpus_plan(
+            speakers=("vivian",),
+            seeds=(11,),
+            style_profiles=DEFAULT_STYLE_PROFILES[:1],
+            generation_profiles=DEFAULT_GENERATION_PROFILES[:1],
+            augmentation_profiles=DEFAULT_AUGMENTATION_PROFILES[:1],
+            labels=("negative",),
+            shard_index=0,
+            shard_count=1,
+        )
+        self.assertGreater(len(requests), 0)
+        self.assertEqual({request.label for request in requests}, {"negative"})
 
     def test_apply_augmentation_changes_signal_and_keeps_bounds(self) -> None:
         t = np.linspace(0.0, 1.0, 1600, endpoint=False, dtype=np.float32)

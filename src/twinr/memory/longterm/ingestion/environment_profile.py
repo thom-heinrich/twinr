@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.memory.longterm.core.models import LongTermMemoryObjectV1, LongTermReflectionResultV1, LongTermSourceRefV1
+from twinr.memory.longterm.ingestion.environment_stats import iqr, jensen_shannon_divergence, mad, quantile, safe_sigma
 
 
 logger = logging.getLogger(__name__)
@@ -35,16 +36,24 @@ _DEFAULT_TIMEZONE_NAME = "Europe/Berlin"
 _DEFAULT_BASELINE_DAYS = 14
 _DEFAULT_HISTORY_DAYS = 42
 _DEFAULT_MIN_BASELINE_DAYS = 5
+_DEFAULT_LONG_BASELINE_DAYS = 56
 _DEFAULT_EPOCH_MINUTES = 5
 _DEFAULT_TRANSITION_WINDOW_S = 90.0
 _DEFAULT_DAY_START_HOUR = 6
 _DEFAULT_NIGHT_START_HOUR = 22
 _DEFAULT_IQR_MULTIPLIER = 1.5
+_DEFAULT_ACUTE_Z_THRESHOLD = 3.0
+_DEFAULT_ACUTE_EMPIRICAL_Q = 0.01
+_DEFAULT_DRIFT_MIN_SIGMA = 1.5
+_DEFAULT_DRIFT_MIN_DAYS = 5
+_DEFAULT_REGIME_ACCEPT_DAYS = 10
+_DEFAULT_MIN_COVERAGE_RATIO = 0.8
 _MAX_SOURCE_EVENT_IDS = 32
 _SMART_HOME_ENVIRONMENT_DOMAIN = "smart_home_environment"
 _MOTION_SIGNAL_TYPE = "motion_node_activity"
 _HEALTH_SIGNAL_TYPE = "node_health"
 _WEEKDAY_CLASSES = ("all_days", "weekday", "weekend")
+_BASELINE_KINDS = ("short", "long")
 
 
 def _normalize_text(value: object | None) -> str:
@@ -320,6 +329,9 @@ class SmartHomeEnvironmentBaselineStat:
     median: float
     iqr: float
     ewma: float
+    mad: float
+    lower_quantile: float
+    upper_quantile: float
 
     def as_dict(self) -> dict[str, float]:
         """Return the stat bundle as a JSON-safe mapping."""
@@ -328,6 +340,9 @@ class SmartHomeEnvironmentBaselineStat:
             "median": round(self.median, 4),
             "iqr": round(self.iqr, 4),
             "ewma": round(self.ewma, 4),
+            "mad": round(self.mad, 4),
+            "lower_quantile": round(self.lower_quantile, 4),
+            "upper_quantile": round(self.upper_quantile, 4),
         }
 
 
@@ -380,6 +395,7 @@ class SmartHomeEnvironmentBaseline:
     """Describe one rolling baseline built from daily profiles."""
 
     environment_id: str
+    baseline_kind: str
     weekday_class: str
     window_days: int
     sample_count: int
@@ -391,10 +407,14 @@ class SmartHomeEnvironmentBaseline:
         return LongTermMemoryObjectV1(
             memory_id=(
                 f"environment_baseline:{_tokenize_identifier(self.environment_id, fallback='environment')}:"
-                f"{self.weekday_class}:rolling_{self.window_days}d"
+                + (
+                    f"{self.weekday_class}:rolling_{self.window_days}d"
+                    if self.baseline_kind == "short"
+                    else f"{self.baseline_kind}:{self.weekday_class}:rolling_{self.window_days}d"
+                )
             ),
             kind="pattern",
-            summary=f"Rolling smart-home environment baseline for {self.weekday_class} days.",
+            summary=f"Rolling {self.baseline_kind} smart-home environment baseline for {self.weekday_class} days.",
             details="Robust baseline built from prior daily room-agnostic motion markers.",
             source=LongTermSourceRefV1(
                 source_type="sensor_memory",
@@ -404,7 +424,7 @@ class SmartHomeEnvironmentBaseline:
             status="active",
             confidence=min(0.9, 0.42 + (min(self.sample_count, self.window_days) * 0.03)),
             sensitivity="low",
-            slot_key=f"environment_baseline:{self.environment_id}:{self.weekday_class}",
+            slot_key=f"environment_baseline:{self.environment_id}:{self.baseline_kind}:{self.weekday_class}",
             value_key="environment_baseline",
             valid_from=valid_from.isoformat(),
             valid_to=valid_to.isoformat(),
@@ -412,6 +432,7 @@ class SmartHomeEnvironmentBaseline:
                 "memory_domain": _SMART_HOME_ENVIRONMENT_DOMAIN,
                 "pattern_type": "environment_baseline",
                 "environment_id": self.environment_id,
+                "baseline_kind": self.baseline_kind,
                 "weekday_class": self.weekday_class,
                 "window_days": self.window_days,
                 "sample_count": self.sample_count,
@@ -431,8 +452,11 @@ class SmartHomeEnvironmentDeviationMetric:
     observed: float
     baseline_median: float
     delta_ratio: float
+    robust_z: float | None = None
+    lower_quantile: float | None = None
+    upper_quantile: float | None = None
 
-    def as_dict(self) -> dict[str, float | str]:
+    def as_dict(self) -> dict[str, float | str | None]:
         """Return the metric payload as a JSON-safe mapping."""
 
         return {
@@ -440,6 +464,9 @@ class SmartHomeEnvironmentDeviationMetric:
             "observed": round(self.observed, 4),
             "baseline_median": round(self.baseline_median, 4),
             "delta_ratio": round(self.delta_ratio, 4),
+            "robust_z": None if self.robust_z is None else round(self.robust_z, 4),
+            "lower_quantile": None if self.lower_quantile is None else round(self.lower_quantile, 4),
+            "upper_quantile": None if self.upper_quantile is None else round(self.upper_quantile, 4),
         }
 
 
@@ -501,6 +528,209 @@ class SmartHomeEnvironmentDeviation:
 
 
 @dataclass(frozen=True, slots=True)
+class SmartHomeEnvironmentDeviationEvent:
+    """Describe one grouped day-level deviation event."""
+
+    environment_id: str
+    observed_at: datetime
+    classification: str
+    severity: str
+    time_scale: str
+    metrics: tuple[SmartHomeEnvironmentDeviationMetric, ...]
+    quality_flags: tuple[str, ...]
+    blocked_by: tuple[str, ...]
+    short_label: str
+    human_readable: str
+
+    def as_memory_object(self, *, event_ids: Sequence[str]) -> LongTermMemoryObjectV1:
+        """Render the grouped deviation event as one memory summary."""
+
+        return LongTermMemoryObjectV1(
+            memory_id=(
+                f"environment_deviation_event:{_tokenize_identifier(self.environment_id, fallback='environment')}:"
+                f"{self.classification}:{self.observed_at.date().isoformat()}"
+            ),
+            kind="summary",
+            summary=f"Smart-home environment {self.classification}: {self.short_label}.",
+            details=self.human_readable,
+            source=LongTermSourceRefV1(
+                source_type="sensor_memory",
+                event_ids=tuple(event_ids[:_MAX_SOURCE_EVENT_IDS]),
+                modality="sensor",
+            ),
+            status="candidate",
+            confidence=0.74 if self.severity == "moderate" else 0.82,
+            sensitivity="low",
+            slot_key=f"environment_deviation_event:{self.environment_id}:{self.classification}:{self.observed_at.date().isoformat()}",
+            value_key=self.classification,
+            valid_from=self.observed_at.date().isoformat(),
+            valid_to=self.observed_at.date().isoformat(),
+            attributes={
+                "memory_domain": _SMART_HOME_ENVIRONMENT_DOMAIN,
+                "summary_type": "environment_deviation_event",
+                "environment_id": self.environment_id,
+                "observed_at": self.observed_at.isoformat(),
+                "classification": self.classification,
+                "severity": self.severity,
+                "time_scale": self.time_scale,
+                "markers": [metric.as_dict() for metric in self.metrics],
+                "quality_flags": list(self.quality_flags),
+                "blocked_by": list(self.blocked_by),
+                "explanation": {
+                    "short_label": self.short_label,
+                    "human_readable": self.human_readable,
+                },
+            },
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SmartHomeEnvironmentQualityState:
+    """Describe one bounded interpretation-quality state for the reference day."""
+
+    environment_id: str
+    observed_at: datetime
+    classification: str
+    quality_flags: tuple[str, ...]
+    blocked_by: tuple[str, ...]
+    evidence_markers: tuple[str, ...]
+    human_readable: str
+
+    def as_memory_object(self, *, event_ids: Sequence[str]) -> LongTermMemoryObjectV1:
+        """Render the quality state as one summary object."""
+
+        return LongTermMemoryObjectV1(
+            memory_id=(
+                f"environment_quality_state:{_tokenize_identifier(self.environment_id, fallback='environment')}:"
+                f"{self.observed_at.date().isoformat()}"
+            ),
+            kind="summary",
+            summary=f"Smart-home environment quality state for {self.observed_at.date().isoformat()}: {self.classification}.",
+            details=self.human_readable,
+            source=LongTermSourceRefV1(
+                source_type="sensor_memory",
+                event_ids=tuple(event_ids[:_MAX_SOURCE_EVENT_IDS]),
+                modality="sensor",
+            ),
+            status="active",
+            confidence=0.84,
+            sensitivity="low",
+            slot_key=f"environment_quality_state:{self.environment_id}",
+            value_key=self.observed_at.date().isoformat(),
+            valid_from=self.observed_at.date().isoformat(),
+            valid_to=self.observed_at.date().isoformat(),
+            attributes={
+                "memory_domain": _SMART_HOME_ENVIRONMENT_DOMAIN,
+                "summary_type": "environment_quality_state",
+                "environment_id": self.environment_id,
+                "observed_at": self.observed_at.isoformat(),
+                "classification": self.classification,
+                "quality_flags": list(self.quality_flags),
+                "blocked_by": list(self.blocked_by),
+                "evidence_markers": list(self.evidence_markers),
+            },
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SmartHomeEnvironmentChangePoint:
+    """Describe one transition into a changed behavior regime."""
+
+    environment_id: str
+    observed_at: datetime
+    change_started_on: date
+    severity: str
+    metrics: tuple[SmartHomeEnvironmentDeviationMetric, ...]
+    quality_flags: tuple[str, ...]
+    blocked_by: tuple[str, ...]
+    human_readable: str
+
+    def as_memory_object(self, *, event_ids: Sequence[str]) -> LongTermMemoryObjectV1:
+        """Render the change-point summary as one memory object."""
+
+        return LongTermMemoryObjectV1(
+            memory_id=(
+                f"environment_change_point:{_tokenize_identifier(self.environment_id, fallback='environment')}:"
+                f"{self.observed_at.date().isoformat()}"
+            ),
+            kind="summary",
+            summary="Smart-home environment transition detected.",
+            details=self.human_readable,
+            source=LongTermSourceRefV1(
+                source_type="sensor_memory",
+                event_ids=tuple(event_ids[:_MAX_SOURCE_EVENT_IDS]),
+                modality="sensor",
+            ),
+            status="candidate",
+            confidence=0.8 if self.severity == "moderate" else 0.86,
+            sensitivity="low",
+            slot_key=f"environment_change_point:{self.environment_id}",
+            value_key=self.observed_at.date().isoformat(),
+            valid_from=self.change_started_on.isoformat(),
+            valid_to=self.observed_at.date().isoformat(),
+            attributes={
+                "memory_domain": _SMART_HOME_ENVIRONMENT_DOMAIN,
+                "summary_type": "environment_change_point",
+                "environment_id": self.environment_id,
+                "observed_at": self.observed_at.isoformat(),
+                "change_started_on": self.change_started_on.isoformat(),
+                "severity": self.severity,
+                "markers": [metric.as_dict() for metric in self.metrics],
+                "quality_flags": list(self.quality_flags),
+                "blocked_by": list(self.blocked_by),
+            },
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SmartHomeEnvironmentRegime:
+    """Describe one accepted new normal for the environment."""
+
+    environment_id: str
+    valid_from_day: date
+    observed_at: datetime
+    severity: str
+    metrics: tuple[SmartHomeEnvironmentDeviationMetric, ...]
+    quality_flags: tuple[str, ...]
+    human_readable: str
+
+    def as_memory_object(self, *, event_ids: Sequence[str]) -> LongTermMemoryObjectV1:
+        """Render the accepted regime as one pattern object."""
+
+        return LongTermMemoryObjectV1(
+            memory_id=(
+                f"environment_regime:{_tokenize_identifier(self.environment_id, fallback='environment')}:"
+                f"{self.valid_from_day.isoformat()}"
+            ),
+            kind="pattern",
+            summary="Accepted smart-home environment regime shift.",
+            details=self.human_readable,
+            source=LongTermSourceRefV1(
+                source_type="sensor_memory",
+                event_ids=tuple(event_ids[:_MAX_SOURCE_EVENT_IDS]),
+                modality="sensor",
+            ),
+            status="active",
+            confidence=0.82 if self.severity == "moderate" else 0.88,
+            sensitivity="low",
+            slot_key=f"environment_regime:{self.environment_id}",
+            value_key=self.valid_from_day.isoformat(),
+            valid_from=self.valid_from_day.isoformat(),
+            valid_to=self.observed_at.date().isoformat(),
+            attributes={
+                "memory_domain": _SMART_HOME_ENVIRONMENT_DOMAIN,
+                "pattern_type": "environment_regime",
+                "environment_id": self.environment_id,
+                "observed_at": self.observed_at.isoformat(),
+                "regime_started_on": self.valid_from_day.isoformat(),
+                "severity": self.severity,
+                "markers": [metric.as_dict() for metric in self.metrics],
+                "quality_flags": list(self.quality_flags),
+            },
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class LongTermEnvironmentProfileCompiler:
     """Compile room-agnostic smart-home environment markers and deviations."""
 
@@ -508,26 +738,114 @@ class LongTermEnvironmentProfileCompiler:
     enabled: bool = False
     environment_id: str = "home:main"
     baseline_days: int = _DEFAULT_BASELINE_DAYS
-    history_days: int = _DEFAULT_HISTORY_DAYS
+    short_baseline_days: int = _DEFAULT_BASELINE_DAYS
+    long_baseline_days: int = _DEFAULT_LONG_BASELINE_DAYS
+    history_days: int = _DEFAULT_LONG_BASELINE_DAYS
     min_baseline_days: int = _DEFAULT_MIN_BASELINE_DAYS
     epoch_minutes: int = _DEFAULT_EPOCH_MINUTES
     transition_window_s: float = _DEFAULT_TRANSITION_WINDOW_S
     day_start_hour: int = _DEFAULT_DAY_START_HOUR
     night_start_hour: int = _DEFAULT_NIGHT_START_HOUR
     iqr_multiplier: float = _DEFAULT_IQR_MULTIPLIER
+    acute_z_threshold: float = _DEFAULT_ACUTE_Z_THRESHOLD
+    acute_empirical_q: float = _DEFAULT_ACUTE_EMPIRICAL_Q
+    drift_min_sigma: float = _DEFAULT_DRIFT_MIN_SIGMA
+    drift_min_days: int = _DEFAULT_DRIFT_MIN_DAYS
+    regime_accept_days: int = _DEFAULT_REGIME_ACCEPT_DAYS
+    min_coverage_ratio: float = _DEFAULT_MIN_COVERAGE_RATIO
+
+    def __post_init__(self) -> None:
+        """Keep legacy direct-instantiation fields backward compatible."""
+
+        if self.short_baseline_days == _DEFAULT_BASELINE_DAYS and self.baseline_days != _DEFAULT_BASELINE_DAYS:
+            object.__setattr__(self, "short_baseline_days", max(7, int(self.baseline_days)))
+        if self.long_baseline_days < self.short_baseline_days:
+            object.__setattr__(self, "long_baseline_days", max(self.short_baseline_days * 2, _DEFAULT_LONG_BASELINE_DAYS))
+        if self.history_days < self.long_baseline_days:
+            object.__setattr__(self, "history_days", max(self.long_baseline_days, self.history_days))
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LongTermEnvironmentProfileCompiler":
         """Build the compiler from Twinr config using the existing sensor-memory gate."""
 
         baseline_days = max(7, int(getattr(config, "long_term_memory_sensor_baseline_days", _DEFAULT_BASELINE_DAYS) or _DEFAULT_BASELINE_DAYS))
-        min_days = max(3, int(getattr(config, "long_term_memory_sensor_min_days_observed", _DEFAULT_MIN_BASELINE_DAYS) or _DEFAULT_MIN_BASELINE_DAYS))
+        short_baseline_days = max(
+            7,
+            int(
+                getattr(config, "long_term_memory_environment_short_baseline_days", baseline_days)
+                or baseline_days
+            ),
+        )
+        long_baseline_days = max(
+            short_baseline_days * 2,
+            int(
+                getattr(config, "long_term_memory_environment_long_baseline_days", _DEFAULT_LONG_BASELINE_DAYS)
+                or _DEFAULT_LONG_BASELINE_DAYS
+            ),
+        )
+        min_days = max(
+            3,
+            int(
+                getattr(config, "long_term_memory_environment_min_baseline_days", getattr(config, "long_term_memory_sensor_min_days_observed", _DEFAULT_MIN_BASELINE_DAYS))
+                or _DEFAULT_MIN_BASELINE_DAYS
+            ),
+        )
         return cls(
             timezone_name=getattr(config, "local_timezone_name", _DEFAULT_TIMEZONE_NAME),
             enabled=bool(getattr(config, "long_term_memory_sensor_memory_enabled", False)),
             baseline_days=baseline_days,
-            history_days=max(_DEFAULT_HISTORY_DAYS, baseline_days * 3),
+            short_baseline_days=short_baseline_days,
+            long_baseline_days=long_baseline_days,
+            history_days=max(_DEFAULT_HISTORY_DAYS, long_baseline_days),
             min_baseline_days=min_days,
+            acute_z_threshold=max(
+                0.5,
+                float(
+                    getattr(config, "long_term_memory_environment_acute_z_threshold", _DEFAULT_ACUTE_Z_THRESHOLD)
+                    or _DEFAULT_ACUTE_Z_THRESHOLD
+                ),
+            ),
+            acute_empirical_q=min(
+                0.2,
+                max(
+                    0.001,
+                    float(
+                        getattr(config, "long_term_memory_environment_acute_empirical_q", _DEFAULT_ACUTE_EMPIRICAL_Q)
+                        or _DEFAULT_ACUTE_EMPIRICAL_Q
+                    ),
+                ),
+            ),
+            drift_min_sigma=max(
+                0.5,
+                float(
+                    getattr(config, "long_term_memory_environment_drift_min_sigma", _DEFAULT_DRIFT_MIN_SIGMA)
+                    or _DEFAULT_DRIFT_MIN_SIGMA
+                ),
+            ),
+            drift_min_days=max(
+                3,
+                int(
+                    getattr(config, "long_term_memory_environment_drift_min_days", _DEFAULT_DRIFT_MIN_DAYS)
+                    or _DEFAULT_DRIFT_MIN_DAYS
+                ),
+            ),
+            regime_accept_days=max(
+                5,
+                int(
+                    getattr(config, "long_term_memory_environment_regime_accept_days", _DEFAULT_REGIME_ACCEPT_DAYS)
+                    or _DEFAULT_REGIME_ACCEPT_DAYS
+                ),
+            ),
+            min_coverage_ratio=min(
+                1.0,
+                max(
+                    0.1,
+                    float(
+                        getattr(config, "long_term_memory_environment_min_coverage_ratio", _DEFAULT_MIN_COVERAGE_RATIO)
+                        or _DEFAULT_MIN_COVERAGE_RATIO
+                    ),
+                ),
+            ),
         )
 
     def compile(
@@ -561,17 +879,37 @@ class LongTermEnvironmentProfileCompiler:
 
             nodes = self._build_nodes(events=relevant_events)
             day_profiles, day_event_ids = self._build_day_profiles(events=relevant_events)
+            day_profiles = self._update_reference_profile_similarity_markers(
+                day_profiles=day_profiles,
+                events=relevant_events,
+                reference_day=reference_day,
+            )
             baselines, baseline_event_ids = self._build_baselines(
                 day_profiles=day_profiles,
                 reference_day=reference_day,
                 day_event_ids=day_event_ids,
+            )
+            quality_state = self._build_quality_state(
+                reference=reference,
+                reference_day=reference_day,
+                events=relevant_events,
+                nodes=nodes,
+                day_profiles=day_profiles,
+                baselines=baselines,
             )
             deviations = self._build_deviations(
                 reference=reference,
                 reference_day=reference_day,
                 day_profiles=day_profiles,
                 baselines=baselines,
-                day_event_ids=day_event_ids,
+                quality_state=quality_state,
+            )
+            change_point, regime = self._build_regime_signals(
+                reference=reference,
+                reference_day=reference_day,
+                day_profiles=day_profiles,
+                baselines=baselines,
+                quality_state=quality_state,
             )
 
             created: list[LongTermMemoryObjectV1] = []
@@ -595,9 +933,27 @@ class LongTermEnvironmentProfileCompiler:
                         event_ids=baseline_event_ids.get(key, ()),
                     )
                 )
+            if quality_state is not None:
+                created.append(
+                    quality_state.as_memory_object(
+                        event_ids=day_event_ids.get(reference_day, ()),
+                    )
+                )
             for deviation in deviations:
                 created.append(
                     deviation.as_memory_object(
+                        event_ids=day_event_ids.get(reference_day, ()),
+                    )
+                )
+            if change_point is not None:
+                created.append(
+                    change_point.as_memory_object(
+                        event_ids=day_event_ids.get(reference_day, ()),
+                    )
+                )
+            if regime is not None:
+                created.append(
+                    regime.as_memory_object(
                         event_ids=day_event_ids.get(reference_day, ()),
                     )
                 )
@@ -833,6 +1189,10 @@ class LongTermEnvironmentProfileCompiler:
         active_followed_count = 0
         active_to_inactive_count = 0
         motion_burst_count = 0
+        active_run_lengths: list[int] = []
+        current_active_run = 0
+        inactive_gap_lengths: list[int] = []
+        current_inactive_gap = 0
         for index, active in enumerate(active_flags):
             if active and (index == 0 or not active_flags[index - 1]):
                 motion_burst_count += 1
@@ -840,6 +1200,20 @@ class LongTermEnvironmentProfileCompiler:
                 active_followed_count += 1
                 if not active_flags[index + 1]:
                     active_to_inactive_count += 1
+            if active:
+                current_active_run += 1
+                if current_inactive_gap > 0:
+                    inactive_gap_lengths.append(current_inactive_gap)
+                    current_inactive_gap = 0
+            else:
+                current_inactive_gap += 1
+                if current_active_run > 0:
+                    active_run_lengths.append(current_active_run)
+                    current_active_run = 0
+        if current_active_run > 0:
+            active_run_lengths.append(current_active_run)
+        if current_inactive_gap > 0:
+            inactive_gap_lengths.append(current_inactive_gap)
 
         transition_count = sum(transition_counts.values())
         mean_active_node_count = (
@@ -847,6 +1221,10 @@ class LongTermEnvironmentProfileCompiler:
             if epochs
             else 0.0
         )
+        interval_minutes = [
+            max(0.0, (later.observed_at - earlier.observed_at).total_seconds() / 60.0)
+            for earlier, later in zip(motion_events, motion_events[1:])
+        ]
 
         health_by_node: dict[str, str] = {}
         for event in health_events:
@@ -872,11 +1250,112 @@ class LongTermEnvironmentProfileCompiler:
             "transition_entropy_day": round(_entropy_from_counts(transition_counts), 4),
             "fragmentation_index_day": round((active_to_inactive_count / active_followed_count) if active_followed_count else 0.0, 4),
             "motion_burst_count_day": motion_burst_count,
+            "inter_event_interval_median_day": None if not interval_minutes else round(float(median(interval_minutes)), 4),
+            "inter_event_interval_iqr_day": None if len(interval_minutes) < 2 else round(iqr(interval_minutes), 4),
+            "active_epoch_run_length_median_day": None if not active_run_lengths else round(float(median(active_run_lengths)) * self.epoch_minutes, 4),
+            "inactive_gap_entropy_day": round(
+                _entropy_from_counts(Counter(int(length) for length in inactive_gap_lengths)),
+                4,
+            ),
             "circadian_similarity_14d": None,
+            "transition_graph_divergence_14d": None,
+            "node_usage_divergence_14d": None,
             "sensor_coverage_ratio_day": None if sensor_coverage_ratio is None else round(sensor_coverage_ratio, 4),
             "hourly_activity_vector": tuple(hourly_counts),
             "profile_day": day.isoformat(),
         }
+
+    def _update_reference_profile_similarity_markers(
+        self,
+        *,
+        day_profiles: Mapping[date, SmartHomeEnvironmentDayProfile],
+        events: tuple[SmartHomeEnvironmentEvent, ...],
+        reference_day: date,
+    ) -> dict[date, SmartHomeEnvironmentDayProfile]:
+        """Update the reference day with similarity and graph-divergence markers."""
+
+        updated = dict(day_profiles)
+        reference_profile = updated.get(reference_day)
+        if reference_profile is None:
+            return updated
+
+        comparison_days = [
+            day
+            for day in sorted(updated)
+            if day < reference_day
+            and (reference_day - day).days <= self.short_baseline_days
+            and _weekday_class(day) == reference_profile.weekday_class
+        ]
+        if len(comparison_days) < self.min_baseline_days:
+            comparison_days = [
+                day
+                for day in sorted(updated)
+                if day < reference_day and (reference_day - day).days <= self.short_baseline_days
+            ]
+        if len(comparison_days) < self.min_baseline_days:
+            return updated
+
+        reference_markers = dict(reference_profile.markers)
+        today_vector = reference_markers.get("hourly_activity_vector")
+        if isinstance(today_vector, tuple):
+            prior_vectors = [
+                tuple(float(value) for value in updated[day].markers.get("hourly_activity_vector", ()))
+                for day in comparison_days
+                if isinstance(updated[day].markers.get("hourly_activity_vector"), tuple)
+            ]
+            if prior_vectors and len(prior_vectors[0]) == len(today_vector):
+                baseline_vector = [
+                    float(median([vector[index] for vector in prior_vectors]))
+                    for index in range(len(today_vector))
+                ]
+                similarity = _cosine_similarity(
+                    [float(value) for value in today_vector],
+                    baseline_vector,
+                )
+                if similarity is not None:
+                    reference_markers["circadian_similarity_14d"] = round(similarity, 4)
+
+        motion_by_day: dict[date, tuple[SmartHomeEnvironmentEvent, ...]] = {}
+        for day in tuple(comparison_days) + (reference_day,):
+            day_events = tuple(
+                event
+                for event in events
+                if event.signal_kind == "motion_detected" and event.local_day == day
+            )
+            if day_events:
+                motion_by_day[day] = day_events
+
+        current_motion_events = motion_by_day.get(reference_day, ())
+        if current_motion_events:
+            current_node_counts = Counter(event.node_id for event in current_motion_events)
+            current_transition_counts = Counter(
+                f"{source}->{target}" for source, target, _ in self._transition_edges(current_motion_events)
+            )
+            comparison_node_counts: Counter[str] = Counter()
+            comparison_transition_counts: Counter[str] = Counter()
+            for day in comparison_days:
+                day_events = motion_by_day.get(day, ())
+                comparison_node_counts.update(event.node_id for event in day_events)
+                comparison_transition_counts.update(
+                    f"{source}->{target}"
+                    for source, target, _ in self._transition_edges(day_events)
+                )
+            node_divergence = jensen_shannon_divergence(current_node_counts, comparison_node_counts)
+            transition_divergence = jensen_shannon_divergence(current_transition_counts, comparison_transition_counts)
+            if node_divergence is not None:
+                reference_markers["node_usage_divergence_14d"] = round(node_divergence, 4)
+            if transition_divergence is not None:
+                reference_markers["transition_graph_divergence_14d"] = round(transition_divergence, 4)
+
+        updated[reference_day] = SmartHomeEnvironmentDayProfile(
+            environment_id=reference_profile.environment_id,
+            day=reference_profile.day,
+            weekday_class=reference_profile.weekday_class,
+            markers=reference_markers,
+            quality_flags=reference_profile.quality_flags,
+            supporting_ranges=reference_profile.supporting_ranges,
+        )
+        return updated
 
     def _day_quality_flags(
         self,
@@ -904,91 +1383,91 @@ class LongTermEnvironmentProfileCompiler:
         prior_days = sorted(day for day in day_profiles if day < reference_day)
         baselines: dict[str, SmartHomeEnvironmentBaseline] = {}
         baseline_event_ids: dict[str, tuple[str, ...]] = {}
-        for weekday_class in _WEEKDAY_CLASSES:
-            eligible_days = [
-                day
-                for day in prior_days
-                if (reference_day - day).days <= self.baseline_days
-                and (weekday_class == "all_days" or _weekday_class(day) == weekday_class)
-            ]
-            if len(eligible_days) < self.min_baseline_days:
-                continue
-            profiles = [day_profiles[day] for day in eligible_days]
-            marker_names = [
-                "active_epoch_count_day",
-                "first_activity_minute_local",
-                "last_activity_minute_local",
-                "longest_daytime_inactivity_min",
-                "night_activity_epoch_count",
-                "unique_active_node_count_day",
-                "transition_count_day",
-                "fragmentation_index_day",
-                "sensor_coverage_ratio_day",
-            ]
-            marker_stats: dict[str, SmartHomeEnvironmentBaselineStat] = {}
-            for marker_name in marker_names:
-                values = [
-                    float(profile.markers[marker_name])
-                    for profile in profiles
-                    if profile.markers.get(marker_name) is not None
+        marker_names = [
+            "active_epoch_count_day",
+            "first_activity_minute_local",
+            "last_activity_minute_local",
+            "longest_daytime_inactivity_min",
+            "night_activity_epoch_count",
+            "unique_active_node_count_day",
+            "mean_active_node_count_per_active_epoch",
+            "node_entropy_day",
+            "dominant_node_share_day",
+            "transition_count_day",
+            "transition_entropy_day",
+            "fragmentation_index_day",
+            "motion_burst_count_day",
+            "inter_event_interval_median_day",
+            "inter_event_interval_iqr_day",
+            "active_epoch_run_length_median_day",
+            "inactive_gap_entropy_day",
+            "circadian_similarity_14d",
+            "transition_graph_divergence_14d",
+            "node_usage_divergence_14d",
+            "sensor_coverage_ratio_day",
+        ]
+        for baseline_kind, window_days in (("short", self.short_baseline_days), ("long", self.long_baseline_days)):
+            for weekday_class in _WEEKDAY_CLASSES:
+                eligible_days = [
+                    day
+                    for day in prior_days
+                    if (reference_day - day).days <= window_days
+                    and (weekday_class == "all_days" or _weekday_class(day) == weekday_class)
                 ]
-                if len(values) < self.min_baseline_days:
+                if len(eligible_days) < self.min_baseline_days:
                     continue
-                marker_stats[marker_name] = SmartHomeEnvironmentBaselineStat(
-                    median=float(median(values)),
-                    iqr=float(_iqr(values)),
-                    ewma=float(_ewma(values)),
+                profiles = [day_profiles[day] for day in eligible_days]
+                marker_stats: dict[str, SmartHomeEnvironmentBaselineStat] = {}
+                for marker_name in marker_names:
+                    values = [
+                        float(profile.markers[marker_name])
+                        for profile in profiles
+                        if profile.markers.get(marker_name) is not None
+                    ]
+                    if len(values) < self.min_baseline_days:
+                        continue
+                    marker_stats[marker_name] = SmartHomeEnvironmentBaselineStat(
+                        median=float(median(values)),
+                        iqr=float(iqr(values)),
+                        ewma=float(_ewma(values)),
+                        mad=float(mad(values)),
+                        lower_quantile=float(quantile(values, self.acute_empirical_q)),
+                        upper_quantile=float(quantile(values, 1.0 - self.acute_empirical_q)),
+                    )
+                if not marker_stats:
+                    continue
+                key = f"{baseline_kind}:{weekday_class}"
+                baselines[key] = SmartHomeEnvironmentBaseline(
+                    environment_id=self.environment_id,
+                    baseline_kind=baseline_kind,
+                    weekday_class=weekday_class,
+                    window_days=window_days,
+                    sample_count=len(eligible_days),
+                    marker_stats=marker_stats,
                 )
-            if not marker_stats:
-                continue
-            baselines[weekday_class] = SmartHomeEnvironmentBaseline(
-                environment_id=self.environment_id,
-                weekday_class=weekday_class,
-                window_days=self.baseline_days,
-                sample_count=len(eligible_days),
-                marker_stats=marker_stats,
-            )
-            collected_event_ids: list[str] = []
-            for day in eligible_days:
-                collected_event_ids.extend(day_event_ids.get(day, ()))
-            baseline_event_ids[weekday_class] = tuple(list(dict.fromkeys(collected_event_ids))[-_MAX_SOURCE_EVENT_IDS:])
-
-        reference_profile = day_profiles.get(reference_day)
-        if reference_profile is not None:
-            today_vector = reference_profile.markers.get("hourly_activity_vector")
-            if isinstance(today_vector, tuple):
-                today_values = [float(value) for value in today_vector]
-                baseline = baselines.get(reference_profile.weekday_class) or baselines.get("all_days")
-                if baseline is not None:
-                    comparison_days = [
-                        day
-                        for day in prior_days
-                        if (reference_day - day).days <= self.baseline_days
-                        and (baseline.weekday_class == "all_days" or _weekday_class(day) == baseline.weekday_class)
-                    ]
-                    prior_vectors = [
-                        tuple(float(value) for value in day_profiles[day].markers.get("hourly_activity_vector", ()))
-                        for day in comparison_days
-                        if isinstance(day_profiles[day].markers.get("hourly_activity_vector"), tuple)
-                    ]
-                    if prior_vectors and len(prior_vectors[0]) == len(today_values):
-                        baseline_vector = [
-                            float(median([vector[index] for vector in prior_vectors]))
-                            for index in range(len(today_values))
-                        ]
-                        similarity = _cosine_similarity(today_values, baseline_vector)
-                        if similarity is not None:
-                            updated_markers = dict(reference_profile.markers)
-                            updated_markers["circadian_similarity_14d"] = round(similarity, 4)
-                            day_profiles[reference_day] = SmartHomeEnvironmentDayProfile(
-                                environment_id=reference_profile.environment_id,
-                                day=reference_profile.day,
-                                weekday_class=reference_profile.weekday_class,
-                                markers=updated_markers,
-                                quality_flags=reference_profile.quality_flags,
-                                supporting_ranges=reference_profile.supporting_ranges,
-                            )
+                collected_event_ids: list[str] = []
+                for day in eligible_days:
+                    collected_event_ids.extend(day_event_ids.get(day, ()))
+                baseline_event_ids[key] = tuple(list(dict.fromkeys(collected_event_ids))[-_MAX_SOURCE_EVENT_IDS:])
         return baselines, baseline_event_ids
+
+    def _select_baseline(
+        self,
+        *,
+        baselines: Mapping[str, SmartHomeEnvironmentBaseline],
+        weekday_class: str,
+        baseline_kind: str = "short",
+    ) -> SmartHomeEnvironmentBaseline | None:
+        """Select the preferred baseline for one weekday bucket and horizon."""
+
+        return (
+            baselines.get(f"{baseline_kind}:{weekday_class}")
+            or baselines.get(f"{baseline_kind}:all_days")
+            or baselines.get(f"short:{weekday_class}")
+            or baselines.get("short:all_days")
+            or baselines.get(f"long:{weekday_class}")
+            or baselines.get("long:all_days")
+        )
 
     def _build_deviations(
         self,
@@ -997,25 +1476,32 @@ class LongTermEnvironmentProfileCompiler:
         reference_day: date,
         day_profiles: Mapping[date, SmartHomeEnvironmentDayProfile],
         baselines: Mapping[str, SmartHomeEnvironmentBaseline],
-        day_event_ids: Mapping[date, tuple[str, ...]],
-    ) -> tuple[SmartHomeEnvironmentDeviation, ...]:
+        quality_state: SmartHomeEnvironmentQualityState | None,
+    ) -> tuple[SmartHomeEnvironmentDeviation | SmartHomeEnvironmentDeviationEvent, ...]:
         """Build typed deviations for the reference day against the rolling baseline."""
 
         profile = day_profiles.get(reference_day)
         if profile is None:
             return ()
-        baseline = baselines.get(profile.weekday_class) or baselines.get("all_days")
+        baseline = self._select_baseline(
+            baselines=baselines,
+            weekday_class=profile.weekday_class,
+            baseline_kind="short",
+        )
         if baseline is None:
             return ()
 
-        deviations: list[SmartHomeEnvironmentDeviation] = []
-        blocked_by = ("sensor_quality_limited",) if "device_offline_present" in profile.quality_flags else ()
+        deviations: list[SmartHomeEnvironmentDeviation | SmartHomeEnvironmentDeviationEvent] = []
+        event_metrics: list[SmartHomeEnvironmentDeviationMetric] = []
+        blocked_by = tuple(quality_state.blocked_by) if quality_state is not None else ()
         deviation_specs = (
             ("daily_activity_drop", "active_epoch_count_day", "low", "less activity than usual"),
             ("night_activity_increase", "night_activity_epoch_count", "high", "more night activity than usual"),
             ("late_start_of_day", "first_activity_minute_local", "high", "later start of day than usual"),
             ("early_end_of_day", "last_activity_minute_local", "low", "earlier end of day than usual"),
             ("fragmentation_shift", "fragmentation_index_day", "high", "more fragmented movement than usual"),
+            ("transition_graph_shift", "transition_graph_divergence_14d", "high", "changed movement transitions compared with the recent pattern"),
+            ("node_usage_shift", "node_usage_divergence_14d", "high", "changed spread of movement across nodes"),
             ("possible_sensor_failure", "sensor_coverage_ratio_day", "low", "lower sensor coverage than expected"),
         )
         for deviation_type, marker_name, direction, short_label in deviation_specs:
@@ -1027,8 +1513,9 @@ class LongTermEnvironmentProfileCompiler:
             )
             if metric is None:
                 continue
+            event_metrics.append(metric)
             delta_ratio = abs(metric.delta_ratio)
-            severity = "high" if delta_ratio >= 0.35 else "moderate"
+            severity = "high" if (metric.robust_z is not None and abs(metric.robust_z) >= max(4.0, self.acute_z_threshold + 0.5)) or delta_ratio >= 0.45 else "moderate"
             deviations.append(
                 SmartHomeEnvironmentDeviation(
                     environment_id=self.environment_id,
@@ -1043,6 +1530,25 @@ class LongTermEnvironmentProfileCompiler:
                     human_readable=(
                         "Observed marker drift against the rolling room-agnostic smart-home baseline. "
                         f"Marker {marker_name} moved in the {direction} direction for {profile.day.isoformat()}."
+                    ),
+                )
+            )
+        if event_metrics:
+            event_severity = "high" if any(metric.robust_z is not None and abs(metric.robust_z) >= 4.0 for metric in event_metrics) or len(event_metrics) >= 3 else "moderate"
+            deviations.append(
+                SmartHomeEnvironmentDeviationEvent(
+                    environment_id=self.environment_id,
+                    observed_at=reference,
+                    classification="acute_deviation",
+                    severity=event_severity,
+                    time_scale="day",
+                    metrics=tuple(event_metrics[:4]),
+                    quality_flags=profile.quality_flags,
+                    blocked_by=blocked_by,
+                    short_label="multiple environment markers differ from the recent pattern",
+                    human_readable=(
+                        "Several room-agnostic smart-home markers differ from the recent pattern for this day. "
+                        "Treat this as an acute environment deviation only together with the attached quality and blocker signals."
                     ),
                 )
             )
@@ -1065,19 +1571,299 @@ class LongTermEnvironmentProfileCompiler:
         if stats is None:
             return None
         observed = float(observed_raw)
-        spread = max(stats.iqr * self.iqr_multiplier, 1.0 if marker_name.endswith("_count_day") else 0.05)
-        delta = observed - stats.median
-        if direction == "high" and delta <= spread:
+        baseline_median = float(stats.median)
+        robust_sigma = safe_sigma(mad_value=float(stats.mad), iqr_value=float(stats.iqr))
+        robust_z = (observed - baseline_median) / robust_sigma
+        spread = max(float(stats.iqr) * self.iqr_multiplier, 1.0 if marker_name.endswith("_count_day") else 0.05)
+        delta = observed - baseline_median
+        if direction == "high" and delta <= spread and observed <= float(stats.upper_quantile):
             return None
-        if direction == "low" and delta >= -spread:
+        if direction == "low" and delta >= -spread and observed >= float(stats.lower_quantile):
             return None
-        denominator = max(abs(stats.median), 1.0)
+        if direction == "high" and robust_z < self.acute_z_threshold and observed <= float(stats.upper_quantile):
+            return None
+        if direction == "low" and robust_z > -self.acute_z_threshold and observed >= float(stats.lower_quantile):
+            return None
+        denominator = max(abs(baseline_median), robust_sigma, 1.0)
         return SmartHomeEnvironmentDeviationMetric(
             name=marker_name,
             observed=observed,
-            baseline_median=stats.median,
+            baseline_median=baseline_median,
             delta_ratio=delta / denominator,
+            robust_z=robust_z,
+            lower_quantile=float(stats.lower_quantile),
+            upper_quantile=float(stats.upper_quantile),
         )
+
+    def _build_quality_state(
+        self,
+        *,
+        reference: datetime,
+        reference_day: date,
+        events: tuple[SmartHomeEnvironmentEvent, ...],
+        nodes: tuple[SmartHomeEnvironmentNode, ...],
+        day_profiles: Mapping[date, SmartHomeEnvironmentDayProfile],
+        baselines: Mapping[str, SmartHomeEnvironmentBaseline],
+    ) -> SmartHomeEnvironmentQualityState | None:
+        """Build one bounded quality-state summary for the reference day."""
+
+        del events
+        profile = day_profiles.get(reference_day)
+        if profile is None:
+            return None
+        baseline = self._select_baseline(
+            baselines=baselines,
+            weekday_class=profile.weekday_class,
+            baseline_kind="short",
+        )
+        quality_flags = list(profile.quality_flags)
+        blocked_by: list[str] = []
+        evidence_markers: list[str] = []
+
+        coverage = profile.markers.get("sensor_coverage_ratio_day")
+        try:
+            coverage_value = None if coverage is None else float(coverage)
+        except (TypeError, ValueError):
+            coverage_value = None
+        if coverage_value is not None and coverage_value < self.min_coverage_ratio:
+            quality_flags.append("low_sensor_coverage")
+            blocked_by.append("sensor_quality_limited")
+            evidence_markers.append("sensor_coverage_ratio_day")
+        if "device_offline_present" in quality_flags:
+            blocked_by.append("sensor_quality_limited")
+            evidence_markers.append("sensor_coverage_ratio_day")
+
+        recent_node_change_present = any(
+            0 <= (reference_day - node.first_seen_at.date()).days <= max(2, self.drift_min_days)
+            for node in nodes
+        )
+        if recent_node_change_present:
+            quality_flags.append("recent_node_change_present")
+
+        if baseline is not None and self._likely_visitor_activity(profile=profile, baseline=baseline):
+            quality_flags.append("possible_visitor_or_multi_person_activity")
+            evidence_markers.extend(
+                (
+                    "active_epoch_count_day",
+                    "unique_active_node_count_day",
+                    "node_entropy_day",
+                )
+            )
+
+        deduped_flags = tuple(dict.fromkeys(flag for flag in quality_flags if flag))
+        deduped_blocked = tuple(dict.fromkeys(flag for flag in blocked_by if flag))
+        deduped_evidence = tuple(dict.fromkeys(marker for marker in evidence_markers if marker))
+        classification = "blocked" if deduped_blocked else ("caution" if deduped_flags else "ok")
+        if classification == "ok":
+            detail = "Environment quality looked good enough for behavior interpretation."
+        elif classification == "blocked":
+            detail = (
+                "Environment quality is limited for behavior interpretation because sensor health or coverage is reduced. "
+                f"Flags: {', '.join(deduped_flags) or 'none'}."
+            )
+        else:
+            detail = (
+                "Environment quality is usable with caution. "
+                f"Flags: {', '.join(deduped_flags) or 'none'}."
+            )
+        return SmartHomeEnvironmentQualityState(
+            environment_id=self.environment_id,
+            observed_at=reference,
+            classification=classification,
+            quality_flags=deduped_flags,
+            blocked_by=deduped_blocked,
+            evidence_markers=deduped_evidence,
+            human_readable=detail,
+        )
+
+    def _likely_visitor_activity(
+        self,
+        *,
+        profile: SmartHomeEnvironmentDayProfile,
+        baseline: SmartHomeEnvironmentBaseline,
+    ) -> bool:
+        """Return whether the day looks more like unusual multi-person activity."""
+
+        marker_names = (
+            "active_epoch_count_day",
+            "unique_active_node_count_day",
+            "node_entropy_day",
+        )
+        positives = 0
+        for marker_name in marker_names:
+            observed_raw = profile.markers.get(marker_name)
+            stats = baseline.marker_stats.get(marker_name)
+            if observed_raw is None or stats is None:
+                continue
+            observed = float(observed_raw)
+            sigma = safe_sigma(mad_value=float(stats.mad), iqr_value=float(stats.iqr))
+            robust_z = (observed - float(stats.median)) / sigma
+            if robust_z >= self.acute_z_threshold and observed >= float(stats.upper_quantile):
+                positives += 1
+        return positives >= 2
+
+    def _build_regime_signals(
+        self,
+        *,
+        reference: datetime,
+        reference_day: date,
+        day_profiles: Mapping[date, SmartHomeEnvironmentDayProfile],
+        baselines: Mapping[str, SmartHomeEnvironmentBaseline],
+        quality_state: SmartHomeEnvironmentQualityState | None,
+    ) -> tuple[SmartHomeEnvironmentChangePoint | None, SmartHomeEnvironmentRegime | None]:
+        """Build transition and accepted-regime signals for the reference day."""
+
+        profile = day_profiles.get(reference_day)
+        if profile is None:
+            return None, None
+        short_baseline = self._select_baseline(
+            baselines=baselines,
+            weekday_class=profile.weekday_class,
+            baseline_kind="short",
+        )
+        long_baseline = self._select_baseline(
+            baselines=baselines,
+            weekday_class=profile.weekday_class,
+            baseline_kind="long",
+        )
+        if short_baseline is None or long_baseline is None:
+            return None, None
+
+        metrics: list[SmartHomeEnvironmentDeviationMetric] = []
+        regime_metrics: list[SmartHomeEnvironmentDeviationMetric] = []
+        candidate_start_days: list[date] = []
+        regime_start_days: list[date] = []
+        for marker_name in (
+            "active_epoch_count_day",
+            "night_activity_epoch_count",
+            "first_activity_minute_local",
+            "last_activity_minute_local",
+            "fragmentation_index_day",
+            "transition_graph_divergence_14d",
+            "node_usage_divergence_14d",
+        ):
+            metric, run_start_day, run_length = self._drift_metric(
+                reference_day=reference_day,
+                day_profiles=day_profiles,
+                long_baseline=long_baseline,
+                marker_name=marker_name,
+            )
+            if metric is None or run_start_day is None:
+                continue
+            metrics.append(metric)
+            candidate_start_days.append(run_start_day)
+            if run_length >= self.regime_accept_days:
+                regime_metrics.append(metric)
+                regime_start_days.append(run_start_day)
+
+        if not metrics:
+            return None, None
+
+        blocked_by = tuple(quality_state.blocked_by) if quality_state is not None else ()
+        quality_flags = tuple(quality_state.quality_flags) if quality_state is not None else ()
+        change_point = SmartHomeEnvironmentChangePoint(
+            environment_id=self.environment_id,
+            observed_at=reference,
+            change_started_on=min(candidate_start_days),
+            severity="high" if any(metric.robust_z is not None and abs(metric.robust_z) >= 2.5 for metric in metrics) or len(metrics) >= 3 else "moderate",
+            metrics=tuple(metrics[:4]),
+            quality_flags=quality_flags,
+            blocked_by=blocked_by,
+            human_readable=(
+                "Recent room-agnostic smart-home markers suggest an ongoing transition away from the older behavior regime. "
+                "This is a drift candidate, not a confirmed concern on its own."
+            ),
+        )
+
+        regime = None
+        if regime_metrics and not blocked_by:
+            regime = SmartHomeEnvironmentRegime(
+                environment_id=self.environment_id,
+                valid_from_day=min(regime_start_days),
+                observed_at=reference,
+                severity="high" if len(regime_metrics) >= 3 else "moderate",
+                metrics=tuple(regime_metrics[:4]),
+                quality_flags=quality_flags,
+                human_readable=(
+                    "The environment has stayed on a shifted pattern long enough to treat it as a new normal baseline candidate."
+                ),
+            )
+        return change_point, regime
+
+    def _drift_metric(
+        self,
+        *,
+        reference_day: date,
+        day_profiles: Mapping[date, SmartHomeEnvironmentDayProfile],
+        long_baseline: SmartHomeEnvironmentBaseline,
+        marker_name: str,
+    ) -> tuple[SmartHomeEnvironmentDeviationMetric | None, date | None, int]:
+        """Return one drift metric plus the start day and run length when stable."""
+
+        stats = long_baseline.marker_stats.get(marker_name)
+        if stats is None:
+            return None, None, 0
+        series = [
+            (day, float(day_profiles[day].markers[marker_name]))
+            for day in sorted(day_profiles)
+            if day <= reference_day
+            and (reference_day - day).days <= self.long_baseline_days
+            and day_profiles[day].markers.get(marker_name) is not None
+        ]
+        if len(series) < max(self.min_baseline_days, self.drift_min_days + 1):
+            return None, None, 0
+
+        sigma = safe_sigma(mad_value=float(stats.mad), iqr_value=float(stats.iqr))
+        baseline_median = float(stats.median)
+        residuals = [(value - baseline_median) / sigma for _, value in series]
+        short_values = [value for _, value in series[-min(7, len(series)):]]
+        short_ewma = _ewma(short_values)
+        shift_sigma = (short_ewma - baseline_median) / sigma
+        if abs(shift_sigma) < self.drift_min_sigma:
+            return None, None, 0
+        direction = 1 if shift_sigma > 0.0 else -1
+        if not self._cusum_change_detected(residuals=residuals, direction=direction):
+            return None, None, 0
+
+        trailing_days: list[date] = []
+        for day, value in reversed(series):
+            residual = (value - baseline_median) / sigma
+            sign = 1 if residual > 0.0 else -1 if residual < 0.0 else 0
+            if sign != direction or abs(residual) < self.drift_min_sigma:
+                break
+            trailing_days.append(day)
+        if len(trailing_days) < self.drift_min_days:
+            return None, None, 0
+
+        metric = SmartHomeEnvironmentDeviationMetric(
+            name=marker_name,
+            observed=short_ewma,
+            baseline_median=baseline_median,
+            delta_ratio=(short_ewma - baseline_median) / max(abs(baseline_median), sigma, 1.0),
+            robust_z=shift_sigma,
+            lower_quantile=float(stats.lower_quantile),
+            upper_quantile=float(stats.upper_quantile),
+        )
+        return metric, min(trailing_days), len(trailing_days)
+
+    def _cusum_change_detected(
+        self,
+        *,
+        residuals: Sequence[float],
+        direction: int,
+    ) -> bool:
+        """Return whether one simple CUSUM run indicates a regime change."""
+
+        if not residuals or direction == 0:
+            return False
+        slack = 0.5
+        threshold = max(3.5, self.drift_min_sigma * float(self.drift_min_days))
+        positive = 0.0
+        negative = 0.0
+        for residual in residuals:
+            positive = max(0.0, positive + residual - slack)
+            negative = min(0.0, negative + residual + slack)
+        return positive >= threshold if direction > 0 else abs(negative) >= threshold
 
     def _node_event_ids(
         self,

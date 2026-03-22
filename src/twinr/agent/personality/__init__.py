@@ -7,6 +7,10 @@ typed state, prompt planning, and the future ChonkyDB/remote-state seam.
 """
 
 from twinr.agent.personality.context_builder import PersonalityContextBuilder
+from twinr.agent.personality.display_impulses import (
+    AmbientDisplayImpulseCandidate,
+    build_ambient_display_impulse_candidates,
+)
 from twinr.agent.personality.evolution import (
     BackgroundPersonalityEvolutionLoop,
     PersonalityEvolutionLoop,
@@ -74,7 +78,9 @@ from twinr.agent.personality.store import (
 )
 
 __all__ = [
+    "AmbientDisplayImpulseCandidate",
     "BackgroundPersonalityEvolutionLoop",
+    "build_ambient_display_impulse_candidates",
     "ConversationStyleProfile",
     "ConversationTurnSteeringCue",
     "DEFAULT_PERSONALITY_SNAPSHOT_KIND",

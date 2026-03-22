@@ -14,10 +14,12 @@ and snapshot commits through remote-primary state.
 - render a bounded conversational self-expression and `MINDSHARE` layer so Twinr can naturally speak from ongoing themes without pretending to have a human inner life
 - derive authoritative per-turn steering cues from shared-thread and appetite state so Twinr can decide more consistently when to briefly update, when one calm follow-up is acceptable, and when it should simply observe
 - derive explicit per-topic positive-engagement actions such as `silent`, `hint`, `brief_update`, `ask_one`, and `invite_follow_up` so Twinr can foster welcomed interaction without becoming pushy
+- derive calm ambient display-impulse candidates from that same structured state so Twinr's evolving tone, topics, and co-attention can surface visually outside spoken turns
 - serialize those steering cues for runtime evaluators with compact semantic match summaries and region-qualified local titles where available, then resolve matched topics back into concrete follow-up keep-open versus release-after-answer behavior
 - provide storage seams for remote snapshot loading and saving without pushing persistence into base-agent prompting
 - extract structured interaction, continuity, place, and world signals from long-term consolidation output and tool history
 - gate background learning so repeated interaction, place, and world signals can evolve the durable personality snapshot without allowing one-off drift
+- expose both synchronous commit paths and foreground-safe queueing paths so runtime turn finalization can hand off tool-history learning without blocking on remote-primary personality writes
 - manage RSS/Atom subscriptions plus calm refresh/discovery state for place/world intelligence
 - learn slow-changing topic/region source-calibration signals from structured conversation and tool evidence
 - condense repeated feed updates into situational-awareness threads so world context can mature over days/weeks instead of staying headline-shaped
@@ -35,6 +37,7 @@ and snapshot commits through remote-primary state.
 | [models.py](./models.py) | Typed evolving-personality state and prompt-layer models |
 | [context_builder.py](./context_builder.py) | Ordered prompt-layer assembly |
 | [self_expression.py](./self_expression.py) | Conversational self-expression policy plus prompt-facing current-mindshare rendering |
+| [display_impulses.py](./display_impulses.py) | Silent ambient display-impulse candidates derived generically from mindshare and positive-engagement state |
 | [positive_engagement.py](./positive_engagement.py) | Explicit positive-engagement actions derived generically from appetite, ongoing interest, and co-attention |
 | [steering.py](./steering.py) | Authoritative turn-steering cues plus runtime follow-up resolution derived from co-attention and conversation appetite |
 | [store.py](./store.py) | Remote snapshot persistence seam for prompt state, signals, and deltas |
@@ -71,6 +74,15 @@ result = learning.record_tool_history(
 )
 ```
 
+```python
+learning.enqueue_tool_history(
+    tool_calls=(tool_call,),
+    tool_results=(tool_result,),
+)
+# later, one background commit path flushes the queued signals
+learning.flush_pending()
+```
+
 ## Learning model
 
 The current signal taxonomy is intentionally structured and conservative:
@@ -89,6 +101,7 @@ The current signal taxonomy is intentionally structured and conservative:
 - Twinr's engagement model distinguishes `resonant`, `warm`, `uncertain`, `cooling`, and `avoid`; absence alone must not count as dislike unless repeated prior exposure and non-reengagement are structurally evidenced
 - `MINDSHARE` now also derives a topic-specific `conversation appetite` from those engagement states plus the learned global style profile, so each surfaced theme carries bounded cues for `depth`, `follow-up`, and `proactivity` instead of relying on hidden prompt guesswork
 - `positive_engagement.py` lifts that implicit guidance into explicit turn actions: each surfaced topic resolves generically to `silent`, `hint`, `brief_update`, `ask_one`, or `invite_follow_up`, and the policy must stay topic-generic instead of accreting hardcoded examples
+- `display_impulses.py` reuses the same generic state for non-voice ambient display moments: reserve-card candidates must stay positive, short, and generic instead of hardcoding specific places, topics, or benchmark phrases
 - repeated user returns to a topic may also raise Twinr's persisted `ongoing interest` in it; this is the companion analogue of `stop/linger/return` signals in ranking systems, but bounded for dignity and calm rather than optimized for addiction or time-on-device
 - when sustained user interest and Twinr's own feed coverage line up, the system now also tracks bounded `co-attention` so some themes can become genuine shared running threads rather than isolated prompt hints
 - `steering.py` turns that same state into authoritative turn guidance inside `PERSONALITY`, serializes compact machine-readable cues for the closure evaluator, and resolves matched topics back into concrete runtime follow-up behavior without turning `MINDSHARE` itself into instruction authority

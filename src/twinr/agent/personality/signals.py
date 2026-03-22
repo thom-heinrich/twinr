@@ -345,8 +345,8 @@ class PersonalitySignalExtractor:
     ) -> PersonalitySignalBatch:
         """Extract interaction and place signals from one consolidated turn."""
 
-        del turn  # Reserved for future explicit-style/humor extraction from structured turn context.
         relevant_objects = tuple((*consolidation.durable_objects, *consolidation.deferred_objects))
+        style_feedback_objects = tuple((*relevant_objects, *consolidation.episodic_objects))
         return PersonalitySignalBatch(
             interaction_signals=(
                 self._extract_topic_affinity_signals(
@@ -363,7 +363,7 @@ class PersonalitySignalExtractor:
                 )
                 + self._extract_style_and_feedback_signals(
                     turn_id=consolidation.turn_id,
-                    memory_objects=relevant_objects,
+                    memory_objects=style_feedback_objects,
                 )
                 + self._extract_topic_aversion_signals(
                     turn_id=consolidation.turn_id,
@@ -643,6 +643,7 @@ class PersonalitySignalExtractor:
                         impact=confidence * 0.5,
                         evidence_count=support_count,
                         source_event_ids=_coalesce_event_ids((memory_object.source.event_ids,)),
+                        explicit_user_requested=True,
                         delta_target=STYLE_VERBOSITY_DELTA_TARGET,
                         delta_value=delta_value,
                         delta_summary=delta_summary,
@@ -679,6 +680,7 @@ class PersonalitySignalExtractor:
                         impact=confidence * 0.4,
                         evidence_count=support_count,
                         source_event_ids=_coalesce_event_ids((memory_object.source.event_ids,)),
+                        explicit_user_requested=True,
                         delta_target=STYLE_INITIATIVE_DELTA_TARGET,
                         delta_value=delta_value,
                         delta_summary=delta_summary,
@@ -715,6 +717,7 @@ class PersonalitySignalExtractor:
                         impact=confidence * 0.3,
                         evidence_count=support_count,
                         source_event_ids=_coalesce_event_ids((memory_object.source.event_ids,)),
+                        explicit_user_requested=True,
                         delta_target="humor.intensity",
                         delta_value=delta_value,
                         delta_summary=delta_summary,

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import errno
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 import sys
 import tempfile
@@ -10,6 +11,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
+from twinr.agent.personality.display_impulses import AmbientDisplayImpulseCandidate
+from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCueStore
 from twinr.display.emoji_cues import DisplayEmojiCueStore
 from twinr.display.face_cues import DisplayFaceCueStore
 from twinr.hardware.portrait_match import PortraitMatchObservation
@@ -47,6 +50,7 @@ from twinr.proactive.social.observers import ReSpeakerAudioObservationProvider
 from twinr.proactive.social.observers import NullAudioObservationProvider
 from twinr.proactive.social.vision_review import ProactiveVisionReview
 from twinr.proactive.runtime.audio_policy import ReSpeakerAudioPolicySnapshot
+from twinr.proactive.runtime.display_ambient_impulses import DisplayAmbientImpulsePublisher
 from twinr.proactive.runtime.service import _build_wakeword_policy
 from twinr.runtime import TwinrRuntime
 
@@ -2034,6 +2038,261 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertEqual(cue.symbol, "thumbs_up")
         self.assertEqual(cue.accent, "success")
 
+    def test_coordinator_publishes_display_ambient_impulse_while_idle_and_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                proactive_capture_interval_s=60.0,
+                display_driver="hdmi_wayland",
+                display_attention_refresh_interval_s=1.0,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(10.0)
+            publisher = DisplayAmbientImpulsePublisher.from_config(config)
+            publisher.local_now = lambda: datetime(2026, 3, 22, 12, 0, tzinfo=timezone.utc)
+            publisher.candidate_loader = (
+                lambda _config, *, local_now: (
+                    AmbientDisplayImpulseCandidate(
+                        topic_key="ai companions",
+                        title="AI companions",
+                        source="world",
+                        action="invite_follow_up",
+                        attention_state="shared_thread",
+                        salience=0.92,
+                        eyebrow="GEMEINSAMER FADEN",
+                        headline="AI companions",
+                        body="Wenn du magst, schauen wir spaeter kurz darauf.",
+                        symbol="heart",
+                        accent="warm",
+                        reason=f"test@{local_now.date().isoformat()}",
+                    ),
+                )
+            )
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=None,
+                pir_monitor=FakePirMonitor(events=[True], level=True),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                display_ambient_impulse_publisher=publisher,
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            result = coordinator.tick()
+            cue = DisplayAmbientImpulseCueStore.from_config(config).load_active(
+                now=datetime(2026, 3, 22, 12, 0, 1, tzinfo=timezone.utc)
+            )
+
+        self.assertIsNone(result.decision)
+        self.assertIsNotNone(cue)
+        assert cue is not None
+        self.assertEqual(cue.source, "proactive_ambient_impulse")
+        self.assertEqual(cue.topic_key, "ai companions")
+        self.assertEqual(cue.action, "invite_follow_up")
+        self.assertEqual(cue.attention_state, "shared_thread")
+
+    def test_display_gesture_refresh_dispatches_visual_wakeup_for_peace_sign(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                display_driver="hdmi_wayland",
+                display_attention_refresh_interval_s=1.0,
+                gesture_wakeup_enabled=True,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(10.0)
+            vision_observer = FakeVisionObserver(
+                [],
+                supports_gesture_refresh=True,
+                gesture_observations=[
+                    SocialVisionObservation(
+                        camera_online=True,
+                        camera_ready=True,
+                        camera_ai_ready=True,
+                        hand_or_object_near_camera=True,
+                        showing_intent_likely=True,
+                        fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
+                        fine_hand_gesture_confidence=0.92,
+                    )
+                ],
+            )
+            handled: list[str] = []
+            handled_event = Event()
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=vision_observer,
+                pir_monitor=FakePirMonitor(),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                gesture_wakeup_handler=(
+                    lambda decision: handled.append(decision.trigger_gesture.value)
+                    or handled_event.set()
+                    or True
+                ),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            refreshed = coordinator.refresh_display_gesture_emoji()
+            self.assertTrue(handled_event.wait(1.0))
+            coordinator.close_background_lanes(timeout_s=1.0)
+
+        self.assertTrue(refreshed)
+        self.assertEqual(handled, ["peace_sign"])
+
+    def test_display_gesture_refresh_pauses_and_resumes_stream_capture_for_visual_wakeup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                wakeword_enabled=True,
+                wakeword_backend="kws",
+                wakeword_primary_backend="kws",
+                wakeword_fallback_backend="disabled",
+                display_driver="hdmi_wayland",
+                display_attention_refresh_interval_s=1.0,
+                gesture_wakeup_enabled=True,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(10.0)
+            wakeword_stream = FakeWakewordStream()
+            wakeword_stream.open()
+            vision_observer = FakeVisionObserver(
+                [],
+                supports_gesture_refresh=True,
+                gesture_observations=[
+                    SocialVisionObservation(
+                        camera_online=True,
+                        camera_ready=True,
+                        camera_ai_ready=True,
+                        hand_or_object_near_camera=True,
+                        showing_intent_likely=True,
+                        fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
+                        fine_hand_gesture_confidence=0.92,
+                    )
+                ],
+            )
+            handler_states: list[tuple[bool, bool]] = []
+            handled_event = Event()
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=vision_observer,
+                pir_monitor=FakePirMonitor(),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                wakeword_stream=wakeword_stream,
+                gesture_wakeup_handler=(
+                    lambda _decision: handler_states.append((wakeword_stream.opened, wakeword_stream.closed))
+                    or handled_event.set()
+                    or True
+                ),
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            refreshed = coordinator.refresh_display_gesture_emoji()
+            self.assertTrue(handled_event.wait(1.0))
+            coordinator.close_background_lanes(timeout_s=1.0)
+
+        self.assertTrue(refreshed)
+        self.assertEqual(handler_states, [(False, True)])
+        self.assertEqual(wakeword_stream.close_calls, 1)
+        self.assertEqual(wakeword_stream.open_calls, 2)
+        self.assertTrue(wakeword_stream.opened)
+        self.assertFalse(wakeword_stream.closed)
+
+    def test_display_gesture_refresh_does_not_block_attention_refresh_during_visual_wakeup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                proactive_enabled=True,
+                wakeword_enabled=True,
+                wakeword_backend="kws",
+                wakeword_primary_backend="kws",
+                wakeword_fallback_backend="disabled",
+                display_driver="hdmi_wayland",
+                display_attention_refresh_interval_s=0.1,
+                gesture_wakeup_enabled=True,
+            )
+            runtime = TwinrRuntime(config=config)
+            clock = MutableClock(10.0)
+            wakeword_stream = FakeWakewordStream()
+            wakeword_stream.open()
+            handler_started = Event()
+            handler_release = Event()
+            handler_finished = Event()
+            vision_observer = FakeVisionObserver(
+                [],
+                attention_observations=[
+                    SocialVisionObservation(
+                        camera_online=True,
+                        camera_ready=True,
+                        camera_ai_ready=True,
+                        person_visible=True,
+                        primary_person_center_x=0.2,
+                        primary_person_center_y=0.5,
+                        engaged_with_device=True,
+                    )
+                ],
+                supports_attention_refresh=True,
+                supports_gesture_refresh=True,
+                gesture_observations=[
+                    SocialVisionObservation(
+                        camera_online=True,
+                        camera_ready=True,
+                        camera_ai_ready=True,
+                        hand_or_object_near_camera=True,
+                        showing_intent_likely=True,
+                        fine_hand_gesture=SocialFineHandGesture.PEACE_SIGN,
+                        fine_hand_gesture_confidence=0.92,
+                    )
+                ],
+            )
+
+            def _blocking_handler(_decision) -> bool:
+                handler_started.set()
+                handler_release.wait(1.0)
+                handler_finished.set()
+                return True
+
+            coordinator = ProactiveCoordinator(
+                config=config,
+                runtime=runtime,
+                engine=SocialTriggerEngine(),
+                trigger_handler=lambda _decision: True,
+                vision_observer=vision_observer,
+                pir_monitor=FakePirMonitor(),
+                audio_observer=FakeAudioObserver(SocialAudioObservation(speech_detected=False)),
+                wakeword_stream=wakeword_stream,
+                gesture_wakeup_handler=_blocking_handler,
+                emit=lambda _line: None,
+                clock=clock,
+            )
+
+            gesture_refreshed = coordinator.refresh_display_gesture_emoji()
+            self.assertTrue(handler_started.wait(1.0))
+            clock.now += 0.2
+            attention_refreshed = coordinator.refresh_display_attention()
+            face_cue = DisplayFaceCueStore.from_config(config).load_active()
+            handler_release.set()
+            self.assertTrue(handler_finished.wait(1.0))
+            coordinator.close_background_lanes(timeout_s=1.0)
+
+        self.assertTrue(gesture_refreshed)
+        self.assertTrue(attention_refreshed)
+        self.assertEqual(wakeword_stream.close_calls, 1)
+        self.assertEqual(wakeword_stream.open_calls, 2)
+        self.assertIsNotNone(face_cue)
+
     def test_display_attention_refresh_uses_fast_signal_only_audio_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -2971,6 +3230,41 @@ class ProactiveMonitorTests(unittest.TestCase):
         self.assertIsNotNone(monitor.coordinator.audio_observer)
         build_local_provider.assert_called_once_with(config)
 
+    def test_build_default_monitor_keeps_gesture_camera_when_visual_wakeup_is_enabled(self) -> None:
+        config = TwinrConfig(
+            proactive_enabled=False,
+            wakeword_enabled=False,
+            gesture_wakeup_enabled=True,
+            display_driver="hdmi_wayland",
+            display_attention_refresh_interval_s=0.2,
+        )
+        runtime = TwinrRuntime(config=config)
+        local_provider = FakeVisionObserver(
+            [],
+            supports_gesture_refresh=True,
+        )
+
+        with patch(
+            "twinr.proactive.runtime.service.LocalAICameraObservationProvider.from_config",
+            return_value=local_provider,
+        ) as build_local_provider:
+            monitor = build_default_proactive_monitor(
+                config=config,
+                runtime=runtime,
+                backend=FakeBackend("person_visible=no"),
+                camera=FakeCamera(),
+                camera_lock=None,
+                audio_lock=None,
+                trigger_handler=lambda _decision: True,
+                gesture_wakeup_handler=lambda _decision: True,
+                emit=lambda _line: None,
+            )
+
+        self.assertIsNotNone(monitor)
+        self.assertIs(monitor.coordinator.vision_observer, local_provider)
+        self.assertEqual(type(monitor.coordinator.engine).__name__, "_NullSocialTriggerEngine")
+        build_local_provider.assert_called_once_with(config)
+
     def test_build_default_monitor_wraps_audio_with_respeaker_signals_and_warns_on_permission_issue(self) -> None:
         config = TwinrConfig(
             wakeword_enabled=True,
@@ -3159,6 +3453,11 @@ class ProactiveMonitorTests(unittest.TestCase):
         )
         self.assertEqual(first_facts["known_user_hint"]["policy_recommendation"], "blocked")
         self.assertEqual(first_facts["affect_proxy"]["state"], "unknown")
+        self.assertEqual(first_facts["person_state"]["presence_state"]["state"], "occupied_visible")
+        self.assertEqual(first_facts["person_state"]["attention_state"]["state"], "attending_to_device")
+        self.assertEqual(first_facts["person_state"]["identity_state"]["state"], "blocked_ambiguous_room")
+        self.assertTrue(first_facts["person_state"]["targeted_inference_blocked"])
+        self.assertEqual(first_facts["person_state"]["recommended_channel"], "display")
         self.assertEqual(first_facts["audio_policy"]["presence_audio_active"], True)
         self.assertEqual(first_facts["audio_policy"]["recent_follow_up_speech"], False)
         self.assertEqual(first_facts["audio_policy"]["room_busy_or_overlapping"], None)

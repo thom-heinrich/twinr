@@ -3,6 +3,7 @@
 from pathlib import Path
 from struct import pack
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -12,8 +13,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.proactive.wakeword.evaluation import WakewordEvalMetrics, WakewordScoreSanityReport
 from twinr.proactive.wakeword.promotion import (
     _build_stream_policy,
+    WakewordStreamEvalReport,
     load_wakeword_promotion_spec,
     run_wakeword_promotion_eval,
     run_wakeword_stream_eval,
@@ -347,6 +350,98 @@ class WakewordPromotionTests(unittest.TestCase):
         self.assertEqual(spec.suites[0].manifest_path, suite_manifest)
         self.assertEqual(spec.ambient_guards[0].manifest_path, ambient_manifest)
 
+    def test_run_wakeword_promotion_eval_blocks_failed_wekws_bundle_sanity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            suite_manifest = root / "suite.json"
+            suite_manifest.write_text(
+                json.dumps(
+                    [
+                        {"captured_audio_path": str(root / "positive.wav"), "label": "correct"},
+                        {"captured_audio_path": str(root / "negative.wav"), "label": "false_positive"},
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            spec_path = root / "promotion_spec.json"
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "suites": [
+                            {
+                                "name": "critical",
+                                "manifest_path": str(suite_manifest),
+                                "max_false_negatives": 0,
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = TwinrConfig(
+                project_root=temp_dir,
+                wakeword_enabled=True,
+                wakeword_primary_backend="wekws",
+                wakeword_fallback_backend="stt",
+                wakeword_verifier_mode="disabled",
+                wakeword_phrases=("twinna", "twinr"),
+                wakeword_wekws_model_path=str(root / "model.onnx"),
+                wakeword_wekws_config_path=str(root / "config.yaml"),
+                wakeword_wekws_words_path=str(root / "words.txt"),
+                wakeword_wekws_cmvn_path=str(root / "global_cmvn"),
+            )
+            passing_stream_report = WakewordStreamEvalReport(
+                metrics=WakewordEvalMetrics(
+                    total=2,
+                    true_positive=1,
+                    false_positive=0,
+                    true_negative=1,
+                    false_negative=0,
+                    precision=1.0,
+                    recall=1.0,
+                    false_positive_rate=0.0,
+                    false_negative_rate=0.0,
+                ),
+                evaluated_entries=2,
+                accepted_detection_count=1,
+                total_audio_seconds=2.0,
+            )
+            failing_sanity = WakewordScoreSanityReport(
+                backend="wekws",
+                passed=False,
+                positive_examples=8,
+                negative_examples=8,
+                positive_score_floor=0.21,
+                negative_score_ceiling=0.24,
+                min_positive_score=0.20,
+                max_negative_score=0.25,
+                separation_margin=-0.03,
+                reason=None,
+            )
+
+            with patch(
+                "twinr.proactive.wakeword.promotion.WakewordWekwsSpotter",
+                return_value=object(),
+            ), patch(
+                "twinr.proactive.wakeword.promotion.evaluate_wekws_score_sanity_entries",
+                return_value=failing_sanity,
+            ), patch(
+                "twinr.proactive.wakeword.promotion.evaluate_wakeword_stream_entries",
+                return_value=passing_stream_report,
+            ):
+                report = run_wakeword_promotion_eval(
+                    config=config,
+                    spec_path=spec_path,
+                    backend=None,
+                    model_factory=None,
+                )
+
+        self.assertFalse(report.passed)
+        self.assertIsNotNone(report.backend_sanity)
+        self.assertIn("wekws_bundle_sanity", report.blockers[0])
+
     def test_run_wakeword_promotion_eval_blocks_suite_and_ambient_regressions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -417,3 +512,63 @@ class WakewordPromotionTests(unittest.TestCase):
         self.assertTrue(any("ambient_longform" in blocker for blocker in report.blockers))
         self.assertIsNotNone(report.report_path)
         self.assertTrue(report_path_exists)
+
+    def test_run_wakeword_promotion_eval_replaces_read_only_existing_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            suite_positive = root / "suite_positive.wav"
+            _write_wav(suite_positive, amplitude=1200)
+            suite_manifest = root / "suite_manifest.json"
+            suite_manifest.write_text(
+                json.dumps([{"captured_audio_path": str(suite_positive), "label": "correct"}]) + "\n",
+                encoding="utf-8",
+            )
+            spec_path = root / "promotion_spec.json"
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "suites": [
+                            {
+                                "name": "critical16",
+                                "manifest_path": str(suite_manifest),
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            existing_report_path = root / "artifacts" / "ops" / "wakeword_eval" / "latest_promotion.json"
+            existing_report_path.parent.mkdir(parents=True, exist_ok=True)
+            existing_report_path.write_text('{"stale": true}\n', encoding="utf-8")
+            os.chmod(existing_report_path, 0o444)
+            config = TwinrConfig(
+                project_root=temp_dir,
+                wakeword_enabled=True,
+                wakeword_primary_backend="openwakeword",
+                wakeword_fallback_backend="stt",
+                wakeword_verifier_mode="disabled",
+                wakeword_phrases=("twinr",),
+                wakeword_openwakeword_models=("twinr",),
+                wakeword_openwakeword_threshold=0.08,
+                wakeword_openwakeword_patience_frames=1,
+                wakeword_openwakeword_activation_samples=1,
+                audio_sample_rate=16000,
+                audio_channels=1,
+                audio_speech_threshold=400,
+                wakeword_attempt_cooldown_s=10.0,
+            )
+
+            report = run_wakeword_promotion_eval(
+                config=config,
+                spec_path=spec_path,
+                backend=None,
+                model_factory=_model_factory,
+            )
+
+            payload = json.loads(existing_report_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.report_path, existing_report_path)
+        self.assertNotIn("stale", payload)
+        self.assertEqual(payload["suites"][0]["metrics"]["true_positive"], 1)
