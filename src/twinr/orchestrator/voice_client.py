@@ -87,6 +87,7 @@ class OrchestratorVoiceWebSocketClient:
         self.max_queue = int(max_queue)
         self._socket = None
         self._socket_lock = Lock()
+        self._send_lock = Lock()
         self._receiver_stop = Event()
         self._receiver_started = Event()
         self._receiver_thread: Thread | None = None
@@ -169,7 +170,8 @@ class OrchestratorVoiceWebSocketClient:
     def _send_payload(self, payload: dict[str, Any], *, context: str) -> None:
         socket = self._require_socket()
         try:
-            socket.send(json.dumps(payload, ensure_ascii=False))
+            with self._send_lock:
+                socket.send(json.dumps(payload, ensure_ascii=False))
         except ConnectionClosed as exc:
             raise ConnectionError(f"Voice orchestrator websocket closed while sending {context}") from exc
 

@@ -14,7 +14,7 @@ class PersonStateTests(unittest.TestCase):
             live_facts={
                 "sensor": {
                     "observed_at": 12.0,
-                    "wakeword_armed": True,
+                    "voice_activation_armed": True,
                 },
                 "pir": {
                     "motion_detected": True,

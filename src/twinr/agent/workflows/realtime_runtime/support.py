@@ -1004,6 +1004,7 @@ class TwinrRealtimeSupportMixin:
                 self.player,
                 kind=kind,
                 sample_rate=config.openai_realtime_input_sample_rate,
+                config=config,
                 emit=self._try_emit,
                 delay_override_ms=(
                     config.processing_feedback_delay_ms

@@ -44,6 +44,9 @@ _SYSTEM_EVENT_PREFIXES = (
 _LLM_EVENT_NAMES = {
     "adaptive_timing_updated",
     "follow_up_rearmed",
+    "search_finished",
+    "tool_call_failed",
+    "tool_call_finished",
     "transcript_submitted",
     "turn_completed",
     "turn_started",
@@ -59,15 +62,15 @@ _HARDWARE_EVENT_NAMES = {
     "hardware_loop_error",
     "listen_timeout",
     "stt_failed",
-    "wakeword_detected",
-    "wakeword_skipped",
+    "voice_activation_detected",
+    "voice_activation_skipped",
 }
 _HARDWARE_EVENT_PREFIXES = (
     "button_",
     "listen_",
     "print_",
     "stt_",
-    "wakeword_",
+    "voice_activation_",
 )
 _KIND_LABELS = {
     "conversation": "conv",
@@ -185,7 +188,21 @@ class TwinrDisplayDebugLogBuilder:
             lines.append(compact_text(f"mode {runtime_status.lower()} | src {request_source}", limit=_MAX_LINE_LENGTH))
             model = compact_text(latest_usage.model or "unknown", limit=26)
             web_text = "yes" if latest_usage.used_web_search else "no"
-            lines.append(compact_text(f"model {model} | web {web_text}", limit=_MAX_LINE_LENGTH))
+            budget_trace = ""
+            if latest_usage.request_kind == "search":
+                budget_trace = compact_text(
+                    (latest_usage.metadata or {}).get("search_budget_trace"),
+                    limit=18,
+                )
+            if budget_trace:
+                lines.append(
+                    compact_text(
+                        f"model {model} | web {web_text} | out {budget_trace}",
+                        limit=_MAX_LINE_LENGTH,
+                    )
+                )
+            else:
+                lines.append(compact_text(f"model {model} | web {web_text}", limit=_MAX_LINE_LENGTH))
         else:
             lines.append(compact_text(f"mode {runtime_status.lower()} | src -", limit=_MAX_LINE_LENGTH))
 
@@ -259,12 +276,12 @@ class TwinrDisplayDebugLogBuilder:
 
         if event_name == "button_pressed":
             return compact_text(f"{time_text} button {payload.get('button', 'press')}", limit=_MAX_LINE_LENGTH)
-        if event_name == "wakeword_detected":
-            phrase = compact_text(str(payload.get("matched_phrase", "wakeword")), limit=28)
-            return compact_text(f"{time_text} wakeword {phrase}", limit=_MAX_LINE_LENGTH)
-        if event_name == "wakeword_skipped":
+        if event_name == "voice_activation_detected":
+            phrase = compact_text(str(payload.get("matched_phrase", "activation")), limit=28)
+            return compact_text(f"{time_text} voice {phrase}", limit=_MAX_LINE_LENGTH)
+        if event_name == "voice_activation_skipped":
             reason = compact_text(str(payload.get("skip_reason", "busy")), limit=24)
-            return compact_text(f"{time_text} wakeword skip {reason}", limit=_MAX_LINE_LENGTH)
+            return compact_text(f"{time_text} voice skip {reason}", limit=_MAX_LINE_LENGTH)
         if event_name == "print_job_sent":
             return compact_text(f"{time_text} print sent", limit=_MAX_LINE_LENGTH)
         if event_name == "print_failed":
@@ -315,6 +332,33 @@ class TwinrDisplayDebugLogBuilder:
             return compact_text(f"{time_text} follow-up armed", limit=_MAX_LINE_LENGTH)
         if event_name == "adaptive_timing_updated":
             return compact_text(f"{time_text} timing adapted", limit=_MAX_LINE_LENGTH)
+        if event_name == "search_finished":
+            budget_trace = self._search_budget_trace(payload) or "?"
+            fallback_suffix = " fallback" if payload.get("fallback_reason") else ""
+            return compact_text(
+                f"{time_text} search {budget_trace}{fallback_suffix}",
+                limit=_MAX_LINE_LENGTH,
+            )
+        if event_name in {"tool_call_finished", "tool_call_failed"}:
+            tool_name = compact_text(str(payload.get("tool_name", "tool")), limit=18)
+            status = compact_text(str(payload.get("status", "ok")), limit=12)
+            latency_ms = payload.get("latency_ms")
+            if isinstance(latency_ms, int) and latency_ms >= 0:
+                latency_text = f"{latency_ms}ms"
+            else:
+                latency_text = "?ms"
+            suffix_parts: list[str] = []
+            error_code = compact_text(str(payload.get("error_code", "")).strip(), limit=18)
+            if error_code:
+                suffix_parts.append(error_code)
+            fallback_reason = compact_text(str(payload.get("fallback_reason", "")).strip(), limit=18)
+            if fallback_reason:
+                suffix_parts.append(f"fb {fallback_reason}")
+            suffix = f" {' '.join(suffix_parts)}" if suffix_parts else ""
+            return compact_text(
+                f"{time_text} tool {tool_name} {status} {latency_text}{suffix}",
+                limit=_MAX_LINE_LENGTH,
+            )
 
         message = compact_text(str(entry.get("message", event_name)), limit=44)
         return compact_text(f"{time_text} {message}", limit=_MAX_LINE_LENGTH)
@@ -331,7 +375,34 @@ class TwinrDisplayDebugLogBuilder:
             limit=30,
         )
         web_suffix = " web" if record.used_web_search else ""
-        return compact_text(f"{time_text} {kind} {source}{web_suffix} {subject}", limit=_MAX_LINE_LENGTH)
+        budget_prefix = ""
+        if record.request_kind == "search":
+            budget_trace = compact_text((record.metadata or {}).get("search_budget_trace"), limit=18)
+            if budget_trace:
+                budget_prefix = f" {budget_trace}"
+        return compact_text(f"{time_text} {kind} {source}{web_suffix}{budget_prefix} {subject}", limit=_MAX_LINE_LENGTH)
+
+    def _search_budget_trace(self, payload: dict[str, object]) -> str:
+        explicit_trace = compact_text(str(payload.get("search_budget_trace") or "").strip(), limit=18)
+        if explicit_trace:
+            return explicit_trace
+        raw_attempts = payload.get("search_attempts")
+        if not isinstance(raw_attempts, list):
+            return ""
+        budgets: list[int] = []
+        for attempt in raw_attempts:
+            if not isinstance(attempt, dict):
+                continue
+            max_output_tokens = attempt.get("max_output_tokens")
+            if isinstance(max_output_tokens, int):
+                budgets.append(max_output_tokens)
+        if not budgets:
+            return ""
+        trace: list[int] = []
+        for budget in budgets:
+            if not trace or trace[-1] != budget:
+                trace.append(budget)
+        return compact_text("->".join(str(budget) for budget in trace), limit=18)
 
     def _time_text(self, value: object) -> str:
         text = str(value or "").strip()

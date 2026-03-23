@@ -124,6 +124,21 @@ TWINR_CHONKYDB_TIMEOUT_S=20
 
 Compatibility fallback is present for legacy `CCODEX_MEMORY_BASE_URL` and `CCODEX_MEMORY_API_KEY`, but the Twinr code and docs should call the backend `chonkydb`.
 
+## Current live topology
+
+Twinr's live runtime endpoint and the backend operator endpoint are not the same
+thing:
+
+- `.env` carries the live Twinr runtime URL: `https://tessairact.com:2149`
+- `.env.chonkydb` carries operator/backend provenance for the dedicated
+  ChonkyDB instance on `thh1986`
+- the current live routing contract is:
+  `https://tessairact.com:2149` -> `thh1986.ddns.net` local `127.0.0.1:3044`
+
+Do not repoint Twinr directly to `thh1986.ddns.net:3044` unless the public
+proxy/routing contract has deliberately changed and the Pi/runtime config has
+been updated together.
+
 In `remote_primary` mode:
 
 - ChonkyDB is the primary long-term source of truth.
@@ -216,7 +231,7 @@ neighbors = client.graph_neighbors(
 
 - Both `x-api-key` and `Authorization: Bearer ...` are supported by the live service.
 - The current shared service still identifies itself as `ccodex_memory` in some response fields. Twinr treats that as remote service metadata, not as the local product name.
-- The public `https://tessairact.com:2149` endpoint is currently reachable from the Twinr server and the Pi.
+- The public `https://tessairact.com:2149` endpoint is currently reachable from the Twinr server and the Pi and proxies to the dedicated `thh1986` backend on local `127.0.0.1:3044`.
 
 ## Retrieval target
 

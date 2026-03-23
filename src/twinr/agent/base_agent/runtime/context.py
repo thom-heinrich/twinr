@@ -12,6 +12,8 @@ from twinr.memory import LongTermMemoryService, TwinrPersonalGraphStore
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteReadFailedError, LongTermRemoteUnavailableError
 from twinr.proactive import ProactiveGovernor
 
+from .display_grounding import build_active_display_grounding_message
+
 
 _ALLOWED_VOICE_STATUSES = frozenset(
     {
@@ -404,6 +406,10 @@ class TwinrRuntimeContextMixin:
             if guidance:
                 messages.append(("system", guidance))
 
+            display_grounding = build_active_display_grounding_message(self.config)
+            if display_grounding:
+                messages.append(("system", display_grounding))
+
             for context_message in self._fast_topic_system_messages_unlocked(
                 query_text=query_text,
                 event_prefix="supervisor_direct_context_fast_topic",
@@ -439,6 +445,10 @@ class TwinrRuntimeContextMixin:
             if guidance:
                 messages.append(("system", guidance))
 
+            display_grounding = build_active_display_grounding_message(self.config)
+            if display_grounding:
+                messages.append(("system", display_grounding))
+
             messages.extend(self._raw_tail_context_unlocked(limit=3))
             return tuple(messages)
 
@@ -466,6 +476,10 @@ class TwinrRuntimeContextMixin:
             guidance = self._voice_guidance_message()
             if guidance:
                 messages.append(("system", guidance))
+
+            display_grounding = build_active_display_grounding_message(self.config)
+            if display_grounding:
+                messages.append(("system", display_grounding))
 
             messages.extend(self._local_summary_context_unlocked(limit=1))
             messages.extend(

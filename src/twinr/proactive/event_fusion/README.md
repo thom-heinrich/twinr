@@ -17,6 +17,10 @@ Short-window multimodal event fusion for Twinr's proactive sensing stack.
 - social-trigger prompt wording or delivery cooldown policy
 - emotion, wellbeing, or diagnosis claims
 
+The active runtime now consumes these claims through
+[`../runtime/safety_trigger_fusion.py`](../runtime/safety_trigger_fusion.py),
+which keeps the fusion package itself free of runtime-policy side effects.
+
 ## Key files
 
 | File | Purpose |

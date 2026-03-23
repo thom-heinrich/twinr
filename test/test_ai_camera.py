@@ -4,6 +4,8 @@ import sys
 import tempfile
 import unittest
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.hardware.ai_camera import (
@@ -20,6 +22,7 @@ from twinr.hardware.ai_camera import (
 from twinr.hardware.camera_ai.detection import DetectionResult
 from twinr.hardware.camera_ai.face_anchors import (
     SupplementalFaceAnchorResult,
+    _visible_person_from_face_row,
     merge_detection_with_face_anchors,
 )
 from twinr.hardware.camera_ai.config import MediaPipeVisionConfig
@@ -169,6 +172,259 @@ class AICameraTests(unittest.TestCase):
         self.assertEqual(adapter.get_last_gesture_debug_details()["pose_hint_source"], "fresh_mediapipe")
         self.assertEqual(adapter.get_last_gesture_debug_details()["pose_hint_confidence"], 0.83)
 
+    def test_adapter_attention_observe_records_fast_path_gate_reasons(self) -> None:
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                attention_score_threshold=0.62,
+            )
+        )
+        primary_box = AICameraBox(top=0.18, left=0.30, bottom=0.86, right=0.70)
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=primary_box,
+                    zone=AICameraZone.CENTER,
+                    confidence=0.81,
+                ),
+            ),
+            person_near_device=False,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+
+        observation = adapter.observe_attention()
+        debug = adapter.get_last_attention_debug_details()
+
+        self.assertTrue(observation.camera_ready)
+        self.assertIsNotNone(debug)
+        assert debug is not None
+        self.assertTrue(debug["pose_inference_skipped"])
+        self.assertEqual(debug["attention_visual_attention_source"], "detection_center_fallback")
+        self.assertEqual(debug["attention_visual_attention_fallback_ceiling"], 0.35)
+        self.assertEqual(debug["attention_visual_attention_threshold"], 0.62)
+        self.assertEqual(debug["attention_looking_reason"], "fallback_score_below_threshold_ceiling")
+        self.assertEqual(debug["attention_hand_near_reason"], "no_large_object_box_detected")
+        self.assertEqual(debug["attention_showing_intent_reason"], "hand_near_false")
+
+    def test_adapter_attention_observe_uses_face_anchor_geometry_for_confirmed_looking(self) -> None:
+        primary_box = AICameraBox(top=0.18, left=0.30, bottom=0.86, right=0.70)
+        face_box = AICameraBox(top=0.26, left=0.42, bottom=0.40, right=0.56)
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                attention_score_threshold=0.62,
+            ),
+            face_anchor_detector=SimpleNamespace(
+                detect=lambda frame: SupplementalFaceAnchorResult(
+                    state="ok",
+                    visible_persons=(
+                        AICameraVisiblePerson(
+                            box=face_box,
+                            zone=AICameraZone.CENTER,
+                            confidence=0.93,
+                        ),
+                    ),
+                    face_count=1,
+                )
+            ),
+        )
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=primary_box,
+                    zone=AICameraZone.CENTER,
+                    confidence=0.81,
+                ),
+            ),
+            person_near_device=False,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: object()
+
+        observation = adapter.observe_attention()
+        debug = adapter.get_last_attention_debug_details()
+
+        self.assertTrue(observation.camera_ready)
+        self.assertTrue(observation.looking_toward_device)
+        self.assertEqual(observation.looking_signal_state, "confirmed")
+        self.assertEqual(observation.looking_signal_source, "face_anchor_matched")
+        self.assertGreater(observation.visual_attention_score or 0.0, 0.62)
+        self.assertIsNotNone(debug)
+        assert debug is not None
+        self.assertEqual(debug["attention_visual_attention_source"], "face_anchor_matched")
+        self.assertEqual(debug["attention_looking_signal_state"], "confirmed")
+        self.assertEqual(debug["attention_face_anchor_count"], 1)
+        self.assertEqual(debug["attention_looking_reason"], "matched_face_anchor_geometry_meets_threshold")
+
+    def test_adapter_attention_observe_keeps_side_glance_face_anchor_below_looking_threshold(self) -> None:
+        primary_box = AICameraBox(top=0.18, left=0.28, bottom=0.86, right=0.92)
+        face_box = AICameraBox(top=0.26, left=0.66, bottom=0.40, right=0.82)
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                attention_score_threshold=0.62,
+            ),
+            face_anchor_detector=SimpleNamespace(
+                detect=lambda frame: SupplementalFaceAnchorResult(
+                    state="ok",
+                    visible_persons=(
+                        AICameraVisiblePerson(
+                            box=face_box,
+                            zone=AICameraZone.RIGHT,
+                            confidence=0.93,
+                        ),
+                    ),
+                    face_count=1,
+                )
+            ),
+        )
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=primary_box,
+                    zone=AICameraZone.CENTER,
+                    confidence=0.81,
+                ),
+            ),
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: object()
+
+        observation = adapter.observe_attention()
+        debug = adapter.get_last_attention_debug_details()
+
+        self.assertTrue(observation.camera_ready)
+        self.assertFalse(observation.looking_toward_device)
+        self.assertEqual(observation.looking_signal_state, "inactive")
+        self.assertEqual(observation.looking_signal_source, "face_anchor_matched")
+        self.assertLess(observation.visual_attention_score or 0.0, 0.62)
+        self.assertIsNotNone(debug)
+        assert debug is not None
+        self.assertEqual(debug["attention_visual_attention_source"], "face_anchor_matched")
+        self.assertEqual(debug["attention_looking_signal_state"], "inactive")
+        self.assertEqual(debug["attention_looking_reason"], "matched_face_anchor_geometry_below_threshold")
+
+    def test_visible_person_from_face_row_derives_landmark_attention_hint(self) -> None:
+        person = _visible_person_from_face_row(
+            [100.0, 40.0, 80.0, 80.0, 120.0, 70.0, 160.0, 70.0, 140.0, 90.0, 125.0, 110.0, 155.0, 110.0, 0.91],
+            frame_width=320,
+            frame_height=240,
+            min_face_height=0.05,
+        )
+
+        self.assertIsNotNone(person)
+        assert person is not None
+        self.assertIsNotNone(person.attention_hint_score)
+        self.assertGreater(person.attention_hint_score or 0.0, 0.9)
+
+    def test_adapter_attention_observe_prefers_face_landmark_attention_hint(self) -> None:
+        primary_box = AICameraBox(top=0.18, left=0.30, bottom=0.86, right=0.70)
+        face_box = AICameraBox(top=0.26, left=0.42, bottom=0.40, right=0.56)
+        adapter = LocalAICameraAdapter(
+            config=AICameraAdapterConfig(
+                attention_score_threshold=0.62,
+            ),
+            face_anchor_detector=SimpleNamespace(
+                detect=lambda frame: SupplementalFaceAnchorResult(
+                    state="ok",
+                    visible_persons=(
+                        AICameraVisiblePerson(
+                            box=face_box,
+                            zone=AICameraZone.CENTER,
+                            confidence=0.93,
+                            attention_hint_score=0.82,
+                        ),
+                    ),
+                    face_count=1,
+                )
+            ),
+        )
+        adapter._load_detection_runtime = lambda: {}
+        adapter._probe_online = lambda runtime: None
+        adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+            person_count=1,
+            primary_person_box=primary_box,
+            primary_person_zone=AICameraZone.CENTER,
+            visible_persons=(
+                AICameraVisiblePerson(
+                    box=primary_box,
+                    zone=AICameraZone.CENTER,
+                    confidence=0.81,
+                ),
+            ),
+            person_near_device=True,
+            hand_or_object_near_camera=False,
+            objects=(),
+        )
+        adapter._capture_rgb_frame = lambda runtime, observed_at: object()
+
+        observation = adapter.observe_attention()
+        debug = adapter.get_last_attention_debug_details()
+
+        self.assertTrue(observation.camera_ready)
+        self.assertTrue(observation.looking_toward_device)
+        self.assertEqual(observation.looking_signal_state, "confirmed")
+        self.assertEqual(observation.looking_signal_source, "face_anchor_matched")
+        self.assertAlmostEqual(observation.visual_attention_score or 0.0, 0.82, places=3)
+        self.assertIsNotNone(debug)
+        assert debug is not None
+        self.assertEqual(debug["attention_looking_reason"], "matched_face_anchor_landmark_attention_meets_threshold")
+
+    def test_visible_person_from_face_row_reduces_landmark_attention_hint_for_side_glance(self) -> None:
+        person = _visible_person_from_face_row(
+            [100.0, 40.0, 80.0, 80.0, 120.0, 70.0, 160.0, 70.0, 127.0, 90.0, 118.0, 110.0, 148.0, 110.0, 0.91],
+            frame_width=320,
+            frame_height=240,
+            min_face_height=0.05,
+        )
+
+        self.assertIsNotNone(person)
+        assert person is not None
+        self.assertIsNotNone(person.attention_hint_score)
+        self.assertLess(person.attention_hint_score or 0.0, 0.62)
+
+    def test_visible_person_from_face_row_confirms_off_axis_looking_toward_device(self) -> None:
+        person = _visible_person_from_face_row(
+            [250.0, 40.0, 50.0, 70.0, 258.0, 65.0, 286.0, 65.0, 265.0, 85.0, 259.0, 100.0, 279.0, 100.0, 0.91],
+            frame_width=320,
+            frame_height=240,
+            min_face_height=0.05,
+        )
+
+        self.assertIsNotNone(person)
+        assert person is not None
+        self.assertIsNotNone(person.attention_hint_score)
+        self.assertGreater(person.attention_hint_score or 0.0, 0.62)
+
+    def test_visible_person_from_face_row_rejects_off_axis_face_turning_away(self) -> None:
+        person = _visible_person_from_face_row(
+            [250.0, 40.0, 50.0, 70.0, 258.0, 65.0, 286.0, 65.0, 281.0, 85.0, 266.0, 100.0, 286.0, 100.0, 0.91],
+            frame_width=320,
+            frame_height=240,
+            min_face_height=0.05,
+        )
+
+        self.assertIsNotNone(person)
+        assert person is not None
+        self.assertIsNotNone(person.attention_hint_score)
+        self.assertLess(person.attention_hint_score or 0.0, 0.62)
+
     def test_adapter_gesture_observe_uses_full_mediapipe_fallback_when_fast_lane_returns_none(self) -> None:
         adapter = LocalAICameraAdapter(
             config=AICameraAdapterConfig(
@@ -299,6 +555,63 @@ class AICameraTests(unittest.TestCase):
         self.assertEqual(adapter.get_last_gesture_debug_details()["gesture_target_source"], "face_anchor_promoted")
         self.assertEqual(adapter.get_last_gesture_debug_details()["gesture_target_face_anchor_count"], 1)
         self.assertEqual(observation.person_count, 1)
+
+    def test_adapter_gesture_observe_records_candidate_capture_for_manual_qc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter = LocalAICameraAdapter(
+                config=AICameraAdapterConfig(
+                    pose_backend="mediapipe",
+                    gesture_candidate_capture_dir=tmpdir,
+                    gesture_candidate_capture_cooldown_s=0.0,
+                    gesture_candidate_capture_max_images=4,
+                )
+            )
+            primary_box = AICameraBox(top=0.12, left=0.24, bottom=0.92, right=0.68)
+            adapter._load_detection_runtime = lambda: {}
+            adapter._probe_online = lambda runtime: None
+            adapter._capture_detection = lambda runtime, observed_at: DetectionResult(
+                person_count=1,
+                primary_person_box=primary_box,
+                primary_person_zone=AICameraZone.CENTER,
+                visible_persons=(
+                    AICameraVisiblePerson(
+                        box=primary_box,
+                        zone=AICameraZone.CENTER,
+                        confidence=0.81,
+                    ),
+                ),
+                person_near_device=True,
+                hand_or_object_near_camera=False,
+                objects=(),
+            )
+            adapter._capture_rgb_frame = lambda runtime, observed_at: np.full((12, 16, 3), 96, dtype=np.uint8)
+            adapter._ensure_mediapipe_pipeline = lambda: SimpleNamespace(
+                analyze_pose_hints=lambda **_: MediaPipeVisionResult(
+                    pose_confidence=0.83,
+                    sparse_keypoints={
+                        9: (0.36, 0.41, 0.91),
+                        10: (0.58, 0.39, 0.93),
+                    },
+                )
+            )
+            adapter._ensure_live_gesture_pipeline = lambda: SimpleNamespace(
+                observe=lambda **_: SimpleNamespace(
+                    hand_count=0,
+                    fine_hand_gesture=AICameraFineHandGesture.NONE,
+                    fine_hand_gesture_confidence=None,
+                    gesture_event=AICameraGestureEvent.NONE,
+                    gesture_confidence=None,
+                ),
+                debug_snapshot=lambda: {"resolved_source": "none", "live_hand_count": 0},
+            )
+
+            adapter.observe_gesture()
+
+            debug = adapter.get_last_gesture_debug_details()
+            self.assertTrue(debug["candidate_capture_saved"])
+            self.assertEqual(debug["candidate_capture_reasons"], ["pose_hint"])
+            self.assertTrue(Path(debug["candidate_capture_image_path"]).is_file())
+            self.assertTrue(Path(debug["candidate_capture_metadata_path"]).is_file())
 
     def test_adapter_reports_missing_custom_mediapipe_gesture_model_explicitly(self) -> None:
         adapter = LocalAICameraAdapter(

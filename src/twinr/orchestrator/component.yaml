@@ -8,9 +8,9 @@ owned_concerns:
   - Define websocket transport contracts for turn requests, ack events, tool exchange, text deltas, and turn completion
   - Expose the websocket client, FastAPI server, and local session bridge used by edge-orchestrator deployments
   - Correlate remote tool calls and results while keeping fast ack phrases mapped to stable transport IDs
-  - Define bounded streaming voice contracts for edge audio frames, runtime-state updates, wake confirmations, follow-up windows, and barge-in interrupts
-  - Host the server-side voice session that evaluates wakeword candidates and emits follow-up or barge-in decisions
-  - Adapt colocated local STT HTTP services into bounded transcript calls for the server-side voice session
+  - Define bounded streaming voice contracts for edge audio frames, runtime-state updates, wake confirmations, same-stream transcript commits, follow-up windows, and barge-in interrupts
+  - Host the server-side voice session that evaluates activation candidates and emits same-stream transcript or barge-in decisions
+  - Adapt the thh1986 remote ASR HTTP service into bounded transcript calls for the server-side voice session
 out_of_scope:
   - Tool prompt authoring, schema construction, or concrete tool-side business logic in src/twinr/agent/tools
   - Runtime loop selection or CLI orchestration in src/twinr/__main__.py and src/twinr/agent/workflows
@@ -60,11 +60,11 @@ files:
       - OrchestratorVoiceAudioFrame
       - OrchestratorVoiceBargeInInterruptEvent
       - OrchestratorVoiceErrorEvent
-      - OrchestratorVoiceFollowUpCaptureRequestedEvent
       - OrchestratorVoiceFollowUpClosedEvent
       - OrchestratorVoiceHelloRequest
       - OrchestratorVoiceReadyEvent
       - OrchestratorVoiceRuntimeStateEvent
+      - OrchestratorVoiceTranscriptCommittedEvent
       - OrchestratorVoiceWakeConfirmedEvent
       - decode_voice_server_event
   - path: voice_client.py
@@ -81,14 +81,19 @@ files:
     exports:
       - EdgeOrchestratorSession
       - RemoteToolBridge
-  - path: local_stt.py
-    role: Bounded HTTP client for colocated local STT services used by the voice session
+  - path: remote_asr.py
+    role: Bounded HTTP client for the thh1986 remote ASR service used by the voice session
     exports:
-      - LocalSttBackendAdapter
-      - LocalSttServiceError
-      - LocalSttTranscript
+      - RemoteAsrBackendAdapter
+      - RemoteAsrServiceError
+      - RemoteAsrTranscript
+  - path: voice_transcript_debug_stream.py
+    role: Bounded JSONL storage for raw transcript-first gateway decisions
+    exports:
+      - VoiceTranscriptDebugStream
+      - VoiceTranscriptDebugStreamConfig
   - path: voice_session.py
-    role: Server-side wakeword, follow-up, and barge-in decision session for streaming edge audio
+    role: Server-side activation, follow-up, and barge-in decision session for streaming edge audio
     exports:
       - EdgeOrchestratorVoiceSession
 public_api:
@@ -107,11 +112,11 @@ public_api:
     - OrchestratorVoiceAudioFrame
     - OrchestratorVoiceBargeInInterruptEvent
     - OrchestratorVoiceErrorEvent
-    - OrchestratorVoiceFollowUpCaptureRequestedEvent
     - OrchestratorVoiceFollowUpClosedEvent
     - OrchestratorVoiceHelloRequest
     - OrchestratorVoiceReadyEvent
     - OrchestratorVoiceRuntimeStateEvent
+    - OrchestratorVoiceTranscriptCommittedEvent
     - OrchestratorVoiceWakeConfirmedEvent
     - OrchestratorVoiceWebSocketClient
     - OrchestratorWebSocketClient

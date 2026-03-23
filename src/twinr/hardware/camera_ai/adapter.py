@@ -14,8 +14,10 @@ from twinr.agent.base_agent.config import TwinrConfig
 from .config import AICameraAdapterConfig, MediaPipeVisionConfig
 from .detection import DetectionResult, capture_detection
 from .face_anchors import OpenCVFaceAnchorDetector, SupplementalFaceAnchorResult, merge_detection_with_face_anchors
+from .gesture_candidate_capture import GestureCandidateCaptureStore
 from .imx500_runtime import IMX500RuntimeSessionManager
 from .live_gesture_pipeline import LiveGesturePipeline
+from .looking_signal import infer_fast_looking_signal
 from .mediapipe_pipeline import MediaPipeVisionPipeline
 from .models import (
     AICameraBox,
@@ -85,6 +87,10 @@ class LocalAICameraAdapter:
         self._lock = Lock()
         self._health_lock = Lock()  # AUDIT-FIX(#1): Health/frame metadata can be updated by timeout callers outside the main capture lock.
         self._runtime_manager = IMX500RuntimeSessionManager(config=self.config, sleep_fn=self._sleep)
+        self._gesture_candidate_capture = GestureCandidateCaptureStore.from_config(
+            self.config,
+            clock=self._clock,
+        )
         self._last_frame_at: float | None = None
         self._last_health_change_at: float | None = None
         self._last_health_signature: tuple[bool, bool, bool, str | None] | None = None
@@ -106,6 +112,7 @@ class LocalAICameraAdapter:
         self._last_motion_confidence: float | None = None
         self._face_anchor_detector = face_anchor_detector
         self._last_gesture_debug_details: dict[str, Any] | None = None
+        self._last_attention_debug_details: dict[str, Any] | None = None
 
     @classmethod
     def from_config(cls, config: TwinrConfig) -> "LocalAICameraAdapter":
@@ -186,7 +193,7 @@ class LocalAICameraAdapter:
                 frame_rgb=frame_rgb,
                 frame_error=frame_error,
             )
-            detection = self._supplement_visible_persons(
+            detection, face_anchors = self._supplement_visible_persons_with_face_anchors(
                 detection=detection,
                 frame_rgb=frame_rgb,
             )
@@ -196,6 +203,7 @@ class LocalAICameraAdapter:
                 detection=detection,
                 pose=pose_result,
                 pose_error=pose_error,
+                face_anchors=None if pose_result is not None else face_anchors,
             )
             return self._with_health(
                 observation,
@@ -259,6 +267,11 @@ class LocalAICameraAdapter:
             online_error = self._probe_online(runtime)
             if online_error is not None:
                 logger.warning("Local AI camera attention online probe failed with %s.", online_error)
+                self._last_attention_debug_details = {
+                    "mode": "attention_fast",
+                    "pipeline_error": online_error,
+                    "attention_pipeline_note": "attention_fast_path_skips_pose_and_hand_inference",
+                }
                 return self._health_only_observation(
                     observed_at=observed_at,
                     online=False,
@@ -276,16 +289,22 @@ class LocalAICameraAdapter:
                     runtime,
                     observed_at=observed_at,
                 )
-                detection = self._supplement_visible_persons(
-                    detection=detection,
-                    frame_rgb=frame_rgb,
-                )
+            detection, face_anchors = self._supplement_visible_persons_with_face_anchors(
+                detection=detection,
+                frame_rgb=frame_rgb,
+            )
             observation = self._compose_observation(
                 observed_at=observed_at,
                 observed_monotonic=observed_monotonic,
                 detection=detection,
                 pose=None,
                 pose_error=None,
+                face_anchors=face_anchors,
+            )
+            self._last_attention_debug_details = self._build_attention_debug_details(
+                detection=detection,
+                observation=observation,
+                face_anchors=face_anchors,
             )
             return self._with_health(
                 observation,
@@ -299,6 +318,11 @@ class LocalAICameraAdapter:
             code = self._classify_error(exc)
             logger.warning("Local AI camera attention observation failed with %s.", code)
             logger.debug("Local AI camera attention observation exception details.", exc_info=True)
+            self._last_attention_debug_details = {
+                "mode": "attention_fast",
+                "pipeline_error": code,
+                "attention_pipeline_note": "attention_fast_path_skips_pose_and_hand_inference",
+            }
             return self._health_only_observation(
                 observed_at=observed_at,
                 online=True,
@@ -409,6 +433,18 @@ class LocalAICameraAdapter:
                         final_resolved_source = "mediapipe_pose_event_fallback"
                 self._last_gesture_debug_details = {
                     **gesture_debug,
+                    "live_fine_hand_gesture": gesture_observation.fine_hand_gesture.value,
+                    "live_fine_hand_gesture_confidence": (
+                        None
+                        if gesture_observation.fine_hand_gesture_confidence is None
+                        else round(float(gesture_observation.fine_hand_gesture_confidence), 3)
+                    ),
+                    "live_gesture_event": gesture_observation.gesture_event.value,
+                    "live_gesture_confidence": (
+                        None
+                        if gesture_observation.gesture_confidence is None
+                        else round(float(gesture_observation.gesture_confidence), 3)
+                    ),
                     "pose_hint_source": pose_hint_source,
                     "pose_hint_confidence": (
                         None if pose_hint_confidence is None else round(float(pose_hint_confidence), 3)
@@ -445,6 +481,12 @@ class LocalAICameraAdapter:
                 camera_metrics = self._runtime_manager.last_camera_metrics()
                 if camera_metrics:
                     self._last_gesture_debug_details.update(camera_metrics)
+                capture_result = self._gesture_candidate_capture.maybe_capture(
+                    observed_at=observed_at,
+                    frame_rgb=frame_rgb,
+                    debug_details=self._last_gesture_debug_details,
+                )
+                self._last_gesture_debug_details.update(capture_result.debug_fields())
             except Exception as exc:  # pragma: no cover - hardware-dependent path.
                 code = self._classify_error(exc)
                 logger.warning("Local AI camera live gesture observation failed with %s.", code)
@@ -523,6 +565,103 @@ class LocalAICameraAdapter:
         if self._last_gesture_debug_details is None:
             return None
         return dict(self._last_gesture_debug_details)
+
+    def get_last_attention_debug_details(self) -> dict[str, Any] | None:
+        """Return the newest bounded attention debug snapshot for operators."""
+
+        if self._last_attention_debug_details is None:
+            return None
+        return dict(self._last_attention_debug_details)
+
+    def _build_attention_debug_details(
+        self,
+        *,
+        detection: DetectionResult,
+        observation: AICameraObservation,
+        face_anchors: SupplementalFaceAnchorResult | None,
+    ) -> dict[str, Any]:
+        """Summarize why fast attention facts did or did not become active.
+
+        The HDMI attention loop deliberately skips pose/hand inference for
+        latency. Expose that fact explicitly, together with the fallback score
+        ceilings, so operators can see when `LOOKING`, `HAND_NEAR`, or
+        `INTENT_LIKELY` were impossible on the fast path instead of treating
+        them as random dropouts.
+        """
+
+        looking_signal = infer_fast_looking_signal(
+            detection=detection,
+            face_anchors=face_anchors,
+            attention_score_threshold=self.config.attention_score_threshold,
+        )
+        visual_attention_score = observation.visual_attention_score
+        attention_threshold = round(float(self.config.attention_score_threshold), 3)
+        fallback_visual_attention_ceiling = None if looking_signal.source != "detection_center_fallback" else 0.35
+        looking_reason = looking_signal.reason
+
+        if observation.hand_or_object_near_camera:
+            hand_near_reason = "large_object_box_detected"
+        else:
+            hand_near_reason = "no_large_object_box_detected"
+
+        showing_intent_reason = "inactive"
+        if observation.showing_intent_likely is True:
+            showing_intent_reason = "fallback_conditions_met"
+        elif observation.hand_or_object_near_camera is not True:
+            showing_intent_reason = "hand_near_false"
+        elif observation.looking_toward_device is True:
+            showing_intent_reason = "waiting_for_hand_near_only"
+        elif observation.person_near_device is True:
+            showing_intent_reason = "waiting_for_hand_near_only"
+        else:
+            showing_intent_reason = "looking_and_person_near_false"
+
+        primary_box = detection.primary_person_box
+        payload: dict[str, Any] = {
+            "mode": "attention_fast",
+            "pose_inference_skipped": True,
+            "pose_skip_reason": "latency_preserving_attention_fast_path",
+            "attention_pipeline_note": "attention_fast_path_skips_pose_and_hand_inference",
+            "detection_person_count": detection.person_count,
+            "detection_visible_person_count": len(detection.visible_persons),
+            "detection_primary_person_zone": detection.primary_person_zone.value,
+            "detection_person_near_device": detection.person_near_device,
+            "detection_hand_or_object_near_camera": detection.hand_or_object_near_camera,
+            "attention_visual_attention_source": looking_signal.source,
+            "attention_visual_attention_score": (
+                None if visual_attention_score is None else round(float(visual_attention_score), 3)
+            ),
+            "attention_visual_attention_threshold": attention_threshold,
+            "attention_visual_attention_fallback_ceiling": fallback_visual_attention_ceiling,
+            "attention_looking_toward_device": observation.looking_toward_device,
+            "attention_looking_signal_state": observation.looking_signal_state,
+            "attention_looking_signal_source": observation.looking_signal_source,
+            "attention_looking_reason": looking_reason,
+            "attention_face_anchor_state": looking_signal.face_anchor_state,
+            "attention_face_anchor_count": looking_signal.face_anchor_count,
+            "attention_face_anchor_match_confidence": looking_signal.matched_face_confidence,
+            "attention_face_anchor_match_center_x": looking_signal.matched_face_center_x,
+            "attention_face_anchor_match_center_y": looking_signal.matched_face_center_y,
+            "attention_hand_near_source": "detection_large_object_boxes",
+            "attention_hand_or_object_near_camera": observation.hand_or_object_near_camera,
+            "attention_hand_near_reason": hand_near_reason,
+            "attention_showing_intent_source": "detection_hand_plus_attention_fallback",
+            "attention_showing_intent_likely": observation.showing_intent_likely,
+            "attention_showing_intent_reason": showing_intent_reason,
+        }
+        if primary_box is not None:
+            payload.update(
+                {
+                    "detection_primary_person_center_x": round(float(primary_box.center_x), 3),
+                    "detection_primary_person_center_y": round(float(primary_box.center_y), 3),
+                    "detection_primary_person_area": round(float(primary_box.area), 3),
+                    "detection_primary_person_height": round(float(primary_box.height), 3),
+                }
+            )
+        camera_metrics = self._runtime_manager.last_camera_metrics()
+        if camera_metrics:
+            payload.update(camera_metrics)
+        return payload
 
     def _resolve_gesture_pose_fallback(
         self,
@@ -881,6 +1020,7 @@ class LocalAICameraAdapter:
         detection: DetectionResult,
         pose: PoseResult | None,
         pose_error: str | None,
+        face_anchors: SupplementalFaceAnchorResult | None = None,
     ) -> AICameraObservation:
         """Merge detection and pose signals into one bounded observation."""
 
@@ -888,8 +1028,15 @@ class LocalAICameraAdapter:
         primary_person_zone = detection.primary_person_zone
         person_near_device = detection.person_near_device
 
-        visual_attention = None
-        looking_toward_device = None
+        fast_looking_signal = infer_fast_looking_signal(
+            detection=detection,
+            face_anchors=face_anchors,
+            attention_score_threshold=self.config.attention_score_threshold,
+        )
+        visual_attention = fast_looking_signal.visual_attention_score
+        looking_toward_device = fast_looking_signal.looking_toward_device
+        looking_signal_state = fast_looking_signal.state if fast_looking_signal.source is not None else None
+        looking_signal_source = fast_looking_signal.source
         engaged_with_device = None
         body_pose = AICameraBodyPose.UNKNOWN
         pose_confidence = None
@@ -902,20 +1049,23 @@ class LocalAICameraAdapter:
         showing_intent_likely = None
         hand_or_object_near_camera = detection.hand_or_object_near_camera
 
-        if primary_person_box is not None:
-            center_x = self._box_center_x(primary_person_box)
-            if center_x is not None:
-                base_center_score = 1.0 - min(1.0, abs(center_x - 0.5) / 0.5)
-                visual_attention = round(base_center_score * 0.35, 3)
-                looking_toward_device = visual_attention >= self.config.attention_score_threshold
-                engaged_with_device = person_near_device is True and visual_attention >= self.config.engaged_score_threshold
-                showing_intent_likely = hand_or_object_near_camera and (looking_toward_device or person_near_device is True)
+        if visual_attention is not None or person_near_device is not None:
+            engaged_with_device = person_near_device is True and (visual_attention or 0.0) >= self.config.engaged_score_threshold
+            showing_intent_likely = hand_or_object_near_camera and (looking_toward_device is True or person_near_device is True)
 
         if pose is not None:
             if pose.visual_attention_score is not None:
-                visual_attention = pose.visual_attention_score  # AUDIT-FIX(#7): Preserve detection-derived fallback signals when pose output is partial.
-            if pose.looking_toward_device is not None:
-                looking_toward_device = pose.looking_toward_device  # AUDIT-FIX(#7): Do not overwrite usable fallback gaze state with None.
+                if visual_attention is None or float(pose.visual_attention_score) >= float(visual_attention):
+                    visual_attention = pose.visual_attention_score  # AUDIT-FIX(#7): Preserve higher-confidence pose attention when available.
+            if pose.looking_toward_device is True:
+                looking_toward_device = True
+                looking_signal_state = "confirmed"
+                looking_signal_source = "pose_attention"
+            elif pose.looking_toward_device is False and looking_toward_device is not True:
+                looking_toward_device = False
+                looking_signal_state = "inactive"
+                if looking_signal_source is None:
+                    looking_signal_source = "pose_attention"
             engaged_with_device = (
                 detection.person_count > 0
                 and (person_near_device is True or looking_toward_device is True)
@@ -949,6 +1099,8 @@ class LocalAICameraAdapter:
             primary_person_zone=primary_person_zone,
             visible_persons=detection.visible_persons,
             looking_toward_device=looking_toward_device,
+            looking_signal_state=looking_signal_state,
+            looking_signal_source=looking_signal_source,
             person_near_device=person_near_device,
             engaged_with_device=engaged_with_device,
             visual_attention_score=visual_attention,
@@ -1014,26 +1166,45 @@ class LocalAICameraAdapter:
             logger.debug("Local AI camera RGB preview exception details.", exc_info=True)
             return None, code
 
-    def _supplement_visible_persons(
+    def _supplement_visible_persons_with_face_anchors(
         self,
         *,
         detection: DetectionResult,
         frame_rgb: Any | None,
-    ) -> DetectionResult:
-        """Add bounded supplemental face anchors when SSD saw fewer than two people."""
+    ) -> tuple[DetectionResult, SupplementalFaceAnchorResult]:
+        """Add bounded supplemental face anchors and return the raw face result."""
 
-        if self._face_anchor_detector is None or frame_rgb is None or detection.person_count >= 2:
-            return detection
+        if self._face_anchor_detector is None:
+            return detection, SupplementalFaceAnchorResult(
+                state="disabled",
+                detail="face_anchor_detector_disabled",
+            )
+        if detection.person_count >= 2:
+            return detection, SupplementalFaceAnchorResult(
+                state="skipped",
+                detail="multiple_people_already_detected",
+            )
+        if frame_rgb is None:
+            return detection, SupplementalFaceAnchorResult(
+                state="skipped",
+                detail="face_anchor_frame_unavailable",
+            )
         try:
             face_result = self._face_anchor_detector.detect(frame_rgb)
-            return merge_detection_with_face_anchors(
-                detection=detection,
-                face_anchors=face_result,
+            return (
+                merge_detection_with_face_anchors(
+                    detection=detection,
+                    face_anchors=face_result,
+                ),
+                face_result,
             )
         except Exception:
             logger.warning("Local AI camera supplemental face-anchor detection failed.")
             logger.debug("Local AI camera face-anchor exception details.", exc_info=True)
-            return detection
+            return detection, SupplementalFaceAnchorResult(
+                state="backend_unavailable",
+                detail="supplemental_face_anchor_detection_failed",
+            )
 
     def _detect_face_anchors_for_gesture(
         self,
@@ -1259,6 +1430,8 @@ class LocalAICameraAdapter:
             primary_person_zone=observation.primary_person_zone,
             visible_persons=observation.visible_persons,
             looking_toward_device=observation.looking_toward_device,
+            looking_signal_state=observation.looking_signal_state,
+            looking_signal_source=observation.looking_signal_source,
             person_near_device=observation.person_near_device,
             engaged_with_device=observation.engaged_with_device,
             visual_attention_score=observation.visual_attention_score,

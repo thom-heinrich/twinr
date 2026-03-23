@@ -411,6 +411,16 @@ class ContinuousAttentionTracker:
             return None
         if (observed_at - self._last_selected_at) > self.config.target_hold_s:
             return None
+        fresh_tracks = [
+            track
+            for track in tracks
+            if (observed_at - track.updated_at) <= 1e-6
+        ]
+        for track in fresh_tracks:
+            if track.track_id == self._last_selected_track_id:
+                return track
+        if fresh_tracks:
+            return None
         for track in tracks:
             if track.track_id == self._last_selected_track_id:
                 return track
@@ -521,6 +531,7 @@ class ContinuousAttentionTracker:
 def _visible_person_anchors(camera: Mapping[str, object]) -> tuple[_VisiblePersonAnchor, ...]:
     """Parse bounded visible-person anchors from camera automation facts."""
 
+    primary_anchor = _primary_visible_person_anchor(camera)
     raw_people = camera.get("visible_persons")
     anchors: list[_VisiblePersonAnchor] = []
     if isinstance(raw_people, (tuple, list)):
@@ -540,20 +551,36 @@ def _visible_person_anchors(camera: Mapping[str, object]) -> tuple[_VisiblePerso
                 )
             )
     if anchors:
+        if len(anchors) == 1 and primary_anchor is not None:
+            single_anchor = anchors[0]
+            return (
+                _VisiblePersonAnchor(
+                    center_x=primary_anchor.center_x,
+                    center_y=single_anchor.center_y,
+                    zone=primary_anchor.zone,
+                    confidence=max(single_anchor.confidence, primary_anchor.confidence),
+                ),
+            )
         return tuple(anchors)
+    if primary_anchor is None:
+        return ()
+    return (primary_anchor,)
+
+
+def _primary_visible_person_anchor(camera: Mapping[str, object]) -> _VisiblePersonAnchor | None:
+    """Return the stabilized primary-person anchor when camera facts expose one."""
+
     person_visible = coerce_optional_bool(camera.get("person_visible")) is True
     center_x = None if coerce_optional_bool(camera.get("primary_person_center_x_unknown")) is True else coerce_optional_ratio(camera.get("primary_person_center_x"))
     center_y = None if coerce_optional_bool(camera.get("primary_person_center_y_unknown")) is True else coerce_optional_ratio(camera.get("primary_person_center_y"))
     if not person_visible or center_x is None or center_y is None:
-        return ()
+        return None
     zone = _normalize_horizontal(camera.get("primary_person_zone")) or _horizontal_from_center_x(center_x)
-    return (
-        _VisiblePersonAnchor(
-            center_x=center_x,
-            center_y=center_y,
-            zone=zone or "center",
-            confidence=max(0.6, coerce_optional_ratio(camera.get("visual_attention_score")) or 0.0),
-        ),
+    return _VisiblePersonAnchor(
+        center_x=center_x,
+        center_y=center_y,
+        zone=zone or "center",
+        confidence=max(0.6, coerce_optional_ratio(camera.get("visual_attention_score")) or 0.0),
     )
 
 

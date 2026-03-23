@@ -76,293 +76,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Capture one proactive ambient-audio observation and print the parsed fields",
     )
     parser.add_argument(
-        "--wakeword-eval",
-        action="store_true",
-        help="Evaluate the current wakeword detector against labeled captures or a JSONL manifest.",
-    )
-    parser.add_argument(
-        "--wakeword-stream-eval",
-        action="store_true",
-        help="Replay labeled captures through Twinr's runtime-faithful wakeword streaming path.",
-    )
-    parser.add_argument(
-        "--wakeword-autotune",
-        action="store_true",
-        help="Search for a better wakeword calibration profile from labeled captures or a JSONL manifest.",
-    )
-    parser.add_argument(
-        "--wakeword-manifest",
-        type=Path,
-        help="Optional JSONL or JSON-array manifest of labeled wakeword captures for eval/autotune/verifier training or post-training acceptance tuning.",
-    )
-    parser.add_argument(
-        "--wakeword-training-plan",
-        action="store_true",
-        help="Render the canonical Twinr wakeword training and Pi-acceptance plan.",
-    )
-    parser.add_argument(
-        "--wakeword-training-plan-output",
-        type=Path,
-        help="Optional Markdown output path for --wakeword-training-plan.",
-    )
-    parser.add_argument(
-        "--wakeword-export-wekws",
-        action="store_true",
-        help="Export labeled Twinr wakeword manifests into WeKws/Kaldi-style split directories.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-output-dir",
-        type=Path,
-        help="Output directory for --wakeword-export-wekws.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-train-manifest",
-        type=Path,
-        help="Required train manifest for --wakeword-export-wekws.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-dev-manifest",
-        type=Path,
-        help="Optional dev manifest for --wakeword-export-wekws.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-test-manifest",
-        type=Path,
-        help="Optional test manifest for --wakeword-export-wekws.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-positive-token",
-        default="TWINR_FAMILY",
-        help="Positive class token for --wakeword-export-wekws; angle brackets are added automatically.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-filler-token",
-        default="FILLER",
-        help="Negative filler token for --wakeword-export-wekws; angle brackets are added automatically.",
-    )
-    parser.add_argument(
-        "--wakeword-prepare-wekws-experiment",
-        action="store_true",
-        help="Prepare a reproducible WeKws training workspace from an exported Twinr WeKws dataset.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-dataset-dir",
-        type=Path,
-        help="Input dataset directory produced by --wakeword-export-wekws.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-experiment-dir",
-        type=Path,
-        help="Output directory for --wakeword-prepare-wekws-experiment.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-recipe",
-        default="mdtc_fbank_stream",
-        help="Built-in WeKws experiment recipe id for --wakeword-prepare-wekws-experiment.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-gpus",
-        default="0",
-        help="Comma-separated GPU ids to embed into the generated WeKws runner script.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-num-workers",
-        type=int,
-        default=8,
-        help="Data-loader worker count to embed into the generated WeKws runner script.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-cmvn-num-workers",
-        type=int,
-        default=16,
-        help="CMVN worker count to embed into the generated WeKws runner script.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-min-duration-frames",
-        type=int,
-        default=50,
-        help="Minimum keyword duration in frames for the generated WeKws training command.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-seed",
-        type=int,
-        default=666,
-        help="Random seed to embed into the generated WeKws training command.",
-    )
-    parser.add_argument(
-        "--wakeword-wekws-base-checkpoint",
-        type=Path,
-        help="Optional upstream WeKws checkpoint to resume or fine-tune from.",
-    )
-    parser.add_argument(
-        "--wakeword-kws-provision",
-        action="store_true",
-        help="Download and prepare one official sherpa-onnx KWS bundle plus Twinr keyword files.",
-    )
-    parser.add_argument(
-        "--wakeword-kws-bundle",
-        default="gigaspeech_3_3m_bpe_int8",
-        help="Built-in sherpa-onnx KWS bundle id for --wakeword-kws-provision.",
-    )
-    parser.add_argument(
-        "--wakeword-kws-output-dir",
-        type=Path,
-        help="Where to write the prepared sherpa-onnx KWS bundle; defaults to src/twinr/proactive/wakeword/models/kws.",
-    )
-    parser.add_argument(
-        "--wakeword-kws-keyword",
-        action="append",
-        default=[],
-        help="Explicit KWS keyword phrase; repeat to override derivation from the configured wakeword phrases.",
-    )
-    parser.add_argument(
-        "--wakeword-kws-lexicon-entry",
-        action="append",
-        default=[],
-        help=(
-            "Optional custom phone-lexicon entry in the form WORD=PHONE PHONE ...; "
-            "repeat to add multiple pronunciations or words for phone-based bundles."
-        ),
-    )
-    parser.add_argument(
-        "--wakeword-kws-force",
-        action="store_true",
-        help="Overwrite an existing KWS output directory for --wakeword-kws-provision.",
-    )
-    parser.add_argument(
-        "--wakeword-promotion-eval",
-        action="store_true",
-        help="Run runtime-faithful suite and ambient promotion guards from one JSON spec.",
-    )
-    parser.add_argument(
-        "--wakeword-promotion-spec",
-        type=Path,
-        help="JSON spec for --wakeword-promotion-eval with labeled suites and ambient guards.",
-    )
-    parser.add_argument(
-        "--wakeword-train-model",
-        action="store_true",
-        help="Train a local openWakeWord-compatible Twinr base model from a generated dataset root.",
-    )
-    parser.add_argument(
-        "--wakeword-dataset-root",
-        type=Path,
-        help="Dataset root produced by scripts/generate_multivoice_dataset.py for base-model training.",
-    )
-    parser.add_argument(
-        "--wakeword-model-output",
-        type=Path,
-        help="Where to write the trained wakeword .onnx model.",
-    )
-    parser.add_argument(
-        "--wakeword-model-metadata-output",
-        type=Path,
-        help="Optional metadata .json output path for --wakeword-train-model.",
-    )
-    parser.add_argument(
-        "--wakeword-training-workdir",
-        type=Path,
-        help="Optional working directory for intermediate wakeword training features.",
-    )
-    parser.add_argument(
-        "--wakeword-training-rounds",
-        type=int,
-        default=2,
-        help="How many fixed-length jitter variants to build per training clip.",
-    )
-    parser.add_argument(
-        "--wakeword-training-steps",
-        type=int,
-        default=20000,
-        help="Maximum training steps for the openWakeWord base-model loop.",
-    )
-    parser.add_argument(
-        "--wakeword-training-layer-dim",
-        type=int,
-        default=128,
-        help="Hidden layer width for the trained wakeword detector.",
-    )
-    parser.add_argument(
-        "--wakeword-training-model-type",
-        default="mlp",
-        help="Wakeword base-model training backend: mlp, dnn, or rnn.",
-    )
-    parser.add_argument(
-        "--wakeword-training-feature-device",
-        default="cpu",
-        help="Feature extraction device for wakeword training: cpu or gpu.",
-    )
-    parser.add_argument(
-        "--wakeword-training-difficulty-model",
-        type=Path,
-        help="Optional reference .onnx detector used to upweight deployment-proximate hard examples during MLP training.",
-    )
-    parser.add_argument(
-        "--wakeword-training-difficulty-positive-scale",
-        type=float,
-        default=0.0,
-        help="Additional positive hard-example emphasis derived from the reference detector scores.",
-    )
-    parser.add_argument(
-        "--wakeword-training-difficulty-negative-scale",
-        type=float,
-        default=0.0,
-        help="Additional negative hard-example emphasis derived from the reference detector scores.",
-    )
-    parser.add_argument(
-        "--wakeword-training-difficulty-power",
-        type=float,
-        default=2.0,
-        help="Exponent applied to difficulty-derived sample weighting during MLP training.",
-    )
-    parser.add_argument(
-        "--wakeword-train-verifier",
-        action="store_true",
-        help="Train a local openWakeWord custom verifier from a labeled wakeword manifest.",
-    )
-    parser.add_argument(
-        "--wakeword-train-sequence-verifier",
-        action="store_true",
-        help="Train a Twinr clip-level sequence verifier for the openWakeWord cascade from a labeled wakeword manifest.",
-    )
-    parser.add_argument(
-        "--wakeword-verifier-output",
-        type=Path,
-        help="Where to write the trained wakeword verifier .pkl file.",
-    )
-    parser.add_argument(
-        "--wakeword-verifier-model",
-        help="Optional wakeword model name or local model path used to train the verifier.",
-    )
-    parser.add_argument(
-        "--wakeword-sequence-verifier-output",
-        type=Path,
-        help="Where to write the trained Twinr sequence verifier .pkl file.",
-    )
-    parser.add_argument(
-        "--wakeword-sequence-verifier-model",
-        help="Wakeword model name or local model path used as the stage-1 detector for sequence-verifier training.",
-    )
-    parser.add_argument(
-        "--wakeword-sequence-verifier-aux-model",
-        action="append",
-        default=[],
-        help="Optional auxiliary wakeword model path or name used to add extra score tracks to the sequence verifier; repeat for multiple models.",
-    )
-    parser.add_argument(
-        "--wakeword-label-capture",
-        type=Path,
-        help="Record an operator label for one stored wakeword capture.",
-    )
-    parser.add_argument(
-        "--wakeword-label",
-        help="Operator label to save for --wakeword-label-capture, for example correct or false_positive.",
-    )
-    parser.add_argument(
-        "--wakeword-label-notes",
-        help="Optional operator note stored with --wakeword-label-capture.",
-    )
-    parser.add_argument(
         "--openai-web-search",
         action="store_true",
         default=None,
@@ -503,6 +216,25 @@ def _should_enable_display_companion(config: TwinrConfig, env_file: str | Path) 
     return _is_raspberry_pi_host()
 
 
+def _should_enable_respeaker_led_companion(config: TwinrConfig, env_file: str | Path) -> bool:
+    """Enable the ReSpeaker LED companion on authoritative Pi runtime hosts."""
+
+    if not _uses_pi_runtime_root(env_file):
+        return False
+    explicit_setting = getattr(config, "respeaker_led_enabled", None)
+    if explicit_setting is not None:
+        return bool(explicit_setting)
+    if not _is_raspberry_pi_host():
+        return False
+    from twinr.hardware.respeaker import config_targets_respeaker
+
+    return config_targets_respeaker(
+        getattr(config, "voice_orchestrator_audio_device", None),
+        getattr(config, "proactive_audio_input_device", None),
+        getattr(config, "audio_input_device", None),
+    )
+
+
 def _should_ensure_remote_watchdog_companion(config: TwinrConfig, env_file: str | Path) -> bool:
     """Return whether the remote-memory watchdog companion must be started."""
 
@@ -544,71 +276,6 @@ def _assert_pi_runtime_root(env_file: str | Path, *, command_name: str) -> None:
         raise RuntimeError(
             f"{command_name} with /twinr runtime state must import from {expected_source_root}, not {package_root}"
         )
-
-
-def _default_wakeword_verifier_output_path(model_name: str | None) -> Path | None:
-    """Infer one sibling verifier path for a local wakeword model file."""
-
-    if model_name is None:
-        return None
-    normalized_model_name = str(model_name).strip()
-    if not normalized_model_name:
-        return None
-    candidate = Path(normalized_model_name).expanduser()
-    if not candidate.exists():
-        return None
-    return candidate.resolve(strict=False).with_suffix(".verifier.pkl")
-
-
-def _default_wakeword_sequence_verifier_output_path(model_name: str | None) -> Path | None:
-    """Infer one sibling sequence-verifier path for a local wakeword model file."""
-
-    if model_name is None:
-        return None
-    normalized_model_name = str(model_name).strip()
-    if not normalized_model_name:
-        return None
-    candidate = Path(normalized_model_name).expanduser()
-    if not candidate.exists():
-        return None
-    return candidate.resolve(strict=False).with_suffix(".sequence_verifier.pkl")
-
-
-def _default_wakeword_kws_output_dir(config: TwinrConfig) -> Path:
-    """Return the canonical repo-local directory for provisioned KWS assets."""
-
-    return Path(config.project_root).resolve(strict=False) / "src/twinr/proactive/wakeword/models/kws"
-
-
-def _parse_kws_lexicon_entries(values: list[str] | tuple[str, ...]) -> dict[str, tuple[str, ...]]:
-    """Parse repeated WORD=PHONE PHONE CLI flags into one lexicon-entry mapping."""
-
-    parsed: dict[str, list[str]] = {}
-    for raw_value in values:
-        text = str(raw_value or "").strip()
-        if not text:
-            continue
-        word, separator, pronunciation = text.partition("=")
-        word = word.strip()
-        pronunciation = " ".join(pronunciation.split())
-        if separator != "=" or not word or not pronunciation:
-            raise ValueError(
-                "Each --wakeword-kws-lexicon-entry must use WORD=PHONE PHONE ... syntax."
-            )
-        parsed.setdefault(word, []).append(pronunciation)
-    return {word: tuple(pronunciations) for word, pronunciations in parsed.items()}
-
-
-def _build_wakeword_verifier_backend(config: TwinrConfig, backend) -> Any:
-    """Build one verifier backend when wakeword verification needs STT."""
-
-    if backend is not None:
-        return backend
-    if config.wakeword_verifier_mode == "disabled" or not config.openai_api_key:
-        return None
-    from twinr.providers.openai import OpenAIBackend
-
-    return OpenAIBackend(config=config)
 
 
 def _build_runtime(config: TwinrConfig) -> Any:
@@ -829,112 +496,6 @@ def main() -> int:
     if args.run_orchestrator_server:
         return _run_orchestrator_server(config, args.env_file)
 
-    if args.wakeword_training_plan:
-        from twinr.proactive.wakeword import (
-            build_default_wakeword_training_plan,
-            render_wakeword_training_plan_markdown,
-        )
-
-        plan = build_default_wakeword_training_plan(project_root=config.project_root)
-        markdown = render_wakeword_training_plan_markdown(plan)
-        if args.wakeword_training_plan_output is not None:
-            output_path = args.wakeword_training_plan_output.expanduser().resolve(strict=False)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(markdown, encoding="utf-8")
-            print(f"wakeword_training_plan_output={output_path}")
-            print(f"wakeword_training_plan_model_name={plan.stage1_model_name}")
-            print(f"wakeword_training_plan_phrase_profile={plan.stage1_phrase_profile}")
-            return 0
-        print(markdown.rstrip())
-        return 0
-
-    if args.wakeword_export_wekws:
-        if args.wakeword_wekws_output_dir is None:
-            raise RuntimeError("--wakeword-wekws-output-dir is required with --wakeword-export-wekws")
-        if args.wakeword_wekws_train_manifest is None:
-            raise RuntimeError("--wakeword-wekws-train-manifest is required with --wakeword-export-wekws")
-        from twinr.proactive.wakeword import export_wakeword_manifests_to_wekws
-
-        report = export_wakeword_manifests_to_wekws(
-            output_dir=args.wakeword_wekws_output_dir,
-            train_manifest=args.wakeword_wekws_train_manifest,
-            dev_manifest=args.wakeword_wekws_dev_manifest,
-            test_manifest=args.wakeword_wekws_test_manifest,
-            positive_token=args.wakeword_wekws_positive_token,
-            filler_token=args.wakeword_wekws_filler_token,
-        )
-        print(f"wakeword_wekws_output_dir={report.output_dir}")
-        print(f"wakeword_wekws_dict={report.dict_path}")
-        print(f"wakeword_wekws_words={report.words_path}")
-        print(f"wakeword_wekws_metadata={report.metadata_path}")
-        for split_report in report.split_reports:
-            prefix = f"wakeword_wekws_{split_report.split_name}"
-            print(f"{prefix}_manifest={split_report.manifest_path}")
-            print(f"{prefix}_output_dir={split_report.output_dir}")
-            print(f"{prefix}_entries={split_report.entry_count}")
-            print(f"{prefix}_positive={split_report.positive_count}")
-            print(f"{prefix}_negative={split_report.negative_count}")
-            print(f"{prefix}_ignored={split_report.ignored_count}")
-        return 0
-
-    if args.wakeword_prepare_wekws_experiment:
-        if args.wakeword_wekws_dataset_dir is None:
-            raise RuntimeError("--wakeword-wekws-dataset-dir is required with --wakeword-prepare-wekws-experiment")
-        if args.wakeword_wekws_experiment_dir is None:
-            raise RuntimeError(
-                "--wakeword-wekws-experiment-dir is required with --wakeword-prepare-wekws-experiment"
-            )
-        from twinr.proactive.wakeword import prepare_wekws_experiment
-
-        report = prepare_wekws_experiment(
-            output_dir=args.wakeword_wekws_experiment_dir,
-            exported_dataset_dir=args.wakeword_wekws_dataset_dir,
-            recipe_id=str(args.wakeword_wekws_recipe or "").strip() or "mdtc_fbank_stream",
-            seed=int(args.wakeword_wekws_seed),
-            gpus=str(args.wakeword_wekws_gpus or "0"),
-            num_workers=int(args.wakeword_wekws_num_workers),
-            cmvn_num_workers=int(args.wakeword_wekws_cmvn_num_workers),
-            min_duration_frames=int(args.wakeword_wekws_min_duration_frames),
-            base_checkpoint=args.wakeword_wekws_base_checkpoint,
-        )
-        print(f"wakeword_wekws_experiment_dir={report.output_dir}")
-        print(f"wakeword_wekws_recipe={report.recipe.recipe_id}")
-        print(f"wakeword_wekws_config={report.config_path}")
-        print(f"wakeword_wekws_dict={report.dict_dir}")
-        print(f"wakeword_wekws_model_dir={report.model_dir}")
-        print(f"wakeword_wekws_script={report.script_path}")
-        print(f"wakeword_wekws_metadata={report.metadata_path}")
-        for split_report in report.split_reports:
-            prefix = f"wakeword_wekws_{split_report.split_name}"
-            print(f"{prefix}_source_dir={split_report.source_dir}")
-            print(f"{prefix}_output_dir={split_report.output_dir}")
-            print(f"{prefix}_entries={split_report.utterance_count}")
-            print(f"{prefix}_data_list={split_report.data_list_path}")
-        return 0
-
-    if args.wakeword_kws_provision:
-        from twinr.proactive.wakeword import provision_builtin_kws_bundle
-
-        report = provision_builtin_kws_bundle(
-            output_dir=args.wakeword_kws_output_dir or _default_wakeword_kws_output_dir(config),
-            bundle_id=str(args.wakeword_kws_bundle or "").strip() or "gigaspeech_3_3m_bpe_int8",
-            phrases=config.wakeword_phrases,
-            explicit_keywords=tuple(str(item).strip() for item in (args.wakeword_kws_keyword or []) if str(item).strip()),
-            lexicon_entries=_parse_kws_lexicon_entries(args.wakeword_kws_lexicon_entry or []),
-            force=args.wakeword_kws_force,
-        )
-        print(f"wakeword_kws_bundle_id={report.bundle_id}")
-        print(f"wakeword_kws_output_dir={report.output_dir}")
-        print("wakeword_kws_keywords=" + ",".join(report.keyword_names))
-        print(f"wakeword_kws_tokens_path={report.tokens_path}")
-        print(f"wakeword_kws_encoder_path={report.encoder_path}")
-        print(f"wakeword_kws_decoder_path={report.decoder_path}")
-        print(f"wakeword_kws_joiner_path={report.joiner_path}")
-        print(f"wakeword_kws_keywords_file_path={report.keywords_path}")
-        if report.lexicon_path is not None:
-            print(f"wakeword_kws_lexicon_path={report.lexicon_path}")
-        return 0
-
     uses_openai = any(
         [
             args.openai_prompt,
@@ -961,6 +522,7 @@ def main() -> int:
             from twinr.agent.workflows.runtime_error_hold import hold_runtime_error_state
             from twinr.agent.workflows.streaming_runner import TwinrStreamingHardwareLoop
             from twinr.display.companion import optional_display_companion
+            from twinr.hardware.respeaker.companion import optional_respeaker_led_companion
             from twinr.ops import loop_instance_lock
             from twinr.providers import build_streaming_provider_bundle
             from twinr.providers.openai import OpenAIBackend
@@ -972,28 +534,32 @@ def main() -> int:
                     config,
                     enabled=_should_enable_display_companion(config, args.env_file),
                 ):
-                    runtime = _build_runtime(config)
-                    _print_runtime_banner(runtime, config, env_path)
-                    try:
-                        backend = OpenAIBackend(config=config)
-                        provider_bundle = build_streaming_provider_bundle(config, support_backend=backend)
-                        loop = TwinrStreamingHardwareLoop(
-                            config=config,
-                            runtime=runtime,
-                            print_backend=provider_bundle.print_backend,
-                            stt_provider=provider_bundle.stt,
-                            verification_stt_provider=getattr(provider_bundle, "verification_stt", None),
-                            agent_provider=provider_bundle.agent,
-                            tts_provider=provider_bundle.tts,
-                            tool_agent_provider=provider_bundle.tool_agent,
-                        )
-                        return loop.run(duration_s=args.loop_duration)
-                    except Exception as exc:
-                        return hold_runtime_error_state(
-                            runtime=runtime,
-                            error=exc,
-                            duration_s=args.loop_duration,
-                        )
+                    with optional_respeaker_led_companion(
+                        config,
+                        enabled=_should_enable_respeaker_led_companion(config, args.env_file),
+                    ):
+                        runtime = _build_runtime(config)
+                        _print_runtime_banner(runtime, config, env_path)
+                        try:
+                            backend = OpenAIBackend(config=config)
+                            provider_bundle = build_streaming_provider_bundle(config, support_backend=backend)
+                            loop = TwinrStreamingHardwareLoop(
+                                config=config,
+                                runtime=runtime,
+                                print_backend=provider_bundle.print_backend,
+                                stt_provider=provider_bundle.stt,
+                                verification_stt_provider=getattr(provider_bundle, "verification_stt", None),
+                                agent_provider=provider_bundle.agent,
+                                tts_provider=provider_bundle.tts,
+                                tool_agent_provider=provider_bundle.tool_agent,
+                            )
+                            return loop.run(duration_s=args.loop_duration)
+                        except Exception as exc:
+                            return hold_runtime_error_state(
+                                runtime=runtime,
+                                error=exc,
+                                duration_s=args.loop_duration,
+                            )
 
         if args.run_whatsapp_channel:
             from twinr.ops.runtime_scope import build_scoped_runtime_config
@@ -1058,6 +624,7 @@ def main() -> int:
             from twinr.agent.workflows.runtime_error_hold import hold_runtime_error_state
             from twinr.agent.workflows.realtime_runner import TwinrRealtimeHardwareLoop
             from twinr.display.companion import optional_display_companion
+            from twinr.hardware.respeaker.companion import optional_respeaker_led_companion
             from twinr.ops import loop_instance_lock
 
             with loop_instance_lock(config, "realtime-loop"):
@@ -1065,19 +632,23 @@ def main() -> int:
                     config,
                     enabled=_should_enable_display_companion(config, args.env_file),
                 ):
-                    try:
-                        loop = TwinrRealtimeHardwareLoop(
-                            config=config,
-                            runtime=runtime,
-                            print_backend=backend,
-                        )
-                        return loop.run(duration_s=args.loop_duration)
-                    except Exception as exc:
-                        return hold_runtime_error_state(
-                            runtime=runtime,
-                            error=exc,
-                            duration_s=args.loop_duration,
-                        )
+                    with optional_respeaker_led_companion(
+                        config,
+                        enabled=_should_enable_respeaker_led_companion(config, args.env_file),
+                    ):
+                        try:
+                            loop = TwinrRealtimeHardwareLoop(
+                                config=config,
+                                runtime=runtime,
+                                print_backend=backend,
+                            )
+                            return loop.run(duration_s=args.loop_duration)
+                        except Exception as exc:
+                            return hold_runtime_error_state(
+                                runtime=runtime,
+                                error=exc,
+                                duration_s=args.loop_duration,
+                            )
 
         if args.run_whatsapp_channel:
             if backend is None:
@@ -1144,6 +715,7 @@ def main() -> int:
             from twinr.agent.legacy.classic_hardware_loop import TwinrHardwareLoop
             from twinr.agent.workflows.runtime_error_hold import hold_runtime_error_state
             from twinr.display.companion import optional_display_companion
+            from twinr.hardware.respeaker.companion import optional_respeaker_led_companion
             from twinr.ops import loop_instance_lock
 
             with loop_instance_lock(config, "hardware-loop"):
@@ -1151,19 +723,23 @@ def main() -> int:
                     config,
                     enabled=_should_enable_display_companion(config, args.env_file),
                 ):
-                    try:
-                        loop = TwinrHardwareLoop(
-                            config=config,
-                            runtime=runtime,
-                            backend=backend,
-                        )
-                        return loop.run(duration_s=args.loop_duration)
-                    except Exception as exc:
-                        return hold_runtime_error_state(
-                            runtime=runtime,
-                            error=exc,
-                            duration_s=args.loop_duration,
-                        )
+                    with optional_respeaker_led_companion(
+                        config,
+                        enabled=_should_enable_respeaker_led_companion(config, args.env_file),
+                    ):
+                        try:
+                            loop = TwinrHardwareLoop(
+                                config=config,
+                                runtime=runtime,
+                                backend=backend,
+                            )
+                            return loop.run(duration_s=args.loop_duration)
+                        except Exception as exc:
+                            return hold_runtime_error_state(
+                                runtime=runtime,
+                                error=exc,
+                                duration_s=args.loop_duration,
+                            )
 
         if args.audio_file and backend is not None:
             transcript = backend.transcribe_path(args.audio_file)
@@ -1224,230 +800,6 @@ def main() -> int:
             snapshot = observe_audio_perception_once(config)
             for line in render_audio_perception_snapshot_lines(snapshot):
                 print(line)
-
-        if args.wakeword_label_capture:
-            if not args.wakeword_label:
-                raise RuntimeError("--wakeword-label is required with --wakeword-label-capture")
-            from twinr.proactive import append_wakeword_capture_label
-
-            entry = append_wakeword_capture_label(
-                config,
-                capture_path=args.wakeword_label_capture,
-                label=args.wakeword_label,
-                notes=args.wakeword_label_notes,
-            )
-            print(f"wakeword_label_capture={args.wakeword_label_capture}")
-            print(f"wakeword_label={entry['data']['label']}")
-            return 0
-
-        if args.wakeword_train_model:
-            if args.wakeword_dataset_root is None:
-                raise RuntimeError("--wakeword-dataset-root is required with --wakeword-train-model")
-            if args.wakeword_model_output is None:
-                raise RuntimeError("--wakeword-model-output is required with --wakeword-train-model")
-            from twinr.proactive.wakeword import train_wakeword_base_model_from_dataset_root
-
-            report = train_wakeword_base_model_from_dataset_root(
-                dataset_root=args.wakeword_dataset_root,
-                output_model_path=args.wakeword_model_output,
-                metadata_path=args.wakeword_model_metadata_output,
-                acceptance_manifest=args.wakeword_manifest,
-                workdir=args.wakeword_training_workdir,
-                training_rounds=args.wakeword_training_rounds,
-                model_type=str(args.wakeword_training_model_type or "mlp").strip().lower() or "mlp",
-                layer_dim=args.wakeword_training_layer_dim,
-                steps=args.wakeword_training_steps,
-                feature_device=str(args.wakeword_training_feature_device or "cpu").strip().lower() or "cpu",
-                difficulty_reference_model_path=args.wakeword_training_difficulty_model,
-                difficulty_positive_scale=args.wakeword_training_difficulty_positive_scale,
-                difficulty_negative_scale=args.wakeword_training_difficulty_negative_scale,
-                difficulty_power=args.wakeword_training_difficulty_power,
-                evaluation_config=config,
-            )
-            print(f"wakeword_model_dataset_root={report.dataset_root}")
-            print(f"wakeword_model_output={report.output_model_path}")
-            print(f"wakeword_model_metadata={report.metadata_path}")
-            print(f"wakeword_model_total_length_samples={report.total_length_samples}")
-            print(f"wakeword_model_train_positive_clips={report.train_positive_clips}")
-            print(f"wakeword_model_train_negative_clips={report.train_negative_clips}")
-            print(f"wakeword_model_validation_positive_clips={report.validation_positive_clips}")
-            print(f"wakeword_model_validation_negative_clips={report.validation_negative_clips}")
-            print(f"wakeword_model_selected_threshold={report.selected_threshold:.6f}")
-            if report.acceptance_metrics is not None:
-                print(f"wakeword_model_acceptance_precision={report.acceptance_metrics.precision:.4f}")
-                print(f"wakeword_model_acceptance_recall={report.acceptance_metrics.recall:.4f}")
-                print(f"wakeword_model_acceptance_fpr={report.acceptance_metrics.false_positive_rate:.4f}")
-                print(f"wakeword_model_acceptance_fnr={report.acceptance_metrics.false_negative_rate:.4f}")
-            return 0
-
-        if args.wakeword_train_verifier:
-            if args.wakeword_manifest is None:
-                raise RuntimeError("--wakeword-manifest is required with --wakeword-train-verifier")
-            from twinr.proactive.wakeword import train_wakeword_custom_verifier_from_manifest
-
-            configured_models = tuple(str(item).strip() for item in config.wakeword_openwakeword_models if str(item).strip())
-            model_name = str(args.wakeword_verifier_model or (configured_models[0] if configured_models else "")).strip()
-            if not model_name:
-                raise RuntimeError(
-                    "Wakeword verifier training requires --wakeword-verifier-model or one configured openWakeWord model."
-                )
-            output_path = args.wakeword_verifier_output or _default_wakeword_verifier_output_path(model_name)
-            if output_path is None:
-                raise RuntimeError(
-                    "--wakeword-verifier-output is required when the verifier model is not a local file path."
-                )
-            report = train_wakeword_custom_verifier_from_manifest(
-                manifest_path=args.wakeword_manifest,
-                output_path=output_path,
-                model_name=model_name,
-                inference_framework=config.wakeword_openwakeword_inference_framework,
-            )
-            print(f"wakeword_verifier_manifest={report.manifest_path}")
-            print(f"wakeword_verifier_model={report.model_name}")
-            print(f"wakeword_verifier_positive_clips={report.positive_clips}")
-            print(f"wakeword_verifier_negative_clips={report.negative_clips}")
-            print(f"wakeword_verifier_negative_seconds={report.negative_seconds:.3f}")
-            print(f"wakeword_verifier_output={report.output_path}")
-            return 0
-
-        if args.wakeword_train_sequence_verifier:
-            if args.wakeword_manifest is None:
-                raise RuntimeError("--wakeword-manifest is required with --wakeword-train-sequence-verifier")
-            from twinr.proactive.wakeword import train_wakeword_sequence_verifier_from_manifest
-
-            configured_models = tuple(
-                str(item).strip() for item in config.wakeword_openwakeword_models if str(item).strip()
-            )
-            model_name = str(
-                args.wakeword_sequence_verifier_model or (configured_models[0] if configured_models else "")
-            ).strip()
-            if not model_name:
-                raise RuntimeError(
-                    "Sequence verifier training requires --wakeword-sequence-verifier-model or one configured openWakeWord model."
-                )
-            output_path = (
-                args.wakeword_sequence_verifier_output
-                or _default_wakeword_sequence_verifier_output_path(model_name)
-            )
-            if output_path is None:
-                raise RuntimeError(
-                    "--wakeword-sequence-verifier-output is required when the sequence-verifier model is not a local file path."
-                )
-            auxiliary_models = tuple(
-                str(item).strip() for item in (args.wakeword_sequence_verifier_aux_model or []) if str(item).strip()
-            )
-            report = train_wakeword_sequence_verifier_from_manifest(
-                manifest_path=args.wakeword_manifest,
-                output_path=output_path,
-                model_name=model_name,
-                auxiliary_models=auxiliary_models,
-                inference_framework=config.wakeword_openwakeword_inference_framework,
-            )
-            print(f"wakeword_sequence_verifier_manifest={report.manifest_path}")
-            print(f"wakeword_sequence_verifier_model={report.model_name}")
-            print(
-                "wakeword_sequence_verifier_auxiliary_models="
-                + ",".join(report.auxiliary_models)
-            )
-            print(f"wakeword_sequence_verifier_positive_clips={report.positive_clips}")
-            print(f"wakeword_sequence_verifier_negative_clips={report.negative_clips}")
-            print(f"wakeword_sequence_verifier_negative_seconds={report.negative_seconds:.3f}")
-            print(f"wakeword_sequence_verifier_total_length_samples={report.total_length_samples}")
-            print(f"wakeword_sequence_verifier_embedding_frames={report.embedding_frames}")
-            print(f"wakeword_sequence_verifier_feature_dimensions={report.feature_dimensions}")
-            print(f"wakeword_sequence_verifier_output={report.output_path}")
-            return 0
-
-        if args.wakeword_eval:
-            from twinr.proactive import run_wakeword_eval
-
-            verifier_backend = _build_wakeword_verifier_backend(config, backend)
-            report = run_wakeword_eval(
-                config=config,
-                manifest_path=args.wakeword_manifest,
-                backend=verifier_backend,
-            )
-            print(f"wakeword_eval_entries={report.evaluated_entries}")
-            print(f"wakeword_eval_precision={report.metrics.precision:.4f}")
-            print(f"wakeword_eval_recall={report.metrics.recall:.4f}")
-            print(f"wakeword_eval_fpr={report.metrics.false_positive_rate:.4f}")
-            print(f"wakeword_eval_fnr={report.metrics.false_negative_rate:.4f}")
-            if report.report_path is not None:
-                print(f"wakeword_eval_report={report.report_path}")
-            return 0
-
-        if args.wakeword_stream_eval:
-            if args.wakeword_manifest is None:
-                raise RuntimeError("--wakeword-manifest is required with --wakeword-stream-eval")
-            from twinr.proactive import run_wakeword_stream_eval
-
-            verifier_backend = _build_wakeword_verifier_backend(config, backend)
-            report = run_wakeword_stream_eval(
-                config=config,
-                manifest_path=args.wakeword_manifest,
-                backend=verifier_backend,
-            )
-            print(f"wakeword_stream_eval_entries={report.evaluated_entries}")
-            print(f"wakeword_stream_eval_precision={report.metrics.precision:.4f}")
-            print(f"wakeword_stream_eval_recall={report.metrics.recall:.4f}")
-            print(f"wakeword_stream_eval_fpr={report.metrics.false_positive_rate:.4f}")
-            print(f"wakeword_stream_eval_fnr={report.metrics.false_negative_rate:.4f}")
-            print(f"wakeword_stream_eval_accepted_detections={report.accepted_detection_count}")
-            print(f"wakeword_stream_eval_total_audio_seconds={report.total_audio_seconds:.3f}")
-            if report.report_path is not None:
-                print(f"wakeword_stream_eval_report={report.report_path}")
-            return 0
-
-        if args.wakeword_promotion_eval:
-            if args.wakeword_promotion_spec is None:
-                raise RuntimeError("--wakeword-promotion-spec is required with --wakeword-promotion-eval")
-            from twinr.proactive import run_wakeword_promotion_eval
-
-            verifier_backend = _build_wakeword_verifier_backend(config, backend)
-            report = run_wakeword_promotion_eval(
-                config=config,
-                spec_path=args.wakeword_promotion_spec,
-                backend=verifier_backend,
-            )
-            print(f"wakeword_promotion_passed={str(report.passed).lower()}")
-            print(f"wakeword_promotion_blocker_count={len(report.blockers)}")
-            if report.blockers:
-                print("wakeword_promotion_blockers=" + " | ".join(report.blockers))
-            for index, suite_result in enumerate(report.suite_results):
-                prefix = f"wakeword_promotion_suite_{index}"
-                print(f"{prefix}_name={suite_result.spec.name}")
-                print(f"{prefix}_precision={suite_result.report.metrics.precision:.4f}")
-                print(f"{prefix}_recall={suite_result.report.metrics.recall:.4f}")
-                print(f"{prefix}_fp={suite_result.report.metrics.false_positive}")
-                print(f"{prefix}_fn={suite_result.report.metrics.false_negative}")
-            for index, ambient_result in enumerate(report.ambient_results):
-                prefix = f"wakeword_promotion_ambient_{index}"
-                print(f"{prefix}_name={ambient_result.spec.name}")
-                print(f"{prefix}_false_accepts_per_hour={ambient_result.false_accepts_per_hour:.6f}")
-                print(f"{prefix}_accepted_detections={ambient_result.report.accepted_detection_count}")
-            if report.report_path is not None:
-                print(f"wakeword_promotion_report={report.report_path}")
-            return 0
-
-        if args.wakeword_autotune:
-            from twinr.proactive import autotune_wakeword_profile
-
-            verifier_backend = _build_wakeword_verifier_backend(config, backend)
-            recommendation = autotune_wakeword_profile(
-                config=config,
-                manifest_path=args.wakeword_manifest,
-                backend=verifier_backend,
-            )
-            print(f"wakeword_autotune_precision={recommendation.metrics.precision:.4f}")
-            print(f"wakeword_autotune_recall={recommendation.metrics.recall:.4f}")
-            print(f"wakeword_autotune_fpr={recommendation.metrics.false_positive_rate:.4f}")
-            print(f"wakeword_autotune_score={recommendation.score:.4f}")
-            if recommendation.profile_path is not None:
-                print(f"wakeword_autotune_profile={recommendation.profile_path}")
-            print(f"wakeword_autotune_threshold={recommendation.profile.threshold}")
-            print(f"wakeword_autotune_patience_frames={recommendation.profile.patience_frames}")
-            print(f"wakeword_autotune_activation_samples={recommendation.profile.activation_samples}")
-            return 0
 
         if args.vision_prompt and backend is not None:
             from twinr.providers.openai import OpenAIImageInput

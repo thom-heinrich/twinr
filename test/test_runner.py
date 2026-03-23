@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -1214,6 +1215,24 @@ class HardwareLoopTests(unittest.TestCase):
         self.assertTrue(button_monitor.exited)
         self.assertTrue(proactive_monitor.entered)
         self.assertTrue(proactive_monitor.exited)
+
+    def test_run_starts_boot_sound_once_when_loop_enters_waiting(self) -> None:
+        backend = FakeBackend()
+        button_monitor = FakeIdleButtonMonitor()
+        loop, _lines, _recorder, _player, _printer = self.make_loop(
+            backend=backend,
+            button_monitor=button_monitor,
+        )
+
+        with mock.patch("twinr.agent.legacy.classic_hardware_loop.start_startup_boot_sound") as start_mock:
+            result = loop.run(duration_s=0.01, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        start_mock.assert_called_once_with(
+            config=loop.config,
+            playback_coordinator=loop.playback_coordinator,
+            emit=loop.emit,
+        )
 
 
 if __name__ == "__main__":

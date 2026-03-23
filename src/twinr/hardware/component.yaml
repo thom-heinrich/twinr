@@ -24,7 +24,7 @@ owned_concerns:
   - Probe ReSpeaker XVF3800 USB/ALSA readiness and capture typed host-control primitives
   - Derive conservative XVF3800 runtime facts such as direction confidence, overlap, mute state, and busy-state interruption hints
   - Keep expensive XVF3800 host-control polling on an activity-aware schedule so idle Pi loops reuse recent signal snapshots instead of re-reading USB control state every tick
-  - Resolve one calm XVF3800 listening/mute-only indicator contract for future ring or LED feedback
+  - Resolve one calm XVF3800 indicator contract and drive bounded runtime-owned ring feedback for waiting, listening, thinking, speaking, and error states
   - Derive conservative XVF3800 non-speech and background-media suppression facts from bounded ambient capture
   - Persist and assess local on-device voice profiles
 out_of_scope:
@@ -201,11 +201,16 @@ files:
       - AUDIO_MGR_SELECTED_AZIMUTHS_PARAMETER
       - DEFAULT_RESPEAKER_PARAMETER_SPECS
       - DOA_VALUE_PARAMETER
+      - LED_COLOR_PARAMETER
+      - LED_EFFECT_PARAMETER
       - GPO_READ_VALUES_PARAMETER
       - VERSION_PARAMETER
       - ReSpeakerClaimMetadata
       - ReSpeakerDerivedSignalState
       - ReSpeakerCaptureDevice
+      - ReSpeakerLedController
+      - ReSpeakerLedLoop
+      - ReSpeakerLedProfile
       - ReSpeakerIndicatorState
       - ReSpeakerMemoryClass
       - ReSpeakerDirectionSnapshot
@@ -228,15 +233,34 @@ files:
       - claim_contract_to_payload
       - config_targets_respeaker
       - derive_respeaker_signal_state
+      - optional_respeaker_led_companion
       - probe_respeaker_xvf3800
       - read_default_respeaker_parameters
+      - resolve_respeaker_led_profile
       - resolve_respeaker_indicator_state
   - path: respeaker/claim_contract.py
     role: Build and serialize per-claim XVF3800 provenance/confidence metadata
   - path: respeaker/ambient_classification.py
     role: Conservative non-speech and background-media classification from bounded ambient capture plus XVF3800 speech facts
+  - path: respeaker/companion.py
+    role: Optional Pi-runtime background companion for the XVF3800 LED loop
+    exports:
+      - optional_respeaker_led_companion
   - path: respeaker/indicator_policy.py
     role: Shared calm XVF3800 ring/indicator semantics for listening, mute, and unavailable states
+  - path: respeaker/led_profiles.py
+    role: Calm runtime-state-to-color pulse profiles for the XVF3800 ring
+    exports:
+      - ReSpeakerLedProfile
+      - resolve_respeaker_led_profile
+  - path: respeaker/led_controller.py
+    role: Bounded XVF3800 LED writes with deduped effect/color updates
+    exports:
+      - ReSpeakerLedController
+  - path: respeaker/led_loop.py
+    role: Snapshot-driven runtime LED loop that keeps the XVF3800 ring aligned with Twinr status
+    exports:
+      - ReSpeakerLedLoop
   - path: respeaker/derived_signals.py
     role: Conservative XVF3800 signal interpretation helpers for direction, overlap, and busy-state interruption facts
   - path: respeaker/models.py
@@ -252,9 +276,14 @@ files:
   - path: respeaker/scheduled_provider.py
     role: Activity-aware XVF3800 polling wrapper that caches heavy host-control snapshots between active refresh windows
   - path: respeaker/transport.py
-    role: Dependency-light libusb host-control transport for XVF3800 reads
+    role: Dependency-light libusb host-control transport for XVF3800 reads and bounded LED writes
     exports:
       - ReSpeakerLibusbTransport
+  - path: respeaker/write_specs.py
+    role: Official bounded XVF3800 write specs used by Twinr LED control
+    exports:
+      - LED_COLOR_PARAMETER
+      - LED_EFFECT_PARAMETER
   - path: voice_profile.py
     role: Local voice profile store, enrollment, and assessment helpers
     exports:

@@ -176,6 +176,17 @@ class LocalAICameraObservationProvider:
             return None
         return dict(details)
 
+    def attention_debug_details(self) -> dict[str, object] | None:
+        """Return the newest bounded attention-pipeline debug details."""
+
+        getter = getattr(self.adapter, "get_last_attention_debug_details", None)
+        if not callable(getter):
+            return None
+        details = getter()
+        if details is None:
+            return None
+        return dict(details)
+
     def _to_social_observation(self, observation: AICameraObservation) -> SocialVisionObservation:
         """Map one adapter observation onto the stable social vision contract."""
 
@@ -213,6 +224,8 @@ class LocalAICameraObservationProvider:
             primary_person_center_x=observation.primary_person_center_x,
             primary_person_center_y=observation.primary_person_center_y,
             looking_toward_device=bool(observation.looking_toward_device),
+            looking_signal_state=observation.looking_signal_state,
+            looking_signal_source=observation.looking_signal_source,
             person_near_device=observation.person_near_device,
             engaged_with_device=observation.engaged_with_device,
             visual_attention_score=observation.visual_attention_score,

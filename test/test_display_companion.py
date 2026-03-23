@@ -14,11 +14,13 @@ class _FakeDisplayLoop:
         self.started = Event()
         self.stopped = Event()
         self.sleep = lambda _seconds: None
+        self.stop_requested = lambda: False
 
     def run(self, *, duration_s: float | None = None) -> int:
         self.run_calls += 1
         self.started.set()
-        self.sleep(60.0)
+        while not self.stop_requested():
+            self.sleep(60.0)
         self.stopped.set()
         return 0
 

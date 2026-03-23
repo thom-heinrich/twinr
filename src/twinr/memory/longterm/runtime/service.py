@@ -1727,12 +1727,19 @@ class LongTermMemoryService:
     ) -> PersistentMemoryEntry:
         """Store an operator-requested explicit memory in prompt memory."""
 
-        with self._store_lock:
-            return self.prompt_context_store.memory_store.remember(
-                kind=kind,
-                summary=summary,
-                details=details,
-            )
+        # Prompt-context stores already serialize their own writes and, in remote-primary mode,
+        # synchronously attest the saved snapshot. Holding the shared long-term store lock here
+        # would unnecessarily couple explicit-memory saves to unrelated background persistence.
+        return self.prompt_context_store.memory_store.remember(
+            kind=kind,
+            summary=summary,
+            details=details,
+        )
+
+    def delete_explicit_memory(self, *, entry_id: str) -> PersistentMemoryEntry | None:
+        """Delete one explicit durable-memory entry by id."""
+
+        return self.prompt_context_store.memory_store.delete(entry_id=entry_id)
 
     def update_user_profile(
         self,
@@ -1742,11 +1749,19 @@ class LongTermMemoryService:
     ) -> ManagedContextEntry:
         """Upsert one managed user-profile instruction entry."""
 
-        with self._store_lock:
-            return self.prompt_context_store.user_store.upsert(
-                category=category,
-                instruction=instruction,
-            )
+        return self.prompt_context_store.user_store.upsert(
+            category=category,
+            instruction=instruction,
+        )
+
+    def remove_user_profile(
+        self,
+        *,
+        category: str,
+    ) -> ManagedContextEntry | None:
+        """Delete one managed user-profile instruction entry by category."""
+
+        return self.prompt_context_store.user_store.delete(category=category)
 
     def update_personality(
         self,
@@ -1756,11 +1771,19 @@ class LongTermMemoryService:
     ) -> ManagedContextEntry:
         """Upsert one managed personality instruction entry."""
 
-        with self._store_lock:
-            return self.prompt_context_store.personality_store.upsert(
-                category=category,
-                instruction=instruction,
-            )
+        return self.prompt_context_store.personality_store.upsert(
+            category=category,
+            instruction=instruction,
+        )
+
+    def remove_personality(
+        self,
+        *,
+        category: str,
+    ) -> ManagedContextEntry | None:
+        """Delete one managed personality instruction entry by category."""
+
+        return self.prompt_context_store.personality_store.delete(category=category)
 
     def flush(self, *, timeout_s: float = 2.0) -> bool:
         """Flush active background writers within one true total deadline."""

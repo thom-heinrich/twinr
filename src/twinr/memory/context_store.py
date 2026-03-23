@@ -386,6 +386,21 @@ class ManagedContextFileStore:
                 raise RuntimeError(f"Failed to persist managed context update for {self.path}.")
             return updated
 
+    def delete(self, *, category: str) -> ManagedContextEntry | None:
+        """Remove one managed context instruction when it exists."""
+
+        key = _slugify(category, fallback="update")
+        with self._locked():
+            entries = list(self.load_entries())
+            for index, existing in enumerate(entries):
+                if existing.key != key:
+                    continue
+                removed = entries.pop(index)
+                if not self._persist_entries(tuple(entries)):
+                    raise RuntimeError(f"Failed to persist managed context deletion for {self.path}.")
+                return removed
+        return None
+
     def replace_base_text(self, content: str) -> None:
         """Replace the human-authored markdown outside the managed block."""
 
@@ -797,6 +812,21 @@ class PersistentMemoryMarkdownStore:
             if not self._persist_entries(tuple(entries)):
                 raise RuntimeError(f"Failed to persist prompt memory update for {self.path}.")
             return entry
+
+    def delete(self, *, entry_id: str) -> PersistentMemoryEntry | None:
+        """Delete one durable explicit-memory entry when it exists."""
+
+        normalized_entry_id = _normalize_entry_id(entry_id)
+        with self._locked():
+            entries = list(self.load_entries())
+            for index, existing in enumerate(entries):
+                if existing.entry_id != normalized_entry_id:
+                    continue
+                removed = entries.pop(index)
+                if not self._persist_entries(tuple(entries)):
+                    raise RuntimeError(f"Failed to persist prompt memory deletion for {self.path}.")
+                return removed
+        return None
 
     def render_context(self, *, limit: int = 12) -> str | None:
         """Render durable memory entries into prompt-context text.

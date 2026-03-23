@@ -8,7 +8,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.voice_orchestrator import EdgeVoiceOrchestrator
-from twinr.orchestrator.voice_contracts import OrchestratorVoiceErrorEvent, OrchestratorVoiceReadyEvent
+from twinr.orchestrator.voice_contracts import (
+    OrchestratorVoiceErrorEvent,
+    OrchestratorVoiceFollowUpClosedEvent,
+    OrchestratorVoiceReadyEvent,
+    OrchestratorVoiceTranscriptCommittedEvent,
+)
 
 
 class _FakeVoiceClient:
@@ -73,25 +78,26 @@ class _FakeCaptureProcess:
 class EdgeVoiceOrchestratorTests(unittest.TestCase):
     def _make_orchestrator(self):
         lines: list[str] = []
+        committed: list[tuple[str, str]] = []
         orchestrator = EdgeVoiceOrchestrator(
             TwinrConfig(
                 voice_orchestrator_ws_url="ws://127.0.0.1:8797/ws/orchestrator/voice",
             ),
             emit=lines.append,
-            on_wakeword_match=lambda match: True,
-            on_follow_up_capture_requested=lambda: True,
+            on_voice_activation=lambda match: True,
+            on_transcript_committed=lambda transcript, source: committed.append((transcript, source)) or True,
             on_barge_in_interrupt=lambda: True,
         )
         fake_client = _FakeVoiceClient()
         orchestrator._client = fake_client
-        return orchestrator, fake_client, lines
+        return orchestrator, fake_client, lines, committed
 
     def test_reconnects_and_replays_runtime_state_after_remote_close(self) -> None:
-        orchestrator, fake_client, lines = self._make_orchestrator()
+        orchestrator, fake_client, lines, _committed = self._make_orchestrator()
 
         orchestrator.notify_runtime_state(
             state="speaking",
-            detail="wakeword",
+            detail="voice_activation",
             follow_up_allowed=True,
         )
         self.assertEqual(fake_client.open_calls, 1)
@@ -107,13 +113,37 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         self.assertEqual(fake_client.open_calls, 2)
         self.assertEqual(len(fake_client.hello_requests), 2)
         self.assertEqual(fake_client.runtime_states[-1].state, "speaking")
-        self.assertEqual(fake_client.runtime_states[-1].detail, "wakeword")
+        self.assertEqual(fake_client.runtime_states[-1].detail, "voice_activation")
         self.assertEqual(len(fake_client.audio_frames), 1)
         self.assertIn("voice_orchestrator_error=Voice orchestrator websocket closed unexpectedly.", lines)
         self.assertIn("voice_orchestrator_reconnected=true", lines)
 
+    def test_notify_runtime_state_includes_intent_context_fields(self) -> None:
+        orchestrator, fake_client, _lines, _committed = self._make_orchestrator()
+
+        orchestrator.notify_runtime_state(
+            state="follow_up_open",
+            detail="voice_activation",
+            follow_up_allowed=True,
+            attention_state="attending_to_device",
+            interaction_intent_state="showing_intent",
+            person_visible=True,
+            interaction_ready=True,
+            targeted_inference_blocked=False,
+            recommended_channel="speech",
+        )
+
+        event = fake_client.runtime_states[-1]
+        self.assertEqual(event.state, "follow_up_open")
+        self.assertEqual(event.attention_state, "attending_to_device")
+        self.assertEqual(event.interaction_intent_state, "showing_intent")
+        self.assertTrue(event.person_visible)
+        self.assertTrue(event.interaction_ready)
+        self.assertFalse(event.targeted_inference_blocked)
+        self.assertEqual(event.recommended_channel, "speech")
+
     def test_open_starts_capture_thread_even_when_initial_connect_fails(self) -> None:
-        orchestrator, fake_client, lines = self._make_orchestrator()
+        orchestrator, fake_client, lines, _committed = self._make_orchestrator()
         fake_client.fail_open_calls = 1
         started = mock.Mock()
 
@@ -132,7 +162,7 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         self.assertIn("voice_orchestrator_unavailable=ConnectionError", lines)
 
     def test_next_frame_reconnects_after_send_failure(self) -> None:
-        orchestrator, fake_client, lines = self._make_orchestrator()
+        orchestrator, fake_client, lines, _committed = self._make_orchestrator()
         orchestrator._connect_client()
         fake_client.fail_audio_sends = 1
 
@@ -147,25 +177,36 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(fake_client.audio_frames), 1)
         self.assertIn("voice_orchestrator_reconnected=true", lines)
 
-    def test_ready_backend_controls_remote_follow_up_capability(self) -> None:
-        orchestrator, _fake_client, _lines = self._make_orchestrator()
+    def test_ready_backend_tracks_remote_asr_gateway(self) -> None:
+        orchestrator, _fake_client, _lines, _committed = self._make_orchestrator()
 
-        self.assertFalse(orchestrator.supports_remote_follow_up())
-
-        orchestrator._handle_server_event(
-            OrchestratorVoiceReadyEvent(session_id="voice-1", backend="local_stt")
-        )
-        self.assertEqual(orchestrator.ready_backend, "local_stt")
         self.assertTrue(orchestrator.supports_remote_follow_up())
 
         orchestrator._handle_server_event(
-            OrchestratorVoiceReadyEvent(session_id="voice-1", backend="openwakeword")
+            OrchestratorVoiceReadyEvent(session_id="voice-1", backend="remote_asr")
         )
-        self.assertEqual(orchestrator.ready_backend, "openwakeword")
-        self.assertFalse(orchestrator.supports_remote_follow_up())
+        self.assertEqual(orchestrator.ready_backend, "remote_asr")
+        self.assertTrue(orchestrator.supports_remote_follow_up())
+
+    def test_transcript_committed_event_dispatches_same_stream_transcript(self) -> None:
+        orchestrator, _fake_client, lines, committed = self._make_orchestrator()
+
+        orchestrator._handle_server_event(
+            OrchestratorVoiceTranscriptCommittedEvent(
+                transcript="wie geht es dir",
+                source="follow_up",
+            )
+        )
+        orchestrator._handle_server_event(
+            OrchestratorVoiceFollowUpClosedEvent(reason="timeout")
+        )
+
+        self.assertEqual(committed, [("wie geht es dir", "follow_up")])
+        self.assertIn("voice_orchestrator_transcript_committed=follow_up", lines)
+        self.assertIn("voice_orchestrator_follow_up_closed=timeout", lines)
 
     def test_capture_loop_retries_transient_respeaker_process_exit_before_first_frame(self) -> None:
-        orchestrator, _fake_client, lines = self._make_orchestrator()
+        orchestrator, _fake_client, lines, _committed = self._make_orchestrator()
         failed_process = _FakeCaptureProcess(returncode=1)
         recovered_process = _FakeCaptureProcess()
         sent_frames: list[bytes] = []
@@ -206,6 +247,31 @@ class EdgeVoiceOrchestratorTests(unittest.TestCase):
         self.assertEqual(start_process.call_count, 2)
         self.assertEqual(len(sent_frames), 1)
         self.assertNotIn("voice_orchestrator_capture_failed=RuntimeError", lines)
+
+    def test_start_process_uses_sanitized_audio_env(self) -> None:
+        orchestrator, _fake_client, lines, _committed = self._make_orchestrator()
+        fake_process = _FakeCaptureProcess()
+        sanitized_env = {"PATH": "/usr/bin", "HOME": "/root"}
+
+        with (
+            mock.patch("twinr.agent.workflows.voice_orchestrator.shutil.which", return_value="/usr/bin/arecord"),
+            mock.patch(
+                "twinr.agent.workflows.voice_orchestrator.build_audio_subprocess_env",
+                return_value=sanitized_env,
+            ) as build_env,
+            mock.patch(
+                "twinr.agent.workflows.voice_orchestrator.subprocess.Popen",
+                return_value=fake_process,
+            ) as popen,
+            mock.patch("twinr.agent.workflows.voice_orchestrator.os.set_blocking"),
+        ):
+            process = orchestrator._start_process()
+
+        self.assertIs(process, fake_process)
+        build_env.assert_called_once_with()
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.kwargs["env"], sanitized_env)
+        self.assertIn("voice_orchestrator_capture=started", lines)
 
 
 if __name__ == "__main__":

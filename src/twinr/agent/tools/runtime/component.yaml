@@ -10,6 +10,7 @@ owned_concerns:
   - Route smart-home entity discovery, state-read, control, and stream tools through the same thin executor path as the rest of the realtime tool surface
   - Route the shared household-identity tool through the same executor and binding path as legacy portrait and voice tools
   - Route the RSS/world-intelligence configuration tool through the same thin executor and binding path as the other persistent tool handlers
+  - Persist one normalized success/failure observability event per realtime tool call so operator artifacts can show tool name, status, latency, and fallback/model metadata
   - Run the generic streaming tool loop that alternates provider turns and tool execution
   - Run the dual-lane supervisor and specialist handoff loop with speech-lane events
   - Generate LLM-only recovery replies when streaming lanes fail after the user has already started a turn
@@ -35,6 +36,8 @@ files:
     role: Thin dispatcher from workflow owners to handler modules
     exports:
       - RealtimeToolExecutor
+  - path: observability.py
+    role: Generic per-tool runtime observability extraction and ops-event persistence
   - path: registry.py
     role: Canonical realtime tool binding registry and bootstrap validation
     exports:

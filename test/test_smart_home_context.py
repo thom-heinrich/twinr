@@ -16,8 +16,8 @@ def _local_facts(*, observed_at: float = 12.0) -> dict[str, object]:
         "sensor": {
             "observed_at": observed_at,
             "captured_at": observed_at,
-            "wakeword_armed": True,
-            "wakeword_presence_reason": "person_visible",
+            "voice_activation_armed": True,
+            "voice_activation_presence_reason": "person_visible",
         },
         "pir": {
             "motion_detected": True,
@@ -134,7 +134,7 @@ class SmartHomeContextTrackerTests(unittest.TestCase):
 
         self.assertTrue(facts["near_device_presence"]["occupied_likely"])
         self.assertTrue(facts["near_device_presence"]["person_visible"])
-        self.assertTrue(facts["near_device_presence"]["wakeword_armed"])
+        self.assertTrue(facts["near_device_presence"]["voice_activation_armed"])
         self.assertTrue(facts["room_context"]["configured"])
         self.assertTrue(facts["room_context"]["available"])
         self.assertTrue(facts["room_context"]["same_room_motion_recent"])

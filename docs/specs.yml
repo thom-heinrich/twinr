@@ -114,7 +114,7 @@ providers:
       - OpenAI
       - DeepInfra
       - OpenRouter
-    default_openai_model: gpt-5.2
+    default_openai_model: gpt-5.4-mini
     default_openai_reasoning_effort: medium
     web_search_capable: true
   tts:

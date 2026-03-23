@@ -122,6 +122,7 @@ class SupervisorDecision:
     spoken_reply: str | None = None
     kind: str | None = None
     goal: str | None = None
+    prompt: str | None = None
     allow_web_search: bool | None = None
     location_hint: str | None = None
     date_context: str | None = None

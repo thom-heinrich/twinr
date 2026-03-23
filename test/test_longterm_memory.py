@@ -234,6 +234,36 @@ class _RecordingFlushService:
         return self.flush_result
 
 
+class _RecordingPromptContextMutationService(_RecordingFlushService):
+    def __init__(self) -> None:
+        super().__init__(flush_result=True)
+        self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def store_explicit_memory(self, *, kind: str, summary: str, details: str | None = None):
+        self.calls.append(("store_explicit_memory", (kind, summary, details)))
+        return SimpleNamespace(kind=kind, summary=summary, details=details)
+
+    def delete_explicit_memory(self, *, entry_id: str):
+        self.calls.append(("delete_explicit_memory", (entry_id,)))
+        return SimpleNamespace(entry_id=entry_id)
+
+    def update_user_profile(self, *, category: str, instruction: str):
+        self.calls.append(("update_user_profile", (category, instruction)))
+        return SimpleNamespace(key=category, instruction=instruction)
+
+    def remove_user_profile(self, *, category: str):
+        self.calls.append(("remove_user_profile", (category,)))
+        return SimpleNamespace(key=category)
+
+    def update_personality(self, *, category: str, instruction: str):
+        self.calls.append(("update_personality", (category, instruction)))
+        return SimpleNamespace(key=category, instruction=instruction)
+
+    def remove_personality(self, *, category: str):
+        self.calls.append(("remove_personality", (category,)))
+        return SimpleNamespace(key=category)
+
+
 class _RuntimeMemoryProbe(TwinrRuntimeMemoryMixin):
     def __init__(self, *, config: TwinrConfig, long_term_memory: object) -> None:
         self.config = config
@@ -1498,6 +1528,49 @@ class LongTermMemoryServiceTests(unittest.TestCase):
         self.assertEqual(personality_entry.key, "response_style")
         self.assertIn("response_style: Keep answers calm and short.", personality_text)
 
+    def test_prompt_context_mutations_do_not_wait_on_shared_store_lock(self) -> None:
+        service = object.__new__(LongTermMemoryService)
+        service.prompt_context_store = SimpleNamespace(
+            memory_store=SimpleNamespace(
+                remember=lambda **kwargs: ("remember", kwargs),
+                delete=lambda **kwargs: ("delete", kwargs),
+            ),
+            user_store=SimpleNamespace(
+                upsert=lambda **kwargs: ("user_upsert", kwargs),
+                delete=lambda **kwargs: ("user_delete", kwargs),
+            ),
+            personality_store=SimpleNamespace(
+                upsert=lambda **kwargs: ("personality_upsert", kwargs),
+                delete=lambda **kwargs: ("personality_delete", kwargs),
+            ),
+        )
+        service._store_lock = _FailOnEnterLock()
+
+        self.assertEqual(
+            service.store_explicit_memory(kind="fact", summary="summary", details="details"),
+            ("remember", {"kind": "fact", "summary": "summary", "details": "details"}),
+        )
+        self.assertEqual(
+            service.delete_explicit_memory(entry_id="MEM-1"),
+            ("delete", {"entry_id": "MEM-1"}),
+        )
+        self.assertEqual(
+            service.update_user_profile(category="nickname", instruction="Use Erika."),
+            ("user_upsert", {"category": "nickname", "instruction": "Use Erika."}),
+        )
+        self.assertEqual(
+            service.remove_user_profile(category="nickname"),
+            ("user_delete", {"category": "nickname"}),
+        )
+        self.assertEqual(
+            service.update_personality(category="tone", instruction="Stay calm."),
+            ("personality_upsert", {"category": "tone", "instruction": "Stay calm."}),
+        )
+        self.assertEqual(
+            service.remove_personality(category="tone"),
+            ("personality_delete", {"category": "tone"}),
+        )
+
     def test_service_can_analyze_turn_into_consolidated_memory_objects(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
@@ -2210,6 +2283,42 @@ class RuntimeMemoryFlushTimeoutTests(unittest.TestCase):
             runtime._flush_long_term_memory_strict(operation="test", timeout_s=5.0)
 
         self.assertEqual(long_term_memory.flush_timeouts, [60.0])
+
+    def test_prompt_context_runtime_writes_do_not_trigger_long_term_flush(self) -> None:
+        config = TwinrConfig(
+            openai_api_key="test-key",
+            project_root=".",
+            long_term_memory_mode="remote_primary",
+            long_term_memory_remote_flush_timeout_s=60.0,
+        )
+        long_term_memory = _RecordingPromptContextMutationService()
+        runtime = _RuntimeMemoryProbe(config=config, long_term_memory=long_term_memory)
+
+        memory_entry = runtime.store_durable_memory(kind="fact", summary="summary", details="details")
+        deleted_entry = runtime.delete_durable_memory_entry(entry_id="MEM-1")
+        user_entry = runtime.update_user_profile_context(category="nickname", instruction="Use Erika.")
+        removed_user_entry = runtime.remove_user_profile_context(category="nickname")
+        personality_entry = runtime.update_personality_context(category="tone", instruction="Stay calm.")
+        removed_personality_entry = runtime.remove_personality_context(category="tone")
+
+        self.assertEqual(memory_entry.kind, "fact")
+        self.assertEqual(deleted_entry.entry_id, "MEM-1")
+        self.assertEqual(user_entry.key, "nickname")
+        self.assertEqual(removed_user_entry.key, "nickname")
+        self.assertEqual(personality_entry.key, "tone")
+        self.assertEqual(removed_personality_entry.key, "tone")
+        self.assertEqual(long_term_memory.flush_timeouts, [])
+        self.assertEqual(
+            [name for name, _args in long_term_memory.calls],
+            [
+                "store_explicit_memory",
+                "delete_explicit_memory",
+                "update_user_profile",
+                "remove_user_profile",
+                "update_personality",
+                "remove_personality",
+            ],
+        )
 
 
 if __name__ == "__main__":

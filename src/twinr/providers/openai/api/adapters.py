@@ -785,6 +785,13 @@ _SUPERVISOR_DECISION_SCHEMA: dict[str, Any] = {
             "type": ["string", "null"],
             "description": "Short specialist goal. Null unless action is handoff.",
         },
+        "prompt": {
+            "type": ["string", "null"],
+            "description": (
+                "Optional clean rewritten task or search query for the specialist. "
+                "Use null to reuse the original user wording."
+            ),
+        },
         "allow_web_search": {
             "type": ["boolean", "null"],
             "description": "True only when the specialist may use live web search.",
@@ -818,6 +825,7 @@ _SUPERVISOR_DECISION_SCHEMA: dict[str, Any] = {
         "spoken_reply",
         "kind",
         "goal",
+        "prompt",
         "allow_web_search",
         "location_hint",
         "date_context",
@@ -843,7 +851,7 @@ _FIRST_WORD_REPLY_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-_FIRST_WORD_MODEL_FALLBACKS: tuple[str, ...] = ("gpt-4o-mini",)
+_FIRST_WORD_MODEL_FALLBACKS: tuple[str, ...] = ()
 
 
 @dataclass
@@ -890,6 +898,22 @@ class OpenAISupervisorDecisionProvider:
             return override
         return self.config.openai_reasoning_effort
 
+    def _resolved_max_output_tokens(self, *, model: str) -> int:
+        """Return a bounded structured-output budget for supervisor decisions.
+
+        GPT-5-family supervisor calls on the live Pi regularly need more than
+        the old 80-token cap to finish the strict JSON contract, especially when
+        the fast lane carries richer grounding and personality instructions.
+        Keep smaller legacy models free to use the configured lower cap, but
+        floor GPT-5/o-series structured supervisor turns to a safer budget.
+        """
+
+        configured = max(32, int(self.config.streaming_supervisor_max_output_tokens))
+        normalized_model = str(model or "").strip().lower()
+        if normalized_model.startswith(("gpt-5", "o")):
+            return max(configured, 160)
+        return configured
+
     def _merged_base_instructions(self, instructions: str | None) -> str | None:
         """Merge backend tool-loop instructions with supervisor overrides."""
 
@@ -922,7 +946,7 @@ class OpenAISupervisorDecisionProvider:
             allow_web_search=False,
             model=model,
             reasoning_effort=reasoning_effort,
-            max_output_tokens=max(32, int(self.config.streaming_supervisor_max_output_tokens)),
+            max_output_tokens=self._resolved_max_output_tokens(model=model),
             prompt_cache_scope="supervisor_decision",
         )
         _apply_reasoning_effort_request(
@@ -959,6 +983,7 @@ class OpenAISupervisorDecisionProvider:
             spoken_reply=_optional_text(payload.get("spoken_reply")),
             kind=_optional_text(payload.get("kind")),
             goal=_optional_text(payload.get("goal")),
+            prompt=_optional_text(payload.get("prompt")),
             allow_web_search=_optional_bool(payload.get("allow_web_search")),
             location_hint=_optional_text(payload.get("location_hint")),
             date_context=_optional_text(payload.get("date_context")),

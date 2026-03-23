@@ -121,6 +121,7 @@ The room-agnostic long-horizon smart-home profiling design for motion sensors no
 The ReSpeaker-specific requirements and build checklist for turning the XVF3800 into a first-class Twinr sensor live in [`RESPEAKER_REQUIREMENTS.md`](RESPEAKER_REQUIREMENTS.md).
 The camera-side output contract for later runtime integration lives in [`AI_CAMERA_INTEGRATION_CONTRACT.md`](AI_CAMERA_INTEGRATION_CONTRACT.md). That contract now separates `body_pose`, `motion`, `coarse_arm_gesture`, and `fine_hand_gesture` explicitly so Twinr can keep realistic V1 camera requirements and stricter V2 hand-gesture ambitions apart.
 The current fine-hand-gesture evaluation and recommendation path lives in [`AI_CAMERA_FINE_HAND_GESTURE_PATH.md`](AI_CAMERA_FINE_HAND_GESTURE_PATH.md).
+The currently accepted Raspberry Pi gesture runtime freeze point lives in [`PI_GESTURE_BASELINE.md`](PI_GESTURE_BASELINE.md). That document records the exact low-light, MediaPipe, ROI, and HDMI ack values that are currently accepted on `/twinr`.
 
 Explicit requests to change future user-profile context or future speaking/behavior rules are written into managed sections inside `personality/USER.md` and `personality/PERSONALITY.md`. Twinr reloads those files on the next provider request instead of baking them permanently into code.
 The target-state design for a richer persistent Twinr self now lives in [`persistent_personality_architecture.md`](persistent_personality_architecture.md). That document separates stable core character, relational user model, place intelligence, world intelligence, and bounded reflective evolution instead of treating personality as one growing prompt blob.
@@ -347,16 +348,23 @@ Optional tuning knobs:
 - `TWINR_ATTENTION_SERVO_MAX_ACCELERATION_US_PER_S2`
 - `TWINR_ATTENTION_SERVO_MAX_JERK_US_PER_S3`
 - `TWINR_ATTENTION_SERVO_MIN_COMMAND_DELTA_US`
+- `TWINR_ATTENTION_SERVO_VISIBLE_RETARGET_TOLERANCE_US`
+- `TWINR_ATTENTION_SERVO_IDLE_RELEASE_S`
+- `TWINR_ATTENTION_SERVO_SETTLED_RELEASE_S`
+- `TWINR_ATTENTION_SERVO_FOLLOW_EXIT_ONLY`
+- `TWINR_ATTENTION_SERVO_MECHANICAL_RANGE_DEGREES`
+- `TWINR_ATTENTION_SERVO_EXIT_FOLLOW_MAX_DEGREES`
+- `TWINR_ATTENTION_SERVO_EXIT_ACTIVATION_DELAY_S`
 
-Supported driver values are `auto`, `sysfs_pwm`, `pigpio`, `lgpio_pwm`, and
-`lgpio`.
+Supported driver values are `auto`, `twinr_kernel`, `sysfs_pwm`, `pigpio`,
+`lgpio_pwm`, and `lgpio`.
 
-When `TWINR_ATTENTION_SERVO_DRIVER=auto`, Twinr probes for a usable
-kernel-PWM sysfs path first, then a usable hardware-timed `pigpio` path, and
+When `TWINR_ATTENTION_SERVO_DRIVER=auto`, Twinr first probes for the custom
+`/sys/class/twinr_servo/servo0` kernel-module contract, then a usable
+kernel-PWM sysfs path, then a usable hardware-timed `pigpio` path, and only
 falls back to `lgpio_pwm` before the older `lgpio` servo helper. The
-`lgpio_pwm` path keeps the same 50 Hz pulse train but programs duty cycle
-through `lgpio.tx_pwm`, which is calmer on hosts where `lgpio.tx_servo`
-itself causes visible fidgeting.
+`twinr_kernel` path is the preferred senior-facing option when the out-of-tree
+Twinr kernel servo module is built and loaded on the Pi.
 
 For calm physical behavior, do not think only in terms of "smaller pulse
 steps". Many hobby servos have a pulse dead band, so tiny frequent pulse
@@ -364,9 +372,12 @@ changes can buzz or twitch instead of looking softer. Twinr therefore combines:
 
 - attention-target smoothing
 - short exit-trajectory extrapolation, so the body can keep following briefly in the user's leaving direction instead of freezing or snapping back the moment the camera loses them
+- an exit-activation delay, so brief camera dropouts do not immediately trigger a body turn
 - hard velocity limits
 - acceleration and jerk limits in pulse space
 - a small command threshold so sub-dead-band plan noise is not emitted as GPIO churn
+- release-after-settle on stable off-center targets, so a loaded servo can move into place and then relax instead of audibly holding torque forever
+- optional exit-only follow, so Twinr stays physically still while a person remains in frame, cancels exit-follow immediately when any person is visible again, and only turns gently along the departure trajectory up to one configured off-center degree limit before releasing the servo again
 
 Keep the servo signal at `3.3V` logic level on the Pi side, and power the
 servo from a supply that matches the specific servo module instead of feeding
@@ -481,7 +492,7 @@ By default, the UI binds to `0.0.0.0:1337`, so it is reachable from the local ne
 
 ## OpenAI backend
 
-Twinr now includes an OpenAI backend slice for speech-to-text, `gpt-5.2` reasoning, text-to-speech, and optional web search.
+Twinr now includes an OpenAI backend slice for speech-to-text, `gpt-5.4-mini` reasoning, text-to-speech, and optional web search.
 
 Recommended `.env` additions:
 
@@ -550,7 +561,9 @@ TWINR_WAKEWORD_SPEECH_GRACE_S=90
 TWINR_WAKEWORD_ATTEMPT_COOLDOWN_S=4.0
 ```
 
-When the OpenAI secret is already project-scoped (`sk-proj-...`), keep `OPENAI_SEND_PROJECT_HEADER=false`. That avoids a redundant project header that can block STT/TTS while `gpt-5.2` still works.
+`OPENAI_MODEL` is the central non-coding text model. Search, supervisor routing, first-word replies, conversation closure, long-term-memory text compilation, and display reserve generation inherit it unless a dedicated override is configured. Audio-specialized paths stay separate on purpose.
+
+When the OpenAI secret is already project-scoped (`sk-proj-...`), keep `OPENAI_SEND_PROJECT_HEADER=false`. That avoids a redundant project header that can block STT/TTS while `gpt-5.4-mini` still works.
 
 Smoke examples:
 

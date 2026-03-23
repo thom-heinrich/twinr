@@ -14,6 +14,7 @@ from twinr.hardware.servo_follow import (
     LGPIOServoPulseWriter,
     PigpioServoPulseWriter,
     SysfsPWMServoPulseWriter,
+    TwinrKernelServoPulseWriter,
 )
 
 
@@ -22,12 +23,17 @@ class FakeServoPulseWriter:
         self.writes: list[tuple[str, int, int]] = []
         self.disables: list[tuple[str, int]] = []
         self.closed = False
+        self.current_pulse_width_us_value: int | None = None
 
     def write(self, *, gpio_chip: str, gpio: int, pulse_width_us: int) -> None:
         self.writes.append((gpio_chip, gpio, pulse_width_us))
 
     def disable(self, *, gpio_chip: str, gpio: int) -> None:
         self.disables.append((gpio_chip, gpio))
+
+    def current_pulse_width_us(self, *, gpio_chip: str, gpio: int) -> int | None:
+        del gpio_chip, gpio
+        return self.current_pulse_width_us_value
 
     def close(self) -> None:
         self.closed = True
@@ -317,6 +323,42 @@ class SysfsPWMServoPulseWriterTests(unittest.TestCase):
             )
 
 
+class TwinrKernelServoPulseWriterTests(unittest.TestCase):
+    def test_probe_requires_kernel_sysfs_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            writer = TwinrKernelServoPulseWriter(sysfs_root=Path(temp_dir))
+
+            with self.assertRaisesRegex(RuntimeError, "Twinr kernel servo module"):
+                writer.probe(18)
+
+    def test_write_and_disable_program_kernel_sysfs_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name, value in {
+                "gpio": "-1\n",
+                "period_us": "20000\n",
+                "pulse_width_us": "1500\n",
+                "enabled": "0\n",
+            }.items():
+                (root / name).write_text(value, encoding="utf-8")
+
+            writer = TwinrKernelServoPulseWriter(sysfs_root=root)
+
+            writer.write(gpio_chip="gpiochip0", gpio=18, pulse_width_us=1498)
+            self.assertEqual((root / "gpio").read_text(encoding="utf-8").strip(), "18")
+            self.assertEqual((root / "pulse_width_us").read_text(encoding="utf-8").strip(), "1498")
+            self.assertEqual((root / "enabled").read_text(encoding="utf-8").strip(), "1")
+
+            writer.write(gpio_chip="gpiochip0", gpio=18, pulse_width_us=1481)
+            self.assertEqual((root / "gpio").read_text(encoding="utf-8").strip(), "18")
+            self.assertEqual((root / "pulse_width_us").read_text(encoding="utf-8").strip(), "1481")
+            self.assertEqual((root / "enabled").read_text(encoding="utf-8").strip(), "1")
+
+            writer.disable(gpio_chip="gpiochip0", gpio=18)
+            self.assertEqual((root / "enabled").read_text(encoding="utf-8").strip(), "0")
+            self.assertEqual((root / "gpio").read_text(encoding="utf-8").strip(), "-1")
+
+
 class AttentionServoControllerTests(unittest.TestCase):
     def _build_controller(
         self,
@@ -330,10 +372,23 @@ class AttentionServoControllerTests(unittest.TestCase):
         max_velocity_us_per_s: float = 100000.0,
         max_acceleration_us_per_s2: float = 100000.0,
         max_jerk_us_per_s3: float = 1000000.0,
+        rest_max_velocity_us_per_s: float = 35.0,
+        rest_max_acceleration_us_per_s2: float = 120.0,
+        rest_max_jerk_us_per_s3: float = 450.0,
         min_command_delta_us: int = 1,
+        visible_retarget_tolerance_us: int = 0,
         reference_interval_s: float = 0.2,
         soft_limit_margin_us: int = 70,
         idle_release_s: float = 1.0,
+        settled_release_s: float = 0.0,
+        follow_exit_only: bool = False,
+        mechanical_range_degrees: float = 270.0,
+        exit_follow_max_degrees: float = 60.0,
+        exit_activation_delay_s: float = 0.75,
+        exit_settle_hold_s: float = 0.6,
+        exit_reacquire_center_tolerance: float = 0.08,
+        exit_visible_edge_threshold: float = 0.74,
+        exit_cooldown_s: float = 30.0,
     ) -> tuple[AttentionServoController, FakeServoPulseWriter]:
         writer = FakeServoPulseWriter()
         controller = AttentionServoController(
@@ -356,10 +411,23 @@ class AttentionServoControllerTests(unittest.TestCase):
                 max_velocity_us_per_s=max_velocity_us_per_s,
                 max_acceleration_us_per_s2=max_acceleration_us_per_s2,
                 max_jerk_us_per_s3=max_jerk_us_per_s3,
+                rest_max_velocity_us_per_s=rest_max_velocity_us_per_s,
+                rest_max_acceleration_us_per_s2=rest_max_acceleration_us_per_s2,
+                rest_max_jerk_us_per_s3=rest_max_jerk_us_per_s3,
                 min_command_delta_us=min_command_delta_us,
+                visible_retarget_tolerance_us=visible_retarget_tolerance_us,
                 reference_interval_s=reference_interval_s,
                 soft_limit_margin_us=soft_limit_margin_us,
                 idle_release_s=idle_release_s,
+                settled_release_s=settled_release_s,
+                follow_exit_only=follow_exit_only,
+                mechanical_range_degrees=mechanical_range_degrees,
+                exit_follow_max_degrees=exit_follow_max_degrees,
+                exit_activation_delay_s=exit_activation_delay_s,
+                exit_settle_hold_s=exit_settle_hold_s,
+                exit_reacquire_center_tolerance=exit_reacquire_center_tolerance,
+                exit_visible_edge_threshold=exit_visible_edge_threshold,
+                exit_cooldown_s=exit_cooldown_s,
             ),
             pulse_writer=writer,
         )
@@ -380,6 +448,128 @@ class AttentionServoControllerTests(unittest.TestCase):
         self.assertEqual(decision.target_pulse_width_us, 1804)
         self.assertEqual(decision.commanded_pulse_width_us, 1540)
         self.assertEqual(writer.writes, [("gpiochip0", 18, 1540)])
+
+    def test_disabled_controller_releases_stale_output_on_startup(self) -> None:
+        writer = FakeServoPulseWriter()
+
+        AttentionServoController(
+            config=AttentionServoConfig(
+                enabled=False,
+                driver="twinr_kernel",
+                gpio_chip="gpiochip0",
+                gpio=18,
+            ),
+            pulse_writer=writer,
+        )
+
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_exit_only_recentering_starts_from_writer_seed_instead_of_blind_center(self) -> None:
+        writer = FakeServoPulseWriter()
+        writer.current_pulse_width_us_value = 1337
+        controller = AttentionServoController(
+            config=AttentionServoConfig(
+                enabled=True,
+                driver="twinr_kernel",
+                gpio_chip="gpiochip0",
+                gpio=18,
+                follow_exit_only=True,
+                max_velocity_us_per_s=100000.0,
+                max_acceleration_us_per_s2=100000.0,
+                max_jerk_us_per_s3=1000000.0,
+                rest_max_velocity_us_per_s=35.0,
+                rest_max_acceleration_us_per_s2=120.0,
+                rest_max_jerk_us_per_s3=450.0,
+                min_command_delta_us=1,
+            ),
+            pulse_writer=writer,
+        )
+
+        decisions = [
+            controller.update(
+                observed_at=10.0 + (0.2 * step),
+                active=False,
+                target_center_x=None,
+                confidence=0.0,
+            )
+            for step in range(5)
+        ]
+
+        self.assertEqual(decisions[0].reason, "recentering")
+        self.assertIsNotNone(decisions[0].commanded_pulse_width_us)
+        self.assertGreater(decisions[0].commanded_pulse_width_us or 0, 1337)
+        self.assertLess(decisions[0].commanded_pulse_width_us or 0, 1500)
+        self.assertTrue(all(decision.reason == "recentering" for decision in decisions))
+        self.assertGreater(len(writer.writes), 1)
+        self.assertLess(writer.writes[-1][2], 1500)
+
+    def test_exit_only_visible_target_first_clears_stale_startup_offset_before_waiting(self) -> None:
+        writer = FakeServoPulseWriter()
+        writer.current_pulse_width_us_value = 1331
+        controller = AttentionServoController(
+            config=AttentionServoConfig(
+                enabled=True,
+                driver="twinr_kernel",
+                gpio_chip="gpiochip0",
+                gpio=18,
+                follow_exit_only=True,
+                max_velocity_us_per_s=100000.0,
+                max_acceleration_us_per_s2=100000.0,
+                max_jerk_us_per_s3=1000000.0,
+                rest_max_velocity_us_per_s=35.0,
+                rest_max_acceleration_us_per_s2=120.0,
+                rest_max_jerk_us_per_s3=450.0,
+                min_command_delta_us=1,
+            ),
+            pulse_writer=writer,
+        )
+
+        decision = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.62,
+            confidence=0.95,
+            visible_target_present=True,
+        )
+
+        self.assertEqual(decision.reason, "startup_recentering")
+        self.assertIsNotNone(decision.commanded_pulse_width_us)
+        self.assertGreater(decision.commanded_pulse_width_us or 0, 1331)
+        self.assertLess(decision.commanded_pulse_width_us or 0, 1500)
+
+    def test_exit_only_visible_target_recenters_near_center_stale_kernel_seed_before_waiting(self) -> None:
+        writer = FakeServoPulseWriter()
+        writer.current_pulse_width_us_value = 1476
+        controller = AttentionServoController(
+            config=AttentionServoConfig(
+                enabled=True,
+                driver="twinr_kernel",
+                gpio_chip="gpiochip0",
+                gpio=18,
+                follow_exit_only=True,
+                max_velocity_us_per_s=100000.0,
+                max_acceleration_us_per_s2=100000.0,
+                max_jerk_us_per_s3=1000000.0,
+                rest_max_velocity_us_per_s=35.0,
+                rest_max_acceleration_us_per_s2=120.0,
+                rest_max_jerk_us_per_s3=450.0,
+                min_command_delta_us=10,
+                max_step_us=20,
+            ),
+            pulse_writer=writer,
+        )
+
+        decision = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.62,
+            confidence=0.95,
+            visible_target_present=True,
+        )
+
+        self.assertEqual(decision.reason, "startup_recentering")
+        self.assertEqual(decision.commanded_pulse_width_us, 1500)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1500)])
 
     def test_update_holds_recent_target_then_recenters(self) -> None:
         controller, writer = self._build_controller(
@@ -645,6 +835,73 @@ class AttentionServoControllerTests(unittest.TestCase):
             ],
         )
 
+    def test_update_holds_visible_target_micro_retargets_within_tolerance(self) -> None:
+        controller, writer = self._build_controller(
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            visible_retarget_tolerance_us=50,
+        )
+
+        first = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.80,
+            confidence=0.95,
+        )
+        second = controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.82,
+            confidence=0.95,
+        )
+
+        self.assertEqual(first.commanded_pulse_width_us, 1728)
+        self.assertEqual(second.target_pulse_width_us, 1728)
+        self.assertEqual(second.commanded_pulse_width_us, 1728)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1728)])
+
+    def test_update_allows_loss_projection_after_visible_target_hysteresis(self) -> None:
+        controller, writer = self._build_controller(
+            target_hold_s=1.2,
+            loss_extrapolation_s=0.8,
+            loss_extrapolation_gain=1.0,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            visible_retarget_tolerance_us=50,
+        )
+
+        first = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.80,
+            confidence=0.95,
+        )
+        held_visible = controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.82,
+            confidence=0.95,
+        )
+        projected = controller.update(
+            observed_at=10.4,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(first.commanded_pulse_width_us, 1728)
+        self.assertEqual(held_visible.commanded_pulse_width_us, 1728)
+        self.assertEqual(held_visible.reason, "following_target")
+        self.assertEqual(projected.reason, "projecting_recent_trajectory")
+        self.assertGreater(projected.commanded_pulse_width_us or 0, held_visible.commanded_pulse_width_us or 0)
+        self.assertEqual(
+            writer.writes,
+            [
+                ("gpiochip0", 18, 1728),
+                ("gpiochip0", 18, projected.commanded_pulse_width_us),
+            ],
+        )
+
     def test_update_releases_idle_output_after_recentering(self) -> None:
         controller, writer = self._build_controller(target_hold_s=0.0, max_step_us=300, idle_release_s=0.6)
         controller.update(
@@ -666,11 +923,797 @@ class AttentionServoControllerTests(unittest.TestCase):
             target_center_x=None,
             confidence=0.0,
         )
+        released_confirmed = controller.update(
+            observed_at=11.6,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
 
         self.assertEqual(recentering.reason, "recentering")
         self.assertEqual(recentering.commanded_pulse_width_us, 1500)
-        self.assertEqual(released.reason, "idle_released")
+        self.assertEqual(released.reason, "recentering")
+        self.assertEqual(released.commanded_pulse_width_us, 1500)
+        self.assertEqual(released_confirmed.reason, "idle_released")
+        self.assertIsNone(released_confirmed.commanded_pulse_width_us)
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_recentering_snaps_to_exact_center_before_idle_release(self) -> None:
+        writer = FakeServoPulseWriter()
+        writer.current_pulse_width_us_value = 1476
+        controller = AttentionServoController(
+            config=AttentionServoConfig(
+                enabled=True,
+                driver="twinr_kernel",
+                gpio_chip="gpiochip0",
+                gpio=18,
+                follow_exit_only=True,
+                idle_release_s=0.6,
+                max_velocity_us_per_s=100000.0,
+                max_acceleration_us_per_s2=100000.0,
+                max_jerk_us_per_s3=1000000.0,
+                rest_max_velocity_us_per_s=35.0,
+                rest_max_acceleration_us_per_s2=120.0,
+                rest_max_jerk_us_per_s3=450.0,
+                min_command_delta_us=10,
+                max_step_us=20,
+            ),
+            pulse_writer=writer,
+        )
+
+        first = controller.update(
+            observed_at=10.0,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        released = controller.update(
+            observed_at=10.7,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        released_confirmed = controller.update(
+            observed_at=11.4,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(first.reason, "recentering")
+        self.assertEqual(first.commanded_pulse_width_us, 1500)
+        self.assertEqual(released.reason, "recentering")
+        self.assertEqual(released.commanded_pulse_width_us, 1500)
+        self.assertEqual(released_confirmed.reason, "idle_released")
+        self.assertIsNone(released_confirmed.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1500)])
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_update_releases_stable_off_center_target_after_settle(self) -> None:
+        controller, writer = self._build_controller(
+            max_step_us=300,
+            settled_release_s=0.6,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.9,
+        )
+        controller.update(
+            observed_at=10.4,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.9,
+        )
+        released = controller.update(
+            observed_at=11.1,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.9,
+        )
+        held_released = controller.update(
+            observed_at=11.3,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.9,
+        )
+
+        self.assertEqual(released.reason, "settled_released")
         self.assertIsNone(released.commanded_pulse_width_us)
+        self.assertEqual(held_released.reason, "settled_released")
+        self.assertIsNone(held_released.commanded_pulse_width_us)
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1766)])
+
+    def test_update_resumes_from_released_target_instead_of_center(self) -> None:
+        controller, writer = self._build_controller(
+            max_step_us=100,
+            settled_release_s=0.6,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.9,
+        )
+        controller.update(
+            observed_at=10.4,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.9,
+        )
+        controller.update(
+            observed_at=11.1,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.9,
+        )
+        controller.update(
+            observed_at=11.8,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.9,
+        )
+        controller.update(
+            observed_at=12.5,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.9,
+        )
+        resumed = controller.update(
+            observed_at=12.7,
+            active=True,
+            target_center_x=0.2,
+            confidence=0.9,
+        )
+
+        self.assertEqual(resumed.commanded_pulse_width_us, 1666)
+        self.assertEqual(writer.writes[-1], ("gpiochip0", 18, 1666))
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_exit_only_visible_target_does_not_command_servo(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+        )
+
+        decision = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.9,
+            confidence=0.95,
+        )
+
+        self.assertEqual(decision.reason, "waiting_for_exit")
+        self.assertIsNone(decision.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [])
+        self.assertEqual(writer.disables, [])
+
+    def test_exit_only_visible_target_ignores_low_confidence_and_stays_still(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+        )
+
+        decision = controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.9,
+            confidence=0.15,
+        )
+
+        self.assertEqual(decision.reason, "waiting_for_exit")
+        self.assertIsNone(decision.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [])
+        self.assertEqual(writer.disables, [])
+
+    def test_exit_only_visible_edge_departure_can_start_monotone_pursuit_without_full_loss(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.4,
+            exit_visible_edge_threshold=0.74,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.78,
+            confidence=0.95,
+            visible_target_present=True,
+        )
+        waiting = controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.79,
+            confidence=0.95,
+            visible_target_present=True,
+        )
+        pursuing = controller.update(
+            observed_at=10.5,
+            active=True,
+            target_center_x=0.79,
+            confidence=0.95,
+            visible_target_present=True,
+        )
+
+        self.assertEqual(waiting.reason, "waiting_for_exit")
+        self.assertEqual(pursuing.reason, "pursuing_edge_departure")
+        self.assertEqual(pursuing.commanded_pulse_width_us, 1669)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1669)])
+
+    def test_exit_only_waits_for_loss_confirmation_before_projecting(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            loss_extrapolation_s=0.8,
+            loss_extrapolation_gain=1.0,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.5,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.6,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.8,
+            confidence=0.95,
+        )
+        waiting = controller.update(
+            observed_at=10.4,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        projected = controller.update(
+            observed_at=10.8,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(waiting.reason, "awaiting_exit_confirmation")
+        self.assertIsNone(waiting.commanded_pulse_width_us)
+        self.assertEqual(projected.reason, "pursuing_exit_direction")
+        self.assertEqual(projected.commanded_pulse_width_us, 1669)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1669)])
+
+    def test_exit_only_uses_explicit_camera_visibility_instead_of_active_hold_state(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            loss_extrapolation_s=0.8,
+            loss_extrapolation_gain=1.0,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.5,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.6,
+            confidence=0.95,
+            visible_target_present=True,
+        )
+        controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.8,
+            confidence=0.95,
+            visible_target_present=True,
+        )
+        waiting = controller.update(
+            observed_at=10.4,
+            active=True,
+            target_center_x=0.8,
+            confidence=0.95,
+            visible_target_present=False,
+        )
+        projected = controller.update(
+            observed_at=10.8,
+            active=True,
+            target_center_x=0.8,
+            confidence=0.95,
+            visible_target_present=False,
+        )
+
+        self.assertEqual(waiting.reason, "awaiting_exit_confirmation")
+        self.assertIsNone(waiting.commanded_pulse_width_us)
+        self.assertEqual(projected.reason, "pursuing_exit_direction")
+        self.assertEqual(projected.commanded_pulse_width_us, 1669)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1669)])
+
+    def test_exit_only_projects_after_visibility_loss_and_clamps_to_sixty_degrees(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            loss_extrapolation_s=0.8,
+            loss_extrapolation_gain=1.0,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.0,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.6,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.8,
+            confidence=0.95,
+        )
+        projected = controller.update(
+            observed_at=10.4,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(projected.reason, "pursuing_exit_direction")
+        self.assertEqual(projected.target_pulse_width_us, 1669)
+        self.assertEqual(projected.commanded_pulse_width_us, 1669)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1669)])
+
+    def test_exit_only_prefers_recent_outward_anchor_over_last_inward_visible_sample(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            loss_extrapolation_s=0.8,
+            loss_extrapolation_gain=0.0,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.0,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.94,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.64,
+            confidence=0.95,
+        )
+        projected = controller.update(
+            observed_at=10.4,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(projected.reason, "pursuing_exit_direction")
+        self.assertEqual(projected.target_pulse_width_us, 1669)
+        self.assertEqual(projected.commanded_pulse_width_us, 1669)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1669)])
+
+    def test_exit_only_visible_reentry_starts_cooldown_while_exit_motion_is_still_in_flight(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            loss_extrapolation_s=0.8,
+            loss_extrapolation_gain=1.0,
+            max_step_us=80,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.0,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.6,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.8,
+            confidence=0.95,
+        )
+        projected = controller.update(
+            observed_at=10.4,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        returned_visible = controller.update(
+            observed_at=10.5,
+            active=True,
+            target_center_x=0.52,
+            confidence=0.12,
+        )
+
+        self.assertEqual(projected.reason, "pursuing_exit_direction")
+        self.assertEqual(returned_visible.reason, "reacquired_visible_cooldown")
+        self.assertEqual(projected.commanded_pulse_width_us, 1580)
+        self.assertIsNone(returned_visible.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1580)])
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_exit_only_visible_reentry_after_exit_limit_stays_still_even_with_low_confidence(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            loss_extrapolation_s=0.8,
+            loss_extrapolation_gain=1.0,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.0,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.6,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.8,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.4,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        settled = controller.update(
+            observed_at=11.1,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        returned_visible = controller.update(
+            observed_at=11.2,
+            active=True,
+            target_center_x=0.52,
+            confidence=0.12,
+        )
+
+        self.assertEqual(settled.reason, "holding_exit_limit")
+        self.assertIsNone(settled.commanded_pulse_width_us)
+        self.assertEqual(returned_visible.reason, "reacquired_visible_cooldown")
+        self.assertIsNone(returned_visible.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1669)])
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_exit_only_holds_output_briefly_after_reaching_exit_limit_before_release(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            loss_extrapolation_s=0.8,
+            loss_extrapolation_gain=1.0,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.0,
+            exit_settle_hold_s=0.6,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.6,
+            confidence=0.95,
+        )
+        pursuing = controller.update(
+            observed_at=10.2,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        held = controller.update(
+            observed_at=10.6,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        released = controller.update(
+            observed_at=10.9,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(pursuing.reason, "pursuing_exit_direction")
+        self.assertEqual(held.reason, "pursuing_exit_direction")
+        self.assertEqual(held.commanded_pulse_width_us, 1669)
+        self.assertEqual(released.reason, "holding_exit_limit")
+        self.assertIsNone(released.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1669)])
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_exit_only_visible_edge_reentry_keeps_pursuing_same_direction_until_centered(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.0,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.95,
+        )
+        pursuing = controller.update(
+            observed_at=10.2,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        still_off_center = controller.update(
+            observed_at=10.3,
+            active=True,
+            target_center_x=0.78,
+            confidence=0.95,
+        )
+
+        self.assertEqual(pursuing.reason, "pursuing_exit_direction")
+        self.assertEqual(still_off_center.reason, "pursuing_edge_departure")
+        self.assertEqual(still_off_center.commanded_pulse_width_us, 1669)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1669)])
+        self.assertEqual(writer.disables, [])
+
+    def test_exit_only_visible_reacquire_starts_cooldown_without_reversing(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            max_step_us=80,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.0,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.95,
+        )
+        pursuing = controller.update(
+            observed_at=10.2,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        visible_again = controller.update(
+            observed_at=10.3,
+            active=True,
+            target_center_x=0.52,
+            confidence=0.95,
+        )
+
+        self.assertEqual(pursuing.reason, "pursuing_exit_direction")
+        self.assertEqual(pursuing.commanded_pulse_width_us, 1580)
+        self.assertEqual(visible_again.reason, "reacquired_visible_cooldown")
+        self.assertIsNone(visible_again.commanded_pulse_width_us)
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_exit_only_cooldown_blocks_new_motion_then_recenters_after_absence(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.0,
+            exit_cooldown_s=30.0,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.85,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.2,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        controller.update(
+            observed_at=10.4,
+            active=True,
+            target_center_x=0.52,
+            confidence=0.95,
+        )
+        cooldown = controller.update(
+            observed_at=15.0,
+            active=True,
+            target_center_x=0.9,
+            confidence=0.95,
+        )
+        recentered = controller.update(
+            observed_at=40.6,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(cooldown.reason, "exit_cooldown")
+        self.assertIsNone(cooldown.commanded_pulse_width_us)
+        self.assertEqual(recentered.reason, "recentering")
+        self.assertIsNotNone(recentered.commanded_pulse_width_us)
+        self.assertGreater(recentered.commanded_pulse_width_us or 0, 1500)
+        self.assertLess(recentered.commanded_pulse_width_us or 0, 1669)
+        self.assertEqual(writer.writes[-1], ("gpiochip0", 18, recentered.commanded_pulse_width_us or 0))
+
+    def test_exit_only_holds_exit_limit_without_new_impulses_until_visible_reacquire_or_rest_return(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            loss_extrapolation_s=0.2,
+            loss_extrapolation_gain=1.0,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.0,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.75,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.9,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.4,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        released = controller.update(
+            observed_at=11.1,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        held_visible = controller.update(
+            observed_at=11.2,
+            active=True,
+            target_center_x=0.72,
+            confidence=0.95,
+        )
+
+        self.assertEqual(released.reason, "holding_exit_limit")
+        self.assertIsNone(released.commanded_pulse_width_us)
+        self.assertEqual(held_visible.reason, "holding_exit_limit")
+        self.assertIsNone(held_visible.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1669)])
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_exit_only_centered_visible_reentry_after_exit_limit_starts_cooldown(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            loss_extrapolation_s=0.2,
+            loss_extrapolation_gain=1.0,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.0,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.75,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.9,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.4,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        controller.update(
+            observed_at=11.1,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        centered_visible = controller.update(
+            observed_at=11.2,
+            active=True,
+            target_center_x=0.51,
+            confidence=0.95,
+        )
+
+        self.assertEqual(centered_visible.reason, "reacquired_visible_cooldown")
+        self.assertIsNone(centered_visible.commanded_pulse_width_us)
+        self.assertEqual(writer.writes, [("gpiochip0", 18, 1669)])
+        self.assertEqual(writer.disables, [("gpiochip0", 18)])
+
+    def test_exit_only_recenters_after_long_absence_from_exit_limit(self) -> None:
+        controller, writer = self._build_controller(
+            follow_exit_only=True,
+            target_hold_s=1.2,
+            loss_extrapolation_s=0.2,
+            loss_extrapolation_gain=1.0,
+            max_step_us=400,
+            target_smoothing_s=0.0,
+            exit_activation_delay_s=0.0,
+            exit_cooldown_s=30.0,
+        )
+
+        controller.update(
+            observed_at=10.0,
+            active=True,
+            target_center_x=0.75,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.2,
+            active=True,
+            target_center_x=0.9,
+            confidence=0.95,
+        )
+        controller.update(
+            observed_at=10.4,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        controller.update(
+            observed_at=10.7,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        controller.update(
+            observed_at=11.1,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+        recentered = controller.update(
+            observed_at=40.3,
+            active=False,
+            target_center_x=None,
+            confidence=0.0,
+        )
+
+        self.assertEqual(recentered.reason, "recentering")
+        self.assertIsNotNone(recentered.commanded_pulse_width_us)
+        self.assertLess(recentered.commanded_pulse_width_us or 0, 1669)
+        self.assertGreater(recentered.commanded_pulse_width_us or 0, 1500)
+        self.assertEqual(
+            writer.writes,
+            [("gpiochip0", 18, 1669), ("gpiochip0", 18, recentered.commanded_pulse_width_us or 0)],
+        )
         self.assertEqual(writer.disables, [("gpiochip0", 18)])
 
     def test_close_disables_active_output(self) -> None:

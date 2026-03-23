@@ -178,6 +178,22 @@ def derive_fused_event_claims(
         now=now,
         horizon_s=config.fusion_horizon_s,
     )
+    distress_audio = tuple(dict.fromkeys(shout_audio + cry_audio))
+    if distress_audio and slumped:
+        claims.append(
+            _build_claim_from_support(
+                state="distress_possible",
+                preferred_action_level=FusionActionLevel.REVIEW_ONLY,
+                audio_support=distress_audio,
+                vision_support=slumped,
+                expected_modalities=2,
+                policy_context=policy_context,
+                now=now,
+                config=config,
+                vision_observation_buffer=vision_observation_buffer,
+                review_preferred=True,
+            )
+        )
     if cry_audio and slumped:
         claims.append(
             _build_claim_from_support(

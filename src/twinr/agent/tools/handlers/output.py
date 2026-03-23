@@ -79,6 +79,65 @@ def _normalize_sources(raw_sources: object) -> list[str]:
     return [text] if text else []
 
 
+def _search_attempts_payload(raw_attempts: object) -> list[dict[str, object]]:
+    """Serialize provider search attempts into a bounded JSON-safe payload."""
+
+    payload: list[dict[str, object]] = []
+    if not isinstance(raw_attempts, Iterable) or isinstance(raw_attempts, (str, bytes, bytearray, Mapping)):
+        return payload
+    for item in raw_attempts:
+        model = _normalize_optional_text(getattr(item, "model", None))
+        api_path = _normalize_optional_text(getattr(item, "api_path", None))
+        outcome = _normalize_optional_text(getattr(item, "outcome", None))
+        if not model or not api_path or not outcome:
+            continue
+        record: dict[str, object] = {
+            "model": model,
+            "api_path": api_path,
+            "outcome": outcome,
+        }
+        max_output_tokens = getattr(item, "max_output_tokens", None)
+        if isinstance(max_output_tokens, int):
+            record["max_output_tokens"] = max_output_tokens
+        status = _normalize_optional_text(getattr(item, "status", None))
+        if status:
+            record["status"] = status
+        detail = _normalize_optional_text(getattr(item, "detail", None))
+        if detail:
+            record["detail"] = detail
+        payload.append(record)
+    return payload
+
+
+def _search_budget_payload(search_attempts: list[dict[str, object]]) -> dict[str, object]:
+    """Summarize the max-output-token ladder used by one search turn."""
+
+    budgets: list[int] = []
+    for attempt in search_attempts:
+        if not isinstance(attempt, Mapping):
+            continue
+        max_output_tokens = attempt.get("max_output_tokens")
+        if isinstance(max_output_tokens, int):
+            budgets.append(max_output_tokens)
+    if not budgets:
+        return {}
+
+    trace: list[int] = []
+    for budget in budgets:
+        if not trace or trace[-1] != budget:
+            trace.append(budget)
+    initial_budget = trace[0]
+    final_budget = trace[-1]
+    peak_budget = max(trace)
+    return {
+        "search_budget_trace": "->".join(str(budget) for budget in trace),
+        "search_initial_output_budget": initial_budget,
+        "search_final_output_budget": final_budget,
+        "search_peak_output_budget": peak_budget,
+        "search_budget_escalated": peak_budget > initial_budget,
+    }
+
+
 _TODAY_PATTERNS = (
     re.compile(r"\bheute\b", re.IGNORECASE),
     re.compile(r"\btoday\b", re.IGNORECASE),
@@ -481,6 +540,11 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
         # AUDIT-FIX(#8): Normalize backend source collections before iterating, measuring, or storing them.
         sources = _normalize_sources(getattr(result, "sources", None))
         used_web_search = bool(getattr(result, "used_web_search", False))
+        requested_model = _normalize_optional_text(getattr(result, "requested_model", None))
+        actual_model = _normalize_optional_text(getattr(result, "model", None))
+        fallback_reason = _normalize_optional_text(getattr(result, "fallback_reason", None))
+        search_attempts = _search_attempts_payload(getattr(result, "attempt_log", ()))
+        search_budget = _search_budget_payload(search_attempts)
     except Exception as exc:
         # AUDIT-FIX(#2): Surface a consistent search failure without leaking raw provider errors into the event stream.
         _emit_tool_failure(
@@ -494,6 +558,20 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
 
     # AUDIT-FIX(#4): Emit sanitized backend metadata returned from the search path.
     _emit_kv_safe(owner, "search_used_web_search", str(used_web_search).lower())
+    if requested_model:
+        _emit_kv_safe(owner, "search_requested_model", requested_model)
+    if actual_model:
+        _emit_kv_safe(owner, "search_actual_model", actual_model)
+    if fallback_reason:
+        _emit_kv_safe(owner, "search_fallback_reason", fallback_reason)
+    if search_attempts:
+        _emit_kv_safe(owner, "search_attempt_count", len(search_attempts))
+    search_budget_trace = search_budget.get("search_budget_trace")
+    if isinstance(search_budget_trace, str) and search_budget_trace:
+        _emit_kv_safe(owner, "search_budget_trace", search_budget_trace)
+    search_peak_budget = search_budget.get("search_peak_output_budget")
+    if isinstance(search_peak_budget, int):
+        _emit_kv_safe(owner, "search_peak_output_budget", search_peak_budget)
     response_id = _normalize_optional_text(getattr(result, "response_id", None))
     if response_id:
         # AUDIT-FIX(#4): Response identifiers may come from external providers and still need sanitized emission.
@@ -517,6 +595,10 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
             used_web_search=used_web_search,
             token_usage=getattr(result, "token_usage", None),
             question=question,
+            requested_model=requested_model or None,
+            actual_model=actual_model or None,
+            fallback_reason=fallback_reason or None,
+            **search_budget,
         ),
         event_name="search_usage_store_failed",
         message="Search usage metrics could not be persisted.",
@@ -530,6 +612,11 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
             "Live web search completed.",
             sources=len(sources),
             used_web_search=used_web_search,
+            requested_model=requested_model or None,
+            actual_model=actual_model or None,
+            fallback_reason=fallback_reason or None,
+            search_attempts=search_attempts,
+            **search_budget,
         ),
         event_name="search_finished_event_failed",
         message="Search completion event could not be recorded.",
@@ -554,10 +641,14 @@ def handle_search_live_info(owner: Any, arguments: dict[str, object]) -> dict[st
         "answer": answer,
         "sources": sources,
         "used_web_search": used_web_search,
+        "requested_model": requested_model or None,
+        "actual_model": actual_model or None,
+        "fallback_reason": fallback_reason or None,
         "response_id": response_id or None,
         "request_id": request_id or None,
-        "model": getattr(result, "model", None),
+        "model": actual_model or None,
         "token_usage": getattr(result, "token_usage", None),
+        **search_budget,
     }
 
 

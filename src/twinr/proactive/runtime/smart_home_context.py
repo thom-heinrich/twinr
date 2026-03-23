@@ -129,7 +129,7 @@ class NearDevicePresenceSnapshot:
     person_recently_visible: bool = False
     room_motion_recent: bool = False
     speech_recent: bool = False
-    wakeword_armed: bool = False
+    voice_activation_armed: bool = False
     reason: str | None = None
     claim: RuntimeClaimMetadata = field(default_factory=_default_local_claim)
 
@@ -143,7 +143,7 @@ class NearDevicePresenceSnapshot:
             "person_recently_visible": self.person_recently_visible,
             "room_motion_recent": self.room_motion_recent,
             "speech_recent": self.speech_recent,
-            "wakeword_armed": self.wakeword_armed,
+            "voice_activation_armed": self.voice_activation_armed,
             "reason": self.reason,
         }
         payload.update(self.claim.to_payload())
@@ -581,23 +581,23 @@ def _derive_near_device_presence(
 
     person_visible = coerce_optional_bool(camera.get("person_visible")) is True
     person_visible_for_s = _coerce_non_negative_float(camera.get("person_visible_for_s"))
-    wakeword_armed = coerce_optional_bool(sensor.get("wakeword_armed")) is True
-    wakeword_presence_reason = normalize_text(sensor.get("wakeword_presence_reason")) or None
+    voice_activation_armed = coerce_optional_bool(sensor.get("voice_activation_armed")) is True
+    voice_activation_presence_reason = normalize_text(sensor.get("voice_activation_presence_reason")) or None
     room_motion_recent = (
         coerce_optional_bool(pir.get("motion_detected")) is True
-        or wakeword_presence_reason in {"pir_motion", "recent_pir_motion"}
+        or voice_activation_presence_reason in {"pir_motion", "recent_pir_motion"}
     )
     person_recently_visible = (
         person_visible
         or (person_visible_for_s is not None and person_visible_for_s > 0.0)
-        or wakeword_presence_reason in {"person_visible", "recent_person_visible"}
+        or voice_activation_presence_reason in {"person_visible", "recent_person_visible"}
     )
     speech_recent = any(
         (
             coerce_optional_bool(vad.get("speech_detected")) is True,
             coerce_optional_bool(audio_policy.get("presence_audio_active")) is True,
             coerce_optional_bool(audio_policy.get("recent_follow_up_speech")) is True,
-            wakeword_presence_reason in {"speech_while_recently_present", "recent_speech_while_present"},
+            voice_activation_presence_reason in {"speech_while_recently_present", "recent_speech_while_present"},
         )
     )
     occupied_likely = any(
@@ -606,7 +606,7 @@ def _derive_near_device_presence(
             person_recently_visible,
             room_motion_recent,
             speech_recent,
-            wakeword_armed,
+            voice_activation_armed,
         )
     )
 
@@ -618,8 +618,8 @@ def _derive_near_device_presence(
         reason = "room_motion_recent"
     elif speech_recent:
         reason = "speech_recent"
-    elif wakeword_armed:
-        reason = "wakeword_armed"
+    elif voice_activation_armed:
+        reason = "voice_activation_armed"
     else:
         reason = None
 
@@ -631,7 +631,7 @@ def _derive_near_device_presence(
                 0.86 if person_recently_visible and not person_visible else None,
                 0.76 if room_motion_recent else None,
                 0.72 if speech_recent else None,
-                0.78 if wakeword_armed else None,
+                0.78 if voice_activation_armed else None,
             )
         )
     )
@@ -642,7 +642,7 @@ def _derive_near_device_presence(
         person_recently_visible=person_recently_visible,
         room_motion_recent=room_motion_recent,
         speech_recent=speech_recent,
-        wakeword_armed=wakeword_armed,
+        voice_activation_armed=voice_activation_armed,
         reason=reason,
         claim=RuntimeClaimMetadata(
             confidence=(0.0 if confidence is None else confidence),

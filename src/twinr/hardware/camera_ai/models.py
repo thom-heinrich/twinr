@@ -85,6 +85,7 @@ class AICameraVisiblePerson:
     box: AICameraBox | None
     zone: AICameraZone = AICameraZone.UNKNOWN
     confidence: float = 0.0
+    attention_hint_score: float | None = None
 
     def __post_init__(self) -> None:
         """Normalize person-anchor metadata into stable bounded values."""
@@ -92,6 +93,11 @@ class AICameraVisiblePerson:
         object.__setattr__(self, "box", _coerce_box(self.box))
         object.__setattr__(self, "zone", _coerce_zone(self.zone))
         object.__setattr__(self, "confidence", _clamp_ratio(self.confidence, default=0.0))
+        object.__setattr__(
+            self,
+            "attention_hint_score",
+            _coerce_optional_ratio(self.attention_hint_score),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +192,8 @@ class AICameraObservation:
     primary_person_zone: AICameraZone = AICameraZone.UNKNOWN
     visible_persons: tuple[AICameraVisiblePerson, ...] = ()
     looking_toward_device: bool | None = None
+    looking_signal_state: str | None = None
+    looking_signal_source: str | None = None
     person_near_device: bool | None = None
     engaged_with_device: bool | None = None
     visual_attention_score: float | None = None
@@ -259,6 +267,16 @@ class AICameraObservation:
         object.__setattr__(self, "primary_person_zone", _coerce_zone(self.primary_person_zone))
         object.__setattr__(self, "visible_persons", visible_persons)
         object.__setattr__(self, "looking_toward_device", _coerce_optional_bool(self.looking_toward_device))
+        object.__setattr__(
+            self,
+            "looking_signal_state",
+            _normalize_token(self.looking_signal_state, max_length=32) or None,
+        )
+        object.__setattr__(
+            self,
+            "looking_signal_source",
+            _normalize_token(self.looking_signal_source, max_length=48) or None,
+        )
         object.__setattr__(self, "person_near_device", _coerce_optional_bool(self.person_near_device))
         object.__setattr__(self, "engaged_with_device", _coerce_optional_bool(self.engaged_with_device))
         object.__setattr__(self, "visual_attention_score", _coerce_optional_ratio(self.visual_attention_score))
@@ -552,12 +570,14 @@ def _coerce_visible_person(value: object) -> AICameraVisiblePerson | None:
             box=value.get("box"),
             zone=value.get("zone", AICameraZone.UNKNOWN),
             confidence=value.get("confidence", 0.0),
+            attention_hint_score=value.get("attention_hint_score"),
         )
     if all(hasattr(value, attr) for attr in ("box", "zone", "confidence")):
         return AICameraVisiblePerson(
             box=getattr(value, "box"),
             zone=getattr(value, "zone"),
             confidence=getattr(value, "confidence"),
+            attention_hint_score=getattr(value, "attention_hint_score", None),
         )
     box = _coerce_box(value)
     if box is None:

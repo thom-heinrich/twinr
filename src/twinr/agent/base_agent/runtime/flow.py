@@ -260,13 +260,13 @@ class TwinrRuntimeFlowMixin:
             message="Twinr started speaking a due automation prompt.",
         )
 
-    def begin_wakeword_prompt(self, prompt: str) -> str:
-        """Start a wakeword acknowledgement prompt before hands-free listening."""
+    def begin_voice_activation_prompt(self, prompt: str) -> str:
+        """Start the remote voice-activation acknowledgement prompt."""
 
         return self._begin_background_prompt(
             prompt,
-            event="wakeword_prompt_started",
-            message="Twinr acknowledged a wakeword before opening hands-free listening.",
+            event="voice_activation_prompt_started",
+            message="Twinr acknowledged a remote voice activation before hands-free listening.",
         )
 
     def _begin_background_prompt(self, prompt: str, *, event: str, message: str) -> str:

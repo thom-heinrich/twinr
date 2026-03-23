@@ -25,6 +25,7 @@ from twinr.display.ambient_impulse_cues import (
     DisplayAmbientImpulseCueStore,
 )
 from twinr.display.contracts import TwinrDisplayAdapter
+from twinr.display.debug_signals import DisplayDebugSignal, DisplayDebugSignalStore
 from twinr.display.debug_log import LogSections, TwinrDisplayDebugLogBuilder
 from twinr.display.emoji_cues import DisplayEmojiCue, DisplayEmojiCueStore
 from twinr.display.face_cues import DisplayFaceCue, DisplayFaceCueStore
@@ -87,6 +88,12 @@ def _default_internet_probe() -> bool:
     return False
 
 
+def _never_stop() -> bool:
+    """Return the default stop signal for standalone display loops."""
+
+    return False
+
+
 @dataclass(slots=True)
 class TwinrStatusDisplayLoop:
     """Drive the status panel from runtime snapshots and health signals.
@@ -116,6 +123,7 @@ class TwinrStatusDisplayLoop:
     # AUDIT-FIX(#8): Replace invalid `callable` annotations with explicit callable signatures for Python 3.11 type safety.
     emit: Callable[[str], None] = _default_emit
     sleep: Callable[[float], None] = time.sleep
+    stop_requested: Callable[[], bool] = _never_stop
     health_collector: Callable[..., TwinrSystemHealth] = collect_system_health
     clock: Callable[[], datetime] = _default_clock
     internet_probe: Callable[[], bool] = _default_internet_probe
@@ -127,6 +135,7 @@ class TwinrStatusDisplayLoop:
     presentation_cue_store: DisplayPresentationStore | None = None
     news_ticker_runtime: DisplayNewsTickerRuntime | None = None
     respeaker_hci_store: DisplayReSpeakerHciStore | None = None
+    debug_signal_store: DisplayDebugSignalStore | None = None
     _cached_health: TwinrSystemHealth | None = field(default=None, init=False, repr=False)
     _cached_health_error: str | None = field(default=None, init=False, repr=False)
     _cached_health_status: str | None = field(default=None, init=False, repr=False)
@@ -177,6 +186,7 @@ class TwinrStatusDisplayLoop:
             presentation_cue_store=DisplayPresentationStore.from_config(config),
             news_ticker_runtime=DisplayNewsTickerRuntime.from_config(config, emit=emit or _default_emit),
             respeaker_hci_store=DisplayReSpeakerHciStore.from_config(config),
+            debug_signal_store=DisplayDebugSignalStore.from_config(config),
         )
 
     def run(self, *, duration_s: float | None = None, max_cycles: int | None = None) -> int:
@@ -194,6 +204,8 @@ class TwinrStatusDisplayLoop:
         cycles = 0
         try:
             while True:
+                if self.stop_requested():
+                    return 0
                 if duration_s is not None and (time.monotonic() - started_at) >= duration_s:
                     return 0
                 if max_cycles is not None and cycles >= max_cycles:
@@ -210,6 +222,7 @@ class TwinrStatusDisplayLoop:
                 emoji_cue = self._active_emoji_cue()
                 ambient_impulse_cue = self._active_ambient_impulse_cue()
                 presentation_cue = self._active_presentation_cue()
+                debug_signals = self._active_debug_signals()
                 ticker_text = self._ticker_text()
                 signature = self._render_signature(
                     status=status,
@@ -223,6 +236,7 @@ class TwinrStatusDisplayLoop:
                     emoji_cue=emoji_cue,
                     ambient_impulse_cue=ambient_impulse_cue,
                     presentation_cue=presentation_cue,
+                    debug_signals=debug_signals,
                 )
                 if self._should_render_signature(status=status, signature=signature, last_signature=last_signature):
                     self._last_render_started_at = datetime.now(timezone.utc)
@@ -239,6 +253,7 @@ class TwinrStatusDisplayLoop:
                         emoji_cue=emoji_cue,
                         ambient_impulse_cue=ambient_impulse_cue,
                         presentation_cue=presentation_cue,
+                        debug_signals=debug_signals,
                     ):
                         self._emit_display_status(status=status, presentation_cue=presentation_cue)
                         last_signature = signature
@@ -569,6 +584,7 @@ class TwinrStatusDisplayLoop:
         emoji_cue: DisplayEmojiCue | None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None,
         presentation_cue: DisplayPresentationCue | None,
+        debug_signals: tuple[DisplayDebugSignal, ...],
     ) -> bool:
         try:
             self.display.show_status(
@@ -583,6 +599,7 @@ class TwinrStatusDisplayLoop:
                 emoji_cue=emoji_cue,
                 ambient_impulse_cue=ambient_impulse_cue,
                 presentation_cue=presentation_cue,
+                debug_signals=debug_signals,
             )
             return True
         except Exception as exc:
@@ -603,6 +620,7 @@ class TwinrStatusDisplayLoop:
                     emoji_cue=emoji_cue,
                     ambient_impulse_cue=ambient_impulse_cue,
                     presentation_cue=presentation_cue,
+                    debug_signals=debug_signals,
                 )
                 return True
             except Exception as retry_exc:
@@ -774,6 +792,7 @@ class TwinrStatusDisplayLoop:
         emoji_cue: DisplayEmojiCue | None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None,
         presentation_cue: DisplayPresentationCue | None,
+        debug_signals: tuple[DisplayDebugSignal, ...] = (),
     ) -> tuple[object, ...]:
         layout_mode = self._display_layout()
         if layout_mode == "debug_log":
@@ -798,6 +817,7 @@ class TwinrStatusDisplayLoop:
             reserve_signature,
             presentation_signature,
             presentation_bucket,
+            tuple(signal.signature() for signal in debug_signals),
         )
 
     def _should_render_signature(
@@ -904,6 +924,23 @@ class TwinrStatusDisplayLoop:
         except Exception as exc:
             self._emit_error("display_ambient_impulse_cue_load_failed", exc)
             return None
+
+    def _active_debug_signals(self) -> tuple[DisplayDebugSignal, ...]:
+        """Return the current bounded HDMI debug-signal pills."""
+
+        if self._display_layout() != "default":
+            return ()
+        store = self.debug_signal_store
+        if store is None:
+            return ()
+        try:
+            snapshot = store.load_active()
+        except Exception as exc:
+            self._emit_error("display_debug_signal_load_failed", exc)
+            return ()
+        if snapshot is None:
+            return ()
+        return snapshot.signals
 
     def _debug_log_builder(self) -> TwinrDisplayDebugLogBuilder:
         if self.debug_log_builder is None:

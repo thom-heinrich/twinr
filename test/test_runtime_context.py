@@ -12,9 +12,13 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.agent.base_agent.runtime.display_grounding import (
+    build_active_display_grounding_instruction_overlay,
+)
 from twinr.agent.base_agent.runtime import TwinrRuntime
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteUnavailableError
 from twinr.agent.base_agent.state.snapshot import RuntimeSnapshotStore
+from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseController
 
 
 class RuntimeContextTests(unittest.TestCase):
@@ -24,6 +28,17 @@ class RuntimeContextTests(unittest.TestCase):
             project_root=temp_dir,
             long_term_memory_path=str(root / "state" / "chonkydb"),
             runtime_state_path=str(root / "state" / "runtime-state.json"),
+        )
+
+    def _write_active_display_cue(self, config: TwinrConfig) -> None:
+        controller = DisplayAmbientImpulseController.from_config(config)
+        controller.show_impulse(
+            topic_key="hamburg local politics",
+            eyebrow="",
+            headline="Hamburger Lokalpolitik zieht wieder an",
+            body="Ich halte kurz die Augen auf dem Rathaus.",
+            hold_seconds=300.0,
+            source="test",
         )
 
     def test_provider_context_accepts_datetime_voice_timestamp(self) -> None:
@@ -180,6 +195,64 @@ class RuntimeContextTests(unittest.TestCase):
                 self.assertIn(("assistant", "Zweiter Turn"), context)
             finally:
                 runtime.shutdown(timeout_s=1.0)
+
+    def test_search_provider_context_includes_active_display_grounding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            self._write_active_display_cue(config)
+            runtime = TwinrRuntime(config=config)
+            try:
+                context = runtime.search_provider_conversation_context()
+                system_messages = [content for role, content in context if role == "system"]
+                self.assertTrue(
+                    any(
+                        "AUF DEINEM SCREEN STEHT GERADE" in message
+                        and "Sichtbarer Themenanker: hamburg local politics." in message
+                        and "Sichtbare Überschrift: Hamburger Lokalpolitik zieht wieder an." in message
+                        and "formuliere goal und prompt mit dem sichtbaren Thema" in message
+                        for message in system_messages
+                    )
+                )
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_supervisor_context_includes_active_display_grounding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            self._write_active_display_cue(config)
+            runtime = TwinrRuntime(config=config)
+            try:
+                context = runtime.supervisor_provider_conversation_context()
+                system_messages = [content for role, content in context if role == "system"]
+                self.assertTrue(
+                    any(
+                        "Sichtbarer Themenanker: hamburg local politics." in message
+                        and "behandle diesen Screen-Inhalt als primären Deutungsanker" in message
+                        for message in system_messages
+                    )
+                )
+                direct_context = runtime.supervisor_direct_provider_conversation_context(
+                    "Was ist denn heute so in der Hamburger Lokalpolitik?"
+                )
+                direct_system_messages = [content for role, content in direct_context if role == "system"]
+                self.assertTrue(
+                    any("Sichtbarer Themenanker: hamburg local politics." in message for message in direct_system_messages)
+                )
+            finally:
+                runtime.shutdown(timeout_s=1.0)
+
+    def test_display_grounding_overlay_marks_visible_card_as_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir)
+            self._write_active_display_cue(config)
+
+            overlay = build_active_display_grounding_instruction_overlay(config)
+
+            self.assertIsNotNone(overlay)
+            self.assertIn("AUF DEINEM SCREEN STEHT GERADE", overlay)
+            self.assertIn("Sichtbarer Themenanker: hamburg local politics.", overlay)
+            self.assertIn("autoritativer situativer Kontext", overlay)
+            self.assertIn("nicht bloß wegen einer kurzen Rückfrage zur sichtbaren Karte", overlay)
 
     def test_provider_context_degrades_when_remote_long_term_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

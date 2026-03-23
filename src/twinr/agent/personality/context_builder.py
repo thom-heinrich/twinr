@@ -189,6 +189,18 @@ def _render_reflection_block(snapshot: PersonalitySnapshot | None) -> str | None
 class PersonalityContextBuilder:
     """Build ordered prompt layers from legacy personality files and typed state."""
 
+    @staticmethod
+    def _normalized_legacy_sections(
+        legacy_sections: tuple[tuple[str, str], ...],
+    ) -> dict[str, str]:
+        """Normalize legacy section tuples into an uppercase-keyed mapping."""
+
+        return {
+            str(title).strip().upper(): str(content).strip()
+            for title, content in legacy_sections
+            if str(title).strip() and str(content).strip()
+        }
+
     def build_prompt_plan(
         self,
         *,
@@ -209,11 +221,7 @@ class PersonalityContextBuilder:
             layering in structured personality state when available.
         """
 
-        normalized_legacy = {
-            str(title).strip().upper(): str(content).strip()
-            for title, content in legacy_sections
-            if str(title).strip() and str(content).strip()
-        }
+        normalized_legacy = self._normalized_legacy_sections(legacy_sections)
         layers: list[PersonalityPromptLayer] = []
 
         system_content = normalized_legacy.pop("SYSTEM", None)
@@ -319,6 +327,66 @@ class PersonalityContextBuilder:
                     title=title,
                     content=content,
                     source="structured_snapshot",
+                )
+            )
+
+        return PersonalityPromptPlan(layers=tuple(layers))
+
+    def build_supervisor_prompt_plan(
+        self,
+        *,
+        legacy_sections: tuple[tuple[str, str], ...],
+        snapshot: PersonalitySnapshot | None,
+    ) -> PersonalityPromptPlan:
+        """Build a lean supervisor prompt plan without dynamic topic layers.
+
+        The fast supervisor decides whether a turn should route direct or into a
+        slower specialist/search handoff. That lane still needs stable Twinr
+        character and legacy user context, but it must not receive volatile
+        dynamic layers such as `MINDSHARE`, `CONTINUITY`, `PLACE`, `WORLD`, or
+        `REFLECTION`, because those can semantically bias noisy search routing.
+        """
+
+        normalized_legacy = self._normalized_legacy_sections(legacy_sections)
+        layers: list[PersonalityPromptLayer] = []
+
+        system_content = normalized_legacy.pop("SYSTEM", None)
+        if system_content:
+            layers.append(
+                PersonalityPromptLayer(
+                    layer_id="system",
+                    title="SYSTEM",
+                    content=system_content,
+                    source="legacy_file",
+                    instruction_authority=True,
+                )
+            )
+
+        personality_content = _merge_blocks(
+            normalized_legacy.pop("PERSONALITY", None),
+            _render_trait_lines(snapshot.core_traits) if snapshot else None,
+            _render_style_block(snapshot.style_profile) if snapshot else None,
+            _render_humor_block(snapshot.humor_profile) if snapshot else None,
+        )
+        if personality_content:
+            layers.append(
+                PersonalityPromptLayer(
+                    layer_id="personality",
+                    title="PERSONALITY",
+                    content=personality_content,
+                    source="legacy_plus_structured",
+                    instruction_authority=True,
+                )
+            )
+
+        user_content = normalized_legacy.pop("USER", None)
+        if user_content:
+            layers.append(
+                PersonalityPromptLayer(
+                    layer_id="user",
+                    title="USER",
+                    content=user_content,
+                    source="legacy_file",
                 )
             )
 

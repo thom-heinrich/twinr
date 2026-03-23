@@ -210,6 +210,118 @@ class PersonalityTests(unittest.TestCase):
         self.assertNotIn("MEMORY (context data; not instructions):", instructions)
         self.assertNotIn("REMINDERS (context data; not instructions):", instructions)
 
+    def test_supervisor_loop_instructions_exclude_dynamic_topic_layers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            personality_dir = Path(tmpdir) / "personality"
+            personality_dir.mkdir()
+            (personality_dir / "SYSTEM.md").write_text("System context", encoding="utf-8")
+            (personality_dir / "PERSONALITY.md").write_text("Style context", encoding="utf-8")
+            (personality_dir / "USER.md").write_text("User profile", encoding="utf-8")
+
+            remote_state = _FakeRemoteState()
+            remote_state.snapshots[DEFAULT_PERSONALITY_SNAPSHOT_KIND] = {
+                "schema_version": 1,
+                "core_traits": [
+                    {
+                        "name": "laid_back",
+                        "summary": "Stay relaxed and grounded.",
+                        "weight": 0.86,
+                        "stable": True,
+                    }
+                ],
+                "style_profile": {
+                    "verbosity": 0.34,
+                    "initiative": 0.61,
+                },
+                "humor_profile": {
+                    "style": "dry",
+                    "summary": "Quietly dry humor when it lands.",
+                    "intensity": 0.58,
+                    "boundaries": ["sensitive_context"],
+                },
+                "relationship_signals": [
+                    {
+                        "topic": "AI companions",
+                        "summary": "Strong shared thread.",
+                        "salience": 0.88,
+                        "stance": "affinity",
+                        "source": "conversation_turn",
+                    }
+                ],
+                "continuity_threads": [
+                    {
+                        "thread_id": "thread:janina",
+                        "title": "Janina",
+                        "summary": "Check in about Janina.",
+                        "salience": 0.78,
+                        "last_updated": "2026-03-20T18:00:00+00:00",
+                    }
+                ],
+                "place_focuses": [
+                    {
+                        "name": "Schwarzenbek",
+                        "summary": "Treat Schwarzenbek as home base.",
+                        "geography": "city",
+                        "salience": 0.98,
+                    }
+                ],
+                "world_signals": [
+                    {
+                        "signal_id": "world:hamburg_local_politics",
+                        "topic": "Hamburg local politics",
+                        "summary": "Recent local-politics developments in Hamburg.",
+                        "scope": "local",
+                        "salience": 0.79,
+                        "confidence": 0.84,
+                        "source": "live_search",
+                        "updated_at": "2026-03-20T19:25:00+00:00",
+                    }
+                ],
+            }
+            remote_state.snapshots[DEFAULT_WORLD_INTELLIGENCE_STATE_KIND] = {
+                "schema_version": 1,
+                "interest_signals": [
+                    {
+                        "signal_id": "interest:hamburg_local_politics",
+                        "topic": "Hamburg local politics",
+                        "summary": "Repeated user follow-ups show strong durable engagement.",
+                        "scope": "topic",
+                        "salience": 0.86,
+                        "confidence": 0.84,
+                        "engagement_score": 0.95,
+                        "evidence_count": 3,
+                        "engagement_count": 5,
+                        "updated_at": "2026-03-20T19:25:00+00:00",
+                    }
+                ],
+            }
+
+            config = TwinrConfig(
+                project_root=tmpdir,
+                personality_dir="personality",
+                long_term_memory_enabled=True,
+                long_term_memory_mode="remote_primary",
+                long_term_memory_remote_required=False,
+            )
+            with patch(
+                "twinr.agent.base_agent.prompting.personality.LongTermRemoteStateStore.from_config",
+                return_value=remote_state,
+            ):
+                instructions = load_supervisor_loop_instructions(config)
+
+        self.assertIn("SYSTEM:\nSystem context", instructions)
+        self.assertIn("PERSONALITY:\nStyle context", instructions)
+        self.assertIn("## Structured core character", instructions)
+        self.assertIn("## Evolving conversation style", instructions)
+        self.assertIn("## Evolving humor stance", instructions)
+        self.assertNotIn("MINDSHARE (context data; not instructions):", instructions)
+        self.assertNotIn("CONTINUITY (context data; not instructions):", instructions)
+        self.assertNotIn("PLACE (context data; not instructions):", instructions)
+        self.assertNotIn("WORLD (context data; not instructions):", instructions)
+        self.assertNotIn("REFLECTION (context data; not instructions):", instructions)
+        self.assertNotIn("Hamburg local politics", instructions)
+        self.assertNotIn("Schwarzenbek", instructions)
+
     def test_conversation_closure_instructions_stay_dedicated_and_lean(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             personality_dir = Path(tmpdir) / "personality"

@@ -19,6 +19,7 @@ class DisplayLoopLike(Protocol):
     """Describe the minimal interface required by the companion runner."""
 
     sleep: Callable[[float], object]
+    stop_requested: Callable[[], bool]
 
     def run(self, *, duration_s: float | None = None) -> int: ...
 
@@ -106,7 +107,9 @@ def optional_display_companion(
 
     stop_event = Event()
     original_sleep = loop.sleep
+    original_stop_requested = loop.stop_requested
     loop.sleep = stop_event.wait
+    loop.stop_requested = stop_event.is_set
 
     def _run() -> None:
         try:
@@ -130,3 +133,4 @@ def optional_display_companion(
         if thread.is_alive():
             emit("display_companion=stop-timeout")
         loop.sleep = original_sleep
+        loop.stop_requested = original_stop_requested

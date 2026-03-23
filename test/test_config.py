@@ -24,8 +24,10 @@ class TwinrConfigTests(unittest.TestCase):
 
             config = TwinrConfig.from_env(env_path)
 
-        self.assertEqual(config.openai_search_model, "gpt-4o-mini-search-preview")
-        self.assertEqual(config.streaming_first_word_model, "gpt-4o-mini")
+        self.assertEqual(config.openai_search_model, "gpt-5.4-mini")
+        self.assertEqual(config.openai_search_max_output_tokens, 1024)
+        self.assertEqual(config.openai_search_retry_max_output_tokens, 1536)
+        self.assertEqual(config.streaming_first_word_model, "gpt-5.4-mini")
         self.assertEqual(config.streaming_first_word_context_turns, 1)
         self.assertEqual(config.streaming_first_word_max_output_tokens, 32)
         self.assertEqual(config.streaming_first_word_prefetch_min_chars, 4)
@@ -34,14 +36,30 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_first_word_final_lane_wait_ms, 900)
         self.assertEqual(config.streaming_final_lane_watchdog_timeout_ms, 4000)
         self.assertEqual(config.streaming_final_lane_hard_timeout_ms, 15000)
+        self.assertEqual(config.streaming_search_final_lane_watchdog_timeout_ms, 6000)
+        self.assertEqual(config.streaming_search_final_lane_hard_timeout_ms, 30000)
+        self.assertEqual(config.streaming_supervisor_model, "gpt-5.4-mini")
+        self.assertEqual(config.streaming_supervisor_max_output_tokens, 80)
         self.assertEqual(config.streaming_supervisor_prefetch_min_chars, 8)
         self.assertEqual(config.streaming_supervisor_prefetch_wait_ms, 80)
-        self.assertEqual(config.streaming_specialist_model, "gpt-4o-mini")
+        self.assertEqual(config.streaming_specialist_model, "gpt-5.4-mini")
         self.assertEqual(config.streaming_specialist_reasoning_effort, "low")
         self.assertEqual(config.local_semantic_router_mode, "off")
         self.assertIsNone(config.local_semantic_router_model_dir)
         self.assertIsNone(config.local_semantic_router_user_intent_model_dir)
         self.assertTrue(config.local_semantic_router_trace)
+
+    def test_voice_orchestrator_remote_asr_wake_defaults_favor_short_live_wakes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.voice_orchestrator_remote_asr_min_wake_duration_ms, 300)
+        self.assertEqual(config.voice_orchestrator_intent_stage1_window_bonus_ms, 400)
+        self.assertEqual(config.voice_orchestrator_intent_min_wake_duration_relief_ms, 100)
+        self.assertEqual(config.voice_orchestrator_intent_follow_up_timeout_bonus_s, 1.5)
 
     def test_from_env_reads_local_semantic_router_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -117,11 +135,17 @@ class TwinrConfigTests(unittest.TestCase):
     def test_display_reserve_generation_defaults_follow_primary_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
-            env_path.write_text("OPENAI_MODEL=gpt-5.2\n", encoding="utf-8")
+            env_path.write_text("OPENAI_MODEL=gpt-5.4-mini\n", encoding="utf-8")
 
             config = TwinrConfig.from_env(env_path)
 
-        self.assertEqual(config.display_reserve_generation_model, "gpt-5.2")
+        self.assertEqual(config.default_model, "gpt-5.4-mini")
+        self.assertEqual(config.openai_search_model, "gpt-5.4-mini")
+        self.assertEqual(config.streaming_first_word_model, "gpt-5.4-mini")
+        self.assertEqual(config.streaming_supervisor_model, "gpt-5.4-mini")
+        self.assertEqual(config.streaming_specialist_model, "gpt-5.4-mini")
+        self.assertEqual(config.conversation_closure_model, "gpt-5.4-mini")
+        self.assertEqual(config.display_reserve_generation_model, "gpt-5.4-mini")
         self.assertEqual(config.display_reserve_generation_timeout_seconds, 12.0)
 
     def test_from_env_reads_display_runtime_trace_flag(self) -> None:
@@ -165,6 +189,18 @@ class TwinrConfigTests(unittest.TestCase):
             config = TwinrConfig.from_env(env_path)
 
         self.assertTrue(config.display_companion_enabled)
+
+    def test_from_env_reads_respeaker_led_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "TWINR_RESPEAKER_LED_ENABLED=true\n",
+                encoding="utf-8",
+            )
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertTrue(config.respeaker_led_enabled)
 
     def test_from_env_reads_display_face_cue_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -212,9 +248,22 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ATTENTION_SERVO_MAX_VELOCITY_US_PER_S=72.0",
                         "TWINR_ATTENTION_SERVO_MAX_ACCELERATION_US_PER_S2=180.0",
                         "TWINR_ATTENTION_SERVO_MAX_JERK_US_PER_S3=640.0",
+                        "TWINR_ATTENTION_SERVO_REST_MAX_VELOCITY_US_PER_S=34.0",
+                        "TWINR_ATTENTION_SERVO_REST_MAX_ACCELERATION_US_PER_S2=110.0",
+                        "TWINR_ATTENTION_SERVO_REST_MAX_JERK_US_PER_S3=420.0",
                         "TWINR_ATTENTION_SERVO_MIN_COMMAND_DELTA_US=9",
+                        "TWINR_ATTENTION_SERVO_VISIBLE_RETARGET_TOLERANCE_US=44",
                         "TWINR_ATTENTION_SERVO_SOFT_LIMIT_MARGIN_US=55",
                         "TWINR_ATTENTION_SERVO_IDLE_RELEASE_S=1.4",
+                        "TWINR_ATTENTION_SERVO_SETTLED_RELEASE_S=0.7",
+                        "TWINR_ATTENTION_SERVO_FOLLOW_EXIT_ONLY=true",
+                        "TWINR_ATTENTION_SERVO_MECHANICAL_RANGE_DEGREES=270.0",
+                        "TWINR_ATTENTION_SERVO_EXIT_FOLLOW_MAX_DEGREES=60.0",
+                        "TWINR_ATTENTION_SERVO_EXIT_ACTIVATION_DELAY_S=0.45",
+                        "TWINR_ATTENTION_SERVO_EXIT_SETTLE_HOLD_S=0.85",
+                        "TWINR_ATTENTION_SERVO_EXIT_REACQUIRE_CENTER_TOLERANCE=0.09",
+                        "TWINR_ATTENTION_SERVO_EXIT_VISIBLE_EDGE_THRESHOLD=0.76",
+                        "TWINR_ATTENTION_SERVO_EXIT_COOLDOWN_S=33.0",
                     ]
                 )
                 + "\n",
@@ -240,9 +289,39 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.attention_servo_max_velocity_us_per_s, 72.0)
         self.assertEqual(config.attention_servo_max_acceleration_us_per_s2, 180.0)
         self.assertEqual(config.attention_servo_max_jerk_us_per_s3, 640.0)
+        self.assertEqual(config.attention_servo_rest_max_velocity_us_per_s, 34.0)
+        self.assertEqual(config.attention_servo_rest_max_acceleration_us_per_s2, 110.0)
+        self.assertEqual(config.attention_servo_rest_max_jerk_us_per_s3, 420.0)
         self.assertEqual(config.attention_servo_min_command_delta_us, 9)
+        self.assertEqual(config.attention_servo_visible_retarget_tolerance_us, 44)
         self.assertEqual(config.attention_servo_soft_limit_margin_us, 55)
         self.assertEqual(config.attention_servo_idle_release_s, 1.4)
+        self.assertEqual(config.attention_servo_settled_release_s, 0.7)
+        self.assertTrue(config.attention_servo_follow_exit_only)
+        self.assertEqual(config.attention_servo_mechanical_range_degrees, 270.0)
+        self.assertEqual(config.attention_servo_exit_follow_max_degrees, 60.0)
+        self.assertEqual(config.attention_servo_exit_activation_delay_s, 0.45)
+        self.assertEqual(config.attention_servo_exit_settle_hold_s, 0.85)
+        self.assertEqual(config.attention_servo_exit_reacquire_center_tolerance, 0.09)
+        self.assertEqual(config.attention_servo_exit_visible_edge_threshold, 0.76)
+        self.assertEqual(config.attention_servo_exit_cooldown_s, 33.0)
+
+    def test_attention_servo_exit_activation_delay_is_clamped_to_target_hold(self) -> None:
+        config = TwinrConfig(
+            attention_servo_target_hold_s=0.4,
+            attention_servo_exit_activation_delay_s=1.2,
+        )
+
+        self.assertEqual(config.attention_servo_exit_activation_delay_s, 0.4)
+
+    def test_from_env_reads_twinr_kernel_attention_servo_driver(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text("TWINR_ATTENTION_SERVO_DRIVER=twinr_kernel\n", encoding="utf-8")
+
+            config = TwinrConfig.from_env(env_path)
+
+        self.assertEqual(config.attention_servo_driver, "twinr_kernel")
 
     def test_from_env_reads_display_emoji_cue_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -723,36 +802,7 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_PROACTIVE_VISION_REVIEW_MAX_FRAMES=5",
                         "TWINR_PROACTIVE_VISION_REVIEW_MAX_AGE_S=15.5",
                         "TWINR_PROACTIVE_VISION_REVIEW_MIN_SPACING_S=1.7",
-                        "TWINR_WAKEWORD_ENABLED=true",
-                        "TWINR_WAKEWORD_BACKEND=openwakeword",
-                        "TWINR_WAKEWORD_PRIMARY_BACKEND=openwakeword",
-                        "TWINR_WAKEWORD_FALLBACK_BACKEND=stt",
-                        "TWINR_WAKEWORD_VERIFIER_MODE=ambiguity_only",
-                        "TWINR_WAKEWORD_VERIFIER_MARGIN=0.11",
-                        "TWINR_WAKEWORD_PHRASES=hey twinr, hey twinna, twinr, twinner",
-                        "TWINR_WAKEWORD_SAMPLE_MS=1700",
-                        "TWINR_WAKEWORD_PRESENCE_GRACE_S=600",
-                        "TWINR_WAKEWORD_MOTION_GRACE_S=180",
-                        "TWINR_WAKEWORD_SPEECH_GRACE_S=75",
-                        "TWINR_WAKEWORD_ATTEMPT_COOLDOWN_S=5.5",
-                        "TWINR_WAKEWORD_BLOCK_PROACTIVE_AFTER_ATTEMPT_S=14",
-                        "TWINR_WAKEWORD_MIN_ACTIVE_RATIO=0.06",
-                        "TWINR_WAKEWORD_MIN_ACTIVE_CHUNKS=2",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_MODELS=/twinr/models/wakewords/twinr.tflite, /twinr/models/wakewords/twinna.tflite",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_CUSTOM_VERIFIER_MODELS=twinr=/twinr/models/wakewords/twinr.verifier.pkl, twinna=/twinr/models/wakewords/twinna.verifier.pkl",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_CUSTOM_VERIFIER_THRESHOLD=0.23",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_SEQUENCE_VERIFIER_MODELS=twinr=/twinr/models/wakewords/twinr.sequence_verifier.pkl",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_SEQUENCE_VERIFIER_THRESHOLD=0.61",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_THRESHOLD=0.57",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_VAD_THRESHOLD=0.18",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_PATIENCE_FRAMES=3",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_ACTIVATION_SAMPLES=4",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_DEACTIVATION_THRESHOLD=0.12",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_ENABLE_SPEEX=true",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT=false",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_INFERENCE_FRAMEWORK=onnx",
-                        "TWINR_WAKEWORD_CALIBRATION_PROFILE_PATH=state/custom_wakeword_calibration.json",
-                        "TWINR_WAKEWORD_CALIBRATION_RECOMMENDED_PATH=state/custom_wakeword_calibration.recommended.json",
+                        "TWINR_VOICE_ACTIVATION_PHRASES=hey twinr, hey twinna, twinr, twinner",
                         "TWINR_PROACTIVE_PERSON_RETURNED_ABSENCE_S=1400",
                         "TWINR_PROACTIVE_PERSON_RETURNED_RECENT_MOTION_S=45",
                         "TWINR_PROACTIVE_ATTENTION_WINDOW_S=7.5",
@@ -1057,55 +1107,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_vision_review_max_frames, 5)
         self.assertEqual(config.proactive_vision_review_max_age_s, 15.5)
         self.assertEqual(config.proactive_vision_review_min_spacing_s, 1.7)
-        self.assertTrue(config.wakeword_enabled)
-        self.assertEqual(config.wakeword_backend, "openwakeword")
-        self.assertEqual(config.wakeword_primary_backend, "openwakeword")
-        self.assertEqual(config.wakeword_fallback_backend, "stt")
-        self.assertEqual(config.wakeword_verifier_mode, "ambiguity_only")
-        self.assertEqual(config.wakeword_verifier_margin, 0.11)
-        self.assertEqual(config.wakeword_phrases, ("hey twinr", "hey twinna", "twinr", "twinner"))
-        self.assertEqual(config.wakeword_stt_phrases, ("hey twinr", "hey twinna", "twinr", "twinner"))
-        self.assertEqual(config.wakeword_sample_ms, 1700)
-        self.assertEqual(config.wakeword_presence_grace_s, 600.0)
-        self.assertEqual(config.wakeword_motion_grace_s, 180.0)
-        self.assertEqual(config.wakeword_speech_grace_s, 75.0)
-        self.assertEqual(config.wakeword_attempt_cooldown_s, 5.5)
-        self.assertEqual(config.wakeword_block_proactive_after_attempt_s, 14.0)
-        self.assertEqual(config.wakeword_min_active_ratio, 0.06)
-        self.assertEqual(config.wakeword_min_active_chunks, 2)
-        self.assertEqual(
-            config.wakeword_openwakeword_models,
-            ("/twinr/models/wakewords/twinr.tflite", "/twinr/models/wakewords/twinna.tflite"),
-        )
-        self.assertEqual(
-            config.wakeword_openwakeword_custom_verifier_models,
-            (
-                ("twinr", "/twinr/models/wakewords/twinr.verifier.pkl"),
-                ("twinna", "/twinr/models/wakewords/twinna.verifier.pkl"),
-            ),
-        )
-        self.assertEqual(config.wakeword_openwakeword_custom_verifier_threshold, 0.23)
-        self.assertEqual(
-            config.wakeword_openwakeword_sequence_verifier_models,
-            (("twinr", "/twinr/models/wakewords/twinr.sequence_verifier.pkl"),),
-        )
-        self.assertEqual(config.wakeword_openwakeword_sequence_verifier_threshold, 0.61)
-        self.assertEqual(config.wakeword_openwakeword_threshold, 0.57)
-        self.assertEqual(config.wakeword_openwakeword_vad_threshold, 0.18)
-        self.assertEqual(config.wakeword_openwakeword_patience_frames, 3)
-        self.assertEqual(config.wakeword_openwakeword_activation_samples, 4)
-        self.assertEqual(config.wakeword_openwakeword_deactivation_threshold, 0.12)
-        self.assertTrue(config.wakeword_openwakeword_enable_speex)
-        self.assertFalse(config.wakeword_openwakeword_transcribe_on_detect)
-        self.assertEqual(config.wakeword_openwakeword_inference_framework, "onnx")
-        self.assertEqual(
-            config.wakeword_calibration_profile_path,
-            "state/custom_wakeword_calibration.json",
-        )
-        self.assertEqual(
-            config.wakeword_calibration_recommended_path,
-            "state/custom_wakeword_calibration.recommended.json",
-        )
+        self.assertEqual(config.voice_activation_phrases, ("hey twinr", "hey twinna", "twinr", "twinner"))
         self.assertEqual(config.proactive_person_returned_absence_s, 1400.0)
         self.assertEqual(config.proactive_person_returned_recent_motion_s, 45.0)
         self.assertEqual(config.proactive_attention_window_s, 7.5)
@@ -1308,7 +1310,7 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_transcript_verifier_max_capture_ms, 6500)
         self.assertEqual(config.streaming_first_word_prefetch_min_words, 2)
         self.assertTrue(config.conversation_closure_guard_enabled)
-        self.assertEqual(config.conversation_closure_model, "gpt-4o-mini")
+        self.assertEqual(config.conversation_closure_model, "gpt-5.4-mini")
         self.assertEqual(config.conversation_closure_reasoning_effort, "")
         self.assertEqual(config.conversation_closure_context_turns, 4)
         self.assertEqual(config.conversation_closure_instructions_file, "CONVERSATION_CLOSURE.md")
@@ -1398,167 +1400,6 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.proactive_quiet_hours_start_local, "21:00")
         self.assertEqual(config.proactive_quiet_hours_end_local, "07:00")
 
-    def test_wakeword_openwakeword_threshold_allows_deployment_tuned_low_values(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            env_path = Path(temp_dir) / ".env"
-            env_path.write_text(
-                "\n".join(
-                    [
-                        "TWINR_WAKEWORD_ENABLED=true",
-                        "TWINR_WAKEWORD_BACKEND=openwakeword",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_THRESHOLD=0.001",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-
-            config = TwinrConfig.from_env(env_path)
-
-        self.assertEqual(config.wakeword_openwakeword_threshold, 0.001)
-
-    def test_wakeword_transcribe_on_detect_legacy_flag_maps_to_verifier_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            env_path = Path(temp_dir) / ".env"
-            env_path.write_text(
-                "\n".join(
-                    [
-                        "TWINR_WAKEWORD_ENABLED=true",
-                        "TWINR_WAKEWORD_BACKEND=openwakeword",
-                        "TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT=true",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-
-            config = TwinrConfig.from_env(env_path)
-
-        self.assertEqual(config.wakeword_primary_backend, "openwakeword")
-        self.assertEqual(config.wakeword_verifier_mode, "always")
-
-    def test_from_env_reads_stt_specific_wakeword_phrases(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            env_path = Path(temp_dir) / ".env"
-            env_path.write_text(
-                "\n".join(
-                    [
-                        "TWINR_WAKEWORD_PHRASES=hallo twinr, twinr",
-                        "TWINR_WAKEWORD_STT_PHRASES=hallo twinr, hallo twin, twinr, twin",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            config = TwinrConfig.from_env(env_path)
-
-        self.assertEqual(config.wakeword_phrases, ("hallo twinr", "twinr"))
-        self.assertEqual(config.wakeword_stt_phrases, ("hallo twinr", "hallo twin", "twinr", "twin"))
-
-    def test_from_env_reads_kws_wakeword_assets(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            tokens = root / "tokens.txt"
-            encoder = root / "encoder.onnx"
-            decoder = root / "decoder.onnx"
-            joiner = root / "joiner.onnx"
-            keywords = root / "keywords.txt"
-            for path in (tokens, encoder, decoder, joiner, keywords):
-                path.write_text("x\n", encoding="utf-8")
-            env_path = root / ".env"
-            env_path.write_text(
-                "\n".join(
-                    [
-                        "TWINR_WAKEWORD_BACKEND=kws",
-                        "TWINR_WAKEWORD_PRIMARY_BACKEND=kws",
-                        f"TWINR_WAKEWORD_KWS_TOKENS_PATH={tokens}",
-                        f"TWINR_WAKEWORD_KWS_ENCODER_PATH={encoder}",
-                        f"TWINR_WAKEWORD_KWS_DECODER_PATH={decoder}",
-                        f"TWINR_WAKEWORD_KWS_JOINER_PATH={joiner}",
-                        f"TWINR_WAKEWORD_KWS_KEYWORDS_FILE_PATH={keywords}",
-                        "TWINR_WAKEWORD_KWS_PROVIDER=cpu",
-                        "TWINR_WAKEWORD_KWS_NUM_THREADS=3",
-                        "TWINR_WAKEWORD_KWS_SAMPLE_RATE=16000",
-                        "TWINR_WAKEWORD_KWS_FEATURE_DIM=80",
-                        "TWINR_WAKEWORD_KWS_MAX_ACTIVE_PATHS=6",
-                        "TWINR_WAKEWORD_KWS_KEYWORDS_SCORE=1.4",
-                        "TWINR_WAKEWORD_KWS_KEYWORDS_THRESHOLD=0.31",
-                        "TWINR_WAKEWORD_KWS_NUM_TRAILING_BLANKS=2",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            config = TwinrConfig.from_env(env_path)
-
-        self.assertEqual(config.wakeword_backend, "kws")
-        self.assertEqual(config.wakeword_primary_backend, "kws")
-        self.assertEqual(config.wakeword_kws_tokens_path, str(tokens))
-        self.assertEqual(config.wakeword_kws_encoder_path, str(encoder))
-        self.assertEqual(config.wakeword_kws_decoder_path, str(decoder))
-        self.assertEqual(config.wakeword_kws_joiner_path, str(joiner))
-        self.assertEqual(config.wakeword_kws_keywords_file_path, str(keywords))
-        self.assertEqual(config.wakeword_kws_provider, "cpu")
-        self.assertEqual(config.wakeword_kws_num_threads, 3)
-        self.assertEqual(config.wakeword_kws_sample_rate, 16000)
-        self.assertEqual(config.wakeword_kws_feature_dim, 80)
-        self.assertEqual(config.wakeword_kws_max_active_paths, 6)
-        self.assertEqual(config.wakeword_kws_keywords_score, 1.4)
-        self.assertEqual(config.wakeword_kws_keywords_threshold, 0.31)
-        self.assertEqual(config.wakeword_kws_num_trailing_blanks, 2)
-
-    def test_from_env_defaults_to_bundled_openwakeword_model_when_present(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            env_path = root / ".env"
-            model_path = root / "src" / "twinr" / "proactive" / "wakeword" / "models" / "twinr_v1.onnx"
-            model_path.parent.mkdir(parents=True, exist_ok=True)
-            model_path.write_bytes(b"fake-onnx-model")
-            env_path.write_text("", encoding="utf-8")
-
-            config = TwinrConfig.from_env(env_path)
-
-        self.assertEqual(config.wakeword_openwakeword_models, (str(model_path),))
-        self.assertEqual(config.wakeword_openwakeword_inference_framework, "onnx")
-
-    def test_from_env_defaults_to_bundled_openwakeword_verifier_when_present(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            env_path = root / ".env"
-            model_path = root / "src" / "twinr" / "proactive" / "wakeword" / "models" / "twinr_v1.onnx"
-            verifier_path = model_path.with_suffix(".verifier.pkl")
-            model_path.parent.mkdir(parents=True, exist_ok=True)
-            model_path.write_bytes(b"fake-onnx-model")
-            verifier_path.write_bytes(b"fake-verifier")
-            env_path.write_text("", encoding="utf-8")
-
-            config = TwinrConfig.from_env(env_path)
-
-        self.assertEqual(config.wakeword_openwakeword_models, (str(model_path),))
-        self.assertEqual(
-            config.wakeword_openwakeword_custom_verifier_models,
-            (("twinr_v1", str(verifier_path)),),
-        )
-
-    def test_from_env_defaults_to_bundled_openwakeword_sequence_verifier_when_present(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            env_path = root / ".env"
-            model_path = root / "src" / "twinr" / "proactive" / "wakeword" / "models" / "twinr_v1.onnx"
-            verifier_path = model_path.with_suffix(".sequence_verifier.pkl")
-            model_path.parent.mkdir(parents=True, exist_ok=True)
-            model_path.write_bytes(b"fake-onnx-model")
-            verifier_path.write_bytes(b"fake-sequence-verifier")
-            env_path.write_text("", encoding="utf-8")
-
-            config = TwinrConfig.from_env(env_path)
-
-        self.assertEqual(config.wakeword_openwakeword_models, (str(model_path),))
-        self.assertEqual(
-            config.wakeword_openwakeword_sequence_verifier_models,
-            (("twinr_v1", str(verifier_path)),),
-        )
-
     def test_from_env_defaults_long_term_memory_path_to_project_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
@@ -1614,6 +1455,8 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_STREAMING_BRIDGE_REPLY_TIMEOUT_MS=300",
                         "TWINR_STREAMING_FINAL_LANE_WATCHDOG_TIMEOUT_MS=4500",
                         "TWINR_STREAMING_FINAL_LANE_HARD_TIMEOUT_MS=16000",
+                        "TWINR_STREAMING_SEARCH_FINAL_LANE_WATCHDOG_TIMEOUT_MS=7000",
+                        "TWINR_STREAMING_SEARCH_FINAL_LANE_HARD_TIMEOUT_MS=28000",
                         "TWINR_STREAMING_SUPERVISOR_MODEL=gpt-4o-mini",
                         "TWINR_STREAMING_SUPERVISOR_REASONING_EFFORT=low",
                         "TWINR_STREAMING_SPECIALIST_MODEL=gpt-5.2-chat-latest",
@@ -1638,6 +1481,8 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertEqual(config.streaming_bridge_reply_timeout_ms, 300)
         self.assertEqual(config.streaming_final_lane_watchdog_timeout_ms, 4500)
         self.assertEqual(config.streaming_final_lane_hard_timeout_ms, 16000)
+        self.assertEqual(config.streaming_search_final_lane_watchdog_timeout_ms, 7000)
+        self.assertEqual(config.streaming_search_final_lane_hard_timeout_ms, 28000)
         self.assertEqual(config.streaming_supervisor_model, "gpt-4o-mini")
         self.assertEqual(config.streaming_supervisor_reasoning_effort, "low")
         self.assertEqual(config.streaming_specialist_model, "gpt-5.2-chat-latest")
@@ -1656,14 +1501,17 @@ class TwinrConfigTests(unittest.TestCase):
                         "TWINR_ORCHESTRATOR_SHARED_SECRET=secret-token",
                         "TWINR_VOICE_ORCHESTRATOR_ENABLED=1",
                         "TWINR_VOICE_ORCHESTRATOR_WS_URL=wss://voice.example/ws/orchestrator/voice",
-                        "TWINR_VOICE_ORCHESTRATOR_WAKE_STAGE1_MODE=local_stt",
+                        "TWINR_VOICE_ORCHESTRATOR_WAKE_STAGE1_MODE=remote_asr",
                         "TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_WINDOW_MS=2400",
                         "TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_MIN_ACTIVE_RATIO=0.12",
-                        "TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_URL=http://10.10.0.2:18090",
-                        "TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_BEARER_TOKEN=voice-secret",
-                        "TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_TIMEOUT_S=2.75",
-                        "TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_LANGUAGE=de",
-                        "TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_MODE=active_listening",
+                        "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL=http://10.10.0.2:18090",
+                        "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_BEARER_TOKEN=voice-secret",
+                        "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_TIMEOUT_S=2.75",
+                        "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_LANGUAGE=de",
+                        "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_MODE=active_listening",
+                        "TWINR_VOICE_ORCHESTRATOR_INTENT_STAGE1_WINDOW_BONUS_MS=550",
+                        "TWINR_VOICE_ORCHESTRATOR_INTENT_MIN_WAKE_DURATION_RELIEF_MS=140",
+                        "TWINR_VOICE_ORCHESTRATOR_INTENT_FOLLOW_UP_TIMEOUT_BONUS_S=2.25",
                         "TWINR_VOICE_ORCHESTRATOR_FOLLOW_UP_TIMEOUT_S=7.5",
                     ]
                 ),
@@ -1679,12 +1527,15 @@ class TwinrConfigTests(unittest.TestCase):
         self.assertTrue(config.voice_orchestrator_enabled)
         self.assertEqual(config.voice_orchestrator_ws_url, "wss://voice.example/ws/orchestrator/voice")
         self.assertEqual(config.voice_orchestrator_shared_secret, "secret-token")
-        self.assertEqual(config.voice_orchestrator_wake_stage1_mode, "local_stt")
+        self.assertEqual(config.voice_orchestrator_wake_stage1_mode, "remote_asr")
         self.assertEqual(config.voice_orchestrator_wake_candidate_window_ms, 2400)
         self.assertEqual(config.voice_orchestrator_wake_candidate_min_active_ratio, 0.12)
-        self.assertEqual(config.voice_orchestrator_local_stt_url, "http://10.10.0.2:18090")
-        self.assertEqual(config.voice_orchestrator_local_stt_bearer_token, "voice-secret")
-        self.assertEqual(config.voice_orchestrator_local_stt_timeout_s, 2.75)
-        self.assertEqual(config.voice_orchestrator_local_stt_language, "de")
-        self.assertEqual(config.voice_orchestrator_local_stt_mode, "active_listening")
+        self.assertEqual(config.voice_orchestrator_remote_asr_url, "http://10.10.0.2:18090")
+        self.assertEqual(config.voice_orchestrator_remote_asr_bearer_token, "voice-secret")
+        self.assertEqual(config.voice_orchestrator_remote_asr_timeout_s, 2.75)
+        self.assertEqual(config.voice_orchestrator_remote_asr_language, "de")
+        self.assertEqual(config.voice_orchestrator_remote_asr_mode, "active_listening")
+        self.assertEqual(config.voice_orchestrator_intent_stage1_window_bonus_ms, 550)
+        self.assertEqual(config.voice_orchestrator_intent_min_wake_duration_relief_ms, 140)
+        self.assertEqual(config.voice_orchestrator_intent_follow_up_timeout_bonus_s, 2.25)
         self.assertEqual(config.voice_orchestrator_follow_up_timeout_s, 7.5)

@@ -14,6 +14,7 @@ streaming APIs.
 - route the shared local household-identity tool through the same thin executor surface as the legacy portrait and voice tools
 - route the RSS/world-intelligence configuration tool through the same thin executor surface as the other persistent tool handlers
 - dispatch learned-skill control tools and hidden self-coding runtime triggers through the same thin executor surface
+- record one generic success/failure observability event per realtime tool call so operator readback can see which tool ran, how long it took, and whether model fallback metadata was involved
 - run the generic streaming tool loop and the supervisor/specialist handoff loop
 - keep the structured supervisor-decision lane isolated from general tool-agent instructions so routing stays provider- and lane-specific
 - fail closed when the supervisor/specialist runtime cannot produce a verified final answer instead of synthesizing replacement speech on the active streaming path
@@ -40,6 +41,7 @@ lines when the fast lane does not provide one.
 |---|---|
 | [__init__.py](./__init__.py) | Runtime export surface |
 | [executor.py](./executor.py) | Owner-to-handler dispatcher |
+| [observability.py](./observability.py) | Generic per-tool runtime telemetry for operator artifacts |
 | [registry.py](./registry.py) | Tool binding validation |
 | [broker_policy.py](./broker_policy.py) | Background automation tool-call policy |
 | [streaming_loop.py](./streaming_loop.py) | Generic tool round loop |

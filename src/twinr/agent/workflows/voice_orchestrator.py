@@ -2,8 +2,9 @@
 
 This module keeps `realtime_runner.py` orchestration-focused by handling the
 bounded `arecord` lifecycle, websocket transport, and decision dispatch for the
-Alexa-like hybrid voice path. It does not run turns itself; it only forwards
-server-side wake/follow-up/barge-in decisions back into the realtime loop.
+Alexa-like server-backed voice path. It does not run turns itself; it only
+forwards server-side wake/transcript-commit/follow-up-close/barge-in decisions
+back into the realtime loop.
 """
 
 from __future__ import annotations
@@ -18,19 +19,21 @@ from typing import Callable
 from uuid import uuid4
 
 from twinr.agent.base_agent.config import TwinrConfig
+from twinr.hardware.audio_env import build_audio_subprocess_env
 from twinr.hardware.respeaker_capture_recovery import wait_for_transient_respeaker_capture_ready
-from twinr.proactive import WakewordMatch
 from twinr.orchestrator import (
     OrchestratorVoiceAudioFrame,
     OrchestratorVoiceBargeInInterruptEvent,
     OrchestratorVoiceErrorEvent,
-    OrchestratorVoiceFollowUpCaptureRequestedEvent,
+    OrchestratorVoiceFollowUpClosedEvent,
     OrchestratorVoiceHelloRequest,
     OrchestratorVoiceReadyEvent,
     OrchestratorVoiceRuntimeStateEvent,
+    OrchestratorVoiceTranscriptCommittedEvent,
     OrchestratorVoiceWakeConfirmedEvent,
     OrchestratorVoiceWebSocketClient,
 )
+from twinr.orchestrator.voice_activation import VoiceActivationMatch
 
 
 class EdgeVoiceOrchestrator:
@@ -47,14 +50,14 @@ class EdgeVoiceOrchestrator:
         config: TwinrConfig,
         *,
         emit: Callable[[str], None],
-        on_wakeword_match: Callable[[WakewordMatch], bool],
-        on_follow_up_capture_requested: Callable[[], bool],
+        on_voice_activation: Callable[[VoiceActivationMatch], bool],
+        on_transcript_committed: Callable[[str, str], bool],
         on_barge_in_interrupt: Callable[[], bool],
     ) -> None:
         self.config = config
         self.emit = emit
-        self._on_wakeword_match = on_wakeword_match
-        self._on_follow_up_capture_requested = on_follow_up_capture_requested
+        self._on_voice_activation = on_voice_activation
+        self._on_transcript_committed = on_transcript_committed
         self._on_barge_in_interrupt = on_barge_in_interrupt
         self._device = (
             str(config.voice_orchestrator_audio_device or config.proactive_audio_input_device or config.audio_input_device)
@@ -140,27 +143,40 @@ class EdgeVoiceOrchestrator:
         self.close()
 
     def pause_capture(self, *, reason: str) -> None:
-        """Pause the long-lived microphone stream before a local bounded capture."""
+        """Keep compatibility with old callers without pausing server-only capture."""
 
-        self._paused.set()
-        self.emit(f"voice_orchestrator_capture_paused={reason}")
-        process = self._process
-        if process is not None:
-            self._stop_process(process)
+        self.emit(f"voice_orchestrator_capture_pause_ignored={reason}")
 
     def resume_capture(self, *, reason: str) -> None:
-        """Resume microphone streaming after a local bounded capture."""
+        """Keep compatibility with old callers without mutating capture state."""
 
-        self.emit(f"voice_orchestrator_capture_resumed={reason}")
-        self._paused.clear()
+        self.emit(f"voice_orchestrator_capture_resume_ignored={reason}")
 
-    def notify_runtime_state(self, *, state: str, detail: str | None = None, follow_up_allowed: bool = False) -> None:
+    def notify_runtime_state(
+        self,
+        *,
+        state: str,
+        detail: str | None = None,
+        follow_up_allowed: bool = False,
+        attention_state: str | None = None,
+        interaction_intent_state: str | None = None,
+        person_visible: bool | None = None,
+        interaction_ready: bool | None = None,
+        targeted_inference_blocked: bool | None = None,
+        recommended_channel: str | None = None,
+    ) -> None:
         """Send the current edge runtime state to the server."""
 
         event = OrchestratorVoiceRuntimeStateEvent(
             state=state,
             detail=detail,
             follow_up_allowed=follow_up_allowed,
+            attention_state=attention_state,
+            interaction_intent_state=interaction_intent_state,
+            person_visible=person_visible,
+            interaction_ready=interaction_ready,
+            targeted_inference_blocked=targeted_inference_blocked,
+            recommended_channel=recommended_channel,
         )
         with self._state_lock:
             self._last_runtime_state = event
@@ -182,23 +198,9 @@ class EdgeVoiceOrchestrator:
         return normalized or None
 
     def supports_remote_follow_up(self) -> bool:
-        """Return whether the live gateway can keep continuation on the server.
+        """Return whether the live gateway owns follow-up on the same stream."""
 
-        Transcript-first `local_stt` sessions can safely hold `follow_up_open`
-        server-side because the same rolling transcript path can keep wake and
-        continuation decisions coherent. Backend-led rescue paths such as
-        `openwakeword` do better when Twinr reopens a bounded local follow-up
-        capture with an explicit beep instead of silently holding the server in
-        `follow_up_open`.
-        """
-
-        backend = self.ready_backend
-        if backend is not None:
-            return backend == "local_stt"
-        stage1_mode = str(
-            getattr(self.config, "voice_orchestrator_wake_stage1_mode", "backend") or "backend"
-        ).strip().lower()
-        return stage1_mode == "local_stt"
+        return True
 
     def _connect_client(self) -> None:
         self._client.open()
@@ -365,8 +367,8 @@ class EdgeVoiceOrchestrator:
             return
         if isinstance(event, OrchestratorVoiceWakeConfirmedEvent):
             self.emit(f"voice_orchestrator_wake_confirmed={event.matched_phrase or 'unknown'}")
-            self._on_wakeword_match(
-                WakewordMatch(
+            self._on_voice_activation(
+                VoiceActivationMatch(
                     detected=True,
                     transcript="",
                     matched_phrase=event.matched_phrase,
@@ -378,9 +380,12 @@ class EdgeVoiceOrchestrator:
                 )
             )
             return
-        if isinstance(event, OrchestratorVoiceFollowUpCaptureRequestedEvent):
-            self.emit("voice_orchestrator_follow_up_capture_requested=true")
-            self._on_follow_up_capture_requested()
+        if isinstance(event, OrchestratorVoiceTranscriptCommittedEvent):
+            self.emit(f"voice_orchestrator_transcript_committed={event.source}")
+            self._on_transcript_committed(event.transcript, event.source)
+            return
+        if isinstance(event, OrchestratorVoiceFollowUpClosedEvent):
+            self.emit(f"voice_orchestrator_follow_up_closed={event.reason}")
             return
         if isinstance(event, OrchestratorVoiceBargeInInterruptEvent):
             self.emit("voice_orchestrator_barge_in_interrupt=true")
@@ -413,6 +418,7 @@ class EdgeVoiceOrchestrator:
                 "-r",
                 str(self._sample_rate),
             ],
+            env=build_audio_subprocess_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,

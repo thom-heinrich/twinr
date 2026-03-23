@@ -8,6 +8,7 @@ owned_concerns:
   - Resolve canonical filesystem paths for ops artifacts, stores, self-tests, and support bundles
   - Persist sanitized operational events and provider usage telemetry as bounded JSONL stores
   - Sample config, device, and host health for Twinr's local web UI and support workflows, including ReSpeaker runtime, host-control readiness, and conservative direction/interruption facts
+  - Validate the Pi-side OpenAI env contract so acceptance probes can trust `/twinr/.env` directly
   - Run a dedicated rolling remote-memory watchdog that reuses Twinr's fail-closed readiness probe
   - Persist structured probe evidence and supervisor-seeded watchdog bootstrap snapshots for required-remote debugging
   - Ensure live Pi runtimes can start that watchdog as a separate companion process
@@ -91,6 +92,11 @@ files:
       - ConfigCheck
       - check_summary
       - run_config_checks
+  - path: openai_env_contract.py
+    role: Fail-closed validation of the Pi-side OpenAI `.env` contract used by acceptance probes
+    exports:
+      - OpenAIEnvContractStatus
+      - check_openai_env_contract
   - path: self_coding_pi.py
     role: Pi bootstrap for the pinned self-coding Codex bridge, CLI, auth sync, and remote self-test
   - path: pi_repo_mirror.py
@@ -143,6 +149,7 @@ public_api:
     - DeviceOverview
     - DeviceStatus
     - ConfigCheck
+    - OpenAIEnvContractStatus
     - ServiceHealth
     - SelfTestResult
     - RemoteMemoryWatchdog
@@ -159,6 +166,7 @@ public_api:
     - UsageRecord
     - UsageSummary
     - build_support_bundle
+    - check_openai_env_contract
     - check_summary
     - collect_device_overview
     - collect_system_health
@@ -193,3 +201,4 @@ tests:
   - path: test/test_web_app.py
   - path: test/test_main.py
   - path: test/test_display_service.py
+  - path: test/test_ops_openai_env_contract.py

@@ -746,6 +746,12 @@ class TwinrRealtimeBackgroundMixin:
         ).to_automation_facts()
         normalized_event_names = self._normalize_event_names((*normalized_event_names, *context_update.event_names))
         self._latest_sensor_observation_facts = merged_facts
+        refresh_voice_context = getattr(self, "_refresh_voice_orchestrator_sensor_context", None)
+        if callable(refresh_voice_context):
+            try:
+                refresh_voice_context()
+            except Exception as exc:
+                self._safe_emit(f"voice_orchestrator_context_refresh_failed={type(exc).__name__}")
 
         # AUDIT-FIX(#4): Never block on a full observation queue; drop the oldest entry and keep the newest live state.
         try:

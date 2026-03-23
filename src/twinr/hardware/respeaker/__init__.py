@@ -11,9 +11,16 @@ from twinr.hardware.respeaker.claim_contract import (
     build_respeaker_signal_claim_contract,
     claim_contract_to_payload,
 )
+from twinr.hardware.respeaker.companion import optional_respeaker_led_companion
 from twinr.hardware.respeaker.indicator_policy import (
     ReSpeakerIndicatorState,
     resolve_respeaker_indicator_state,
+)
+from twinr.hardware.respeaker.led_controller import ReSpeakerLedController
+from twinr.hardware.respeaker.led_loop import ReSpeakerLedLoop
+from twinr.hardware.respeaker.led_profiles import (
+    ReSpeakerLedProfile,
+    resolve_respeaker_led_profile,
 )
 from twinr.hardware.respeaker.models import (
     ReSpeakerCaptureDevice,
@@ -49,6 +56,7 @@ from twinr.hardware.respeaker.scheduled_provider import (
     ScheduledReSpeakerSignalProvider,
 )
 from twinr.hardware.respeaker.transport import ReSpeakerLibusbTransport
+from twinr.hardware.respeaker.write_specs import LED_COLOR_PARAMETER, LED_EFFECT_PARAMETER
 
 __all__ = [
     "AEC_AZIMUTH_VALUES_PARAMETER",
@@ -56,11 +64,16 @@ __all__ = [
     "AUDIO_MGR_SELECTED_AZIMUTHS_PARAMETER",
     "DEFAULT_RESPEAKER_PARAMETER_SPECS",
     "DOA_VALUE_PARAMETER",
+    "LED_COLOR_PARAMETER",
+    "LED_EFFECT_PARAMETER",
     "GPO_READ_VALUES_PARAMETER",
     "VERSION_PARAMETER",
     "ReSpeakerClaimMetadata",
     "ReSpeakerDerivedSignalState",
     "ReSpeakerCaptureDevice",
+    "ReSpeakerLedController",
+    "ReSpeakerLedLoop",
+    "ReSpeakerLedProfile",
     "ReSpeakerIndicatorState",
     "ReSpeakerDirectionSnapshot",
     "ReSpeakerLibusbTransport",
@@ -83,7 +96,9 @@ __all__ = [
     "claim_contract_to_payload",
     "config_targets_respeaker",
     "derive_respeaker_signal_state",
+    "optional_respeaker_led_companion",
     "probe_respeaker_xvf3800",
     "read_default_respeaker_parameters",
+    "resolve_respeaker_led_profile",
     "resolve_respeaker_indicator_state",
 ]

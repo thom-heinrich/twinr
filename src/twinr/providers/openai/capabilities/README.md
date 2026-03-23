@@ -14,8 +14,17 @@ responses, live search, speech, reminder phrasing, or printing.
 - printer-safe receipt composition and print-text sanitization
 
 Search prompt shaping keeps approximate default geography in structured
-`user_location` metadata, while free-text location hints are reserved for
-explicit user-provided target places.
+`user_location` metadata, preserves only bounded recent user/assistant search
+context, and now injects explicit caller-supplied place/date hints into the
+final search prompt as structured context so ASR-noisy or relative-date turns
+can still ground correctly without overriding a clearly different explicit
+topic. Responses-based web search also retries incomplete
+`max_output_tokens` stops through a bounded budget ladder so newer GPT-5 search
+models can finish cleanly instead of degrading into generic blank-answer
+errors. Successful search results now also retain the requested model,
+structured per-attempt metadata, and any concrete fallback reason so runtime
+callers can persist what actually happened when a search left its primary
+model.
 
 `capabilities` does **not** own:
 - low-level client construction, shared request builders, or base types in [`../core`](../core/README.md)

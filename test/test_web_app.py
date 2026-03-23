@@ -124,7 +124,7 @@ class WebAppTests(unittest.TestCase):
         personality_dir = root / "personality"
         personality_dir.mkdir(parents=True, exist_ok=True)
         env_lines = [
-            "OPENAI_MODEL=gpt-5.2",
+            "OPENAI_MODEL=gpt-5.4-mini",
             "OPENAI_API_KEY=sk-test-1234",
             "TWINR_WEB_HOST=0.0.0.0",
             "TWINR_WEB_PORT=1337",
@@ -156,7 +156,7 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("Twinr", response.text)
         self.assertIn("Dashboard", response.text)
         self.assertIn("Reminders", response.text)
-        self.assertIn("sk-t…1234", response.text)
+        self.assertIn("****1234", response.text)
         self.assertIn("Status and failures", response.text)
 
     def test_managed_web_auth_redirects_unauthenticated_requests_to_login(self) -> None:
@@ -1291,6 +1291,7 @@ class WebAppTests(unittest.TestCase):
             time_of_day="09:00",
             timezone_name="Europe/Berlin",
             actions=(AutomationAction(kind="say", text="Guten Morgen."),),
+            source="web_ui",
         )
 
         toggle_response = client.post(

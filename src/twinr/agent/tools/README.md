@@ -10,7 +10,7 @@ tool orchestration while leaving concrete handler modules internal.
 - expose the stable `twinr.agent.tools` import surface
 - route callers toward the correct child package for prompting, schemas, runtime, or handlers
 - preserve the package boundary that keeps concrete handlers off the public API
-- carry the canonical schema/instruction surface for reminder, automation, memory, and self-coding tools, including learned-skill activation and control
+- carry the canonical schema/instruction surface for reminder, automation, memory, guided user-discovery, and self-coding tools, including learned-skill activation and control
 - expose the route-aware first-word overlay builder used when the local semantic router short-circuits into `web`, `memory`, or `tool` handoffs
 
 `tools` does **not** own:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from twinr.agent.base_agent.runtime.automation import TwinrRuntimeAutomationMixin
 from twinr.agent.base_agent.runtime.base import TwinrRuntimeBase
 from twinr.agent.base_agent.runtime.context import TwinrRuntimeContextMixin
+from twinr.agent.base_agent.runtime.discovery import TwinrRuntimeDiscoveryMixin
 from twinr.agent.base_agent.runtime.flow import TwinrRuntimeFlowMixin
 from twinr.agent.base_agent.runtime.memory import TwinrRuntimeMemoryMixin
 from twinr.agent.base_agent.runtime.snapshot import TwinrRuntimeSnapshotMixin
@@ -13,6 +14,7 @@ from twinr.agent.base_agent.runtime.snapshot import TwinrRuntimeSnapshotMixin
 class TwinrRuntime(
     TwinrRuntimeFlowMixin,
     TwinrRuntimeContextMixin,
+    TwinrRuntimeDiscoveryMixin,
     TwinrRuntimeMemoryMixin,
     TwinrRuntimeAutomationMixin,
     TwinrRuntimeSnapshotMixin,

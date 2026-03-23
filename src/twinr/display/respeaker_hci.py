@@ -42,7 +42,7 @@ class DisplayReSpeakerHciState:
     non_speech_audio_likely: bool | None = None
     background_media_likely: bool | None = None
     resume_window_open: bool | None = None
-    wakeword_armed: bool | None = None
+    voice_activation_armed: bool | None = None
     initiative_block_reason: str | None = None
     speech_delivery_defer_reason: str | None = None
 
@@ -228,7 +228,7 @@ def parse_respeaker_hci_state(
         non_speech_audio_likely=_coerce_optional_bool(observation.get("non_speech_audio_likely")),
         background_media_likely=_coerce_optional_bool(observation.get("background_media_likely")),
         resume_window_open=_coerce_optional_bool(observation.get("resume_window_open")),
-        wakeword_armed=_coerce_optional_bool(observation.get("wakeword_armed")),
+        voice_activation_armed=_coerce_optional_bool(observation.get("voice_activation_armed")),
         initiative_block_reason=_normalize_text(observation.get("audio_initiative_block_reason")) or None,
         speech_delivery_defer_reason=_normalize_text(observation.get("audio_speech_delivery_defer_reason")) or None,
     )

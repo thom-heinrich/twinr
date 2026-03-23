@@ -14,6 +14,9 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
 - derive calm ReSpeaker HCI states such as `DFU`, `fehlt`, `stumm`, or room-audio blockers from authoritative ops events instead of parsing proactive payloads inline
 - derive the debug-log sections from persisted ops events, usage telemetry,
   host health, and the remote-memory watchdog artifact
+- surface generic realtime tool-call completion/failure events in the operator
+  `LLM Log`, including tool name, status, latency, and compact fallback/error
+  clues instead of requiring direct JSONL inspection
 - persist an authoritative display heartbeat so ops health and the runtime
   supervisor can detect a hung companion thread instead of trusting lock
   ownership alone
@@ -35,6 +38,10 @@ fallback backend, and the legacy Waveshare 4.2 V2 panel adapter.
 - allow optional external face-expression cues on HDMI so other Twinr
   capabilities can steer gaze, brows, mouth, or tiny head drift without
   coupling those semantics into the generic runtime snapshot schema
+- persist and load optional HDMI header debug signals so operator-only camera
+  and fusion states such as `MOTION_STILL`, `POSE_UPRIGHT`, or
+  `POSSIBLE_FALL` can appear in one bounded top-lane without leaking those
+  transient internals into the generic runtime snapshot schema
 - allow optional external HDMI emoji cues so other capabilities can claim the
   otherwise free right-hand reserve area with one real Unicode symbol such as
   `👍` or `👋` without pushing emoji-only semantics into the generic runtime
@@ -169,9 +176,10 @@ TWINR_DISPLAY_COMPANION_ENABLED=false
 ```
 
 The default HDMI surface is intentionally much calmer than the operator
-`debug_log` view: solid black background, a slim top bar with `TWINR` on the
-left, the live runtime state in the middle, and `TIME + SYSTEM` on the right,
-plus an animated white-on-black face on the left that mirrors the familiar
+`debug_log` view: solid black background, a three-line top header with
+`TWINR` on the left, the live runtime state in the middle, and `TIME + SYSTEM`
+on the right in the first row, plus two bounded operator-only perception rows
+underneath, and an animated white-on-black face on the left that mirrors the familiar
 e-paper eye/mouth language. The header state should mirror the real runtime
 state directly in uppercase, for example `WAITING`, `LISTENING`, `THINKING`,
 or `SPEAKING`, instead of restating generic readiness. The visible `SYSTEM`
@@ -182,18 +190,28 @@ deliberately claims it. That keeps the senior-facing screen glanceable from a
 distance while `debug_log` remains the explicit diagnostics layout for
 operators.
 
+For Pi debugging, that same HDMI header now reserves two wrapped signal rows
+underneath the main status line as one persistent extended view. Those rows
+remain file-backed, short-lived, and operator-only: they may show pills such
+as `LOOKING_CONFIRMED`, `LOOKING_PROXY`, `HAND_NEAR`, `PERSON_1`,
+`POSE_UPRIGHT`, `MOTION_STILL`, `ATTENTION_WINDOW`, or `POSSIBLE_FALL`, but
+they must stay bounded to two rows with overflow compaction instead of
+turning the senior-facing header into an operator dashboard.
+
 On larger HDMI outputs such as 1920x1080, the same rule still applies: do not
 let that free right-hand reserve turn into random chrome. Keep the content
-centered, preserve the slim header, and allow the face itself to scale up so
-the screen still reads as "face first, calm state header second" instead of
-turning into one giant empty status card.
+centered, preserve the face-first hierarchy, and allow the face itself to
+scale up so the screen still reads as "face first, calm state header second"
+instead of turning into one giant empty status card.
 
 On the real 800x480 HDMI surface, that same hierarchy must still read clearly
-even when the bottom news ticker is active: keep the top bar visibly slim and
-leave the right-hand reserve area free of status-card chrome so the live
-screen does not regress back toward the earlier cramped composition. When a
-capability does claim that reserve area, prefer one real emoji cue with a soft
-halo over dense text or extra chrome so the surface stays readable at a glance.
+with the current extended debugging view: keep the top header large enough to
+show the perception pills, suppress the visible bottom news ticker so that
+vertical budget goes into face and header clarity, and leave the right-hand
+reserve area free of status-card chrome so the live screen does not regress
+back toward the earlier cramped composition. When a capability does claim that
+reserve area, prefer one real emoji cue with a soft halo over dense text or
+extra chrome so the surface stays readable at a glance.
 Gesture acknowledgements should mirror clear symbols like `👍`, `👎`, `👋`,
 `✌️`, `👌`, or `👉` directly instead of inventing extra text, while still
 keeping face emotions in the face channel and not in emoji-only surrogates.
@@ -433,6 +451,10 @@ display loop never blocks on remote feed downloads, but the ticker now draws
 its sources from Twinr's persisted world-intelligence subscriptions instead of
 from a second static feed list.
 
+The current default HDMI extended view keeps that ticker runtime alive but
+suppresses the visible bottom bar. This is intentional while the top-of-screen
+perception header runs in its persistent three-line debugging mode.
+
 Configure it with:
 
 ```dotenv
@@ -456,11 +478,11 @@ first time it sees an otherwise empty source pool. After that, the shared
 world-intelligence pool remains the authoritative source.
 
 Behavior contract:
-- when disabled, the bottom ticker bar is omitted entirely
-- when enabled but cold, the bar shows `Loading headlines...`
-- when the last refresh failed and no cached items exist, the bar shows `Headlines unavailable.`
+- the ticker runtime remains asynchronous and cache-backed whether or not the visible bar is currently suppressed
+- the current default HDMI extended view omits the visible bottom ticker bar even when headline text is available
+- when that visible ticker bar is re-enabled later, a cold ticker should show `Loading headlines...`
+- when the last refresh failed and no cached items exist, a re-enabled ticker should show `Headlines unavailable.`
 - fullscreen HDMI presentations suppress the ticker while the focused surface owns the whole screen
-- when the ticker reduces vertical space too far, the right-hand status panel collapses into compact summary rows instead of letting card chrome overlap
 
 `service.py` also keeps display telemetry semantic now: `display_status=...`
 is emitted only when the user-meaningful display state changes, such as a real
@@ -537,8 +559,11 @@ TWINR_DISPLAY_LAYOUT=debug_log
 `debug_log` removes the face entirely and uses the full screen for grouped
 `System Log`, `LLM Log`, and `Hardware Log` sections sourced from Twinr's
 runtime snapshot, ops event store, usage store, host health snapshot, and
-remote ChonkyDB watchdog artifact. The legacy env value `debug_face` is kept
-as a compatibility alias and normalizes to `debug_log`.
+remote ChonkyDB watchdog artifact. Search turns surface their actual
+requested/actual model and compact output-budget trace there as well, so
+operators can see at a glance whether a live search stayed on the primary
+budget or escalated to the retry budget. The legacy env value `debug_face` is
+kept as a compatibility alias and normalizes to `debug_log`.
 
 ## See also
 

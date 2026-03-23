@@ -2,8 +2,8 @@
 
 `runtime` owns the canonical `TwinrRuntime` object for the base agent. It
 assembles focused mixins for lifecycle setup, state transitions, provider
-context, structured memory, reminders and automations, and runtime snapshot
-durability.
+context, structured memory, guided user-discovery, reminders and automations,
+and runtime snapshot durability.
 
 ## Responsibility
 
@@ -13,11 +13,13 @@ durability.
 - drive state transitions for listening, answering, printing, and failures
 - rearm follow-up listening directly from `answering` when a conversation stays open after a spoken reply
 - assemble provider-facing context, adaptive timing, and voice guidance
+- surface the currently visible reserve-lane card as bounded grounding context for supervisor/search lanes when the user is clearly reacting to what Twinr is showing, including a stronger per-turn authoritative overlay for fast supervisor decisions
 - keep the first-word lane on bounded local context so direct replies never block on remote long-term retrieval
 - keep the supervisor fast lane on the same remote-free path while still surfacing one local on-device memory summary
 - mediate on-device memory, durable memory, reminders, automations, and snapshots
+- expose the runtime-side guided user-discovery flow so Twinr can persist, review, correct, and delete high-value get-to-know-you facts across managed context, graph memory, and durable memory without bloating orchestration code
 - forward completed tool history into long-term-backed personality learning after a turn is finalized
-- keep the explicit best-effort `flush_long_term_memory()` API bounded to the caller's timeout while reserving the stricter remote-primary minimum only for durability-critical mutation paths
+- keep the explicit best-effort `flush_long_term_memory()` API bounded to the caller's timeout while reserving the stricter remote-primary minimum only for long-term object/graph/midterm durability paths, not already-attested prompt-context writes
 - expose runtime-side RSS/world-intelligence configuration so persistent feed subscriptions can shape Twinr's calm place/world awareness
 
 `runtime` does **not** own:
@@ -34,6 +36,8 @@ durability.
 | [base.py](./base.py) | Bootstrap services and shutdown |
 | [flow.py](./flow.py) | Drive turn and print flow |
 | [context.py](./context.py) | Build provider and timing context |
+| [discovery.py](./discovery.py) | Runtime bridge for the guided user-discovery service |
+| [display_grounding.py](./display_grounding.py) | Read the active reserve-lane cue and turn it into bounded provider-grounding messages plus an authoritative per-turn supervisor overlay |
 | [memory.py](./memory.py) | Mutate structured and durable memory |
 | [automation.py](./automation.py) | Manage reminders and automations |
 | [snapshot.py](./snapshot.py) | Persist and restore runtime state |

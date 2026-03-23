@@ -15,6 +15,7 @@ from typing import Protocol
 
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCue
 from twinr.display.contracts import DisplayStateFields
+from twinr.display.debug_signals import DisplayDebugSignal
 from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.display.face_cues import DisplayFaceCue
 from twinr.display.hdmi_ambient_moments import HdmiAmbientMoment, HdmiAmbientMomentDirector
@@ -29,6 +30,8 @@ from twinr.display.reserve_bus import DisplayReserveBusState, resolve_display_re
 
 _STATE_CARD_ORDER = ("Status", "Internet", "AI", "System", "Zeit", "Hinweis")
 _DETAIL_MAX_LINES = 3
+_DEFAULT_HEADER_SIGNAL_ROWS = 2
+_DEFAULT_SCENE_SHOW_TICKER = False
 
 
 class _HdmiSceneTools(Protocol):
@@ -73,13 +76,14 @@ class HdmiSceneCard:
 
 @dataclass(frozen=True, slots=True)
 class HdmiHeaderModel:
-    """Prepared content for the slim top HDMI status header."""
+    """Prepared content for the extended top HDMI status header."""
 
     brand: str
     state: str
     time_value: str
     system_value: str
     system_accent: tuple[int, int, int]
+    debug_signals: tuple[DisplayDebugSignal, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,7 +303,8 @@ class HdmiDefaultSceneRenderer:
         headline: str,
         helper_text: str,
         state_fields: DisplayStateFields,
-        animation_frame: int,
+        debug_signals: tuple[DisplayDebugSignal, ...] = (),
+        animation_frame: int = 0,
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
@@ -318,6 +323,7 @@ class HdmiDefaultSceneRenderer:
             ticker_text=ticker_text,
             helper_text=helper_text,
             state_fields=state_fields,
+            debug_signals=debug_signals,
             animation_frame=animation_frame,
             face_cue=face_cue,
             emoji_cue=emoji_cue,
@@ -368,7 +374,8 @@ class HdmiDefaultSceneRenderer:
         headline: str,
         helper_text: str,
         state_fields: DisplayStateFields,
-        animation_frame: int,
+        debug_signals: tuple[DisplayDebugSignal, ...] = (),
+        animation_frame: int = 0,
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
@@ -379,12 +386,13 @@ class HdmiDefaultSceneRenderer:
     ) -> HdmiDefaultScene:
         """Build the scene model so layout and content can evolve independently."""
 
-        ticker = self._build_ticker_model(ticker_text)
+        ticker = self._build_ticker_model(ticker_text) if _DEFAULT_SCENE_SHOW_TICKER else None
         layout = self._layout_for_size(
             width=width,
             height=height,
             reserve_ticker=ticker is not None,
             reserve_card_active=ambient_impulse_cue is not None and presentation_cue is None,
+            header_debug_signal_count=len(debug_signals),
         )
         presentation_graph = self._presentation_graph(
             cue=presentation_cue,
@@ -417,6 +425,7 @@ class HdmiDefaultSceneRenderer:
                 status=status,
                 headline=headline,
                 state_fields=state_fields,
+                debug_signals=debug_signals,
             ),
             panel=self._build_panel_model(reserve_bus=reserve_bus),
             ticker=None if presentation_graph is not None else ticker,
@@ -457,9 +466,12 @@ class HdmiDefaultSceneRenderer:
         height: int,
         reserve_ticker: bool,
         reserve_card_active: bool = False,
+        header_debug_signal_count: int = 0,
     ) -> HdmiDefaultSceneLayout:
+        del header_debug_signal_count
         if width < 560 or height < 320:
-            header_box = (12, 10, width - 12, 56)
+            header_bottom = 102
+            header_box = (12, 10, width - 12, header_bottom)
             if reserve_ticker:
                 ticker_box = (12, height - 54, width - 12, height - 12)
                 content_bottom = ticker_box[1] - 10
@@ -467,15 +479,16 @@ class HdmiDefaultSceneRenderer:
                 ticker_box = (12, height - 12, width - 12, height - 12)
                 content_bottom = height - 12
             face_box_width = max(94, min(126, int(width * 0.33)))
-            face_box = (18, 70, 18 + face_box_width, content_bottom)
-            panel_box = (face_box[2] + 14, 68, width - 18, content_bottom)
+            content_top = 110
+            face_box = (18, content_top, 18 + face_box_width, content_bottom)
+            panel_box = (face_box[2] + 14, content_top - 2, width - 18, content_bottom)
         else:
             content_left, content_right = self._content_frame_edges(width)
             content_width = content_right - content_left
             widescreen = width >= 1280
             compact_hdmi = not widescreen and width >= 720
-            header_bottom = 60 if widescreen else 58 if compact_hdmi else 66
-            content_top = 78 if widescreen else 76 if compact_hdmi else 86
+            header_bottom = 112 if widescreen else 108 if compact_hdmi else 118
+            content_top = 130 if widescreen else 126 if compact_hdmi else 136
             panel_gap = 34 if widescreen else 30 if compact_hdmi else 24
             if widescreen:
                 panel_width = (
@@ -548,6 +561,7 @@ class HdmiDefaultSceneRenderer:
         status: str,
         headline: str,
         state_fields: DisplayStateFields,
+        debug_signals: tuple[DisplayDebugSignal, ...] = (),
     ) -> HdmiHeaderModel:
         normalise_text = self.tools._normalise_text
         system_raw = state_field_value(normalise_text, state_fields, "System")
@@ -559,6 +573,7 @@ class HdmiDefaultSceneRenderer:
             time_value=time_value(state_fields),
             system_value=system_value,
             system_accent=(116, 242, 170) if system_value == "OK" else (255, 134, 110),
+            debug_signals=debug_signals,
         )
 
     def _build_panel_model(
@@ -632,16 +647,31 @@ class HdmiDefaultSceneRenderer:
     def _draw_twinr_header(self, draw: object, *, box: tuple[int, int, int, int], header: HdmiHeaderModel) -> None:
         left, top, right, bottom = box
         box_height = max(32, bottom - top)
-        header_font = self.tools._font(24 if box_height >= 50 else 18, bold=True)
-        state_font = self.tools._font(22 if box_height >= 50 else 17, bold=True)
-        time_font = self.tools._font(22 if box_height >= 50 else 16, bold=False)
-        system_label_font = self.tools._font(12 if box_height >= 50 else 10, bold=True)
-        system_value_font = self.tools._font(22 if box_height >= 50 else 18, bold=True)
-        label_y = top + max(4, (box_height - self.tools._text_height(draw, font=header_font)) // 2) - 1
-        state_y = top + max(4, (box_height - self.tools._text_height(draw, font=state_font)) // 2) - 1
-        time_y = top + max(4, (box_height - self.tools._text_height(draw, font=time_font)) // 2) - 1
-        system_label_y = top + max(4, (box_height - self.tools._text_height(draw, font=system_label_font)) // 2) - 2
-        system_value_y = top + max(4, (box_height - self.tools._text_height(draw, font=system_value_font)) // 2) - 1
+        main_row_height = box_height
+        debug_lane_top = bottom
+        debug_lane_bottom = bottom
+        signal_row_count = _DEFAULT_HEADER_SIGNAL_ROWS
+        if signal_row_count > 0:
+            signal_row_gap = 6
+            signal_lane_padding_bottom = 8
+            max_pill_height = 20 if box_height >= 84 else 18
+            signal_lane_height = max(
+                38,
+                (max_pill_height * signal_row_count) + (signal_row_gap * max(0, signal_row_count - 1)),
+            )
+            debug_lane_bottom = bottom - signal_lane_padding_bottom
+            debug_lane_top = max(top + 30, debug_lane_bottom - signal_lane_height)
+            main_row_height = max(32, debug_lane_top - top - 4)
+        header_font = self.tools._font(24 if main_row_height >= 50 else 18, bold=True)
+        state_font = self.tools._font(22 if main_row_height >= 50 else 17, bold=True)
+        time_font = self.tools._font(22 if main_row_height >= 50 else 16, bold=False)
+        system_label_font = self.tools._font(12 if main_row_height >= 50 else 10, bold=True)
+        system_value_font = self.tools._font(22 if main_row_height >= 50 else 18, bold=True)
+        label_y = top + max(4, (main_row_height - self.tools._text_height(draw, font=header_font)) // 2) - 1
+        state_y = top + max(4, (main_row_height - self.tools._text_height(draw, font=state_font)) // 2) - 1
+        time_y = top + max(4, (main_row_height - self.tools._text_height(draw, font=time_font)) // 2) - 1
+        system_label_y = top + max(4, (main_row_height - self.tools._text_height(draw, font=system_label_font)) // 2) - 2
+        system_value_y = top + max(4, (main_row_height - self.tools._text_height(draw, font=system_value_font)) // 2) - 1
 
         draw.rounded_rectangle(box, radius=20, fill=(0, 0, 0), outline=(255, 255, 255), width=2)
         draw.text((left + 20, label_y), header.brand, fill=(255, 255, 255), font=header_font)
@@ -660,17 +690,120 @@ class HdmiDefaultSceneRenderer:
 
         state_left = left + 20 + brand_width + 26
         state_right = system_x - 24
-        if state_right <= state_left:
+        if state_right > state_left:
+            state_text = self.tools._truncate_text(
+                draw,
+                header.state,
+                max_width=state_right - state_left,
+                font=state_font,
+            )
+            state_width = self.tools._text_width(draw, state_text, font=state_font)
+            state_x = state_left + max(0, ((state_right - state_left) - state_width) // 2)
+            draw.text((state_x, state_y), state_text, fill=(255, 255, 255), font=state_font)
+        if signal_row_count > 0:
+            self._draw_header_signal_lane(
+                draw,
+                left=left + 18,
+                top=debug_lane_top,
+                right=right - 18,
+                bottom=debug_lane_bottom,
+                signals=header.debug_signals,
+            )
+
+    def _draw_header_signal_lane(
+        self,
+        draw: object,
+        *,
+        left: int,
+        top: int,
+        right: int,
+        bottom: int,
+        signals: tuple[DisplayDebugSignal, ...],
+    ) -> None:
+        """Draw a bounded wrapped signal lane under the HDMI status header."""
+
+        if not signals or right <= left or bottom <= top:
             return
-        state_text = self.tools._truncate_text(
-            draw,
-            header.state,
-            max_width=state_right - state_left,
-            font=state_font,
+        font = self.tools._font(12 if (bottom - top) >= 18 else 10, bold=True)
+        text_height = self.tools._text_height(draw, font=font)
+        gap = 8
+        row_gap = 6
+        max_rows = _DEFAULT_HEADER_SIGNAL_ROWS
+        lane_height = max(0, bottom - top)
+        pill_height = max(
+            16,
+            min(
+                max(16, (lane_height - (row_gap * max(0, max_rows - 1))) // max_rows),
+                text_height + 8,
+            ),
         )
-        state_width = self.tools._text_width(draw, state_text, font=state_font)
-        state_x = state_left + max(0, ((state_right - state_left) - state_width) // 2)
-        draw.text((state_x, state_y), state_text, fill=(255, 255, 255), font=state_font)
+        total_rows_height = (pill_height * max_rows) + (row_gap * max(0, max_rows - 1))
+        y = top + max(0, (lane_height - total_rows_height) // 2)
+        gap = 8
+        overflow = 0
+        available_width = max(0, right - left)
+        rendered_rows: list[list[tuple[str, tuple[int, int, int], int]]] = [[]]
+        row_widths: list[int] = [0]
+        for index, signal in enumerate(signals):
+            label = self.tools._normalise_text(signal.label, fallback=signal.key.upper()).upper()
+            pill_width = self.tools._text_width(draw, label, font=font) + 18
+            required_width = pill_width if not rendered_rows[-1] else pill_width + gap
+            if row_widths[-1] + required_width <= available_width:
+                color = self._header_signal_color(signal.accent)
+                rendered_rows[-1].append((label, color, pill_width))
+                row_widths[-1] += required_width
+                continue
+            if len(rendered_rows) < max_rows:
+                color = self._header_signal_color(signal.accent)
+                rendered_rows.append([(label, color, pill_width)])
+                row_widths.append(pill_width)
+                continue
+            overflow = len(signals) - index
+            break
+        if overflow > 0:
+            overflow_width = 0
+            last_row = rendered_rows[-1]
+            while True:
+                overflow_label = f"+{overflow}"
+                overflow_width = self.tools._text_width(draw, overflow_label, font=font) + 18
+                required_width = overflow_width if not last_row else overflow_width + gap
+                if row_widths[-1] + required_width <= available_width:
+                    break
+                if not last_row:
+                    break
+                _removed_label, _removed_color, _removed_width = last_row.pop()
+                overflow += 1
+                row_widths[-1] = sum(item[2] for item in last_row) + (gap * max(0, len(last_row) - 1))
+            required_width = overflow_width if not last_row else overflow_width + gap
+            if row_widths[-1] + required_width <= available_width:
+                last_row.append((overflow_label, (214, 214, 214), overflow_width))
+                row_widths[-1] += required_width
+        for row_index, rendered_labels in enumerate(rendered_rows[:max_rows]):
+            x = left
+            row_y = y + (row_index * (pill_height + row_gap))
+            for label, color, pill_width in rendered_labels:
+                draw.rounded_rectangle(
+                    (x, row_y, x + pill_width, row_y + pill_height),
+                    radius=min(11, pill_height // 2),
+                    fill=(12, 12, 12),
+                    outline=color,
+                    width=2,
+                )
+                text_y = row_y + max(1, (pill_height - text_height) // 2) - 1
+                draw.text((x + 9, text_y), label, fill=color, font=font)
+                x += pill_width + gap
+
+    def _header_signal_color(self, accent: str) -> tuple[int, int, int]:
+        """Return the header-pill outline/text color for one signal accent."""
+
+        mapping = {
+            "neutral": (214, 214, 214),
+            "info": (114, 168, 255),
+            "success": (116, 242, 170),
+            "warning": (255, 196, 104),
+            "alert": (255, 134, 110),
+        }
+        return mapping.get(accent, (214, 214, 214))
 
     def _draw_emoji_reserve(
         self,

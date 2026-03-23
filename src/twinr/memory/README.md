@@ -10,6 +10,8 @@ subpackages.
 `memory` owns:
 - expose the canonical `twinr.memory` import surface
 - persist durable prompt memory, managed user/personality context, and reminders
+- persist the guided user-discovery state that powers Twinr's resumable onboarding and lifelong profile-learning flow
+- review, correct, and delete learned discovery facts while keeping managed-context and structured-memory commits synchronized
 - write local prompt-context snapshots world-readable (`0644`) so the dedicated remote-memory watchdog can validate them even when the productive runtime itself runs as `root`
 - overlap independent prompt/user/personality remote snapshot bootstrap reads so required-remote readiness is bounded by the slowest prompt-context snapshot instead of the sum of all three
 - provide shared full-text and query-normalization helpers reused by memory stores
@@ -29,6 +31,8 @@ subpackages.
 | [__init__.py](./__init__.py) | Public memory exports |
 | [context_store.py](./context_store.py) | Prompt and managed-context stores |
 | [reminders.py](./reminders.py) | Reminder persistence and rendering |
+| [user_discovery.py](./user_discovery.py) | Resumable guided onboarding and lifelong profile-learning state plus progression policy |
+| [user_discovery_policy.py](./user_discovery_policy.py) | Adaptive discovery topic scoring from reserve-lane engagement |
 | [query_normalization.py](./query_normalization.py) | Retrieval query rewrite cache |
 | [fulltext.py](./fulltext.py) | In-memory FTS selector |
 | [component.yaml](./component.yaml) | Structured package metadata |

@@ -222,11 +222,17 @@ class FusionTrackerTests(unittest.TestCase):
             audio_hints=AudioClassifierHints(cry_like_confidence=0.83),
         )
 
-        self.assertEqual([claim.state for claim in claims], ["cry_like_distress_possible"])
-        self.assertFalse(claims[0].delivery_allowed)
-        self.assertIn("multi_person_context", claims[0].blocked_by)
-        self.assertTrue(claims[0].review_recommended)
-        self.assertIsNotNone(claims[0].keyframe_review_plan)
+        states = [claim.state for claim in claims]
+        self.assertIn("distress_possible", states)
+        self.assertIn("cry_like_distress_possible", states)
+        distress_claim = next(claim for claim in claims if claim.state == "distress_possible")
+        cry_claim = next(claim for claim in claims if claim.state == "cry_like_distress_possible")
+        self.assertFalse(distress_claim.delivery_allowed)
+        self.assertFalse(cry_claim.delivery_allowed)
+        self.assertIn("multi_person_context", distress_claim.blocked_by)
+        self.assertIn("multi_person_context", cry_claim.blocked_by)
+        self.assertTrue(cry_claim.review_recommended)
+        self.assertIsNotNone(cry_claim.keyframe_review_plan)
 
     def test_blocks_shout_like_audio_when_background_media_is_active(self) -> None:
         tracker = MultimodalEventFusionTracker()
@@ -248,6 +254,49 @@ class FusionTrackerTests(unittest.TestCase):
         self.assertIn("background_media_active", claims[0].blocked_by)
         self.assertFalse(claims[0].review_recommended)
         self.assertIsNone(claims[0].keyframe_review_plan)
+
+    def test_emits_distress_possible_from_distress_audio_and_slumped_sequence(self) -> None:
+        tracker = MultimodalEventFusionTracker()
+
+        tracker.observe(
+            SocialObservation(
+                observed_at=1.0,
+                inspected=True,
+                vision=SocialVisionObservation(
+                    person_visible=True,
+                    person_count=1,
+                    body_pose=SocialBodyPose.SLUMPED,
+                    motion_state=SocialMotionState.STILL,
+                ),
+                audio=SocialAudioObservation(speech_detected=False),
+            )
+        )
+        claims = tracker.observe(
+            SocialObservation(
+                observed_at=4.5,
+                inspected=True,
+                vision=SocialVisionObservation(
+                    person_visible=True,
+                    person_count=1,
+                    body_pose=SocialBodyPose.SLUMPED,
+                    motion_state=SocialMotionState.STILL,
+                ),
+                audio=SocialAudioObservation(
+                    speech_detected=True,
+                    distress_detected=True,
+                ),
+            )
+        )
+
+        states = [claim.state for claim in claims]
+        self.assertIn("shout_like_audio", states)
+        self.assertIn("distress_possible", states)
+        distress_claim = next(claim for claim in claims if claim.state == "distress_possible")
+        self.assertTrue(distress_claim.delivery_allowed)
+        self.assertEqual(distress_claim.action_level, FusionActionLevel.REVIEW_ONLY)
+        self.assertTrue(distress_claim.review_recommended)
+        self.assertIn("shout_like_audio", distress_claim.supporting_audio_events)
+        self.assertIn("slumped_quiet", distress_claim.supporting_vision_events)
 
     def test_emits_laugh_like_positive_contact_with_single_person_context(self) -> None:
         tracker = MultimodalEventFusionTracker()

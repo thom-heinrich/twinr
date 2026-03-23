@@ -3,12 +3,14 @@ name: runtime
 path: src/twinr/agent/base_agent/runtime
 kind: python-package
 visibility: internal
-summary: Compose TwinrRuntime from focused mixins for lifecycle, flow, context, memory, automations, and snapshot durability.
+summary: Compose TwinrRuntime from focused mixins for lifecycle, flow, context, discovery, memory, automations, and snapshot durability.
 owned_concerns:
   - Assemble the canonical TwinrRuntime surface from focused runtime mixins
   - Bootstrap and shut down runtime-owned stores and background-capable services
   - Drive state-machine transitions for listening, answering, printing, and failures
   - Assemble provider-facing conversation context, adaptive timing, and voice guidance
+  - Surface the active reserve-lane card as bounded provider context and per-turn supervisor grounding overlays for display-grounded turns
+  - Bridge guided user-discovery actions into managed context, graph memory, and durable memory commits without widening workflow loops
   - Mediate on-device memory, durable memory, reminders, automations, and runtime snapshot persistence
   - Forward completed tool history into long-term-backed personality learning after turn finalization
   - Expose runtime-side RSS/world-intelligence configuration so persistent feed subscriptions can shape calm place/world awareness
@@ -38,6 +40,15 @@ files:
     role: Provider context, adaptive timing, voice state, and live config
     exports:
       - TwinrRuntimeContextMixin
+  - path: discovery.py
+    role: Guided user-discovery runtime bridge and commit callback wiring
+    exports:
+      - TwinrRuntimeDiscoveryMixin
+  - path: display_grounding.py
+    role: Build bounded provider and supervisor grounding overlays from the active reserve-lane card
+    exports:
+      - build_active_display_grounding_instruction_overlay
+      - build_active_display_grounding_message
   - path: memory.py
     role: Structured memory and durable-memory mutation helpers
     exports:
@@ -79,3 +90,4 @@ tests:
   - path: test/test_automations.py
   - path: test/test_reminders.py
   - path: test/test_proactive_monitor.py
+  - path: test/test_user_discovery.py

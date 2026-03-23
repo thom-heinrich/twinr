@@ -3,10 +3,11 @@ name: memory
 path: src/twinr/memory
 kind: python-package
 visibility: internal
-summary: Coordinate Twinr's memory package surface for short-term memory, prompt-context stores, reminders, shared retrieval helpers, ChonkyDB integration, and long-term memory subsystems.
+summary: Coordinate Twinr's memory package surface for short-term memory, prompt-context stores, reminders, guided user-discovery, shared retrieval helpers, ChonkyDB integration, and long-term memory subsystems.
 owned_concerns:
   - Expose the canonical `twinr.memory` import surface across short-term, durable, graph, and long-term memory primitives
   - Provide file-backed prompt-context, managed-context, and reminder stores used by runtime, prompt assembly, and web flows
+  - Persist guided user-discovery state, review/correction flows, and adaptive discovery topic policy for Twinr's lifelong profile learning
   - Provide shared retrieval helpers for bounded full-text selection and optional canonical query rewriting
   - Host the `on_device`, `chonkydb`, and `longterm` subpackages as the memory subsystem root
 out_of_scope:
@@ -90,6 +91,26 @@ files:
       - now_in_timezone
       - parse_due_at
       - resolve_timezone
+  - path: user_discovery.py
+    role: Guided onboarding, lifelong discovery state, fact review, and memory-routing service
+    exports:
+      - UserDiscoveryCommitCallbacks
+      - UserDiscoveryFact
+      - UserDiscoveryInvitation
+      - UserDiscoveryMemoryRoute
+      - UserDiscoveryResult
+      - UserDiscoveryReviewItem
+      - UserDiscoveryService
+      - UserDiscoveryState
+      - UserDiscoveryStoredFact
+      - UserDiscoveryTopicDefinition
+      - UserDiscoveryTopicState
+  - path: user_discovery_policy.py
+    role: Topic scoring and phrasing policy derived from reserve-lane engagement signals
+    exports:
+      - UserDiscoveryEngagementSignals
+      - UserDiscoveryPolicyEngine
+      - UserDiscoveryTopicPolicy
   - path: query_normalization.py
     role: Retrieval-query normalization and optional rewrite caching
     exports:
@@ -178,6 +199,7 @@ primary_callers:
 tests:
   - path: test/test_context_store.py
   - path: test/test_reminders.py
+  - path: test/test_user_discovery.py
   - path: test/test_longterm_memory.py
   - path: test/test_longterm_remote_state.py
   - path: test/test_state_machine.py

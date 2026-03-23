@@ -513,6 +513,8 @@ class SocialVisionObservation:
     primary_person_center_x: float | None = None
     primary_person_center_y: float | None = None
     looking_toward_device: bool = False
+    looking_signal_state: str | None = None
+    looking_signal_source: str | None = None
     person_near_device: bool | None = None
     engaged_with_device: bool | None = None
     visual_attention_score: float | None = None
@@ -936,12 +938,7 @@ class SocialTriggerEngine:
             ready,
             key=lambda item: (int(item.priority), item.score),
         )
-        self._last_triggered_at[selected.trigger_id] = now
-        if selected.trigger_id in {"possible_fall", "floor_stillness"}:
-            self._possible_fall_candidate_at = None
-            self._possible_fall_loss_candidate_at = None
-            self._possible_fall_loss_pose = SocialBodyPose.UNKNOWN
-            self._possible_fall_loss_visible_duration_s = None
+        self.note_trigger_dispatched(selected.trigger_id, observed_at=now)
         return SocialTriggerDecision(
             trigger_id=selected.trigger_id,
             prompt=selected.prompt,
@@ -952,6 +949,27 @@ class SocialTriggerEngine:
             threshold=selected.threshold,
             evidence=selected.evidence,
         )
+
+    def note_trigger_dispatched(self, trigger_id: str, *, observed_at: float) -> None:
+        """Record that one trigger was dispatched outside normal selection flow.
+
+        Runtime-side fusion can legitimately choose a fused safety trigger
+        instead of the engine's own decision while still depending on the
+        engine for cooldowns and fall-transition state. This hook keeps those
+        internal guards aligned without forcing runtime code to mutate private
+        engine state directly.
+        """
+
+        trigger_key = _coerce_bounded_text(trigger_id, max_length=64)
+        observed_at_value = _coerce_timestamp(observed_at)
+        if trigger_key is None or observed_at_value is None:
+            return
+        self._last_triggered_at[trigger_key] = observed_at_value
+        if trigger_key in {"possible_fall", "floor_stillness"}:
+            self._possible_fall_candidate_at = None
+            self._possible_fall_loss_candidate_at = None
+            self._possible_fall_loss_pose = SocialBodyPose.UNKNOWN
+            self._possible_fall_loss_visible_duration_s = None
 
     def _candidate_person_returned(
         self,

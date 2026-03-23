@@ -32,6 +32,7 @@ and snapshot commits through remote-primary state.
 - provider-specific prompt copy or wording
 - memory, reminder, automation, or graph persistence implementations
 - foreground runtime loop decisions about which dynamic sections belong to tool, supervisor, or main turns
+- the fast supervisor lane's final prompt selection and routing policy
 
 ## Key files
 
@@ -119,6 +120,7 @@ The current signal taxonomy is intentionally structured and conservative:
 - when sustained user interest and Twinr's own feed coverage line up, the system now also tracks bounded `co-attention` so some themes can become genuine shared running threads rather than isolated prompt hints
 - `steering.py` turns that same state into authoritative turn guidance inside `PERSONALITY`, serializes compact machine-readable cues for the closure evaluator, and resolves matched topics back into concrete runtime follow-up behavior without turning `MINDSHARE` itself into instruction authority
 - steering cues should stay semantically narrow: if a durable signal already says a topic is local/regional and region-scoped, the cue title may carry that regional anchor so closure matching does not confuse nearby community topics with public-policy threads
+- the fast supervisor lane should consume only a lean subset of this package: stable character/style may flow there, but volatile layers such as `MINDSHARE`, `CONTINUITY`, `PLACE`, `WORLD`, and `REFLECTION` must stay out so noisy search routing does not get semantically dragged by ambient state
 
 ## See also
 

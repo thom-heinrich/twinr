@@ -297,7 +297,7 @@ class TwinrRuntimeMemoryMixin:
         summary: str,
         details: str | None = None,
     ) -> PersistentMemoryEntry:
-        """Write an explicit durable memory entry and flush it."""
+        """Write an explicit durable memory entry through the prompt-context store."""
 
         kind = self._normalize_required_text("kind", kind)  # AUDIT-FIX(#7)
         summary = self._normalize_required_text("summary", summary)  # AUDIT-FIX(#7)
@@ -309,7 +309,19 @@ class TwinrRuntimeMemoryMixin:
                 summary=summary,
                 details=details,
             )
-            self._flush_long_term_memory_strict(operation="store_durable_memory")  # AUDIT-FIX(#2)
+        return entry
+
+    def delete_durable_memory_entry(
+        self,
+        *,
+        entry_id: str,
+    ) -> PersistentMemoryEntry | None:
+        """Delete one explicit durable-memory entry through the prompt-context store."""
+
+        entry_id = self._normalize_required_text("entry_id", entry_id)  # AUDIT-FIX(#7)
+
+        with self._memory_runtime_lock():  # AUDIT-FIX(#2/#9)
+            entry = self.long_term_memory.delete_explicit_memory(entry_id=entry_id)
         return entry
 
     def update_user_profile_context(
@@ -318,7 +330,7 @@ class TwinrRuntimeMemoryMixin:
         category: str,
         instruction: str,
     ) -> ManagedContextEntry:
-        """Update managed user-profile context and flush it durably."""
+        """Update managed user-profile context through the prompt-context store."""
 
         category = self._normalize_required_text("category", category)  # AUDIT-FIX(#7)
         instruction = self._normalize_required_text("instruction", instruction)  # AUDIT-FIX(#7)
@@ -328,7 +340,19 @@ class TwinrRuntimeMemoryMixin:
                 category=category,
                 instruction=instruction,
             )
-            self._flush_long_term_memory_strict(operation="update_user_profile_context")  # AUDIT-FIX(#2)
+        return entry
+
+    def remove_user_profile_context(
+        self,
+        *,
+        category: str,
+    ) -> ManagedContextEntry | None:
+        """Delete one managed user-profile instruction through the prompt-context store."""
+
+        category = self._normalize_required_text("category", category)  # AUDIT-FIX(#7)
+
+        with self._memory_runtime_lock():  # AUDIT-FIX(#2/#9)
+            entry = self.long_term_memory.remove_user_profile(category=category)
         return entry
 
     def update_personality_context(
@@ -337,7 +361,7 @@ class TwinrRuntimeMemoryMixin:
         category: str,
         instruction: str,
     ) -> ManagedContextEntry:
-        """Update managed personality context and flush it durably."""
+        """Update managed personality context through the prompt-context store."""
 
         category = self._normalize_required_text("category", category)  # AUDIT-FIX(#7)
         instruction = self._normalize_required_text("instruction", instruction)  # AUDIT-FIX(#7)
@@ -347,7 +371,19 @@ class TwinrRuntimeMemoryMixin:
                 category=category,
                 instruction=instruction,
             )
-            self._flush_long_term_memory_strict(operation="update_personality_context")  # AUDIT-FIX(#2)
+        return entry
+
+    def remove_personality_context(
+        self,
+        *,
+        category: str,
+    ) -> ManagedContextEntry | None:
+        """Delete one managed personality instruction through the prompt-context store."""
+
+        category = self._normalize_required_text("category", category)  # AUDIT-FIX(#7)
+
+        with self._memory_runtime_lock():  # AUDIT-FIX(#2/#9)
+            entry = self.long_term_memory.remove_personality(category=category)
         return entry
 
     def configure_world_intelligence(
@@ -633,6 +669,50 @@ class TwinrRuntimeMemoryMixin:
                         "edge_type": compact_text(edge_type),
                     },
                 )
+        return result
+
+    def delete_contact(
+        self,
+        *,
+        node_id: str,
+    ):
+        """Delete one contact from graph memory."""
+
+        node_id = self._normalize_required_text("node_id", node_id)  # AUDIT-FIX(#7)
+
+        with self._memory_runtime_lock():  # AUDIT-FIX(#1/#4/#9)
+            result = self.graph_memory.delete_contact(node_id=node_id)
+            self._persist_snapshot_or_raise(operation="delete_contact")  # AUDIT-FIX(#1)
+        return result
+
+    def delete_preference(
+        self,
+        *,
+        node_id: str,
+        edge_type: str | None = None,
+    ):
+        """Delete one preference from graph memory."""
+
+        node_id = self._normalize_required_text("node_id", node_id)  # AUDIT-FIX(#7)
+        edge_type = self._normalize_optional_text("edge_type", edge_type)  # AUDIT-FIX(#7)
+
+        with self._memory_runtime_lock():  # AUDIT-FIX(#1/#4/#9)
+            result = self.graph_memory.delete_preference(node_id=node_id, edge_type=edge_type)
+            self._persist_snapshot_or_raise(operation="delete_preference")  # AUDIT-FIX(#1)
+        return result
+
+    def delete_plan(
+        self,
+        *,
+        node_id: str,
+    ):
+        """Delete one future plan from graph memory."""
+
+        node_id = self._normalize_required_text("node_id", node_id)  # AUDIT-FIX(#7)
+
+        with self._memory_runtime_lock():  # AUDIT-FIX(#1/#4/#9)
+            result = self.graph_memory.delete_plan(node_id=node_id)
+            self._persist_snapshot_or_raise(operation="delete_plan")  # AUDIT-FIX(#1)
         return result
 
     def select_long_term_memory_conflicts(

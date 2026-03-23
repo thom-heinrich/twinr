@@ -10,7 +10,7 @@ Twinr currently starts with an OpenAI-first backend slice for:
 ## Recommended `.env` settings
 
 ```dotenv
-OPENAI_MODEL=gpt-5.2
+OPENAI_MODEL=gpt-5.4-mini
 OPENAI_REASONING_EFFORT=medium
 OPENAI_STT_MODEL=whisper-1
 OPENAI_TTS_MODEL=gpt-4o-mini-tts
@@ -42,6 +42,8 @@ TWINR_VISION_REFERENCE_IMAGE=/home/thh/reference-user.jpg
 ```
 
 `OPENAI_SEND_PROJECT_HEADER=false` is recommended when the API key is already project-scoped (`sk-proj-...`). In that setup, sending an additional explicit project header can break audio requests even when LLM access works.
+
+`OPENAI_MODEL` is Twinr's central non-coding text model. Search, supervisor routing, first-word replies, conversation closure, long-term-memory text compilation, and display reserve generation inherit it unless you set a dedicated override. Audio-specialized paths remain separate on purpose: `OPENAI_STT_MODEL`, `OPENAI_TTS_MODEL`, `OPENAI_REALTIME_MODEL`, `OPENAI_REALTIME_TRANSCRIPTION_MODEL`, and `TWINR_STREAMING_TRANSCRIPT_VERIFIER_MODEL`.
 
 ## Python entry points
 

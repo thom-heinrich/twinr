@@ -264,6 +264,10 @@ def _visible_person_from_face_row(
         box=box,
         zone=_zone_from_center(box.center_x),
         confidence=max(0.0, min(1.0, score)),
+        attention_hint_score=_attention_hint_score_from_face_row(
+            row,
+            frame_width=frame_width,
+        ),
     )
 
 
@@ -310,6 +314,72 @@ def _attention_enriched_person(
         box=face_person.box,
         zone=face_person.zone,
         confidence=max(existing.confidence, face_person.confidence),
+        attention_hint_score=face_person.attention_hint_score,
+    )
+
+
+def _attention_hint_score_from_face_row(
+    row: Sequence[object],
+    *,
+    frame_width: int,
+) -> float | None:
+    """Derive one fast head-orientation hint from YuNet face landmarks.
+
+    YuNet returns eye, nose, and mouth landmarks together with the face box.
+    Those landmarks are cheap enough to use on every HDMI refresh and give a
+    much better proxy for "looking toward Twinr" than raw face-detection
+    confidence or body-box centering alone. The score stays frontal-friendly
+    near the optical axis but also rewards off-axis faces whose yaw points back
+    toward the device, which is the normal geometry when somebody sits to the
+    left or right of the camera and still looks directly at Twinr.
+    """
+
+    if frame_width <= 0 or len(row) < 15:
+        return None
+    try:
+        box_x = float(row[0]) / frame_width
+        box_width = float(row[2]) / frame_width
+        right_eye_x = float(row[4]) / frame_width
+        left_eye_x = float(row[6]) / frame_width
+        nose_x = float(row[8]) / frame_width
+        mouth_right_x = float(row[10]) / frame_width
+        mouth_left_x = float(row[12]) / frame_width
+    except (TypeError, ValueError):
+        return None
+    values = (box_x, box_width, right_eye_x, left_eye_x, nose_x, mouth_right_x, mouth_left_x)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    face_center_x = box_x + (box_width / 2.0)
+    eye_center_x = (left_eye_x + right_eye_x) / 2.0
+    mouth_center_x = (mouth_left_x + mouth_right_x) / 2.0
+    eye_span = abs(right_eye_x - left_eye_x)
+    mouth_span = abs(mouth_left_x - mouth_right_x)
+    if eye_span < 0.01 or mouth_span < 0.01:
+        return None
+    nose_eye_alignment = max(0.0, 1.0 - abs(nose_x - eye_center_x) / eye_span)
+    nose_mouth_alignment = max(0.0, 1.0 - abs(nose_x - mouth_center_x) / eye_span)
+    eye_left_distance = abs(nose_x - right_eye_x)
+    eye_right_distance = abs(left_eye_x - nose_x)
+    mouth_left_distance = abs(nose_x - mouth_right_x)
+    mouth_right_distance = abs(mouth_left_x - nose_x)
+    eye_balance = max(0.0, 1.0 - abs(eye_left_distance - eye_right_distance) / eye_span)
+    mouth_balance = max(0.0, 1.0 - abs(mouth_left_distance - mouth_right_distance) / mouth_span)
+    center_alignment = (nose_eye_alignment * 0.7) + (nose_mouth_alignment * 0.3)
+    symmetry_alignment = (eye_balance * 0.7) + (mouth_balance * 0.3)
+    frontal_alignment = (center_alignment * 0.35) + (symmetry_alignment * 0.65)
+
+    frame_offset = max(-1.0, min(1.0, (face_center_x - 0.5) / 0.5))
+    off_axis_weight = min(0.85, abs(frame_offset))
+    expected_centering_shift = -frame_offset * 0.45
+    eye_shift = max(-1.0, min(1.0, (nose_x - eye_center_x) / eye_span))
+    mouth_shift = max(-1.0, min(1.0, (nose_x - mouth_center_x) / eye_span))
+    eye_centering = max(0.0, 1.0 - abs(eye_shift - expected_centering_shift) / 0.55)
+    mouth_centering = max(0.0, 1.0 - abs(mouth_shift - expected_centering_shift) / 0.55)
+    center_seeking_alignment = (eye_centering * 0.7) + (mouth_centering * 0.3)
+    return round(
+        (frontal_alignment * (1.0 - off_axis_weight))
+        + (center_seeking_alignment * off_axis_weight),
+        3,
     )
 
 

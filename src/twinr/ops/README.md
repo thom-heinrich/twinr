@@ -13,6 +13,7 @@ tools.
 - resolve canonical paths for ops artifacts and stores
 - persist sanitized ops events and usage telemetry
 - collect config, device, and system-health snapshots
+- validate the Pi-side OpenAI env contract for acceptance scripts so `/twinr/.env` can be trusted directly for provider probes without one-off shell injection
 - run a dedicated rolling ChonkyDB remote-memory watchdog
 - persist structured remote-readiness probe evidence and supervisor-seeded watchdog bootstrap snapshots so restart phases do not look like dead/stale watchdog failures
 - run strict bootstrap/recovery remote probes once, then reuse a cheaper steady-state keepalive that proves current remote readability without reseeding every snapshot on every tick
@@ -54,6 +55,7 @@ tools.
 | [events.py](./events.py) | Ops event JSONL store |
 | [usage.py](./usage.py) | Usage telemetry store |
 | [checks.py](./checks.py) | Config audit checks |
+| [openai_env_contract.py](./openai_env_contract.py) | Fail-closed validation for the Pi-side OpenAI `.env` contract used by acceptance probes |
 | [health.py](./health.py) | Host and service health, including display-companion assessment via the shared display heartbeat contract |
 | [remote_memory_watchdog.py](./remote_memory_watchdog.py) | Continuous fail-closed ChonkyDB readiness watchdog plus structured probe/bootstrap artifacts |
 | [remote_memory_watchdog_companion.py](./remote_memory_watchdog_companion.py) | Start the external watchdog process for live Pi loops when needed |
@@ -103,6 +105,13 @@ watchdog.run(duration_s=5.0)
 ```
 
 ```python
+from twinr.ops import check_openai_env_contract
+
+status = check_openai_env_contract("/twinr/.env")
+assert status.ok, status.detail
+```
+
+```python
 from twinr.ops.runtime_supervisor import TwinrRuntimeSupervisor
 
 supervisor = TwinrRuntimeSupervisor(config=config, env_file="/twinr/.env")
@@ -117,6 +126,7 @@ PYTHONPATH=src python3 -m twinr.ops.remote_memory_watchdog_soak --project-root /
 python3 hardware/ops/watch_pi_repo_mirror.py --once
 python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5
 python3 hardware/ops/watch_pi_repo_mirror.py --interval-s 5 --metadata-only
+python3 hardware/ops/check_pi_openai_env_contract.py --env-file /twinr/.env
 python3 hardware/ops/bootstrap_self_coding_pi.py
 PYTHONPATH=src python3 -m twinr --env-file .env --self-coding-codex-self-test --self-coding-live-auth-check
 PYTHONPATH=src python3 -m twinr --env-file .env --long-term-memory-live-acceptance

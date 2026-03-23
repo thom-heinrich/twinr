@@ -17,6 +17,9 @@ from twinr.agent.base_agent.contracts import (
 )
 from twinr.agent.base_agent.conversation.turn_controller import _normalize_turn_text
 from twinr.agent.tools import DualLaneToolLoop
+from twinr.agent.workflows.streaming_supervisor_context import (
+    build_streaming_supervisor_turn_instructions,
+)
 
 
 class StreamingSpeculationController:
@@ -225,7 +228,7 @@ class StreamingSpeculationController:
                 details={"text_len": len(cleaned)},
             ):
                 supervisor_conversation = loop.runtime.supervisor_provider_conversation_context()
-            supervisor_instructions = loop.streaming_turn_loop.supervisor_instructions
+            supervisor_instructions = build_streaming_supervisor_turn_instructions(loop.config)
         loop._trace_event(
             "speculative_supervisor_worker_started",
             kind="queue",

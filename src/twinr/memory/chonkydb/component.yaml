@@ -9,6 +9,7 @@ owned_concerns:
   - Define typed request and response models for ChonkyDB record, retrieve, and graph endpoints
   - Expose one-shot top-k retrieval contracts that return structured remote payloads in a single call
   - Define the canonical Twinr personal-graph schema and the on-device graph store
+  - Support add and delete operations for graph-backed contacts, preferences, and plans
   - Build prompt-context and subtext payloads from persisted graph memory
 out_of_scope:
   - ChonkyDB server implementation, deployment, or upstream API design

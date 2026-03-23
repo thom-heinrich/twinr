@@ -216,7 +216,8 @@ class DisplayReserveCompanionFlowTests(unittest.TestCase):
                     max_items=5,
                 )
 
-        topic_keys = [candidate.topic_key for candidate in candidates]
+        filtered_candidates = [candidate for candidate in candidates if candidate.source != "user_discovery"]
+        topic_keys = [candidate.topic_key for candidate in filtered_candidates]
         self.assertEqual(topic_keys[0], "ai companions")
         self.assertIn("thread:person:janina", topic_keys)
         self.assertIn("morning coffee", topic_keys)
@@ -295,6 +296,34 @@ class DisplayReserveCompanionFlowTests(unittest.TestCase):
         self.assertIn("agentic ai", topic_keys)
         self.assertIn("peace and diplomacy", topic_keys)
         self.assertGreaterEqual(len(candidates), 5)
+
+    def test_flow_includes_user_discovery_candidate_when_setup_is_due(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir, display_reserve_bus_candidate_limit=8)
+            now = datetime(2026, 3, 22, 18, 0, tzinfo=timezone.utc)
+            fake_memory = _FakeMemoryService()
+            flow = DisplayReserveCompanionFlow(
+                personality_service=_FakePersonalityService(),
+                world_store=_FakeWorldStore(),
+                copy_generator=_NoopCopyGenerator(),
+            )
+
+            with patch(
+                "twinr.proactive.runtime.display_reserve_flow.build_ambient_display_impulse_candidates",
+                return_value=(),
+            ), patch(
+                "twinr.proactive.runtime.display_reserve_flow.LongTermMemoryService.from_config",
+                return_value=fake_memory,
+            ):
+                candidates = flow.load_candidates(
+                    config,
+                    local_now=now,
+                    max_items=3,
+                )
+
+        discovery_candidate = next(candidate for candidate in candidates if candidate.source == "user_discovery")
+        self.assertEqual(discovery_candidate.candidate_family, "user_discovery")
+        self.assertIn("Hast du 15 Minuten", discovery_candidate.headline)
 
 
 if __name__ == "__main__":

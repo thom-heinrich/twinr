@@ -50,7 +50,12 @@ def _validate_instruction(name: str, value: str) -> str:
 
 
 # AUDIT-FIX(#4): Support backward-compatible optional .env overrides while preserving deterministic order and deduplicating entries.
-def _load_identifier_tuple(env_name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+def _load_identifier_tuple(
+    env_name: str,
+    default: tuple[str, ...],
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
     """Load a deterministic tuple of validated identifiers from the environment."""
 
     raw = os.getenv(env_name)
@@ -62,7 +67,7 @@ def _load_identifier_tuple(env_name: str, default: tuple[str, ...]) -> tuple[str
             if candidate.strip()
         )
     )
-    if not validated:
+    if not validated and not allow_empty:
         raise ValueError(f"{env_name} must contain at least one identifier")
     return validated
 
@@ -142,6 +147,8 @@ _SEARCH_AGENT_INSTRUCTIONS_DEFAULT: Final[str] = (
     "Keep the answer easy for a senior user to understand. "
     "Use plain text only, with no markdown, tables, or bullet lists. "
     "Interpret the user's request semantically, not as a title or brand keyword match. "
+    "When explicit structured place or date context is supplied with the request, treat that context as authoritative disambiguation for partial wording, deictic follow-ups, or likely ASR noise, but do not let it override a clearly different explicit topic. "
+    "If system context describes a currently visible Twinr display topic and the user is clearly reacting to that display, prefer that displayed topic wording over a malformed near-match from ASR or a partial transcript token. "
     "If the request asks for a current-information category such as news, weather, traffic, prices, or opening hours, answer that category instead of latching onto a source whose title merely contains the same words. "
     "If a broad news request does not specify a place, prefer major national or international headlines over a single inferred local-city bulletin. "
     "Prefer concrete facts, names, phone numbers, times, weather values, and exact dates when available from recent and reliable sources. "
@@ -227,10 +234,11 @@ TTS_MODEL_FALLBACKS = _load_identifier_tuple(
     ("tts-1", "tts-1-hd"),
 )
 
-# AUDIT-FIX(#4): Validate search-model fallback IDs early and keep ordering deterministic for retry logic.
+# AUDIT-FIX(#4): Search should follow the central main model by default; env overrides may add explicit recovery models when needed.
 SEARCH_MODEL_FALLBACKS = _load_identifier_tuple(
     "TWINR_SEARCH_MODEL_FALLBACKS",
-    ("gpt-4o-mini", "gpt-5.2-chat-latest"),
+    (),
+    allow_empty=True,
 )
 
 # AUDIT-FIX(#6): Freeze the legacy voice collection to prevent accidental cross-request mutation in the shared process.

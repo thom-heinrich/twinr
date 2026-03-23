@@ -271,7 +271,7 @@ class DualLaneToolLoop:
             decision = self.supervisor_decision_provider.decide(
                 prompt,
                 conversation=conversation,
-                instructions=self.supervisor_instructions,
+                instructions=merge_instructions(self.supervisor_instructions, instructions),
             )
             _raise_if_should_stop(should_stop, context="supervisor_decision_provider_return")
             if not _supervisor_decision_has_required_user_reply(decision):

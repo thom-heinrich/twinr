@@ -1,0 +1,15 @@
+[Unit]
+Description=Twinr Voice Gateway LAN Bridge to local orchestrator server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/env bash -lc 'ss -ltn sport = :8798 | grep -q "127.0.0.1:8798\\|0.0.0.0:8798"'
+ExecStart=/usr/bin/socat TCP-LISTEN:8797,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:8798
+Restart=always
+RestartSec=1
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

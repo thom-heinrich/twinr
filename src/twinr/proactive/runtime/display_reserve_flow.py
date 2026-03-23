@@ -35,6 +35,7 @@ from .display_reserve_learning import (
 )
 from .display_reserve_memory import load_display_reserve_memory_candidates
 from .display_reserve_reflection import load_display_reserve_reflection_candidates
+from .display_reserve_user_discovery import load_display_reserve_user_discovery_candidates
 from .display_reserve_world import load_display_reserve_world_candidates
 
 
@@ -109,6 +110,13 @@ class DisplayReserveCompanionFlow:
                 subscriptions=world_subscriptions,
                 state=world_state,
                 max_items=max(limited_max, 8),
+            )
+        )
+        candidates.extend(
+            load_display_reserve_user_discovery_candidates(
+                config,
+                local_now=local_now,
+                max_items=1,
             )
         )
         memory_candidates = load_display_reserve_memory_candidates(

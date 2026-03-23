@@ -25,6 +25,7 @@ owned_concerns:
   - Derive a bounded continuous visible-person target from multi-person camera anchors, motion recency, short-horizon prediction, conservative audio-to-vision speaker handoff, and short stale-track bridging across brief detector misses
   - Derive a bounded multimodal attention-target surface from camera anchor, visible-person tracks, speaker association, showing-intent cues, and short-lived session focus memory, with speaker and last-motion priority preserved in multi-person scenes
   - Drive calm HDMI face attention-follow cues from the current relevant-person anchor without teaching the generic runtime snapshot schema about gaze-follow behavior, while mirroring camera-space anchors into user-facing gaze, adding small near-center head turns before full side gaze commits, reserving stronger up/down body-language poses for explicit semantic cues, and renewing or briefly holding matching cues before they expire or disappear on short camera dropouts
+  - Publish bounded HDMI header debug pills from current camera facts plus brief event/trigger holds so Pi debugging can inspect camera and fusion state without widening the generic runtime snapshot schema
   - Fan that same conservative attention target out to an optional bounded body-follow servo so physical turning reuses the HDMI attention policy instead of inventing a second targeting path
   - Persist a bounded continuous HDMI attention debug stream with per-refresh outcome codes, stage timings, and camera/target/cue state so transient eye-follow dropouts leave first-run evidence
   - Keep a dedicated live-gesture acknowledgement lane separate from the broader social camera-surface path so user-facing symbol latency does not regress eye-follow or depend on full proactive observation cadence
@@ -34,6 +35,7 @@ owned_concerns:
   - Publish sparse personality-driven HDMI reserve impulses only when quiet-hours, cadence, presence, and reserve-surface ownership all allow it
   - Blend right-lane ambient companion candidates from personality, durable memory hooks, slower reflection summaries, and long-horizon shown-card outcome learning through one modular orchestration path
   - Blend reserve-lane candidates from personality state plus durable memory follow-up and clarification hooks so ambient prompts can also strengthen Twinr's long-term memory
+  - Publish guided user-discovery start, resume, and short profile-review invitations into the same reserve lane so lifelong profile learning stays visible without a second profile UI
   - Derive direct reserve-lane world candidates from active RSS subscriptions and condensed awareness threads so seeded world breadth still reaches the right-hand lane when other sources are temporarily sparse
   - Rewrite reserve-lane wording through one bounded structured LLM pass at plan-build time so the visible text can reflect Twinr's current personality and structured shared-thread or memory-follow-up context without templated phrasing
   - Record shown reserve cards into a bounded exposure history so later learning code can tell which visual prompts were actually seen before it scores user reactions
@@ -45,6 +47,7 @@ owned_concerns:
   - Retry exact transient GPIO busy overlaps for PIR startup over a short bounded handover window so runtime restarts do not flap into error while a previous Twinr process is still releasing GPIO17
   - Pause and resume the streaming wakeword capture path around accepted hands-free turns so exclusive ALSA conversation capture can reuse the same microphone device safely
   - Export normalized observation facts and ops telemetry from runtime monitoring
+  - Route short-window multimodal event-fusion safety claims into the active runtime trigger path while preserving engine cooldowns, visibility-loss fallback, and downstream review/suppression policy
   - Export structured ReSpeaker audio-policy facts plus presence-session metadata for bounded automation and long-term memory ingestion
   - Wrap targeted ReSpeaker XVF3800 audio paths with direct signal facts plus readable-frame startup/runtime blocking when capture dies
   - Require sustained bounded readable-frame success before a targeted ReSpeaker startup path leaves error state, so unstable USB enumeration cannot flap Twinr between ok and error
@@ -101,6 +104,10 @@ files:
     role: Shared `confidence` / `source` / `requires_confirmation` helpers for multimodal runtime claims
     exports:
       - RuntimeClaimMetadata
+  - path: safety_trigger_fusion.py
+    role: Runtime-only bridge that prefers short-window fused safety claims while preserving legacy engine cooldowns and fall-fallback behavior
+    exports:
+      - SafetyTriggerFusionBridge
   - path: ambiguous_room_guard.py
     role: Fail-closed room-ambiguity guard for person-targeted runtime inferences
     exports:
@@ -169,6 +176,11 @@ files:
       - display_attention_refresh_supported
       - derive_display_attention_cue
       - resolve_display_attention_refresh_interval
+  - path: display_debug_signals.py
+    role: Bounded publisher for optional HDMI header debug pills derived from current camera facts plus brief event and trigger holds
+    exports:
+      - DisplayDebugSignalPublishResult
+      - DisplayDebugSignalPublisher
   - path: display_gesture_emoji.py
     role: Conservative runtime producer that mirrors stabilized rising-edge user gestures into short-lived HDMI emoji acknowledgements without overwriting foreign emoji cues
     exports:
@@ -198,6 +210,10 @@ files:
       - build_memory_conflict_candidate
       - build_memory_follow_up_candidate
       - load_display_reserve_memory_candidates
+  - path: display_reserve_user_discovery.py
+    role: Guided user-discovery reserve-candidate loader for start, resume, and short profile-review invites
+    exports:
+      - load_display_reserve_user_discovery_candidates
   - path: display_reserve_reflection.py
     role: Reflection-derived reserve-candidate loader for summaries and midterm packets that should inform the ambient lane without reflection-specific coupling elsewhere
     exports:
@@ -339,6 +355,7 @@ primary_callers:
   - path: src/twinr/proactive/__init__.py
 tests:
   - path: test/test_display_attention.py
+  - path: test/test_display_debug_signals.py
   - path: test/test_display_ambient_impulses.py
   - path: test/test_display_social_reserve.py
   - path: test/test_display_reserve_generation.py

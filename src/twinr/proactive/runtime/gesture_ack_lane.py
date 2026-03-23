@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from twinr.agent.base_agent.config import TwinrConfig
 
 from ..social.engine import SocialFineHandGesture, SocialGestureEvent, SocialVisionObservation
-from ..social.gesture_calibration import GestureCalibrationProfile
+from ..social.gesture_calibration import FineHandGesturePolicy, GestureCalibrationProfile
 from .display_gesture_emoji import (
     DisplayGestureEmojiDecision,
     decision_for_coarse_gesture,
@@ -34,6 +34,18 @@ _SUPPORTED_FINE_GESTURES = frozenset(
 )
 _SUPPORTED_COARSE_GESTURES = frozenset({SocialGestureEvent.WAVE})
 _PENDING_RESET_AFTER_S = 0.9
+_DISPLAY_ACK_FALLBACK_POLICIES = {
+    # Pi-side live/ROI gesture scores are materially lower than the broader
+    # social-path defaults. Keep the HDMI ack lane tuned to real device traces
+    # so clear user gestures publish, while still blocking the weakest false
+    # positives seen in candidate-frame QA.
+    SocialFineHandGesture.THUMBS_UP: FineHandGesturePolicy(0.56, 1, 0.35),
+    SocialFineHandGesture.THUMBS_DOWN: FineHandGesturePolicy(0.67, 1, 0.35),
+    SocialFineHandGesture.POINTING: FineHandGesturePolicy(0.66, 1, 0.32),
+    SocialFineHandGesture.PEACE_SIGN: FineHandGesturePolicy(0.60, 1, 0.40),
+    SocialFineHandGesture.OK_SIGN: FineHandGesturePolicy(0.86, 1, 0.46),
+    SocialFineHandGesture.MIDDLE_FINGER: FineHandGesturePolicy(0.90, 1, 0.28),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,13 +138,22 @@ class GestureAckLane:
         if fine_gesture not in _SUPPORTED_FINE_GESTURES:
             return None
         confidence = _coerce_confidence(observation.fine_hand_gesture_confidence)
+        fallback_policy = _DISPLAY_ACK_FALLBACK_POLICIES.get(
+            fine_gesture,
+            FineHandGesturePolicy(0.72, 1, 0.35),
+        )
         policy = self.calibration.fine_hand_policy(
             fine_gesture,
-            fallback_min_confidence=0.72,
-            fallback_confirm_samples=1,
-            fallback_hold_s=0.35,
+            fallback_min_confidence=fallback_policy.min_confidence,
+            fallback_confirm_samples=fallback_policy.confirm_samples,
+            fallback_hold_s=fallback_policy.hold_s,
         )
-        if confidence < policy.min_confidence:
+        effective_policy = FineHandGesturePolicy(
+            min_confidence=min(policy.min_confidence, fallback_policy.min_confidence),
+            confirm_samples=policy.confirm_samples,
+            hold_s=policy.hold_s,
+        )
+        if confidence < effective_policy.min_confidence:
             return None
         decision = decision_for_fine_hand_gesture(fine_gesture)
         if not decision.active:
@@ -140,8 +161,8 @@ class GestureAckLane:
         return _GestureCandidate(
             key=f"fine:{fine_gesture.value}",
             decision=decision,
-            confirm_samples=policy.confirm_samples,
-            hold_s=policy.hold_s,
+            confirm_samples=effective_policy.confirm_samples,
+            hold_s=effective_policy.hold_s,
         )
 
     def _reset_pending_if_stale(self, observed_at: float) -> None:

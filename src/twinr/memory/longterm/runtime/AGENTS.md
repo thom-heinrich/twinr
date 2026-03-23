@@ -22,7 +22,7 @@ Out of scope:
 ## Invariants
 
 - `service.py` stays orchestration-focused. New extraction, reasoning, storage, or policy logic belongs in the package that already owns that concern.
-- All runtime mutations that touch prompt, object, graph, or midterm stores must stay serialized under the shared `_store_lock`.
+- Shared `_store_lock` serialization is reserved for object/graph/midterm mutation paths that truly share those stores. Prompt-context mutations keep their own store-local locking and must not wait behind unrelated background multimodal or turn persistence.
 - Personality learning stays a downstream sidecar owned by `src/twinr/agent/personality/`; `service.py` may route consolidated turns and tool history into it, but must not reimplement signal taxonomy or evolution policy here.
 - Foreground runtime turn-finalization paths must only queue tool-history learning and must not reacquire the shared long-term store lock for that queue step; any expensive remote-primary personality commit belongs to the later bounded persistence/flush path, not the answer-finalization hot path.
 - When runtime reflection creates summaries or promotes objects inline, the downstream personality-learning handoff must see that enriched batch instead of only the pre-reflection consolidator result.

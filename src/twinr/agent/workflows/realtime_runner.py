@@ -51,7 +51,7 @@ from twinr.hardware.voice_profile import VoiceProfileMonitor
 from twinr.integrations import build_smart_home_hub_adapter
 from twinr.integrations.smarthome import SmartHomeObservation, SmartHomeSensorWorker
 from twinr.ops.usage import TwinrUsageStore
-from twinr.proactive import SocialTriggerDecision, WakewordMatch, build_default_proactive_monitor
+from twinr.proactive import SocialTriggerDecision, build_default_proactive_monitor
 from twinr.providers.openai import OpenAIProviderBundle
 from twinr.providers.factory import build_streaming_provider_bundle
 from twinr.providers.openai.realtime import OpenAIRealtimeSession
@@ -66,10 +66,18 @@ from twinr.agent.workflows.listen_timeout_diagnostics import (
 from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
 from twinr.agent.workflows.print_lane import PrintLaneRequest, TwinrPrintLane
 from twinr.agent.workflows.realtime_runtime.support import TwinrRealtimeSupportMixin, _default_emit
+from twinr.agent.workflows.remote_transcript_commit import (
+    RemoteTranscriptCommit,
+    RemoteTranscriptCommitCoordinator,
+    RemoteTranscriptWaitHandle,
+)
 from twinr.agent.workflows.realtime_runner_tools import TwinrRealtimeToolDelegatesMixin
+from twinr.agent.workflows.startup_boot_sound import start_startup_boot_sound
 from twinr.agent.workflows.streaming_transcript_verifier import StreamingTranscriptVerifierRuntime
 from twinr.agent.workflows.turn_guidance import TurnGuidanceRuntime
 from twinr.agent.workflows.voice_orchestrator import EdgeVoiceOrchestrator
+from twinr.orchestrator.voice_runtime_intent import VoiceRuntimeIntentContext
+from twinr.orchestrator.voice_activation import VoiceActivationMatch
 from twinr.proactive.runtime.gesture_wakeup_lane import GestureWakeupDecision
 
 
@@ -161,6 +169,7 @@ class TwinrRealtimeHardwareLoop(
         self._answer_interrupt_lock = Lock()
         self._answer_interrupt_event: Event | None = None
         self._conversation_session_lock = Lock()  # AUDIT-FIX(#1): Serialize session entry across button, wakeword, and proactive threads.
+        self._remote_transcript_commits = RemoteTranscriptCommitCoordinator()
         self._current_turn_audio_pcm: bytes | None = None
         self._current_turn_audio_sample_rate: int = self.config.openai_realtime_input_sample_rate
         self.tool_executor = RealtimeToolExecutor(self)
@@ -203,6 +212,8 @@ class TwinrRealtimeHardwareLoop(
         self.sleep = sleep
         self.error_reset_seconds = error_reset_seconds
         self._last_status: str | None = None
+        self._last_voice_orchestrator_runtime_state: tuple[str, str | None, bool] | None = None
+        self._last_voice_orchestrator_intent_context: VoiceRuntimeIntentContext | None = None
         self._last_print_request_at: float | None = None
         self._next_reminder_check_at: float = 0.0
         self._next_automation_check_at: float = 0.0
@@ -215,10 +226,10 @@ class TwinrRealtimeHardwareLoop(
         # long-term persistence or sensor-triggered automations.
         self._sensor_observation_queue: Queue[tuple[dict[str, object], tuple[str, ...]]] = Queue(maxsize=1)
         self._latest_sensor_observation_facts: dict[str, object] | None = None
-        self._wakeword_ack_cache_lock = Lock()
-        self._wakeword_ack_wav_bytes: bytes | None = None
-        self._wakeword_ack_prefetch_started = False
-        self._wakeword_ack_prefetch_thread: Thread | None = None
+        self._voice_activation_ack_cache_lock = Lock()
+        self._voice_activation_ack_wav_bytes: bytes | None = None
+        self._voice_activation_ack_prefetch_started = False
+        self._voice_activation_ack_prefetch_thread: Thread | None = None
         self.print_lane = TwinrPrintLane(
             backend=self.print_backend,
             printer=self.printer,
@@ -234,27 +245,21 @@ class TwinrRealtimeHardwareLoop(
             EdgeVoiceOrchestrator(
                 config=config,
                 emit=self.emit,
-                on_wakeword_match=self.handle_wakeword_match,
-                on_follow_up_capture_requested=self.handle_remote_follow_up_capture_request,
+                on_voice_activation=self.handle_voice_activation,
+                on_transcript_committed=self.handle_remote_transcript_committed,
                 on_barge_in_interrupt=lambda: self._request_answer_interrupt("voice_orchestrator"),
             )
             if bool(getattr(config, "voice_orchestrator_enabled", False))
             else None
         )
-        proactive_monitor_config = (
-            replace(config, wakeword_enabled=False)
-            if self.voice_orchestrator is not None
-            else config
-        )
         self.proactive_monitor = proactive_monitor or build_default_proactive_monitor(
-            config=proactive_monitor_config,
+            config=config,
             runtime=self.runtime,
             backend=self.print_backend,
             camera=self.camera,
             camera_lock=self._camera_lock,
             audio_lock=self._audio_lock,
             trigger_handler=self.handle_social_trigger,
-            wakeword_handler=self.handle_wakeword_match,
             gesture_wakeup_handler=self.handle_gesture_wakeup,
             idle_predicate=self._background_work_allowed,
             observation_handler=self.handle_sensor_observation,
@@ -341,7 +346,13 @@ class TwinrRealtimeHardwareLoop(
             details={"interval_s": self._required_remote_dependency_interval_seconds()},
         )
         self._emit_status(force=True)
-        self._ensure_wakeword_ack_prefetch_started()
+        if getattr(getattr(self.runtime, "status", None), "value", None) != "error":
+            start_startup_boot_sound(
+                config=self.config,
+                playback_coordinator=self.playback_coordinator,
+                emit=self.emit,
+            )
+        self._ensure_voice_activation_ack_prefetch_started()
         try:
             safe_poll_timeout = max(0.0, float(poll_timeout))
         except (TypeError, ValueError):
@@ -533,40 +544,40 @@ class TwinrRealtimeHardwareLoop(
         except Exception as exc:
             self._handle_error(exc)
 
-    def handle_wakeword_match(self, match: WakewordMatch) -> bool:
-        try:  # AUDIT-FIX(#4): Prevent background wakeword handlers from dying on transient runtime or provider failures.
+    def handle_voice_activation(self, match: VoiceActivationMatch) -> bool:
+        try:  # AUDIT-FIX(#4): Prevent background activation handlers from dying on transient runtime or provider failures.
             if not self._required_remote_dependency_current_ready():
                 self._request_required_remote_dependency_refresh()
                 return False
             if not self._background_work_allowed():
                 skip_reason = "busy" if self.runtime.status.value != "waiting" else "conversation_active"
-                self.emit(f"wakeword_skipped={skip_reason}")
+                self.emit(f"voice_activation_skipped={skip_reason}")
                 self._record_event(
-                    "wakeword_skipped",
-                    "Wakeword was detected but Twinr was not idle enough to open a turn.",
+                    "voice_activation_skipped",
+                    "Remote voice activation was detected but Twinr was not idle enough to open a turn.",
                     skip_reason=skip_reason,
                     matched_phrase=match.matched_phrase,
                 )
                 return False
-            self.emit(f"wakeword_phrase={match.matched_phrase or 'unknown'}")
-            seed_transcript = (match.remaining_text or "").strip()  # AUDIT-FIX(#7): Ignore whitespace-only wakeword spillover instead of opening an empty text turn.
+            self.emit(f"voice_activation_phrase={match.matched_phrase or 'unknown'}")
+            seed_transcript = (match.remaining_text or "").strip()  # AUDIT-FIX(#7): Ignore whitespace-only spillover instead of opening an empty text turn.
             if seed_transcript:
-                self.emit("wakeword_mode=direct_text")
+                self.emit("voice_activation_mode=direct_text")
             else:
-                self.emit("wakeword_mode=listen")
+                self.emit("voice_activation_mode=listen")
             self._record_event(
-                "wakeword_detected",
-                "Wakeword matched while Twinr was attentive.",
+                "voice_activation_detected",
+                "Remote voice activation matched while Twinr was attentive.",
                 matched_phrase=match.matched_phrase,
                 transcript_preview=match.transcript[:160],
                 remaining_text=seed_transcript or None,
             )
             play_initial_beep = True
             if not seed_transcript:
-                self._acknowledge_wakeword()
+                self._acknowledge_voice_activation()
                 play_initial_beep = False
             return self._run_conversation_session(
-                initial_source="wakeword",
+                initial_source="voice_activation",
                 seed_transcript=seed_transcript or None,
                 play_initial_beep=play_initial_beep,
             )
@@ -937,16 +948,7 @@ class TwinrRealtimeHardwareLoop(
             return "disabled"
         if not self._follow_up_allowed_for_source(initial_source=initial_source):
             return "disabled"
-        supports_remote_follow_up = getattr(self.voice_orchestrator, "supports_remote_follow_up", None)
-        if callable(supports_remote_follow_up):
-            return "remote" if supports_remote_follow_up() else "local_beep"
-        ready_backend = str(getattr(self.voice_orchestrator, "ready_backend", "") or "").strip().lower()
-        if ready_backend:
-            return "remote" if ready_backend == "local_stt" else "local_beep"
-        stage1_mode = str(
-            getattr(self.config, "voice_orchestrator_wake_stage1_mode", "backend") or "backend"
-        ).strip().lower()
-        return "remote" if stage1_mode == "local_stt" else "local_beep"
+        return "remote"
 
     def _notify_voice_orchestrator_state(
         self,
@@ -957,29 +959,64 @@ class TwinrRealtimeHardwareLoop(
     ) -> None:
         if self.voice_orchestrator is None:
             return
+        intent_context = VoiceRuntimeIntentContext.from_sensor_facts(
+            getattr(self, "_latest_sensor_observation_facts", None)
+        )
         try:
             self.voice_orchestrator.notify_runtime_state(
                 state=state,
                 detail=detail,
                 follow_up_allowed=follow_up_allowed,
+                **intent_context.to_event_fields(),
             )
+            self._last_voice_orchestrator_runtime_state = (state, detail, follow_up_allowed)
+            self._last_voice_orchestrator_intent_context = intent_context
         except Exception as exc:
             self.emit(f"voice_orchestrator_notify_failed={type(exc).__name__}")
 
-    def _pause_voice_orchestrator_capture(self, *, reason: str) -> None:
+    def _refresh_voice_orchestrator_sensor_context(self) -> None:
+        """Push changed multimodal intent context into the live voice gateway."""
+
         if self.voice_orchestrator is None:
             return
-        self.voice_orchestrator.pause_capture(reason=reason)
-
-    def _resume_voice_orchestrator_capture(self, *, reason: str) -> None:
-        if self.voice_orchestrator is None:
+        last_state = self._last_voice_orchestrator_runtime_state
+        if last_state is None:
             return
-        self.voice_orchestrator.resume_capture(reason=reason)
+        intent_context = VoiceRuntimeIntentContext.from_sensor_facts(
+            getattr(self, "_latest_sensor_observation_facts", None)
+        )
+        if intent_context == self._last_voice_orchestrator_intent_context:
+            return
+        state, detail, follow_up_allowed = last_state
+        try:
+            self.voice_orchestrator.notify_runtime_state(
+                state=state,
+                detail=detail,
+                follow_up_allowed=follow_up_allowed,
+                **intent_context.to_event_fields(),
+            )
+            self._last_voice_orchestrator_intent_context = intent_context
+        except Exception as exc:
+            self.emit(f"voice_orchestrator_context_refresh_failed={type(exc).__name__}")
 
-    def handle_remote_follow_up_capture_request(self) -> bool:
-        """Open one bounded local follow-up capture after a remote continuation cue."""
+    def handle_remote_transcript_committed(self, transcript: str, source: str) -> bool:
+        """Consume one transcript committed by the live remote voice stream."""
 
         try:
+            committed_transcript = transcript.strip()
+            committed_source = str(source or "").strip().lower() or "listening"
+            if not committed_transcript:
+                self.emit("voice_orchestrator_transcript_ignored=empty")
+                return False
+            if self._remote_transcript_commits.commit(
+                source=committed_source,
+                transcript=committed_transcript,
+            ):
+                self.emit(f"voice_orchestrator_transcript_delivered={committed_source}")
+                return True
+            if committed_source != "follow_up":
+                self.emit(f"voice_orchestrator_transcript_ignored={committed_source}")
+                return False
             if not self._required_remote_dependency_current_ready():
                 self._request_required_remote_dependency_refresh()
                 return False
@@ -988,17 +1025,106 @@ class TwinrRealtimeHardwareLoop(
                 return False
             self.emit("voice_orchestrator_follow_up=true")
             self._trace_event(
-                "voice_orchestrator_follow_up_capture_requested",
+                "voice_orchestrator_follow_up_transcript_committed",
                 kind="decision",
-                details={"play_initial_beep": True, "runtime_status": self.runtime.status.value},
+                details={
+                    "runtime_status": self.runtime.status.value,
+                    "transcript_chars": len(committed_transcript),
+                },
             )
             return self._run_conversation_session(
                 initial_source="follow_up",
-                play_initial_beep=True,
+                seed_transcript=committed_transcript,
+                play_initial_beep=False,
             )
         except Exception as exc:
             self._handle_error(exc)
             return False
+
+    def _voice_orchestrator_owns_live_listening(self) -> bool:
+        """Return whether the current voice path is server-owned after wake."""
+
+        return self.voice_orchestrator is not None
+
+    def _pause_voice_orchestrator_capture(self, *, reason: str) -> None:
+        """Delegate legacy capture pauses to the edge voice bridge when present."""
+
+        if self.voice_orchestrator is None:
+            return
+        self.voice_orchestrator.pause_capture(reason=reason)
+
+    def _resume_voice_orchestrator_capture(self, *, reason: str) -> None:
+        """Delegate legacy capture resumes to the edge voice bridge when present."""
+
+        if self.voice_orchestrator is None:
+            return
+        self.voice_orchestrator.resume_capture(reason=reason)
+
+    def _begin_remote_transcript_wait(self, *, source: str) -> RemoteTranscriptWaitHandle | None:
+        """Open one bounded wait for a remote transcript commit."""
+
+        try:
+            return self._remote_transcript_commits.begin_wait(source=source)
+        except RuntimeError as exc:
+            self.emit(f"voice_orchestrator_transcript_wait_failed={type(exc).__name__}")
+            self._trace_event(
+                "voice_orchestrator_transcript_wait_failed",
+                kind="error",
+                level="ERROR",
+                details={"source": source, "error": str(exc)},
+            )
+            return None
+
+    def _wait_for_remote_transcript_commit(
+        self,
+        *,
+        wait_handle: RemoteTranscriptWaitHandle,
+        timeout_s: float,
+        initial_source: str,
+        follow_up: bool,
+        listen_source: str,
+        timeout_emit_key: str,
+        timeout_message: str,
+    ) -> RemoteTranscriptCommit | None:
+        """Wait until the remote stream commits one transcript or times out."""
+
+        deadline_at = time.monotonic() + max(0.1, float(timeout_s))
+        while True:
+            if self._active_turn_stop_requested():
+                self._cancel_interrupted_turn()
+                return None
+            if wait_handle.commit is not None:
+                return wait_handle.commit
+            if wait_handle.close is not None:
+                self.runtime.remember_listen_timeout(
+                    initial_source=initial_source,
+                    follow_up=follow_up,
+                )
+                self.runtime.cancel_listening()
+                self._emit_status(force=True)
+                self._notify_voice_orchestrator_state("waiting", detail=wait_handle.close.reason)
+                self.emit(f"{timeout_emit_key}=true")
+                self.emit(f"voice_orchestrator_transcript_closed={wait_handle.close.reason}")
+                self._record_event(
+                    "listen_timeout",
+                    timeout_message,
+                    request_source=listen_source,
+                    reason=wait_handle.close.reason,
+                )
+                return None
+            remaining_s = deadline_at - time.monotonic()
+            if remaining_s <= 0:
+                self.runtime.remember_listen_timeout(
+                    initial_source=initial_source,
+                    follow_up=follow_up,
+                )
+                self.runtime.cancel_listening()
+                self._emit_status(force=True)
+                self._notify_voice_orchestrator_state("waiting", detail="listen_timeout")
+                self.emit(f"{timeout_emit_key}=true")
+                self._record_event("listen_timeout", timeout_message, request_source=listen_source)
+                return None
+            wait_handle.wait(timeout_s=min(0.05, remaining_s))
 
     def _recorder_sample_rate(self) -> int:
         return int(
@@ -1503,12 +1629,56 @@ class TwinrRealtimeHardwareLoop(
             self._play_listen_beep()
 
         capture_started = time.monotonic()
+        if self._voice_orchestrator_owns_live_listening():
+            wait_handle = self._begin_remote_transcript_wait(source="listening")
+            if wait_handle is None:
+                self.runtime.cancel_listening()
+                self._emit_status(force=True)
+                self._notify_voice_orchestrator_state("waiting", detail="remote_wait_failed")
+                return False
+            try:
+                self._notify_voice_orchestrator_state(
+                    "listening",
+                    detail=listen_source,
+                    follow_up_allowed=follow_up,
+                )
+                committed = self._wait_for_remote_transcript_commit(
+                    wait_handle=wait_handle,
+                    timeout_s=listening_window.start_timeout_s,
+                    initial_source=initial_source,
+                    follow_up=follow_up,
+                    listen_source=listen_source,
+                    timeout_emit_key=timeout_emit_key,
+                    timeout_message=timeout_message,
+                )
+            finally:
+                self._remote_transcript_commits.clear_wait(wait_handle)
+            if committed is None:
+                return False
+            capture_ms = int((time.monotonic() - capture_started) * 1000)
+            realtime_started = time.monotonic()
+            return self._complete_realtime_turn(
+                transcript_seed=committed.transcript,
+                turn_label=None,
+                initial_source=initial_source,
+                listen_source=listen_source,
+                proactive_trigger=proactive_trigger,
+                turn_started=turn_started,
+                capture_ms=capture_ms,
+                stt_ms=-1,
+                turn_runner=lambda on_audio_chunk, on_output_text_delta: self.realtime_session.run_text_turn(
+                    committed.transcript,
+                    conversation=self._conversation_context_for_turn_label(None),
+                    on_audio_chunk=on_audio_chunk,
+                    on_output_text_delta=on_output_text_delta,
+                ),
+                realtime_started=realtime_started,
+            )
         self._notify_voice_orchestrator_state(
             "listening",
             detail=listen_source,
             follow_up_allowed=follow_up,
         )
-        self._pause_voice_orchestrator_capture(reason=listen_source)
         try:
             with self._audio_lock:
                 transcript_seed = ""
@@ -1567,8 +1737,6 @@ class TwinrRealtimeHardwareLoop(
             self.emit(f"{timeout_emit_key}=true")
             self._record_event("listen_timeout", timeout_message, request_source=listen_source)
             return False
-        finally:
-            self._resume_voice_orchestrator_capture(reason=listen_source)
         audio_pcm = capture_result.pcm_bytes
         if self._active_turn_stop_requested():
             self._cancel_interrupted_turn()
@@ -1974,86 +2142,82 @@ class TwinrRealtimeHardwareLoop(
                 follow_up_allowed=True,
             )
             return True
-        if not force_close and follow_up_mode == "local_beep":
-            self.emit("voice_orchestrator_follow_up_mode=local_beep")
         self._notify_voice_orchestrator_state("waiting", detail=listen_source)
         return not force_close
 
-    def _acknowledge_wakeword(self) -> None:
+    def _acknowledge_voice_activation(self) -> None:
         if self.voice_orchestrator is not None:
             self._play_listen_beep()
-            self.emit("wakeword_ack=earcon")
-            self.emit("wakeword_ack_cached=true")
-            self.emit("timing_wakeword_ack_tts_ms=0")
+            self.emit("voice_activation_ack=earcon")
+            self.emit("voice_activation_ack_cached=true")
+            self.emit("timing_voice_activation_ack_tts_ms=0")
             self._record_event(
-                "wakeword_acknowledged",
-                "Twinr confirmed a wakeword with an earcon before opening hands-free listening.",
+                "voice_activation_acknowledged",
+                "Twinr confirmed a remote voice activation with an earcon before opening hands-free listening.",
                 prompt="earcon",
             )
             return
-        prompt = self.runtime.begin_wakeword_prompt("Ja?")
+        prompt = self.runtime.begin_voice_activation_prompt("Ja?")
         self._emit_status(force=True)
-        cached_audio = self._cached_wakeword_ack_wav_bytes()
+        cached_audio = self._cached_voice_activation_ack_wav_bytes()
         tts_started = time.monotonic()
         try:
             self._play_listen_beep()
             if cached_audio is None:
-                cached_audio = self._build_wakeword_ack_wav_bytes(prompt)
-                with self._wakeword_ack_cache_lock:
-                    if self._wakeword_ack_wav_bytes is None:
-                        self._wakeword_ack_wav_bytes = cached_audio
+                cached_audio = self._build_voice_activation_ack_wav_bytes(prompt)
+                with self._voice_activation_ack_cache_lock:
+                    if self._voice_activation_ack_wav_bytes is None:
+                        self._voice_activation_ack_wav_bytes = cached_audio
             self.playback_coordinator.play_wav_bytes(
-                owner="wakeword_ack",
+                owner="voice_activation_ack",
                 priority=PlaybackPriority.SPEECH,
                 wav_bytes=cached_audio,
             )
         finally:
-            self.runtime.finish_speaking()  # AUDIT-FIX(#6): Ensure wakeword acknowledgment failures do not strand runtime state in "speaking".
+            self.runtime.finish_speaking()  # AUDIT-FIX(#6): Ensure activation acknowledgment failures do not strand runtime state in "speaking".
             self._emit_status(force=True)
-        self.emit(f"wakeword_ack={prompt}")
-        self.emit(f"wakeword_ack_cached={str(cached_audio is not None).lower()}")
-        self.emit(f"timing_wakeword_ack_tts_ms={int((time.monotonic() - tts_started) * 1000)}")
+        self.emit(f"voice_activation_ack={prompt}")
+        self.emit(f"voice_activation_ack_cached={str(cached_audio is not None).lower()}")
+        self.emit(f"timing_voice_activation_ack_tts_ms={int((time.monotonic() - tts_started) * 1000)}")
         self._record_event(
-            "wakeword_acknowledged",
-            "Twinr confirmed a wakeword before opening hands-free listening.",
+            "voice_activation_acknowledged",
+            "Twinr confirmed a remote voice activation before opening hands-free listening.",
             prompt=prompt,
         )
 
-    def _ensure_wakeword_ack_prefetch_started(self) -> None:
-        if not self.config.wakeword_enabled:
-            return
-        with self._wakeword_ack_cache_lock:
-            if self._wakeword_ack_wav_bytes is not None:
+    def _ensure_voice_activation_ack_prefetch_started(self) -> None:
+        with self._voice_activation_ack_cache_lock:
+            if self._voice_activation_ack_wav_bytes is not None:
                 return
-            if self._wakeword_ack_prefetch_started:
+            if self._voice_activation_ack_prefetch_started:
                 return
-            self._wakeword_ack_prefetch_started = True
-            self._wakeword_ack_prefetch_thread = Thread(
-                target=self._prime_wakeword_ack_cache,
-                name="twinr-wakeword-ack",
+            self._voice_activation_ack_prefetch_started = True
+            self._voice_activation_ack_prefetch_thread = Thread(
+                target=self._prime_voice_activation_ack_cache,
+                name="twinr-voice-activation-ack",
                 daemon=True,
             )
-            self._wakeword_ack_prefetch_thread.start()
+            self._voice_activation_ack_prefetch_thread.start()
 
-    def _cached_wakeword_ack_wav_bytes(self) -> bytes | None:
-        with self._wakeword_ack_cache_lock:
-            return self._wakeword_ack_wav_bytes
+    def _cached_voice_activation_ack_wav_bytes(self) -> bytes | None:
+        with self._voice_activation_ack_cache_lock:
+            return self._voice_activation_ack_wav_bytes
 
-    def _prime_wakeword_ack_cache(self) -> None:
+    def _prime_voice_activation_ack_cache(self) -> None:
         try:
-            audio_bytes = self._build_wakeword_ack_wav_bytes("Ja?")
+            audio_bytes = self._build_voice_activation_ack_wav_bytes("Ja?")
         except Exception as exc:
-            with self._wakeword_ack_cache_lock:
-                self._wakeword_ack_prefetch_started = False  # AUDIT-FIX(#9): Allow retry after transient TTS/network failures instead of disabling the cache for the process lifetime.
-                self._wakeword_ack_prefetch_thread = None
-            self.emit(f"wakeword_ack_prefetch_failed={type(exc).__name__}")
+            with self._voice_activation_ack_cache_lock:
+                self._voice_activation_ack_prefetch_started = False  # AUDIT-FIX(#9): Allow retry after transient TTS/network failures instead of disabling the cache for the process lifetime.
+                self._voice_activation_ack_prefetch_thread = None
+            self.emit(f"voice_activation_ack_prefetch_failed={type(exc).__name__}")
             return
-        with self._wakeword_ack_cache_lock:
-            self._wakeword_ack_wav_bytes = audio_bytes
-            self._wakeword_ack_prefetch_thread = None
+        with self._voice_activation_ack_cache_lock:
+            self._voice_activation_ack_wav_bytes = audio_bytes
+            self._voice_activation_ack_prefetch_thread = None
 
-    def _build_wakeword_ack_wav_bytes(self, prompt: str) -> bytes:
-        """Return one locally normalized wakeword-ack payload for Pi playback."""
+    def _build_voice_activation_ack_wav_bytes(self, prompt: str) -> bytes:
+        """Return one locally normalized activation-ack payload for Pi playback."""
 
         return normalize_wav_playback_level(self.tts_provider.synthesize(prompt))
 
@@ -2072,8 +2236,8 @@ class TwinrRealtimeHardwareLoop(
             return "follow_up_timeout"
         if initial_source == "proactive":
             return "proactive_listen_timeout"
-        if initial_source == "wakeword":
-            return "wakeword_listen_timeout"
+        if initial_source == "voice_activation":
+            return "voice_activation_listen_timeout"
         return "listen_timeout"
 
     def _listening_timeout_message(self, *, initial_source: str, follow_up: bool) -> str:
@@ -2081,8 +2245,8 @@ class TwinrRealtimeHardwareLoop(
             return "Follow-up listening window expired."
         if initial_source == "proactive":
             return "Hands-free listening window after a proactive prompt expired."
-        if initial_source == "wakeword":
-            return "Wakeword listening window expired."
+        if initial_source == "voice_activation":
+            return "Voice-activation listening window expired."
         return "Listening timed out before speech started."
 
     def _handle_print_turn(self) -> None:

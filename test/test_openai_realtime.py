@@ -317,6 +317,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "remember_plan": lambda _arguments: {"status": "created"},
                 "update_user_profile": lambda _arguments: {"status": "updated"},
                 "update_personality": lambda _arguments: {"status": "updated"},
+                "manage_user_discovery": lambda _arguments: {"status": "ok"},
                 "configure_world_intelligence": lambda _arguments: {"status": "ok"},
                 "update_simple_setting": lambda _arguments: {"status": "updated"},
                 "enroll_voice_profile": lambda _arguments: {"status": "enrolled"},
@@ -360,6 +361,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
                 "remember_plan",
                 "update_user_profile",
                 "update_personality",
+                "manage_user_discovery",
                 "configure_world_intelligence",
                 "update_simple_setting",
                 "enroll_voice_profile",
@@ -416,6 +418,10 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("confirmed", tools_by_name["update_user_profile"]["parameters"]["properties"])
         self.assertIn("instruction", tools_by_name["update_personality"]["parameters"]["properties"])
         self.assertIn("confirmed", tools_by_name["update_personality"]["parameters"]["properties"])
+        self.assertIn("action", tools_by_name["manage_user_discovery"]["parameters"]["properties"])
+        self.assertIn("learned_facts", tools_by_name["manage_user_discovery"]["parameters"]["properties"])
+        self.assertIn("topic_complete", tools_by_name["manage_user_discovery"]["parameters"]["properties"])
+        self.assertIn("permission_granted", tools_by_name["manage_user_discovery"]["parameters"]["properties"])
         self.assertIn("action", tools_by_name["configure_world_intelligence"]["parameters"]["properties"])
         self.assertIn("feed_urls", tools_by_name["configure_world_intelligence"]["parameters"]["properties"])
         self.assertIn("subscription_refs", tools_by_name["configure_world_intelligence"]["parameters"]["properties"])
@@ -455,6 +461,7 @@ class OpenAIRealtimeSessionTests(unittest.TestCase):
         self.assertIn("list_smart_home_entities", connection.session.calls[0]["instructions"])
         self.assertIn("small live situation picture", connection.session.calls[0]["instructions"])
         self.assertIn("two to four targeted smart-home queries", connection.session.calls[0]["instructions"])
+        self.assertIn("manage_user_discovery", connection.session.calls[0]["instructions"])
         self.assertIn("configure_world_intelligence tool", connection.session.calls[0]["instructions"])
 
     def test_open_uses_realtime_safe_top_level_tool_schemas(self) -> None:

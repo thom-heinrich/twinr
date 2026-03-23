@@ -8,6 +8,7 @@ owned_concerns:
   - Orchestrate button, wakeword, configured visual gesture-wakeup, and proactive entry points for Twinr hardware loops
   - Coordinate live conversation sessions, print delivery, and bounded speech output
   - Bridge bounded edge audio and runtime-state updates into the server-backed voice orchestrator without moving runtime-state ownership off the Pi loop
+  - Coordinate bounded same-stream transcript commits from the server-backed voice orchestrator so live wake/listen turns stay remote and the Pi remains an I/O edge
   - Keep live capture paths from failing immediately on proven transient XVF3800 re-enumeration by reusing the bounded hardware-level recovery helper
   - Cache and replay one normalized wakeword-ack payload so the Pi confirmation voice stays audible without widening broader speech policy
   - Start one bounded managed smart-home sensor worker and feed its normalized observations into the realtime sensor path
@@ -16,6 +17,8 @@ owned_concerns:
   - Keep turn-guidance context shaping and transcript-verifier gate policy outside the active loop classes
   - Adapt authoritative local semantic-router decisions, including optional two-stage user-intent routing, into supervisor-compatible handoffs for the streaming loop without moving bundle or ONNX logic into this package
   - Serialize beep, feedback, and spoken playback under one priority-aware speaker coordinator
+  - Render and queue one bounded startup boot clip from media/boot.mp3 through the shared playback coordinator without blocking loop startup
+  - Render and cache reusable workflow media clips such as the processing waiting ambience so repeated thinking loops stay bounded on the Pi
   - Keep required remote-memory fail-closed checks off the GPIO polling thread
   - Bridge structured personality steering cues into concrete follow-up reopen/close decisions
   - Choose speech versus display-first delivery for non-safety proactive prompts based on quiet hours, media/noise suppression, and bounded repeat cooldowns, with display-first prompts routed into the right-hand reserve lane instead of fullscreen presentation
@@ -46,9 +49,16 @@ files:
     exports:
       - TwinrRealtimeHardwareLoop
   - path: voice_orchestrator.py
-    role: Edge-side voice websocket bridge that streams bounded audio/runtime-state updates, survives bounded transient XVF3800 capture loss, and dispatches wake, follow-up, and barge-in events back into the realtime loop
+    role: Edge-side voice websocket bridge that streams bounded audio/runtime-state updates, survives bounded transient XVF3800 capture loss, and dispatches wake, same-stream transcript commits, follow-up-close, and barge-in events back into the realtime loop
     exports:
       - EdgeVoiceOrchestrator
+  - path: remote_transcript_commit.py
+    role: Coordinate active waits for server-side transcript commits during remote listen windows
+    exports:
+      - RemoteTranscriptCommit
+      - RemoteTranscriptCommitCoordinator
+      - RemoteTranscriptClose
+      - RemoteTranscriptWaitHandle
   - path: streaming_runner.py
     role: Streaming loop entrypoint and turn orchestration shell that delegates capture, speculation, planning, and turn execution
     exports:
@@ -73,7 +83,7 @@ files:
       - TranscriptVerifierGateDecision
       - StreamingTranscriptVerifierRuntime
   - path: streaming_capture.py
-    role: Streaming microphone-capture, timeout, and batch-STT fallback controller
+    role: Streaming microphone-capture, same-stream remote transcript wait, timeout, and batch-STT fallback controller
     exports:
       - StreamingAudioTurnRequest
       - StreamingCaptureController
@@ -81,6 +91,10 @@ files:
     role: Speculative first-word and supervisor warmup controller for the streaming loop
   - path: streaming_lane_planner.py
     role: Streaming lane-plan construction, final-lane path selection, and LLM recovery callback wiring
+  - path: streaming_supervisor_context.py
+    role: Build per-turn fast-lane supervisor instructions, including visible-card grounding overlays
+    exports:
+      - build_streaming_supervisor_turn_instructions
   - path: streaming_semantic_router.py
     role: Streaming workflow bridge from local semantic-router decisions, including optional two-stage user-intent routing, into supervisor-style handoffs and bridge replies
     exports:
@@ -107,6 +121,21 @@ files:
       - PlaybackCoordinator
       - PlaybackPriority
       - PlaybackRunResult
+  - path: rendered_audio_clip.py
+    role: Render, normalize, chunk, and cache reusable workflow media clips
+    exports:
+      - RenderedAudioClipSpec
+      - RenderedAudioClipError
+      - RenderedAudioClipConfigurationError
+      - RenderedAudioClipRenderError
+      - build_rendered_audio_clip_wav_bytes
+      - iter_wav_bytes_chunks
+  - path: startup_boot_sound.py
+    role: Render and queue the bounded startup boot clip through the shared playback coordinator
+    exports:
+      - build_startup_boot_sound_wav_bytes
+      - play_startup_boot_sound
+      - start_startup_boot_sound
   - path: realtime_runtime/background.py
     role: Active reminder, automation, and proactive background-delivery mixin, including reserve-lane routing for display-first proactive prompts and the overnight reserve-lane maintenance trigger
     exports:
@@ -155,7 +184,7 @@ files:
       - PrintLaneRequest
       - TwinrPrintLane
   - path: working_feedback.py
-    role: Bounded processing, answering, and printing tone loops
+    role: Bounded processing, answering, and printing tone/media loops with long-think attenuation
     exports:
       - WorkingFeedbackKind
       - WorkingFeedbackProfile
@@ -175,12 +204,16 @@ primary_callers:
   - path: src/twinr/agent/tools/runtime/dual_lane_loop.py
 tests:
   - path: test/test_playback_coordinator.py
+  - path: test/test_rendered_audio_clip.py
+  - path: test/test_startup_boot_sound.py
   - path: test/test_main.py
   - path: test/test_orchestrator.py
   - path: test/test_runner.py
   - path: test/test_realtime_runner.py
   - path: test/test_streaming_runner.py
+  - path: test/test_dual_lane_loop.py
   - path: test/test_speech_output.py
+  - path: test/test_working_feedback.py
   - path: test/test_workflow_forensics.py
   - path: test/test_openai_realtime.py
   - path: test/test_longterm_multimodal.py

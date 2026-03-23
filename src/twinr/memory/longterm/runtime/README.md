@@ -23,6 +23,7 @@ bounded background writers into the APIs used by agent runtime loops.
 - Route explicit RSS/world-intelligence configuration plus reflection-phase feed refresh/recalibration into the structured personality-learning service without mixing that source logic into the core memory algorithms
 - Split one service-level flush timeout into explicit per-writer budgets so wall-clock runtime deadlines stay real
 - Keep low-signal multimodal writes on the deterministic reflection path while skipping optional midterm compilation that would otherwise duplicate per-turn remote latency
+- Expose explicit delete entry points for durable prompt memory and managed user/personality context so discovery corrections can retract stale learned facts cleanly
 - Verify remote-primary snapshot readiness before runtime loops start
 - Record per-snapshot pointer/origin readiness evidence so watchdog failures can be traced to the exact remote read path
 - Reuse successful remote snapshot probes within one bounded readiness pass so watchdog startup does not refetch the same snapshot twice back-to-back
@@ -33,6 +34,7 @@ bounded background writers into the APIs used by agent runtime loops.
 - Prewarm generic foreground-read paths plus current object/conflict payload caches before live text-channel traffic so the first real remote-only recall turn can hit a warmed remote cache instead of rebuilding selectors and fetching first-hit payloads on demand
 - Reuse remote snapshot/catalog/item reads through TTL-bounded in-process caches so warmed foreground recall stays sub-second on the Pi without changing remote-only truth semantics
 - Keep foreground provider-context reads on the stores' own consistency boundaries instead of queueing them behind the shared background-writer mutation lock
+- Keep prompt-context mutations on their own store-level durability boundary instead of queueing them behind the shared background-writer mutation lock
 - Wire adaptive retrieval policies derived from confirmed memory, routines, and proactive outcomes into provider context
 - Expose review, retention, proactive, and operator mutation entry points
 

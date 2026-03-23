@@ -27,7 +27,7 @@ Pi-side setup, probe, and smoke-test scripts for Twinr peripherals.
 | [piaicam/](./piaicam) | Pi AI Camera smoke tests, custom gesture dataset capture, and MediaPipe model staging/training |
 | [pir/](./pir) | PIR setup and motion probe |
 | [printer/](./printer) | Thermal-printer CUPS setup |
-| [servo_kernel/](./servo_kernel) | Out-of-tree Raspberry Pi servo kernel module source and build recipe |
+| [servo_kernel/](./servo_kernel) | Out-of-tree Raspberry Pi servo kernel module plus low-level C acceptance tool for calm body-motion probes, including persisted last-target safety between bounded runs |
 | [component.yaml](./component.yaml) | Structured directory metadata |
 | [AGENTS.md](./AGENTS.md) | Local editing rules |
 

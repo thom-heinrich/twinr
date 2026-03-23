@@ -49,19 +49,21 @@ _CHUNK_BYTES = 64 * 1024
 async def _pipe(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
+    *,
+    close_writer_on_eof: bool,
 ) -> None:
-    """Copy bytes until EOF, then half-close the destination stream."""
+    """Copy bytes until EOF and only half-close after a real upstream EOF."""
 
-    try:
-        while True:
-            chunk = await reader.read(_CHUNK_BYTES)
-            if not chunk:
-                break
-            writer.write(chunk)
-            await writer.drain()
-    finally:
-        with contextlib.suppress(Exception):
-            writer.write_eof()
+    while True:
+        chunk = await reader.read(_CHUNK_BYTES)
+        if not chunk:
+            if close_writer_on_eof and writer.can_write_eof():
+                with contextlib.suppress(Exception):
+                    writer.write_eof()
+                    await writer.drain()
+            return
+        writer.write(chunk)
+        await writer.drain()
 
 
 async def _handle_client(
@@ -78,18 +80,24 @@ async def _handle_client(
     target_writer: asyncio.StreamWriter | None = None
     try:
         target_reader, target_writer = await asyncio.open_connection(target_host, target_port)
-        upstream = asyncio.create_task(_pipe(client_reader, target_writer))
-        downstream = asyncio.create_task(_pipe(target_reader, client_writer))
-        done, pending = await asyncio.wait(
-            {upstream, downstream},
-            return_when=asyncio.FIRST_COMPLETED,
+        upstream = asyncio.create_task(
+            _pipe(
+                client_reader,
+                target_writer,
+                close_writer_on_eof=True,
+            )
         )
-        for task in pending:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        for task in done:
-            await task
+        downstream = asyncio.create_task(
+            _pipe(
+                target_reader,
+                client_writer,
+                close_writer_on_eof=False,
+            )
+        )
+        results = await asyncio.gather(upstream, downstream, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+                raise result
     except Exception as exc:
         print(f"proxy_connection_failed peer={peer!r} error={type(exc).__name__}:{exc}", flush=True)
     finally:

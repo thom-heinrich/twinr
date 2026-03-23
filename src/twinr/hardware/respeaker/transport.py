@@ -1,13 +1,14 @@
-"""Dependency-light libusb transport for XVF3800 host-control reads."""
+"""Dependency-light libusb transport for XVF3800 host-control I/O."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from ctypes import POINTER, byref, c_char_p, c_int, c_uint, c_ubyte, c_uint16, c_void_p
 import ctypes
 import ctypes.util
 import math  # AUDIT-FIX(#2): Needed for finite-range validation of timing configuration.
 import struct
+from threading import RLock
 import time
 
 from twinr.hardware.respeaker.models import (
@@ -20,6 +21,7 @@ from twinr.hardware.respeaker.models import (
 
 
 _CONTROL_READ_REQUEST_TYPE = 0xC0
+_CONTROL_WRITE_REQUEST_TYPE = 0x40
 _CONTROL_REQUEST = 0
 _CONTROL_SUCCESS = 0
 _SERVICER_COMMAND_RETRY = 64
@@ -34,6 +36,7 @@ _MAX_SAFE_RETRY_SLEEP_S = 1.0  # AUDIT-FIX(#1): Prevent configuration from injec
 _MAX_SAFE_RETRY_ATTEMPTS = 1000  # AUDIT-FIX(#2): Defend against pathological configuration values.
 _XVF3800_VENDOR_ID = 0x2886
 _XVF3800_PRODUCT_ID = 0x001A
+_TRANSPORT_IO_LOCK = RLock()
 
 
 def _sanitize_reason(value: object, *, fallback: str) -> str:
@@ -145,6 +148,115 @@ def _validate_parameter_spec(spec: ReSpeakerParameterSpec) -> str | None:
     return None
 
 
+def _normalize_write_values(
+    spec: ReSpeakerParameterSpec,
+    values: Sequence[object] | str | bytes | bytearray,
+) -> bytes:
+    """Encode one write payload according to the XVF3800 host-control schema."""
+
+    access_mode = str(getattr(spec, "access_mode", "") or "").strip().lower()
+    if access_mode == "ro":
+        raise ValueError("write_not_allowed_for_read_only_spec")
+
+    value_count = int(spec.value_count)
+    if value_count < 0:
+        raise ValueError("invalid_value_count")
+
+    if spec.value_type is ReSpeakerParameterType.CHAR:
+        if isinstance(values, str):
+            encoded = values.encode("utf-8")
+        elif isinstance(values, (bytes, bytearray)):
+            encoded = bytes(values)
+        else:
+            encoded = bytes(values)
+        if len(encoded) > value_count:
+            raise ValueError("char_payload_exceeds_spec_length")
+        return encoded
+
+    if isinstance(values, (str, bytes, bytearray)):
+        raise TypeError("write_values_must_be_a_numeric_sequence")
+
+    normalized = tuple(values)
+    if len(normalized) != value_count:
+        raise ValueError("write_value_count_mismatch")
+
+    if spec.value_type is ReSpeakerParameterType.UINT8:
+        payload = bytearray()
+        for index, value in enumerate(normalized):
+            if isinstance(value, bool):
+                raise TypeError(f"write_value[{index}] must be an int")
+            integer = int(value)
+            if integer < 0 or integer > 0xFF:
+                raise ValueError(f"write_value[{index}] out_of_range_uint8")
+            payload.extend(integer.to_bytes(1, byteorder="little", signed=False))
+        return bytes(payload)
+
+    if spec.value_type is ReSpeakerParameterType.UINT16:
+        return struct.pack(
+            "<" + ("H" * value_count),
+            *(
+                _coerce_bounded_write_int(value, minimum=0, maximum=0xFFFF, index=index)
+                for index, value in enumerate(normalized)
+            ),
+        )
+
+    if spec.value_type is ReSpeakerParameterType.UINT32:
+        return struct.pack(
+            "<" + ("I" * value_count),
+            *(
+                _coerce_bounded_write_int(value, minimum=0, maximum=0xFFFFFFFF, index=index)
+                for index, value in enumerate(normalized)
+            ),
+        )
+
+    if spec.value_type is ReSpeakerParameterType.INT32:
+        return struct.pack(
+            "<" + ("i" * value_count),
+            *(
+                _coerce_bounded_write_int(
+                    value,
+                    minimum=-(2**31),
+                    maximum=(2**31) - 1,
+                    index=index,
+                )
+                for index, value in enumerate(normalized)
+            ),
+        )
+
+    if spec.value_type in (ReSpeakerParameterType.FLOAT, ReSpeakerParameterType.RADIANS):
+        return struct.pack(
+            "<" + ("f" * value_count),
+            *(
+                _coerce_finite_write_float(value, index=index)
+                for index, value in enumerate(normalized)
+            ),
+        )
+
+    raise ValueError("unsupported_write_value_type")
+
+
+def _coerce_bounded_write_int(value: object, *, minimum: int, maximum: int, index: int) -> int:
+    """Validate one integer write value before it reaches ctypes/libusb."""
+
+    if isinstance(value, bool):
+        raise TypeError(f"write_value[{index}] must be an int")
+    integer = int(value)
+    if integer < minimum or integer > maximum:
+        raise ValueError(f"write_value[{index}] out_of_range")
+    return integer
+
+
+def _coerce_finite_write_float(value: object, *, index: int) -> float:
+    """Validate one float-style write value before USB encoding."""
+
+    if isinstance(value, bool):
+        raise TypeError(f"write_value[{index}] must be a finite number")
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise ValueError(f"write_value[{index}] must be finite")
+    return normalized
+
+
 class _LibusbBindings:
     """Wrap the tiny libusb surface needed for XVF3800 host-control reads."""
 
@@ -237,7 +349,7 @@ class _LibusbBindings:
 
 
 class ReSpeakerLibusbTransport:
-    """Read bounded XVF3800 host-control parameters via system libusb."""
+    """Read and write bounded XVF3800 host-control parameters via system libusb."""
 
     def __init__(
         self,
@@ -319,42 +431,116 @@ class ReSpeakerLibusbTransport:
                 {},
             )
 
+        with _TRANSPORT_IO_LOCK:
+            context = None
+            handle = None
+            reads: dict[str, ReSpeakerParameterRead] = {}
+            try:
+                context = self._bindings.init_context()
+                handle = self._bindings.open_device(context, self.vendor_id, self.product_id)
+                if handle is None:
+                    return (
+                        self._availability_for_open_failure(probe),
+                        {},
+                    )
+                for index, spec in enumerate(specs):  # AUDIT-FIX(#3): Iterate inside the transport guard so generator failures become clean transport errors with any earlier reads preserved.
+                    spec_name = self._unique_spec_name(reads, self._spec_name(spec, index))  # AUDIT-FIX(#4): Preserve all reads even when spec names collide.
+                    try:
+                        reads[spec_name] = self._read_parameter(handle, spec)
+                    except Exception as exc:  # AUDIT-FIX(#3): One broken spec or ctypes edge case must not abort the entire batch.
+                        reads[spec_name] = self._failed_read(
+                            spec,
+                            attempt_count=0,
+                            error=f"read_exception:{exc.__class__.__name__}",
+                        )
+                return (
+                    ReSpeakerTransportAvailability(backend="libusb", available=True),
+                    reads,
+                )
+            except Exception as exc:  # AUDIT-FIX(#3): Narrow OSError-only handling missed ctypes/signature/generator failures and could crash the caller.
+                return (
+                    ReSpeakerTransportAvailability(
+                        backend="libusb",
+                        available=False,
+                        reason=self._transport_error_reason(exc),
+                    ),
+                    reads,
+                )
+            finally:
+                self._safe_release(handle=handle, context=context)  # AUDIT-FIX(#6): Cleanup must never mask the original transport outcome.
+
+    def write_parameter(
+        self,
+        spec: ReSpeakerParameterSpec,
+        values: Sequence[object] | str | bytes | bytearray,
+        *,
+        probe: ReSpeakerProbeResult | None = None,
+    ) -> ReSpeakerTransportAvailability:
+        """Write one bounded XVF3800 host-control parameter."""
+
+        if self._config_error is not None:
+            return ReSpeakerTransportAvailability(
+                backend="libusb",
+                available=False,
+                reason=f"invalid_config:{self._config_error}",
+            )
+
+        if self._bindings is None:
+            return ReSpeakerTransportAvailability(
+                backend="libusb",
+                available=False,
+                reason="libusb_unavailable",
+            )
+
+        try:
+            payload = _normalize_write_values(spec, values)
+        except Exception as exc:
+            return ReSpeakerTransportAvailability(
+                backend="libusb",
+                available=False,
+                reason=f"invalid_write:{_sanitize_reason(exc, fallback=exc.__class__.__name__)}",
+            )
+
         context = None
         handle = None
-        reads: dict[str, ReSpeakerParameterRead] = {}
-        try:
-            context = self._bindings.init_context()
-            handle = self._bindings.open_device(context, self.vendor_id, self.product_id)
-            if handle is None:
-                return (
-                    self._availability_for_open_failure(probe),
-                    {},
+        with _TRANSPORT_IO_LOCK:
+            try:
+                context = self._bindings.init_context()
+                handle = self._bindings.open_device(context, self.vendor_id, self.product_id)
+                if handle is None:
+                    return self._availability_for_open_failure(probe)
+
+                buffer = (c_ubyte * len(payload)).from_buffer_copy(payload)
+                transfer_size = self._bindings.control_transfer(
+                    handle,
+                    request_type=_CONTROL_WRITE_REQUEST_TYPE,
+                    request=_CONTROL_REQUEST,
+                    value=int(spec.cmdid),
+                    index=int(spec.resid),
+                    buffer=buffer,
+                    timeout_ms=self.read_timeout_ms,
                 )
-            for index, spec in enumerate(specs):  # AUDIT-FIX(#3): Iterate inside the transport guard so generator failures become clean transport errors with any earlier reads preserved.
-                spec_name = self._unique_spec_name(reads, self._spec_name(spec, index))  # AUDIT-FIX(#4): Preserve all reads even when spec names collide.
-                try:
-                    reads[spec_name] = self._read_parameter(handle, spec)
-                except Exception as exc:  # AUDIT-FIX(#3): One broken spec or ctypes edge case must not abort the entire batch.
-                    reads[spec_name] = self._failed_read(
-                        spec,
-                        attempt_count=0,
-                        error=f"read_exception:{exc.__class__.__name__}",
+                if transfer_size < 0:
+                    return ReSpeakerTransportAvailability(
+                        backend="libusb",
+                        available=False,
+                        reason=self._binding_error_name(transfer_size),
                     )
-            return (
-                ReSpeakerTransportAvailability(backend="libusb", available=True),
-                reads,
-            )
-        except Exception as exc:  # AUDIT-FIX(#3): Narrow OSError-only handling missed ctypes/signature/generator failures and could crash the caller.
-            return (
-                ReSpeakerTransportAvailability(
+                if transfer_size != len(payload):
+                    return ReSpeakerTransportAvailability(
+                        backend="libusb",
+                        available=False,
+                        reason=f"short_write:{transfer_size}/{len(payload)}",
+                    )
+                return ReSpeakerTransportAvailability(backend="libusb", available=True)
+            except Exception as exc:
+                return ReSpeakerTransportAvailability(
                     backend="libusb",
                     available=False,
                     reason=self._transport_error_reason(exc),
-                ),
-                reads,
-            )
-        finally:
-            self._safe_release(handle=handle, context=context)  # AUDIT-FIX(#6): Cleanup must never mask the original transport outcome.
+                )
+            finally:
+                self._safe_release(handle=handle, context=context)
 
     def _availability_for_open_failure(self, probe: ReSpeakerProbeResult | None) -> ReSpeakerTransportAvailability:
         if probe is not None and not probe.usb_visible:

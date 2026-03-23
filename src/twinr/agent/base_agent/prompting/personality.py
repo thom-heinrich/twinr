@@ -115,11 +115,24 @@ def load_supervisor_loop_personality_context(config: TwinrConfig) -> Personality
         config: Runtime configuration that points to personality and state stores.
 
     Returns:
-        A context bundle containing only static personality-file sections.
+        A lean context bundle for the fast supervisor lane. It keeps stable
+        legacy/system character context plus structured core style/humor, but
+        excludes volatile topic/state layers such as `MINDSHARE`, `CONTINUITY`,
+        `PLACE`, `WORLD`, and `REFLECTION`.
     """
 
-    sections = _load_static_sections(config)
-    return PersonalityContext(sections=tuple(sections))
+    remote_state = LongTermRemoteStateStore.from_config(config)
+    directory = _resolve_personality_directory(config)
+    legacy_sections = _load_legacy_static_sections(
+        directory=directory,
+        remote_state=remote_state,
+    )
+    structured_sections = _PERSONALITY_CONTEXT_SERVICE.build_supervisor_sections(
+        legacy_sections=tuple(legacy_sections),
+        config=config,
+        remote_state=remote_state,
+    )
+    return PersonalityContext(sections=tuple(structured_sections))
 
 
 def load_personality_context(config: TwinrConfig) -> PersonalityContext:

@@ -162,6 +162,89 @@ class ContinuousAttentionTrackerTests(unittest.TestCase):
         self.assertTrue(snapshot.speaker_locked)
         self.assertAlmostEqual(snapshot.target_center_x or 0.0, 0.748, places=3)
 
+    def test_does_not_hold_stale_selected_track_over_fresh_visible_anchor(self) -> None:
+        tracker = ContinuousAttentionTracker.from_config(TwinrConfig())
+
+        initial = tracker.observe(
+            observed_at=0.0,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 2,
+                    "visible_persons": [
+                        {
+                            "box": {"top": 0.1, "left": 0.05, "bottom": 0.9, "right": 0.25},
+                            "zone": "left",
+                            "confidence": 0.85,
+                        },
+                        {
+                            "box": {"top": 0.1, "left": 0.8, "bottom": 0.9, "right": 0.98},
+                            "zone": "right",
+                            "confidence": 0.95,
+                        },
+                    ],
+                },
+                "vad": {"speech_detected": False},
+            },
+        )
+
+        follow = tracker.observe(
+            observed_at=0.4,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 1,
+                    "visible_persons": [
+                        {
+                            "box": {"top": 0.1, "left": 0.44, "bottom": 0.9, "right": 0.66},
+                            "zone": "center",
+                            "confidence": 0.9,
+                        },
+                    ],
+                    "primary_person_center_x": 0.55,
+                    "primary_person_center_y": 0.5,
+                },
+                "vad": {"speech_detected": False},
+            },
+        )
+
+        self.assertEqual(initial.target_track_id, "visible_track_2")
+        self.assertEqual(initial.state, "active_visible_person")
+        self.assertEqual(follow.state, "active_visible_person")
+        self.assertEqual(follow.focus_source, "primary_visible_person")
+        self.assertAlmostEqual(follow.target_center_x or 0.0, 0.55, places=2)
+
+    def test_single_visible_person_prefers_stabilized_primary_anchor_over_raw_box_center(self) -> None:
+        tracker = ContinuousAttentionTracker.from_config(TwinrConfig())
+
+        snapshot = tracker.observe(
+            observed_at=0.0,
+            live_facts={
+                "camera": {
+                    "person_visible": True,
+                    "person_count": 1,
+                    "visible_persons": [
+                        {
+                            "box": {"top": 0.1, "left": 0.82, "bottom": 0.92, "right": 0.98},
+                            "zone": "right",
+                            "confidence": 0.92,
+                        },
+                    ],
+                    "primary_person_center_x": 0.76,
+                    "primary_person_center_y": 0.66,
+                    "primary_person_zone": "right",
+                    "visual_attention_score": 0.88,
+                },
+                "vad": {"speech_detected": False},
+            },
+        )
+
+        self.assertTrue(snapshot.active)
+        self.assertEqual(snapshot.state, "active_visible_person")
+        self.assertEqual(snapshot.focus_source, "primary_visible_person")
+        self.assertAlmostEqual(snapshot.target_center_x or 0.0, 0.76, places=2)
+        self.assertAlmostEqual(snapshot.target_center_y or 0.0, 0.51, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

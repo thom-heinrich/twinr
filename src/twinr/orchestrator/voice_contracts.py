@@ -2,9 +2,9 @@
 
 The text-turn orchestrator already owns bounded websocket transport for remote
 tool turns. This module adds the audio-session contract used by the Alexa-like
-hybrid voice path: the edge sends bounded PCM frames plus runtime-state
-updates, and the server responds with explicit wakeword, follow-up, and
-barge-in decisions.
+server-backed voice path: the edge sends bounded PCM frames plus runtime-state
+updates, and the server responds with explicit wakeword, transcript-commit,
+follow-up-close, and barge-in decisions.
 """
 
 from __future__ import annotations
@@ -150,6 +150,12 @@ class OrchestratorVoiceRuntimeStateEvent:
     state: str
     detail: str | None = None
     follow_up_allowed: bool = False
+    attention_state: str | None = None
+    interaction_intent_state: str | None = None
+    person_visible: bool | None = None
+    interaction_ready: bool | None = None
+    targeted_inference_blocked: bool | None = None
+    recommended_channel: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -159,6 +165,18 @@ class OrchestratorVoiceRuntimeStateEvent:
         }
         if self.detail is not None:
             payload["detail"] = self.detail
+        if self.attention_state is not None:
+            payload["attention_state"] = self.attention_state
+        if self.interaction_intent_state is not None:
+            payload["interaction_intent_state"] = self.interaction_intent_state
+        if self.person_visible is not None:
+            payload["person_visible"] = self.person_visible
+        if self.interaction_ready is not None:
+            payload["interaction_ready"] = self.interaction_ready
+        if self.targeted_inference_blocked is not None:
+            payload["targeted_inference_blocked"] = self.targeted_inference_blocked
+        if self.recommended_channel is not None:
+            payload["recommended_channel"] = self.recommended_channel
         return payload
 
     @classmethod
@@ -168,6 +186,26 @@ class OrchestratorVoiceRuntimeStateEvent:
             state=_coerce_text(payload_dict.get("state")) or "waiting",
             detail=_coerce_optional_text(payload_dict.get("detail")),
             follow_up_allowed=_coerce_bool(payload_dict.get("follow_up_allowed"), default=False),
+            attention_state=_coerce_optional_text(payload_dict.get("attention_state")),
+            interaction_intent_state=_coerce_optional_text(
+                payload_dict.get("interaction_intent_state")
+            ),
+            person_visible=(
+                _coerce_bool(payload_dict.get("person_visible"))
+                if payload_dict.get("person_visible") is not None
+                else None
+            ),
+            interaction_ready=(
+                _coerce_bool(payload_dict.get("interaction_ready"))
+                if payload_dict.get("interaction_ready") is not None
+                else None
+            ),
+            targeted_inference_blocked=(
+                _coerce_bool(payload_dict.get("targeted_inference_blocked"))
+                if payload_dict.get("targeted_inference_blocked") is not None
+                else None
+            ),
+            recommended_channel=_coerce_optional_text(payload_dict.get("recommended_channel")),
         )
 
 
@@ -238,21 +276,26 @@ class OrchestratorVoiceWakeConfirmedEvent:
 
 
 @dataclass(frozen=True, slots=True)
-class OrchestratorVoiceFollowUpCaptureRequestedEvent:
-    """Ask the edge to open a bounded local capture for a follow-up turn."""
+class OrchestratorVoiceTranscriptCommittedEvent:
+    """Commit one transcribed user utterance from the live remote stream."""
 
-    transcript_preview: str | None = None
+    transcript: str
+    source: str = "listening"
 
     def to_payload(self) -> dict[str, Any]:
-        payload = {"type": "follow_up_capture_requested"}
-        if self.transcript_preview is not None:
-            payload["transcript_preview"] = self.transcript_preview
-        return payload
+        return {
+            "type": "transcript_committed",
+            "transcript": self.transcript,
+            "source": self.source,
+        }
 
     @classmethod
-    def from_payload(cls, payload: Any) -> OrchestratorVoiceFollowUpCaptureRequestedEvent:
+    def from_payload(cls, payload: Any) -> OrchestratorVoiceTranscriptCommittedEvent:
         payload_dict = _coerce_dict(payload)
-        return cls(transcript_preview=_coerce_optional_text(payload_dict.get("transcript_preview")))
+        return cls(
+            transcript=_coerce_text(payload_dict.get("transcript")),
+            source=_coerce_text(payload_dict.get("source")) or "listening",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,7 +349,7 @@ class OrchestratorVoiceErrorEvent:
 VoiceServerEvent = (
     OrchestratorVoiceReadyEvent
     | OrchestratorVoiceWakeConfirmedEvent
-    | OrchestratorVoiceFollowUpCaptureRequestedEvent
+    | OrchestratorVoiceTranscriptCommittedEvent
     | OrchestratorVoiceFollowUpClosedEvent
     | OrchestratorVoiceBargeInInterruptEvent
     | OrchestratorVoiceErrorEvent
@@ -322,8 +365,8 @@ def decode_voice_server_event(payload: Any) -> VoiceServerEvent:
         return OrchestratorVoiceReadyEvent.from_payload(payload_dict)
     if message_type == "wake_confirmed":
         return OrchestratorVoiceWakeConfirmedEvent.from_payload(payload_dict)
-    if message_type == "follow_up_capture_requested":
-        return OrchestratorVoiceFollowUpCaptureRequestedEvent.from_payload(payload_dict)
+    if message_type == "transcript_committed":
+        return OrchestratorVoiceTranscriptCommittedEvent.from_payload(payload_dict)
     if message_type == "follow_up_closed":
         return OrchestratorVoiceFollowUpClosedEvent.from_payload(payload_dict)
     if message_type == "barge_in_interrupt":
@@ -337,11 +380,11 @@ __all__ = [
     "OrchestratorVoiceAudioFrame",
     "OrchestratorVoiceBargeInInterruptEvent",
     "OrchestratorVoiceErrorEvent",
-    "OrchestratorVoiceFollowUpCaptureRequestedEvent",
     "OrchestratorVoiceFollowUpClosedEvent",
     "OrchestratorVoiceHelloRequest",
     "OrchestratorVoiceReadyEvent",
     "OrchestratorVoiceRuntimeStateEvent",
+    "OrchestratorVoiceTranscriptCommittedEvent",
     "OrchestratorVoiceWakeConfirmedEvent",
     "VoiceServerEvent",
     "decode_voice_server_event",

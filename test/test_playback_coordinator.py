@@ -45,6 +45,27 @@ class _ChunkPlayer:
         self.stop_calls += 1
 
 
+class _PCMChunkPlayer:
+    def __init__(self) -> None:
+        self.played: list[bytes] = []
+        self.sample_rates: list[int] = []
+        self.channels: list[int] = []
+        self.stop_calls = 0
+
+    def play_pcm16_chunks(self, chunks, *, sample_rate: int, channels: int = 1, should_stop=None) -> None:
+        payload = bytearray()
+        for chunk in chunks:
+            payload.extend(chunk)
+            if callable(should_stop) and should_stop():
+                break
+        self.played.append(bytes(payload))
+        self.sample_rates.append(sample_rate)
+        self.channels.append(channels)
+
+    def stop_playback(self) -> None:
+        self.stop_calls += 1
+
+
 class PlaybackCoordinatorTests(unittest.TestCase):
     def test_higher_priority_request_preempts_active_feedback(self) -> None:
         player = _BlockingTonePlayer()
@@ -97,6 +118,25 @@ class PlaybackCoordinatorTests(unittest.TestCase):
         coordinator.close(timeout_s=1.0)
 
         self.assertEqual(player.played, [b"ABC"])
+        self.assertFalse(result.preempted)
+        self.assertGreaterEqual(result.runtime_ms, 0.0)
+
+    def test_streamed_pcm16_playback_runs_through_single_queue(self) -> None:
+        player = _PCMChunkPlayer()
+        coordinator = PlaybackCoordinator(player)
+
+        result = coordinator.play_pcm16_chunks(
+            owner="feedback",
+            priority=PlaybackPriority.FEEDBACK,
+            chunks=iter((b"\x01\x00", b"\x02\x00", b"\x03\x00")),
+            sample_rate=24000,
+            channels=1,
+        )
+        coordinator.close(timeout_s=1.0)
+
+        self.assertEqual(player.played, [b"\x01\x00\x02\x00\x03\x00"])
+        self.assertEqual(player.sample_rates, [24000])
+        self.assertEqual(player.channels, [1])
         self.assertFalse(result.preempted)
         self.assertGreaterEqual(result.runtime_ms, 0.0)
 

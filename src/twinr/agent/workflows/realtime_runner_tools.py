@@ -84,6 +84,9 @@ class TwinrRealtimeToolDelegatesMixin:
     def _handle_update_personality_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_update_personality(arguments)
 
+    def _handle_manage_user_discovery_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
+        return self.tool_executor.handle_manage_user_discovery(arguments)
+
     def _handle_configure_world_intelligence_tool_call(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.tool_executor.handle_configure_world_intelligence(arguments)
 

@@ -38,3 +38,5 @@ hardware/display/vendor/
 .pytest*/
 .tmp_remote_chonky/
 .env*
+*.wav
+*.env

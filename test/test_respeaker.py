@@ -13,6 +13,7 @@ from twinr.hardware.respeaker import (
     AEC_SPENERGY_VALUES_PARAMETER,
     AUDIO_MGR_SELECTED_AZIMUTHS_PARAMETER,
     DOA_VALUE_PARAMETER,
+    LED_COLOR_PARAMETER,
     GPO_READ_VALUES_PARAMETER,
     VERSION_PARAMETER,
     ReSpeakerLibusbTransport,
@@ -269,6 +270,51 @@ class ReSpeakerProbeTests(unittest.TestCase):
         self.assertEqual(availability.reason, "permission_denied_or_transport_blocked")
         self.assertTrue(availability.requires_elevated_permissions)
         self.assertEqual(reads, {})
+
+    def test_libusb_transport_writes_led_color_payload(self) -> None:
+        class FakeBindings:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def init_context(self):
+                return object()
+
+            def open_device(self, context, vendor_id, product_id):
+                return object()
+
+            def close(self, handle) -> None:
+                return None
+
+            def exit(self, context) -> None:
+                return None
+
+            def control_transfer(self, handle, *, request_type, request, value, index, buffer, timeout_ms):
+                self.calls.append(
+                    {
+                        "request_type": request_type,
+                        "request": request,
+                        "value": value,
+                        "index": index,
+                        "payload": bytes(buffer),
+                        "timeout_ms": timeout_ms,
+                    }
+                )
+                return len(buffer)
+
+            def error_name(self, code: int) -> str:
+                return f"err_{code}"
+
+        bindings = FakeBindings()
+        transport = ReSpeakerLibusbTransport(bindings=bindings)
+
+        availability = transport.write_parameter(LED_COLOR_PARAMETER, (0xFFAA33,))
+
+        self.assertTrue(availability.available)
+        self.assertEqual(len(bindings.calls), 1)
+        self.assertEqual(bindings.calls[0]["request_type"], 0x40)
+        self.assertEqual(bindings.calls[0]["value"], LED_COLOR_PARAMETER.cmdid)
+        self.assertEqual(bindings.calls[0]["index"], LED_COLOR_PARAMETER.resid)
+        self.assertEqual(bindings.calls[0]["payload"], b"\x33\xaa\xff\x00")
 
     def test_snapshot_service_interprets_directional_primitives(self) -> None:
         class FakeTransport:

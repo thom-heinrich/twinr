@@ -1498,6 +1498,113 @@ def build_agent_tool_schemas(tool_names: Iterable[str] | str | bytes | bytearray
                 },
             }
         )
+    if "manage_user_discovery" in available:
+        tools.append(
+            {
+                "type": "function",
+                "name": "manage_user_discovery",
+                "description": (
+                    "Manage Twinr's guided get-to-know-you flow across the initial setup and later short lifelong-learning follow-ups. "
+                    "Use this when the user wants to start or continue the setup, offers to tell Twinr something about themselves, freely volunteers stable profile details that should enter the bounded discovery flow, answers an active get-to-know-you question, asks to pause or skip a topic, or says not now to a visible discovery invitation. "
+                    "When the user answered, include compact learned_facts in canonical English as durable summaries, not raw transcript quotes, and use one learned_fact or memory_route per distinct learned detail. "
+                    "Direct first-person profile statements or direct profile corrections from an identified speaker already count as approval for discovery saves or mutations."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": _string_property(
+                            "Discovery action.",
+                            enum=[
+                                "start_or_resume",
+                                "answer",
+                                "skip_topic",
+                                "pause_session",
+                                "snooze",
+                                "status",
+                                "review_profile",
+                                "replace_fact",
+                                "delete_fact",
+                            ],
+                        ),
+                        "topic_id": _string_property(
+                            "Optional predefined topic such as basics, companion_style, social, interests, hobbies, routines, pets, no_goes, or health.",
+                            min_length=1,
+                        ),
+                        "fact_id": _string_property(
+                            "Required for replace_fact and delete_fact. Use the exact fact_id from a prior review_profile result and omit it for other actions.",
+                            min_length=1,
+                        ),
+                        "learned_facts": _array_property(
+                            "Optional compact durable facts learned from the user's answer. Use canonical English, not raw transcript quotes.",
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "storage": _string_property(
+                                        "Use user_profile for stable personal facts and personality for how Twinr should address or behave toward the user.",
+                                        enum=["user_profile", "personality"],
+                                    ),
+                                    "text": _string_property(
+                                        "Short durable fact or behavior preference in canonical English.",
+                                        min_length=1,
+                                    ),
+                                },
+                                "required": ["storage", "text"],
+                                "additionalProperties": False,
+                            },
+                            max_items=8,
+                        ),
+                        "memory_routes": _array_property(
+                            "Optional structured durable routes learned from the user's answer or used as replacements. Use canonical English semantic text, create one route per distinct learned detail, and only fill fields relevant to that route_kind.",
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "route_kind": _string_property(
+                                        "Structured discovery route kind.",
+                                        enum=["user_profile", "personality", "contact", "preference", "plan", "durable_memory"],
+                                    ),
+                                    "text": _string_property("Managed-context fact text.", min_length=1),
+                                    "category": _string_property("Preference category.", min_length=1),
+                                    "given_name": _string_property("Contact given name.", min_length=1),
+                                    "family_name": _string_property("Contact family name.", min_length=1),
+                                    "phone": _string_property("Contact phone number.", min_length=1),
+                                    "email": _string_property("Contact email address.", min_length=1),
+                                    "role": _string_property("Contact role.", min_length=1),
+                                    "relation": _string_property("Contact relation to the user.", min_length=1),
+                                    "notes": _string_property("Short contact notes.", min_length=1),
+                                    "value": _string_property("Preference value.", min_length=1),
+                                    "sentiment": _string_property("Preference sentiment.", enum=["prefer", "like", "dislike", "avoid"]),
+                                    "for_product": _string_property("Optional preference scope or product.", min_length=1),
+                                    "summary": _string_property("Plan or durable-memory summary.", min_length=1),
+                                    "when_text": _string_property("Optional natural-language timing text for a plan.", min_length=1),
+                                    "details": _string_property("Optional additional details.", min_length=1),
+                                    "kind": _string_property("Durable-memory kind label.", min_length=1),
+                                },
+                                "required": ["route_kind"],
+                                "additionalProperties": False,
+                            },
+                            max_items=8,
+                        ),
+                        "topic_complete": _boolean_property(
+                            "Set true only when the current topic is sufficiently covered for now and Twinr may move on or wrap up."
+                        ),
+                        "permission_granted": _boolean_property(
+                            "For sensitive topics such as health, set true only after the user clearly agreed to continue on that topic, or false when the user declined."
+                        ),
+                        "snooze_days": _number_property(
+                            "Optional whole-number snooze length in days for not-now responses.",
+                            minimum=1,
+                            maximum=14,
+                            integer=True,
+                        ),
+                        "confirmed": _boolean_property(
+                            "Set true only after the user clearly confirmed the persistent save when speaker confirmation is required."
+                        ),
+                    },
+                    "required": ["action"],
+                    "additionalProperties": False,
+                },
+            }
+        )
     if "configure_world_intelligence" in available:
         tools.append(
             {

@@ -43,6 +43,7 @@ from twinr.hardware.printer import RawReceiptPrinter
 from twinr.hardware.voice_profile import VoiceProfileMonitor
 from twinr.ops.usage import TwinrUsageStore
 from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
+from twinr.agent.workflows.startup_boot_sound import start_startup_boot_sound
 from twinr.agent.workflows.working_feedback import WorkingFeedbackKind, start_working_feedback_loop
 from twinr.proactive import (
     ProactiveGovernorCandidate,
@@ -496,6 +497,12 @@ class TwinrHardwareLoop:
         poll_timeout = self._coerce_non_negative_float(poll_timeout, 0.25, minimum=0.01)
         started_at = time.monotonic()
         self._emit_status(force=True)
+        if self.runtime.status.value != "error":
+            start_startup_boot_sound(
+                config=self.config,
+                playback_coordinator=self.playback_coordinator,
+                emit=self.emit,
+            )
         with ExitStack() as stack:
             monitor = stack.enter_context(self.button_monitor)
             if self.proactive_monitor is not None:
@@ -1192,6 +1199,7 @@ class TwinrHardwareLoop:
                 self.player,
                 kind=kind,
                 sample_rate=self.config.audio_sample_rate,
+                config=self.config,
                 emit=self.emit,
                 delay_override_ms=(
                     self.config.processing_feedback_delay_ms

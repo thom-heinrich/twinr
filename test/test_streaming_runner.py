@@ -38,6 +38,7 @@ from twinr.providers.openai import (
     OpenAIToolCallingAgentProvider,
     OpenAITextResponse,
 )
+from twinr.proactive.runtime.gesture_wakeup_lane import GestureWakeupDecision
 from twinr.runtime import TwinrRuntime
 from twinr.state_machine import TwinrEvent, TwinrStatus
 
@@ -663,7 +664,7 @@ class FakeVoiceOrchestrator:
         self.paused: list[str] = []
         self.resumed: list[str] = []
 
-    def notify_runtime_state(self, *, state: str, detail: str | None = None, follow_up_allowed: bool = False) -> None:
+    def notify_runtime_state(self, *, state: str, detail: str | None = None, follow_up_allowed: bool = False, **_kwargs) -> None:
         self.states.append((state, detail, follow_up_allowed))
 
     def pause_capture(self, *, reason: str) -> None:
@@ -923,7 +924,7 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertGreaterEqual(refresh_calls_after_resume, 1)
         self.assertEqual(runtime.refresh_snapshot_activity_calls, refresh_calls_after_resume)
 
-    def test_audio_turn_pauses_voice_orchestrator_before_local_capture(self) -> None:
+    def test_audio_turn_uses_same_stream_remote_commit_when_voice_orchestrator_owns_listening(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config = TwinrConfig(
                 openai_api_key="test-key",
@@ -931,7 +932,7 @@ class StreamingRunnerTests(unittest.TestCase):
                 personality_dir="personality",
                 long_term_memory_query_rewrite_enabled=False,
             )
-            recorder = FakeRecorder()
+            recorder = FailIfCalledRecorder()
             loop = TwinrStreamingHardwareLoop(
                 config=config,
                 runtime=TwinrRuntime(config=config),
@@ -948,15 +949,25 @@ class StreamingRunnerTests(unittest.TestCase):
                 button_monitor=SimpleNamespace(),
                 proactive_monitor=SimpleNamespace(),
             )
-            fake_voice = FakeVoiceOrchestrator()
-            capture_states: list[tuple[list[str], list[str]]] = []
-            original_capture = recorder.capture_pcm_until_pause_with_options
+            class _AutoCommitVoiceOrchestrator(FakeVoiceOrchestrator):
+                def notify_runtime_state(
+                    self,
+                    *,
+                    state: str,
+                    detail: str | None = None,
+                    follow_up_allowed: bool = False,
+                    **kwargs,
+                ) -> None:
+                    super().notify_runtime_state(
+                        state=state,
+                        detail=detail,
+                        follow_up_allowed=follow_up_allowed,
+                        **kwargs,
+                    )
+                    if state == "listening":
+                        loop.handle_remote_transcript_committed("wie geht es dir", "listening")
 
-            def capture_with_pause_snapshot(**kwargs):
-                capture_states.append((list(fake_voice.paused), list(fake_voice.resumed)))
-                return original_capture(**kwargs)
-
-            recorder.capture_pcm_until_pause_with_options = capture_with_pause_snapshot  # type: ignore[method-assign]
+            fake_voice = _AutoCommitVoiceOrchestrator()
             loop.voice_orchestrator = fake_voice
             completed_turns: list[dict[str, object]] = []
 
@@ -985,10 +996,78 @@ class StreamingRunnerTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertEqual(fake_voice.states, [("listening", "wakeword", False)])
-        self.assertEqual(capture_states, [(["wakeword"], [])])
-        self.assertEqual(fake_voice.paused, ["wakeword"])
-        self.assertEqual(fake_voice.resumed, ["wakeword"])
+        self.assertEqual(fake_voice.paused, [])
+        self.assertEqual(fake_voice.resumed, [])
+        self.assertEqual(completed_turns[0]["transcript"], "wie geht es dir")
         self.assertEqual(completed_turns[0]["listen_source"], "wakeword")
+
+    def test_gesture_wakeup_streaming_loop_uses_same_stream_remote_commit(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            recorder = FailIfCalledRecorder()
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=TwinrRuntime(config=config),
+                tool_agent_provider=FakeToolAgentProvider(config),
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                recorder=recorder,
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            class _AutoCommitVoiceOrchestrator(FakeVoiceOrchestrator):
+                def notify_runtime_state(
+                    self,
+                    *,
+                    state: str,
+                    detail: str | None = None,
+                    follow_up_allowed: bool = False,
+                    **kwargs,
+                ) -> None:
+                    super().notify_runtime_state(
+                        state=state,
+                        detail=detail,
+                        follow_up_allowed=follow_up_allowed,
+                        **kwargs,
+                    )
+                    if state == "listening":
+                        loop.handle_remote_transcript_committed("erzaehl mir die news", "listening")
+
+            fake_voice = _AutoCommitVoiceOrchestrator()
+            loop.voice_orchestrator = fake_voice
+            completed_turns: list[dict[str, object]] = []
+
+            def complete_streaming_turn(**kwargs):
+                completed_turns.append(dict(kwargs))
+                return True
+
+            loop._complete_streaming_turn = complete_streaming_turn  # type: ignore[method-assign]
+
+            handled = loop.handle_gesture_wakeup(
+                GestureWakeupDecision(
+                    active=True,
+                    reason="gesture_wakeup:peace_sign",
+                    confidence=0.92,
+                )
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual(fake_voice.states, [("listening", "gesture", False)])
+        self.assertEqual(fake_voice.paused, [])
+        self.assertEqual(fake_voice.resumed, [])
+        self.assertEqual(completed_turns[0]["transcript"], "erzaehl mir die news")
+        self.assertEqual(completed_turns[0]["listen_source"], "gesture")
 
     def test_openai_dual_lane_uses_separate_backends_per_lane(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -2313,6 +2392,112 @@ class StreamingRunnerTests(unittest.TestCase):
         self.assertIsNotNone(reply)
         self.assertEqual(reply.spoken_text, "Ich schaue kurz nach.")
         self.assertEqual(len(decision_provider.calls), prewarm_calls + 1)
+
+    def test_search_prefetch_uses_extended_final_lane_timeout_budget(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                streaming_final_lane_watchdog_timeout_ms=4000,
+                streaming_final_lane_hard_timeout_ms=15000,
+                streaming_search_final_lane_watchdog_timeout_ms=6500,
+                streaming_search_final_lane_hard_timeout_ms=28000,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            decision = SimpleNamespace(
+                action="handoff",
+                spoken_ack=None,
+                spoken_reply=None,
+                kind="search",
+                goal="search",
+                allow_web_search=True,
+                response_id="resp_prefetch",
+                request_id="req_prefetch",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            loop._resolve_local_semantic_route = lambda transcript: None  # type: ignore[method-assign]
+            loop._consume_speculative_supervisor_decision = lambda transcript: decision  # type: ignore[method-assign]
+
+            lane_plan = loop._build_streaming_turn_lane_plan("Was ist in Hamburg los?")
+
+        self.assertTrue(lane_plan.is_dual_lane)
+        self.assertIsNotNone(lane_plan.timeout_policy)
+        assert lane_plan.timeout_policy is not None
+        self.assertEqual(lane_plan.timeout_policy.final_lane_watchdog_timeout_ms, 6500)
+        self.assertEqual(lane_plan.timeout_policy.final_lane_hard_timeout_ms, 28000)
+
+    def test_direct_dual_lane_turn_keeps_generic_final_lane_timeout_budget(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                openai_api_key="test-key",
+                project_root=temp_dir,
+                personality_dir="personality",
+                streaming_final_lane_watchdog_timeout_ms=4000,
+                streaming_final_lane_hard_timeout_ms=15000,
+                streaming_search_final_lane_watchdog_timeout_ms=6500,
+                streaming_search_final_lane_hard_timeout_ms=28000,
+                long_term_memory_query_rewrite_enabled=False,
+            )
+            runtime = TwinrRuntime(config=config)
+            dual_lane = CapturingDualLaneLoop()
+            loop = TwinrStreamingHardwareLoop(
+                config=config,
+                runtime=runtime,
+                tool_agent_provider=FakeToolAgentProvider(config),
+                streaming_turn_loop=dual_lane,
+                print_backend=FakePrintBackend(config),
+                stt_provider=FakeSpeechToTextProvider(config),
+                agent_provider=FakePrintBackend(config),
+                tts_provider=FakeTextToSpeechProvider(config),
+                player=FakePlayer(),
+                printer=FakePrinter(),
+                voice_profile_monitor=FakeVoiceProfileMonitor(),
+                usage_store=FakeUsageStore(),
+                button_monitor=SimpleNamespace(),
+                proactive_monitor=SimpleNamespace(),
+            )
+            decision = SimpleNamespace(
+                action="direct",
+                spoken_ack=None,
+                spoken_reply="Kurz gesagt: Es geht um Haushalt und Verkehr.",
+                kind=None,
+                goal=None,
+                allow_web_search=False,
+                response_id="resp_prefetch",
+                request_id="req_prefetch",
+                model="gpt-4o-mini",
+                token_usage=None,
+            )
+            loop._resolve_local_semantic_route = lambda transcript: None  # type: ignore[method-assign]
+            loop._consume_speculative_supervisor_decision = lambda transcript: decision  # type: ignore[method-assign]
+
+            lane_plan = loop._build_streaming_turn_lane_plan("Was ist in Hamburg los?")
+
+        self.assertTrue(lane_plan.is_dual_lane)
+        self.assertIsNotNone(lane_plan.timeout_policy)
+        assert lane_plan.timeout_policy is not None
+        self.assertEqual(lane_plan.timeout_policy.final_lane_watchdog_timeout_ms, 4000)
+        self.assertEqual(lane_plan.timeout_policy.final_lane_hard_timeout_ms, 15000)
 
     def test_direct_goodbye_turn_uses_closure_guard_to_suppress_follow_up(self) -> None:
         with TemporaryDirectory() as temp_dir:

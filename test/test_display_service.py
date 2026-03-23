@@ -14,6 +14,11 @@ from twinr.display.ambient_impulse_cues import (
     DisplayAmbientImpulseCueStore,
 )
 from twinr.display import service as display_service_mod
+from twinr.display.debug_signals import (
+    DisplayDebugSignal,
+    DisplayDebugSignalSnapshot,
+    DisplayDebugSignalStore,
+)
 from twinr.display.emoji_cues import DisplayEmojiCue, DisplayEmojiCueStore
 from twinr.display.face_cues import DisplayFaceCue, DisplayFaceCueStore
 from twinr.display.heartbeat import DisplayHeartbeatStore
@@ -38,6 +43,7 @@ class FakeDisplay:
                 DisplayEmojiCue | None,
                 DisplayAmbientImpulseCue | None,
                 DisplayPresentationCue | None,
+                tuple[DisplayDebugSignal, ...],
             ]
         ] = []
 
@@ -55,6 +61,7 @@ class FakeDisplay:
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
+        debug_signals: tuple[DisplayDebugSignal, ...] = (),
     ) -> None:
         self.calls.append(
             (
@@ -69,6 +76,7 @@ class FakeDisplay:
                 emoji_cue,
                 ambient_impulse_cue,
                 presentation_cue,
+                debug_signals,
             )
         )
 
@@ -113,6 +121,7 @@ class ReopenableDisplay:
         emoji_cue: DisplayEmojiCue | None = None,
         ambient_impulse_cue: DisplayAmbientImpulseCue | None = None,
         presentation_cue: DisplayPresentationCue | None = None,
+        debug_signals: tuple[DisplayDebugSignal, ...] = (),
     ) -> None:
         del (
             status,
@@ -126,6 +135,7 @@ class ReopenableDisplay:
             emoji_cue,
             ambient_impulse_cue,
             presentation_cue,
+            debug_signals,
         )
         if self.fail:
             raise RuntimeError("boom")
@@ -232,7 +242,7 @@ class DisplayServiceTests(unittest.TestCase):
             self.assertEqual(
                 [
                     (status, headline, details)
-                    for status, headline, _ticker, details, _fields, _logs, _frame, _cue, _emoji, _ambient, _presentation in display.calls
+                    for status, headline, _ticker, details, _fields, _logs, _frame, _cue, _emoji, _ambient, _presentation, _signals in display.calls
                 ],
                 [
                     ("waiting", "Waiting", ("Internet ok", "AI ok", "System ok", "Zeit 12:34")),
@@ -379,6 +389,7 @@ class DisplayServiceTests(unittest.TestCase):
             emoji_cue=None,
             ambient_impulse_cue=None,
             presentation_cue=None,
+            debug_signals=(),
         )
 
         self.assertTrue(rendered)
@@ -1024,6 +1035,69 @@ class DisplayServiceTests(unittest.TestCase):
         self.assertEqual(cue.title, "Family Call")
         self.assertEqual(cue.body_lines, ("Tap green and answer",))
         self.assertEqual(cue.accent, "warm")
+
+    def test_display_loop_forwards_active_debug_signals_to_default_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            snapshot_path = root / "state" / "runtime-state.json"
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            store = RuntimeSnapshotStore(snapshot_path)
+            store.save(
+                status="waiting",
+                memory_turns=(),
+                last_transcript=None,
+                last_response="Hallo Thom",
+            )
+            config = TwinrConfig(
+                project_root=str(root),
+                runtime_state_path=str(snapshot_path),
+                display_poll_interval_s=0.0,
+                openai_api_key="sk-test",
+            )
+            debug_signal_store = DisplayDebugSignalStore.from_config(config)
+            save_now = datetime.now(timezone.utc)
+            debug_signal_store.save(
+                DisplayDebugSignalSnapshot(
+                    source="test",
+                    signals=(
+                        DisplayDebugSignal(
+                            key="motion_state",
+                            label="MOTION_STILL",
+                            accent="neutral",
+                            priority=90,
+                        ),
+                        DisplayDebugSignal(
+                            key="person_visible",
+                            label="PERSON_1",
+                            accent="info",
+                            priority=70,
+                        ),
+                    ),
+                ),
+                hold_seconds=15.0,
+                now=save_now,
+            )
+            display = FakeDisplay()
+            loop = TwinrStatusDisplayLoop(
+                config=config,
+                display=display,
+                snapshot_store=store,
+                emit=lambda _line: None,
+                sleep=lambda _seconds: None,
+                health_collector=lambda _config, *, snapshot=None: self.make_health(),
+                internet_probe=lambda: True,
+                clock=self.make_clock(),
+                debug_signal_store=debug_signal_store,
+            )
+
+            loop.run(max_cycles=1)
+
+        self.assertEqual(len(display.calls), 1)
+        signals = display.calls[0][11]
+        self.assertEqual(
+            tuple(signal.label for signal in signals),
+            ("MOTION_STILL", "PERSON_1"),
+        )
 
     def test_all_statuses_have_six_to_twelve_frames(self) -> None:
         loop = TwinrStatusDisplayLoop(

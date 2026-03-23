@@ -195,6 +195,9 @@ class OpenAISearchResult:
     model: str | None = None
     token_usage: TokenUsage | None = None
     used_web_search: bool = False
+    requested_model: str | None = None
+    fallback_reason: str | None = None
+    attempt_log: tuple["OpenAISearchAttempt", ...] = ()
 
     def __post_init__(self) -> None:
         """Normalize ``sources`` into an immutable tuple of strings."""
@@ -206,6 +209,59 @@ class OpenAISearchResult:
         if any(not isinstance(source, str) for source in normalized_sources):
             raise TypeError("sources must contain only strings")
         object.__setattr__(self, "sources", normalized_sources)
+        normalized_requested_model = str(self.requested_model).strip() if self.requested_model is not None else None
+        object.__setattr__(self, "requested_model", normalized_requested_model or None)
+        normalized_fallback_reason = str(self.fallback_reason).strip() if self.fallback_reason is not None else None
+        object.__setattr__(self, "fallback_reason", normalized_fallback_reason or None)
+        normalized_attempt_log = tuple(self.attempt_log)
+        if any(not isinstance(item, OpenAISearchAttempt) for item in normalized_attempt_log):
+            raise TypeError("attempt_log must contain only OpenAISearchAttempt items")
+        object.__setattr__(self, "attempt_log", normalized_attempt_log)
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAISearchAttempt:
+    """Capture one model attempt made while resolving a live web-search turn."""
+
+    model: str
+    api_path: str
+    max_output_tokens: int | None = None
+    outcome: str = "unknown"
+    status: str | None = None
+    detail: str | None = None
+
+    def __post_init__(self) -> None:
+        """Normalize structured search-attempt fields."""
+
+        normalized_model = str(self.model).strip()
+        if not normalized_model:
+            raise ValueError("model must not be empty")
+        object.__setattr__(self, "model", normalized_model)
+
+        normalized_api_path = str(self.api_path).strip().lower()
+        if not normalized_api_path:
+            raise ValueError("api_path must not be empty")
+        object.__setattr__(self, "api_path", normalized_api_path)
+
+        normalized_outcome = str(self.outcome).strip().lower() or "unknown"
+        object.__setattr__(self, "outcome", normalized_outcome)
+
+        normalized_status = str(self.status).strip().lower() if self.status is not None else None
+        object.__setattr__(self, "status", normalized_status or None)
+
+        normalized_detail = str(self.detail).strip() if self.detail is not None else None
+        object.__setattr__(self, "detail", normalized_detail or None)
+
+        max_output_tokens = self.max_output_tokens
+        if max_output_tokens is None:
+            return
+        try:
+            normalized_budget = int(max_output_tokens)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("max_output_tokens must be int or None") from exc
+        if normalized_budget <= 0:
+            raise ValueError("max_output_tokens must be > 0")
+        object.__setattr__(self, "max_output_tokens", normalized_budget)
 
 
 @dataclass(frozen=True, slots=True)

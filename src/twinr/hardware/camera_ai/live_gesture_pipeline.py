@@ -364,17 +364,25 @@ class LiveGesturePipeline:
                     debug_snapshot["resolved_source"] = (
                         "live_hand_roi" if hand_box_source == "live" else "recent_live_hand_roi"
                     )
-            if (
-                fine_hand_gesture == AICameraFineHandGesture.NONE
-                and not effective_visible_person_boxes
-                and not effective_hand_boxes
-            ):
+            full_frame_rescue_reason = _resolve_full_frame_rescue_reason(
+                fine_hand_gesture=fine_hand_gesture,
+                effective_visible_person_boxes=effective_visible_person_boxes,
+                effective_hand_boxes=effective_hand_boxes,
+                person_roi_detection_count=int(debug_snapshot.get("person_roi_detection_count", 0)),
+                live_roi_hand_box_count=int(debug_snapshot.get("live_roi_hand_box_count", 0)),
+                live_roi_combined_gesture=str(
+                    debug_snapshot.get("live_roi_combined_gesture", AICameraFineHandGesture.NONE.value)
+                    or AICameraFineHandGesture.NONE.value
+                ),
+            )
+            if full_frame_rescue_reason is not None:
                 full_frame_choice, full_frame_debug = self._recognize_from_full_frame_hand_landmarks(
                     runtime=runtime,
                     frame_rgb=frame_rgb,
                     timestamp_ms=timestamp_ms,
                 )
                 debug_snapshot.update(full_frame_debug)
+                debug_snapshot["full_frame_hand_attempt_reason"] = full_frame_rescue_reason
                 hand_count = max(hand_count, int(debug_snapshot["full_frame_hand_detection_count"]))
                 if full_frame_choice[0] != AICameraFineHandGesture.NONE:
                     fine_hand_gesture, fine_hand_confidence = full_frame_choice
@@ -913,6 +921,38 @@ def _crop_hand_box(
         return frame_rgb[y0:y1, x0:x1]
     except Exception:
         return None
+
+
+def _resolve_full_frame_rescue_reason(
+    *,
+    fine_hand_gesture: AICameraFineHandGesture,
+    effective_visible_person_boxes: tuple[AICameraBox, ...],
+    effective_hand_boxes: tuple[tuple[float, float, float, float], ...],
+    person_roi_detection_count: int,
+    live_roi_hand_box_count: int,
+    live_roi_combined_gesture: str,
+) -> str | None:
+    """Explain when the bounded whole-frame hand rescue is still justified."""
+
+    if fine_hand_gesture != AICameraFineHandGesture.NONE:
+        return None
+    if not effective_visible_person_boxes:
+        if not effective_hand_boxes:
+            return "no_person_roi_or_live_hand_box"
+        if (
+            live_roi_hand_box_count > 0
+            and live_roi_combined_gesture == AICameraFineHandGesture.NONE.value
+        ):
+            return "live_hand_roi_without_symbol"
+        return None
+    if (
+        live_roi_hand_box_count > 0
+        and live_roi_combined_gesture == AICameraFineHandGesture.NONE.value
+    ):
+        return "live_hand_roi_without_symbol"
+    if person_roi_detection_count <= 0:
+        return "visible_person_roi_without_hand_detection"
+    return None
 
 
 def _open_palm_score(categories: object) -> float | None:

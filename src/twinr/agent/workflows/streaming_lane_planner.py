@@ -11,6 +11,9 @@ from twinr.agent.tools import (
     build_tool_agent_instructions,
 )
 from twinr.agent.base_agent.contracts import supervisor_decision_requires_full_context
+from twinr.agent.workflows.streaming_supervisor_context import (
+    build_streaming_supervisor_turn_instructions,
+)
 from twinr.agent.workflows.streaming_turn_coordinator import StreamingTurnLanePlan
 from twinr.agent.workflows.streaming_turn_orchestrator import StreamingTurnTimeoutPolicy
 
@@ -192,6 +195,7 @@ class StreamingLanePlanner:
         search_context = None
         supervisor_context = None
         supervisor_direct_context = None
+        supervisor_turn_instructions = None
         tool_context = None
         skip_structured_supervisor_decision = False
 
@@ -252,6 +256,12 @@ class StreamingLanePlanner:
                     loop.runtime.tool_provider_conversation_context(),
                 )
             return tool_context
+
+        def _supervisor_turn_instructions():
+            nonlocal supervisor_turn_instructions
+            if supervisor_turn_instructions is None:
+                supervisor_turn_instructions = build_streaming_supervisor_turn_instructions(loop.config)
+            return supervisor_turn_instructions
 
         def _handoff_context(decision):
             kind = str(getattr(decision, "kind", "") or "").strip().lower()
@@ -333,7 +343,7 @@ class StreamingLanePlanner:
                 resolved_decision = loop.streaming_turn_loop.resolve_supervisor_decision(
                     transcript,
                     conversation=_supervisor_context(),
-                    instructions=turn_instructions,
+                    instructions=_supervisor_turn_instructions(),
                     should_stop=loop._active_turn_stop_requested,
                 )
             if resolved_decision is not None:
@@ -348,7 +358,7 @@ class StreamingLanePlanner:
                     resolved_decision = loop.streaming_turn_loop.resolve_supervisor_decision(
                         transcript,
                         conversation=_supervisor_direct_context(),
-                        instructions=turn_instructions,
+                        instructions=_supervisor_turn_instructions(),
                         should_stop=loop._active_turn_stop_requested,
                     )
                     action = str(getattr(resolved_decision, "action", "") or "").strip().lower()

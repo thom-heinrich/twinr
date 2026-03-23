@@ -21,6 +21,7 @@ from typing import Any
 from twinr.agent.base_agent.config import TwinrConfig
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCue
 from twinr.display.contracts import DisplayLogSections, DisplayStateFields
+from twinr.display.debug_signals import DisplayDebugSignal
 from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.display.face_cues import DisplayFaceCue
 from twinr.display.hdmi_default_scene import (
@@ -179,6 +180,7 @@ class HdmiFramebufferDisplay:
         details: tuple[str, ...] = (),
         state_fields: DisplayStateFields = (),
         log_sections: DisplayLogSections = (),
+        debug_signals: tuple[DisplayDebugSignal, ...] = (),
         animation_frame: int = 0,
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
@@ -194,6 +196,7 @@ class HdmiFramebufferDisplay:
             details=details,
             state_fields=state_fields,
             log_sections=log_sections,
+            debug_signals=debug_signals,
             animation_frame=animation_frame,
             face_cue=face_cue,
             emoji_cue=emoji_cue,
@@ -265,7 +268,8 @@ class HdmiFramebufferDisplay:
         details: tuple[str, ...],
         state_fields: DisplayStateFields,
         log_sections: DisplayLogSections,
-        animation_frame: int,
+        debug_signals: tuple[DisplayDebugSignal, ...] = (),
+        animation_frame: int = 0,
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
         emoji_cue: DisplayEmojiCue | None = None,
@@ -300,6 +304,7 @@ class HdmiFramebufferDisplay:
                 helper_text=helper_text,
                 state_fields=ordered_fields,
                 log_sections=log_sections,
+                debug_signals=debug_signals,
             )
             return image
 
@@ -313,6 +318,7 @@ class HdmiFramebufferDisplay:
             ticker_text=ticker_text,
             helper_text=helper_text,
             state_fields=ordered_fields,
+            debug_signals=debug_signals,
             animation_frame=animation_frame,
             face_cue=face_cue,
             emoji_cue=emoji_cue,
@@ -352,6 +358,7 @@ class HdmiFramebufferDisplay:
         headline: str,
         helper_text: str,
         state_fields: DisplayStateFields,
+        debug_signals: tuple[DisplayDebugSignal, ...],
         animation_frame: int,
         ticker_text: str | None = None,
         face_cue: DisplayFaceCue | None = None,
@@ -370,6 +377,7 @@ class HdmiFramebufferDisplay:
             ticker_text=ticker_text,
             helper_text=helper_text,
             state_fields=state_fields,
+            debug_signals=debug_signals,
             animation_frame=animation_frame,
             face_cue=face_cue,
             emoji_cue=emoji_cue,
@@ -401,7 +409,9 @@ class HdmiFramebufferDisplay:
         helper_text: str,
         state_fields: DisplayStateFields,
         log_sections: DisplayLogSections,
+        debug_signals: tuple[DisplayDebugSignal, ...] = (),
     ) -> None:
+        del debug_signals
         header_font = self._font(20, bold=True)
         status_font = self._font(38, bold=True)
         helper_font = self._font(18, bold=False)

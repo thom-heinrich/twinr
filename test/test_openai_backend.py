@@ -565,13 +565,25 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertTrue(request["prompt_cache_key"].startswith("twinr:search:"))
         self.assertLessEqual(len(request["prompt_cache_key"]), 64)
         self.assertEqual(request["reasoning"], {"effort": "low"})
-        self.assertEqual(request["max_output_tokens"], 160)
-        self.assertEqual(request["input"][-1]["content"][0]["text"], "Wie wird das Wetter morgen?")
+        self.assertEqual(request["max_output_tokens"], 1024)
+        prompt = request["input"][-1]["content"][0]["text"]
+        self.assertIn("User question: Wie wird das Wetter morgen?", prompt)
+        self.assertIn("Resolved explicit-date variant: Wie wird das Wetter am 2026-03-13?", prompt)
+        self.assertIn("Explicit place context: Schwarzenbek", prompt)
+        self.assertIn("Explicit local date/time context: Friday, 2026-03-13 10:00 (Europe/Berlin)", prompt)
         self.assertEqual(request["tools"][0]["user_location"]["city"], "Schwarzenbek")
+        self.assertIn(
+            "authoritative disambiguation for partial wording",
+            request["instructions"],
+        )
+        self.assertIn(
+            "Avoid stiff, bureaucratic, or institutional wording.",
+            self.responses.calls[-1]["instructions"],
+        )
         self.assertEqual(self.responses.calls[-1]["text"]["format"]["name"], "twinr_live_search_spoken_answer")
         self.assertNotIn("tools", self.responses.calls[-1])
 
-    def test_search_live_info_uses_only_literal_user_query(self) -> None:
+    def test_search_live_info_uses_bounded_search_conversation_and_explicit_context_prompt(self) -> None:
         self.responses.output_text = "Morgen in Schwarzenbek 11 Grad, leichter Regen."
 
         backend = OpenAIBackend(
@@ -602,9 +614,15 @@ class OpenAIBackendTests(unittest.TestCase):
 
         request = self.responses.calls[0]
         self.assertNotIn("THIS SHOULD NOT REACH THE SEARCH HELPER", request["instructions"])
-        self.assertEqual(len(request["input"]), 1)
-        self.assertEqual(request["input"][0]["role"], "user")
+        self.assertEqual([item["role"] for item in request["input"]], ["user", "assistant", "user", "user"])
         self.assertEqual(request["input"][0]["content"][0]["text"], "Und morgen?")
+        self.assertEqual(request["input"][1]["content"][0]["text"], "Ich prüfe das live.")
+        self.assertEqual(request["input"][2]["content"][0]["text"], "Bitte mit Temperatur und Regen.")
+        prompt = request["input"][-1]["content"][0]["text"]
+        self.assertIn("User question: Und morgen?", prompt)
+        self.assertIn("Explicit place context: Schwarzenbek", prompt)
+        self.assertNotIn("very long system context", str(request["input"]))
+        self.assertNotIn("Long-term system block", str(request["input"]))
 
     def test_search_live_info_does_not_inject_default_city_when_location_hint_is_missing(self) -> None:
         self.responses.output_text = "In Schwarzenbek 9 Grad, trocken."
@@ -646,7 +664,7 @@ class OpenAIBackendTests(unittest.TestCase):
             set(_SUPERVISOR_DECISION_SCHEMA["properties"]),
         )
 
-    def test_search_live_info_falls_back_to_chat_latest_when_primary_search_model_returns_blank(self) -> None:
+    def test_search_live_info_falls_back_to_main_model_when_primary_search_model_returns_blank(self) -> None:
         class BlankThenAnswerResponses:
             def __init__(self) -> None:
                 self.calls: list[dict] = []
@@ -681,7 +699,7 @@ class OpenAIBackendTests(unittest.TestCase):
                 )
 
         backend = OpenAIBackend(
-            config=replace(self.config, openai_search_model="gpt-5.2"),
+            config=replace(self.config, default_model="gpt-5.4-mini", openai_search_model="gpt-5.2"),
             client=SimpleNamespace(
                 responses=BlankThenAnswerResponses(),
                 audio=SimpleNamespace(
@@ -696,12 +714,270 @@ class OpenAIBackendTests(unittest.TestCase):
         self.assertEqual(result.answer, "Morgen in Schwarzenbek bis 11 Grad und zeitweise Regen.")
         self.assertEqual(
             [call["model"] for call in backend._client.responses.calls],
-            ["gpt-5.2", "gpt-5.2", "gpt-4o-mini", "gpt-5.2", "gpt-4o-mini"],
+            ["gpt-5.2", "gpt-5.2", "gpt-5.4-mini", "gpt-5.4-mini"],
         )
+        self.assertEqual([call["max_output_tokens"] for call in backend._client.responses.calls[:3]], [1024, 1536, 1024])
+        self.assertEqual(result.requested_model, "gpt-5.2")
+        self.assertEqual(result.model, "gpt-5.4-mini")
+        self.assertIn("gpt-5.2->gpt-5.4-mini", result.fallback_reason or "")
+        self.assertEqual(tuple(attempt.outcome for attempt in result.attempt_log), ("unusable", "unusable", "success"))
+
+    def test_search_live_info_retries_blank_completed_same_model_before_fallback(self) -> None:
+        class BlankCompletedThenAnswerResponses:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                response_format = ((kwargs.get("text") or {}).get("format") or {})
+                if response_format.get("name") == "twinr_live_search_spoken_answer":
+                    return SimpleNamespace(
+                        id="resp_voice",
+                        _request_id="req_voice",
+                        model="gpt-5.4-mini-2026-03-17",
+                        usage=_fake_usage(),
+                        output_text=json.dumps(
+                            {"spoken_answer": "Agentische KI wird gerade stärker in echte Arbeitsabläufe eingebaut."}
+                        ),
+                        output=[
+                            SimpleNamespace(
+                                type="message",
+                                status="completed",
+                                content=[
+                                    SimpleNamespace(
+                                        type="output_text",
+                                        text="Agentische KI wird gerade stärker in echte Arbeitsabläufe eingebaut.",
+                                    )
+                                ],
+                            )
+                        ],
+                    )
+
+                budget = kwargs["max_output_tokens"]
+                if budget < 1536:
+                    return SimpleNamespace(
+                        id=f"resp_blank_{budget}",
+                        _request_id=f"req_blank_{budget}",
+                        model="gpt-5.4-mini-2026-03-17",
+                        usage=_fake_usage(),
+                        status="completed",
+                        output_text="",
+                        output=[SimpleNamespace(type="web_search_call")],
+                    )
+
+                return SimpleNamespace(
+                    id="resp_complete",
+                    _request_id="req_complete",
+                    model="gpt-5.4-mini-2026-03-17",
+                    usage=_fake_usage(),
+                    status="completed",
+                    output_text="Agentische KI wird gerade stärker in echte Arbeitsabläufe eingebaut.",
+                    output=[
+                        SimpleNamespace(type="web_search_call"),
+                        SimpleNamespace(
+                            type="message",
+                            status="completed",
+                            content=[
+                                SimpleNamespace(
+                                    type="output_text",
+                                    text="Agentische KI wird gerade stärker in echte Arbeitsabläufe eingebaut.",
+                                )
+                            ],
+                        ),
+                    ],
+                )
+
+        backend = OpenAIBackend(
+            config=replace(
+                self.config,
+                openai_search_model="gpt-5.4-mini",
+                openai_search_max_output_tokens=160,
+                openai_search_retry_max_output_tokens=240,
+            ),
+            client=SimpleNamespace(
+                responses=BlankCompletedThenAnswerResponses(),
+                audio=SimpleNamespace(
+                    transcriptions=self.transcriptions,
+                    speech=self.speech,
+                ),
+            ),
+        )
+
+        result = backend.search_live_info_with_metadata("Was gibt es Neues zu KI-Begleitern und agentischer KI?")
+
         self.assertEqual(
-            [call["max_output_tokens"] for call in backend._client.responses.calls[:3]],
-            [160, 240, 160],
+            result.answer,
+            "Agentische KI wird gerade stärker in echte Arbeitsabläufe eingebaut.",
         )
+        self.assertEqual(result.requested_model, "gpt-5.4-mini")
+        self.assertEqual(result.model, "gpt-5.4-mini-2026-03-17")
+        self.assertIsNone(result.fallback_reason)
+        self.assertEqual(
+            [call["max_output_tokens"] for call in backend._client.responses.calls[:-1]],
+            [160, 240, 512, 768, 1024, 1536],
+        )
+        self.assertEqual(backend._client.responses.calls[-1]["max_output_tokens"], 160)
+        self.assertEqual(
+            tuple(attempt.outcome for attempt in result.attempt_log),
+            ("retry", "retry", "retry", "retry", "retry", "success"),
+        )
+        self.assertTrue(all(attempt.model == "gpt-5.4-mini" for attempt in result.attempt_log))
+
+    def test_search_live_info_retries_incomplete_max_output_tokens_until_completed(self) -> None:
+        class IncompleteThenCompletedResponses:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                response_format = ((kwargs.get("text") or {}).get("format") or {})
+                if response_format.get("name") == "twinr_live_search_spoken_answer":
+                    return SimpleNamespace(
+                        id="resp_voice",
+                        _request_id="req_voice",
+                        model=kwargs["model"],
+                        usage=_fake_usage(),
+                        output_text=json.dumps(
+                            {"spoken_answer": "In Hamburg sind gerade Schulbau und Verkehr besonders umkämpft."}
+                        ),
+                        output=[
+                            SimpleNamespace(
+                                type="message",
+                                status="completed",
+                                content=[
+                                    SimpleNamespace(
+                                        type="output_text",
+                                        text="In Hamburg sind gerade Schulbau und Verkehr besonders umkämpft.",
+                                    )
+                                ],
+                            )
+                        ],
+                    )
+
+                budget = kwargs["max_output_tokens"]
+                base_output = [
+                    SimpleNamespace(
+                        type="web_search_call",
+                        action=SimpleNamespace(
+                            sources=[SimpleNamespace(url="https://hamburg.example/politik")]
+                        ),
+                    )
+                ]
+                if budget < 2048:
+                    partial_output = "" if budget < 1024 else "Hamburg ringt gerade um Schulbau."
+                    incomplete_message = (
+                        []
+                        if budget < 1024
+                        else [
+                            SimpleNamespace(
+                                type="message",
+                                status="incomplete",
+                                content=[
+                                    SimpleNamespace(
+                                        type="output_text",
+                                        text="Hamburg ringt gerade um Schulbau.",
+                                    )
+                                ],
+                            )
+                        ]
+                    )
+                    return SimpleNamespace(
+                        id=f"resp_{budget}",
+                        _request_id=f"req_{budget}",
+                        model=kwargs["model"],
+                        usage=_fake_usage(),
+                        status="incomplete",
+                        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                        output_text=partial_output,
+                        output=base_output + incomplete_message,
+                    )
+
+                return SimpleNamespace(
+                    id="resp_complete",
+                    _request_id="req_complete",
+                    model=kwargs["model"],
+                    usage=_fake_usage(),
+                    status="completed",
+                    output_text="In Hamburg sind gerade Schulbau und Verkehr besonders umkämpft.",
+                    output=base_output
+                    + [
+                        SimpleNamespace(
+                            type="message",
+                            status="completed",
+                            content=[
+                                SimpleNamespace(
+                                    type="output_text",
+                                    text="In Hamburg sind gerade Schulbau und Verkehr besonders umkämpft.",
+                                )
+                            ],
+                        )
+                    ],
+                )
+
+        backend = OpenAIBackend(
+            config=replace(self.config, openai_search_model="gpt-5.4-mini"),
+            client=SimpleNamespace(
+                responses=IncompleteThenCompletedResponses(),
+                audio=SimpleNamespace(
+                    transcriptions=self.transcriptions,
+                    speech=self.speech,
+                ),
+            ),
+        )
+
+        result = backend.search_live_info_with_metadata("Was ist in der Hamburger Lokalpolitik spannend?")
+
+        self.assertEqual(result.answer, "In Hamburg sind gerade Schulbau und Verkehr besonders umkämpft.")
+        self.assertEqual(result.sources, ("https://hamburg.example/politik",))
+        self.assertEqual(
+            [call["max_output_tokens"] for call in backend._client.responses.calls[:-1]],
+            [1024, 1536, 2048],
+        )
+        self.assertEqual(backend._client.responses.calls[-1]["max_output_tokens"], 160)
+
+    def test_search_live_info_raises_budget_error_when_incomplete_retry_ladder_is_exhausted(self) -> None:
+        class AlwaysIncompleteResponses:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    id=f"resp_{kwargs['max_output_tokens']}",
+                    _request_id=f"req_{kwargs['max_output_tokens']}",
+                    model=kwargs["model"],
+                    usage=_fake_usage(),
+                    status="incomplete",
+                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                    output_text="",
+                    output=[SimpleNamespace(type="web_search_call")],
+                )
+
+        backend = OpenAIBackend(
+            config=replace(self.config, openai_search_model="gpt-5.4-mini"),
+            client=SimpleNamespace(
+                responses=AlwaysIncompleteResponses(),
+                audio=SimpleNamespace(
+                    transcriptions=self.transcriptions,
+                    speech=self.speech,
+                ),
+            ),
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            backend.search_live_info_with_metadata("Was gibt es Neues?")
+
+        self.assertIn("max_output_tokens=3072", str(ctx.exception))
+        self.assertIn("incomplete=max_output_tokens", str(ctx.exception))
+        attempts_by_model: dict[str, list[int]] = {}
+        for call in backend._client.responses.calls:
+            attempts_by_model.setdefault(call["model"], []).append(call["max_output_tokens"])
+        self.assertEqual(
+            tuple(attempts_by_model),
+            backend._candidate_search_models(),
+        )
+        for budgets in attempts_by_model.values():
+            self.assertEqual(budgets, [1024, 1536, 2048, 3072])
 
     def test_search_live_info_uses_search_preview_chat_path(self) -> None:
         backend = OpenAIBackend(
@@ -738,7 +1014,9 @@ class OpenAIBackendTests(unittest.TestCase):
         )
         self.assertEqual(self.client.chat.completions.calls[0]["messages"][0]["role"], "system")
         prompt = self.client.chat.completions.calls[0]["messages"][-1]["content"]
-        self.assertEqual(prompt, "Wie wird das Wetter morgen?")
+        self.assertIn("User question: Wie wird das Wetter morgen?", prompt)
+        self.assertIn("Resolved explicit-date variant: Wie wird das Wetter am 2026-03-16?", prompt)
+        self.assertIn("Explicit place context: Schwarzenbek", prompt)
         self.assertEqual(len(self.responses.calls), 1)
         self.assertEqual(self.responses.calls[0]["text"]["format"]["name"], "twinr_live_search_spoken_answer")
 
@@ -755,7 +1033,9 @@ class OpenAIBackendTests(unittest.TestCase):
         )
 
         prompt = self.client.chat.completions.calls[-1]["messages"][-1]["content"]
-        self.assertEqual(prompt, "Wettervorhersage für Schwarzenbek am 16. März 2026")
+        self.assertIn("User question: Wettervorhersage für Schwarzenbek am 16. März 2026", prompt)
+        self.assertIn("Explicit place context: Schwarzenbek", prompt)
+        self.assertIn("Explicit local date/time context: Monday, 2026-03-16 (Europe/Berlin)", prompt)
 
     def test_compose_print_job_uses_context_and_request_source(self) -> None:
         self.responses.output_text = "TERMINE\nMontag 14 Uhr\nAdresse Praxis"

@@ -2,9 +2,10 @@
 
 `handlers` owns the concrete realtime tool handlers used during live turns. It
 translates tool payloads into bounded runtime reads or mutations for automations,
-smart-home, memory, reminders, output, self-coding, settings, voice-profile, portrait-
-identity, shared household-identity flows, and RSS/world-intelligence source
-configuration, and keeps shared voice/argument guards close to that boundary.
+smart-home, memory, reminders, guided user-discovery, output, self-coding,
+settings, voice-profile, portrait-identity, shared household-identity flows,
+and RSS/world-intelligence source configuration, and keeps shared voice/argument
+guards close to that boundary.
 
 ## Responsibility
 
@@ -12,10 +13,11 @@ configuration, and keeps shared voice/argument guards close to that boundary.
 - implement per-tool handler functions called by `RealtimeToolExecutor`
 - validate and normalize tool arguments before they reach runtime methods
 - expose one smart-home tool surface for discovery, filtered state queries, low-risk control, and bounded stream inspection
-- keep handler-local telemetry and audit side effects best-effort
+- keep handler-local telemetry and audit side effects best-effort, including search-turn journaling for requested model, actual model, fallback cause, and the bounded output-budget trace actually used by the provider
 - share sensitive-action confirmation and live-audio guard helpers
 - translate local camera-driven portrait-enrollment results into structured guidance for the model
 - expose one shared local household-identity tool surface for face, voice, status, and explicit confirm or deny feedback
+- expose one bounded guided user-discovery tool surface for onboarding, lifelong profile learning, learned-fact review, and explicit correction or deletion
 - bridge the self-coding front-stage flow plus learned-skill control/runtime hooks into deterministic ASE modules
 - expose one explicit tool surface for RSS/world-intelligence subscription setup and occasional recalibration
 
@@ -33,6 +35,7 @@ configuration, and keeps shared voice/argument guards close to that boundary.
 | [smarthome.py](./smarthome.py) | Smart-home discovery, filtered state-read, control, and stream handlers |
 | [intelligence.py](./intelligence.py) | RSS/world-intelligence subscription and refresh-config handler |
 | [memory.py](./memory.py) | Durable-memory tool handlers |
+| [user_discovery.py](./user_discovery.py) | Guided get-to-know-you, review, correction, and deletion handler |
 | [output.py](./output.py) | Print, search, and camera handlers |
 | [household_identity.py](./household_identity.py) | Shared local household identity manager tool handler |
 | [portrait_identity.py](./portrait_identity.py) | Local portrait-identity enrollment, status, and reset handlers |

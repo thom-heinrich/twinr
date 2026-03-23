@@ -344,21 +344,21 @@ def _derive_presence_state(
         person_recently_visible = coerce_optional_bool(near.get("person_recently_visible")) is True
         room_motion_recent = coerce_optional_bool(near.get("room_motion_recent")) is True
         speech_recent = coerce_optional_bool(near.get("speech_recent")) is True
-        wakeword_armed = coerce_optional_bool(near.get("wakeword_armed")) is True
+        voice_activation_armed = coerce_optional_bool(near.get("voice_activation_armed")) is True
         reason = normalize_text(near.get("reason")) or None
         evidence = _evidence(
             ("near_device_presence.person_visible", person_visible),
             ("near_device_presence.person_recently_visible", person_recently_visible),
             ("near_device_presence.room_motion_recent", room_motion_recent),
             ("near_device_presence.speech_recent", speech_recent),
-            ("near_device_presence.wakeword_armed", wakeword_armed),
+            ("near_device_presence.voice_activation_armed", voice_activation_armed),
         )
         confidence = _payload_confidence(near) or _fallback_presence_confidence(
             person_visible=person_visible,
             recent_visible=person_recently_visible,
             motion_recent=room_motion_recent,
             speech_recent=speech_recent,
-            wakeword_armed=wakeword_armed,
+            voice_activation_armed=voice_activation_armed,
         )
         if person_visible:
             state = "occupied_visible"
@@ -397,14 +397,14 @@ def _derive_presence_state(
             coerce_optional_bool(vad.get("speech_detected")) is True,
         )
     )
-    wakeword_armed = coerce_optional_bool(sensor.get("wakeword_armed")) is True
+    voice_activation_armed = coerce_optional_bool(sensor.get("voice_activation_armed")) is True
     evidence = _evidence(
         ("camera.person_visible", person_visible),
         ("camera.person_recently_visible", person_recently_visible),
         ("pir.motion_detected", motion_recent),
         ("audio_policy.presence_audio_active", coerce_optional_bool(audio_policy.get("presence_audio_active")) is True),
         ("audio_policy.recent_follow_up_speech", coerce_optional_bool(audio_policy.get("recent_follow_up_speech")) is True),
-        ("sensor.wakeword_armed", wakeword_armed),
+        ("sensor.voice_activation_armed", voice_activation_armed),
     )
     if person_visible:
         return _axis(
@@ -419,12 +419,12 @@ def _derive_presence_state(
                 recent_visible=person_recently_visible,
                 motion_recent=motion_recent,
                 speech_recent=speech_recent,
-                wakeword_armed=wakeword_armed,
+                voice_activation_armed=voice_activation_armed,
             ),
             source="local_runtime_facts",
             evidence=evidence,
         )
-    if person_recently_visible or motion_recent or (speech_recent and wakeword_armed):
+    if person_recently_visible or motion_recent or (speech_recent and voice_activation_armed):
         return _axis(
             axis="presence_state",
             kind="derived_state",
@@ -437,12 +437,12 @@ def _derive_presence_state(
                 recent_visible=person_recently_visible,
                 motion_recent=motion_recent,
                 speech_recent=speech_recent,
-                wakeword_armed=wakeword_armed,
+                voice_activation_armed=voice_activation_armed,
             ),
             source="local_runtime_facts",
             evidence=evidence,
         )
-    if speech_recent or wakeword_armed:
+    if speech_recent or voice_activation_armed:
         return _axis(
             axis="presence_state",
             kind="derived_state",
@@ -1124,7 +1124,7 @@ def _fallback_presence_confidence(
     recent_visible: bool,
     motion_recent: bool,
     speech_recent: bool,
-    wakeword_armed: bool,
+    voice_activation_armed: bool,
 ) -> float:
     """Estimate a conservative presence confidence from local corroboration only."""
 
@@ -1134,7 +1134,7 @@ def _fallback_presence_confidence(
             0.8 if recent_visible else None,
             0.7 if motion_recent else None,
             0.68 if speech_recent else None,
-            0.64 if wakeword_armed else None,
+            0.64 if voice_activation_armed else None,
         )
     ) or 0.0
 

@@ -172,6 +172,124 @@ class DisplayDebugLogTests(unittest.TestCase):
 
         self.assertTrue(any("x3" in line for line in sections[0][1]))
 
+    def test_build_sections_surfaces_search_budget_trace_in_llm_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            event_store = TwinrOpsEventStore.from_config(config)
+            usage_store = TwinrUsageStore.from_config(config)
+            watchdog_store = RemoteMemoryWatchdogStore.from_config(config)
+            usage_store.append(
+                source="realtime_tool",
+                request_kind="search",
+                model="gpt-5.4-mini-2026-03-17",
+                used_web_search=True,
+                metadata={
+                    "request_source": "button",
+                    "question": "Was gibt es Neues zu KI-Begleitern?",
+                    "search_budget_trace": "1024->1536",
+                },
+            )
+            event_store.append(
+                event="search_finished",
+                message="Live web search completed.",
+                data={
+                    "requested_model": "gpt-5.4-mini",
+                    "actual_model": "gpt-5.4-mini-2026-03-17",
+                    "search_budget_trace": "1024->1536",
+                    "search_budget_escalated": True,
+                },
+            )
+
+            builder = TwinrDisplayDebugLogBuilder(
+                config=config,
+                event_store=event_store,
+                usage_store=usage_store,
+                watchdog_store=watchdog_store,
+            )
+            sections = builder.build_sections(
+                snapshot=RuntimeSnapshot(status="waiting"),
+                runtime_status="Waiting",
+                internet_state="ok",
+                ai_state="ok",
+                system_state="ok",
+                clock_text="09:31",
+            )
+
+        llm_lines = sections[1][1]
+        self.assertTrue(any("model gpt-5.4-mini-2026-03-17 | web yes | out 1024->1536" in line for line in llm_lines))
+        self.assertTrue(any("search 1024->1536" in line for line in llm_lines))
+
+    def test_build_sections_surfaces_generic_tool_completion_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            event_store = TwinrOpsEventStore.from_config(config)
+            usage_store = TwinrUsageStore.from_config(config)
+            watchdog_store = RemoteMemoryWatchdogStore.from_config(config)
+            event_store.append(
+                event="tool_call_finished",
+                message="Realtime tool call finished.",
+                data={
+                    "tool_name": "inspect_camera",
+                    "status": "ok",
+                    "latency_ms": 2140,
+                    "actual_model": "gpt-5.2-chat-latest",
+                },
+            )
+
+            builder = TwinrDisplayDebugLogBuilder(
+                config=config,
+                event_store=event_store,
+                usage_store=usage_store,
+                watchdog_store=watchdog_store,
+            )
+            sections = builder.build_sections(
+                snapshot=RuntimeSnapshot(status="waiting"),
+                runtime_status="Waiting",
+                internet_state="ok",
+                ai_state="ok",
+                system_state="ok",
+                clock_text="09:31",
+            )
+
+        llm_lines = sections[1][1]
+        self.assertTrue(any("tool inspect_camera ok 2140ms" in line for line in llm_lines))
+
+    def test_build_sections_surfaces_generic_tool_failure_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(project_root=temp_dir)
+            event_store = TwinrOpsEventStore.from_config(config)
+            usage_store = TwinrUsageStore.from_config(config)
+            watchdog_store = RemoteMemoryWatchdogStore.from_config(config)
+            event_store.append(
+                event="tool_call_failed",
+                message="Realtime tool call failed.",
+                data={
+                    "tool_name": "schedule_reminder",
+                    "status": "error",
+                    "latency_ms": 9,
+                    "error_code": "invalid_arguments",
+                    "failure_origin": "result_status",
+                },
+            )
+
+            builder = TwinrDisplayDebugLogBuilder(
+                config=config,
+                event_store=event_store,
+                usage_store=usage_store,
+                watchdog_store=watchdog_store,
+            )
+            sections = builder.build_sections(
+                snapshot=RuntimeSnapshot(status="waiting"),
+                runtime_status="Waiting",
+                internet_state="ok",
+                ai_state="ok",
+                system_state="ok",
+                clock_text="09:31",
+            )
+
+        llm_lines = sections[1][1]
+        self.assertTrue(any("tool schedule_reminder error 9ms invalid_arguments" in line for line in llm_lines))
+
     def test_build_sections_includes_respeaker_hci_lines_in_hardware_log(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = TwinrConfig(project_root=temp_dir)

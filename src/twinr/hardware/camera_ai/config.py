@@ -37,6 +37,9 @@ _DEFAULT_LOW_LIGHT_RECOVER_LUX_THRESHOLD = 2.2
 _DEFAULT_LOW_LIGHT_MANUAL_EXPOSURE_RATIO = 0.90
 _DEFAULT_LOW_LIGHT_MANUAL_ANALOGUE_GAIN = 8.0
 _DEFAULT_LOW_LIGHT_AUTO_EXPOSURE_CAP_RATIO = 0.60
+_DEFAULT_GESTURE_CANDIDATE_CAPTURE_DIR = "artifacts/tmp/gesture_candidate_captures"
+_DEFAULT_GESTURE_CANDIDATE_CAPTURE_COOLDOWN_S = 1.5
+_DEFAULT_GESTURE_CANDIDATE_CAPTURE_MAX_IMAGES = 24
 _DEFAULT_PERSON_CONFIDENCE = 0.40
 _DEFAULT_OBJECT_CONFIDENCE = 0.55
 _DEFAULT_PERSON_NEAR_AREA = 0.20
@@ -72,6 +75,9 @@ _MIN_SEQUENCE_WINDOW_S = 0.1  # AUDIT-FIX(#1): Keep temporal windows finite and 
 _MAX_SEQUENCE_WINDOW_S = 10.0  # AUDIT-FIX(#1): Keep temporal windows finite and usable.
 _MIN_SEQUENCE_MIN_FRAMES = 2  # AUDIT-FIX(#1): Require at least a minimally meaningful temporal sequence.
 _MAX_SEQUENCE_MIN_FRAMES = 120  # AUDIT-FIX(#1): Prevent impossible gesture windows and runaway buffering.
+_MAX_GESTURE_CANDIDATE_CAPTURE_COOLDOWN_S = 300.0  # AUDIT-FIX(#13): Keep debug capture cooldown bounded on the Pi.
+_MIN_GESTURE_CANDIDATE_CAPTURE_MAX_IMAGES = 1  # AUDIT-FIX(#13): Always keep at least one QA frame slot when enabled.
+_MAX_GESTURE_CANDIDATE_CAPTURE_MAX_IMAGES = 128  # AUDIT-FIX(#13): Prevent unbounded artifact growth from QA capture.
 _MIN_ROI_CANDIDATES = 1  # AUDIT-FIX(#11): Keep ROI fan-out bounded on the Pi.
 _MAX_ROI_CANDIDATES = 6  # AUDIT-FIX(#11): Bound per-frame MediaPipe hand ROI work.
 
@@ -99,6 +105,9 @@ class AICameraAdapterConfig:
     low_light_manual_exposure_ratio: float = _DEFAULT_LOW_LIGHT_MANUAL_EXPOSURE_RATIO
     low_light_manual_analogue_gain: float = _DEFAULT_LOW_LIGHT_MANUAL_ANALOGUE_GAIN
     low_light_auto_exposure_cap_ratio: float = _DEFAULT_LOW_LIGHT_AUTO_EXPOSURE_CAP_RATIO
+    gesture_candidate_capture_dir: str = _DEFAULT_GESTURE_CANDIDATE_CAPTURE_DIR
+    gesture_candidate_capture_cooldown_s: float = _DEFAULT_GESTURE_CANDIDATE_CAPTURE_COOLDOWN_S
+    gesture_candidate_capture_max_images: int = _DEFAULT_GESTURE_CANDIDATE_CAPTURE_MAX_IMAGES
     person_confidence_threshold: float = _DEFAULT_PERSON_CONFIDENCE
     object_confidence_threshold: float = _DEFAULT_OBJECT_CONFIDENCE
     person_near_area_threshold: float = _DEFAULT_PERSON_NEAR_AREA
@@ -298,6 +307,35 @@ class AICameraAdapterConfig:
             _clamp_ratio(
                 self.low_light_auto_exposure_cap_ratio,
                 default=_DEFAULT_LOW_LIGHT_AUTO_EXPOSURE_CAP_RATIO,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "gesture_candidate_capture_dir",
+            _coerce_local_path(
+                self.gesture_candidate_capture_dir,
+                default=_DEFAULT_GESTURE_CANDIDATE_CAPTURE_DIR,
+            )
+            or _DEFAULT_GESTURE_CANDIDATE_CAPTURE_DIR,
+        )
+        object.__setattr__(
+            self,
+            "gesture_candidate_capture_cooldown_s",
+            _coerce_bounded_float(
+                self.gesture_candidate_capture_cooldown_s,
+                default=_DEFAULT_GESTURE_CANDIDATE_CAPTURE_COOLDOWN_S,
+                minimum=0.0,
+                maximum=_MAX_GESTURE_CANDIDATE_CAPTURE_COOLDOWN_S,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "gesture_candidate_capture_max_images",
+            _coerce_bounded_int(
+                self.gesture_candidate_capture_max_images,
+                default=_DEFAULT_GESTURE_CANDIDATE_CAPTURE_MAX_IMAGES,
+                minimum=_MIN_GESTURE_CANDIDATE_CAPTURE_MAX_IMAGES,
+                maximum=_MAX_GESTURE_CANDIDATE_CAPTURE_MAX_IMAGES,
             ),
         )
 

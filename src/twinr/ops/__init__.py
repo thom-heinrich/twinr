@@ -22,6 +22,7 @@ from twinr.ops.remote_memory_watchdog import (
     RemoteMemoryWatchdogSample,
     RemoteMemoryWatchdogSnapshot,
 )
+from twinr.ops.openai_env_contract import OpenAIEnvContractStatus, check_openai_env_contract
 from twinr.ops.self_test import SelfTestResult, TwinrSelfTestRunner
 from twinr.ops.support import SupportBundleInfo, build_support_bundle, redact_env_values
 from twinr.ops.usage import TokenUsage, TwinrUsageStore, UsageRecord, UsageSummary, extract_model_name, extract_token_usage
@@ -36,6 +37,7 @@ __all__ = [
     "RemoteMemoryWatchdog",
     "RemoteMemoryWatchdogSample",
     "RemoteMemoryWatchdogSnapshot",
+    "OpenAIEnvContractStatus",
     "SupportBundleInfo",
     "TokenUsage",
     "TwinrInstanceAlreadyRunningError",
@@ -48,6 +50,7 @@ __all__ = [
     "UsageRecord",
     "UsageSummary",
     "build_support_bundle",
+    "check_openai_env_contract",
     "check_summary",
     "collect_device_overview",
     "collect_system_health",

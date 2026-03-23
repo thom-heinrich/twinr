@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
+import audioop
+import io
 import math
+import time
+import wave
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from dataclasses import replace
 import logging
+from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
 from typing import Literal
 from weakref import WeakKeyDictionary
 
+from twinr.agent.base_agent.config import TwinrConfig
 from twinr.agent.workflows.playback_coordinator import PlaybackCoordinator, PlaybackPriority
+from twinr.agent.workflows.rendered_audio_clip import (
+    RenderedAudioClipError,
+    RenderedAudioClipSpec,
+    build_rendered_audio_clip_wav_bytes,
+    iter_wav_bytes_chunks,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +39,29 @@ class WorkingFeedbackProfile:
     volume: float
     gap_ms: int
     patterns: tuple[tuple[tuple[int, int], ...], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingFeedbackMediaSpec:
+    """Describe one optional rendered media loop for a feedback kind."""
+
+    clip: RenderedAudioClipSpec
+    pause_ms: int = 80
+    attenuation_start_s: float | None = None
+    attenuation_reach_floor_s: float | None = None
+    minimum_output_gain: float | None = None
+    attenuation_step_ms: int = 1000
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedWorkingFeedbackMedia:
+    """Carry one rendered media clip plus optional PCM metadata."""
+
+    spec: WorkingFeedbackMediaSpec
+    wav_bytes: bytes
+    pcm_bytes: bytes | None = None
+    sample_rate: int | None = None
+    channels: int | None = None
 
 
 _DEFAULT_WORKING_FEEDBACK_PROFILES: dict[WorkingFeedbackKind, WorkingFeedbackProfile] = {
@@ -66,6 +101,26 @@ _DEFAULT_WORKING_FEEDBACK_PROFILES: dict[WorkingFeedbackKind, WorkingFeedbackPro
             ((1108, 52),),
         ),
     ),
+}
+
+_DEFAULT_WORKING_FEEDBACK_MEDIA_SPECS: dict[WorkingFeedbackKind, WorkingFeedbackMediaSpec] = {
+    "processing": WorkingFeedbackMediaSpec(
+        clip=RenderedAudioClipSpec(
+            relative_path=Path("media") / "waiting.mp3",
+            clip_start_s=3.0,
+            clip_duration_s=3.0,
+            fade_in_duration_s=0.9,
+            fade_out_start_s=2.75,
+            fade_out_duration_s=0.25,
+            output_gain=0.3,
+            normalize_max_gain=1.0,
+        ),
+        pause_ms=80,
+        attenuation_start_s=4.0,
+        attenuation_reach_floor_s=30.0,
+        minimum_output_gain=0.15,
+        attenuation_step_ms=1000,
+    )
 }
 
 
@@ -314,8 +369,11 @@ def _stop_player_playback(player) -> None:
 # AUDIT-FIX(#4): Fail closed if the player cannot actually render tones.
 def _player_supports_playback(player) -> bool:
     """Report whether the player exposes a supported tone playback API."""
-    return callable(getattr(player, "play_tone_sequence", None)) or callable(
-        getattr(player, "play_tone", None)
+    return (
+        callable(getattr(player, "play_tone_sequence", None))
+        or callable(getattr(player, "play_tone", None))
+        or callable(getattr(player, "play_wav_chunks", None))
+        or callable(getattr(player, "play_pcm16_chunks", None))
     )
 
 
@@ -360,6 +418,182 @@ def _play_sequence(
                 return
 
 
+def _play_wav_clip(
+    player,
+    wav_bytes: bytes,
+    *,
+    stop_event: Event,
+) -> None:
+    """Play one rendered WAV clip through chunked, interruptible playback."""
+
+    play_wav_chunks = getattr(player, "play_wav_chunks", None)
+    if not callable(play_wav_chunks):
+        raise AttributeError("player must implement play_wav_chunks()")
+    play_wav_chunks(
+        iter_wav_bytes_chunks(wav_bytes),
+        should_stop=stop_event.is_set,
+    )
+
+
+def _play_pcm16_clip(
+    player,
+    *,
+    pcm_chunks,
+    sample_rate: int,
+    channels: int,
+    stop_event: Event,
+) -> None:
+    """Play one PCM16 clip through interruptible chunked playback."""
+
+    play_pcm16_chunks = getattr(player, "play_pcm16_chunks", None)
+    if not callable(play_pcm16_chunks):
+        raise AttributeError("player must implement play_pcm16_chunks()")
+    try:
+        play_pcm16_chunks(
+            pcm_chunks,
+            sample_rate=sample_rate,
+            channels=channels,
+            should_stop=stop_event.is_set,
+        )
+    except TypeError as exc:
+        if "should_stop" not in str(exc):
+            raise
+        play_pcm16_chunks(
+            pcm_chunks,
+            sample_rate=sample_rate,
+            channels=channels,
+        )
+
+
+def _resolve_media_spec(kind: WorkingFeedbackKind) -> WorkingFeedbackMediaSpec | None:
+    return _DEFAULT_WORKING_FEEDBACK_MEDIA_SPECS.get(kind)
+
+
+def _media_uses_long_think_attenuation(media_spec: WorkingFeedbackMediaSpec) -> bool:
+    return (
+        media_spec.minimum_output_gain is not None
+        and media_spec.attenuation_start_s is not None
+        and media_spec.attenuation_reach_floor_s is not None
+        and float(media_spec.clip.output_gain) > 0.0
+    )
+
+
+def _player_supports_pcm16_chunks(player) -> bool:
+    return callable(getattr(player, "play_pcm16_chunks", None))
+
+
+def _decode_pcm16_wav_bytes(wav_bytes: bytes) -> tuple[bytes, int, int] | None:
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wave_reader:
+            channels = int(wave_reader.getnchannels())
+            sample_width = int(wave_reader.getsampwidth())
+            sample_rate = int(wave_reader.getframerate())
+            pcm_bytes = wave_reader.readframes(wave_reader.getnframes())
+    except (wave.Error, EOFError):
+        return None
+    if sample_width != 2 or channels <= 0 or sample_rate <= 0 or not pcm_bytes:
+        return None
+    return pcm_bytes, sample_rate, channels
+
+
+def _media_output_gain_for_elapsed_s(
+    media_spec: WorkingFeedbackMediaSpec,
+    *,
+    elapsed_s: float,
+) -> float:
+    base_output_gain = max(0.0, float(media_spec.clip.output_gain))
+    if not _media_uses_long_think_attenuation(media_spec):
+        return base_output_gain
+    floor_output_gain = max(
+        0.0,
+        min(base_output_gain, float(media_spec.minimum_output_gain or base_output_gain)),
+    )
+    start_s = max(0.0, float(media_spec.attenuation_start_s or 0.0))
+    reach_floor_s = max(start_s, float(media_spec.attenuation_reach_floor_s or start_s))
+    if elapsed_s <= start_s:
+        return base_output_gain
+    if reach_floor_s <= start_s or elapsed_s >= reach_floor_s:
+        return floor_output_gain
+    progress = (elapsed_s - start_s) / max(0.001, reach_floor_s - start_s)
+    return base_output_gain + ((floor_output_gain - base_output_gain) * progress)
+
+
+def _iter_attenuated_pcm16_chunks(
+    media: _ResolvedWorkingFeedbackMedia,
+    *,
+    loop_elapsed_s: float,
+):
+    pcm_bytes = media.pcm_bytes or b""
+    sample_rate = int(media.sample_rate or 0)
+    channels = int(media.channels or 0)
+    if not pcm_bytes or sample_rate <= 0 or channels <= 0:
+        return
+    step_ms = max(1000, int(media.spec.attenuation_step_ms))
+    bytes_per_chunk = max(2 * channels, int(sample_rate * (step_ms / 1000.0)) * channels * 2)
+    base_output_gain = max(0.001, float(media.spec.clip.output_gain))
+    for chunk_index, start in enumerate(range(0, len(pcm_bytes), bytes_per_chunk)):
+        chunk = pcm_bytes[start : start + bytes_per_chunk]
+        if not chunk:
+            continue
+        chunk_elapsed_s = loop_elapsed_s + ((chunk_index * step_ms) / 1000.0)
+        effective_gain = _media_output_gain_for_elapsed_s(
+            media.spec,
+            elapsed_s=chunk_elapsed_s,
+        )
+        scale = max(0.0, min(1.0, effective_gain / base_output_gain))
+        if scale >= 0.999:
+            yield chunk
+            continue
+        yield audioop.mul(chunk, 2, scale)
+
+
+def _resolve_media_clip(
+    *,
+    player,
+    kind: WorkingFeedbackKind,
+    config: TwinrConfig | None,
+    emit: Callable[[str], None] | None,
+) -> _ResolvedWorkingFeedbackMedia | None:
+    if config is None:
+        return None
+    media_spec = _resolve_media_spec(kind)
+    if media_spec is None:
+        return None
+    try:
+        wav_bytes = build_rendered_audio_clip_wav_bytes(config, media_spec.clip)
+    except RenderedAudioClipError as exc:
+        _safe_emit(
+            emit,
+            f"working_feedback_media_fallback={kind}:{exc.__class__.__name__}",
+        )
+        return None
+    if wav_bytes is None:
+        return None
+    if not _media_uses_long_think_attenuation(media_spec):
+        return _ResolvedWorkingFeedbackMedia(spec=media_spec, wav_bytes=wav_bytes)
+    if not _player_supports_pcm16_chunks(player):
+        _safe_emit(
+            emit,
+            f"working_feedback_media_attenuation_fallback={kind}:missing_player_api",
+        )
+        return _ResolvedWorkingFeedbackMedia(spec=media_spec, wav_bytes=wav_bytes)
+    decoded = _decode_pcm16_wav_bytes(wav_bytes)
+    if decoded is None:
+        _safe_emit(
+            emit,
+            f"working_feedback_media_attenuation_fallback={kind}:invalid_wav",
+        )
+        return _ResolvedWorkingFeedbackMedia(spec=media_spec, wav_bytes=wav_bytes)
+    pcm_bytes, sample_rate, channels = decoded
+    return _ResolvedWorkingFeedbackMedia(
+        spec=media_spec,
+        wav_bytes=wav_bytes,
+        pcm_bytes=pcm_bytes,
+        sample_rate=sample_rate,
+        channels=channels,
+    )
+
+
 def start_working_feedback_loop(
     player,
     *,
@@ -369,6 +603,7 @@ def start_working_feedback_loop(
     profiles: Mapping[WorkingFeedbackKind, WorkingFeedbackProfile] | None = None,
     delay_override_ms: int | None = None,
     playback_coordinator: PlaybackCoordinator | None = None,
+    config: TwinrConfig | None = None,
 ) -> Callable[[], None]:
     """Start a bounded feedback loop and return its stop callback.
 
@@ -411,6 +646,12 @@ def start_working_feedback_loop(
         delay_override_ms,
         emit,
     )
+    resolved_media = _resolve_media_clip(
+        player=player,
+        kind=kind,
+        config=config,
+        emit=emit,
+    )
     stop_event = Event()
     player_state = _get_player_runtime_state(player)
     generation, previous_stop_event = _activate_player_loop(player_state, stop_event)
@@ -421,6 +662,7 @@ def start_working_feedback_loop(
         try:
             if stop_event.wait(profile.delay_ms / 1000.0):
                 return
+            feedback_started_at = time.monotonic()
             pattern_index = 0
             while not stop_event.is_set():
                 if not _is_active_player_loop(player_state, generation, stop_event):
@@ -447,7 +689,55 @@ def start_working_feedback_loop(
                         stop_event,
                     ):
                         return
-                    if playback_coordinator is None:
+                    if (
+                        resolved_media is not None
+                        and resolved_media.pcm_bytes is not None
+                        and resolved_media.sample_rate is not None
+                        and resolved_media.channels is not None
+                        and (
+                            playback_coordinator is not None
+                            or _player_supports_pcm16_chunks(player)
+                        )
+                    ):
+                        loop_elapsed_s = max(0.0, time.monotonic() - feedback_started_at)
+                        pcm_chunks = _iter_attenuated_pcm16_chunks(
+                            resolved_media,
+                            loop_elapsed_s=loop_elapsed_s,
+                        )
+                        if playback_coordinator is None:
+                            _play_pcm16_clip(
+                                player,
+                                pcm_chunks=pcm_chunks,
+                                sample_rate=resolved_media.sample_rate,
+                                channels=resolved_media.channels,
+                                stop_event=stop_event,
+                            )
+                        else:
+                            playback_coordinator.play_pcm16_chunks(
+                                owner=f"working_feedback:{kind}",
+                                priority=PlaybackPriority.FEEDBACK,
+                                chunks=pcm_chunks,
+                                sample_rate=resolved_media.sample_rate,
+                                channels=resolved_media.channels,
+                                should_stop=stop_event.is_set,
+                            )
+                    elif resolved_media is not None and (
+                        playback_coordinator is not None or callable(getattr(player, "play_wav_chunks", None))
+                    ):
+                        if playback_coordinator is None:
+                            _play_wav_clip(
+                                player,
+                                resolved_media.wav_bytes,
+                                stop_event=stop_event,
+                            )
+                        else:
+                            playback_coordinator.play_wav_chunks(
+                                owner=f"working_feedback:{kind}",
+                                priority=PlaybackPriority.FEEDBACK,
+                                chunks=iter_wav_bytes_chunks(resolved_media.wav_bytes),
+                                should_stop=stop_event.is_set,
+                            )
+                    elif playback_coordinator is None:
                         _play_sequence(
                             player,
                             sequence,
@@ -467,6 +757,12 @@ def start_working_feedback_loop(
                             should_stop=stop_event.is_set,
                         )
                 except Exception as exc:
+                    if stop_event.is_set() or not _is_active_player_loop(
+                        player_state,
+                        generation,
+                        stop_event,
+                    ):
+                        return
                     # AUDIT-FIX(#5): Never emit raw exception payloads from the audio backend.
                     _safe_emit(
                         emit,
@@ -477,7 +773,8 @@ def start_working_feedback_loop(
                     if acquired:
                         player_state.playback_lock.release()
 
-                if stop_event.wait(max(0.05, profile.pause_ms / 1000.0)):
+                pause_ms = resolved_media.spec.pause_ms if resolved_media is not None else profile.pause_ms
+                if stop_event.wait(max(0.05, pause_ms / 1000.0)):
                     return
         finally:
             _release_player_loop(player_state, generation, stop_event)

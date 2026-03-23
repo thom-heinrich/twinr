@@ -634,6 +634,83 @@ class TwinrPersonalGraphStore:
             self._save_document_locked(nodes, edges, created_at=document.created_at)
         return TwinrGraphWriteResult(status=status, label=clean_summary, node_id=plan_node_id, edge_type="user_plans")
 
+    def delete_contact(self, *, node_id: str) -> TwinrGraphWriteResult:
+        """Delete one remembered contact and any now-orphaned contact-method nodes."""
+
+        clean_node_id = _normalize_text(node_id, limit=120)
+        if not clean_node_id:
+            raise ValueError("node_id is required.")
+        with self._document_lock():
+            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            nodes = {node.node_id: node for node in document.nodes}
+            contact = nodes.get(clean_node_id)
+            if contact is None or contact.node_type != "person":
+                return TwinrGraphWriteResult(status="not_found", label="", node_id=clean_node_id)
+            label = contact.label
+            del nodes[clean_node_id]
+            edges = [
+                edge
+                for edge in document.edges
+                if edge.source_node_id != clean_node_id and edge.target_node_id != clean_node_id
+            ]
+            self._prune_unreferenced_nodes(nodes, edges)
+            self._save_document_locked(nodes, edges, created_at=document.created_at)
+        return TwinrGraphWriteResult(status="deleted", label=label, node_id=clean_node_id)
+
+    def delete_preference(
+        self,
+        *,
+        node_id: str,
+        edge_type: str | None = None,
+    ) -> TwinrGraphWriteResult:
+        """Delete one remembered preference edge and prune unused target nodes."""
+
+        clean_node_id = _normalize_text(node_id, limit=120)
+        clean_edge_type = _normalize_text(edge_type or "", limit=80) or None
+        if not clean_node_id:
+            raise ValueError("node_id is required.")
+        with self._document_lock():
+            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            nodes = {node.node_id: node for node in document.nodes}
+            target = nodes.get(clean_node_id)
+            label = target.label if target is not None else ""
+            removed = False
+            edges: list[TwinrGraphEdgeV1] = []
+            for edge in document.edges:
+                if edge.source_node_id == self.user_node_id and edge.target_node_id == clean_node_id:
+                    if clean_edge_type is None or edge.edge_type == clean_edge_type:
+                        removed = True
+                        continue
+                edges.append(edge)
+            if not removed:
+                return TwinrGraphWriteResult(status="not_found", label=label, node_id=clean_node_id, edge_type=clean_edge_type)
+            self._prune_unreferenced_nodes(nodes, edges)
+            self._save_document_locked(nodes, edges, created_at=document.created_at)
+        return TwinrGraphWriteResult(status="deleted", label=label, node_id=clean_node_id, edge_type=clean_edge_type)
+
+    def delete_plan(self, *, node_id: str) -> TwinrGraphWriteResult:
+        """Delete one remembered user plan and any orphaned temporal helper nodes."""
+
+        clean_node_id = _normalize_text(node_id, limit=120)
+        if not clean_node_id:
+            raise ValueError("node_id is required.")
+        with self._document_lock():
+            document = self._load_local_document_locked() or self._load_remote_document() or self._empty_document()
+            nodes = {node.node_id: node for node in document.nodes}
+            plan = nodes.get(clean_node_id)
+            if plan is None or plan.node_type != "plan":
+                return TwinrGraphWriteResult(status="not_found", label="", node_id=clean_node_id, edge_type="user_plans")
+            label = plan.label
+            del nodes[clean_node_id]
+            edges = [
+                edge
+                for edge in document.edges
+                if edge.source_node_id != clean_node_id and edge.target_node_id != clean_node_id
+            ]
+            self._prune_unreferenced_nodes(nodes, edges)
+            self._save_document_locked(nodes, edges, created_at=document.created_at)
+        return TwinrGraphWriteResult(status="deleted", label=label, node_id=clean_node_id, edge_type="user_plans")
+
     def build_prompt_context(
         self,
         query_text: str | None,
@@ -1465,6 +1542,25 @@ class TwinrPersonalGraphStore:
                 return edges
         edges.append(new_edge)
         return edges
+
+    def _prune_unreferenced_nodes(
+        self,
+        nodes: dict[str, TwinrGraphNodeV1],
+        edges: list[TwinrGraphEdgeV1],
+    ) -> None:
+        referenced_node_ids = {self.user_node_id}
+        for edge in edges:
+            referenced_node_ids.add(edge.source_node_id)
+            referenced_node_ids.add(edge.target_node_id)
+        removable_node_ids = [
+            node_id
+            for node_id, node in nodes.items()
+            if node_id not in referenced_node_ids
+            and node_id != self.user_node_id
+            and node.graph_ref is None
+        ]
+        for node_id in removable_node_ids:
+            nodes.pop(node_id, None)
 
     def _preference_prompt_line(self, edge_type: str, label: str, attributes: Mapping[str, object]) -> str:
         product = _normalize_text(str(attributes.get("for_product", "")), limit=60)

@@ -115,6 +115,12 @@ class StreamingCaptureController:
         )
         self._begin_listening(request)
         capture_started = time.monotonic()
+        if loop._voice_orchestrator_owns_live_listening():
+            return self._run_remote_audio_turn(
+                request=request,
+                turn_started=turn_started,
+                capture_started=capture_started,
+            )
         loop._notify_voice_orchestrator_state(
             "listening",
             detail=request.listen_source,
@@ -187,6 +193,74 @@ class StreamingCaptureController:
                 kind="span_end",
                 kpi={"duration_ms": round((time.monotonic() - turn_started) * 1000.0, 3)},
             )
+
+    def _run_remote_audio_turn(
+        self,
+        *,
+        request: StreamingAudioTurnRequest,
+        turn_started: float,
+        capture_started: float,
+    ) -> bool:
+        """Wait for the same-stream remote transcript instead of reopening capture.
+
+        When the voice orchestrator owns live listening, the Pi must stay on the
+        existing server-side stream after wake instead of opening a second local
+        capture path that fights the orchestrator's long-lived ``arecord``.
+        """
+
+        loop = self._loop
+        wait_handle = loop._begin_remote_transcript_wait(source="listening")
+        if wait_handle is None:
+            loop.runtime.cancel_listening()
+            loop._emit_status(force=True)
+            loop._notify_voice_orchestrator_state("waiting", detail="remote_wait_failed")
+            return False
+        try:
+            loop._notify_voice_orchestrator_state(
+                "listening",
+                detail=request.listen_source,
+                follow_up_allowed=request.follow_up,
+            )
+            committed = loop._wait_for_remote_transcript_commit(
+                wait_handle=wait_handle,
+                timeout_s=request.listening_window.start_timeout_s,
+                initial_source=request.initial_source,
+                follow_up=request.follow_up,
+                listen_source=request.listen_source,
+                timeout_emit_key=request.timeout_emit_key,
+                timeout_message=request.timeout_message,
+            )
+        finally:
+            loop._remote_transcript_commits.clear_wait(wait_handle)
+        if committed is None:
+            loop._trace_event(
+                "streaming_remote_audio_turn_closed_without_commit",
+                kind="branch",
+                details={"listen_source": request.listen_source},
+            )
+            return False
+        capture_ms = int((time.monotonic() - capture_started) * 1000)
+        transcript = committed.transcript.strip()
+        loop._trace_event(
+            "streaming_remote_transcript_ready",
+            kind="observation",
+            details={
+                "listen_source": request.listen_source,
+                "transcript_len": len(transcript),
+                "capture_ms": capture_ms,
+            },
+        )
+        return loop._complete_streaming_turn(
+            transcript=transcript,
+            listen_source=request.listen_source,
+            proactive_trigger=request.proactive_trigger,
+            turn_started=turn_started,
+            capture_ms=capture_ms,
+            stt_ms=-1,
+            allow_follow_up_rearm=loop._follow_up_allowed_for_source(
+                initial_source=request.initial_source
+            ),
+        )
 
     def _begin_listening(self, request: StreamingAudioTurnRequest) -> None:
         loop = self._loop

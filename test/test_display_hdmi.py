@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from twinr.config import TwinrConfig
 from twinr.display.ambient_impulse_cues import DisplayAmbientImpulseCue
+from twinr.display.debug_signals import DisplayDebugSignal
 from twinr.display.emoji_cues import DisplayEmojiCue
 from twinr.display.face_cues import DisplayFaceCue
 from twinr.display.face_expressions import (
@@ -177,6 +178,21 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
 
     def test_render_status_image_draws_default_screen(self) -> None:
         display = self.make_display()
+        scene = display._scene_renderer().build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            animation_frame=0,
+        )
 
         image = display.render_status_image(
             status="waiting",
@@ -195,8 +211,8 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
 
         self.assertEqual(image.size, display.canvas_size)
         dark_pixels = sum(1 for pixel in image.getdata() if max(pixel) <= 20)
-        face_pixels = image.crop((50, 110, 330, 430))
-        panel_pixels = image.crop((360, 100, 770, 450))
+        face_pixels = image.crop(scene.layout.face_box)
+        panel_pixels = image.crop(scene.layout.panel_box)
         face_bright = sum(1 for pixel in face_pixels.getdata() if min(pixel) >= 220)
         panel_bright = sum(1 for pixel in panel_pixels.getdata() if min(pixel) >= 220)
 
@@ -264,7 +280,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         self.assertEqual(rendered_lines, ("H1", "H2", "H3", "H4", "B1", "B2", "B3"))
         self.assertGreater(len(rendered_lines), 5)
 
-    def test_render_status_image_draws_bottom_news_ticker(self) -> None:
+    def test_render_status_image_hides_bottom_news_ticker_in_extended_view(self) -> None:
         display = self.make_display()
         base = display.render_status_image(
             status="waiting",
@@ -296,36 +312,9 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             ticker_text="Tagesschau · Calm readable headline for seniors",
         )
 
-        scene = display._scene_renderer().build_scene(
-            width=800,
-            height=480,
-            status="waiting",
-            headline="Waiting",
-            helper_text="Press the green button and speak naturally.",
-            state_fields=(
-                ("Status", "Waiting"),
-                ("Internet", "ok"),
-                ("AI", "ok"),
-                ("System", "ok"),
-                ("Zeit", "12:34"),
-            ),
-            animation_frame=0,
-            ticker_text="Tagesschau · Calm readable headline for seniors",
-        )
-        ticker_diff = ImageChops.difference(base.crop(scene.layout.ticker_box), ticked.crop(scene.layout.ticker_box))
-        panel_inner_box = (
-            scene.layout.panel_box[0] + 10,
-            scene.layout.panel_box[1] + 10,
-            scene.layout.panel_box[2] - 10,
-            scene.layout.panel_box[3] - 10,
-        )
-        panel_diff = ImageChops.difference(base.crop(panel_inner_box), ticked.crop(panel_inner_box))
+        self.assertIsNone(ImageChops.difference(base, ticked).getbbox())
 
-        self.assertIsNotNone(ticker_diff.getbbox())
-        self.assertGreater(sum(1 for pixel in ticker_diff.getdata() if max(pixel) >= 24), 2000)
-        self.assertEqual(sum(1 for pixel in panel_diff.getdata() if max(pixel) >= 24), 0)
-
-    def test_default_scene_only_reserves_bottom_band_when_ticker_is_visible(self) -> None:
+    def test_default_scene_does_not_reserve_bottom_band_for_hidden_ticker_text(self) -> None:
         display = self.make_display()
         state_fields = (
             ("Status", "Waiting"),
@@ -356,11 +345,11 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         )
 
         self.assertFalse(without_ticker.layout.ticker_reserved)
-        self.assertTrue(with_ticker.layout.ticker_reserved)
-        self.assertGreater(without_ticker.layout.panel_box[3], with_ticker.layout.panel_box[3])
-        self.assertGreater(without_ticker.layout.face_box[3], with_ticker.layout.face_box[3])
+        self.assertFalse(with_ticker.layout.ticker_reserved)
+        self.assertEqual(without_ticker.layout.panel_box[3], with_ticker.layout.panel_box[3])
+        self.assertEqual(without_ticker.layout.face_box[3], with_ticker.layout.face_box[3])
 
-    def test_default_scene_uses_compact_panel_when_ticker_reduces_vertical_space(self) -> None:
+    def test_default_scene_keeps_noncompact_panel_when_ticker_text_is_hidden(self) -> None:
         display = self.make_display()
         scene = display._scene_renderer().build_scene(
             width=800,
@@ -379,7 +368,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
             ticker_text="Tagesschau · Calm readable headline for seniors",
         )
 
-        self.assertTrue(scene.layout.compact_panel)
+        self.assertFalse(scene.layout.compact_panel)
 
     def test_default_scene_waiting_face_animates_between_idle_frames(self) -> None:
         display = self.make_display()
@@ -791,6 +780,89 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
 
         self.assertIsNone(ImageChops.difference(first, second).getbbox())
 
+    def test_default_scene_renderer_keeps_extended_header_height_without_waiting_for_debug_signals(self) -> None:
+        display = self.make_display()
+        renderer = display._scene_renderer()
+
+        base_scene = renderer.build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            debug_signals=(),
+            animation_frame=0,
+        )
+        debug_scene = renderer.build_scene(
+            width=800,
+            height=480,
+            status="waiting",
+            headline="Waiting",
+            helper_text="Press the green button and speak naturally.",
+            state_fields=(
+                ("Status", "Waiting"),
+                ("Internet", "ok"),
+                ("AI", "ok"),
+                ("System", "ok"),
+                ("Zeit", "12:34"),
+            ),
+            debug_signals=(
+                DisplayDebugSignal(
+                    key="motion_state",
+                    label="MOTION_STILL",
+                    accent="neutral",
+                    priority=90,
+                ),
+            ),
+            animation_frame=0,
+        )
+
+        self.assertEqual(
+            debug_scene.layout.header_box[3] - debug_scene.layout.header_box[1],
+            base_scene.layout.header_box[3] - base_scene.layout.header_box[1],
+        )
+
+    def test_draw_twinr_header_renders_debug_signal_pills_and_overflow(self) -> None:
+        renderer = HdmiDefaultSceneRenderer(tools=_FakeSceneTools())
+        draw = _RecordingDraw()
+
+        renderer._draw_twinr_header(
+            draw,
+            box=(20, 18, 260, 86),
+            header=types.SimpleNamespace(
+                brand="TWINR",
+                state="WAITING",
+                time_value="12:34",
+                system_value="OK",
+                system_accent=(116, 242, 170),
+                debug_signals=(
+                    DisplayDebugSignal(key="possible_fall", label="POSSIBLE_FALL", accent="alert", priority=10),
+                    DisplayDebugSignal(key="attention_window", label="ATTENTION_WINDOW", accent="info", priority=30),
+                    DisplayDebugSignal(key="motion_state", label="MOTION_STILL", accent="neutral", priority=90),
+                    DisplayDebugSignal(key="pose", label="POSE_UPRIGHT", accent="neutral", priority=80),
+                ),
+            ),
+        )
+
+        pill_texts = [call["text"] for call in draw.text_calls]
+        pill_positions = {
+            call["position"][1]
+            for call in draw.text_calls
+            if call["text"] in {"POSSIBLE_FALL", "ATTENTION_WINDOW", "MOTION_STILL", "POSE_UPRIGHT"}
+        }
+
+        self.assertIn("POSSIBLE_FALL", pill_texts)
+        self.assertTrue(any(text.startswith("+") for text in pill_texts))
+        self.assertTrue(any(entry["outline"] == (255, 134, 110) for entry in draw.rounded_rectangles))
+        self.assertGreaterEqual(len(pill_positions), 2)
+
     def test_default_scene_keeps_right_hand_area_visibly_reserved_when_idle(self) -> None:
         display = self.make_display()
         scene = display._scene_renderer().build_scene(
@@ -987,7 +1059,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
 
         self.assertEqual(sum("display_emoji_font=missing" in line for line in emitted), 1)
 
-    def test_default_scene_prioritises_face_space_and_uses_a_slighter_header(self) -> None:
+    def test_default_scene_uses_extended_header_and_keeps_face_first_layout(self) -> None:
         display = self.make_display()
         scene = display._scene_renderer().build_scene(
             width=800,
@@ -1009,11 +1081,11 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         face_width = scene.layout.face_box[2] - scene.layout.face_box[0]
         panel_width = scene.layout.panel_box[2] - scene.layout.panel_box[0]
 
-        self.assertLess(header_height, 44)
+        self.assertGreater(header_height, 80)
         self.assertGreater(face_width, 380)
         self.assertLess(panel_width, 340)
 
-    def test_default_scene_with_ticker_keeps_compact_panel_visibly_face_first(self) -> None:
+    def test_default_scene_with_ticker_text_still_keeps_extended_face_first_layout(self) -> None:
         display = self.make_display()
         scene = display._scene_renderer().build_scene(
             width=800,
@@ -1035,8 +1107,9 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         face_width = scene.layout.face_box[2] - scene.layout.face_box[0]
         panel_width = scene.layout.panel_box[2] - scene.layout.panel_box[0]
 
-        self.assertTrue(scene.layout.compact_panel)
-        self.assertLess(header_height, 44)
+        self.assertFalse(scene.layout.ticker_reserved)
+        self.assertFalse(scene.layout.compact_panel)
+        self.assertGreater(header_height, 80)
         self.assertGreater(face_width, panel_width)
         self.assertLess(panel_width, 330)
 
@@ -1063,7 +1136,7 @@ class HdmiFramebufferDisplayTests(unittest.TestCase):
         face_width = scene.layout.face_box[2] - scene.layout.face_box[0]
         panel_width = scene.layout.panel_box[2] - scene.layout.panel_box[0]
 
-        self.assertLess(header_height, 48)
+        self.assertGreater(header_height, 90)
         self.assertGreater(face_width, panel_width)
         self.assertLess(panel_width, 640)
 

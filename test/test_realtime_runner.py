@@ -38,11 +38,13 @@ from twinr.memory.longterm.core.models import (
 )
 from twinr.memory.longterm.storage.remote_state import LongTermRemoteStatus, LongTermRemoteUnavailableError
 from twinr.memory.reminders import now_in_timezone
-from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority, WakewordMatch
+from twinr.orchestrator.voice_activation import VoiceActivationMatch
+from twinr.proactive import SocialTriggerDecision, SocialTriggerPriority
 from twinr.proactive.runtime.audio_policy import ReSpeakerAudioPolicySnapshot
 from twinr.proactive.runtime.gesture_wakeup_lane import GestureWakeupDecision
 from twinr.proactive.runtime.runtime_contract import ReSpeakerRuntimeContractError
 from twinr.providers.openai import OpenAITextResponse
+from twinr.providers.openai.core.types import OpenAISearchAttempt
 from twinr.providers.openai.realtime import OpenAIRealtimeTurn
 from twinr.realtime_runner import TwinrRealtimeHardwareLoop
 from twinr.runtime import TwinrRuntime
@@ -715,14 +717,37 @@ class FakeAmbientAudioSampler:
 
 
 class FakeVoiceOrchestrator:
-    def __init__(self, *, ready_backend: str = "local_stt") -> None:
+    def __init__(self, *, ready_backend: str = "remote_asr") -> None:
         self.states: list[tuple[str, str | None, bool]] = []
+        self.intent_contexts: list[dict[str, object | None]] = []
         self.paused: list[str] = []
         self.resumed: list[str] = []
         self.ready_backend = ready_backend
 
-    def notify_runtime_state(self, *, state: str, detail: str | None = None, follow_up_allowed: bool = False) -> None:
+    def notify_runtime_state(
+        self,
+        *,
+        state: str,
+        detail: str | None = None,
+        follow_up_allowed: bool = False,
+        attention_state: str | None = None,
+        interaction_intent_state: str | None = None,
+        person_visible: bool | None = None,
+        interaction_ready: bool | None = None,
+        targeted_inference_blocked: bool | None = None,
+        recommended_channel: str | None = None,
+    ) -> None:
         self.states.append((state, detail, follow_up_allowed))
+        self.intent_contexts.append(
+            {
+                "attention_state": attention_state,
+                "interaction_intent_state": interaction_intent_state,
+                "person_visible": person_visible,
+                "interaction_ready": interaction_ready,
+                "targeted_inference_blocked": targeted_inference_blocked,
+                "recommended_channel": recommended_channel,
+            }
+        )
 
     def pause_capture(self, *, reason: str) -> None:
         self.paused.append(reason)
@@ -731,7 +756,7 @@ class FakeVoiceOrchestrator:
         self.resumed.append(reason)
 
     def supports_remote_follow_up(self) -> bool:
-        return str(self.ready_backend or "").strip().lower() == "local_stt"
+        return str(self.ready_backend or "").strip().lower() == "remote_asr"
 
 
 class FakeConversationClosureEvaluator:
@@ -1582,11 +1607,11 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(printer.printed, ["GUTEN TAG"])
 
-    def test_wakeword_with_remaining_text_runs_direct_text_turn(self) -> None:
+    def test_voice_activation_with_remaining_text_runs_direct_text_turn(self) -> None:
         loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
 
-        handled = loop.handle_wakeword_match(
-            WakewordMatch(
+        handled = loop.handle_voice_activation(
+            VoiceActivationMatch(
                 detected=True,
                 transcript="Hey Twinr wie spaet ist es",
                 matched_phrase="hey twinr",
@@ -1600,15 +1625,15 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(realtime_session.calls, [])
         self.assertEqual(recorder.pause_values, [])
         self.assertGreaterEqual(len(player.tones), 1)
-        self.assertIn("wakeword_mode=direct_text", lines)
+        self.assertIn("voice_activation_mode=direct_text", lines)
         self.assertEqual(loop.runtime.last_transcript, "")
         self.assertIn("transcript=Hallo Twinr", lines)
 
-    def test_wakeword_without_remaining_text_opens_listening_window(self) -> None:
+    def test_voice_activation_without_remaining_text_opens_listening_window(self) -> None:
         loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
 
-        handled = loop.handle_wakeword_match(
-            WakewordMatch(
+        handled = loop.handle_voice_activation(
+            VoiceActivationMatch(
                 detected=True,
                 transcript="Hey Twinr",
                 matched_phrase="hey twinr",
@@ -1627,8 +1652,106 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(recorder.pause_grace_values, [loop.config.adaptive_timing_pause_grace_ms])
         self.assertGreaterEqual(len(player.tones), 1)
         self.assertEqual(player.played, [b"WAVPCM", b"PCM"])
-        self.assertIn("wakeword_mode=listen", lines)
-        self.assertIn("wakeword_ack=Ja?", lines)
+        self.assertIn("voice_activation_mode=listen", lines)
+        self.assertIn("voice_activation_ack=Ja?", lines)
+
+    def test_voice_orchestrator_activation_without_remaining_text_uses_same_stream_remote_commit(self) -> None:
+        loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop()
+        realtime_session.turns = [
+            OpenAIRealtimeTurn(
+                transcript="Wie geht es dir?",
+                response_text="Mir geht es gut.",
+                response_id="resp_rt_same_stream",
+                end_conversation=False,
+            )
+        ]
+
+        class _AutoCommitVoiceOrchestrator(FakeVoiceOrchestrator):
+            def notify_runtime_state(self, *, state: str, detail: str | None = None, follow_up_allowed: bool = False, **kwargs) -> None:
+                super().notify_runtime_state(
+                    state=state,
+                    detail=detail,
+                    follow_up_allowed=follow_up_allowed,
+                    **kwargs,
+                )
+                if state == "listening":
+                    loop.handle_remote_transcript_committed("wie geht es dir", "listening")
+
+        loop.voice_orchestrator = _AutoCommitVoiceOrchestrator()
+
+        handled = loop.handle_voice_activation(
+            VoiceActivationMatch(
+                detected=True,
+                transcript="Hey Twinr",
+                matched_phrase="hey twinr",
+                remaining_text="",
+                normalized_transcript="hey twinr",
+            )
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(realtime_session.calls, [])
+        self.assertEqual(realtime_session.text_calls, ["wie geht es dir"])
+        self.assertEqual(recorder.pause_values, [])
+        self.assertIn(("listening", "voice_activation", False), loop.voice_orchestrator.states)
+        self.assertIn("voice_activation_ack=earcon", lines)
+        self.assertIn("voice_orchestrator_transcript_delivered=listening", lines)
+
+    def test_notify_voice_orchestrator_state_includes_compact_person_state_context(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+        loop._latest_sensor_observation_facts = {
+            "camera": {"person_visible": True},
+            "person_state": {
+                "interaction_ready": True,
+                "targeted_inference_blocked": False,
+                "recommended_channel": "speech",
+                "attention_state": {"state": "attending_to_device"},
+                "interaction_intent_state": {"state": "showing_intent"},
+            },
+        }
+
+        loop._notify_voice_orchestrator_state("waiting", detail="idle", follow_up_allowed=False)
+
+        self.assertEqual(fake_voice.states[-1], ("waiting", "idle", False))
+        self.assertEqual(
+            fake_voice.intent_contexts[-1],
+            {
+                "attention_state": "attending_to_device",
+                "interaction_intent_state": "showing_intent",
+                "person_visible": True,
+                "interaction_ready": True,
+                "targeted_inference_blocked": False,
+                "recommended_channel": "speech",
+            },
+        )
+
+    def test_refresh_voice_orchestrator_sensor_context_replays_last_state_only_on_context_change(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+        fake_voice = FakeVoiceOrchestrator()
+        loop.voice_orchestrator = fake_voice
+
+        loop._notify_voice_orchestrator_state("waiting", detail="idle", follow_up_allowed=False)
+        self.assertEqual(len(fake_voice.states), 1)
+
+        loop._latest_sensor_observation_facts = {
+            "camera": {"person_visible": True},
+            "person_state": {
+                "interaction_ready": True,
+                "targeted_inference_blocked": False,
+                "recommended_channel": "speech",
+                "attention_state": {"state": "attending_to_device"},
+                "interaction_intent_state": {"state": "showing_intent"},
+            },
+        }
+        loop._refresh_voice_orchestrator_sensor_context()
+        self.assertEqual(len(fake_voice.states), 2)
+        self.assertEqual(fake_voice.states[-1], ("waiting", "idle", False))
+        self.assertTrue(fake_voice.intent_contexts[-1]["interaction_ready"])
+
+        loop._refresh_voice_orchestrator_sensor_context()
+        self.assertEqual(len(fake_voice.states), 2)
 
     def test_gesture_wakeup_opens_listening_window_with_beep(self) -> None:
         recorder = FakeRecorder(recordings=[RuntimeError("No speech detected before timeout")])
@@ -1654,7 +1777,7 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(player.played, [])
         self.assertIn("gesture_wakeup_mode=listen", lines)
         self.assertIn("gesture_wakeup_gesture=peace_sign", lines)
-        self.assertNotIn("wakeword_ack=Ja?", lines)
+        self.assertNotIn("voice_activation_ack=Ja?", lines)
 
     def test_gesture_wakeup_is_skipped_when_runtime_is_busy(self) -> None:
         loop, lines, _realtime_session, _print_backend, _recorder, player, _printer = self.make_loop()
@@ -1672,42 +1795,36 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertEqual(player.played, [])
         self.assertIn("gesture_wakeup_skipped=busy", lines)
 
-    def test_wakeword_ack_uses_cached_audio_when_prefetched(self) -> None:
-        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
-            config=TwinrConfig(wakeword_enabled=True)
-        )
+    def test_voice_activation_ack_uses_cached_audio_when_prefetched(self) -> None:
+        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop()
 
-        loop._prime_wakeword_ack_cache()
-        loop._acknowledge_wakeword()
+        loop._prime_voice_activation_ack_cache()
+        loop._acknowledge_voice_activation()
 
         self.assertEqual(print_backend.synthesize_calls, ["Ja?"])
         self.assertEqual(player.played, [b"WAVPCM"])
-        self.assertIn("wakeword_ack=Ja?", lines)
-        self.assertIn("wakeword_ack_cached=true", lines)
+        self.assertIn("voice_activation_ack=Ja?", lines)
+        self.assertIn("voice_activation_ack_cached=true", lines)
 
-    def test_wakeword_ack_normalizes_quiet_valid_wav(self) -> None:
-        loop, _lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
-            config=TwinrConfig(wakeword_enabled=True)
-        )
+    def test_voice_activation_ack_normalizes_quiet_valid_wav(self) -> None:
+        loop, _lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop()
         quiet_wav = _pcm_to_test_wav_bytes((b"\x10\x00" + b"\xf0\xff") * 800)
         print_backend.synthesize_result = quiet_wav
 
-        loop._acknowledge_wakeword()
+        loop._acknowledge_voice_activation()
 
         self.assertEqual(player.played, [normalize_wav_playback_level(quiet_wav)])
 
-    def test_voice_orchestrator_wakeword_ack_uses_earcon_only(self) -> None:
-        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
-            config=TwinrConfig(wakeword_enabled=True)
-        )
+    def test_voice_orchestrator_activation_ack_uses_earcon_only(self) -> None:
+        loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop()
         loop.voice_orchestrator = FakeVoiceOrchestrator()
 
-        loop._acknowledge_wakeword()
+        loop._acknowledge_voice_activation()
 
         self.assertEqual(print_backend.synthesize_calls, [])
         self.assertEqual(player.played, [])
         self.assertGreaterEqual(len(player.tones), 1)
-        self.assertIn("wakeword_ack=earcon", lines)
+        self.assertIn("voice_activation_ack=earcon", lines)
 
     def test_voice_orchestrator_handles_follow_up_remotely_after_answer(self) -> None:
         config = TwinrConfig(conversation_follow_up_enabled=True)
@@ -1727,63 +1844,17 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         handled = loop._run_single_text_turn(
             transcript="wie spaet ist es",
-            listen_source="wakeword",
+            listen_source="voice_activation",
             proactive_trigger=None,
         )
 
         self.assertTrue(handled)
-        self.assertIn(("thinking", "wakeword", False), fake_voice.states)
-        self.assertIn(("speaking", "wakeword", True), fake_voice.states)
-        self.assertIn(("follow_up_open", "wakeword", True), fake_voice.states)
+        self.assertIn(("thinking", "voice_activation", False), fake_voice.states)
+        self.assertIn(("speaking", "voice_activation", True), fake_voice.states)
+        self.assertIn(("follow_up_open", "voice_activation", True), fake_voice.states)
         self.assertNotIn("conversation_follow_up_vetoed=closure", lines)
 
-    def test_voice_orchestrator_backend_follow_up_reopens_local_beep_listening_after_answer(self) -> None:
-        config = TwinrConfig(
-            conversation_follow_up_enabled=True,
-            conversation_follow_up_timeout_s=3.5,
-            audio_follow_up_speech_start_chunks=5,
-            audio_follow_up_ignore_ms=420,
-        )
-        recorder = FakeRecorder(
-            recordings=[
-                RuntimeError("No speech detected before timeout"),
-            ]
-        )
-        loop, lines, realtime_session, _print_backend, recorder, player, _printer = self.make_loop(
-            config=config,
-            recorder=recorder,
-        )
-        fake_voice = FakeVoiceOrchestrator(ready_backend="openwakeword")
-        loop.voice_orchestrator = fake_voice
-        realtime_session.turns = [
-            OpenAIRealtimeTurn(
-                transcript="Wie spaet ist es?",
-                response_text="Es ist zehn Uhr.",
-                response_id="resp_rt_123",
-                end_conversation=False,
-            )
-        ]
-
-        handled = loop._run_conversation_session(
-            initial_source="wakeword",
-            seed_transcript="wie spaet ist es",
-            play_initial_beep=False,
-        )
-
-        self.assertTrue(handled)
-        self.assertIn(("thinking", "wakeword", False), fake_voice.states)
-        self.assertIn(("speaking", "wakeword", True), fake_voice.states)
-        self.assertNotIn(("follow_up_open", "wakeword", True), fake_voice.states)
-        self.assertIn(("waiting", "wakeword", False), fake_voice.states)
-        self.assertIn(("listening", "follow_up", True), fake_voice.states)
-        self.assertEqual(recorder.start_timeouts, [3.5])
-        self.assertEqual(recorder.speech_start_chunks, [5])
-        self.assertEqual(recorder.ignore_initial_ms, [420])
-        self.assertGreaterEqual(len(player.tones), 1)
-        self.assertIn("voice_orchestrator_follow_up_mode=local_beep", lines)
-        self.assertIn("follow_up_timeout=true", lines)
-
-    def test_remote_follow_up_capture_request_reopens_local_listening_with_beep(self) -> None:
+    def test_remote_follow_up_transcript_commit_reopens_text_turn_without_beep(self) -> None:
         loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
             config=TwinrConfig(conversation_follow_up_enabled=True)
         )
@@ -1795,11 +1866,12 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
 
         loop._run_conversation_session = fake_run_conversation_session  # type: ignore[method-assign]
 
-        handled = loop.handle_remote_follow_up_capture_request()
+        handled = loop.handle_remote_transcript_committed("wie geht es dir", "follow_up")
 
         self.assertTrue(handled)
         self.assertEqual(captured_kwargs["initial_source"], "follow_up")
-        self.assertTrue(captured_kwargs["play_initial_beep"])
+        self.assertEqual(captured_kwargs["seed_transcript"], "wie geht es dir")
+        self.assertFalse(captured_kwargs["play_initial_beep"])
 
     def test_yellow_button_uses_print_backend(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, _player, printer = self.make_loop()
@@ -2507,6 +2579,63 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertIn("appointment", reminder_text)
         self.assertEqual(loop.runtime.memory.ledger[-1].kind, "reminder")
         self.assertIn("reminder_tool_call=true", lines)
+
+    def test_generic_tool_observability_records_success_for_memory_tool_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = TwinrConfig(
+                project_root=temp_dir,
+                memory_markdown_path=str(Path(temp_dir) / "state" / "MEMORY.md"),
+                runtime_state_path=str(Path(temp_dir) / "runtime-state.json"),
+            )
+            loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(config=config)
+
+            result = loop._handle_remember_memory_tool_call(
+                {
+                    "kind": "appointment",
+                    "summary": "Arzttermin am Montag um 14 Uhr.",
+                    "details": "Bei Dr. Meyer in Hamburg.",
+                    "confirmed": True,
+                }
+            )
+
+            self.assertEqual(result["status"], "saved")
+            events = [
+                entry
+                for entry in loop.runtime.ops_events.tail(limit=20)
+                if entry["event"] == "tool_call_finished"
+            ]
+            self.assertTrue(events)
+            latest = events[-1]["data"]
+            self.assertEqual(latest["tool_name"], "remember_memory")
+            self.assertEqual(latest["status"], "saved")
+            self.assertIsInstance(latest["latency_ms"], int)
+            self.assertGreaterEqual(latest["latency_ms"], 0)
+            self.assertNotIn("failure_origin", latest)
+
+    def test_generic_tool_observability_records_failed_status_for_invalid_reminder(self) -> None:
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop()
+
+        result = loop._handle_schedule_reminder_tool_call(
+            {
+                "summary": "Arzttermin",
+            }
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"], "invalid_arguments")
+        events = [
+            entry
+            for entry in loop.runtime.ops_events.tail(limit=20)
+            if entry["event"] == "tool_call_failed"
+        ]
+        self.assertTrue(events)
+        latest = events[-1]["data"]
+        self.assertEqual(latest["tool_name"], "schedule_reminder")
+        self.assertEqual(latest["status"], "error")
+        self.assertEqual(latest["error_code"], "invalid_arguments")
+        self.assertEqual(latest["failure_origin"], "result_status")
+        self.assertIsInstance(latest["latency_ms"], int)
+        self.assertGreaterEqual(latest["latency_ms"], 0)
 
     def test_list_create_update_and_delete_time_automation_tool_calls(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4266,6 +4395,107 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(len(loop.runtime.memory.search_results), 1)
 
+    def test_search_tool_call_persists_requested_actual_model_and_fallback_reason(self) -> None:
+        loop, _lines, _realtime_session, print_backend, _recorder, _player, _printer = self.make_loop()
+        print_backend.search_live_info_with_metadata = lambda *args, **kwargs: SimpleNamespace(
+            answer="Bus 24 faehrt um 07:30 Uhr.",
+            sources=("https://example.com/fahrplan",),
+            response_id="resp_search_1",
+            request_id="req_search_1",
+            used_web_search=True,
+            model="gpt-4o-mini",
+            requested_model="gpt-5.4-mini",
+            fallback_reason="gpt-5.4-mini->gpt-4o-mini: error: transient provider failure",
+            attempt_log=(
+                OpenAISearchAttempt(
+                    model="gpt-5.4-mini",
+                    api_path="responses",
+                    max_output_tokens=1024,
+                    outcome="error",
+                    detail="RuntimeError: transient provider failure",
+                ),
+                OpenAISearchAttempt(
+                    model="gpt-4o-mini",
+                    api_path="responses",
+                    max_output_tokens=1536,
+                    outcome="success",
+                    status="completed",
+                ),
+            ),
+            token_usage=None,
+        )
+
+        result = loop._handle_search_tool_call(
+            {
+                "question": "Wann faehrt der Bus nach Hamburg?",
+                "location_hint": "Schwarzenbek",
+            },
+        )
+
+        self.assertEqual(result["requested_model"], "gpt-5.4-mini")
+        self.assertEqual(result["actual_model"], "gpt-4o-mini")
+        self.assertEqual(
+            result["fallback_reason"],
+            "gpt-5.4-mini->gpt-4o-mini: error: transient provider failure",
+        )
+        self.assertEqual(result["search_budget_trace"], "1024->1536")
+        self.assertTrue(result["search_budget_escalated"])
+        self.assertEqual(result["search_initial_output_budget"], 1024)
+        self.assertEqual(result["search_final_output_budget"], 1536)
+        self.assertEqual(result["search_peak_output_budget"], 1536)
+        deadline = time.monotonic() + 0.5
+        search_finished_events = []
+        while time.monotonic() < deadline:
+            search_finished_events = [
+                entry
+                for entry in loop.runtime.ops_events.tail(limit=20)
+                if entry["event"] == "search_finished"
+            ]
+            if search_finished_events:
+                break
+            time.sleep(0.01)
+        self.assertTrue(search_finished_events)
+        latest = search_finished_events[-1]["data"]
+        self.assertEqual(latest["requested_model"], "gpt-5.4-mini")
+        self.assertEqual(latest["actual_model"], "gpt-4o-mini")
+        self.assertEqual(
+            latest["fallback_reason"],
+            "gpt-5.4-mini->gpt-4o-mini: error: transient provider failure",
+        )
+        self.assertEqual(latest["search_budget_trace"], "1024->1536")
+        self.assertTrue(latest["search_budget_escalated"])
+        self.assertEqual(latest["search_initial_output_budget"], 1024)
+        self.assertEqual(latest["search_final_output_budget"], 1536)
+        self.assertEqual(latest["search_peak_output_budget"], 1536)
+        self.assertEqual(len(latest["search_attempts"]), 2)
+        self.assertEqual(latest["search_attempts"][0]["outcome"], "error")
+        self.assertEqual(latest["search_attempts"][1]["outcome"], "success")
+        generic_events = [
+            entry
+            for entry in loop.runtime.ops_events.tail(limit=20)
+            if entry["event"] == "tool_call_finished"
+        ]
+        self.assertTrue(generic_events)
+        generic_latest = generic_events[-1]["data"]
+        self.assertEqual(generic_latest["tool_name"], "search_live_info")
+        self.assertEqual(generic_latest["status"], "ok")
+        self.assertEqual(generic_latest["requested_model"], "gpt-5.4-mini")
+        self.assertEqual(generic_latest["actual_model"], "gpt-4o-mini")
+        self.assertEqual(
+            generic_latest["fallback_reason"],
+            "gpt-5.4-mini->gpt-4o-mini: error: transient provider failure",
+        )
+        self.assertTrue(generic_latest["used_web_search"])
+        self.assertIsInstance(generic_latest["latency_ms"], int)
+        self.assertGreaterEqual(generic_latest["latency_ms"], 0)
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            recent_events = tuple(loop.runtime.ops_events.tail(limit=20))
+            if any(entry["event"] == "search_result_stored" for entry in recent_events):
+                break
+            time.sleep(0.01)
+        time.sleep(0.05)
+
     def test_social_trigger_speaks_proactive_prompt(self) -> None:
         loop, lines, _realtime_session, print_backend, _recorder, player, _printer = self.make_loop(
             config=TwinrConfig(proactive_quiet_hours_visual_only_enabled=False)
@@ -4570,6 +4800,22 @@ class RealtimeHardwareLoopTests(unittest.TestCase):
         self.assertTrue(button_monitor.exited)
         self.assertTrue(proactive_monitor.entered)
         self.assertTrue(proactive_monitor.exited)
+
+    def test_run_starts_boot_sound_once_when_runtime_is_not_in_error(self) -> None:
+        button_monitor = FakeIdleButtonMonitor()
+        loop, _lines, _realtime_session, _print_backend, _recorder, _player, _printer = self.make_loop(
+            button_monitor=button_monitor,
+        )
+
+        with mock.patch("twinr.agent.workflows.realtime_runner.start_startup_boot_sound") as start_mock:
+            result = loop.run(duration_s=0.01, poll_timeout=0.001)
+
+        self.assertEqual(result, 0)
+        start_mock.assert_called_once_with(
+            config=loop.config,
+            playback_coordinator=loop.playback_coordinator,
+            emit=loop.emit,
+        )
 
     def test_run_holds_error_when_required_remote_dependency_is_unavailable(self) -> None:
         button_monitor = FakeIdleButtonMonitor()

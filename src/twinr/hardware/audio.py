@@ -17,7 +17,7 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 import select
 import subprocess
 import tempfile
@@ -25,9 +25,10 @@ import time
 import wave
 from threading import Lock
 
-from twinr.agent.base_agent.config import TwinrConfig
 from twinr.hardware.audio_env import build_audio_subprocess_env
-from twinr.hardware.respeaker_capture_recovery import wait_for_transient_respeaker_capture_ready
+
+if TYPE_CHECKING:
+    from twinr.agent.base_agent.config import TwinrConfig
 
 _SAMPLE_WIDTH_BYTES = 2
 # AUDIT-FIX(#3): Bound blocking device I/O so broken ALSA devices cannot wedge the process forever.
@@ -679,6 +680,10 @@ class SilenceDetectedRecorder:
                         and not respeaker_recovery_attempted
                     ):
                         respeaker_recovery_attempted = True
+                        from twinr.hardware.respeaker_capture_recovery import (
+                            wait_for_transient_respeaker_capture_ready,
+                        )
+
                         recovered = wait_for_transient_respeaker_capture_ready(
                             device=self.device,
                             sample_rate=self.sample_rate,

@@ -13,6 +13,7 @@ default, compact, supervisor, first-word, and specialist instruction bundles.
 - build route-aware first-word overlays for authoritative local semantic-router handoffs so the instant spoken bridge stays LLM-generated and provisional
 - encode the learned-skill tool policy for self-coding activation, rollback, pause, and reactivation
 - encode when the model should discover, filter, aggregate, control, or inspect smart-home state through the dedicated tool surface
+- encode when the model should start discovery, continue discovery from free self-disclosure, review learned profile facts, split distinct learned details into separate discovery routes, and use replace/delete actions with exact reviewed fact ids instead of inventing ad-hoc profile narration
 - encode the generic multi-query planning policy for broad smart-home and house-status questions so agents compose live status from multiple tool reads instead of a special-case summary path
 - expose public builders for default, compact, supervisor, first-word, and specialist lanes
 

@@ -178,6 +178,37 @@ class FakeSupervisorDecisionProvider:
 
 
 class DualLaneLoopTests(unittest.TestCase):
+    def test_resolve_supervisor_decision_merges_per_turn_instructions(self) -> None:
+        supervisor_decision_provider = FakeSupervisorDecisionProvider(
+            {
+                "action": "handoff",
+                "kind": "search",
+                "goal": "Find current Hamburg local politics updates.",
+                "spoken_ack": "Ich schaue kurz nach.",
+                "allow_web_search": True,
+            }
+        )
+        loop = DualLaneToolLoop(
+            supervisor_provider=FakeSupervisorProvider(),
+            specialist_provider=FakeSpecialistProvider(),
+            tool_handlers={},
+            tool_schemas=(),
+            supervisor_decision_provider=supervisor_decision_provider,
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+
+        decision = loop.resolve_supervisor_decision(
+            "Was ist denn heute in der Hamburger Lokalpolitik los?",
+            conversation=(("system", "Stay calm"),),
+            instructions="DISPLAY OVERLAY",
+        )
+
+        self.assertEqual(decision.action, "handoff")
+        self.assertEqual(len(supervisor_decision_provider.calls), 1)
+        self.assertIn("Supervisor instructions", supervisor_decision_provider.calls[0]["instructions"])
+        self.assertIn("DISPLAY OVERLAY", supervisor_decision_provider.calls[0]["instructions"])
+
     def test_prefetched_handoff_emits_filler_then_preempting_final_lane(self) -> None:
         supervisor = FakeSupervisorProvider()
         specialist = FakeSpecialistProvider()
@@ -438,7 +469,11 @@ class DualLaneLoopTests(unittest.TestCase):
         self.assertEqual(streamed[0], "Einen Moment bitte.")
         self.assertEqual(len(supervisor.start_calls), 0)
         self.assertEqual(decision_provider.calls[0]["conversation"], (("user", "kurzer kontext"),))
-        self.assertEqual(decision_provider.calls[0]["instructions"], "Supervisor instructions")
+        self.assertIn("Supervisor instructions", decision_provider.calls[0]["instructions"])
+        self.assertIn(
+            "General tool-agent instructions that must not leak into the decision lane.",
+            decision_provider.calls[0]["instructions"],
+        )
         self.assertEqual(specialist.start_calls, [])
         self.assertEqual(
             search_calls,
@@ -867,6 +902,50 @@ class DualLaneLoopTests(unittest.TestCase):
                     "question": "Wie wird das Wetter morgen dort?",
                     "location_hint": "Schwarzenbek",
                     "date_context": "Tuesday, 2026-03-17 (Europe/Berlin)",
+                }
+            ],
+        )
+
+    def test_run_handoff_only_prefers_handoff_prompt_for_direct_search(self) -> None:
+        supervisor = FakeSupervisorProvider()
+        specialist = FakeSpecialistProvider()
+        search_calls: list[dict[str, object]] = []
+        loop = DualLaneToolLoop(
+            supervisor_provider=supervisor,
+            specialist_provider=specialist,
+            tool_handlers={
+                "search_live_info": lambda arguments: search_calls.append(arguments) or {"answer": "8 Grad"},
+            },
+            tool_schemas=[{"type": "function", "name": "search_live_info"}],
+            supervisor_instructions="Supervisor instructions",
+            specialist_instructions="Specialist instructions",
+        )
+
+        loop.run_handoff_only(
+            "Was ist denn heute so in der schwarzen Lokalpolitik?",
+            handoff=SimpleNamespace(
+                action="handoff",
+                spoken_ack="Ich schaue kurz nach.",
+                kind="search",
+                goal="Find the latest Hamburg local politics update.",
+                prompt="Was ist heute in der Hamburger Lokalpolitik wichtig?",
+                allow_web_search=True,
+                location_hint="Hamburg",
+                date_context="Sunday, 2026-03-23 (Europe/Berlin)",
+                response_id="prefetch_resp",
+                request_id="prefetch_req",
+                model="gpt-4o-mini",
+                token_usage=None,
+            ),
+        )
+
+        self.assertEqual(
+            search_calls,
+            [
+                {
+                    "question": "Was ist heute in der Hamburger Lokalpolitik wichtig?",
+                    "location_hint": "Hamburg",
+                    "date_context": "Sunday, 2026-03-23 (Europe/Berlin)",
                 }
             ],
         )

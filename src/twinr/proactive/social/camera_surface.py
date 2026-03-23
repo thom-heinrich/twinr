@@ -317,6 +317,10 @@ class ProactiveCameraSnapshot:
     objects_unknown: bool
     visible_persons: tuple[SocialVisiblePerson, ...] = ()
     visible_persons_unknown: bool = False
+    looking_signal_state: str | None = None
+    looking_signal_state_unknown: bool = False
+    looking_signal_source: str | None = None
+    looking_signal_source_unknown: bool = False
 
     @property
     def coarse_arm_gesture(self) -> SocialGestureEvent:
@@ -365,6 +369,8 @@ class ProactiveCameraSnapshot:
                 self.primary_person_center_x_unknown,
                 self.primary_person_center_y_unknown,
                 self.looking_toward_device_unknown,
+                self.looking_signal_state_unknown,
+                self.looking_signal_source_unknown,
                 self.person_near_device_unknown,
                 self.engaged_with_device_unknown,
                 self.visual_attention_score_unknown,
@@ -427,6 +433,10 @@ class ProactiveCameraSnapshot:
             "primary_person_center_y_unknown": self.primary_person_center_y_unknown,
             "looking_toward_device": self.looking_toward_device,
             "looking_toward_device_unknown": self.looking_toward_device_unknown,
+            "looking_signal_state": self.looking_signal_state,
+            "looking_signal_state_unknown": self.looking_signal_state_unknown,
+            "looking_signal_source": self.looking_signal_source,
+            "looking_signal_source_unknown": self.looking_signal_source_unknown,
             "person_near_device": self.person_near_device,
             "person_near_device_unknown": self.person_near_device_unknown,
             "engaged_with_device": self.engaged_with_device,
@@ -754,6 +764,10 @@ class ProactiveCameraSurface:
         self._last_primary_person_center_y_at: float | None = None
         self._last_visual_attention_score: float | None = None
         self._last_visual_attention_score_at: float | None = None
+        self._last_looking_signal_state: str | None = None
+        self._last_looking_signal_state_at: float | None = None
+        self._last_looking_signal_source: str | None = None
+        self._last_looking_signal_source_at: float | None = None
         self._last_smiling = False
         self._last_smiling_at: float | None = None
         self._last_gesture_event = SocialGestureEvent.NONE
@@ -852,6 +866,28 @@ class ProactiveCameraSurface:
         looking_sample = self._looking_toward_device.observe(
             (person_sample.value and observation.looking_toward_device) if camera_semantics_authoritative else None,
             observed_at=now,
+        )
+        looking_signal_state, looking_signal_state_unknown = self._resolve_secondary_text(
+            inspected=camera_semantics_authoritative,
+            observed_at=now,
+            raw_value=(
+                getattr(observation, "looking_signal_state", None)
+                if person_sample.value and looking_sample.value
+                else None
+            ),
+            cache_attr="_last_looking_signal_state",
+            cache_seen_attr="_last_looking_signal_state_at",
+        )
+        looking_signal_source, looking_signal_source_unknown = self._resolve_secondary_text(
+            inspected=camera_semantics_authoritative,
+            observed_at=now,
+            raw_value=(
+                getattr(observation, "looking_signal_source", None)
+                if person_sample.value and looking_sample.value
+                else None
+            ),
+            cache_attr="_last_looking_signal_source",
+            cache_seen_attr="_last_looking_signal_source_at",
         )
         person_near_sample = self._person_near_device.observe(
             (
@@ -1053,6 +1089,10 @@ class ProactiveCameraSurface:
             primary_person_center_y_unknown=primary_person_center_y_unknown,
             looking_toward_device=looking_sample.value,
             looking_toward_device_unknown=looking_sample.unknown,
+            looking_signal_state=looking_signal_state,
+            looking_signal_state_unknown=looking_signal_state_unknown,
+            looking_signal_source=looking_signal_source,
+            looking_signal_source_unknown=looking_signal_source_unknown,
             person_near_device=person_near_sample.value,
             person_near_device_unknown=person_near_sample.unknown,
             engaged_with_device=engaged_sample.value,

@@ -231,6 +231,32 @@ class PlaybackCoordinator:
             ),
         )
 
+    def play_pcm16_chunks(
+        self,
+        *,
+        owner: str,
+        priority: PlaybackPriority | int,
+        chunks,
+        sample_rate: int,
+        channels: int = 1,
+        should_stop: Callable[[], bool] | None = None,
+        atomic: bool = False,
+    ) -> PlaybackRunResult:
+        """Queue one streamed PCM16 playback request."""
+
+        return self._submit_player_action(
+            owner=owner,
+            priority=int(priority),
+            should_stop=should_stop,
+            atomic=atomic,
+            action=lambda request_should_stop: self._play_pcm16_chunks(
+                request_should_stop=request_should_stop,
+                chunks=chunks,
+                sample_rate=sample_rate,
+                channels=channels,
+            ),
+        )
+
     def _submit_player_action(
         self,
         *,
@@ -416,6 +442,32 @@ class PlaybackCoordinator:
             if "should_stop" not in str(exc):
                 raise
             self.player.play_wav_chunks(chunks)
+
+    def _play_pcm16_chunks(
+        self,
+        *,
+        request_should_stop: Callable[[], bool],
+        chunks,
+        sample_rate: int,
+        channels: int,
+    ) -> None:
+        if request_should_stop():
+            return
+        try:
+            self.player.play_pcm16_chunks(
+                chunks,
+                sample_rate=sample_rate,
+                channels=channels,
+                should_stop=request_should_stop,
+            )
+        except TypeError as exc:
+            if "should_stop" not in str(exc):
+                raise
+            self.player.play_pcm16_chunks(
+                chunks,
+                sample_rate=sample_rate,
+                channels=channels,
+            )
 
     def _safe_stop(self, callback: Callable[[], None] | None) -> None:
         if not callable(callback):

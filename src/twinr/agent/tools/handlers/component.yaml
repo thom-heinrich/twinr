@@ -3,7 +3,7 @@ name: handlers
 path: src/twinr/agent/tools/handlers
 kind: python-package
 visibility: internal
-summary: Concrete realtime tool handlers and shared guard helpers for automation, smart-home, memory, reminder, world-intelligence, output, self-coding, settings, voice-profile, portrait-identity, and shared household-identity tool calls.
+summary: Concrete realtime tool handlers and shared guard helpers for automation, smart-home, memory, reminder, guided user-discovery, world-intelligence, output, self-coding, settings, voice-profile, portrait-identity, and shared household-identity tool calls.
 owned_concerns:
   - Validate and normalize tool-call payloads at the handler boundary
   - Translate tool requests into bounded runtime reads and mutations
@@ -13,6 +13,7 @@ owned_concerns:
   - Return structured portrait-enrollment guidance so the model can drive camera retries naturally
   - Return structured shared household-identity guidance for local face, voice, status, and explicit confirm or deny feedback flows
   - Bridge the self-coding front-stage learning flow into deterministic ASE modules
+  - Keep the guided get-to-know-you flow bounded while persisting, reviewing, correcting, and deleting high-value discovery facts across Twinr memory surfaces
   - Expose one explicit tool handler for RSS/world-intelligence subscription setup and occasional recalibration
 out_of_scope:
   - Tool registry, binding, schemas, or prompt instruction assembly
@@ -51,6 +52,10 @@ files:
       - handle_remember_plan
       - handle_update_user_profile
       - handle_update_personality
+  - path: user_discovery.py
+    role: Guided get-to-know-you, review, correction, deletion, and structured memory-routing handler
+    exports:
+      - handle_manage_user_discovery
   - path: intelligence.py
     role: RSS/world-intelligence subscription and refresh-config handler
     exports:
@@ -119,6 +124,7 @@ tests:
   - path: test/test_simple_settings.py
   - path: test/test_voice_profile.py
   - path: test/test_household_identity.py
+  - path: test/test_user_discovery.py
   - path: test/test_runner.py
   - path: test/test_streaming_tool_loop.py
   - path: test/run_pi_tool_matrix.py

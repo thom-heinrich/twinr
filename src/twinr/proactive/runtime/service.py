@@ -1,7 +1,7 @@
-"""Coordinate proactive sensing, wakeword arming, and monitor lifecycle.
+"""Coordinate proactive sensing, voice-presence arming, and monitor lifecycle.
 
 This module assembles the runtime-facing proactive monitor used by Twinr
-workflows. It wires sensor observers, wakeword policy, presence-session
+workflows. It wires sensor observers, presence-session
 tracking, buffered vision review, automation observation export, and the
 background worker lifecycle without owning the lower-level scoring or hardware
 adapters themselves.
@@ -14,6 +14,7 @@ from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
 from typing import TYPE_CHECKING, Any, Callable
 import logging
+import math
 import os
 import tempfile
 import time
@@ -27,7 +28,7 @@ from twinr.hardware.audio import (
     AudioCaptureReadinessProbe,
     pcm16_to_wav_bytes,
 )
-from twinr.hardware.servo_follow import AttentionServoController
+from twinr.hardware.servo_follow import AttentionServoController, AttentionServoDecision
 from twinr.hardware.respeaker import (
     build_respeaker_claim_payloads,
     config_targets_respeaker,
@@ -50,13 +51,6 @@ from ..social.vision_review import (
     ProactiveVisionReview,
     is_reviewable_image_trigger,
 )
-from ..wakeword.calibration import WakewordCalibrationStore, apply_wakeword_calibration
-from ..wakeword.kws import WakewordSherpaOnnxFrameSpotter, WakewordSherpaOnnxSpotter
-from ..wakeword.local_verifier import build_configured_sequence_capture_verifier
-from ..wakeword.matching import WakewordMatch, WakewordPhraseSpotter
-from ..wakeword.policy import SttWakewordVerifier, WakewordDecision, WakewordDecisionPolicy, normalize_wakeword_backend
-from ..wakeword.spotter import WakewordOpenWakeWordSpotter
-from ..wakeword.stream import OpenWakeWordStreamingMonitor, WakewordStreamDetection
 from .affect_proxy import AffectProxySnapshot, derive_affect_proxy
 from .ambiguous_room_guard import (
     AmbiguousRoomGuardSnapshot,
@@ -68,6 +62,7 @@ from .attention_targeting import (
 )
 from .attention_debug_stream import AttentionDebugStream
 from .display_attention import DisplayAttentionCuePublishResult, DisplayAttentionCuePublisher
+from .display_attention_camera_fusion import DisplayAttentionCameraFusion
 from .display_ambient_impulses import (
     DisplayAmbientImpulsePublishResult,
     DisplayAmbientImpulsePublisher,
@@ -76,6 +71,7 @@ from .display_attention import (
     display_attention_refresh_supported,
     resolve_display_attention_refresh_interval,
 )
+from .display_debug_signals import DisplayDebugSignalPublisher
 from .display_gesture_emoji import (
     DisplayGestureEmojiDecision,
     DisplayGestureEmojiPublishResult,
@@ -108,6 +104,7 @@ from .runtime_contract import (
     assess_respeaker_monitor_startup_contract,
     is_respeaker_runtime_hard_block,
 )
+from .safety_trigger_fusion import SafetyTriggerFusionBridge
 from .speaker_association import (
     ReSpeakerSpeakerAssociationSnapshot,
     derive_respeaker_speaker_association,
@@ -154,6 +151,44 @@ def _exception_text(error: BaseException | object, *, limit: int = 240) -> str:
     if len(text) > limit:
         return f"{text[: limit - 3]}..."
     return text
+
+
+def _emit_token(value: object, *, limit: int = 96) -> str:
+    """Render one bounded telemetry token for journal-friendly key=value lines."""
+
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return str(value).lower()
+        text = f"{value:.4f}".rstrip("0").rstrip(".")
+        return text or "0"
+    text = " ".join(str(value).split())
+    if not text:
+        return "none"
+    safe_chars: list[str] = []
+    for char in text:
+        if char.isalnum() or char in {"_", "-", ".", ":", "/"}:
+            safe_chars.append(char)
+        else:
+            safe_chars.append("_")
+    safe = "".join(safe_chars) or "none"
+    if len(safe) <= limit:
+        return safe
+    if limit <= 3:
+        return safe[:limit]
+    return safe[: limit - 3] + "..."
+
+
+def _emit_key_value_line(prefix: str, /, **fields: object) -> str:
+    """Build one stable key=value telemetry line for changed-only journal tracing."""
+
+    parts = [prefix]
+    for key, value in fields.items():
+        parts.append(f"{key}={_emit_token(value)}")
+    return " ".join(parts)
 
 
 # AUDIT-FIX(#1): Degrade gracefully if file-backed ops-event persistence is unavailable.
@@ -512,7 +547,7 @@ class ProactiveTickResult:
     """Describe the externally relevant outcome of one monitor tick."""
 
     decision: SocialTriggerDecision | None = None
-    wakeword_match: WakewordMatch | None = None
+    wakeword_match: object | None = None
     inspected: bool = False
     person_visible: bool = False
 
@@ -533,8 +568,8 @@ class ProactiveCoordinator:
     """Coordinate one proactive monitor tick across sensors and policies.
 
     The coordinator owns the runtime-facing orchestration for PIR, vision,
-    ambient audio, wakeword detection, presence sessions, trigger review, and
-    automation observation export. Lower-level trigger scoring and wakeword
+    ambient audio, presence sessions, trigger review, and
+    automation observation export. Lower-level trigger scoring and voice
     matching remain in sibling packages.
     """
 
@@ -549,16 +584,17 @@ class ProactiveCoordinator:
         pir_monitor: GpioPirMonitor | None = None,
         audio_observer=None,
         presence_session: PresenceSessionController | None = None,
-        wakeword_spotter: WakewordPhraseSpotter | None = None,
-        wakeword_stream: OpenWakeWordStreamingMonitor | None = None,
-        wakeword_policy: WakewordDecisionPolicy | None = None,
+        wakeword_spotter: object | None = None,
+        wakeword_stream: object | None = None,
+        wakeword_policy: object | None = None,
         vision_reviewer: OpenAIProactiveVisionReviewer | None = None,
         portrait_match_provider: PortraitMatchProvider | None = None,
-        wakeword_handler: Callable[[WakewordMatch], bool] | None = None,
+        wakeword_handler: Callable[[object], bool] | None = None,
         gesture_wakeup_handler: Callable[[GestureWakeupDecision], bool] | None = None,
         idle_predicate: Callable[[], bool] | None = None,
         observation_handler: Callable[[dict[str, Any], tuple[str, ...]], None] | None = None,
         display_attention_publisher: DisplayAttentionCuePublisher | None = None,
+        display_debug_signal_publisher: DisplayDebugSignalPublisher | None = None,
         display_gesture_emoji_publisher: DisplayGestureEmojiPublisher | None = None,
         display_ambient_impulse_publisher: DisplayAmbientImpulsePublisher | None = None,
         attention_servo_controller: AttentionServoController | None = None,
@@ -592,6 +628,9 @@ class ProactiveCoordinator:
         self.display_attention_publisher = display_attention_publisher or DisplayAttentionCuePublisher.from_config(
             config
         )
+        self.display_debug_signal_publisher = display_debug_signal_publisher or DisplayDebugSignalPublisher.from_config(
+            config
+        )
         self.display_gesture_emoji_publisher = display_gesture_emoji_publisher or DisplayGestureEmojiPublisher.from_config(
             config
         )
@@ -607,10 +646,7 @@ class ProactiveCoordinator:
         )
         self.emit = emit or (lambda _line: None)
         self.clock = clock
-        self._normalized_wakeword_backend = normalize_wakeword_backend(
-            getattr(config, "wakeword_primary_backend", config.wakeword_backend),
-            default="openwakeword",
-        )
+        self._normalized_wakeword_backend = "disabled"
         self._last_motion_at: float | None = None
         self._last_capture_at: float | None = None
         self._last_display_attention_refresh_at: float | None = None
@@ -618,12 +654,20 @@ class ProactiveCoordinator:
         self._last_audio_snapshot: ProactiveAudioSnapshot | None = None
         self._last_audio_snapshot_at: float | None = None
         self._last_display_attention_follow_key: tuple[object, ...] | None = None
+        self._last_attention_follow_pipeline_key: tuple[object, ...] | None = None
+        self._last_attention_servo_follow_key: tuple[object, ...] | None = None
         self._last_observation_key: tuple[object, ...] | None = None
         self._last_attention_vision_refresh_mode: str | None = None
         self._last_attention_audio_refresh_mode: str | None = None
         self._last_gesture_vision_refresh_mode: str | None = None
+        self._last_display_attention_fusion_debug: dict[str, Any] | None = None
         self._camera_surface = ProactiveCameraSurface.from_config(config)
         self._display_attention_camera_surface = ProactiveCameraSurface.from_config(config)
+        self._display_attention_camera_fusion = DisplayAttentionCameraFusion.from_config(config)
+        self._safety_trigger_fusion = SafetyTriggerFusionBridge.from_config(
+            config,
+            engine=engine,
+        )
         self._gesture_ack_lane = GestureAckLane.from_config(config)
         self._gesture_wakeup_lane = GestureWakeupLane.from_config(config)
         self._gesture_wakeup_dispatcher = GestureWakeupDispatcher(
@@ -966,6 +1010,9 @@ class ProactiveCoordinator:
             now=now,
             motion_active=motion_active,
             audio_observation=audio_snapshot.observation,
+            room_busy_or_overlapping=bool(
+                audio_policy_snapshot is not None and audio_policy_snapshot.room_busy_or_overlapping
+            ),
             evaluate_trigger=proactive_enabled,
         )
         presence_snapshot = self._observe_presence(
@@ -981,6 +1028,7 @@ class ProactiveCoordinator:
             audio_snapshot=audio_snapshot,
             audio_policy_snapshot=audio_policy_snapshot,
             presence_snapshot=presence_snapshot,
+            detected_trigger_id=None if decision is None else decision.trigger_id,
         )
         self._record_observation_if_changed(
             observation,
@@ -990,17 +1038,6 @@ class ProactiveCoordinator:
             presence_snapshot=presence_snapshot,
             runtime_status_value="waiting",
         )
-        wakeword_match = self._maybe_detect_wakeword(
-            now=now,
-            audio_snapshot=audio_snapshot,
-            presence_snapshot=presence_snapshot,
-        )
-        if wakeword_match is not None:
-            return ProactiveTickResult(
-                wakeword_match=wakeword_match,
-                inspected=False,
-                person_visible=False,
-            )
         result = self._process_decision(
             now=now,
             decision=decision,
@@ -1102,7 +1139,16 @@ class ProactiveCoordinator:
             vision=snapshot.observation,
             audio=audio_snapshot.observation,
         )
-        decision = self.engine.observe(observation) if proactive_enabled else None  # AUDIT-FIX(#5): never evaluate proactive triggers when proactive mode is disabled.
+        decision = (
+            self._safety_trigger_fusion.observe(
+                observation,
+                room_busy_or_overlapping=bool(
+                    audio_policy_snapshot is not None and audio_policy_snapshot.room_busy_or_overlapping
+                ),
+            )
+            if proactive_enabled
+            else None
+        )  # AUDIT-FIX(#5): never evaluate proactive triggers when proactive mode is disabled.
         presence_snapshot = self._observe_presence(
             now=now,
             person_visible=snapshot.observation.person_visible,
@@ -1116,6 +1162,7 @@ class ProactiveCoordinator:
             audio_snapshot=audio_snapshot,
             audio_policy_snapshot=audio_policy_snapshot,
             presence_snapshot=presence_snapshot,
+            detected_trigger_id=None if decision is None else decision.trigger_id,
         )
         self._record_observation_if_changed(
             observation,
@@ -1132,7 +1179,7 @@ class ProactiveCoordinator:
             f"{str(audio_snapshot.observation.speech_detected).lower()}"
         )
         if self.presence_session is not None:
-            self._emit(f"wakeword_armed={str(presence_snapshot.armed).lower()}")
+            self._emit(f"voice_activation_armed={str(presence_snapshot.armed).lower()}")
         if audio_snapshot.observation.distress_detected is not None:
             self._emit(
                 "proactive_distress_detected="
@@ -1140,17 +1187,6 @@ class ProactiveCoordinator:
             )
         if audio_snapshot.sample is not None:
             self._emit(f"proactive_audio_peak_rms={audio_snapshot.sample.peak_rms}")
-        wakeword_match = self._maybe_detect_wakeword(
-            now=now,
-            audio_snapshot=audio_snapshot,
-            presence_snapshot=presence_snapshot,
-        )
-        if wakeword_match is not None:
-            return ProactiveTickResult(
-                wakeword_match=wakeword_match,
-                inspected=True,
-                person_visible=snapshot.observation.person_visible,
-            )
         result = self._process_decision(
             now=now,
             decision=decision,
@@ -1214,6 +1250,7 @@ class ProactiveCoordinator:
         now: float,
         motion_active: bool,
         audio_observation: SocialAudioObservation,
+        room_busy_or_overlapping: bool = False,
         evaluate_trigger: bool = True,
     ) -> tuple[SocialObservation, SocialTriggerDecision | None]:
         """Build one observation for the no-camera path and optionally score it."""
@@ -1226,7 +1263,17 @@ class ProactiveCoordinator:
             vision=SocialVisionObservation(person_visible=False),
             audio=audio_observation,
         )
-        return observation, (self.engine.observe(observation) if evaluate_trigger else None)  # AUDIT-FIX(#5): bypass trigger evaluation in wakeword-only/privacy-disabled proactive mode.
+        return (
+            observation,
+            (
+                self._safety_trigger_fusion.observe(
+                    observation,
+                    room_busy_or_overlapping=room_busy_or_overlapping,
+                )
+                if evaluate_trigger
+                else None
+            ),
+        )  # AUDIT-FIX(#5): bypass trigger evaluation in wakeword-only/privacy-disabled proactive mode.
 
     def _observe_presence(
         self,
@@ -1309,31 +1356,14 @@ class ProactiveCoordinator:
         )
         self.latest_presence_snapshot = snapshot
         self._record_presence_if_changed(snapshot)
-        if self.wakeword_stream is not None:
+        if self.wakeword_stream is not None and hasattr(self.wakeword_stream, "update_presence"):
             self.wakeword_stream.update_presence(snapshot)
         return snapshot
 
-    def poll_wakeword_stream(self) -> WakewordMatch | None:
-        """Drain one wakeword stream detection when streaming is enabled."""
+    def poll_wakeword_stream(self) -> object | None:
+        """Local wakeword streaming was removed; proactive no longer drains it."""
 
-        if self.wakeword_stream is None or self.wakeword_handler is None:
-            return None
-        try:
-            error = self.wakeword_stream.poll_error()
-        except Exception as exc:
-            self._handle_wakeword_stream_failure(exc)  # AUDIT-FIX(#6): stream poll failures should downgrade the stream path instead of bubbling out every loop.
-            return None
-        if error:
-            self._handle_wakeword_stream_failure(error)
-            return None
-        try:
-            detection = self.wakeword_stream.poll_detection()
-        except Exception as exc:
-            self._handle_wakeword_stream_failure(exc)
-            return None
-        if detection is None:
-            return None
-        return self._handle_stream_detection(detection)
+        return None
 
     # AUDIT-FIX(#6): Replace a failed streaming wakeword path with a secondary audio observer when available so the monitor degrades instead of repeatedly faulting.
     def _handle_wakeword_stream_failure(self, error: BaseException | object) -> None:
@@ -1790,13 +1820,13 @@ class ProactiveCoordinator:
     ) -> bool:
         """Return whether speech should trigger one bounded local vision inspection.
 
-        Wakeword listening is presence-gated. If PIR is quiet or absent, but
-        the local microphone hears active speech while wakeword mode is enabled,
-        a bounded camera inspection lets the device establish real presence
-        instead of staying permanently idle behind the PIR gate.
+        Remote voice activation is presence-gated. If PIR is quiet or absent,
+        but the local microphone hears active speech while the remote voice
+        path is enabled, a bounded camera inspection lets the device establish
+        real presence instead of staying permanently idle behind the PIR gate.
         """
 
-        if not bool(getattr(self.config, "wakeword_enabled", False)):
+        if not bool(getattr(self.config, "voice_orchestrator_enabled", False)):
             return False
         if self.vision_observer is None:
             return False
@@ -1825,6 +1855,7 @@ class ProactiveCoordinator:
 
         refresh_started_ns = time.monotonic_ns()
         stage_ms: dict[str, float] = {}
+        self._last_display_attention_fusion_debug = None
 
         if not display_attention_refresh_supported(
             config=self.config,
@@ -1887,6 +1918,12 @@ class ProactiveCoordinator:
                 stage_ms=stage_ms,
             )
             return False
+        stage_started_ns = time.monotonic_ns()
+        fused_vision = self._fuse_display_attention_camera_observation(
+            observed_at=now,
+            observation=snapshot.observation,
+        )
+        stage_ms["camera_fusion"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
         self._last_display_attention_refresh_at = now
         self._record_vision_snapshot_safe(snapshot)
         stage_started_ns = time.monotonic_ns()
@@ -1896,7 +1933,7 @@ class ProactiveCoordinator:
                 inspected=True,
                 pir_motion_detected=False,
                 low_motion=False,
-                vision=snapshot.observation,
+                vision=fused_vision,
                 audio=SocialAudioObservation(),
             ),
             inspected=True,
@@ -1916,17 +1953,21 @@ class ProactiveCoordinator:
             inspected=True,
             pir_motion_detected=False,
             low_motion=False,
-            vision=snapshot.observation,
+            vision=fused_vision,
             audio=audio_snapshot.observation,
         )
         stage_started_ns = time.monotonic_ns()
         publish_result = self._update_display_attention_follow(
+            source="display_attention_refresh",
             observed_at=now,
             camera_snapshot=camera_update.snapshot,
             audio_observation=audio_snapshot.observation,
             audio_policy_snapshot=audio_policy_snapshot,
         )
         stage_ms["publish"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
+        stage_started_ns = time.monotonic_ns()
+        self._update_display_debug_signals(camera_update)
+        stage_ms["debug_signals"] = round((time.monotonic_ns() - stage_started_ns) / 1_000_000.0, 3)
         stage_ms["total"] = round((time.monotonic_ns() - refresh_started_ns) / 1_000_000.0, 3)
         self._record_display_attention_follow_if_changed(
             observed_at=now,
@@ -2015,6 +2056,11 @@ class ProactiveCoordinator:
             return False
         self._last_display_gesture_refresh_at = now
         self._record_vision_snapshot_safe(snapshot)
+        self._remember_display_attention_camera_semantics(
+            observed_at=now,
+            observation=snapshot.observation,
+            source="gesture",
+        )
         stage_started_ns = time.monotonic_ns()
         decision = self._gesture_ack_lane.observe(
             observed_at=now,
@@ -2031,9 +2077,7 @@ class ProactiveCoordinator:
             stage_started_ns = time.monotonic_ns()
             wakeup_priority = decide_gesture_wakeup_priority(
                 runtime_status_value=runtime_status_value,
-                voice_path_enabled=bool(
-                    getattr(self.config, "voice_orchestrator_enabled", False) or self.wakeword_stream is not None
-                ),
+                voice_path_enabled=bool(getattr(self.config, "voice_orchestrator_enabled", False)),
                 presence_snapshot=self.latest_presence_snapshot,
                 recent_speech_guard_s=_ATTENTION_REFRESH_AUDIO_CACHE_MAX_AGE_S,
             )
@@ -2291,17 +2335,17 @@ class ProactiveCoordinator:
         if presence_snapshot is not None:
             data.update(
                 {
-                    "wakeword_armed": presence_snapshot.armed,
-                    "wakeword_presence_reason": presence_snapshot.reason,
-                    "wakeword_presence_session_id": presence_session_id,
-                    "wakeword_presence_audio_active": presence_snapshot.presence_audio_active,
-                    "wakeword_recent_follow_up_speech": presence_snapshot.recent_follow_up_speech,
-                    "wakeword_room_busy_or_overlapping": presence_snapshot.room_busy_or_overlapping,
-                    "wakeword_quiet_window_open": presence_snapshot.quiet_window_open,
-                    "wakeword_barge_in_recent": presence_snapshot.barge_in_recent,
-                    "wakeword_speaker_direction_stable": presence_snapshot.speaker_direction_stable,
-                    "wakeword_mute_blocks_voice_capture": presence_snapshot.mute_blocks_voice_capture,
-                    "wakeword_resume_window_open": presence_snapshot.resume_window_open,
+                    "voice_activation_armed": presence_snapshot.armed,
+                    "voice_activation_presence_reason": presence_snapshot.reason,
+                    "voice_activation_presence_session_id": presence_session_id,
+                    "voice_activation_presence_audio_active": presence_snapshot.presence_audio_active,
+                    "voice_activation_recent_follow_up_speech": presence_snapshot.recent_follow_up_speech,
+                    "voice_activation_room_busy_or_overlapping": presence_snapshot.room_busy_or_overlapping,
+                    "voice_activation_quiet_window_open": presence_snapshot.quiet_window_open,
+                    "voice_activation_barge_in_recent": presence_snapshot.barge_in_recent,
+                    "voice_activation_speaker_direction_stable": presence_snapshot.speaker_direction_stable,
+                    "voice_activation_mute_blocks_voice_capture": presence_snapshot.mute_blocks_voice_capture,
+                    "voice_activation_resume_window_open": presence_snapshot.resume_window_open,
                 }
             )
         if vision_snapshot is not None:
@@ -2330,7 +2374,7 @@ class ProactiveCoordinator:
                     "audio_gpo_logic_levels": audio_snapshot.signal_snapshot.gpo_logic_levels,
                 }
             )
-        top_evaluation = self.engine.best_evaluation
+        top_evaluation = self._safety_trigger_fusion.best_evaluation
         if top_evaluation is not None and top_evaluation.score > 0.0:
             data.update(
                 {
@@ -2599,7 +2643,20 @@ class ProactiveCoordinator:
             "speech_detected": observation.audio.speech_detected,
             "distress_detected": observation.audio.distress_detected,
             "low_motion": observation.low_motion,
+            "trigger_source": self._safety_trigger_fusion.last_selected_source,
         }
+        fused_claim = self._safety_trigger_fusion.last_selected_claim
+        if fused_claim is not None:
+            data.update(
+                {
+                    "fused_claim_state": fused_claim.state,
+                    "fused_claim_confidence": fused_claim.confidence,
+                    "fused_claim_action_level": fused_claim.action_level.value,
+                    "fused_claim_supporting_audio_events": list(fused_claim.supporting_audio_events),
+                    "fused_claim_supporting_vision_events": list(fused_claim.supporting_vision_events),
+                    "fused_claim_blocked_by": list(fused_claim.blocked_by),
+                }
+            )
         if review is not None:
             data.update(
                 {
@@ -2841,17 +2898,28 @@ class ProactiveCoordinator:
         audio_snapshot=None,
         audio_policy_snapshot: ReSpeakerAudioPolicySnapshot | None,
         presence_snapshot: PresenceSessionSnapshot | None,
+        detected_trigger_id: str | None = None,
     ) -> None:
         """Publish one normalized observation to the automation observer hook."""
 
         try:
+            self._remember_display_attention_camera_semantics(
+                observed_at=observation.observed_at,
+                observation=observation.vision,
+                source="full",
+            )
             camera_update = self._observe_camera_surface(observation, inspected=inspected)
+            self._update_display_debug_signals(
+                camera_update,
+                detected_trigger_ids=(() if detected_trigger_id is None else (detected_trigger_id,)),
+            )
             if not display_gesture_refresh_supported(
                 config=self.config,
                 vision_observer=self.vision_observer,
             ):
                 self._update_display_gesture_emoji_ack(camera_update)
             publish_result = self._update_display_attention_follow(
+                source="automation_observation",
                 observed_at=observation.observed_at,
                 camera_snapshot=camera_update.snapshot,
                 audio_observation=observation.audio,
@@ -2882,9 +2950,39 @@ class ProactiveCoordinator:
                 error=exc,
             )
 
+    def _update_display_debug_signals(
+        self,
+        camera_update: ProactiveCameraSurfaceUpdate,
+        *,
+        detected_trigger_ids: tuple[str, ...] = (),
+    ) -> None:
+        """Persist HDMI debug pills from current camera state and recent triggers."""
+
+        publisher = self.display_debug_signal_publisher
+        if publisher is None:
+            return
+        try:
+            publisher.publish_from_camera_facts(
+                camera_facts=camera_update.snapshot.to_automation_facts(),
+                event_names=camera_update.event_names,
+                trigger_ids=detected_trigger_ids,
+            )
+        except Exception as exc:
+            self._record_fault(
+                event="proactive_display_debug_signals_publish_failed",
+                message="Failed to publish HDMI debug-signal state.",
+                error=exc,
+                data={
+                    "camera_event_names": list(camera_update.event_names),
+                    "trigger_ids": list(detected_trigger_ids),
+                },
+                level="warning",
+            )
+
     def _update_display_attention_follow(
         self,
         *,
+        source: str,
         observed_at: float,
         camera_snapshot: ProactiveCameraSnapshot,
         audio_observation,
@@ -2925,8 +3023,16 @@ class ProactiveCoordinator:
         self.latest_attention_target_snapshot = attention_target
         live_facts["speaker_association"] = speaker_association.to_automation_facts()
         live_facts["attention_target"] = attention_target.to_automation_facts()
-        self._update_attention_servo_follow(
+        self._record_attention_follow_pipeline_if_changed(
+            source=source,
             observed_at=observed_at,
+            camera_snapshot=camera_snapshot,
+            attention_target=attention_target,
+        )
+        self._update_attention_servo_follow(
+            source=source,
+            observed_at=observed_at,
+            camera_person_visible=camera_snapshot.person_visible,
             attention_target=attention_target,
         )
         publisher = self.display_attention_publisher
@@ -2949,7 +3055,9 @@ class ProactiveCoordinator:
     def _update_attention_servo_follow(
         self,
         *,
+        source: str,
         observed_at: float,
+        camera_person_visible: bool,
         attention_target: MultimodalAttentionTargetSnapshot | None,
     ) -> None:
         """Update the optional body-orientation servo from the current attention target."""
@@ -2957,12 +3065,33 @@ class ProactiveCoordinator:
         controller = self.attention_servo_controller
         if controller is None:
             return
+        if not self._attention_servo_source_is_authoritative(source=source):
+            self._record_attention_servo_follow_if_changed(
+                source=source,
+                observed_at=observed_at,
+                attention_target=attention_target,
+                decision=AttentionServoDecision(
+                    observed_at=observed_at,
+                    active=False,
+                    reason="ignored_non_authoritative_source",
+                    confidence=0.0 if attention_target is None else attention_target.confidence,
+                    target_center_x=None if attention_target is None else attention_target.target_center_x,
+                ),
+            )
+            return
         try:
-            controller.update(
+            decision = controller.update(
                 observed_at=observed_at,
                 active=False if attention_target is None else attention_target.active,
                 target_center_x=None if attention_target is None else attention_target.target_center_x,
                 confidence=0.0 if attention_target is None else attention_target.confidence,
+                visible_target_present=camera_person_visible,
+            )
+            self._record_attention_servo_follow_if_changed(
+                source=source,
+                observed_at=observed_at,
+                attention_target=attention_target,
+                decision=decision,
             )
         except Exception as exc:
             self._record_fault(
@@ -2971,6 +3100,170 @@ class ProactiveCoordinator:
                 error=exc,
                 data={"observed_at": observed_at},
             )
+
+    def _attention_servo_source_is_authoritative(self, *, source: str) -> bool:
+        """Prefer the dedicated HDMI attention-refresh path over automation snapshots for physical servo control."""
+
+        if not display_attention_refresh_supported(
+            config=self.config,
+            vision_observer=self.vision_observer,
+        ):
+            return True
+        return source == "display_attention_refresh"
+
+    def _record_attention_follow_pipeline_if_changed(
+        self,
+        *,
+        source: str,
+        observed_at: float,
+        camera_snapshot: ProactiveCameraSnapshot,
+        attention_target: MultimodalAttentionTargetSnapshot | None,
+    ) -> None:
+        """Record one changed runtime attention-follow pipeline state before servo gating."""
+
+        controller = self.attention_servo_controller
+        controller_config = None if controller is None else getattr(controller, "config", None)
+        key = (
+            source,
+            camera_snapshot.person_visible,
+            camera_snapshot.person_count,
+            camera_snapshot.camera_ready,
+            camera_snapshot.camera_ai_ready,
+            _round_optional_ratio(camera_snapshot.primary_person_center_x),
+            None if attention_target is None else attention_target.state,
+            None if attention_target is None else attention_target.active,
+            None if attention_target is None else attention_target.target_track_id,
+            _round_optional_ratio(None if attention_target is None else attention_target.target_center_x),
+            _round_optional_ratio(None if attention_target is None else attention_target.target_velocity_x),
+            None if attention_target is None else attention_target.focus_source,
+            _round_optional_ratio(None if attention_target is None else attention_target.confidence),
+            None if controller is None else True,
+            None if controller_config is None else getattr(controller_config, "enabled", None),
+            None if controller_config is None else getattr(controller_config, "follow_exit_only", None),
+            None if controller_config is None else getattr(controller_config, "driver", None),
+            None if controller_config is None else getattr(controller_config, "gpio", None),
+        )
+        if key == self._last_attention_follow_pipeline_key:
+            return
+        self._last_attention_follow_pipeline_key = key
+        data = {
+            "observed_at": observed_at,
+            "follow_source": source,
+            "camera_person_visible": camera_snapshot.person_visible,
+            "camera_person_count": camera_snapshot.person_count,
+            "camera_visible_person_count": len(camera_snapshot.visible_persons),
+            "camera_ready": camera_snapshot.camera_ready,
+            "camera_ai_ready": camera_snapshot.camera_ai_ready,
+            "camera_primary_person_zone": camera_snapshot.primary_person_zone.value,
+            "camera_primary_person_center_x": _round_optional_ratio(camera_snapshot.primary_person_center_x),
+            "attention_target_state": None if attention_target is None else attention_target.state,
+            "attention_target_active": None if attention_target is None else attention_target.active,
+            "attention_target_track_id": None if attention_target is None else attention_target.target_track_id,
+            "attention_target_center_x": _round_optional_ratio(
+                None if attention_target is None else attention_target.target_center_x
+            ),
+            "attention_target_velocity_x": _round_optional_ratio(
+                None if attention_target is None else attention_target.target_velocity_x
+            ),
+            "attention_target_focus_source": None if attention_target is None else attention_target.focus_source,
+            "attention_target_confidence": _round_optional_ratio(
+                None if attention_target is None else attention_target.confidence
+            ),
+            "servo_controller_present": controller is not None,
+            "servo_config_enabled": None if controller_config is None else getattr(controller_config, "enabled", None),
+            "servo_follow_exit_only": (
+                None if controller_config is None else getattr(controller_config, "follow_exit_only", None)
+            ),
+            "servo_driver": None if controller_config is None else getattr(controller_config, "driver", None),
+            "servo_gpio": None if controller_config is None else getattr(controller_config, "gpio", None),
+        }
+        self._append_ops_event(
+            event="proactive_attention_follow_pipeline",
+            message="Recorded one changed attention-follow pipeline state before servo gating.",
+            data=data,
+        )
+        self._emit(
+            _emit_key_value_line(
+                "attention_follow_pipeline",
+                source=source,
+                person_visible=camera_snapshot.person_visible,
+                person_count=camera_snapshot.person_count,
+                camera_ready=camera_snapshot.camera_ready,
+                camera_ai_ready=camera_snapshot.camera_ai_ready,
+                target_state=None if attention_target is None else attention_target.state,
+                target_active=None if attention_target is None else attention_target.active,
+                target_center_x=_round_optional_ratio(
+                    None if attention_target is None else attention_target.target_center_x
+                ),
+                target_confidence=_round_optional_ratio(
+                    None if attention_target is None else attention_target.confidence
+                ),
+                servo_enabled=None if controller_config is None else getattr(controller_config, "enabled", None),
+                follow_exit_only=None if controller_config is None else getattr(controller_config, "follow_exit_only", None),
+                servo_driver=None if controller_config is None else getattr(controller_config, "driver", None),
+            )
+        )
+
+    def _record_attention_servo_follow_if_changed(
+        self,
+        *,
+        source: str,
+        observed_at: float,
+        attention_target: MultimodalAttentionTargetSnapshot | None,
+        decision: AttentionServoDecision,
+    ) -> None:
+        """Record only materially changed servo-follow decisions for Pi root-cause tracing."""
+
+        key = (
+            source,
+            decision.reason,
+            decision.active,
+            _round_optional_ratio(decision.target_center_x),
+            _round_optional_ratio(decision.applied_center_x),
+            decision.target_pulse_width_us,
+            decision.commanded_pulse_width_us,
+            None if attention_target is None else attention_target.state,
+            None if attention_target is None else attention_target.target_track_id,
+            _round_optional_ratio(None if attention_target is None else attention_target.target_center_x),
+            None if attention_target is None else attention_target.focus_source,
+        )
+        if key == self._last_attention_servo_follow_key:
+            return
+        self._last_attention_servo_follow_key = key
+        self._append_ops_event(
+            event="proactive_attention_servo_follow",
+            message="Updated the bounded body-orientation servo trace.",
+            data={
+                "observed_at": observed_at,
+                "follow_source": source,
+                "attention_target_state": None if attention_target is None else attention_target.state,
+                "attention_target_active": None if attention_target is None else attention_target.active,
+                "attention_target_track_id": None if attention_target is None else attention_target.target_track_id,
+                "attention_target_center_x": _round_optional_ratio(
+                    None if attention_target is None else attention_target.target_center_x
+                ),
+                "attention_target_focus_source": None if attention_target is None else attention_target.focus_source,
+                "decision_reason": decision.reason,
+                "decision_active": decision.active,
+                "decision_confidence": _round_optional_ratio(decision.confidence),
+                "decision_target_center_x": _round_optional_ratio(decision.target_center_x),
+                "decision_applied_center_x": _round_optional_ratio(decision.applied_center_x),
+                "decision_target_pulse_width_us": decision.target_pulse_width_us,
+                "decision_commanded_pulse_width_us": decision.commanded_pulse_width_us,
+            },
+        )
+        self._emit(
+            _emit_key_value_line(
+                "attention_servo_decision",
+                source=source,
+                reason=decision.reason,
+                active=decision.active,
+                target_center_x=_round_optional_ratio(decision.target_center_x),
+                applied_center_x=_round_optional_ratio(decision.applied_center_x),
+                target_pulse_us=decision.target_pulse_width_us,
+                commanded_pulse_us=decision.commanded_pulse_width_us,
+            )
+        )
 
     def _update_display_gesture_emoji_ack(
         self,
@@ -3299,6 +3592,8 @@ class ProactiveCoordinator:
                     "camera_primary_person_zone": camera_snapshot.primary_person_zone.value,
                     "camera_primary_person_center_x": _round_optional_ratio(camera_snapshot.primary_person_center_x),
                     "camera_primary_person_center_y": _round_optional_ratio(camera_snapshot.primary_person_center_y),
+                    "camera_looking_signal_state": camera_snapshot.looking_signal_state,
+                    "camera_looking_signal_source": camera_snapshot.looking_signal_source,
                     "camera_frame_age_s": _round_optional_seconds(
                         None
                         if camera_snapshot.last_camera_frame_at is None
@@ -3352,6 +3647,16 @@ class ProactiveCoordinator:
                     "decision_speaker_locked": decision.speaker_locked,
                 }
             )
+        attention_debug_details_getter = getattr(self.vision_observer, "attention_debug_details", None)
+        if callable(attention_debug_details_getter):
+            try:
+                attention_debug_details = attention_debug_details_getter()
+            except Exception:
+                attention_debug_details = None
+            if attention_debug_details:
+                payload["pipeline_debug"] = attention_debug_details
+        if self._last_display_attention_fusion_debug:
+            payload["display_camera_fusion"] = dict(self._last_display_attention_fusion_debug)
         try:
             stream.append_tick(
                 outcome=outcome,
@@ -3486,6 +3791,41 @@ class ProactiveCoordinator:
             observation=observation.vision,
         )
 
+    def _remember_display_attention_camera_semantics(
+        self,
+        *,
+        observed_at: float,
+        observation: SocialVisionObservation,
+        source: str,
+    ) -> None:
+        """Keep recent rich camera semantics warm for the HDMI attention lane."""
+
+        if source == "gesture":
+            self._display_attention_camera_fusion.remember_gesture(
+                observed_at=observed_at,
+                observation=observation,
+            )
+            return
+        self._display_attention_camera_fusion.remember_full(
+            observed_at=observed_at,
+            observation=observation,
+        )
+
+    def _fuse_display_attention_camera_observation(
+        self,
+        *,
+        observed_at: float,
+        observation: SocialVisionObservation,
+    ) -> SocialVisionObservation:
+        """Fuse richer recent camera semantics into one fast attention sample."""
+
+        result = self._display_attention_camera_fusion.fuse_attention(
+            observed_at=observed_at,
+            observation=observation,
+        )
+        self._last_display_attention_fusion_debug = dict(result.debug_details)
+        return result.observation
+
     def _observe_vision_for_gesture_refresh(self):
         """Capture one gesture-only vision snapshot for HDMI emoji acknowledgement."""
 
@@ -3538,8 +3878,8 @@ class ProactiveCoordinator:
                 "observed_at": now,
                 "captured_at": now,
                 "presence_session_id": presence_session_id,
-                "wakeword_armed": None if presence_snapshot is None else presence_snapshot.armed,
-                "wakeword_presence_reason": None if presence_snapshot is None else presence_snapshot.reason,
+                "voice_activation_armed": None if presence_snapshot is None else presence_snapshot.armed,
+                "voice_activation_presence_reason": None if presence_snapshot is None else presence_snapshot.reason,
             },
             "pir": {
                 "motion_detected": observation.pir_motion_detected,
@@ -3774,7 +4114,7 @@ class ProactiveMonitorService:
         coordinator: ProactiveCoordinator,
         *,
         poll_interval_s: float,
-        wakeword_stream: OpenWakeWordStreamingMonitor | None = None,
+        wakeword_stream: object | None = None,
         emit: Callable[[str], None] | None = None,
     ) -> None:
         """Initialize one monitor service around a configured coordinator."""
@@ -3978,20 +4318,6 @@ class ProactiveMonitorService:
         try:
             while not self._stop_event.is_set():
                 did_work = False
-                try:
-                    for _ in range(_MAX_WAKEWORD_STREAM_EVENTS_PER_CYCLE):  # AUDIT-FIX(#10): bound per-cycle stream draining so a noisy stream cannot starve normal proactive ticks.
-                        if self.coordinator.poll_wakeword_stream() is None:
-                            break
-                        did_work = True
-                except Exception as exc:
-                    error_text = _exception_text(exc)
-                    self._emit(f"proactive_error={error_text}")
-                    self._append_ops_event(
-                        event="proactive_error",
-                        level="error",
-                        message="Proactive wakeword stream handling failed.",
-                        data={"error": error_text},
-                    )
                 now = time.monotonic()
                 if now >= next_attention_refresh_at:
                     try:
@@ -4074,7 +4400,6 @@ def build_default_proactive_monitor(
     camera_lock: Lock | None,
     audio_lock: Lock | None,
     trigger_handler: Callable[[SocialTriggerDecision], bool],
-    wakeword_handler: Callable[[WakewordMatch], bool] | None = None,
     gesture_wakeup_handler: Callable[[GestureWakeupDecision], bool] | None = None,
     idle_predicate: Callable[[], bool] | None = None,
     observation_handler: Callable[[dict[str, Any], tuple[str, ...]], None] | None = None,
@@ -4082,7 +4407,6 @@ def build_default_proactive_monitor(
 ) -> ProactiveMonitorService | None:
     """Build the default proactive monitor stack from Twinr runtime services."""
 
-    config = _load_wakeword_runtime_config(config=config, runtime=runtime, emit=emit)
     display_attention_enabled = (
         resolve_display_attention_refresh_interval(config) is not None
         and str(getattr(config, "display_driver", "") or "").strip().lower().startswith("hdmi")
@@ -4093,7 +4417,6 @@ def build_default_proactive_monitor(
     )
     if (
         not config.proactive_enabled
-        and not config.wakeword_enabled
         and not display_attention_enabled
         and not display_gesture_enabled
     ):
@@ -4115,17 +4438,7 @@ def build_default_proactive_monitor(
                 f"Proactive triggers were disabled: {_exception_text(exc)}"
             ),
         )
-        engine = _NullSocialTriggerEngine()  # AUDIT-FIX(#4): keep wakeword/monitoring alive even when proactive trigger engine initialization fails.
-
-    primary_backend = normalize_wakeword_backend(
-        getattr(config, "wakeword_primary_backend", config.wakeword_backend),
-        default="openwakeword",
-    )
-    fallback_backend = normalize_wakeword_backend(
-        getattr(config, "wakeword_fallback_backend", "stt"),
-        default="stt",
-    )
-    use_streaming_wakeword = config.wakeword_enabled and primary_backend in {"openwakeword", "kws", "wekws"}
+        engine = _NullSocialTriggerEngine()
 
     pir_monitor = None
     if config.pir_enabled:
@@ -4145,7 +4458,7 @@ def build_default_proactive_monitor(
             reason="pir_unconfigured",
             detail=(
                 "PIR is not configured. Motion-gated camera inspection is disabled, "
-                "but wakeword and audio-only proactive logic can still run."
+                "but audio-only proactive logic can still run."
             ),
         )
 
@@ -4153,42 +4466,11 @@ def build_default_proactive_monitor(
     wakeword_spotter = None
     wakeword_stream = None
     wakeword_policy = None
-    if config.wakeword_enabled:
+    if config.voice_orchestrator_enabled:
         presence_session = PresenceSessionController(
-            presence_grace_s=config.wakeword_presence_grace_s,
-            motion_grace_s=config.wakeword_motion_grace_s,
-            speech_grace_s=config.wakeword_speech_grace_s,
-        )
-        wakeword_policy = _build_wakeword_policy(
-            config=config,
-            backend=backend,
-        )
-        if use_streaming_wakeword:
-            if primary_backend == "kws":
-                wakeword_stream = _build_kws_stream(
-                    config=config,
-                    runtime=runtime,
-                    emit=emit,
-                )
-            elif primary_backend == "wekws":
-                wakeword_stream = _build_wekws_stream(
-                    config=config,
-                    runtime=runtime,
-                    emit=emit,
-                )
-            else:
-                wakeword_stream = _build_openwakeword_stream(
-                    config=config,
-                    runtime=runtime,
-                    emit=emit,
-                )
-        wakeword_spotter = _build_wakeword_spotter(
-            config=config,
-            runtime=runtime,
-            backend=backend,
-            emit=emit,
-            selected_backend=primary_backend,
-            fallback_backend=fallback_backend,
+            presence_grace_s=config.voice_orchestrator_follow_up_timeout_s,
+            motion_grace_s=config.voice_orchestrator_follow_up_timeout_s,
+            speech_grace_s=config.voice_orchestrator_follow_up_timeout_s,
         )
 
     audio_observer = NullAudioObservationProvider()
@@ -4211,7 +4493,7 @@ def build_default_proactive_monitor(
                 "when that hardware is targeted."
             ),
         )
-    if config.proactive_audio_enabled or config.wakeword_enabled:
+    if config.proactive_audio_enabled:
         if wakeword_stream is not None:
             try:
                 audio_observer = AmbientAudioObservationProvider(
@@ -4264,7 +4546,7 @@ def build_default_proactive_monitor(
         getattr(config, "audio_input_device", None),
         getattr(config, "proactive_audio_input_device", None),
     )
-    if respeaker_targeted and (config.proactive_audio_enabled or config.wakeword_enabled):
+    if respeaker_targeted and config.proactive_audio_enabled:
         try:
             base_signal_provider = ReSpeakerSignalProvider(
                 sensor_window_ms=config.proactive_audio_sample_ms,
@@ -4450,7 +4732,6 @@ def build_default_proactive_monitor(
         wakeword_policy=wakeword_policy,
         vision_reviewer=vision_reviewer,
         portrait_match_provider=portrait_match_provider,
-        wakeword_handler=wakeword_handler,
         gesture_wakeup_handler=gesture_wakeup_handler,
         pir_monitor=pir_monitor,
         idle_predicate=idle_predicate,
@@ -4461,518 +4742,6 @@ def build_default_proactive_monitor(
         coordinator,
         poll_interval_s=config.proactive_poll_interval_s,
         wakeword_stream=wakeword_stream,
-        emit=emit,
-    )
-
-
-def _load_wakeword_runtime_config(
-    *,
-    config: TwinrConfig,
-    runtime: TwinrRuntime,
-    emit: Callable[[str], None] | None,
-) -> TwinrConfig:
-    """Apply stored wakeword calibration to the runtime config when enabled."""
-
-    if not config.wakeword_enabled:
-        return config
-    try:
-        profile = WakewordCalibrationStore.from_config(config).load()
-    except Exception as exc:
-        _record_component_warning(
-            runtime=runtime,
-            emit=emit,
-            reason="wakeword_calibration_load_failed",
-            detail=f"Wakeword calibration profile could not be loaded: {_exception_text(exc)}",
-        )
-        return config
-    if profile is None:
-        return config
-    return apply_wakeword_calibration(config, profile)
-
-
-def _build_wakeword_policy(
-    *,
-    config: TwinrConfig,
-    backend: OpenAIBackend,
-) -> WakewordDecisionPolicy:
-    """Build the runtime wakeword policy and optional STT verifier."""
-
-    primary_backend = normalize_wakeword_backend(
-        getattr(config, "wakeword_primary_backend", config.wakeword_backend),
-        default="openwakeword",
-    )
-    local_verifier = build_configured_sequence_capture_verifier(config)
-
-    verifier = None
-    if config.wakeword_verifier_mode != "disabled":
-        verifier = SttWakewordVerifier(
-            backend=backend,
-            phrases=config.wakeword_stt_phrases,
-            language=config.openai_realtime_language,
-        )
-    return WakewordDecisionPolicy(
-        primary_backend=config.wakeword_primary_backend,
-        fallback_backend=config.wakeword_fallback_backend,
-        verifier_mode=config.wakeword_verifier_mode,
-        verifier_margin=config.wakeword_verifier_margin,
-        primary_threshold=(
-            config.wakeword_kws_keywords_threshold
-            if primary_backend == "kws"
-            else config.wakeword_wekws_threshold
-            if primary_backend == "wekws"
-            else config.wakeword_openwakeword_threshold
-        ),
-        verifier=verifier,
-        local_verifier=local_verifier,
-    )
-
-
-def _missing_kws_asset_fields(config: TwinrConfig) -> tuple[str, ...]:
-    """Return the missing required sherpa-onnx KWS asset fields."""
-
-    required_assets = {
-        "TWINR_WAKEWORD_KWS_TOKENS_PATH": config.wakeword_kws_tokens_path,
-        "TWINR_WAKEWORD_KWS_ENCODER_PATH": config.wakeword_kws_encoder_path,
-        "TWINR_WAKEWORD_KWS_DECODER_PATH": config.wakeword_kws_decoder_path,
-        "TWINR_WAKEWORD_KWS_JOINER_PATH": config.wakeword_kws_joiner_path,
-        "TWINR_WAKEWORD_KWS_KEYWORDS_FILE_PATH": config.wakeword_kws_keywords_file_path,
-    }
-    missing: list[str] = []
-    for env_name, value in required_assets.items():
-        if str(value or "").strip():
-            continue
-        missing.append(env_name)
-    return tuple(missing)
-
-
-def _missing_wekws_asset_fields(config: TwinrConfig) -> tuple[str, ...]:
-    """Return the missing required WeKws asset fields."""
-
-    required_assets = {
-        "TWINR_WAKEWORD_WEKWS_MODEL_PATH": config.wakeword_wekws_model_path,
-        "TWINR_WAKEWORD_WEKWS_CONFIG_PATH": config.wakeword_wekws_config_path,
-        "TWINR_WAKEWORD_WEKWS_WORDS_PATH": config.wakeword_wekws_words_path,
-    }
-    missing: list[str] = []
-    for env_name, value in required_assets.items():
-        if str(value or "").strip():
-            continue
-        missing.append(env_name)
-    return tuple(missing)
-
-
-def _build_openwakeword_stream(
-    *,
-    config: TwinrConfig,
-    runtime: TwinrRuntime,
-    emit: Callable[[str], None] | None,
-) -> OpenWakeWordStreamingMonitor | None:
-    """Build the streaming openWakeWord monitor when runtime constraints match."""
-
-    models = _normalize_text_tuple(config.wakeword_openwakeword_models)
-    inference_framework = _resolve_openwakeword_inference_framework(
-        models=models,
-        configured=config.wakeword_openwakeword_inference_framework,
-    )
-    if config.audio_sample_rate != 16000 or config.audio_channels != 1:
-        _record_wakeword_backend_warning(
-            runtime=runtime,
-            emit=emit,
-            reason="openwakeword_requires_16khz_mono",
-            detail=(
-                "openWakeWord needs 16 kHz mono audio. Configure "
-                "TWINR_AUDIO_SAMPLE_RATE=16000 and TWINR_AUDIO_CHANNELS=1."
-            ),
-            fallback_backend=config.wakeword_fallback_backend,
-        )
-        return None
-    if not models:
-        _record_wakeword_backend_warning(
-            runtime=runtime,
-            emit=emit,
-            reason="openwakeword_models_missing",
-            detail=(
-                "openWakeWord backend selected, but no models were configured. "
-                "Set TWINR_WAKEWORD_OPENWAKEWORD_MODELS to model names or file paths."
-            ),
-            fallback_backend=config.wakeword_fallback_backend,
-        )
-        return None
-    try:
-        from twinr.proactive.wakeword.spotter import WakewordOpenWakeWordFrameSpotter
-
-        return OpenWakeWordStreamingMonitor(
-            device=_normalize_optional_text(
-                config.proactive_audio_input_device,
-                config.audio_input_device,
-            ),  # AUDIT-FIX(#8): avoid None.strip() when no explicit audio input device is configured.
-            sample_rate=config.audio_sample_rate,
-            channels=config.audio_channels,
-            spotter=WakewordOpenWakeWordFrameSpotter(
-                wakeword_models=models,
-                phrases=config.wakeword_phrases,
-                custom_verifier_models=dict(config.wakeword_openwakeword_custom_verifier_models),
-                custom_verifier_threshold=config.wakeword_openwakeword_custom_verifier_threshold,
-                threshold=config.wakeword_openwakeword_threshold,
-                vad_threshold=config.wakeword_openwakeword_vad_threshold,
-                patience_frames=config.wakeword_openwakeword_patience_frames,
-                activation_samples=config.wakeword_openwakeword_activation_samples,
-                deactivation_threshold=config.wakeword_openwakeword_deactivation_threshold,
-                enable_speex_noise_suppression=config.wakeword_openwakeword_enable_speex,
-                inference_framework=inference_framework,
-            ),
-            attempt_cooldown_s=config.wakeword_attempt_cooldown_s,
-            speech_threshold=config.audio_speech_threshold,
-            emit=emit,
-        )
-    except Exception as exc:
-        _record_wakeword_backend_warning(
-            runtime=runtime,
-            emit=emit,
-            reason="openwakeword_init_failed",
-            detail=f"openWakeWord streaming initialization failed: {_exception_text(exc)}",
-            fallback_backend=config.wakeword_fallback_backend,
-        )
-        return None
-
-
-def _build_kws_stream(
-    *,
-    config: TwinrConfig,
-    runtime: TwinrRuntime,
-    emit: Callable[[str], None] | None,
-) -> OpenWakeWordStreamingMonitor | None:
-    """Build the sherpa-onnx KWS streaming monitor when configured."""
-
-    if config.audio_channels != 1:
-        _record_wakeword_backend_warning(
-            runtime=runtime,
-            emit=emit,
-            reason="kws_requires_mono_audio",
-            detail="KWS currently requires TWINR_AUDIO_CHANNELS=1.",
-            fallback_backend=config.wakeword_fallback_backend,
-        )
-        return None
-    if int(config.audio_sample_rate) != int(config.wakeword_kws_sample_rate):
-        _record_wakeword_backend_warning(
-            runtime=runtime,
-            emit=emit,
-            reason="kws_sample_rate_mismatch",
-            detail=(
-                "KWS requires TWINR_AUDIO_SAMPLE_RATE to match "
-                "TWINR_WAKEWORD_KWS_SAMPLE_RATE."
-            ),
-            fallback_backend=config.wakeword_fallback_backend,
-        )
-        return None
-    missing_assets = _missing_kws_asset_fields(config)
-    if missing_assets:
-        _record_wakeword_backend_warning(
-            runtime=runtime,
-            emit=emit,
-            reason="kws_assets_missing",
-            detail=(
-                "KWS backend selected, but required sherpa-onnx assets are missing: "
-                + ", ".join(missing_assets)
-            ),
-            fallback_backend=config.wakeword_fallback_backend,
-        )
-        return None
-    try:
-        return OpenWakeWordStreamingMonitor(
-            device=_normalize_optional_text(
-                config.proactive_audio_input_device,
-                config.audio_input_device,
-            ),
-            sample_rate=config.audio_sample_rate,
-            channels=config.audio_channels,
-            spotter=WakewordSherpaOnnxFrameSpotter(
-                tokens_path=config.wakeword_kws_tokens_path or "",
-                encoder_path=config.wakeword_kws_encoder_path or "",
-                decoder_path=config.wakeword_kws_decoder_path or "",
-                joiner_path=config.wakeword_kws_joiner_path or "",
-                keywords_file_path=config.wakeword_kws_keywords_file_path or "",
-                phrases=config.wakeword_phrases,
-                project_root=config.project_root,
-                sample_rate=config.wakeword_kws_sample_rate,
-                feature_dim=config.wakeword_kws_feature_dim,
-                max_active_paths=config.wakeword_kws_max_active_paths,
-                keywords_score=config.wakeword_kws_keywords_score,
-                keywords_threshold=config.wakeword_kws_keywords_threshold,
-                num_trailing_blanks=config.wakeword_kws_num_trailing_blanks,
-                num_threads=config.wakeword_kws_num_threads,
-                provider=config.wakeword_kws_provider,
-            ),
-            attempt_cooldown_s=config.wakeword_attempt_cooldown_s,
-            speech_threshold=config.audio_speech_threshold,
-            emit=emit,
-        )
-    except Exception as exc:
-        _record_wakeword_backend_warning(
-            runtime=runtime,
-            emit=emit,
-            reason="kws_init_failed",
-            detail=f"KWS streaming initialization failed: {_exception_text(exc)}",
-            fallback_backend=config.wakeword_fallback_backend,
-        )
-        return None
-
-
-def _build_wekws_stream(
-    *,
-    config: TwinrConfig,
-    runtime: TwinrRuntime,
-    emit: Callable[[str], None] | None,
-) -> OpenWakeWordStreamingMonitor | None:
-    """Build the WeKws conventional-KWS streaming monitor when configured."""
-
-    if config.audio_channels != 1:
-        _record_wakeword_backend_warning(
-            runtime=runtime,
-            emit=emit,
-            reason="wekws_requires_mono_audio",
-            detail="WeKws currently requires TWINR_AUDIO_CHANNELS=1.",
-            fallback_backend=config.wakeword_fallback_backend,
-        )
-        return None
-    missing_assets = _missing_wekws_asset_fields(config)
-    if missing_assets:
-        _record_wakeword_backend_warning(
-            runtime=runtime,
-            emit=emit,
-            reason="wekws_assets_missing",
-            detail=(
-                "WeKws backend selected, but required ONNX assets are missing: "
-                + ", ".join(missing_assets)
-            ),
-            fallback_backend=config.wakeword_fallback_backend,
-        )
-        return None
-    try:
-        from ..wakeword.wekws import WakewordWekwsFrameSpotter
-
-        spotter = WakewordWekwsFrameSpotter(
-            model_path=config.wakeword_wekws_model_path or "",
-            config_path=config.wakeword_wekws_config_path or "",
-            words_path=config.wakeword_wekws_words_path or "",
-            cmvn_path=config.wakeword_wekws_cmvn_path,
-            phrases=config.wakeword_phrases,
-            project_root=config.project_root,
-            threshold=config.wakeword_wekws_threshold,
-            chunk_ms=config.wakeword_wekws_chunk_ms,
-            num_threads=config.wakeword_wekws_num_threads,
-            provider=config.wakeword_wekws_provider,
-        )
-        if int(config.audio_sample_rate) != int(spotter.model_config.sample_rate):
-            _record_wakeword_backend_warning(
-                runtime=runtime,
-                emit=emit,
-                reason="wekws_sample_rate_mismatch",
-                detail=(
-                    "WeKws requires TWINR_AUDIO_SAMPLE_RATE to match the model "
-                    f"sample rate ({spotter.model_config.sample_rate})."
-                ),
-                fallback_backend=config.wakeword_fallback_backend,
-            )
-            return None
-        return OpenWakeWordStreamingMonitor(
-            device=_normalize_optional_text(
-                config.proactive_audio_input_device,
-                config.audio_input_device,
-            ),
-            sample_rate=config.audio_sample_rate,
-            channels=config.audio_channels,
-            spotter=spotter,
-            attempt_cooldown_s=config.wakeword_attempt_cooldown_s,
-            speech_threshold=config.audio_speech_threshold,
-            emit=emit,
-        )
-    except Exception as exc:
-        _record_wakeword_backend_warning(
-            runtime=runtime,
-            emit=emit,
-            reason="wekws_init_failed",
-            detail=f"WeKws streaming initialization failed: {_exception_text(exc)}",
-            fallback_backend=config.wakeword_fallback_backend,
-        )
-        return None
-
-
-def _build_wakeword_spotter(
-    *,
-    config: TwinrConfig,
-    runtime: TwinrRuntime,
-    backend: OpenAIBackend,
-    emit: Callable[[str], None] | None,
-    selected_backend: str | None = None,
-    fallback_backend: str | None = None,
-):
-    """Build the non-streaming wakeword spotter for the selected backend."""
-
-    selected_backend = normalize_wakeword_backend(
-        selected_backend or config.wakeword_primary_backend or config.wakeword_backend,
-        default="openwakeword",
-    )
-    fallback_backend = normalize_wakeword_backend(
-        fallback_backend or config.wakeword_fallback_backend,
-        default="stt",
-    )
-    if selected_backend == "openwakeword":
-        models = _normalize_text_tuple(config.wakeword_openwakeword_models)
-        inference_framework = _resolve_openwakeword_inference_framework(
-            models=models,
-            configured=config.wakeword_openwakeword_inference_framework,
-        )
-        if not models:
-            _record_wakeword_backend_warning(
-                runtime=runtime,
-                emit=emit,
-                reason="openwakeword_models_missing",
-                detail=(
-                    "openWakeWord backend selected, but no models were configured. "
-                    "Set TWINR_WAKEWORD_OPENWAKEWORD_MODELS to model names or file paths."
-                ),
-                fallback_backend=fallback_backend,
-            )
-        else:
-            try:
-                return WakewordOpenWakeWordSpotter(
-                    wakeword_models=models,
-                    phrases=config.wakeword_phrases,
-                    custom_verifier_models=dict(config.wakeword_openwakeword_custom_verifier_models),
-                    custom_verifier_threshold=config.wakeword_openwakeword_custom_verifier_threshold,
-                    threshold=config.wakeword_openwakeword_threshold,
-                    vad_threshold=config.wakeword_openwakeword_vad_threshold,
-                    patience_frames=config.wakeword_openwakeword_patience_frames,
-                    activation_samples=config.wakeword_openwakeword_activation_samples,
-                    deactivation_threshold=config.wakeword_openwakeword_deactivation_threshold,
-                    enable_speex_noise_suppression=config.wakeword_openwakeword_enable_speex,
-                    inference_framework=inference_framework,
-                    backend=None,
-                    language=config.openai_realtime_language,
-                    transcribe_on_detect=False,
-                )
-            except Exception as exc:
-                _record_wakeword_backend_warning(
-                    runtime=runtime,
-                    emit=emit,
-                    reason="openwakeword_init_failed",
-                    detail=f"openWakeWord initialization failed: {_exception_text(exc)}",
-                    fallback_backend=fallback_backend,
-                )
-        if fallback_backend != "stt":
-            return None
-    if selected_backend == "kws":
-        missing_assets = _missing_kws_asset_fields(config)
-        if missing_assets:
-            _record_wakeword_backend_warning(
-                runtime=runtime,
-                emit=emit,
-                reason="kws_assets_missing",
-                detail=(
-                    "KWS backend selected, but required sherpa-onnx assets are missing: "
-                    + ", ".join(missing_assets)
-                ),
-                fallback_backend=fallback_backend,
-            )
-        else:
-            try:
-                return WakewordSherpaOnnxSpotter(
-                    tokens_path=config.wakeword_kws_tokens_path or "",
-                    encoder_path=config.wakeword_kws_encoder_path or "",
-                    decoder_path=config.wakeword_kws_decoder_path or "",
-                    joiner_path=config.wakeword_kws_joiner_path or "",
-                    keywords_file_path=config.wakeword_kws_keywords_file_path or "",
-                    phrases=config.wakeword_phrases,
-                    project_root=config.project_root,
-                    sample_rate=config.wakeword_kws_sample_rate,
-                    feature_dim=config.wakeword_kws_feature_dim,
-                    max_active_paths=config.wakeword_kws_max_active_paths,
-                    keywords_score=config.wakeword_kws_keywords_score,
-                    keywords_threshold=config.wakeword_kws_keywords_threshold,
-                    num_trailing_blanks=config.wakeword_kws_num_trailing_blanks,
-                    num_threads=config.wakeword_kws_num_threads,
-                    provider=config.wakeword_kws_provider,
-                )
-            except Exception as exc:
-                _record_wakeword_backend_warning(
-                    runtime=runtime,
-                    emit=emit,
-                    reason="kws_init_failed",
-                    detail=f"KWS initialization failed: {_exception_text(exc)}",
-                    fallback_backend=fallback_backend,
-                )
-        if fallback_backend != "stt":
-            return None
-    if selected_backend == "wekws":
-        missing_assets = _missing_wekws_asset_fields(config)
-        if missing_assets:
-            _record_wakeword_backend_warning(
-                runtime=runtime,
-                emit=emit,
-                reason="wekws_assets_missing",
-                detail=(
-                    "WeKws backend selected, but required ONNX assets are missing: "
-                    + ", ".join(missing_assets)
-                ),
-                fallback_backend=fallback_backend,
-            )
-        else:
-            try:
-                from ..wakeword.wekws import WakewordWekwsSpotter
-
-                return WakewordWekwsSpotter(
-                    model_path=config.wakeword_wekws_model_path or "",
-                    config_path=config.wakeword_wekws_config_path or "",
-                    words_path=config.wakeword_wekws_words_path or "",
-                    cmvn_path=config.wakeword_wekws_cmvn_path,
-                    phrases=config.wakeword_phrases,
-                    project_root=config.project_root,
-                    threshold=config.wakeword_wekws_threshold,
-                    chunk_ms=config.wakeword_wekws_chunk_ms,
-                    num_threads=config.wakeword_wekws_num_threads,
-                    provider=config.wakeword_wekws_provider,
-                )
-            except Exception as exc:
-                _record_wakeword_backend_warning(
-                    runtime=runtime,
-                    emit=emit,
-                    reason="wekws_init_failed",
-                    detail=f"WeKws initialization failed: {_exception_text(exc)}",
-                    fallback_backend=fallback_backend,
-                )
-        if fallback_backend != "stt":
-            return None
-    if selected_backend == "disabled":
-        return None
-    return WakewordPhraseSpotter(
-        backend=backend,
-        phrases=config.wakeword_stt_phrases,
-        language=config.openai_realtime_language,
-    )
-
-
-def _record_wakeword_backend_warning(
-    *,
-    runtime: TwinrRuntime,
-    emit: Callable[[str], None] | None,
-    reason: str,
-    detail: str,
-    fallback_backend: str,
-) -> None:
-    """Record one warning about falling back from the preferred wakeword backend."""
-
-    _safe_emit(emit, f"wakeword_backend_warning={reason}")  # AUDIT-FIX(#1): backend fallback warnings must not fail open/close paths when emit sinks are broken.
-    _append_ops_event(
-        runtime,
-        event="wakeword_backend_warning",
-        level="warning",
-        message="Wakeword backend configuration could not use the preferred local detector.",
-        data={
-            "reason": reason,
-            "detail": detail,
-            "fallback_backend": fallback_backend,
-        },
         emit=emit,
     )
 

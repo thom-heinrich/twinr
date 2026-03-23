@@ -495,7 +495,8 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
                 model="gpt-4o-mini",
                 output_text=(
                     '{"action":"handoff","spoken_ack":"Ich schaue kurz nach.","spoken_reply":null,'
-                    '"kind":"search","goal":"weather tomorrow","allow_web_search":true,'
+                    '"kind":"search","goal":"weather tomorrow","prompt":"What is new in Schwarzenbek weather tomorrow?",'
+                    '"allow_web_search":true,'
                     '"location_hint":"Schwarzenbek","date_context":"Tuesday, 2026-03-17 (Europe/Berlin)",'
                     '"context_scope":"full_context"}'
                 ),
@@ -521,6 +522,7 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
         self.assertEqual(decision.action, "handoff")
         self.assertEqual(decision.spoken_ack, "Ich schaue kurz nach.")
         self.assertEqual(decision.kind, "search")
+        self.assertEqual(decision.prompt, "What is new in Schwarzenbek weather tomorrow?")
         self.assertTrue(decision.allow_web_search)
         self.assertEqual(decision.location_hint, "Schwarzenbek")
         self.assertEqual(decision.date_context, "Tuesday, 2026-03-17 (Europe/Berlin)")
@@ -533,7 +535,10 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
         self.assertEqual(request["max_output_tokens"], 80)
         self.assertEqual(request["text"]["format"]["type"], "json_schema")
         self.assertIn("location_hint", request["text"]["format"]["schema"]["properties"])
-        self.assertNotIn("spoken_ack", request["text"]["format"]["schema"]["required"])
+        self.assertEqual(
+            set(request["text"]["format"]["schema"]["required"]),
+            set(request["text"]["format"]["schema"]["properties"]),
+        )
 
     def test_decide_accepts_handoff_without_spoken_ack(self) -> None:
         backend = FakeToolBackend(self.config)
@@ -544,7 +549,7 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
                 model="gpt-4o-mini",
                 output_text=(
                     '{"action":"handoff","spoken_ack":null,"spoken_reply":null,'
-                    '"kind":"search","goal":"weather tomorrow","allow_web_search":true,'
+                    '"kind":"search","goal":"weather tomorrow","prompt":null,"allow_web_search":true,'
                     '"location_hint":"Schwarzenbek","date_context":"Tuesday, 2026-03-17 (Europe/Berlin)",'
                     '"context_scope":"full_context"}'
                 ),
@@ -563,8 +568,10 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
         self.assertEqual(decision.action, "handoff")
         self.assertIsNone(decision.spoken_ack)
         self.assertEqual(decision.kind, "search")
+        self.assertIsNone(decision.prompt)
         self.assertIn("date_context", request["text"]["format"]["schema"]["properties"])
         self.assertIn("context_scope", request["text"]["format"]["schema"]["properties"])
+        self.assertIn("prompt", request["text"]["format"]["schema"]["properties"])
 
     def test_decide_retries_once_when_structured_response_hits_max_output_tokens(self) -> None:
         backend = FakeToolBackend(self.config)
@@ -608,6 +615,39 @@ class OpenAISupervisorDecisionProviderTests(unittest.TestCase):
         self.assertEqual(len(backend._client.responses.create_requests), 2)
         self.assertEqual(backend._client.responses.create_requests[0]["max_output_tokens"], 80)
         self.assertEqual(backend._client.responses.create_requests[1]["max_output_tokens"], 160)
+
+    def test_decide_floors_gpt5_supervisor_budget_to_160_tokens(self) -> None:
+        backend = FakeToolBackend(
+            TwinrConfig(
+                openai_api_key="test-key",
+                default_model="gpt-5.2",
+                streaming_supervisor_max_output_tokens=80,
+            )
+        )
+        backend._client.responses.create_results.append(
+            SimpleNamespace(
+                id="resp_decide_budget",
+                _request_id="req_decide_budget",
+                model="gpt-5.2-chat-latest",
+                output_text=(
+                    '{"action":"handoff","spoken_ack":"Ich schaue kurz nach.","spoken_reply":null,'
+                    '"kind":"search","goal":"latest headlines","allow_web_search":true,'
+                    '"location_hint":null,"date_context":null,"context_scope":"tiny_recent"}'
+                ),
+                output=[],
+                usage=None,
+            )
+        )
+        provider = OpenAISupervisorDecisionProvider(
+            backend,
+            model_override="gpt-5.2-chat-latest",
+        )
+
+        provider.decide("Was gibt es Neues?")
+
+        request = backend._client.responses.create_requests[0]
+        self.assertEqual(request["model"], "gpt-5.2-chat-latest")
+        self.assertEqual(request["max_output_tokens"], 160)
 
 
 class OpenAIConversationClosureDecisionProviderTests(unittest.TestCase):

@@ -17,6 +17,7 @@ used by Twinr's long-term memory flows.
 - keep the personal-graph inter-process lock on a runtime-shared lock path so
   watchdog and supervisor processes can coordinate even when the ChonkyDB data
   directory itself is root-owned
+- support adding and deleting graph-backed contacts, preferences, and plans so discovery corrections can keep structured memory consistent
 - build prompt-context and subtext payloads from persisted graph memory
 - reuse the last successful remote graph document id during steady-state readiness reads so graph bootstrap avoids repeated pointer resolution when the remote snapshot has not moved
 

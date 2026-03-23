@@ -13,6 +13,8 @@ import math
 from pathlib import Path
 import os
 
+from twinr.orchestrator.voice_activation import DEFAULT_VOICE_ACTIVATION_PHRASES
+
 DEFAULT_BUTTON_PROBE_LINES = (
     4,
     5,
@@ -31,32 +33,6 @@ DEFAULT_BUTTON_PROBE_LINES = (
     25,
     27,
 )
-DEFAULT_WAKEWORD_PHRASES = (
-    "hey twinr",
-    "he twinr",
-    "hey twinna",
-    "hey twina",
-    "hey twinner",
-    "hallo twinr",
-    "hallo twinna",
-    "hallo twina",
-    "hallo twinner",
-    "twinr hallo",
-    "twinr hey",
-    "twinna hallo",
-    "twinna hey",
-    "twina hallo",
-    "twina hey",
-    "twinner hallo",
-    "twinner hey",
-    "twinr",
-    "twinna",
-    "twina",
-    "twinner",
-)
-# Custom openWakeWord models can legitimately need very low operating thresholds.
-# Keep the parser permissive and let deployment tuning decide the actual value.
-MIN_SAFE_OPENWAKEWORD_THRESHOLD = 0.0
 SUPPORTED_DISPLAY_DRIVERS = (
     "hdmi_wayland",
     "hdmi_fbdev",
@@ -68,6 +44,7 @@ SUPPORTED_DISPLAY_LAYOUTS = (
     "debug_log",
     "debug_face",
 )
+DEFAULT_OPENAI_MAIN_MODEL = "gpt-5.4-mini"
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -122,6 +99,13 @@ def _parse_optional_text(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _normalize_model_setting(value: object, *, fallback: str) -> str:
+    """Return one non-blank model identifier, or the provided fallback."""
+
+    normalized = str(value or "").strip()
+    return normalized or fallback
 
 
 def _parse_float(
@@ -203,11 +187,11 @@ def _parse_local_semantic_router_mode(value: str | None, default: str = "off") -
     return normalized
 
 
-def _parse_voice_orchestrator_wake_stage1_mode(value: str | None, default: str = "backend") -> str:
-    """Parse the server-side voice wakeword stage-one mode with validation."""
+def _parse_voice_orchestrator_wake_stage1_mode(value: str | None, default: str = "remote_asr") -> str:
+    """Parse the server-side voice stage-one mode with validation."""
 
-    normalized = str(value or default or "backend").strip().lower() or "backend"
-    if normalized not in {"backend", "local_stt"}:
+    normalized = str(value or default or "remote_asr").strip().lower() or "remote_asr"
+    if normalized != "remote_asr":
         raise ValueError(f"Unsupported voice orchestrator wake stage1 mode: {value}")
     return normalized
 
@@ -216,7 +200,7 @@ def _parse_attention_servo_driver(value: str | None, default: str = "auto") -> s
     """Parse the configured attention-servo driver strategy with validation."""
 
     normalized = str(value or default or "auto").strip().lower() or "auto"
-    if normalized not in {"auto", "sysfs_pwm", "pigpio", "lgpio_pwm", "lgpio"}:
+    if normalized not in {"auto", "twinr_kernel", "sysfs_pwm", "pigpio", "lgpio_pwm", "lgpio"}:
         raise ValueError(f"Unsupported attention-servo driver: {value}")
     return normalized
 
@@ -235,75 +219,11 @@ def _default_display_poll_interval_s(display_driver: str | None) -> float:
     return 0.5
 
 
-def _default_bundled_openwakeword_models(project_root: Path) -> tuple[str, ...]:
-    """Return the bundled Twinr wakeword model when the leading repo ships it."""
-
-    candidate = (
-        project_root / "src" / "twinr" / "proactive" / "wakeword" / "models" / "twinr_v1.onnx"
-    ).resolve(strict=False)
-    if candidate.exists():
-        return (str(candidate),)
-    return ()
-
-
-def _default_bundled_openwakeword_custom_verifier_models(
-    project_root: Path,
-    models: tuple[str, ...],
-) -> tuple[tuple[str, str], ...]:
-    """Return bundled verifier assets that live next to configured local models."""
-
-    bundled: list[tuple[str, str]] = []
-    for raw_model in models:
-        model = str(raw_model).strip()
-        if not model or not model.lower().endswith((".onnx", ".tflite")):
-            continue
-        candidate = Path(model).expanduser()
-        if not candidate.is_absolute():
-            candidate = project_root / candidate
-        resolved_model = candidate.resolve(strict=False)
-        verifier_candidate = resolved_model.with_suffix(".verifier.pkl")
-        if verifier_candidate.exists():
-            bundled.append((resolved_model.stem, str(verifier_candidate)))
-    return tuple(bundled)
-
-
-def _default_bundled_openwakeword_sequence_verifier_models(
-    project_root: Path,
-    models: tuple[str, ...],
-) -> tuple[tuple[str, str], ...]:
-    """Return bundled Twinr sequence-verifier assets next to local models."""
-
-    bundled: list[tuple[str, str]] = []
-    for raw_model in models:
-        model = str(raw_model).strip()
-        if not model or not model.lower().endswith((".onnx", ".tflite")):
-            continue
-        candidate = Path(model).expanduser()
-        if not candidate.is_absolute():
-            candidate = project_root / candidate
-        resolved_model = candidate.resolve(strict=False)
-        verifier_candidate = resolved_model.with_suffix(".sequence_verifier.pkl")
-        if verifier_candidate.exists():
-            bundled.append((resolved_model.stem, str(verifier_candidate)))
-    return tuple(bundled)
-
-
-def _default_openwakeword_inference_framework(models: tuple[str, ...]) -> str:
-    """Infer the local runtime from the configured wakeword model paths."""
-
-    normalized_models = tuple(str(item).strip().lower() for item in models if str(item).strip())
-    if normalized_models and all(item.endswith(".onnx") for item in normalized_models):
-        return "onnx"
-    if normalized_models and all(item.endswith(".tflite") for item in normalized_models):
-        return "tflite"
-    return "tflite"
-
-
 @dataclass(frozen=True, slots=True)
 class TwinrConfig:
     """Store the immutable runtime settings snapshot for the base agent.
 
-    The dataclass groups provider selection, streaming and wakeword tuning,
+    The dataclass groups provider selection, streaming and voice-activation tuning,
     hardware wiring, memory durability paths, proactive sensing thresholds,
     and operator service endpoints into one canonical object.
     """
@@ -317,7 +237,7 @@ class TwinrConfig:
     project_root: str = "."
     personality_dir: str = "personality"
     user_display_name: str | None = None
-    default_model: str = "gpt-5.2"
+    default_model: str = DEFAULT_OPENAI_MAIN_MODEL
     openai_reasoning_effort: str = "medium"
     openai_prompt_cache_enabled: bool = True
     openai_prompt_cache_retention: str | None = None
@@ -373,7 +293,7 @@ class TwinrConfig:
     streaming_transcript_verifier_max_capture_ms: int = 6500
     streaming_dual_lane_enabled: bool = True
     streaming_first_word_enabled: bool = True
-    streaming_first_word_model: str = "gpt-4o-mini"
+    streaming_first_word_model: str = ""
     streaming_first_word_reasoning_effort: str = ""
     streaming_first_word_context_turns: int = 1
     streaming_first_word_max_output_tokens: int = 32
@@ -387,14 +307,14 @@ class TwinrConfig:
     streaming_final_lane_hard_timeout_ms: int = 15000
     streaming_search_final_lane_watchdog_timeout_ms: int = 6000
     streaming_search_final_lane_hard_timeout_ms: int = 30000
-    streaming_supervisor_model: str = "gpt-4o-mini"
+    streaming_supervisor_model: str = ""
     streaming_supervisor_reasoning_effort: str = "low"
     streaming_supervisor_context_turns: int = 4
     streaming_supervisor_max_output_tokens: int = 80
     streaming_supervisor_prefetch_enabled: bool = True
     streaming_supervisor_prefetch_min_chars: int = 8
     streaming_supervisor_prefetch_wait_ms: int = 80
-    streaming_specialist_model: str | None = "gpt-4o-mini"
+    streaming_specialist_model: str | None = None
     streaming_specialist_reasoning_effort: str | None = "low"
     local_semantic_router_mode: str = "off"
     local_semantic_router_model_dir: str | None = None
@@ -403,7 +323,7 @@ class TwinrConfig:
     conversation_follow_up_enabled: bool = False
     conversation_follow_up_after_proactive_enabled: bool = False
     conversation_closure_guard_enabled: bool = True
-    conversation_closure_model: str = "gpt-4o-mini"
+    conversation_closure_model: str = ""
     conversation_closure_reasoning_effort: str = ""
     conversation_closure_context_turns: int = 4
     conversation_closure_instructions_file: str = "CONVERSATION_CLOSURE.md"
@@ -437,10 +357,10 @@ class TwinrConfig:
     audio_follow_up_speech_start_chunks: int = 1
     audio_follow_up_ignore_ms: int = 0
     openai_enable_web_search: bool = False
-    openai_search_model: str = "gpt-4o-mini-search-preview"
+    openai_search_model: str = ""
     openai_web_search_context_size: str = "medium"
-    openai_search_max_output_tokens: int = 160
-    openai_search_retry_max_output_tokens: int = 240
+    openai_search_max_output_tokens: int = 1024
+    openai_search_retry_max_output_tokens: int = 1536
     openai_web_search_country: str | None = None
     openai_web_search_region: str | None = None
     openai_web_search_city: str | None = None
@@ -468,22 +388,27 @@ class TwinrConfig:
     voice_orchestrator_ws_url: str = "ws://127.0.0.1:8797/ws/orchestrator/voice"
     voice_orchestrator_shared_secret: str | None = None
     voice_orchestrator_audio_device: str | None = None
+    voice_activation_phrases: tuple[str, ...] = DEFAULT_VOICE_ACTIVATION_PHRASES
     voice_orchestrator_history_ms: int = 4000
-    voice_orchestrator_wake_stage1_mode: str = "backend"
+    voice_orchestrator_wake_stage1_mode: str = "remote_asr"
     voice_orchestrator_wake_candidate_window_ms: int = 2200
     voice_orchestrator_wake_candidate_min_active_ratio: float = 0.0
     voice_orchestrator_wake_candidate_min_transcript_chars: int = 4
     voice_orchestrator_wake_postroll_ms: int = 250
     voice_orchestrator_wake_tail_max_ms: int = 2200
     voice_orchestrator_wake_tail_endpoint_silence_ms: int = 300
-    voice_orchestrator_local_stt_url: str | None = None
-    voice_orchestrator_local_stt_bearer_token: str | None = None
-    voice_orchestrator_local_stt_timeout_s: float = 3.0
-    voice_orchestrator_local_stt_tail_timeout_s: float = 1.25
-    voice_orchestrator_local_stt_language: str | None = None
-    voice_orchestrator_local_stt_mode: str = "active_listening"
-    voice_orchestrator_local_stt_retry_attempts: int = 1
-    voice_orchestrator_local_stt_retry_backoff_s: float = 0.35
+    voice_orchestrator_remote_asr_url: str | None = None
+    voice_orchestrator_remote_asr_bearer_token: str | None = None
+    voice_orchestrator_remote_asr_min_wake_duration_ms: int = 300
+    voice_orchestrator_remote_asr_timeout_s: float = 3.0
+    voice_orchestrator_remote_asr_tail_timeout_s: float = 1.25
+    voice_orchestrator_remote_asr_language: str | None = None
+    voice_orchestrator_remote_asr_mode: str = "active_listening"
+    voice_orchestrator_remote_asr_retry_attempts: int = 1
+    voice_orchestrator_remote_asr_retry_backoff_s: float = 0.35
+    voice_orchestrator_intent_stage1_window_bonus_ms: int = 400
+    voice_orchestrator_intent_min_wake_duration_relief_ms: int = 100
+    voice_orchestrator_intent_follow_up_timeout_bonus_s: float = 1.5
     voice_orchestrator_follow_up_timeout_s: float = 6.0
     voice_orchestrator_follow_up_window_ms: int = 900
     voice_orchestrator_follow_up_min_active_ratio: float = 0.22
@@ -580,58 +505,6 @@ class TwinrConfig:
     proactive_vision_review_max_frames: int = 4
     proactive_vision_review_max_age_s: float = 12.0
     proactive_vision_review_min_spacing_s: float = 1.2
-    wakeword_enabled: bool = False
-    wakeword_backend: str = "openwakeword"
-    wakeword_primary_backend: str = "openwakeword"
-    wakeword_fallback_backend: str = "stt"
-    wakeword_verifier_mode: str = "ambiguity_only"
-    wakeword_verifier_margin: float = 0.08
-    wakeword_phrases: tuple[str, ...] = DEFAULT_WAKEWORD_PHRASES
-    wakeword_stt_phrases: tuple[str, ...] = DEFAULT_WAKEWORD_PHRASES
-    wakeword_sample_ms: int = 1800
-    wakeword_presence_grace_s: float = 15.0 * 60.0
-    wakeword_motion_grace_s: float = 5.0 * 60.0
-    wakeword_speech_grace_s: float = 90.0
-    wakeword_attempt_cooldown_s: float = 4.0
-    wakeword_block_proactive_after_attempt_s: float = 20.0
-    wakeword_min_active_ratio: float = 0.08
-    wakeword_min_active_chunks: int = 2
-    wakeword_openwakeword_models: tuple[str, ...] = ()
-    wakeword_openwakeword_custom_verifier_models: tuple[tuple[str, str], ...] = ()
-    wakeword_openwakeword_custom_verifier_threshold: float = 0.1
-    wakeword_openwakeword_sequence_verifier_models: tuple[tuple[str, str], ...] = ()
-    wakeword_openwakeword_sequence_verifier_threshold: float = 0.5
-    wakeword_openwakeword_threshold: float = 0.5
-    wakeword_openwakeword_vad_threshold: float = 0.0
-    wakeword_openwakeword_patience_frames: int = 1
-    wakeword_openwakeword_activation_samples: int = 3
-    wakeword_openwakeword_deactivation_threshold: float = 0.2
-    wakeword_openwakeword_enable_speex: bool = False
-    wakeword_openwakeword_transcribe_on_detect: bool = False
-    wakeword_openwakeword_inference_framework: str = "tflite"
-    wakeword_kws_tokens_path: str | None = None
-    wakeword_kws_encoder_path: str | None = None
-    wakeword_kws_decoder_path: str | None = None
-    wakeword_kws_joiner_path: str | None = None
-    wakeword_kws_keywords_file_path: str | None = None
-    wakeword_kws_provider: str = "cpu"
-    wakeword_kws_num_threads: int = 2
-    wakeword_kws_sample_rate: int = 16000
-    wakeword_kws_feature_dim: int = 80
-    wakeword_kws_max_active_paths: int = 4
-    wakeword_kws_keywords_score: float = 1.0
-    wakeword_kws_keywords_threshold: float = 0.25
-    wakeword_kws_num_trailing_blanks: int = 1
-    wakeword_wekws_model_path: str | None = None
-    wakeword_wekws_config_path: str | None = None
-    wakeword_wekws_words_path: str | None = None
-    wakeword_wekws_cmvn_path: str | None = None
-    wakeword_wekws_provider: str = "cpu"
-    wakeword_wekws_num_threads: int = 2
-    wakeword_wekws_threshold: float = 0.5
-    wakeword_wekws_chunk_ms: int = 100
-    wakeword_calibration_profile_path: str = "state/wakeword_calibration.json"
-    wakeword_calibration_recommended_path: str = "state/wakeword_calibration.recommended.json"
     proactive_person_returned_absence_s: float = 20.0 * 60.0
     proactive_person_returned_recent_motion_s: float = 30.0
     proactive_attention_window_s: float = 6.0
@@ -785,6 +658,7 @@ class TwinrConfig:
     button_probe_lines: tuple[int, ...] = DEFAULT_BUTTON_PROBE_LINES
     display_driver: str = "hdmi_fbdev"
     display_companion_enabled: bool | None = None
+    respeaker_led_enabled: bool | None = None
     display_fb_path: str = "/dev/fb0"
     display_wayland_display: str = "wayland-0"
     display_wayland_runtime_dir: str | None = None
@@ -836,9 +710,22 @@ class TwinrConfig:
     attention_servo_max_velocity_us_per_s: float = 80.0
     attention_servo_max_acceleration_us_per_s2: float = 220.0
     attention_servo_max_jerk_us_per_s3: float = 900.0
+    attention_servo_rest_max_velocity_us_per_s: float = 35.0
+    attention_servo_rest_max_acceleration_us_per_s2: float = 120.0
+    attention_servo_rest_max_jerk_us_per_s3: float = 450.0
     attention_servo_min_command_delta_us: int = 8
+    attention_servo_visible_retarget_tolerance_us: int = 40
     attention_servo_soft_limit_margin_us: int = 70
     attention_servo_idle_release_s: float = 1.0
+    attention_servo_settled_release_s: float = 0.0
+    attention_servo_follow_exit_only: bool = False
+    attention_servo_mechanical_range_degrees: float = 270.0
+    attention_servo_exit_follow_max_degrees: float = 60.0
+    attention_servo_exit_activation_delay_s: float = 0.75
+    attention_servo_exit_settle_hold_s: float = 0.6
+    attention_servo_exit_reacquire_center_tolerance: float = 0.08
+    attention_servo_exit_visible_edge_threshold: float = 0.74
+    attention_servo_exit_cooldown_s: float = 30.0
     display_presentation_path: str = "artifacts/stores/ops/display_presentation.json"
     display_presentation_ttl_s: float = 20.0
     display_vendor_dir: str = "state/display/vendor"
@@ -907,10 +794,33 @@ class TwinrConfig:
         if not math.isfinite(normalized_display_ambient_impulse_ttl_s):
             raise ValueError("display_ambient_impulse_ttl_s must be finite")
         normalized_display_ambient_impulse_ttl_s = max(0.1, normalized_display_ambient_impulse_ttl_s)
-        normalized_display_reserve_generation_model = (
-            str(self.display_reserve_generation_model or self.default_model or "gpt-5.2").strip()
-            or str(self.default_model or "gpt-5.2").strip()
-            or "gpt-5.2"
+        normalized_default_model = _normalize_model_setting(
+            self.default_model,
+            fallback=DEFAULT_OPENAI_MAIN_MODEL,
+        )
+        normalized_streaming_first_word_model = _normalize_model_setting(
+            self.streaming_first_word_model,
+            fallback=normalized_default_model,
+        )
+        normalized_streaming_supervisor_model = _normalize_model_setting(
+            self.streaming_supervisor_model,
+            fallback=normalized_default_model,
+        )
+        normalized_streaming_specialist_model = _normalize_model_setting(
+            self.streaming_specialist_model,
+            fallback=normalized_default_model,
+        )
+        normalized_conversation_closure_model = _normalize_model_setting(
+            self.conversation_closure_model,
+            fallback=normalized_default_model,
+        )
+        normalized_openai_search_model = _normalize_model_setting(
+            self.openai_search_model,
+            fallback=normalized_default_model,
+        )
+        normalized_display_reserve_generation_model = _normalize_model_setting(
+            self.display_reserve_generation_model,
+            fallback=normalized_default_model,
         )
         normalized_display_reserve_generation_reasoning_effort = (
             str(self.display_reserve_generation_reasoning_effort or "low").strip().lower() or "low"
@@ -1068,10 +978,44 @@ class TwinrConfig:
             1.0,
             normalized_attention_servo_max_jerk_us_per_s3,
         )
+        normalized_attention_servo_rest_max_velocity_us_per_s = float(
+            self.attention_servo_rest_max_velocity_us_per_s
+        )
+        if not math.isfinite(normalized_attention_servo_rest_max_velocity_us_per_s):
+            raise ValueError("attention_servo_rest_max_velocity_us_per_s must be finite")
+        normalized_attention_servo_rest_max_velocity_us_per_s = max(
+            1.0,
+            normalized_attention_servo_rest_max_velocity_us_per_s,
+        )
+        normalized_attention_servo_rest_max_acceleration_us_per_s2 = float(
+            self.attention_servo_rest_max_acceleration_us_per_s2
+        )
+        if not math.isfinite(normalized_attention_servo_rest_max_acceleration_us_per_s2):
+            raise ValueError("attention_servo_rest_max_acceleration_us_per_s2 must be finite")
+        normalized_attention_servo_rest_max_acceleration_us_per_s2 = max(
+            1.0,
+            normalized_attention_servo_rest_max_acceleration_us_per_s2,
+        )
+        normalized_attention_servo_rest_max_jerk_us_per_s3 = float(
+            self.attention_servo_rest_max_jerk_us_per_s3
+        )
+        if not math.isfinite(normalized_attention_servo_rest_max_jerk_us_per_s3):
+            raise ValueError("attention_servo_rest_max_jerk_us_per_s3 must be finite")
+        normalized_attention_servo_rest_max_jerk_us_per_s3 = max(
+            1.0,
+            normalized_attention_servo_rest_max_jerk_us_per_s3,
+        )
         normalized_attention_servo_min_command_delta_us = max(
             1,
             min(
                 int(self.attention_servo_min_command_delta_us),
+                normalized_attention_servo_max_pulse_width_us - normalized_attention_servo_min_pulse_width_us,
+            ),
+        )
+        normalized_attention_servo_visible_retarget_tolerance_us = max(
+            0,
+            min(
+                int(self.attention_servo_visible_retarget_tolerance_us),
                 normalized_attention_servo_max_pulse_width_us - normalized_attention_servo_min_pulse_width_us,
             ),
         )
@@ -1086,6 +1030,69 @@ class TwinrConfig:
         if not math.isfinite(normalized_attention_servo_idle_release_s):
             raise ValueError("attention_servo_idle_release_s must be finite")
         normalized_attention_servo_idle_release_s = max(0.0, normalized_attention_servo_idle_release_s)
+        normalized_attention_servo_settled_release_s = float(self.attention_servo_settled_release_s)
+        if not math.isfinite(normalized_attention_servo_settled_release_s):
+            raise ValueError("attention_servo_settled_release_s must be finite")
+        normalized_attention_servo_settled_release_s = max(0.0, normalized_attention_servo_settled_release_s)
+        normalized_attention_servo_mechanical_range_degrees = float(
+            self.attention_servo_mechanical_range_degrees
+        )
+        if not math.isfinite(normalized_attention_servo_mechanical_range_degrees):
+            raise ValueError("attention_servo_mechanical_range_degrees must be finite")
+        normalized_attention_servo_mechanical_range_degrees = max(
+            30.0,
+            min(360.0, normalized_attention_servo_mechanical_range_degrees),
+        )
+        normalized_attention_servo_exit_follow_max_degrees = float(
+            self.attention_servo_exit_follow_max_degrees
+        )
+        if not math.isfinite(normalized_attention_servo_exit_follow_max_degrees):
+            raise ValueError("attention_servo_exit_follow_max_degrees must be finite")
+        normalized_attention_servo_exit_follow_max_degrees = max(
+            0.0,
+            min(
+                normalized_attention_servo_mechanical_range_degrees * 0.5,
+                normalized_attention_servo_exit_follow_max_degrees,
+            ),
+        )
+        normalized_attention_servo_exit_activation_delay_s = float(
+            self.attention_servo_exit_activation_delay_s
+        )
+        if not math.isfinite(normalized_attention_servo_exit_activation_delay_s):
+            raise ValueError("attention_servo_exit_activation_delay_s must be finite")
+        normalized_attention_servo_exit_activation_delay_s = max(
+            0.0,
+            min(
+                normalized_attention_servo_target_hold_s,
+                normalized_attention_servo_exit_activation_delay_s,
+            ),
+        )
+        normalized_attention_servo_exit_settle_hold_s = float(self.attention_servo_exit_settle_hold_s)
+        if not math.isfinite(normalized_attention_servo_exit_settle_hold_s):
+            raise ValueError("attention_servo_exit_settle_hold_s must be finite")
+        normalized_attention_servo_exit_settle_hold_s = max(0.0, normalized_attention_servo_exit_settle_hold_s)
+        normalized_attention_servo_exit_reacquire_center_tolerance = float(
+            self.attention_servo_exit_reacquire_center_tolerance
+        )
+        if not math.isfinite(normalized_attention_servo_exit_reacquire_center_tolerance):
+            raise ValueError("attention_servo_exit_reacquire_center_tolerance must be finite")
+        normalized_attention_servo_exit_reacquire_center_tolerance = max(
+            0.0,
+            min(0.3, normalized_attention_servo_exit_reacquire_center_tolerance),
+        )
+        normalized_attention_servo_exit_visible_edge_threshold = float(
+            self.attention_servo_exit_visible_edge_threshold
+        )
+        if not math.isfinite(normalized_attention_servo_exit_visible_edge_threshold):
+            raise ValueError("attention_servo_exit_visible_edge_threshold must be finite")
+        normalized_attention_servo_exit_visible_edge_threshold = max(
+            0.55,
+            min(0.95, normalized_attention_servo_exit_visible_edge_threshold),
+        )
+        normalized_attention_servo_exit_cooldown_s = float(self.attention_servo_exit_cooldown_s)
+        if not math.isfinite(normalized_attention_servo_exit_cooldown_s):
+            raise ValueError("attention_servo_exit_cooldown_s must be finite")
+        normalized_attention_servo_exit_cooldown_s = max(0.0, normalized_attention_servo_exit_cooldown_s)
         normalized_display_presentation_ttl_s = float(self.display_presentation_ttl_s)
         if not math.isfinite(normalized_display_presentation_ttl_s):
             raise ValueError("display_presentation_ttl_s must be finite")
@@ -1159,6 +1166,12 @@ class TwinrConfig:
             "long_term_memory_remote_required",
             normalized_mode == "remote_primary",
         )
+        object.__setattr__(self, "default_model", normalized_default_model)
+        object.__setattr__(self, "streaming_first_word_model", normalized_streaming_first_word_model)
+        object.__setattr__(self, "streaming_supervisor_model", normalized_streaming_supervisor_model)
+        object.__setattr__(self, "streaming_specialist_model", normalized_streaming_specialist_model)
+        object.__setattr__(self, "conversation_closure_model", normalized_conversation_closure_model)
+        object.__setattr__(self, "openai_search_model", normalized_openai_search_model)
         object.__setattr__(self, "display_driver", normalized_display_driver)
         object.__setattr__(self, "display_busy_timeout_s", normalized_display_busy_timeout_s)
         object.__setattr__(self, "display_face_cue_path", normalized_display_face_cue_path)
@@ -1322,11 +1335,68 @@ class TwinrConfig:
         )
         object.__setattr__(
             self,
+            "attention_servo_rest_max_velocity_us_per_s",
+            normalized_attention_servo_rest_max_velocity_us_per_s,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_rest_max_acceleration_us_per_s2",
+            normalized_attention_servo_rest_max_acceleration_us_per_s2,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_rest_max_jerk_us_per_s3",
+            normalized_attention_servo_rest_max_jerk_us_per_s3,
+        )
+        object.__setattr__(
+            self,
             "attention_servo_min_command_delta_us",
             normalized_attention_servo_min_command_delta_us,
         )
+        object.__setattr__(
+            self,
+            "attention_servo_visible_retarget_tolerance_us",
+            normalized_attention_servo_visible_retarget_tolerance_us,
+        )
         object.__setattr__(self, "attention_servo_soft_limit_margin_us", normalized_attention_servo_soft_limit_margin_us)
         object.__setattr__(self, "attention_servo_idle_release_s", normalized_attention_servo_idle_release_s)
+        object.__setattr__(self, "attention_servo_settled_release_s", normalized_attention_servo_settled_release_s)
+        object.__setattr__(self, "attention_servo_follow_exit_only", bool(self.attention_servo_follow_exit_only))
+        object.__setattr__(
+            self,
+            "attention_servo_mechanical_range_degrees",
+            normalized_attention_servo_mechanical_range_degrees,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_exit_follow_max_degrees",
+            normalized_attention_servo_exit_follow_max_degrees,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_exit_activation_delay_s",
+            normalized_attention_servo_exit_activation_delay_s,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_exit_settle_hold_s",
+            normalized_attention_servo_exit_settle_hold_s,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_exit_reacquire_center_tolerance",
+            normalized_attention_servo_exit_reacquire_center_tolerance,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_exit_visible_edge_threshold",
+            normalized_attention_servo_exit_visible_edge_threshold,
+        )
+        object.__setattr__(
+            self,
+            "attention_servo_exit_cooldown_s",
+            normalized_attention_servo_exit_cooldown_s,
+        )
         object.__setattr__(self, "display_presentation_path", normalized_display_presentation_path)
         object.__setattr__(self, "display_presentation_ttl_s", normalized_display_presentation_ttl_s)
         object.__setattr__(self, "display_news_ticker_store_path", normalized_display_news_ticker_store_path)
@@ -1456,63 +1526,10 @@ class TwinrConfig:
                 return os.environ[name]
             return file_values.get(name, default)
 
-        wakeword_primary_backend = (
-            get_value(
-                "TWINR_WAKEWORD_PRIMARY_BACKEND",
-                get_value("TWINR_WAKEWORD_BACKEND", "openwakeword"),
-            )
-            or "openwakeword"
-        ).strip().lower()
-        wakeword_verifier_mode = (
-            get_value("TWINR_WAKEWORD_VERIFIER_MODE")
-            or (
-                "always"
-                if _parse_bool(get_value("TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT"), False)
-                else "ambiguity_only"
-            )
-        ).strip().lower()
-        bundled_openwakeword_models = _default_bundled_openwakeword_models(project_root)
-        wakeword_phrases = _parse_csv_strings(
-            get_value("TWINR_WAKEWORD_PHRASES"),
-            DEFAULT_WAKEWORD_PHRASES,
+        voice_activation_phrases = _parse_csv_strings(
+            get_value("TWINR_VOICE_ACTIVATION_PHRASES"),
+            DEFAULT_VOICE_ACTIVATION_PHRASES,
         )
-        wakeword_stt_phrases = _parse_csv_strings(
-            get_value("TWINR_WAKEWORD_STT_PHRASES"),
-            wakeword_phrases,
-        )
-        wakeword_openwakeword_models = _parse_csv_strings(
-            get_value("TWINR_WAKEWORD_OPENWAKEWORD_MODELS"),
-            bundled_openwakeword_models,
-        )
-        wakeword_openwakeword_custom_verifier_models = _parse_csv_mapping(
-            get_value("TWINR_WAKEWORD_OPENWAKEWORD_CUSTOM_VERIFIER_MODELS"),
-            _default_bundled_openwakeword_custom_verifier_models(
-                project_root,
-                wakeword_openwakeword_models,
-            ),
-        )
-        wakeword_openwakeword_sequence_verifier_models = _parse_csv_mapping(
-            get_value("TWINR_WAKEWORD_OPENWAKEWORD_SEQUENCE_VERIFIER_MODELS"),
-            _default_bundled_openwakeword_sequence_verifier_models(
-                project_root,
-                wakeword_openwakeword_models,
-            ),
-        )
-        wakeword_openwakeword_inference_framework = (
-            get_value("TWINR_WAKEWORD_OPENWAKEWORD_INFERENCE_FRAMEWORK")
-            or _default_openwakeword_inference_framework(wakeword_openwakeword_models)
-        ).strip().lower()
-        wakeword_kws_tokens_path = _parse_optional_text(get_value("TWINR_WAKEWORD_KWS_TOKENS_PATH"))
-        wakeword_kws_encoder_path = _parse_optional_text(get_value("TWINR_WAKEWORD_KWS_ENCODER_PATH"))
-        wakeword_kws_decoder_path = _parse_optional_text(get_value("TWINR_WAKEWORD_KWS_DECODER_PATH"))
-        wakeword_kws_joiner_path = _parse_optional_text(get_value("TWINR_WAKEWORD_KWS_JOINER_PATH"))
-        wakeword_kws_keywords_file_path = _parse_optional_text(
-            get_value("TWINR_WAKEWORD_KWS_KEYWORDS_FILE_PATH")
-        )
-        wakeword_wekws_model_path = _parse_optional_text(get_value("TWINR_WAKEWORD_WEKWS_MODEL_PATH"))
-        wakeword_wekws_config_path = _parse_optional_text(get_value("TWINR_WAKEWORD_WEKWS_CONFIG_PATH"))
-        wakeword_wekws_words_path = _parse_optional_text(get_value("TWINR_WAKEWORD_WEKWS_WORDS_PATH"))
-        wakeword_wekws_cmvn_path = _parse_optional_text(get_value("TWINR_WAKEWORD_WEKWS_CMVN_PATH"))
 
         return cls(
             openai_api_key=get_value("OPENAI_API_KEY"),
@@ -1524,7 +1541,7 @@ class TwinrConfig:
             project_root=str(project_root),
             personality_dir=get_value("TWINR_PERSONALITY_DIR", "personality") or "personality",
             user_display_name=get_value("TWINR_USER_DISPLAY_NAME"),
-            default_model=get_value("OPENAI_MODEL", "gpt-5.2") or "gpt-5.2",
+            default_model=get_value("OPENAI_MODEL", DEFAULT_OPENAI_MAIN_MODEL) or DEFAULT_OPENAI_MAIN_MODEL,
             openai_reasoning_effort=get_value("OPENAI_REASONING_EFFORT", "medium") or "medium",
             openai_prompt_cache_enabled=_parse_bool(get_value("OPENAI_PROMPT_CACHE_ENABLED"), True),
             openai_prompt_cache_retention=get_value("OPENAI_PROMPT_CACHE_RETENTION"),
@@ -1669,9 +1686,7 @@ class TwinrConfig:
                 get_value("TWINR_STREAMING_FIRST_WORD_ENABLED"),
                 True,
             ),
-            streaming_first_word_model=(
-                get_value("TWINR_STREAMING_FIRST_WORD_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
-            ),
+            streaming_first_word_model=get_value("TWINR_STREAMING_FIRST_WORD_MODEL", "") or "",
             streaming_first_word_reasoning_effort=(
                 get_value("TWINR_STREAMING_FIRST_WORD_REASONING_EFFORT", "") or ""
             ),
@@ -1735,9 +1750,7 @@ class TwinrConfig:
                     or "30000"
                 ),
             ),
-            streaming_supervisor_model=(
-                get_value("TWINR_STREAMING_SUPERVISOR_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
-            ),
+            streaming_supervisor_model=get_value("TWINR_STREAMING_SUPERVISOR_MODEL", "") or "",
             streaming_supervisor_reasoning_effort=(
                 get_value("TWINR_STREAMING_SUPERVISOR_REASONING_EFFORT", "low") or "low"
             ),
@@ -1757,9 +1770,7 @@ class TwinrConfig:
             streaming_supervisor_prefetch_wait_ms=int(
                 get_value("TWINR_STREAMING_SUPERVISOR_PREFETCH_WAIT_MS", "80") or "80"
             ),
-            streaming_specialist_model=(
-                get_value("TWINR_STREAMING_SPECIALIST_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
-            ),
+            streaming_specialist_model=get_value("TWINR_STREAMING_SPECIALIST_MODEL", "") or "",
             streaming_specialist_reasoning_effort=(
                 get_value("TWINR_STREAMING_SPECIALIST_REASONING_EFFORT", "low") or "low"
             ),
@@ -1789,9 +1800,7 @@ class TwinrConfig:
                 get_value("TWINR_CONVERSATION_CLOSURE_GUARD_ENABLED"),
                 True,
             ),
-            conversation_closure_model=(
-                get_value("TWINR_CONVERSATION_CLOSURE_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
-            ),
+            conversation_closure_model=get_value("TWINR_CONVERSATION_CLOSURE_MODEL", "") or "",
             conversation_closure_reasoning_effort=(
                 get_value("TWINR_CONVERSATION_CLOSURE_REASONING_EFFORT", "") or ""
             ),
@@ -1878,14 +1887,13 @@ class TwinrConfig:
             ),
             audio_follow_up_ignore_ms=int(get_value("TWINR_AUDIO_FOLLOW_UP_IGNORE_MS", "0") or "0"),
             openai_enable_web_search=_parse_bool(get_value("TWINR_OPENAI_ENABLE_WEB_SEARCH"), False),
-            openai_search_model=get_value("OPENAI_SEARCH_MODEL", "gpt-4o-mini-search-preview")
-            or "gpt-4o-mini-search-preview",
+            openai_search_model=get_value("OPENAI_SEARCH_MODEL", "") or "",
             openai_web_search_context_size=get_value("TWINR_OPENAI_WEB_SEARCH_CONTEXT_SIZE", "medium") or "medium",
             openai_search_max_output_tokens=int(
-                get_value("TWINR_OPENAI_SEARCH_MAX_OUTPUT_TOKENS", "160") or "160"
+                get_value("TWINR_OPENAI_SEARCH_MAX_OUTPUT_TOKENS", "1024") or "1024"
             ),
             openai_search_retry_max_output_tokens=int(
-                get_value("TWINR_OPENAI_SEARCH_RETRY_MAX_OUTPUT_TOKENS", "240") or "240"
+                get_value("TWINR_OPENAI_SEARCH_RETRY_MAX_OUTPUT_TOKENS", "1536") or "1536"
             ),
             openai_web_search_country=get_value("TWINR_OPENAI_WEB_SEARCH_COUNTRY"),
             openai_web_search_region=get_value("TWINR_OPENAI_WEB_SEARCH_REGION"),
@@ -1938,12 +1946,13 @@ class TwinrConfig:
                 or None
             ),
             voice_orchestrator_audio_device=get_value("TWINR_VOICE_ORCHESTRATOR_AUDIO_DEVICE") or None,
+            voice_activation_phrases=voice_activation_phrases,
             voice_orchestrator_history_ms=int(
                 get_value("TWINR_VOICE_ORCHESTRATOR_HISTORY_MS", "4000") or "4000"
             ),
             voice_orchestrator_wake_stage1_mode=_parse_voice_orchestrator_wake_stage1_mode(
                 get_value("TWINR_VOICE_ORCHESTRATOR_WAKE_STAGE1_MODE"),
-                "backend",
+                "remote_asr",
             ),
             voice_orchestrator_wake_candidate_window_ms=int(
                 get_value("TWINR_VOICE_ORCHESTRATOR_WAKE_CANDIDATE_WINDOW_MS", "2200") or "2200"
@@ -1971,39 +1980,74 @@ class TwinrConfig:
                 get_value("TWINR_VOICE_ORCHESTRATOR_WAKE_TAIL_ENDPOINT_SILENCE_MS", "300")
                 or "300"
             ),
-            voice_orchestrator_local_stt_url=_parse_optional_text(
-                get_value("TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_URL")
+            voice_orchestrator_remote_asr_url=_parse_optional_text(
+                get_value("TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_URL")
             ),
-            voice_orchestrator_local_stt_bearer_token=_parse_optional_text(
-                get_value("TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_BEARER_TOKEN")
+            voice_orchestrator_remote_asr_bearer_token=_parse_optional_text(
+                get_value("TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_BEARER_TOKEN")
             ),
-            voice_orchestrator_local_stt_timeout_s=_parse_float(
-                get_value("TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_TIMEOUT_S"),
+            voice_orchestrator_remote_asr_min_wake_duration_ms=max(
+                0,
+                int(
+                    get_value(
+                        "TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_MIN_WAKE_DURATION_MS",
+                        "300",
+                    )
+                    or "300"
+                ),
+            ),
+            voice_orchestrator_remote_asr_timeout_s=_parse_float(
+                get_value("TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_TIMEOUT_S"),
                 3.0,
                 minimum=0.25,
             ),
-            voice_orchestrator_local_stt_tail_timeout_s=_parse_float(
-                get_value("TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_TAIL_TIMEOUT_S"),
+            voice_orchestrator_remote_asr_tail_timeout_s=_parse_float(
+                get_value("TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_TAIL_TIMEOUT_S"),
                 1.25,
                 minimum=0.25,
             ),
-            voice_orchestrator_local_stt_language=_parse_optional_text(
-                get_value("TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_LANGUAGE")
+            voice_orchestrator_remote_asr_language=_parse_optional_text(
+                get_value("TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_LANGUAGE")
             ),
-            voice_orchestrator_local_stt_mode=(
-                _parse_optional_text(get_value("TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_MODE"))
+            voice_orchestrator_remote_asr_mode=(
+                _parse_optional_text(get_value("TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_MODE"))
                 or "active_listening"
             ),
-            voice_orchestrator_local_stt_retry_attempts=max(
+            voice_orchestrator_remote_asr_retry_attempts=max(
                 0,
                 int(
-                    get_value("TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_RETRY_ATTEMPTS", "1")
+                    get_value("TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_RETRY_ATTEMPTS", "1")
                     or "1"
                 ),
             ),
-            voice_orchestrator_local_stt_retry_backoff_s=_parse_float(
-                get_value("TWINR_VOICE_ORCHESTRATOR_LOCAL_STT_RETRY_BACKOFF_S"),
+            voice_orchestrator_remote_asr_retry_backoff_s=_parse_float(
+                get_value("TWINR_VOICE_ORCHESTRATOR_REMOTE_ASR_RETRY_BACKOFF_S"),
                 0.35,
+                minimum=0.0,
+            ),
+            voice_orchestrator_intent_stage1_window_bonus_ms=max(
+                0,
+                int(
+                    get_value(
+                        "TWINR_VOICE_ORCHESTRATOR_INTENT_STAGE1_WINDOW_BONUS_MS",
+                        "400",
+                    )
+                    or "400"
+                ),
+            ),
+            voice_orchestrator_intent_min_wake_duration_relief_ms=max(
+                0,
+                int(
+                    get_value(
+                        "TWINR_VOICE_ORCHESTRATOR_INTENT_MIN_WAKE_DURATION_RELIEF_MS",
+                        "100",
+                    )
+                    or "100"
+                ),
+            ),
+            voice_orchestrator_intent_follow_up_timeout_bonus_s=_parse_float(
+                get_value("TWINR_VOICE_ORCHESTRATOR_INTENT_FOLLOW_UP_TIMEOUT_BONUS_S"),
+                1.5,
                 minimum=0.0,
             ),
             voice_orchestrator_follow_up_timeout_s=_parse_float(
@@ -2359,159 +2403,6 @@ class TwinrConfig:
                 get_value("TWINR_PROACTIVE_VISION_REVIEW_MIN_SPACING_S"),
                 1.2,
             ),
-            wakeword_enabled=_parse_bool(get_value("TWINR_WAKEWORD_ENABLED"), False),
-            wakeword_backend=wakeword_primary_backend,
-            wakeword_primary_backend=wakeword_primary_backend,
-            wakeword_fallback_backend=(
-                get_value("TWINR_WAKEWORD_FALLBACK_BACKEND", "stt") or "stt"
-            ).strip().lower(),
-            wakeword_verifier_mode=wakeword_verifier_mode,
-            wakeword_verifier_margin=_parse_clamped_float(
-                get_value("TWINR_WAKEWORD_VERIFIER_MARGIN"),
-                0.08,
-                minimum=0.0,
-                maximum=1.0,
-            ),
-            wakeword_phrases=wakeword_phrases,
-            wakeword_stt_phrases=wakeword_stt_phrases,
-            wakeword_sample_ms=int(get_value("TWINR_WAKEWORD_SAMPLE_MS", "1800") or "1800"),
-            wakeword_presence_grace_s=_parse_float(
-                get_value("TWINR_WAKEWORD_PRESENCE_GRACE_S"),
-                15.0 * 60.0,
-            ),
-            wakeword_motion_grace_s=_parse_float(
-                get_value("TWINR_WAKEWORD_MOTION_GRACE_S"),
-                5.0 * 60.0,
-            ),
-            wakeword_speech_grace_s=_parse_float(
-                get_value("TWINR_WAKEWORD_SPEECH_GRACE_S"),
-                90.0,
-            ),
-            wakeword_attempt_cooldown_s=_parse_float(
-                get_value("TWINR_WAKEWORD_ATTEMPT_COOLDOWN_S"),
-                4.0,
-            ),
-            wakeword_block_proactive_after_attempt_s=_parse_float(
-                get_value("TWINR_WAKEWORD_BLOCK_PROACTIVE_AFTER_ATTEMPT_S"),
-                20.0,
-            ),
-            wakeword_min_active_ratio=_parse_float(
-                get_value("TWINR_WAKEWORD_MIN_ACTIVE_RATIO"),
-                0.08,
-            ),
-            wakeword_min_active_chunks=int(
-                get_value("TWINR_WAKEWORD_MIN_ACTIVE_CHUNKS", "2") or "2"
-            ),
-            wakeword_openwakeword_models=wakeword_openwakeword_models,
-            wakeword_openwakeword_custom_verifier_models=wakeword_openwakeword_custom_verifier_models,
-            wakeword_openwakeword_custom_verifier_threshold=_parse_clamped_float(
-                get_value("TWINR_WAKEWORD_OPENWAKEWORD_CUSTOM_VERIFIER_THRESHOLD"),
-                0.1,
-                minimum=0.0,
-                maximum=1.0,
-            ),
-            wakeword_openwakeword_sequence_verifier_models=(
-                wakeword_openwakeword_sequence_verifier_models
-            ),
-            wakeword_openwakeword_sequence_verifier_threshold=_parse_clamped_float(
-                get_value("TWINR_WAKEWORD_OPENWAKEWORD_SEQUENCE_VERIFIER_THRESHOLD"),
-                0.5,
-                minimum=0.0,
-                maximum=1.0,
-            ),
-            wakeword_openwakeword_threshold=_parse_clamped_float(
-                get_value("TWINR_WAKEWORD_OPENWAKEWORD_THRESHOLD"),
-                0.5,
-                minimum=MIN_SAFE_OPENWAKEWORD_THRESHOLD,
-                maximum=1.0,
-            ),
-            wakeword_openwakeword_vad_threshold=_parse_float(
-                get_value("TWINR_WAKEWORD_OPENWAKEWORD_VAD_THRESHOLD"),
-                0.0,
-            ),
-            wakeword_openwakeword_patience_frames=int(
-                get_value("TWINR_WAKEWORD_OPENWAKEWORD_PATIENCE_FRAMES", "1") or "1"
-            ),
-            wakeword_openwakeword_activation_samples=int(
-                get_value("TWINR_WAKEWORD_OPENWAKEWORD_ACTIVATION_SAMPLES", "3") or "3"
-            ),
-            wakeword_openwakeword_deactivation_threshold=_parse_clamped_float(
-                get_value("TWINR_WAKEWORD_OPENWAKEWORD_DEACTIVATION_THRESHOLD"),
-                0.2,
-                minimum=0.0,
-                maximum=1.0,
-            ),
-            wakeword_openwakeword_enable_speex=_parse_bool(
-                get_value("TWINR_WAKEWORD_OPENWAKEWORD_ENABLE_SPEEX"),
-                False,
-            ),
-            wakeword_openwakeword_transcribe_on_detect=_parse_bool(
-                get_value("TWINR_WAKEWORD_OPENWAKEWORD_TRANSCRIBE_ON_DETECT"),
-                False,
-            ),
-            wakeword_openwakeword_inference_framework=wakeword_openwakeword_inference_framework,
-            wakeword_kws_tokens_path=wakeword_kws_tokens_path,
-            wakeword_kws_encoder_path=wakeword_kws_encoder_path,
-            wakeword_kws_decoder_path=wakeword_kws_decoder_path,
-            wakeword_kws_joiner_path=wakeword_kws_joiner_path,
-            wakeword_kws_keywords_file_path=wakeword_kws_keywords_file_path,
-            wakeword_kws_provider=(
-                get_value("TWINR_WAKEWORD_KWS_PROVIDER", "cpu") or "cpu"
-            ).strip().lower(),
-            wakeword_kws_num_threads=int(
-                get_value("TWINR_WAKEWORD_KWS_NUM_THREADS", "2") or "2"
-            ),
-            wakeword_kws_sample_rate=int(
-                get_value("TWINR_WAKEWORD_KWS_SAMPLE_RATE", "16000") or "16000"
-            ),
-            wakeword_kws_feature_dim=int(
-                get_value("TWINR_WAKEWORD_KWS_FEATURE_DIM", "80") or "80"
-            ),
-            wakeword_kws_max_active_paths=int(
-                get_value("TWINR_WAKEWORD_KWS_MAX_ACTIVE_PATHS", "4") or "4"
-            ),
-            wakeword_kws_keywords_score=_parse_float(
-                get_value("TWINR_WAKEWORD_KWS_KEYWORDS_SCORE"),
-                1.0,
-                minimum=0.0,
-            ),
-            wakeword_kws_keywords_threshold=_parse_float(
-                get_value("TWINR_WAKEWORD_KWS_KEYWORDS_THRESHOLD"),
-                0.25,
-                minimum=0.0,
-            ),
-            wakeword_kws_num_trailing_blanks=int(
-                get_value("TWINR_WAKEWORD_KWS_NUM_TRAILING_BLANKS", "1") or "1"
-            ),
-            wakeword_wekws_model_path=wakeword_wekws_model_path,
-            wakeword_wekws_config_path=wakeword_wekws_config_path,
-            wakeword_wekws_words_path=wakeword_wekws_words_path,
-            wakeword_wekws_cmvn_path=wakeword_wekws_cmvn_path,
-            wakeword_wekws_provider=(
-                get_value("TWINR_WAKEWORD_WEKWS_PROVIDER", "cpu") or "cpu"
-            ).strip().lower(),
-            wakeword_wekws_num_threads=int(
-                get_value("TWINR_WAKEWORD_WEKWS_NUM_THREADS", "2") or "2"
-            ),
-            wakeword_wekws_threshold=_parse_clamped_float(
-                get_value("TWINR_WAKEWORD_WEKWS_THRESHOLD"),
-                0.5,
-                minimum=0.0,
-                maximum=1.0,
-            ),
-            wakeword_wekws_chunk_ms=int(
-                get_value("TWINR_WAKEWORD_WEKWS_CHUNK_MS", "100") or "100"
-            ),
-            wakeword_calibration_profile_path=get_value(
-                "TWINR_WAKEWORD_CALIBRATION_PROFILE_PATH",
-                str(project_root / "state" / "wakeword_calibration.json"),
-            )
-            or str(project_root / "state" / "wakeword_calibration.json"),
-            wakeword_calibration_recommended_path=get_value(
-                "TWINR_WAKEWORD_CALIBRATION_RECOMMENDED_PATH",
-                str(project_root / "state" / "wakeword_calibration.recommended.json"),
-            )
-            or str(project_root / "state" / "wakeword_calibration.recommended.json"),
             proactive_person_returned_absence_s=_parse_float(
                 get_value("TWINR_PROACTIVE_PERSON_RETURNED_ABSENCE_S"),
                 20.0 * 60.0,
@@ -3027,6 +2918,9 @@ class TwinrConfig:
             display_companion_enabled=_parse_optional_bool(
                 get_value("TWINR_DISPLAY_COMPANION_ENABLED")
             ),
+            respeaker_led_enabled=_parse_optional_bool(
+                get_value("TWINR_RESPEAKER_LED_ENABLED")
+            ),
             display_fb_path=get_value("TWINR_DISPLAY_FB_PATH", "/dev/fb0") or "/dev/fb0",
             display_wayland_display=get_value("TWINR_DISPLAY_WAYLAND_DISPLAY", "wayland-0") or "wayland-0",
             display_wayland_runtime_dir=get_value("TWINR_DISPLAY_WAYLAND_RUNTIME_DIR"),
@@ -3232,8 +3126,26 @@ class TwinrConfig:
                 900.0,
                 minimum=1.0,
             ),
+            attention_servo_rest_max_velocity_us_per_s=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_REST_MAX_VELOCITY_US_PER_S"),
+                35.0,
+                minimum=1.0,
+            ),
+            attention_servo_rest_max_acceleration_us_per_s2=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_REST_MAX_ACCELERATION_US_PER_S2"),
+                120.0,
+                minimum=1.0,
+            ),
+            attention_servo_rest_max_jerk_us_per_s3=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_REST_MAX_JERK_US_PER_S3"),
+                450.0,
+                minimum=1.0,
+            ),
             attention_servo_min_command_delta_us=int(
                 get_value("TWINR_ATTENTION_SERVO_MIN_COMMAND_DELTA_US", "8") or "8"
+            ),
+            attention_servo_visible_retarget_tolerance_us=int(
+                get_value("TWINR_ATTENTION_SERVO_VISIBLE_RETARGET_TOLERANCE_US", "40") or "40"
             ),
             attention_servo_soft_limit_margin_us=int(
                 get_value("TWINR_ATTENTION_SERVO_SOFT_LIMIT_MARGIN_US", "70") or "70"
@@ -3241,6 +3153,51 @@ class TwinrConfig:
             attention_servo_idle_release_s=_parse_float(
                 get_value("TWINR_ATTENTION_SERVO_IDLE_RELEASE_S"),
                 1.0,
+                minimum=0.0,
+            ),
+            attention_servo_settled_release_s=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_SETTLED_RELEASE_S"),
+                0.0,
+                minimum=0.0,
+            ),
+            attention_servo_follow_exit_only=_parse_bool(
+                get_value("TWINR_ATTENTION_SERVO_FOLLOW_EXIT_ONLY"),
+                False,
+            ),
+            attention_servo_mechanical_range_degrees=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_MECHANICAL_RANGE_DEGREES"),
+                270.0,
+                minimum=30.0,
+            ),
+            attention_servo_exit_follow_max_degrees=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_EXIT_FOLLOW_MAX_DEGREES"),
+                60.0,
+                minimum=0.0,
+            ),
+            attention_servo_exit_activation_delay_s=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_EXIT_ACTIVATION_DELAY_S"),
+                0.75,
+                minimum=0.0,
+            ),
+            attention_servo_exit_settle_hold_s=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_EXIT_SETTLE_HOLD_S"),
+                0.6,
+                minimum=0.0,
+            ),
+            attention_servo_exit_reacquire_center_tolerance=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_EXIT_REACQUIRE_CENTER_TOLERANCE"),
+                0.08,
+                minimum=0.0,
+            ),
+            attention_servo_exit_visible_edge_threshold=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_EXIT_VISIBLE_EDGE_THRESHOLD"),
+                0.74,
+                minimum=0.55,
+                maximum=0.95,
+            ),
+            attention_servo_exit_cooldown_s=_parse_float(
+                get_value("TWINR_ATTENTION_SERVO_EXIT_COOLDOWN_S"),
+                30.0,
                 minimum=0.0,
             ),
             display_presentation_path=get_value(

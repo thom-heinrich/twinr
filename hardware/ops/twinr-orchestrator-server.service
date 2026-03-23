@@ -1,0 +1,15 @@
+[Unit]
+Description=Twinr Local Voice Orchestrator Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/thh/twinr
+ExecStart=/home/thh/twinr/.venv/bin/python -m twinr --env-file /home/thh/twinr/.voice_gateway_alias.env --run-orchestrator-server
+Restart=always
+RestartSec=1
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

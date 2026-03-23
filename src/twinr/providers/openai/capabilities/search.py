@@ -8,16 +8,18 @@ It keeps live-search behavior isolated from the generic response helpers.
 from __future__ import annotations
 ##REFACTOR: 2026-03-16##
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 import json
 import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from twinr.agent.base_agent.config import DEFAULT_OPENAI_MAIN_MODEL
 from twinr.ops.usage import TokenUsage, extract_model_name, extract_token_usage
 
 from ..core.instructions import SEARCH_AGENT_INSTRUCTIONS, SEARCH_MODEL_FALLBACKS
-from ..core.types import ConversationLike, OpenAISearchResult
+from ..core.types import ConversationLike, OpenAISearchAttempt, OpenAISearchResult
 
 _SEARCH_CONTEXT_MAX_TURNS = 3
 _SEARCH_CONTEXT_CHAR_LIMIT = 160
@@ -73,10 +75,12 @@ _WEEKDAY_INDEX_BY_NAME = {
     "sonntag": 6,
 }
 _VALID_SEARCH_CONTEXT_SIZES = frozenset({"low", "medium", "high"})
-_DEFAULT_SEARCH_MAX_OUTPUT_TOKENS = 512
-_DEFAULT_SEARCH_RETRY_MAX_OUTPUT_TOKENS = 768
-_FALLBACK_SEARCH_MODEL = "gpt-5"
+_DEFAULT_SEARCH_MAX_OUTPUT_TOKENS = 1024
+_DEFAULT_SEARCH_RETRY_MAX_OUTPUT_TOKENS = 1536
+_SEARCH_OUTPUT_TOKEN_RETRY_LADDER = (512, 768, 1024, 1536, 2048, 3072)
+_FALLBACK_SEARCH_MODEL = DEFAULT_OPENAI_MAIN_MODEL
 _SEARCH_VOICE_REWRITE_MAX_OUTPUT_TOKENS = 160
+_MAX_SEARCH_ATTEMPT_DETAIL_CHARS = 240
 _SEARCH_SPOKEN_ANSWER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -122,12 +126,116 @@ def _coerce_positive_int(value: Any, *, default: int, minimum: int = 1) -> int:
     return max(minimum, coerced)
 
 
+def _normalize_search_attempt_detail(value: object) -> str | None:
+    """Return a bounded readable detail string for search-attempt journaling."""
+
+    text = _collapse_whitespace(None if value is None else str(value))
+    if not text:
+        return None
+    if len(text) <= _MAX_SEARCH_ATTEMPT_DETAIL_CHARS:
+        return text
+    return text[: _MAX_SEARCH_ATTEMPT_DETAIL_CHARS - 1].rstrip() + "…"
+
+
+def _response_status_text(response: Any) -> str | None:
+    """Return the normalized top-level response status when available."""
+
+    status = _collapse_whitespace(getattr(response, "status", None)).lower()
+    return status or None
+
+
+def _build_search_attempt(
+    *,
+    model: str,
+    api_path: str,
+    max_output_tokens: int | None,
+    outcome: str,
+    status: str | None = None,
+    detail: object = None,
+) -> OpenAISearchAttempt:
+    """Build one immutable search-attempt record for runtime journaling."""
+
+    return OpenAISearchAttempt(
+        model=model,
+        api_path=api_path,
+        max_output_tokens=max_output_tokens,
+        outcome=outcome,
+        status=status,
+        detail=_normalize_search_attempt_detail(detail),
+    )
+
+
+def _same_search_model_identity(requested_model: str | None, actual_model: str | None) -> bool:
+    """Return whether requested and actual model names refer to the same family."""
+
+    requested = _collapse_whitespace(requested_model)
+    actual = _collapse_whitespace(actual_model)
+    if not requested or not actual:
+        return False
+    if requested == actual:
+        return True
+    if actual.startswith(f"{requested}-") or requested.startswith(f"{actual}-"):
+        return True
+    if requested.endswith("-latest"):
+        requested_base = requested[: -len("-latest")].rstrip("-")
+        if requested_base and (actual == requested_base or actual.startswith(f"{requested_base}-")):
+            return True
+    if actual.endswith("-latest"):
+        actual_base = actual[: -len("-latest")].rstrip("-")
+        if actual_base and (requested == actual_base or requested.startswith(f"{actual_base}-")):
+            return True
+    return False
+
+
 def _normalize_search_context_size(value: Any) -> str | None:
     """Normalize configured search context size to an allowed enum value."""
 
     normalized = _collapse_whitespace(None if value is None else str(value)).lower()
     if normalized in _VALID_SEARCH_CONTEXT_SIZES:
         return normalized
+    return None
+
+
+def _extract_detail_message(detail: Any) -> str | None:
+    """Extract a readable message from SDK error/detail payloads."""
+
+    if detail is None:
+        return None
+    if isinstance(detail, dict):
+        parts = [
+            _collapse_whitespace(detail.get("code")),
+            _collapse_whitespace(detail.get("reason")),
+            _collapse_whitespace(detail.get("message")),
+        ]
+        text_parts = [part for part in parts if part]
+        if text_parts:
+            return ": ".join(text_parts)
+        raw_text = _collapse_whitespace(str(detail))
+        return raw_text or None
+    parts = [
+        _collapse_whitespace(getattr(detail, "code", None)),
+        _collapse_whitespace(getattr(detail, "reason", None)),
+        _collapse_whitespace(getattr(detail, "message", None)),
+    ]
+    text_parts = [part for part in parts if part]
+    if text_parts:
+        return ": ".join(text_parts)
+    raw_text = _collapse_whitespace(str(detail))
+    return raw_text or None
+
+
+def _response_incomplete_detail(response: Any) -> str | None:
+    """Return the best available incomplete-detail message from a response."""
+
+    detail = _extract_detail_message(getattr(response, "incomplete_details", None))
+    if detail:
+        return detail
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message" or getattr(item, "status", None) != "incomplete":
+            continue
+        item_detail = _extract_detail_message(getattr(item, "incomplete_details", None))
+        if item_detail:
+            return item_detail
     return None
 
 
@@ -286,18 +394,30 @@ class OpenAISearchMixin:
             date_context=date_context,
         )
         instructions = SEARCH_AGENT_INSTRUCTIONS
-        search_conversation = None
+        search_conversation = self._prepare_search_conversation(conversation)
         last_error: Exception | None = None
         output_token_candidates = self._search_output_token_candidates()
+        candidate_models = self._candidate_search_models()
+        requested_model = candidate_models[0] if candidate_models else None
+        attempt_log: list[OpenAISearchAttempt] = []
 
-        for model in self._candidate_search_models():
+        for model in candidate_models:
             if self._is_search_preview_model(model):
                 if not self._search_preview_supported():
+                    attempt_log.append(
+                        _build_search_attempt(
+                            model=model,
+                            api_path="preview",
+                            max_output_tokens=None,
+                            outcome="skipped",
+                            detail="preview_api_unavailable",
+                        )
+                    )
                     continue
                 for max_output_tokens in output_token_candidates:
                     try:
                         # AUDIT-FIX(#3): Keep per-model fallback alive if a preview request fails transiently.
-                        candidate, is_complete = self._search_with_preview_model(
+                        candidate, is_complete, attempt = self._search_with_preview_model(
                             model,
                             prompt,
                             conversation=search_conversation,
@@ -305,56 +425,103 @@ class OpenAISearchMixin:
                             location_hint=location_hint,
                             max_output_tokens=max_output_tokens,
                         )
+                        attempt_log.append(attempt)
                     except Exception as exc:  # pragma: no cover - defensive runtime fallback
                         last_error = exc
+                        attempt_log.append(
+                            _build_search_attempt(
+                                model=model,
+                                api_path="preview",
+                                max_output_tokens=max_output_tokens,
+                                outcome="error",
+                                detail=f"{type(exc).__name__}: {exc}",
+                            )
+                        )
                         continue
                     if candidate.answer and is_complete:
                         return self._rewrite_search_result_for_voice(
                             question=normalized_question,
-                            candidate=candidate,
+                            candidate=self._finalize_search_result(
+                                candidate,
+                                requested_model=requested_model,
+                                attempt_log=attempt_log,
+                            ),
                         )
                 continue
 
-            for max_output_tokens in output_token_candidates:
-                try:
-                    request = self._build_response_request(
-                        prompt,
-                        conversation=search_conversation,
-                        instructions=instructions,
-                        allow_web_search=True,
-                        model=model,
-                        reasoning_effort="low",
-                        max_output_tokens=max_output_tokens,
-                        prompt_cache_scope="search",
-                    )
-                    # AUDIT-FIX(#6): Patch the actual web-search tool only, validate search_context_size, and preserve other include fields.
-                    self._apply_web_search_request_overrides(request, location_hint=location_hint)
-                    self._ensure_web_search_sources_included(request)
-                    # AUDIT-FIX(#3): Keep trying remaining models/attempts on transient Responses API failures.
-                    response = self._client.responses.create(**request)
-                    candidate = OpenAISearchResult(
-                        answer=_collapse_whitespace(self._extract_output_text(response).replace("\r", " ").replace("\n", " ")),
-                        sources=self._extract_web_search_sources(response),
-                        response_id=getattr(response, "id", None),
-                        request_id=getattr(response, "_request_id", None),
-                        model=extract_model_name(response, model),
-                        token_usage=extract_token_usage(response),
-                        used_web_search=self._used_web_search(response),
-                    )
-                except Exception as exc:  # pragma: no cover - defensive runtime fallback
-                    last_error = exc
-                    continue
-                if candidate.answer and self._response_is_complete(response):
-                    return self._rewrite_search_result_for_voice(
-                        question=normalized_question,
-                        candidate=candidate,
-                    )
+            candidate, model_error, model_attempts = self._search_with_responses_model(
+                model,
+                prompt,
+                conversation=search_conversation,
+                instructions=instructions,
+                location_hint=location_hint,
+                output_token_candidates=output_token_candidates,
+            )
+            attempt_log.extend(model_attempts)
+            if candidate is not None:
+                return self._rewrite_search_result_for_voice(
+                    question=normalized_question,
+                    candidate=self._finalize_search_result(
+                        candidate,
+                        requested_model=requested_model,
+                        attempt_log=attempt_log,
+                    ),
+                )
+            if model_error is not None:
+                last_error = model_error
 
         if last_error is not None:
             raise RuntimeError(
                 f"OpenAI web search failed after exhausting configured models and retries: {last_error}"
             ) from last_error
         raise RuntimeError("OpenAI web search returned no usable answer text")
+
+    def _finalize_search_result(
+        self,
+        candidate: OpenAISearchResult,
+        *,
+        requested_model: str | None,
+        attempt_log: list[OpenAISearchAttempt] | tuple[OpenAISearchAttempt, ...],
+    ) -> OpenAISearchResult:
+        """Attach requested-model and fallback metadata to a successful result."""
+
+        normalized_attempt_log = tuple(attempt_log)
+        return replace(
+            candidate,
+            requested_model=requested_model,
+            fallback_reason=self._derive_search_fallback_reason(
+                requested_model=requested_model,
+                actual_model=candidate.model,
+                attempt_log=normalized_attempt_log,
+            ),
+            attempt_log=normalized_attempt_log,
+        )
+
+    def _derive_search_fallback_reason(
+        self,
+        *,
+        requested_model: str | None,
+        actual_model: str | None,
+        attempt_log: tuple[OpenAISearchAttempt, ...],
+    ) -> str | None:
+        """Describe why a successful search result left its requested primary model."""
+
+        normalized_requested = _collapse_whitespace(requested_model)
+        normalized_actual = _collapse_whitespace(actual_model)
+        if not normalized_requested or _same_search_model_identity(normalized_requested, normalized_actual):
+            return None
+        for attempt in attempt_log:
+            if attempt.model != normalized_requested:
+                continue
+            if attempt.outcome == "success":
+                continue
+            detail = attempt.detail or attempt.status or attempt.outcome
+            return _normalize_search_attempt_detail(
+                f"{normalized_requested}->{normalized_actual}: {attempt.outcome}: {detail}"
+            )
+        return _normalize_search_attempt_detail(
+            f"{normalized_requested}->{normalized_actual}: fallback_without_primary_success"
+        )
 
     def _search_with_preview_model(
         self,
@@ -365,7 +532,7 @@ class OpenAISearchMixin:
         instructions: str,
         location_hint: str | None,
         max_output_tokens: int,
-    ) -> tuple[OpenAISearchResult, bool]:
+    ) -> tuple[OpenAISearchResult, bool, OpenAISearchAttempt]:
         """Run a search request through a preview chat-completions model."""
 
         messages: list[dict[str, str]] = []
@@ -400,7 +567,136 @@ class OpenAISearchMixin:
             used_web_search=True,
         )
         # AUDIT-FIX(#7): Reject truncated/filtered preview answers instead of returning potentially partial output.
-        return result, self._preview_response_is_complete(response)
+        is_complete = self._preview_response_is_complete(response)
+        attempt = _build_search_attempt(
+            model=model,
+            api_path="preview",
+            max_output_tokens=max_output_tokens,
+            outcome="success" if result.answer and is_complete else "unusable",
+            status=_collapse_whitespace(getattr(response.choices[0], "finish_reason", None)).lower()
+            if getattr(response, "choices", None)
+            else None,
+            detail=None if result.answer else "answer_text=blank",
+        )
+        return result, is_complete, attempt
+
+    def _search_with_responses_model(
+        self,
+        model: str,
+        prompt: str,
+        *,
+        conversation: ConversationLike | None,
+        instructions: str,
+        location_hint: str | None,
+        output_token_candidates: tuple[int, ...],
+    ) -> tuple[OpenAISearchResult | None, Exception | None, tuple[OpenAISearchAttempt, ...]]:
+        """Run a search request through a Responses web-search model.
+
+        The configured primary/retry budgets remain the first attempts, but an
+        incomplete response with ``reason=max_output_tokens`` now expands
+        through a bounded ladder instead of failing as a generic blank answer.
+        """
+
+        pending_output_tokens = list(output_token_candidates)
+        attempted_output_tokens: set[int] = set()
+        last_error: Exception | None = None
+        attempt_log: list[OpenAISearchAttempt] = []
+
+        while pending_output_tokens:
+            max_output_tokens = pending_output_tokens.pop(0)
+            if max_output_tokens in attempted_output_tokens:
+                continue
+            attempted_output_tokens.add(max_output_tokens)
+            try:
+                request = self._build_response_request(
+                    prompt,
+                    conversation=conversation,
+                    instructions=instructions,
+                    allow_web_search=True,
+                    model=model,
+                    reasoning_effort="low",
+                    max_output_tokens=max_output_tokens,
+                    prompt_cache_scope="search",
+                )
+                # AUDIT-FIX(#6): Patch the actual web-search tool only, validate search_context_size, and preserve other include fields.
+                self._apply_web_search_request_overrides(request, location_hint=location_hint)
+                self._ensure_web_search_sources_included(request)
+                # AUDIT-FIX(#3): Keep trying remaining models/attempts on transient Responses API failures.
+                response = self._client.responses.create(**request)
+                candidate = OpenAISearchResult(
+                    answer=_collapse_whitespace(self._extract_output_text(response).replace("\r", " ").replace("\n", " ")),
+                    sources=self._extract_web_search_sources(response),
+                    response_id=getattr(response, "id", None),
+                    request_id=getattr(response, "_request_id", None),
+                    model=extract_model_name(response, model),
+                    token_usage=extract_token_usage(response),
+                    used_web_search=self._used_web_search(response),
+                )
+            except Exception as exc:  # pragma: no cover - defensive runtime fallback
+                last_error = exc
+                attempt_log.append(
+                    _build_search_attempt(
+                        model=model,
+                        api_path="responses",
+                        max_output_tokens=max_output_tokens,
+                        outcome="error",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+                continue
+
+            if candidate.answer and self._response_is_complete(response):
+                attempt_log.append(
+                    _build_search_attempt(
+                        model=model,
+                        api_path="responses",
+                        max_output_tokens=max_output_tokens,
+                        outcome="success",
+                        status=_response_status_text(response),
+                    )
+                )
+                return candidate, None, tuple(attempt_log)
+
+            retry_reason = self._search_budget_retry_reason(response, answer=candidate.answer)
+            retry_budget = self._next_search_retry_max_output_tokens(
+                response,
+                current_max_output_tokens=max_output_tokens,
+                output_token_candidates=output_token_candidates,
+                answer=candidate.answer,
+            )
+            if retry_budget is not None:
+                attempt_log.append(
+                    _build_search_attempt(
+                        model=model,
+                        api_path="responses",
+                        max_output_tokens=max_output_tokens,
+                        outcome="retry",
+                        status=_response_status_text(response),
+                        detail=retry_reason,
+                    )
+                )
+                if retry_budget not in attempted_output_tokens and retry_budget not in pending_output_tokens:
+                    pending_output_tokens.insert(0, retry_budget)
+                continue
+
+            last_error = self._build_search_response_error(
+                model=model,
+                response=response,
+                max_output_tokens=max_output_tokens,
+                answer=candidate.answer,
+            )
+            attempt_log.append(
+                _build_search_attempt(
+                    model=model,
+                    api_path="responses",
+                    max_output_tokens=max_output_tokens,
+                    outcome="unusable",
+                    status=_response_status_text(response),
+                    detail=last_error,
+                )
+            )
+
+        return None, last_error, tuple(attempt_log)
 
     def _rewrite_search_result_for_voice(
         self,
@@ -416,7 +712,7 @@ class OpenAISearchMixin:
         present in the search answer.
         """
 
-        preferred_model = _collapse_whitespace(getattr(self.config, "default_model", None)) or "gpt-4o-mini"
+        preferred_model = _collapse_whitespace(getattr(self.config, "default_model", None)) or DEFAULT_OPENAI_MAIN_MODEL
         prompt = (
             f"Original user question: {question}\n"
             f"Verified live-search answer: {candidate.answer}\n"
@@ -428,11 +724,18 @@ class OpenAISearchMixin:
             "Use only facts already present in the verified live-search answer. "
             "Do not add facts, do not ask a follow-up question unless the verified answer itself lacks a key fact, "
             "and do not mention sources, URLs, markdown, citations, brackets, or reference phrases. "
-            "Keep the reply short, natural, senior-friendly, and usually to one or two short sentences. "
+            "Keep the reply short, natural, warm, spoken, senior-friendly, and usually to one or two short sentences. "
+            "Avoid stiff, bureaucratic, or institutional wording. "
+            "Prefer plain spoken wording over formal written-report phrasing or generic advisories unless the verified answer itself requires that wording. "
             "Return only the spoken answer text."
         )
         last_error: Exception | None = None
-        for model in (preferred_model, "gpt-4o-mini"):
+        rewrite_models: list[str] = []
+        for candidate_model in (preferred_model, *SEARCH_MODEL_FALLBACKS):
+            normalized_candidate = _collapse_whitespace(candidate_model)
+            if normalized_candidate and normalized_candidate not in rewrite_models:
+                rewrite_models.append(normalized_candidate)
+        for model in rewrite_models:
             try:
                 request = self._build_response_request(
                     prompt,
@@ -456,6 +759,9 @@ class OpenAISearchMixin:
                         model=candidate.model,
                         token_usage=candidate.token_usage,
                         used_web_search=candidate.used_web_search,
+                        requested_model=candidate.requested_model,
+                        fallback_reason=candidate.fallback_reason,
+                        attempt_log=candidate.attempt_log,
                     )
             except Exception as exc:  # pragma: no cover - defensive runtime fallback
                 last_error = exc
@@ -471,16 +777,34 @@ class OpenAISearchMixin:
         location_hint: str | None,
         date_context: str | None,
     ) -> str:
-        """Return the literal user query for web search.
+        """Return a structured search prompt with explicit place/date context.
 
-        Search turns should reach the provider as the user's exact request,
-        without extra conversational framing, memory hints, or implicit local
-        rewrites. Structured hints such as explicit ``location_hint`` stay on
-        the tool payload instead of being injected into the text query.
+        Search must stay anchored to the user's actual request, but the
+        provider also needs the structured handoff hints when ASR wording is
+        slightly garbled or relative dates need grounding. The prompt therefore
+        keeps the literal question while surfacing any explicit structured
+        context in separate bounded lines.
         """
 
-        del location_hint, date_context
-        return _collapse_whitespace(question)
+        normalized_question = _collapse_whitespace(question)
+        explicit_query = _resolved_explicit_search_query(normalized_question, date_context)
+        normalized_location = _collapse_whitespace(location_hint)
+        normalized_date_context = _collapse_whitespace(date_context)
+
+        if not normalized_location and not normalized_date_context and explicit_query is None:
+            return normalized_question
+
+        lines = [f"User question: {normalized_question}"]
+        if explicit_query is not None and explicit_query != normalized_question:
+            lines.append(f"Resolved explicit-date variant: {explicit_query}")
+        if normalized_location:
+            lines.append(f"Explicit place context: {normalized_location}")
+        if normalized_date_context:
+            lines.append(f"Explicit local date/time context: {normalized_date_context}")
+        lines.append(
+            "Answer the user's actual request and use the explicit place/date context only to disambiguate partial wording, ASR noise, or relative dates."
+        )
+        return "\n".join(lines)
 
     def _extract_web_search_sources(self, response: Any) -> tuple[str, ...]:
         """Extract and deduplicate source URLs from a Responses search result."""
@@ -529,13 +853,13 @@ class OpenAISearchMixin:
         configured = _collapse_whitespace(getattr(self.config, "openai_search_model", None))
         if configured:
             candidates.append(configured)
+        default_model = _collapse_whitespace(getattr(self.config, "default_model", None))
+        if default_model and default_model not in candidates:
+            candidates.append(default_model)
         for fallback in SEARCH_MODEL_FALLBACKS:
             normalized_fallback = _collapse_whitespace(fallback)
             if normalized_fallback and normalized_fallback not in candidates:
                 candidates.append(normalized_fallback)
-        default_model = _collapse_whitespace(getattr(self.config, "default_model", None))
-        if default_model and default_model not in candidates:
-            candidates.append(default_model)
         if not candidates:
             # AUDIT-FIX(#5): Ensure a deterministic last-resort model candidate instead of an empty iteration set.
             candidates.append(_FALLBACK_SEARCH_MODEL)
@@ -662,6 +986,76 @@ class OpenAISearchMixin:
         if primary == retry:
             return (primary,)
         return (primary, retry)
+
+    def _next_search_retry_max_output_tokens(
+        self,
+        response: Any,
+        *,
+        current_max_output_tokens: int,
+        output_token_candidates: tuple[int, ...],
+        answer: str,
+    ) -> int | None:
+        """Return the next larger retry budget for token-exhausted search responses."""
+
+        if self._search_budget_retry_reason(response, answer=answer) is None:
+            return None
+        larger_budgets = sorted(
+            {
+                *output_token_candidates,
+                *_SEARCH_OUTPUT_TOKEN_RETRY_LADDER,
+            }
+        )
+        for budget in larger_budgets:
+            if budget > current_max_output_tokens:
+                return budget
+        return None
+
+    def _search_budget_retry_reason(self, response: Any, *, answer: str) -> str | None:
+        """Return why the same model deserves a larger search budget."""
+
+        if self._response_hit_max_output_tokens_limit(response):
+            return "max_output_tokens"
+        if not _collapse_whitespace(answer) and _response_status_text(response) == "completed":
+            return "blank_completed"
+        return None
+
+    def _response_hit_max_output_tokens_limit(self, response: Any) -> bool:
+        """Return whether a search response stopped because max_output_tokens was exhausted."""
+
+        status = _collapse_whitespace(getattr(response, "status", None)).lower()
+        if status != "incomplete":
+            return False
+        incomplete_detail = (_response_incomplete_detail(response) or "").lower()
+        return "max_output_tokens" in incomplete_detail
+
+    def _build_search_response_error(
+        self,
+        *,
+        model: str,
+        response: Any,
+        max_output_tokens: int,
+        answer: str,
+    ) -> RuntimeError:
+        """Return an informative error for an unusable search response."""
+
+        parts = [
+            f"OpenAI web search response unusable for model={model!r}",
+            f"max_output_tokens={max_output_tokens}",
+        ]
+        status = _collapse_whitespace(getattr(response, "status", None)).lower()
+        if status:
+            parts.append(f"status={status!r}")
+        incomplete_detail = _response_incomplete_detail(response)
+        if incomplete_detail:
+            parts.append(f"incomplete={incomplete_detail}")
+        error_detail = _extract_detail_message(getattr(response, "error", None))
+        if error_detail:
+            parts.append(f"error={error_detail}")
+        if answer:
+            parts.append("answer_text=partial")
+        else:
+            parts.append("answer_text=blank")
+        return RuntimeError("; ".join(parts))
 
     def _response_is_complete(self, response: Any) -> bool:
         """Return whether a Responses search result completed successfully."""

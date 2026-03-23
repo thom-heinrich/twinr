@@ -81,6 +81,28 @@ class PersonalityContextService:
         )
         return plan.as_sections()
 
+    def build_supervisor_sections(
+        self,
+        *,
+        legacy_sections: tuple[tuple[str, str], ...],
+        config: TwinrConfig,
+        remote_state: LongTermRemoteStateStore | None = None,
+    ) -> tuple[tuple[str, str], ...]:
+        """Build a lean supervisor bundle without dynamic topic-contamination.
+
+        The fast supervisor should keep stable character/style context, but it
+        must not inherit volatile prompt layers such as `MINDSHARE`, `PLACE`,
+        `WORLD`, or `REFLECTION`, because those layers can distort routing for
+        noisy freshness-sensitive turns.
+        """
+
+        snapshot = self.load_snapshot(config=config, remote_state=remote_state)
+        plan = self.builder.build_supervisor_prompt_plan(
+            legacy_sections=legacy_sections,
+            snapshot=snapshot,
+        )
+        return plan.as_sections()
+
     def load_turn_steering_cues(
         self,
         *,

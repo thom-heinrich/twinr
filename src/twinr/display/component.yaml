@@ -10,6 +10,7 @@ owned_concerns:
   - Surface calm ReSpeaker listening, heard-speech, direction-hint, and ring-semantic states without mirroring weak audio evidence
   - Persist and load optional HDMI face-expression cues so external triggers can steer gaze, brows, mouth, and subtle head drift without changing the generic runtime snapshot schema, and let directional cues calm the normal waiting-face idle churn instead of fighting it
   - Expose a producer-facing HDMI face-expression API so camera, proactive, or other runtime modules can set combinable gaze, brow, mouth, and blink cues without writing raw JSON
+  - Persist and load optional HDMI header debug-signal pills so operator-only camera and fusion states can be inspected in one bounded top-lane without changing the generic runtime snapshot schema
   - Persist and load optional HDMI emoji cues so capabilities can claim the free right-hand reserve area with one real Unicode symbol and soft accent halo instead of status-card chrome
   - Persist and load optional HDMI ambient-impulse cues so personality-driven capabilities can claim the same reserve area with one bounded readable question-first card that stays positive and glanceable
   - Persist a bounded reserve-card exposure history so later learning code can correlate shown cards with later structured user reactions without coupling that memory into the renderer
@@ -24,6 +25,7 @@ owned_concerns:
   - Run bounded HDMI visual QC scene sets that capture screenshots, diff metrics, and report-ready artifacts for the visible monitor surface
   - Compose operator-friendly layout variants such as the grouped debug log display
   - Derive bounded debug-log sections from persisted ops events, usage telemetry, host health, and the remote-memory watchdog artifact without poll-to-poll timer churn or raw high-frequency metric jitter
+  - Surface normalized generic realtime tool-call events in the operator `LLM Log` so tool name, success/failure, latency, and compact fallback/error clues are visible without raw JSON inspection
   - Render a visible full-screen HDMI Wayland UI for the Pi monitor path and keep a framebuffer fallback for non-Wayland setups
   - Keep native Wayland surface hosting separate from framebuffer rendering so richer HDMI-only content surfaces can evolve without polluting the generic renderer
   - Validate and load the configured Waveshare vendor driver with Twinr GPIO and SPI expectations
@@ -63,6 +65,8 @@ files:
       - create_display_adapter
   - path: contracts.py
     role: Shared adapter and payload contracts for display backends
+  - path: debug_signals.py
+    role: Persist and normalize optional HDMI header debug-signal pills for bounded operator inspection
   - path: factory.py
     role: Select the configured display backend
     exports:
@@ -160,6 +164,7 @@ tests:
   - path: test/test_display_reserve_bus_feedback.py
   - path: test/test_display_ambient_moments.py
   - path: test/test_display_debug_log.py
+  - path: test/test_display_debug_signals.py
   - path: test/test_display_face_cues.py
   - path: test/test_display_emojis.py
   - path: test/test_display_news_ticker.py
